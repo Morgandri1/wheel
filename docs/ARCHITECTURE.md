@@ -177,8 +177,27 @@ Every command prints a one-line human result (and `--json` for machine output). 
 ```
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
+
+### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
+
+We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in the first hours of this project.
+
+| # | YOKE problem observed | Wheel requirement | Milestone |
+|---|-----------------------|-------------------|-----------|
+| 1 | A body passed as argv goes through the shell: backticks / `$(…)` get substituted and the message is silently corrupted or beheaded. | **Tool calls are the primary agent interface, not the shell.** The engine attaches a built-in MCP server to *every* agent (`wheel mcp-serve` over stdio, forwarding to the engine with the node token; tools: `msg`, `read`, `write`, `rm`, `ls`, `query`, `secret_get`, `run`, `ctx_clear`, `inbox`, `whoami`, `connections`). The `wheel` CLI stays for scripts/humans; its argv path warns on stderr if the body contains `` ` `` or `$(` and points at `--file`. The preamble tells agents to prefer the tools. | MCP: M2 · CLI warn: M1 |
+| 2 | No way to re-read a message once delivered; a garbled delivery is lost. | Messages are durable. `wheel inbox [--since <ts>] [--limit n]` lists my received messages; `wheel inbox <id>` / MCP `inbox` prints the exact body again. The envelope `id` is the handle. | M1 |
+| 3 | Sender can't tell whether what arrived is what was sent. | `wheel msg` returns `{id, sha256, bytes, state}`; the engine stores the sha256 and the UI shows it; delivery is byte-exact and a test proves it (send 200 KiB with every ASCII punctuation char + unicode + a fake close tag → recipient transcript is byte-identical inside the envelope). | M1 |
+| 4 | Delivery state is opaque (queued? delivered? consumed?). | Message states `queued → delivered → consumed` (consumed = the harness reported the turn that contained it complete). Visible via `wheel msg --wait[=SECS]` (blocks until `delivered`, `--wait-consumed` until consumed), the `message` WS event, and the Web message list. | M1 states+event · `--wait` M2 |
+| 5 | Inbound messages were presented to the agent as "the user sent a message", blurring who is talking. | The `<AgentPrompt from type>` envelope is the ONLY framing; `type` is one of `agent | user | endpoint | script | system`. Bodies cannot forge attribution (engine escapes `</AgentPrompt>`; envelope attributes are engine-generated). | M1 |
+| 6 | Limits are discovered only by failing. | Limits are documented in PROTOCOL.md and enforced client-side with a clear error *before* sending: message body ≤ 256 KiB, ctx/table-row value ≤ 1 MiB, chest blob ≤ 50 MiB. | M1 |
+| 7 | `ls` with no argument is operator-only; agents can't enumerate what they can reach. | `wheel ls` with no argument lists every keyspace I'm wired to, with the wire type; `wheel connections` explains each in plain language. | M1 |
+| 8 | Fan-out means N separate sends. | `wheel msg a,b,c "…"` and `--all` (every agent I have a `send` wire to). One message row per recipient, one call. | M2 |
+| 9 | No threading. | `wheel msg --reply-to <id>`; envelope gains `reply_to="<id>"`; Web groups threads. | M2 (nice-to-have) |
+| 10 | Operator couldn't see that a message was mangled. | Web's agent drawer shows every message (body, sha256, state, from/to) and, per agent, the exact bytes written to stdin (transcript view). | Web · M2 |
+| 11 | Long messages truncated somewhere between sender and recipient's context. | Engine never truncates; if a harness limit would be exceeded the message stays `queued` with `last_error`, is surfaced in the UI, and is never silently clipped. | M1 |
+
 ### Message delivery contract
-- Messages persist in sqlite (`messages`: id, from_node, to_node, body, created_at, delivered_at, acked_at).
+- Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
 - Delivery into a running agent: engine writes a user turn to the child's stdin using the `<AgentPrompt …>` envelope above.
   Stopped agents queue; queue drains on start. Messages are delivered one at a time; the next is written when the harness reports the turn complete.
 - `ephemeral_context: true` → when the agent finishes its turn (harness emits result/idle), engine clears context
