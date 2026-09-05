@@ -106,6 +106,27 @@ def main():
     st, _, _ = call("DELETE", "/v1/projects/%s" % pid, alice)
     R.check("API-project-delete", st in (200, 204), "owner delete -> %s" % st)
 
+    # §5: delete "stops + removes container + volume". An orphaned sandbox per deleted
+    # project is a slow resource leak that looks like nothing until the host runs out of
+    # memory — which it did today, with nine leaked containers on a 16 GB box.
+    import subprocess, time
+    if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+        name = "wheel-p-%s" % pid
+        gone = False
+        for _ in range(20):
+            q = subprocess.run(["docker", "ps", "-aq", "--filter", "name=" + name],
+                               capture_output=True, text=True)
+            if not q.stdout.strip():
+                gone = True
+                break
+            time.sleep(1)
+        R.check("API-project-delete-reaps", gone,
+                "container %s still exists after the project was deleted" % name)
+        if not gone:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    else:
+        R.skip("API-project-delete-reaps", "docker not available")
+
     return R.report("api-auth")
 
 
