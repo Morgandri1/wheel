@@ -9,16 +9,17 @@
     "script",
     "mcp",
     "vault",
-    "chest"
+    "chest",
+    "tool"
   ],
   "wire_types": [
     "read",
     "write",
     "send"
   ],
-  "total": 192,
-  "allow": 22,
-  "deny": 170,
+  "total": 243,
+  "allow": 25,
+  "deny": 218,
   "cells": [
     {
       "id": "WM-agent-agent-read",
@@ -208,6 +209,30 @@
       "id": "WM-agent-chest-send",
       "from": "agent",
       "to": "chest",
+      "type": "send",
+      "expect": "deny",
+      "why": "send is only meaningful into agent (and endpoint->script)"
+    },
+    {
+      "id": "WM-agent-tool-read",
+      "from": "agent",
+      "to": "tool",
+      "type": "read",
+      "expect": "allow",
+      "why": "wheel tool ls/call; enabled ops also exposed as MCP <tool>__<op>"
+    },
+    {
+      "id": "WM-agent-tool-write",
+      "from": "agent",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "not listed in the matrix; default DENY"
+    },
+    {
+      "id": "WM-agent-tool-send",
+      "from": "agent",
+      "to": "tool",
       "type": "send",
       "expect": "deny",
       "why": "send is only meaningful into agent (and endpoint->script)"
@@ -405,6 +430,30 @@
       "why": "ctx has no outgoing wires except send->agent (injection)"
     },
     {
+      "id": "WM-ctx-tool-read",
+      "from": "ctx",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "ctx has no outgoing wires except send->agent (injection)"
+    },
+    {
+      "id": "WM-ctx-tool-write",
+      "from": "ctx",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "ctx has no outgoing wires except send->agent (injection)"
+    },
+    {
+      "id": "WM-ctx-tool-send",
+      "from": "ctx",
+      "to": "tool",
+      "type": "send",
+      "expect": "deny",
+      "why": "ctx has no outgoing wires except send->agent (injection)"
+    },
+    {
       "id": "WM-table-agent-read",
       "from": "table",
       "to": "agent",
@@ -592,6 +641,30 @@
       "id": "WM-table-chest-send",
       "from": "table",
       "to": "chest",
+      "type": "send",
+      "expect": "deny",
+      "why": "table has no outgoing wires"
+    },
+    {
+      "id": "WM-table-tool-read",
+      "from": "table",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "table has no outgoing wires"
+    },
+    {
+      "id": "WM-table-tool-write",
+      "from": "table",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "table has no outgoing wires"
+    },
+    {
+      "id": "WM-table-tool-send",
+      "from": "table",
+      "to": "tool",
       "type": "send",
       "expect": "deny",
       "why": "table has no outgoing wires"
@@ -789,6 +862,30 @@
       "why": "endpoint may only send->agent, send->script, write->table"
     },
     {
+      "id": "WM-endpoint-tool-read",
+      "from": "endpoint",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "endpoint may only send->agent, send->script, write->table"
+    },
+    {
+      "id": "WM-endpoint-tool-write",
+      "from": "endpoint",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "endpoint may only send->agent, send->script, write->table"
+    },
+    {
+      "id": "WM-endpoint-tool-send",
+      "from": "endpoint",
+      "to": "tool",
+      "type": "send",
+      "expect": "deny",
+      "why": "endpoint may only send->agent, send->script, write->table"
+    },
+    {
       "id": "WM-script-agent-read",
       "from": "script",
       "to": "agent",
@@ -976,6 +1073,30 @@
       "id": "WM-script-chest-send",
       "from": "script",
       "to": "chest",
+      "type": "send",
+      "expect": "deny",
+      "why": "send is only meaningful into agent (and endpoint->script)"
+    },
+    {
+      "id": "WM-script-tool-read",
+      "from": "script",
+      "to": "tool",
+      "type": "read",
+      "expect": "allow",
+      "why": "same as agent"
+    },
+    {
+      "id": "WM-script-tool-write",
+      "from": "script",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "not listed in the matrix; default DENY"
+    },
+    {
+      "id": "WM-script-tool-send",
+      "from": "script",
+      "to": "tool",
       "type": "send",
       "expect": "deny",
       "why": "send is only meaningful into agent (and endpoint->script)"
@@ -1173,6 +1294,30 @@
       "why": "mcp has no outgoing wires"
     },
     {
+      "id": "WM-mcp-tool-read",
+      "from": "mcp",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "mcp has no outgoing wires"
+    },
+    {
+      "id": "WM-mcp-tool-write",
+      "from": "mcp",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "mcp has no outgoing wires"
+    },
+    {
+      "id": "WM-mcp-tool-send",
+      "from": "mcp",
+      "to": "tool",
+      "type": "send",
+      "expect": "deny",
+      "why": "mcp has no outgoing wires"
+    },
+    {
       "id": "WM-vault-agent-read",
       "from": "vault",
       "to": "agent",
@@ -1360,6 +1505,30 @@
       "id": "WM-vault-chest-send",
       "from": "vault",
       "to": "chest",
+      "type": "send",
+      "expect": "deny",
+      "why": "vault has no outgoing wires"
+    },
+    {
+      "id": "WM-vault-tool-read",
+      "from": "vault",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "vault has no outgoing wires"
+    },
+    {
+      "id": "WM-vault-tool-write",
+      "from": "vault",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "vault has no outgoing wires"
+    },
+    {
+      "id": "WM-vault-tool-send",
+      "from": "vault",
+      "to": "tool",
       "type": "send",
       "expect": "deny",
       "why": "vault has no outgoing wires"
@@ -1555,6 +1724,246 @@
       "type": "send",
       "expect": "deny",
       "why": "chest has no outgoing wires"
+    },
+    {
+      "id": "WM-chest-tool-read",
+      "from": "chest",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "chest has no outgoing wires"
+    },
+    {
+      "id": "WM-chest-tool-write",
+      "from": "chest",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "chest has no outgoing wires"
+    },
+    {
+      "id": "WM-chest-tool-send",
+      "from": "chest",
+      "to": "tool",
+      "type": "send",
+      "expect": "deny",
+      "why": "chest has no outgoing wires"
+    },
+    {
+      "id": "WM-tool-agent-read",
+      "from": "tool",
+      "to": "agent",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-agent-write",
+      "from": "tool",
+      "to": "agent",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-agent-send",
+      "from": "tool",
+      "to": "agent",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-ctx-read",
+      "from": "tool",
+      "to": "ctx",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-ctx-write",
+      "from": "tool",
+      "to": "ctx",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-ctx-send",
+      "from": "tool",
+      "to": "ctx",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-table-read",
+      "from": "tool",
+      "to": "table",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-table-write",
+      "from": "tool",
+      "to": "table",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-table-send",
+      "from": "tool",
+      "to": "table",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-endpoint-read",
+      "from": "tool",
+      "to": "endpoint",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-endpoint-write",
+      "from": "tool",
+      "to": "endpoint",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-endpoint-send",
+      "from": "tool",
+      "to": "endpoint",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-script-read",
+      "from": "tool",
+      "to": "script",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-script-write",
+      "from": "tool",
+      "to": "script",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-script-send",
+      "from": "tool",
+      "to": "script",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-mcp-read",
+      "from": "tool",
+      "to": "mcp",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-mcp-write",
+      "from": "tool",
+      "to": "mcp",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-mcp-send",
+      "from": "tool",
+      "to": "mcp",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-vault-read",
+      "from": "tool",
+      "to": "vault",
+      "type": "read",
+      "expect": "allow",
+      "why": "tool resolves {mode:vault} fills from that vault at call time"
+    },
+    {
+      "id": "WM-tool-vault-write",
+      "from": "tool",
+      "to": "vault",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-vault-send",
+      "from": "tool",
+      "to": "vault",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-chest-read",
+      "from": "tool",
+      "to": "chest",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-chest-write",
+      "from": "tool",
+      "to": "chest",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-chest-send",
+      "from": "tool",
+      "to": "chest",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-tool-read",
+      "from": "tool",
+      "to": "tool",
+      "type": "read",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-tool-write",
+      "from": "tool",
+      "to": "tool",
+      "type": "write",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
+    },
+    {
+      "id": "WM-tool-tool-send",
+      "from": "tool",
+      "to": "tool",
+      "type": "send",
+      "expect": "deny",
+      "why": "tool's only outgoing wire is read->vault"
     }
   ]
 }

@@ -12,7 +12,7 @@ its ID here.
 
 **ID scheme:** `<AREA>-<thing>-<case>`, e.g. `WM-agent-ctx-read`, `API-auth-owner-404`.
 
-**Areas:** `NODE` data model · `WM` wire matrix · `MSG` message delivery · `INJ` injection &
+**Areas:** `NODE` data model · `WM` wire matrix · `TOOL` tool nodes (§3d) · `MSG` message delivery · `INJ` injection &
 ephemeral context · `ENG` engine control plane · `CLI` the `wheel` binary · `API` public API ·
 `ING` ingress · `SEC` isolation & secrets · `COMMS` §3c comms hardening · `E2E` browser ·
 `PERF` soak · `BACK` sandbox backends.
@@ -56,6 +56,7 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 | `NODE-endpoint-path-collide` | Two endpoints with the same method+path → 409. |
 | `NODE-script-lang` | `script`: `language ∈ {python,ts,js}`; `timeout_secs` defaults to 60, must be > 0 and ≤ a documented ceiling. |
 | `NODE-mcp-transport` | `mcp`: `stdio` requires `command`; `http` requires `url`; supplying both/neither → 400. |
+| `NODE-tool-config` | `tool`: `kind: "http"`, valid `base_url`, `operations[]` each with unique slug `id`, method, path, `enabled`, and a `Fill` for every param/body field. Bad `fill.mode` → 400. |
 | `NODE-vault-writeonly` | `vault.config.keys` lists key NAMES only; values are never accepted here. |
 | `NODE-schema-roundtrip` | Every node type round-trips create → `GET /v1/board` → update → read without field loss or type coercion. |
 
@@ -63,19 +64,19 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 
 ## 2. WM — wire matrix (§3), exhaustive
 
-All **192** cells (8 node types × 8 × 3 wire types) are enumerated in
+All **243** cells (9 node types × 9 × 3 wire types) are enumerated in
 **`qa/fixtures/wire_matrix.json`**, generated from the contract by
-`qa/tools/gen_wire_matrix.py`. **22 allow, 170 deny.** `make check` fails if the fixture drifts
+`qa/tools/gen_wire_matrix.py`. **25 allow, 218 deny.** `make check` fails if the fixture drifts
 from the generator, so the doc, the fixture and the tests can't disagree.
 
 IDs are `WM-<from>-<to>-<type>`, e.g. `WM-agent-ctx-read` (allow),
-`WM-table-agent-send` (deny).
+`WM-table-agent-send` (deny). `tool`'s only outgoing wire is `read`→`vault`.
 
 | ID | Criterion |
 |---|---|
-| `WM-create-allow` | Each of the 22 allowed cells: `POST /v1/wires` → 201, wire appears in `GET /v1/board` on the FROM node's outgoing list. |
-| `WM-create-deny` | Each of the 170 denied cells: `POST /v1/wires` → 4xx with a machine-readable reason; no wire row is created. |
-| `WM-engine-deny` | Same 170, posted directly to the **engine** control plane, bypassing the API → rejected. Independent defence. |
+| `WM-create-allow` | Each of the 25 allowed cells: `POST /v1/wires` → 201, wire appears in `GET /v1/board` on the FROM node's outgoing list. |
+| `WM-create-deny` | Each of the 218 denied cells: `POST /v1/wires` → 4xx with a machine-readable reason; no wire row is created. |
+| `WM-engine-deny` | Same 218, posted directly to the **engine** control plane, bypassing the API → rejected. Independent defence. |
 | `WM-enforce-runtime` | For each allowed cell, the corresponding `wheel` CLI call succeeds; for each denied cell, it fails with **exit 3** and touches nothing. |
 | `WM-write-implies-read` | A `write` wire to table/chest grants read too (`wheel table query` works with only `write` wired). |
 | `WM-read-not-write` | A `read` wire does NOT grant write: INSERT via a read-only table wire → exit 3; `wheel chest put` → exit 3; `wheel write <ctx>` → exit 3. |
@@ -126,6 +127,25 @@ The envelope written to the child's stdin is exactly one compact JSON line:
 | `MSG-durable-restart` | `messages` rows (id, sha256, bytes, state, timestamps, last_error) survive container restart. | S2 |
 | `MSG-error-turn` | `result.is_error=true` → agent `status=error`, `last_error` = `result.result`; the message is still marked consumed (not redelivered in a loop). | S2 |
 
+### 3a. Single writer & the user priority lane (§3c #12)
+
+The engine's per-agent delivery loop is the **only** thing that ever writes to a child's stdin.
+User messages take a priority lane ahead of queued agent/endpoint/script messages, but are
+**never** injected mid-turn. All of these are asserted from `WHEEL_FAKE_TRANSCRIPT` — the raw
+bytes the child received — because the engine's own view of what it sent is the thing under test.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MSG-single-writer` | The transcript is always a sequence of **whole JSON lines**. No interleaved, split or partial writes, ever — under concurrent sends, ingress hits, script sends and UI sends at once. Asserted by parsing every transcript line strictly and byte-counting. | **S1** |
+| `MSG-no-midturn` | Agent is mid-turn (scripted slow turn via `WHEEL_FAKE_SCRIPT` `{"sleep":N}`); a user message sent during it appears in the transcript **only after** that turn's `result` event. Not one byte earlier. | **S1** |
+| `MSG-priority-user` | With 3 agent messages already queued and 1 user message sent after them, the **user's is delivered first**; the 3 then drain in their original order. | S2 |
+| `MSG-priority-order` | Two rapid user sends arrive **in send order**, each as its own turn — the priority lane is FIFO within itself, not a stack. | S2 |
+| `MSG-priority-no-starve` | A steady stream of user messages does not starve queued agent messages forever; document and assert the fairness rule. | S3 |
+| `MSG-queued-next` | The message the delivery loop will send next reports state `queued (next)`, so the UI can show the user exactly when their message lands. | S3 |
+| `MSG-stdin-sole-path` | No path other than the delivery loop can reach a child's stdin — not the log/exec routes, not the built-in MCP server, not script nodes. Asserted by attempting each. | **S1** |
+| `MSG-interrupt` | `POST /v1/agents/:id/interrupt` cancels the in-flight turn per the harness protocol and then delivers the user's message. Never implicit — no other action interrupts a turn. *(M2)* | S2 |
+| `MSG-draft-local` | The chat box draft is client-side only (localStorage per agent, survives reload) and creates no `messages` row until Send. *(Web)* | S3 |
+
 ---
 
 ## 4. INJ — ctx injection & ephemeral context (§3)
@@ -170,6 +190,10 @@ container with an empty board (`ENG-route-*`), then behaviourally.
 | `ENG-child-exit` | Non-zero exit mid-stream → `status=error`, `last_error` populated. |
 | `ENG-auth-states` | `/auth/begin` → `/auth/complete` moves an agent out of `needs_auth`; `GET /auth` reports truthfully. Driven by `WHEEL_FAKE_AUTH`. |
 | `ENG-lifecycle` | start/stop/restart/clear are idempotent; double-start doesn't spawn two children; stop kills the child and reaps it (no zombies). |
+| `ENG-spawn-env` | §4b: engine starts with `WHEEL_PROJECT_ID`, `WHEEL_ENGINE_SECRET`, `WHEEL_VAULT_KEY`, `WHEEL_DATA_DIR`, `WHEEL_LISTEN`, `WHEEL_LOG=json`; missing/invalid any of them → **exit non-zero within 10s with a one-line reason**, not a hang. |
+| `ENG-spawn-healthy` | `GET /healthz` is 200 within 10s of start; the host's `start` blocks until green or 504s at 30s. |
+| `ENG-spawn-listen` | `WHEEL_LISTEN=tcp://…` and `unix://…` both work; in process mode the socket is owned by the project uid, mode-restricted, and **not** reachable over TCP. |
+| `ENG-sigterm` | SIGTERM stops children and flushes sqlite within 15s, exits 0; no data loss, no orphaned harness processes. |
 | `ENG-restart-persist` | Board, messages, table data and chest blobs all survive an engine restart. |
 
 ---
@@ -239,6 +263,55 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 
 ---
 
+## 8b. TOOL — tool nodes (§3d, M2)
+
+Imported HTTP specs become agent-callable operations. Two things make this security-sensitive: the
+engine makes outbound requests on the user's behalf (SSRF), and it injects secrets into them that
+the calling agent must never see (fill precedence).
+
+### Import & normalisation
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `TOOL-import-formats` | The **same API** described as OpenAPI 3.x, Swagger 2, Postman v2.1 and Insomnia v4 normalises to **identical** `operations[]` — same ids, methods, paths, params. One fixture API, four source files, one expected output. | S2 |
+| `TOOL-import-detect` | Format auto-detected when `format` is omitted; an explicit wrong `format` fails loudly rather than mis-parsing. | S3 |
+| `TOOL-import-preview` | `POST /v1/tools/import` returns normalised ops and creates **no node**. | S2 |
+| `TOOL-import-malformed` | Truncated / non-JSON / wrong-schema / hostile-huge documents → 400, never a panic, never partial state. | S2 |
+| `TOOL-import-idempotent` | Re-import diffs by `method+path`, **keeps existing fills**, flags added/removed ops. A re-import must never silently reset a `vault` fill back to `agent`. | **S1** |
+| `TOOL-import-engine-only` | The engine is the only parser; Web calls the endpoint rather than re-implementing it (assert Web has no spec-parsing code path). | S3 |
+| `TOOL-op-slug-unique` | Operation `id` slugs are unique within a node; collisions from distinct paths are disambiguated deterministically. | S2 |
+
+### Fills & agent exposure — the privilege boundary
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `TOOL-ls-agent-fields-only` | `wheel tool ls` / `GET /v1/tools/:id/ops` / the MCP input schema expose **only** `agent`-mode fields. `static`, `vault` and `hidden` fields are absent from the schema entirely — not present-but-masked. | **S1** |
+| `TOOL-reject-extra-field` | An agent supplying a field that is not `agent`-mode → **400**, logged as a denial event. Covers static, vault, hidden, and fields not in the spec at all. | **S1** |
+| `TOOL-fill-precedence` | `vault`/`static` are authoritative: an agent cannot override them by any means — same-name arg, differing case, duplicate key, nested JSON pointer collision, array-index path, or header smuggling. | **S1** |
+| `TOOL-vault-requires-wire` | A `vault`-mode fill without a `tool→vault (read)` wire fails the call; it does **not** fall back to sending the request without the secret, nor to an empty value. | **S1** |
+| `TOOL-vault-not-in-board` | Resolved vault values never appear in `GET /v1/board`, the node config, WS events, the call log, or error messages. Canary-grep every response. | **S1** |
+| `TOOL-curl-masked` | `--curl` / UI "copy as curl" renders the exact equivalent request with static **and** vault values masked. | **S1** |
+| `TOOL-hidden-omitted` | `hidden` fields are omitted from the outbound request entirely — not sent empty, not sent null. | S2 |
+| `TOOL-log-no-secrets` | The per-call event logs `{tool, op, status, duration_ms, bytes}` and never request bodies, headers or resolved secrets. | **S1** |
+
+### Execution & SSRF
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `TOOL-ssrf-base-url` | `base_url` resolving to loopback, RFC1918, link-local (169.254/fd00::/::1), `*.railway.internal`, `*.internal`, or a host-local address is **denied at import and at call time**. | **S1** |
+| `TOOL-ssrf-redirect` | A public URL that 30x-redirects to a denied address is blocked **at the redirect**, not just at the first hop. Chain depth ≤ 3 enforced. | **S1** |
+| `TOOL-ssrf-dns` | A public hostname whose DNS resolves to a private address is denied — resolution is checked against the **connected** address, defeating DNS rebinding between check and connect. | **S1** |
+| `TOOL-ssrf-encodings` | Decimal/octal/hex IP encodings, IPv4-mapped IPv6, trailing dots and userinfo tricks (`http://public@127.0.0.1/`) are all denied. | **S1** |
+| `TOOL-timeout` | 30s timeout enforced; a hanging upstream fails the call and does not wedge the agent's turn. | S2 |
+| `TOOL-response-cap` | Responses > 5 MiB are truncated-with-error or rejected, never buffered unbounded. | S2 |
+| `TOOL-call-shape` | `wheel tool call` returns `{status, headers, body}`; non-2xx upstream is returned faithfully, not swallowed. | S2 |
+| `TOOL-dry-run` | `POST /v1/tools/:id/call {dry_run:true}` returns the curl string without sending. | S3 |
+| `TOOL-disabled-op` | A disabled op is not listed and cannot be called. | S2 |
+| `TOOL-mcp-exposure` | Each `read`-wired tool contributes enabled ops to the built-in MCP server as `<tool>__<op>`, description = summary, input schema = agent fields only. Unwiring removes them at next start. | **S1** |
+| `TOOL-wire-gated` | `wheel tool ls/call` without an `agent→tool read` wire → exit 3. Scripts likewise (`script→tool read`). | **S1** |
+
+---
+
 ## 9. SEC — isolation & secrets
 
 | ID | Criterion | Sev |
@@ -278,6 +351,7 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `COMMS-threading` | 9 | `--reply-to <id>` sets envelope `reply_to`. *(M2)* |
 | `COMMS-observability` | 10 | Web shows body, sha256, state, from/to, and the exact stdin transcript per agent. *(Web M2)* |
 | `COMMS-no-truncate` | 11 | `MSG-no-truncate`. |
+| `COMMS-single-writer` | 12 | `MSG-single-writer` + `MSG-no-midturn` + `MSG-priority-*` + `MSG-stdin-sole-path`; interrupt is `MSG-interrupt`. |
 
 ---
 
@@ -309,6 +383,7 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `PERF-200-nodes` | A board of 200 nodes loads and renders; `GET /v1/board` stays within a documented budget. *(M3)* |
 | `PERF-1000-msgs` | 1000 messages queue and drain in order with no loss, no duplication, no state skips. *(M3)* |
 | `PERF-soak` | A 30-minute soak with agents messaging continuously: no fd/memory/zombie growth. *(M3)* |
+| `PERF-msg-latency` | Message → stdin latency within the documented budget; one agent process sustains 10 sequential turns without leak or slowdown. |
 | `PERF-check-budget` | `make check` stays under 3 minutes. |
 
 ---
@@ -321,7 +396,9 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `Q-INJ-ORDER` | In what order are multiple ctx nodes injected, and where does `system_prompt` sit relative to them? | Define it as: `system_prompt` first, then ctx nodes ordered by node name (stable, board-position-independent). Needs SDK confirmation to become `INJ-multi-ctx`. |
 | `Q-MSG-ERROR-REDELIVER` | When a turn errors, is the message consumed or retried? | Consumed exactly once + `last_error`. Infinite redelivery of a poison message is worse than losing one. |
 | `Q-TABLE-CEILING` | Documented ceiling for `script.timeout_secs` and max rows returned by `table query`? | 300s and 10k rows; both need to be in PROTOCOL.md so `CLI-limits-clientside` can enforce them. |
+| `Q-TOOL-ALLOWLIST` | §3d says v1 SSRF policy is deny-all-private with "project allowlist maybe later". Does anything legitimately need to call a private address in v1? | Keep v1 deny with no escape hatch. An allowlist is the feature most likely to be added carelessly later and re-open every `TOOL-ssrf-*` case; better to add it deliberately with its own tests. |
 | `Q-ENDPOINT-AUTH` | Can an ingress endpoint require a shared secret? | Out of scope for M1/M2, but worth a line in the threat model — a public write path into a table is an obvious abuse target. |
+| `Q-PRIORITY-FAIRNESS` | What stops a stream of user messages starving queued agent messages indefinitely (`MSG-priority-no-starve`)? | Drain at most N user messages before letting one queued message through, or timestamp-age escalation. Needs a rule from SDK before I can assert one. |
 
 ---
 

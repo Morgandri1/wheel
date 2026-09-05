@@ -1,0 +1,5 @@
+# QA test dependencies. Installed into qa/.venv by `make bootstrap`.
+jsonschema==4.23.0
+requests==2.32.3
+pytest==8.3.3
+websocket-client==1.8.0
