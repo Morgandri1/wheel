@@ -58,6 +58,8 @@ prod. Design axiom: **every layer is hostile to every other layer.**
 - Engine/vault/host secrets leaking into logs, error bodies, `docker inspect` env (by-design residual,
   §"container"), or a sandbox's env; dev-mode default secret shipping to prod.
 
+- **Defense-in-depth collapse (QA BUG-001, S2, SDK):** the exported JSON Schema accepts `..` in `endpoint.path`, vault VALUES in config, and unknown keys. The contract requires rejection by engine AND api; a permissive schema (Web's type source + the engine's validation gate) removes one of the two layers, so ingress/chest traversal loses its static half. Track: `qa/BUGS.md` 001.
+
 ### TB4 engine ↔ child process (the wire/token model)  [impact H · likelihood H → P0]
 - Node-token: forge/guess (entropy?); reuse after node delete/rename/rewire; TOCTOU race between wire
   deletion and an in-flight CLI call.
