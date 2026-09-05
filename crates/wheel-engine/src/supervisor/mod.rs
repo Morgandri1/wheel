@@ -149,6 +149,18 @@ impl Supervisor {
             cwd: self.cfg.data_dir.clone(),
         };
 
+        // Mint the node's capability token and hand it over as a 0600 FILE.
+        // Rotating here bounds a leaked token to one run, and a file rather
+        // than an env var keeps it out of /proc/<pid>/environ, which any
+        // process of the same uid can read (ADVERSARY F007).
+        let token_file = run_dir.join("token");
+        {
+            let conn = self.db.lock().unwrap();
+            let minted = crate::db::tokens::mint(&conn, agent)?;
+            write_secret_file(&token_file, &minted.plaintext)
+                .context("writing the node token file")?;
+        }
+
         self.set_status(agent, AgentStatus::Starting, None);
 
         let mut cmd = tokio::process::Command::new("claude");
@@ -161,6 +173,15 @@ impl Supervisor {
         for (k, v) in self.harness.env(&spec) {
             cmd.env(k, v);
         }
+        // How the child reaches its board. WHEEL_TOKEN is deliberately NOT set:
+        // the CLI errors loudly if it finds one, so a future regression that
+        // reintroduces an env token is noisy rather than silent.
+        cmd.env(wheel_core::spawn::ENV_TOKEN_FILE, &token_file);
+        cmd.env(
+            wheel_core::spawn::ENV_ENGINE_URL,
+            self.cfg.listen.client_url(),
+        );
+        cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
 
         let mut child = cmd.spawn().context("spawning the harness")?;
         let stdin = child.stdin.take().expect("stdin was piped");
@@ -188,6 +209,12 @@ impl Supervisor {
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {
             let _ = r.child.kill().await;
+        }
+        {
+            // Revoke on stop: a token left live after the process is gone is a
+            // credential with no owner.
+            let conn = self.db.lock().unwrap();
+            let _ = crate::db::tokens::revoke(&conn, agent);
         }
         self.set_status(agent, AgentStatus::Stopped, None);
         Ok(AgentStatus::Stopped)
@@ -480,6 +507,21 @@ fn log_line(conn: &rusqlite::Connection, agent: Uuid, stream: &str, text: &str) 
         ],
     );
     seq as u64
+}
+
+/// Write a secret to a file only its owner can read, creating it with 0600
+/// from the start rather than chmod-ing afterwards — a token that is briefly
+/// world-readable is a token that leaked.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.flush()
 }
 
 /// Broadcast a message row after a state transition, so the UI can show

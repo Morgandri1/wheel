@@ -98,6 +98,21 @@ impl ListenAddr {
         }
     }
 
+    /// What a CHILD should put in `WHEEL_ENGINE_URL` to reach this engine.
+    ///
+    /// Not the same string as the listen address: the engine binds
+    /// `0.0.0.0:7000`, but a child must dial a reachable host, and `0.0.0.0` is
+    /// not one. Unix sockets are already a path, so they pass through.
+    pub fn client_url(&self) -> String {
+        match self {
+            ListenAddr::Tcp(addr) => {
+                let port = addr.rsplit(':').next().unwrap_or("7000");
+                format!("http://127.0.0.1:{port}")
+            }
+            ListenAddr::Unix(p) => format!("unix://{}", p.display()),
+        }
+    }
+
     /// The default for docker mode.
     pub fn default_tcp() -> Self {
         ListenAddr::Tcp(format!("0.0.0.0:{}", crate::ENGINE_PORT))

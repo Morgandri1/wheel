@@ -26,6 +26,7 @@ use crate::{config::Config, db};
 
 pub mod agent_routes;
 pub mod board_routes;
+pub mod cli_routes;
 pub mod events_route;
 
 #[derive(Clone)]
@@ -149,9 +150,24 @@ pub fn router(state: AppState) -> Router {
             require_engine_secret,
         ));
 
+    // A separate realm: node tokens, never the engine secret. Nested outside
+    // the engine-secret route_layer on purpose — a child holding its own token
+    // must not be able to reach /v1/board, and the engine secret must not work
+    // here either.
+    let cli = Router::new()
+        .route("/whoami", get(cli_routes::whoami))
+        .route("/connections", get(cli_routes::connections))
+        .route("/ls", get(cli_routes::ls))
+        .route("/list", get(cli_routes::list))
+        .route("/read", get(cli_routes::read))
+        .route("/write", post(cli_routes::write))
+        .route("/msg", post(cli_routes::msg))
+        .route("/inbox", get(cli_routes::inbox));
+
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
+        .nest("/v1/cli", cli)
         .with_state(state)
 }
 
