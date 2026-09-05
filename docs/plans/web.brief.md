@@ -26,7 +26,8 @@ Types come from `docs/schema/*.json` (SDK exports them) via `json-schema-to-type
    - **Realtime**: one WS connection per open board to `/v1/projects/:id/engine/v1/events` (through the API); update node state, messages, logs. Reconnect with backoff; show a connection indicator.
    - Keyboard: `Delete` removes selection (confirm for nodes with data), `Cmd+K` palette, `Esc` closes panels. Undo for position changes is nice-to-have.
 4. **Auth**: Clerk `<SignIn/>`/`<SignUp/>` with email/password + Google + GitHub enabled; `/app/*` in middleware matcher.
-5. **Quality**: `pnpm lint`, `pnpm typecheck`, `pnpm test` (vitest for the wire-matrix helper + api client), Playwright smoke in `qa/` is QA's — but make the app testable: stable `data-testid`s on palette items, nodes, inspector fields, buttons.
+5. **Deploy**: Vercel (`web/vercel.json` if needed); env `NEXT_PUBLIC_API_URL`, Clerk keys; API CORS must allow the Vercel/`wheel.dev` origins (coordinate via PM).
+6. **Quality**: `pnpm lint`, `pnpm typecheck`, `pnpm test` (vitest for the wire-matrix helper + api client), Playwright smoke in `qa/` is QA's — but make the app testable: stable `data-testid`s on palette items, nodes, inspector fields, buttons.
 
 ## Non-negotiables
 - Never render or cache vault values; never put the Clerk token in URLs; never call the engine directly — always via the API.
