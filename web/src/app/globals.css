@@ -1,0 +1,67 @@
+@import "../styles/tokens.css";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background: var(--panel-0);
+    color: var(--ink);
+    font-family: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+    font-size: 0.9375rem;
+    line-height: 1.55;
+  }
+
+  /* Display sizes use Archivo's width axis — the signage read the design is built on. */
+  h1,
+  h2,
+  .display {
+    font-variation-settings: "wdth" 112;
+    letter-spacing: -0.018em;
+    font-weight: 600;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--wire-read);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--wire-read) 28%, transparent);
+  }
+
+  /* Identifiers are addresses; they get the mono face and nothing else does. */
+  .ident {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-size: 0.8125rem;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer components {
+  .plate {
+    background: var(--panel-1);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    box-shadow: inset 0 1px 0 0 var(--plate-highlight);
+  }
+
+  .hairline {
+    border-color: var(--rule);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

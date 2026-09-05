@@ -1,0 +1,362 @@
+"use client";
+
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  MiniMap,
+  ReactFlow,
+  ReactFlowProvider,
+  applyNodeChanges,
+  useReactFlow,
+  type Connection,
+  type Edge,
+  type Node as RFNode,
+  type NodeChange,
+} from "@xyflow/react";
+import "@xyflow/react/dist/base.css";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { NodePlate, type PlateData } from "@/components/board/node-plate";
+import { WireEdge, type WireData } from "@/components/board/wire-edge";
+import { Palette } from "@/components/board/palette";
+import { Legend } from "@/components/board/legend";
+import { WirePopover } from "@/components/board/wire-popover";
+import { NODE_META } from "@/lib/node-meta";
+import { canConnect, explainDenial, isInjection } from "@/lib/wire-matrix";
+import { suggestName } from "@/lib/validate";
+import { useBoardStore } from "@/store/board";
+import { toast, toastError } from "@/components/ui/toast";
+import type { EngineApi } from "@/lib/api";
+import type { NodeType, Position, WheelNode, WireType } from "@/lib/schema";
+
+const nodeTypes = { plate: NodePlate };
+const edgeTypes = { wire: WireEdge };
+
+interface CanvasProps {
+  nodes: WheelNode[];
+  api: EngineApi;
+  onChanged: () => void;
+}
+
+function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
+  const { screenToFlowPosition, getViewport } = useReactFlow();
+  const wrapper = useRef<HTMLDivElement>(null);
+  const select = useBoardStore((s) => s.select);
+  const selectedNodeId = useBoardStore((s) => s.selectedNodeId);
+  const openTab = useBoardStore((s) => s.openTab);
+  const pendingWire = useBoardStore((s) => s.pendingWire);
+  const setPendingWire = useBoardStore((s) => s.setPendingWire);
+
+  const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const takenNames = useMemo(() => nodes.map((n) => n.name), [nodes]);
+
+  /** Positions being dragged right now; they win over the server's copy until drag ends. */
+  const [dragged, setDragged] = useState<Record<string, Position>>({});
+  const [confirmDelete, setConfirmDelete] = useState<WheelNode | null>(null);
+
+  const rename = useCallback(
+    async (id: string, name: string) => {
+      try {
+        await api.patchNode(id, { name });
+        onChanged();
+      } catch (e) {
+        toastError(e, "Couldn't rename that node.");
+        onChanged();
+      }
+    },
+    [api, onChanged],
+  );
+
+  const rfNodes: RFNode[] = useMemo(
+    () =>
+      nodes.map((n) => ({
+        id: n.id,
+        type: "plate",
+        position: dragged[n.id] ?? n.position,
+        selected: n.id === selectedNodeId,
+        data: { node: n, takenNames, onRename: rename, onOpenLog: openTab } satisfies PlateData,
+      })),
+    [nodes, dragged, selectedNodeId, takenNames, rename, openTab],
+  );
+
+  const removeWire = useCallback(
+    async (from: string, to: string, type: WireType) => {
+      try {
+        await api.deleteWire(from, to, type);
+        onChanged();
+      } catch (e) {
+        toastError(e, "Couldn't remove that wire.");
+      }
+    },
+    [api, onChanged],
+  );
+
+  const rfEdges: Edge[] = useMemo(() => {
+    const out: Edge[] = [];
+    for (const n of nodes) {
+      for (const w of n.wires ?? []) {
+        const target = byId.get(w.to);
+        if (!target) continue;
+        out.push({
+          id: `${n.id}:${w.to}:${w.type}`,
+          source: n.id,
+          target: w.to,
+          type: "wire",
+          data: {
+            wireType: w.type,
+            injection: isInjection(n.type, target.type, w.type),
+            fromName: n.name,
+            toName: target.name,
+            onRemove: () => removeWire(n.id, w.to, w.type),
+          } satisfies WireData,
+        });
+      }
+    }
+    return out;
+  }, [nodes, byId, removeWire]);
+
+  const onNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      const positions: Record<string, Position> = {};
+      for (const c of changes) {
+        if (c.type === "position" && c.position) positions[c.id] = c.position;
+        if (c.type === "select" && c.selected) select(c.id);
+      }
+      if (Object.keys(positions).length) setDragged((prev) => ({ ...prev, ...positions }));
+      // Keep xyflow's internal bookkeeping (dimensions, z-index) in step.
+      void applyNodeChanges(changes, rfNodes);
+    },
+    [rfNodes, select],
+  );
+
+  const onNodeDragStop = useCallback(
+    async (_: unknown, node: RFNode) => {
+      const position = { x: Math.round(node.position.x), y: Math.round(node.position.y) };
+      try {
+        await api.patchNode(node.id, { position });
+      } catch (e) {
+        toastError(e, "Couldn't save that position.");
+      } finally {
+        setDragged((prev) => {
+          const next = { ...prev };
+          delete next[node.id];
+          return next;
+        });
+        onChanged();
+      }
+    },
+    [api, onChanged],
+  );
+
+  /** Refuse an illegal pair at the drag, so the popover only ever offers legal wires. */
+  const isValidConnection = useCallback(
+    (c: Connection | Edge) => {
+      const from = byId.get(c.source as string);
+      const to = byId.get(c.target as string);
+      if (!from || !to || from.id === to.id) return false;
+      return canConnect(from.type, to.type);
+    },
+    [byId],
+  );
+
+  const onConnect = useCallback(
+    (c: Connection) => {
+      const from = byId.get(c.source);
+      const to = byId.get(c.target);
+      if (!from || !to) return;
+      if (from.id === to.id) {
+        toast("A node can't wire to itself.", "error");
+        return;
+      }
+      if (!canConnect(from.type, to.type)) {
+        toast(explainDenial(from.name, from.type, to.name, to.type), "error");
+        return;
+      }
+      const rect = wrapper.current?.getBoundingClientRect();
+      setPendingWire({
+        from: from.id,
+        to: to.id,
+        fromType: from.type,
+        toType: to.type,
+        at: { x: (rect?.left ?? 0) + 260, y: (rect?.top ?? 0) + 120 },
+      });
+    },
+    [byId, setPendingWire],
+  );
+
+  const commitWire = useCallback(
+    async (type: WireType) => {
+      if (!pendingWire) return;
+      const { from, to } = pendingWire;
+      setPendingWire(null);
+      try {
+        await api.createWire(from, to, type);
+        onChanged();
+      } catch (e) {
+        // The engine is the authority. If it disagrees with our matrix, say so plainly.
+        toastError(e, "The engine rejected that wire.");
+        onChanged();
+      }
+    },
+    [api, onChanged, pendingWire, setPendingWire],
+  );
+
+  const place = useCallback(
+    async (type: NodeType, position: Position) => {
+      try {
+        const created = await api.createNode({
+          name: suggestName(type, takenNames),
+          type,
+          position: { x: Math.round(position.x), y: Math.round(position.y) },
+        });
+        onChanged();
+        select(created.id);
+      } catch (e) {
+        toastError(e, `Couldn't place that ${NODE_META[type].label.toLowerCase()}.`);
+      }
+    },
+    [api, onChanged, select, takenNames],
+  );
+
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      const type = e.dataTransfer.getData("application/wheel-node-type") as NodeType;
+      if (!type) return;
+      void place(type, screenToFlowPosition({ x: e.clientX - 104, y: e.clientY - 28 }));
+    },
+    [place, screenToFlowPosition],
+  );
+
+  const placeCentre = useCallback(
+    (type: NodeType) => {
+      const rect = wrapper.current?.getBoundingClientRect();
+      const vp = getViewport();
+      const x = ((rect?.width ?? 800) / 2 - vp.x) / vp.zoom - 104;
+      const y = ((rect?.height ?? 600) / 2 - vp.y) / vp.zoom - 28;
+      void place(type, { x, y });
+    },
+    [getViewport, place],
+  );
+
+  // Delete removes the selection; nodes that own data ask first.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement;
+      if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
+      if ((e.key !== "Delete" && e.key !== "Backspace") || !selectedNodeId) return;
+      const node = byId.get(selectedNodeId);
+      if (!node) return;
+      e.preventDefault();
+      if (node.type === "table" || node.type === "chest" || node.type === "vault") {
+        setConfirmDelete(node);
+      } else {
+        void (async () => {
+          try {
+            await api.deleteNode(node.id);
+            select(null);
+            onChanged();
+          } catch (err) {
+            toastError(err, "Couldn't delete that node.");
+          }
+        })();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [api, byId, onChanged, select, selectedNodeId]);
+
+  return (
+    <div className="flex min-h-0 flex-1">
+      <Palette onPlace={placeCentre} />
+      <div ref={wrapper} className="relative min-w-0 flex-1" data-testid="board-canvas">
+        <ReactFlow
+          nodes={rfNodes}
+          edges={rfEdges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          onNodesChange={onNodesChange}
+          onNodeDragStop={onNodeDragStop}
+          onConnect={onConnect}
+          isValidConnection={isValidConnection}
+          onPaneClick={() => select(null)}
+          onDrop={onDrop}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+          }}
+          fitView
+          fitViewOptions={{ padding: 0.24, maxZoom: 1 }}
+          minZoom={0.2}
+          maxZoom={1.8}
+          proOptions={{ hideAttribution: true }}
+          defaultEdgeOptions={{ type: "wire" }}
+          connectionLineStyle={{ stroke: "var(--rule-strong)", strokeWidth: 1.5 }}
+        >
+          <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--grid-dot)" />
+          <MiniMap
+            pannable
+            zoomable
+            className="!border !border-rule !bg-[var(--panel-1)]"
+            maskColor="color-mix(in srgb, var(--panel-0) 72%, transparent)"
+            nodeColor={(n) => {
+              const data = n.data as PlateData;
+              return NODE_META[data.node.type].tint;
+            }}
+          />
+          <Controls className="!border !border-rule !bg-[var(--panel-1)] [&_button]:!border-rule [&_button]:!bg-[var(--panel-1)] [&_button]:!fill-[var(--ink-dim)]" />
+        </ReactFlow>
+
+        <Legend />
+
+        {pendingWire ? (
+          <WirePopover pending={pendingWire} onPick={commitWire} onCancel={() => setPendingWire(null)} />
+        ) : null}
+
+        {confirmDelete ? (
+          <div className="plate absolute left-1/2 top-6 z-40 w-[380px] -translate-x-1/2 p-4" data-testid="confirm-delete-node">
+            <p className="text-meta">
+              Deleting <span className="ident">{confirmDelete.name}</span> drops its data — the{" "}
+              {confirmDelete.type === "table" ? "rows" : confirmDelete.type === "chest" ? "files" : "secrets"}{" "}
+              go with it.
+            </p>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                className="h-7 rounded-control border border-transparent px-2.5 text-micro text-ink-dim hover:text-ink"
+                onClick={() => setConfirmDelete(null)}
+              >
+                Keep it
+              </button>
+              <button
+                data-testid="btn-confirm-delete-node"
+                className="h-7 rounded-control border px-2.5 text-micro"
+                style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+                onClick={async () => {
+                  try {
+                    await api.deleteNode(confirmDelete.id);
+                    select(null);
+                    onChanged();
+                  } catch (e) {
+                    toastError(e, "Couldn't delete that node.");
+                  } finally {
+                    setConfirmDelete(null);
+                  }
+                }}
+              >
+                Delete {confirmDelete.type}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export function Canvas(props: CanvasProps) {
+  return (
+    <ReactFlowProvider>
+      <CanvasInner {...props} />
+    </ReactFlowProvider>
+  );
+}
