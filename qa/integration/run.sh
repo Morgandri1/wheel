@@ -43,9 +43,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "▸ building the stub engine image"
-docker build -q -t wheel-engine:stub -f infra/dev/Dockerfile.engine.stub . >/dev/null || {
-  echo "stub engine image build failed"; exit 1; }
+# SDK's real engine now exists, so the suite runs against wheel-engine:test — the same
+# image production uses, with only the harness swapped for the fakes. The stub proved the
+# API -> host -> engine chain before that landed and is now a fallback, not the default:
+# a suite that keeps testing the stub after the real engine ships is testing nothing.
+ENGINE_IMAGE="${ENGINE_IMAGE:-}"
+if [ -z "$ENGINE_IMAGE" ]; then
+  if docker image inspect wheel-engine:test >/dev/null 2>&1; then
+    ENGINE_IMAGE=wheel-engine:test
+  else
+    echo "wheel-engine:test not built — run 'make engine-image-test'"
+    exit 77
+  fi
+fi
+export ENGINE_IMAGE
+echo "▸ engine image: $ENGINE_IMAGE ($(docker image inspect "$ENGINE_IMAGE" --format '{{.Created}}' 2>/dev/null))"
+
+# The fake harness is the whole reason the suite is hermetic. If the image ever ships
+# without it we would silently be driving the REAL claude, which costs money and is
+# non-deterministic — so assert it rather than trust the tag.
+if ! docker run --rm --entrypoint sh "$ENGINE_IMAGE" -c 'claude --version 2>/dev/null | grep -qi "claude code"'; then
+  echo "$ENGINE_IMAGE has no usable claude on PATH"; exit 1
+fi
+if [ "$ENGINE_IMAGE" = "wheel-engine:test" ] && \
+   ! docker run --rm --entrypoint sh "$ENGINE_IMAGE" -c 'test -x /usr/local/bin/claude'; then
+  echo "wheel-engine:test does not shadow claude with the fake harness — refusing to run"
+  exit 1
+fi
 
 echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
 if ! docker compose -f "$COMPOSE" up -d --build; then
