@@ -1,43 +1,38 @@
 //! `wheel-host` — the sandbox supervisor (ARCHITECTURE §4b).
 //!
-//! Runs on the single engine machine. Owns every project's sandbox and is the only process that
-//! holds engine secrets at runtime. It has no public domain: the API reaches it over private
-//! networking with a bearer token, and that token is the only thing between anything that can
-//! reach this port and full control of every tenant's sandbox.
+//! Runs on the single engine machine, one instance only. Owns every project's sandbox and is the
+//! only process that holds engine secrets at runtime. It has no public domain: the API reaches it
+//! over private networking with a bearer secret, and nothing else may.
+//!
+//! The security posture is blunt on purpose. Anything that can reach this port can control every
+//! tenant's sandbox, so the bearer check is the first thing in the stack and applies to every
+//! route including the proxies.
 
 mod config;
+mod proxy;
 mod sandbox;
 mod store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, put};
 use axum::{Json, Router};
 use config::{Backend, Config};
-use sandbox::{Sandbox, Secrets, Status};
+use sandbox::{Sandbox, Secrets};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use store::Store;
 use uuid::Uuid;
 
 #[derive(Clone)]
-struct HostState(Arc<Inner>);
-
-struct Inner {
-    cfg: Config,
-    store: Store,
-    sandbox: Box<dyn Sandbox>,
-    http: reqwest::Client,
-}
-
-impl std::ops::Deref for HostState {
-    type Target = Inner;
-    fn deref(&self) -> &Inner {
-        &self.0
-    }
+pub(crate) struct HostState {
+    pub cfg: Config,
+    pub sandbox: Arc<dyn Sandbox>,
+    pub store: Arc<store::Store>,
+    pub http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -50,35 +45,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = Config::from_env()?;
+    let cfg = Config::from_env().context("configuration")?;
     tracing::info!(backend = ?cfg.backend, "wheel-host starting");
 
-    let sandbox: Box<dyn Sandbox> = match cfg.backend {
-        Backend::Docker => Box::new(sandbox::docker::DockerSandbox::connect(cfg.clone())?),
+    let sandbox: Arc<dyn Sandbox> = match cfg.backend {
+        Backend::Docker => Arc::new(sandbox::docker::DockerSandbox::connect(cfg.clone())?),
         Backend::Process => {
-            // M3. Failing loudly beats silently falling back to a weaker isolation model.
-            anyhow::bail!("SANDBOX_BACKEND=process is not implemented yet (M3)")
+            // M3. Failing loudly beats starting with a backend that silently does nothing.
+            anyhow::bail!("the process sandbox backend is not implemented yet (M3)")
         }
     };
 
-    let store = Store::open(&format!("{}/host.db", cfg.data_dir))?;
-    let state = HostState(Arc::new(Inner {
+    let store = Arc::new(store::Store::open(&format!("{}/host.db", cfg.data_dir))?);
+
+    let state = HostState {
         cfg: cfg.clone(),
-        store,
         sandbox,
+        store: store.clone(),
         http: reqwest::Client::new(),
-    }));
+    };
 
     reconcile_on_boot(&state).await;
 
     let app = Router::new()
         .route("/host/v1/healthz", get(healthz))
-        .route("/host/v1/projects/{id}", put(provision).get(status).delete(destroy))
+        .route("/host/v1/projects/{id}", put(put_project).get(get_project).delete(delete_project))
         .route("/host/v1/projects/{id}/start", axum::routing::post(start))
         .route("/host/v1/projects/{id}/stop", axum::routing::post(stop))
         .route("/host/v1/projects/{id}/restart", axum::routing::post(restart))
-        .route("/host/v1/projects/{id}/engine/{*rest}", any(proxy_engine))
-        .route("/host/v1/projects/{id}/ingress/{*rest}", any(proxy_ingress))
+        .route("/host/v1/projects/{id}/engine/{*rest}", any(proxy::engine))
+        .route("/host/v1/projects/{id}/ingress/{*rest}", any(proxy::ingress))
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_bearer))
         .with_state(state);
 
@@ -88,8 +84,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Restart whatever was running before we went down. The host is a single instance, so this store
-/// is the only record that a project is supposed to be up.
+/// Restart whatever was running before we went down.
+///
+/// The host is deliberately a single instance, so nothing else will notice that a project's engine
+/// died with us. Without this, a host restart silently stops every tenant's agents.
 async fn reconcile_on_boot(state: &HostState) {
     let wanted = match state.store.all_desired_running().await {
         Ok(w) => w,
@@ -101,25 +99,21 @@ async fn reconcile_on_boot(state: &HostState) {
     tracing::info!(count = wanted.len(), "reconciling projects that were running");
     for rec in wanted {
         let secrets = Secrets {
-            engine_secret: rec.engine_secret,
-            vault_key: rec.vault_key,
+            engine_secret: rec.engine_secret.clone(),
+            vault_key: rec.vault_key.clone(),
         };
         if let Err(e) = state.sandbox.start(&rec.id, &secrets).await {
             // One project failing to come back must not stop the others.
-            tracing::error!(project_id = %rec.id, error = ?e, "reconcile: start failed");
+            tracing::error!(project = %rec.id, error = ?e, "reconcile: start failed");
         }
     }
 }
 
-/// Bearer gate for every route.
+/// Bearer check, applied to every route.
 ///
-/// The comparison is constant-time: a byte-by-byte early exit would leak the secret one byte at a
-/// time to anything that can measure response latency, which on a private network is everything.
-async fn require_bearer(
-    State(state): State<HostState>,
-    req: Request,
-    next: axum::middleware::Next,
-) -> Response {
+/// Compared in constant time: a byte-by-byte early-exit comparison leaks the secret's prefix to
+/// anyone who can measure response timing across many attempts.
+async fn require_bearer(State(state): State<HostState>, req: Request, next: Next) -> Response {
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -128,8 +122,8 @@ async fn require_bearer(
         .unwrap_or("");
 
     if !constant_time_eq(presented.as_bytes(), state.cfg.secret.as_bytes()) {
-        tracing::warn!("host request rejected: bad or missing bearer");
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        tracing::warn!("rejected host request with bad or missing bearer");
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
     next.run(req).await
 }
@@ -138,197 +132,146 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
-        "sandbox_backend": match state.cfg.backend { Backend::Docker => "docker", Backend::Process => "process" },
+        "sandbox_backend": match state.cfg.backend {
+            Backend::Docker => "docker",
+            Backend::Process => "process",
+        },
     }))
 }
 
 #[derive(Deserialize)]
-struct ProvisionBody {
+struct PutProject {
     engine_secret: String,
     vault_key: String,
 }
 
-async fn provision(
+/// Create-or-update a project's sandbox record. Idempotent, per §4b.
+async fn put_project(
     State(state): State<HostState>,
     Path(id): Path<Uuid>,
-    Json(body): Json<ProvisionBody>,
-) -> Result<StatusCode, HostError> {
-    state
+    Json(body): Json<PutProject>,
+) -> Response {
+    if let Err(e) = state
         .store
         .upsert(&id, &body.engine_secret, &body.vault_key)
-        .await?;
+        .await
+    {
+        return internal(e, "storing project record");
+    }
     let secrets = Secrets {
         engine_secret: body.engine_secret,
         vault_key: body.vault_key,
     };
-    state.sandbox.provision(&id, &secrets).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn status(
-    State(state): State<HostState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, HostError> {
-    if state.store.get(&id).await?.is_none() {
-        return Err(HostError::NotFound);
-    }
-    let s = state.sandbox.status(&id).await?;
-    Ok(Json(json!({ "status": status_str(s) })))
-}
-
-fn status_str(s: Status) -> &'static str {
-    match s {
-        Status::Stopped => "stopped",
-        Status::Starting => "starting",
-        Status::Running => "running",
-        Status::Error => "error",
+    match state.sandbox.provision(&id, &secrets).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => internal(e, "provisioning sandbox"),
     }
 }
 
-async fn start(State(state): State<HostState>, Path(id): Path<Uuid>) -> Result<StatusCode, HostError> {
-    let rec = state.store.get(&id).await?.ok_or(HostError::NotFound)?;
+async fn get_project(State(state): State<HostState>, Path(id): Path<Uuid>) -> Response {
+    match state.store.get(&id).await {
+        Err(e) => internal(e, "reading project record"),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
+        Ok(Some(_)) => match state.sandbox.status(&id).await {
+            Ok(status) => (StatusCode::OK, Json(json!({ "status": status }))).into_response(),
+            Err(e) => {
+                tracing::warn!(project = %id, error = ?e, "status probe failed");
+                (
+                    StatusCode::OK,
+                    Json(json!({ "status": "error", "last_error": e.to_string() })),
+                )
+                    .into_response()
+            }
+        },
+    }
+}
+
+async fn start(State(state): State<HostState>, Path(id): Path<Uuid>) -> Response {
+    let Some(rec) = (match state.store.get(&id).await {
+        Ok(r) => r,
+        Err(e) => return internal(e, "reading project record"),
+    }) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response();
+    };
+
     let secrets = Secrets {
         engine_secret: rec.engine_secret,
         vault_key: rec.vault_key,
     };
-    state.sandbox.start(&id, &secrets).await?;
-    state.store.set_desired_running(&id, true).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn stop(State(state): State<HostState>, Path(id): Path<Uuid>) -> Result<StatusCode, HostError> {
-    state.store.get(&id).await?.ok_or(HostError::NotFound)?;
-    state.sandbox.stop(&id).await?;
-    state.store.set_desired_running(&id, false).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn restart(State(state): State<HostState>, Path(id): Path<Uuid>) -> Result<StatusCode, HostError> {
-    let rec = state.store.get(&id).await?.ok_or(HostError::NotFound)?;
-    let secrets = Secrets {
-        engine_secret: rec.engine_secret,
-        vault_key: rec.vault_key,
-    };
-    state.sandbox.restart(&id, &secrets).await?;
-    state.store.set_desired_running(&id, true).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn destroy(State(state): State<HostState>, Path(id): Path<Uuid>) -> Result<StatusCode, HostError> {
-    // Destroy the sandbox before forgetting it: a sandbox we have no record of is one nobody will
-    // ever clean up.
-    state.sandbox.destroy(&id).await?;
-    state.store.delete(&id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn proxy_engine(
-    State(state): State<HostState>,
-    Path((id, rest)): Path<(Uuid, String)>,
-    req: Request,
-) -> Result<Response, HostError> {
-    let rec = state.store.get(&id).await?.ok_or(HostError::NotFound)?;
-    let base = state.sandbox.engine_base(&id);
-    forward(&state, req, format!("{base}/v1/{rest}"), Some(&rec.engine_secret)).await
-}
-
-async fn proxy_ingress(
-    State(state): State<HostState>,
-    Path((id, rest)): Path<(Uuid, String)>,
-    req: Request,
-) -> Result<Response, HostError> {
-    let rec = state.store.get(&id).await?.ok_or(HostError::NotFound)?;
-    let base = state.sandbox.engine_base(&id);
-    forward(&state, req, format!("{base}/ingress/{rest}"), Some(&rec.engine_secret)).await
-}
-
-/// Forward to a project's engine, attaching that project's engine secret.
-///
-/// Each project has its own secret, so a bug that sent project A's request to project B's engine
-/// would fail authentication rather than silently cross a tenant boundary.
-async fn forward(
-    state: &HostState,
-    req: Request,
-    upstream: String,
-    bearer: Option<&str>,
-) -> Result<Response, HostError> {
-    let method = req.method().clone();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let mut headers = req.headers().clone();
-    // The API's own credential must not be relayed into a tenant's engine.
-    headers.remove(axum::http::header::AUTHORIZATION);
-    headers.remove(axum::http::header::HOST);
-    headers.remove(axum::http::header::CONTENT_LENGTH);
-
-    let body = axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024)
-        .await
-        .map_err(|_| HostError::TooLarge)?;
-
-    let mut rb = state.http.request(method, format!("{upstream}{query}")).headers(headers).body(body);
-    if let Some(b) = bearer {
-        rb = rb.bearer_auth(b);
-    }
-
-    let resp = rb.send().await.map_err(|e| {
-        tracing::warn!(error = ?e, "engine request failed");
-        HostError::BadGateway
-    })?;
-
-    let status = resp.status();
-    let mut builder = Response::builder().status(status);
-    for (k, v) in resp.headers().iter() {
-        if k == axum::http::header::TRANSFER_ENCODING || k == axum::http::header::CONTENT_LENGTH {
-            continue;
+    match state.sandbox.start(&id, &secrets).await {
+        Ok(()) => {
+            // Record intent only after the sandbox is actually up, so a failed start does not make
+            // us try to resurrect a broken project on every future boot.
+            if let Err(e) = state.store.set_desired_running(&id, true).await {
+                tracing::error!(project = %id, error = ?e, "could not persist desired state");
+            }
+            (StatusCode::OK, Json(json!({"status": "running"}))).into_response()
         }
-        builder = builder.header(k, v);
-    }
-    builder
-        .body(axum::body::Body::from_stream(resp.bytes_stream()))
-        .map_err(|_| HostError::Internal)
-}
-
-enum HostError {
-    NotFound,
-    BadGateway,
-    TooLarge,
-    Internal,
-}
-
-impl From<anyhow::Error> for HostError {
-    fn from(e: anyhow::Error) -> Self {
-        tracing::error!(error = ?e, "host operation failed");
-        HostError::Internal
+        Err(e) => {
+            tracing::warn!(project = %id, error = ?e, "start failed");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"status": "error", "last_error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
-impl IntoResponse for HostError {
-    fn into_response(self) -> Response {
-        let (code, msg) = match self {
-            HostError::NotFound => (StatusCode::NOT_FOUND, "not found"),
-            HostError::BadGateway => (StatusCode::BAD_GATEWAY, "engine unreachable"),
-            HostError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
-            HostError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-        };
-        (code, msg).into_response()
+async fn stop(State(state): State<HostState>, Path(id): Path<Uuid>) -> Response {
+    if let Err(e) = state.store.set_desired_running(&id, false).await {
+        return internal(e, "persisting desired state");
+    }
+    match state.sandbox.stop(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "stopped"}))).into_response(),
+        Err(e) => internal(e, "stopping sandbox"),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::constant_time_eq;
-
-    #[test]
-    fn constant_time_eq_behaves_like_eq() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(!constant_time_eq(b"", b"x"));
-        assert!(constant_time_eq(b"", b""));
+async fn restart(State(state): State<HostState>, Path(id): Path<Uuid>) -> Response {
+    let Some(rec) = (match state.store.get(&id).await {
+        Ok(r) => r,
+        Err(e) => return internal(e, "reading project record"),
+    }) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response();
+    };
+    let secrets = Secrets {
+        engine_secret: rec.engine_secret,
+        vault_key: rec.vault_key,
+    };
+    match state.sandbox.restart(&id, &secrets).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "running"}))).into_response(),
+        Err(e) => internal(e, "restarting sandbox"),
     }
+}
+
+async fn delete_project(State(state): State<HostState>, Path(id): Path<Uuid>) -> Response {
+    // Destroy the runtime first: a sandbox whose record we already deleted is one nothing will
+    // ever clean up.
+    if let Err(e) = state.sandbox.destroy(&id).await {
+        return internal(e, "destroying sandbox");
+    }
+    match state.store.delete(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e, "deleting project record"),
+    }
+}
+
+fn internal(e: anyhow::Error, what: &str) -> Response {
+    tracing::error!(error = ?e, "{what} failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "internal"})),
+    )
+        .into_response()
 }
