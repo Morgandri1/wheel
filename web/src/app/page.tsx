@@ -256,51 +256,15 @@ export default function Landing() {
           <p className="note">
             There are no seats and no token markup. Agents sign in with your own Claude and Codex
             plans, so the model does its thinking on the subscription you already pay for. Wheel
-            bills exactly what your swarm uses inside the cluster — compute, network and disk — and
-            a parked agent uses none of the three.
+            bills only what your swarm actually uses inside the cluster — compute, network and
+            disk — and a parked agent uses none of the three.
           </p>
           <div className="byo">
             <span className="tag tag-outline">Your Claude plan</span>
             <span className="tag tag-outline">Your Codex plan</span>
             <span className="tag tag-outline">No token markup</span>
           </div>
-          <div className="meter">
-            <p className="meter-head">
-              <span>Example month — 4-agent swarm</span>
-              <span className="meter-amt">$11.83</span>
-            </p>
-            <div className="meter-track">
-              <div className="meter-fill" />
-            </div>
-            <table className="table meter-lines">
-              <tbody>
-                <tr>
-                  <td>Compute</td>
-                  <td>1,142 min</td>
-                  <td className="ml-amt">$11.42</td>
-                </tr>
-                <tr>
-                  <td>Network</td>
-                  <td>3.1 GB</td>
-                  <td className="ml-amt">$0.31</td>
-                </tr>
-                <tr>
-                  <td>Disk</td>
-                  <td>2 GB·mo</td>
-                  <td className="ml-amt">$0.10</td>
-                </tr>
-                <tr>
-                  <td>Model tokens</td>
-                  <td>your plan</td>
-                  <td className="ml-amt">$0</td>
-                </tr>
-              </tbody>
-            </table>
-            <p className="meter-note">
-              The other 42,058 minutes of the month: parked, free. Figures are a worked example, not
-              a quote.
-            </p>
-          </div>
+          <p className="note">Rates are not set yet. They will be published here before anyone is charged.</p>
         </section>
       </div>
 

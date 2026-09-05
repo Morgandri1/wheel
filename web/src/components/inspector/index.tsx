@@ -9,6 +9,10 @@ import { CtxPanel } from "@/components/inspector/ctx-panel";
 import { EndpointPanel } from "@/components/inspector/endpoint-panel";
 import { TablePanel } from "@/components/inspector/table-panel";
 import { ToolPanel } from "@/components/inspector/tool-panel";
+import { ScriptPanel } from "@/components/inspector/script-panel";
+import { McpPanel } from "@/components/inspector/mcp-panel";
+import { VaultPanel } from "@/components/inspector/vault-panel";
+import { ChestPanel } from "@/components/inspector/chest-panel";
 import { useBoardStore } from "@/store/board";
 import type { EngineApi } from "@/lib/api";
 import type { AgentNode, Project, WheelNode } from "@/lib/schema";
@@ -79,11 +83,14 @@ export function Inspector({
             projectId={projectId}
             onChanged={onChanged}
           />
+        ) : node.type === "script" ? (
+          <ScriptPanel node={node} api={api} onChanged={onChanged} />
+        ) : node.type === "mcp" ? (
+          <McpPanel node={node} api={api} onChanged={onChanged} />
+        ) : node.type === "vault" ? (
+          <VaultPanel node={node} api={api} onChanged={onChanged} />
         ) : (
-          <p className="text-meta text-ink-dim">
-            {meta.blurb} The editor for {meta.label.toLowerCase()} nodes lands next — the node,
-            its wires and its position already work.
-          </p>
+          <ChestPanel node={node} api={api} projectId={projectId} />
         )}
       </div>
     </aside>
