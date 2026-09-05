@@ -3,17 +3,15 @@
 /**
  * One WebSocket per open board, to the API's proxy of the engine event stream.
  *
- * Browsers cannot set headers on a WebSocket handshake, and the Clerk token must never appear in
- * a URL. So it travels as a WebSocket subprotocol (a request header, not a query string):
- *   Sec-WebSocket-Protocol: wheel.v1, wheel.token.<jwt>
- * Flagged to PM as an open question for API — if they prefer a short-lived ticket endpoint,
- * only connect() changes.
+ * Browsers cannot set headers on a WebSocket handshake, and the session JWT must never appear
+ * in a URL. §5 answers both: mint a single-use ticket bound to (user, project) that expires in
+ * 30 seconds, and put that in the query string instead. A fresh ticket is minted per attempt,
+ * so a reconnect after a long backoff never replays a stale one.
  *
  * Frames are buffered and flushed once per animation frame, so a chatty agent cannot drive one
  * React commit per log line.
  */
-import { getAuthToken } from "@/lib/auth";
-import { API_URL } from "@/lib/api";
+import { API_URL, projects } from "@/lib/api";
 import type { EngineEvent } from "@/lib/schema";
 
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
@@ -49,26 +47,31 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
     if (frame === null) frame = requestAnimationFrame(flush);
   };
 
-  const wsUrl = () => {
+  const wsUrl = (ticket: string) => {
     const base = API_URL.replace(/^http/, "ws");
-    return `${base}/v1/projects/${projectId}/engine/v1/events`;
+    return `${base}/v1/projects/${projectId}/engine/v1/events?ticket=${encodeURIComponent(ticket)}`;
   };
 
   const open = async () => {
     if (closed) return;
     handlers.onStatus(attempt === 0 ? "connecting" : "reconnecting");
 
-    let token: string;
+    let ticket: string;
     try {
-      token = await getAuthToken();
-    } catch {
-      handlers.onStatus("closed");
+      ({ ticket } = await projects.wsTicket(projectId));
+    } catch (e) {
+      // An expired session is terminal; anything else is worth another attempt.
+      if ((e as { status?: number })?.status === 401) {
+        handlers.onStatus("closed");
+        return;
+      }
+      scheduleRetry();
       return;
     }
     if (closed) return;
 
     try {
-      ws = new WebSocket(wsUrl(), ["wheel.v1", `wheel.token.${token}`]);
+      ws = new WebSocket(wsUrl(ticket));
     } catch {
       scheduleRetry();
       return;

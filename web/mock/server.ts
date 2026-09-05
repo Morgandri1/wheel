@@ -385,6 +385,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       return noContent(res);
     }
 
+    if (rest === "/ws-ticket" && method === "POST") {
+      return json(res, 200, { ticket: mintTicket(id), expires_in: 30 });
+    }
+
     const lifecycle = /^\/(start|stop|restart)$/.exec(rest);
     if (lifecycle && method === "POST") {
       const action = lifecycle[1]!;
@@ -447,6 +451,26 @@ const server = createServer((req, res) => {
 
 // ── events websocket ────────────────────────────────────────────────────────
 
+/**
+ * §5 ws-ticket: single-use, bound to one project, 30 s. Held in memory because that is exactly
+ * what the real API can do too — a ticket outliving one handshake would defeat the point.
+ */
+const tickets = new Map<string, { projectId: string; expires: number }>();
+
+function mintTicket(projectId: string): string {
+  const ticket = randomUUID();
+  tickets.set(ticket, { projectId, expires: Date.now() + 30_000 });
+  return ticket;
+}
+
+function redeemTicket(ticket: string | null, projectId: string): boolean {
+  if (!ticket) return false;
+  const found = tickets.get(ticket);
+  tickets.delete(ticket);
+  return Boolean(found) && found!.projectId === projectId && found!.expires > Date.now();
+}
+
+
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
@@ -454,21 +478,14 @@ server.on("upgrade", (req, socket, head) => {
   const match = /^\/v1\/projects\/([^/]+)\/engine\/v1\/events$/.exec(url.pathname);
   const record = match ? projects.get(match[1]!) : undefined;
 
-  // The token rides as a subprotocol — never a query string.
-  const protocols = String(req.headers["sec-websocket-protocol"] ?? "")
-    .split(",")
-    .map((p) => p.trim());
-  const authorised = protocols.some((p) => p.startsWith("bearer."));
+  const authorised = match ? redeemTicket(url.searchParams.get("ticket"), match[1]!) : false;
 
   if (!record || !authorised) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     return socket.destroy();
   }
 
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    ws.protocol; // negotiated below via the handleUpgrade response
-    attach(ws, record);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => attach(ws, record));
 });
 
 function attach(ws: WebSocket, record: ProjectRecord) {

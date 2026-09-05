@@ -95,6 +95,17 @@ export const projects = {
   stop: (id: string) => request<Project>(`/v1/projects/${id}/stop`, { method: "POST", projectId: id }),
   restart: (id: string) =>
     request<Project>(`/v1/projects/${id}/restart`, { method: "POST", projectId: id }),
+
+  /**
+   * §5: a browser cannot set headers on a WebSocket handshake, and the session JWT must never
+   * ride in a URL. The API mints a single-use ticket bound to (user, project) instead; it is
+   * the only credential that ever appears in a query string, and it expires in 30 seconds.
+   */
+  wsTicket: (id: string) =>
+    request<{ ticket: string; expires_in: number }>(`/v1/projects/${id}/ws-ticket`, {
+      method: "POST",
+      projectId: id,
+    }),
 };
 
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
