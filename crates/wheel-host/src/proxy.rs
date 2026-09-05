@@ -497,3 +497,94 @@ async fn forward_over_socket(
         )
     })
 }
+
+#[cfg(test)]
+mod upgrade_detection_tests {
+    use super::is_websocket_upgrade;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        m
+    }
+
+    /// Getting this wrong is silent in both directions: miss an upgrade and the events socket is
+    /// answered as a normal request that never streams; see one where there is none and an
+    /// ordinary call is hijacked into a handshake.
+    #[test]
+    fn a_real_handshake_is_recognised() {
+        assert!(is_websocket_upgrade(&headers(&[
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+        ])));
+    }
+
+    #[test]
+    fn header_casing_and_token_lists_are_tolerated() {
+        // Browsers and proxies send these in whatever case and order they like; RFC 9110 makes
+        // both case-insensitive, and `Connection` is a comma-separated list.
+        for (upgrade, connection) in [
+            ("WebSocket", "upgrade"),
+            ("WEBSOCKET", "UPGRADE"),
+            ("websocket", "keep-alive, Upgrade"),
+            ("websocket", "Upgrade, keep-alive"),
+            ("websocket", "  upgrade  "),
+        ] {
+            assert!(
+                is_websocket_upgrade(&headers(&[
+                    ("upgrade", upgrade),
+                    ("connection", connection)
+                ])),
+                "missed a valid handshake: upgrade={upgrade:?} connection={connection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn half_a_handshake_is_not_a_handshake() {
+        // Either header alone is an ordinary request. Treating it as an upgrade would hijack it.
+        assert!(!is_websocket_upgrade(&headers(&[("upgrade", "websocket")])));
+        assert!(!is_websocket_upgrade(&headers(&[(
+            "connection",
+            "Upgrade"
+        )])));
+        assert!(!is_websocket_upgrade(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_different_protocol_is_not_a_websocket() {
+        // `Upgrade: h2c` is a real header that is not this.
+        assert!(!is_websocket_upgrade(&headers(&[
+            ("upgrade", "h2c"),
+            ("connection", "Upgrade"),
+        ])));
+        assert!(!is_websocket_upgrade(&headers(&[
+            ("upgrade", "websocket"),
+            ("connection", "close"),
+        ])));
+    }
+
+    #[test]
+    fn a_substring_is_not_a_token() {
+        // "upgraded" contains "upgrade"; splitting on commas and trimming is what stops a
+        // substring match from counting as the token.
+        assert!(!is_websocket_upgrade(&headers(&[
+            ("upgrade", "websocket"),
+            ("connection", "upgraded"),
+        ])));
+    }
+
+    #[test]
+    fn non_utf8_headers_do_not_panic() {
+        let mut m = HeaderMap::new();
+        m.append("upgrade", HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
+        m.append("connection", HeaderValue::from_static("Upgrade"));
+        assert!(!is_websocket_upgrade(&m));
+    }
+}

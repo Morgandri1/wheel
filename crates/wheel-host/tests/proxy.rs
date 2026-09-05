@@ -358,3 +358,83 @@ async fn a_websocket_to_an_unknown_project_is_refused() {
         .await
         .is_err());
 }
+
+/// Every frame type has to survive the bridge, not just text.
+///
+/// Binary matters because the engine may stream non-JSON payloads. Ping/pong matter more than they
+/// look: the events socket is long-lived, and a bridge that swallows keepalives lets an idle
+/// connection be reaped by an intermediary — which presents as "the board stopped updating" long
+/// after the cause, and is close to undebuggable from the UI side.
+#[tokio::test]
+async fn binary_frames_cross_the_bridge_unchanged() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let engine = mock_engine_ws().await;
+    let (base, id) = serve_host(&engine).await;
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+    let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .expect("bridge should open");
+
+    // Deliberately includes bytes that are not valid UTF-8, so anything treating this as text
+    // would corrupt or reject it.
+    let payload: Vec<u8> = vec![0x00, 0xff, 0xfe, 0x01, 0x7f, 0x80];
+    socket
+        .send(Message::Binary(payload.clone().into()))
+        .await
+        .unwrap();
+
+    let echoed = socket.next().await.expect("a reply").expect("no error");
+    match echoed {
+        Message::Binary(b) => assert_eq!(b.to_vec(), payload, "binary payload was altered"),
+        other => panic!("expected a binary frame back, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_close_from_the_client_ends_the_bridge() {
+    // Half-open connections are a slow leak: the host holds a socket to the engine for a client
+    // that has gone. Closing one side has to tear down the other.
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let engine = mock_engine_ws().await;
+    let (base, id) = serve_host(&engine).await;
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+    let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .expect("bridge should open");
+
+    socket.send(Message::Close(None)).await.unwrap();
+
+    // The stream ends rather than hanging. A timeout here would mean the bridge kept the
+    // connection alive after the client asked to close it.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(msg) = socket.next().await {
+            if matches!(msg, Ok(Message::Close(_)) | Err(_)) {
+                return true;
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the bridge did not end after the client closed"
+    );
+}
+
+#[tokio::test]
+async fn a_websocket_without_the_bearer_is_refused() {
+    let engine = mock_engine_ws().await;
+    let (base, id) = serve_host(&engine).await;
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+
+    assert!(
+        tokio_tungstenite::connect_async(ws_request(&url, "wrong-secret"))
+            .await
+            .is_err(),
+        "the bearer gate does not apply to the websocket route"
+    );
+}
