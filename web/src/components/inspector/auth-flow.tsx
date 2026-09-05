@@ -70,7 +70,7 @@ export function AuthFlow({
       setReplacing(false);
       setJustSaved(true);
       if (next.authenticated) {
-        toast("Credentials saved. Start the agent to pick up any queued messages.");
+        toast("Credentials saved. Anything queued for this agent will be delivered.");
         onAuthenticated();
       }
       await status.refetch();
@@ -112,8 +112,7 @@ export function AuthFlow({
           style={{ color: "var(--danger)" }}
         >
           This agent has no usable credentials, so it stopped at startup. Nothing sent to it was
-          lost — messages stay queued and are delivered once a credential is saved and the agent
-          is restarted.
+          lost — anything queued stays queued and is delivered once a credential is saved.
         </p>
       ) : null}
 

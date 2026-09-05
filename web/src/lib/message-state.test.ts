@@ -140,3 +140,50 @@ describe("naming a sender", () => {
     expect(senderKind({ kind: "system" })).toBe("system");
   });
 });
+
+describe("a queue that cannot drain says why", () => {
+  const queued = (id: string, from: "user" | "node" = "user"): Message => ({
+    id,
+    from: from === "user" ? { kind: "user" } : { kind: "node", name: "peer", type: "agent" },
+    to: "agent-1",
+    body: "hi",
+    sha256: "x",
+    bytes: 2,
+    state: "queued",
+    created_at: `2026-09-05T10:0${id}:00Z`,
+    last_error: null,
+  } as unknown as Message);
+
+  it.each([
+    ["needs_auth", /credentials/i],
+    ["stopped", /started/i],
+    ["budget_exhausted", /budget/i],
+    ["error", /recovers/i],
+  ] as const)("names %s as the blocker rather than promising delivery", (status, pattern) => {
+    const messages = [queued("1")];
+    const d = displayState(messages[0]!, messages, "agent-1", status);
+    expect(d.state).toBe("queued");
+    // Never "goes in as soon as the current turn finishes" — there is no turn coming.
+    expect(d.detail).not.toMatch(/as soon as/i);
+    expect(d.detail).toMatch(pattern);
+  });
+
+  it("still says a message is safe, because SDK stopped eating them", () => {
+    const messages = [queued("1")];
+    expect(displayState(messages[0]!, messages, "agent-1", "needs_auth").detail).toMatch(/nothing is lost/i);
+  });
+
+  it("counts how many are ahead even while blocked", () => {
+    const messages = [queued("1"), queued("2")];
+    const d = displayState(messages[1]!, messages, "agent-1", "needs_auth");
+    expect(d.detail).toMatch(/1 ahead/);
+  });
+
+  it.each(["running", "idle", "starting", "parked"] as const)(
+    "keeps the ordinary wording when the agent is %s",
+    (status) => {
+      const messages = [queued("1")];
+      expect(displayState(messages[0]!, messages, "agent-1", status).label).toBe("Queued (next)");
+    },
+  );
+});
