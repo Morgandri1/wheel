@@ -17,6 +17,7 @@ mod events;
 mod harness;
 mod supervisor;
 
+use anyhow::Context;
 use config::Config;
 use wheel_core::ListenAddr;
 
@@ -89,9 +90,25 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
+                // 0700: the directory is the first line of the tenant boundary,
+                // and every project's socket dir sits on one shared kernel.
+                std::fs::set_permissions(
+                    parent,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )?;
             }
             let listener = tokio::net::UnixListener::bind(&path)?;
-            tracing::info!(path = %path.display(), "listening");
+
+            // Set the mode EXPLICITLY rather than inheriting it from the
+            // umask. Connecting to a unix socket requires the write bit, so a
+            // permissive umask would silently publish this engine's control
+            // plane to every uid on the machine — and in process mode all of a
+            // host's tenants share one kernel. Observed 0755 here by umask
+            // accident; that must not be what we depend on.
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .context("restricting the engine socket to its own uid")?;
+
+            tracing::info!(path = %path.display(), mode = "0600", "listening");
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
