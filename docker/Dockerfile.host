@@ -63,7 +63,9 @@ ENV WHEEL_ROLE=engine \
     WHEEL_LOG=json
 EXPOSE 7000
 
-USER agent
+# The image starts as root: the host role must setuid per project (§4b) and the
+# entrypoint drops the engine role to the unprivileged `agent` uid via setpriv.
+USER root
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:7000/healthz || exit 1
