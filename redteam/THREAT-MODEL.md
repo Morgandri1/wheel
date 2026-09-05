@@ -97,9 +97,33 @@ prod. Design axiom: **every layer is hostile to every other layer.**
   fill (dup keys, case variants, JSON-pointer collision); vault value echoed in response/log/curl;
   malicious spec DoS at import (YAML bomb, $ref loop, multi-MB body).
 
+### TB9 capability delegation — `place` / `grant` / `manage` (new; board-as-code, operator/local runtime)  [impact H · likelihood H → P0]
+New surface: an actor can `place` nodes and `grant` wires to other agents, `manage` (update/remove)
+them, drive a board from a laptop (operator mode) or run `runtime:"local"` agents with their own login,
+and export/import a whole board as `wheel.toml`. Delegation of capability is a classic escalation vector.
+- **Attenuation break:** a granted wire must be *no stronger than the grantor's own* wire to that node.
+  Attacks: agent with `read` on a vault/table grants itself or a confederate `write`/`send`; grant a
+  wire the grantor doesn't hold at all; chain grants (A→B→C) to launder a capability past the attenuation
+  check; type-confusion (grant `send` where only `read` is legal per the 9×9×3 matrix).
+- **Authorization of grant/manage itself:** who may `grant`/`place`/`manage`? If any agent can, a
+  prompt-injected agent rewrites the board (add an endpoint→script→vault exfil path, place a tool node
+  with attacker base_url, wire itself to another agent's inbox). Contract says update/remove are
+  **owner-only** — must be enforced server-side, not just UI-gated, and `place`/`grant` need the same.
+- **board-as-code import (`wheel.toml`):** an imported template is attacker-controlled data — it must go
+  through the SAME validation as API node/wire creation (wire matrix, name regex, SSRF on tool base_url,
+  vault refs, no privilege the importer lacks). A template that declares wires the importer can't create
+  must be rejected, not silently trusted. Malicious template DoS (huge/loopy toml) like the spec parser.
+- **Operator mode & `runtime:"local"`:** commands from a laptop via API, and local agents with their own
+  login, widen the auth surface — a local agent's token scope and a stolen/misused operator session must
+  not exceed the same wire/owner checks; local runtime must not bypass the engine's server-side gating.
+- **Budget stop:** a spend/stop control is a new DoS/abuse lever — can an agent evade its own budget
+  stop, or trip another project's? Must be enforced by the engine/host, not the agent.
+Owner: SDK/Engine (grant/place/manage enforcement, toml import validation) + API (operator-mode auth,
+export/import routes, mail relay) — per PM's M3 scoping.
+
 ## 4. Priority ranking (impact × likelihood)
 P0: TB1 (JWT/tenancy), TB2 (proxy/ingress), TB4 (wire/token), TB5 (envelope + bypassPermissions),
-    TB7 (process-backend isolation, once it exists), TB8 (tool SSRF).
+    TB7 (process-backend isolation, once it exists), TB8 (tool SSRF), TB9 (capability delegation: grant/place attenuation).
 P1: TB3 (secret custody), TB6 (docker hardening).
 P2: Web polish (clickjacking, CORS niceties), log-injection cosmetics.
 
@@ -111,3 +135,5 @@ P2: Web polish (clickjacking, CORS niceties), log-injection cosmetics.
 5. Vault values never appear in board state, logs, curl output, or tool responses.
 6. Every SSRF-capable egress (tool base_url, redirects, mcp.url, script net) resolves to a public IP only.
 7. In process backend, one tenant's uid can touch nothing of another tenant's (fs, socket, /proc, net).
+8. A granted wire is never stronger than the grantor's own wire; place/grant/manage are
+   owner-authorized server-side; imported `wheel.toml` passes the same validation as API creation.
