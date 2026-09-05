@@ -1,59 +1,52 @@
-"""Shared red-team PoC harness. Stdlib only (no pip). Skips cleanly with no stack.
+"""Shared PoC harness. Stdlib only (no deps assumed on the host).
 
-A probe convention: define run(h) that returns None on 'resisted' or a str finding on 'broken'.
-Call finish(run) at module bottom. PASS = resisted; FAIL = live finding (exit 1).
+Rules of engagement enforced here: probes talk ONLY to the local stack named by WHEEL_STACK
+(the API base URL) and WHEEL_HOST (the host base URL). If unset, skip() so probes never hit a
+remote target. Redirects are never auto-followed (SSRF probes must inspect each hop).
 """
-import os, sys, json, base64, hmac, hashlib, urllib.request, urllib.error
+import base64, hashlib, hmac, json, os, sys, time, urllib.request, urllib.error
 
-API = os.environ.get("WHEEL_STACK")        # e.g. http://localhost:8080
-HOST = os.environ.get("WHEEL_HOST")         # host API base, if exposed in dev
-SKIP = 77                                   # exit code = skipped (no stack)
+def stack() -> str | None:
+    return os.environ.get("WHEEL_STACK")
 
-def have_stack():
-    return bool(API)
+def skip_if_no_stack(name: str) -> bool:
+    if not stack():
+        print(f"PENDING-STACK: {name} (set WHEEL_STACK to a local dev API to run)")
+        return True
+    return False
 
-def _b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
-def jwt(header, payload, secret=b"", raw_sig=None):
-    """Mint a JWT for attack variants: alg=none, HS256-with-pubkey confusion, wrong iss, exp/nbf."""
+def jwt(header: dict, payload: dict, secret: bytes = b"", *, sig: bytes | None = None) -> str:
+    """Build a JWT. Used to mint ATTACK variants (alg=none, HS256-with-public-key, bad iss/exp).
+    Never used to forge a real Clerk token against anything but the local stack."""
     h = _b64u(json.dumps(header, separators=(",", ":")).encode())
     p = _b64u(json.dumps(payload, separators=(",", ":")).encode())
     signing_input = f"{h}.{p}".encode()
-    if raw_sig is not None:
-        sig = raw_sig
+    if sig is not None:
+        s = sig
     elif header.get("alg") == "none":
-        sig = ""
-    elif header.get("alg") == "HS256":
-        sig = _b64u(hmac.new(secret, signing_input, hashlib.sha256).digest())
+        return f"{h}.{p}."
     else:
-        sig = ""
-    return f"{h}.{p}.{sig}"
+        s = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64u(s)}"
 
-def req(method, path, token=None, project=None, headers=None, body=None, base=None, follow=False):
-    """HTTP with redirect-follow OFF by default (so we can inspect 3xx). Returns (status, headers, body)."""
-    url = (base or API).rstrip("/") + path
-    hdrs = dict(headers or {})
-    if token is not None:  hdrs["x-auth-token"] = token
-    if project is not None: hdrs["x-project-id"] = project
-    data = body.encode() if isinstance(body, str) else body
-    r = urllib.request.Request(url, data=data, method=method, headers=hdrs)
-    opener = urllib.request.build_opener() if follow else urllib.request.build_opener(_NoRedirect)
+def request(method: str, path: str, *, headers: dict | None = None, body: bytes | None = None,
+            follow_redirects: bool = False):
+    """Return (status, headers, body_bytes). Does NOT raise on 4xx/5xx. No redirect-follow by default."""
+    url = stack().rstrip("/") + path
+    req = urllib.request.Request(url, method=method, data=body, headers=headers or {})
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener() if follow_redirects else urllib.request.build_opener(_NoRedirect)
     try:
-        resp = opener.open(r, timeout=10)
-        return resp.status, dict(resp.headers), resp.read()
+        r = opener.open(req, timeout=10)
+        return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k): return None
-
-def finish(run):
-    if not have_stack():
-        print("SKIP (PENDING-STACK): set WHEEL_STACK to the local API base to run"); sys.exit(SKIP)
-    try:
-        finding = run(sys.modules["__main__"])
-    except Exception as e:
-        print(f"ERROR: probe crashed: {e!r}"); sys.exit(2)
-    if finding:
-        print(f"FAIL: {finding}"); sys.exit(1)
-    print("PASS: resisted"); sys.exit(0)
+def result(passed: bool, msg: str) -> int:
+    print(("PASS: resisted — " if passed else "FAIL: FINDING — ") + msg)
+    return 0 if passed else 1
