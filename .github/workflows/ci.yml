@@ -7,7 +7,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Keyed by SHA on main, by ref elsewhere. cancel-in-progress alone was not enough:
+  # a concurrency group holds at most ONE running plus ONE pending run, and a newly
+  # queued run evicts the pending one regardless of that flag. With a per-ref group,
+  # main could therefore never produce more than one verdict per burst of merges —
+  # eight consecutive main runs came back "cancelled" and main was unverified.
+  # Per-SHA groups let main runs proceed in parallel so every merge gets its own
+  # verdict. Branches and PRs keep per-ref cancellation, where only the latest matters.
+  group: ci-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   # Never cancel a run on main. Merges land every few minutes, and cancel-in-progress
   # meant each one killed the previous run's verdict — eight consecutive "cancelled"
   # results and no completed check on main for over half an hour. A cancelled run is
