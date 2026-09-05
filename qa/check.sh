@@ -156,6 +156,12 @@ step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
 # WHEEL_ENGINE_URL is set, for 404-vs-405).
 step "qa:route-parity" "$PY" qa/contract/route_parity.py
 
+# The plan is the contract and the suites are the evidence; when they drift, both keep
+# looking healthy — a suite reports `ok SEC-vault-env-scope` under a name the plan has
+# never heard of, so the criterion cannot be traced, reported on, or reviewed. One
+# direction only: a planned ID with no test yet is normal (half the plan is M2/M3).
+step "qa:id-traceability" "$PY" qa/contract/id_traceability.py
+
 # A broken workflow file means CI never runs, which reads as "no red" not "no verdict".
 step "qa:ci-lint"      "$PY" qa/contract/ci_workflow_lint.py
 

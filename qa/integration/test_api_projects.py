@@ -6,7 +6,7 @@ public internet and a tenant's container.
 """
 import json, uuid
 import pytest
-from wheel_client import call, mint, new_project, api_up
+from wheel_client import call, session_for, sub_of, new_project, api_up
 
 pytestmark = pytest.mark.skipif(not api_up(), reason="API not running — `make test-int` brings the stack up")
 
@@ -15,7 +15,7 @@ ALICE = "user_alice_projects"
 
 @pytest.fixture(scope="module")
 def alice():
-    return mint(ALICE)
+    return session_for(ALICE)
 
 
 @pytest.fixture(scope="module")
@@ -27,7 +27,7 @@ def test_create_list_get(alice):
     """API-project-crud"""
     p = new_project(alice, "qa-crud")
     assert p["name"] == "qa-crud"
-    assert p["owner_id"] == ALICE, "owner_id must be the JWT sub"
+    assert p["owner_id"] == sub_of(alice), "owner_id must be the JWT sub"
 
     listed = call("GET", "/v1/projects", token=alice)
     assert listed.status == 200
@@ -52,11 +52,22 @@ def test_project_shape(project):
 
 def test_list_is_scoped_to_owner(alice):
     """API-auth-owner-404 · S1 — one tenant must never see another's projects."""
-    new_project(alice, "qa-alice-private")
-    others = call("GET", "/v1/projects", token=mint("user_stranger"))
+    mine = new_project(alice, "qa-alice-private")
+    stranger = session_for("user_stranger")
+    others = call("GET", "/v1/projects", token=stranger)
     assert others.status == 200
-    assert all(p["owner_id"] == "user_stranger" for p in others.json), \
-        "another user's projects appear in this user's list"
+    # Asserted by ID, not by owner_id string: under AUTH_MODE=local the subject is a uuid
+    # the provider chose, not the name this harness asked for, so comparing to a literal
+    # tests the harness's spelling rather than the tenant boundary.
+    assert mine["id"] not in [p["id"] for p in others.json], \
+        "another user's project appears in this user's list"
+    assert all(p["owner_id"] != alice_owner(alice) for p in others.json), \
+        "a project owned by alice is listed for the stranger"
+
+
+def alice_owner(token):
+    got = call("GET", "/v1/projects", token=token)
+    return got.json[0]["owner_id"] if got.json else None
 
 
 def test_unknown_project_is_404(alice):

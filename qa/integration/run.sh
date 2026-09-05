@@ -92,6 +92,17 @@ else
   # "network wheel declared as external, but could not be found" while every laptop passed:
   # our laptops had the network left over. Creating it is setup, not product behaviour.
   docker network create wheel >/dev/null 2>&1 || true
+  # infra/docker-compose.yml still defaults ENGINE_IMAGE to `wheel-engine:stub`, a
+  # placeholder from before SDK's image existed ("until their build lands"). It landed, and
+  # nothing updated the default, so every project start 500s with "No such image". Pin the
+  # image the suite actually verified rather than inheriting a default — the suite should
+  # not depend on someone else's placeholder either way.
+  export ENGINE_IMAGE="${ENGINE_IMAGE:-wheel-engine:test}"
+  # infra/docker-compose.yml defaults ENGINE_IMAGE to wheel-engine:stub, and nothing in the
+  # Makefile builds that tag — so every project start 500s with "No such image" on a clean
+  # machine. The integration suite already requires the real wheel-engine:test, so point the
+  # host at it rather than at an image only some laptops happen to have.
+  export ENGINE_IMAGE="${ENGINE_IMAGE:-wheel-engine:test}"
   docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1 || true
   if ! docker compose -f "$COMPOSE" up -d --build; then
     echo "  compose up failed — retrying once in 20s in case another run was mid-flight"

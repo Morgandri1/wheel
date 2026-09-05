@@ -13,7 +13,7 @@ client that helpfully normalises the path tests the client rather than the serve
 """
 import http.client, os, sys, urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, mint, api_healthy, unique_sub, Results, API
+from wheel_client import call, mint, session_for, api_healthy, unique_sub, Results, API
 
 R = Results()
 
@@ -34,7 +34,7 @@ def raw_request(path, method="GET", host_hdr=None):
 
 def main():
     api_healthy()
-    alice = mint(unique_sub("alice"))
+    alice = session_for(unique_sub("alice"))
 
     st, proj, _ = call("POST", "/v1/projects", alice, {"name": "qa-ingress"})
     if not R.check("ING-setup/create", st in (200, 201), "-> %s %r" % (st, proj)):

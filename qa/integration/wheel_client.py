@@ -41,6 +41,20 @@ def unique_sub(prefix="qa"):
     return "%s_%s" % (prefix, uuid.uuid4().hex[:16])
 
 
+def sub_of(token):
+    """The `sub` claim of a token we hold, read from the token rather than remembered.
+
+    `owner_id == the JWT sub` is the property worth asserting; `owner_id == "user_alice"` is
+    that property with a dev-mode implementation detail baked in, and it fails under local
+    auth where the sub is a generated uuid. Reading the claim keeps the assertion true in
+    both modes. No signature check here on purpose — the API verified it, and this is a test
+    reading its own token.
+    """
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload.encode()))["sub"]
+
+
 def mint(sub, iss=None, secret=None, alg="HS256", exp_delta=3600, nbf_delta=-60):
     """Mint a dev token. Non-default args exist so the auth NEGATIVE cases are expressible."""
     header = b64u(json.dumps({"alg": alg, "typ": "JWT"}).encode())
@@ -52,6 +66,41 @@ def mint(sub, iss=None, secret=None, alg="HS256", exp_delta=3600, nbf_delta=-60)
     sig = b64u(hmac.new(secret if secret is not None else DEV_SECRET,
                         signing_input, hashlib.sha256).digest())
     return "%s.%s.%s" % (header, payload, sig)
+
+
+def session_for(sub):
+    """A token that authenticates against whichever provider the API is actually running.
+
+    `mint()` produces a dev HS256 token, which only works under AUTH_MODE=jwks with
+    AUTH_DEV_SECRET set. The API now defaults an unset AUTH_MODE to `local` in dev
+    (config.rs:143), so a freshly built stack rejects every minted token with 401 while a
+    long-running container built before local auth accepts them. That difference is why
+    this suite passed on my machine and failed on its first real CI run.
+
+    Rather than pin the mode — which would make the suite assert against a configuration
+    nobody deploys — sign up a local account when the minted token is refused. A suite
+    that only works under one auth provider is testing the provider, not the product.
+    """
+    tok = mint(sub)
+    st, _, _ = call("GET", "/v1/projects", tok)
+    # 2xx, not `!= 401`. A stack that is still coming up answers 502/503, and treating that
+    # as "dev tokens are accepted here" hands back a token that starts failing the moment
+    # the API is actually ready — which is how this suite passed locally against a warm
+    # stack and failed in CI against a cold one, reporting it as an auth bug in the API.
+    if 200 <= (st or 0) < 300:
+        return tok
+    email = "%s@qa.wheel.local" % sub.replace("|", "-")
+    password = "qa-integration-password"
+    st, body, _ = call("POST", "/v1/auth/signup", None, {"email": email, "password": password})
+    if st == 409 or (st and st >= 400):
+        st, body, _ = call("POST", "/v1/auth/login", None,
+                           {"email": email, "password": password})
+    tok = (body or {}).get("token") if isinstance(body, dict) else None
+    if not tok:
+        raise RuntimeError(
+            "cannot authenticate against this API: the dev token was refused (AUTH_MODE is "
+            "probably `local`) and local signup answered %s %r" % (st, body))
+    return tok
 
 
 def call(method, path, token=None, body=None, headers=None, base=None, timeout=60, raw_body=None):
