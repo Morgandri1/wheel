@@ -55,4 +55,3 @@ impl Orchestrator for NoopOrchestrator {
         Ok(ProjectStatus::Stopped)
     }
 }
-

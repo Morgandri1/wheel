@@ -8,6 +8,9 @@ pub enum Backend {
     Docker,
     /// Production on Railway, where no docker daemon exists: one unix uid per project.
     Process,
+    /// Dev only: an engine already running at `ENGINE_BASE_URL`. Provides no isolation, so it is
+    /// rejected unless `WHEEL_ENV=dev`.
+    External,
 }
 
 #[derive(Clone)]
@@ -23,6 +26,8 @@ pub struct Config {
     pub nano_cpus: i64,
     pub pids_limit: i64,
     pub start_timeout_secs: u64,
+    /// Only meaningful for the external backend.
+    pub engine_base_url: String,
 }
 
 fn var(k: &str) -> Result<String> {
@@ -52,7 +57,17 @@ impl Config {
         let backend = match var_or("SANDBOX_BACKEND", "docker").as_str() {
             "docker" => Backend::Docker,
             "process" => Backend::Process,
-            other => bail!("SANDBOX_BACKEND must be \"docker\" or \"process\", got {other:?}"),
+            "external" => {
+                // This backend isolates nothing; it forwards to a URL. Allowing it outside dev
+                // would mean shipping a "sandbox" that is not a sandbox.
+                if var_or("WHEEL_ENV", "prod") != "dev" {
+                    bail!("SANDBOX_BACKEND=external requires WHEEL_ENV=dev; it provides no isolation");
+                }
+                Backend::External
+            }
+            other => bail!(
+                "SANDBOX_BACKEND must be \"docker\", \"process\" or \"external\", got {other:?}"
+            ),
         };
 
         Ok(Config {
@@ -67,6 +82,7 @@ impl Config {
             nano_cpus: (parse_or("CONTAINER_CPUS", 1.0f64)? * 1e9) as i64,
             pids_limit: parse_or("CONTAINER_PIDS_LIMIT", 512i64)?,
             start_timeout_secs: parse_or("START_TIMEOUT_SECS", 30u64)?,
+            engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }
 

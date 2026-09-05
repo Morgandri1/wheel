@@ -10,6 +10,8 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | **S2** | SDK | **open** | Exported JSON Schema accepts 12 configs the contract forbids |
 | 002 | `NODE-type-closed` | S3 | SDK | **open** | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
 | 003 | `NODE-tool-config` | **S2** | SDK | **open** | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
+| 005 | `make check` (`rust:fmt`) | S3 **blocking** | API | **open** | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
+| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | **open** | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 
 ---
 
@@ -103,3 +105,57 @@ retaining `raw` so re-import can diff.
 The gate was correct to skip rather than fail, but a skipped gate on `main` is a blind spot — so
 CI now runs `make bootstrap` first, and `make check-strict` (CHECK_STRICT=1) treats any skip as a
 failure. Fixed as part of this report.
+
+
+---
+
+## 004 — Exported wire matrix is missing two contract rows · S3 · SDK
+
+Reported by Web for `endpoint→vault (read)`. QA's independently-derived matrix finds **two**
+missing rows, so the corrected allowed count is **26**, not 25.
+
+| Row | ARCHITECTURE.md §3 | `wire_allowed` / export |
+|---|---|---|
+| `endpoint → vault (read)` | line 160 — "resolve the endpoint's `auth.vault_ref` bearer secret" | absent |
+| `script → tool (read)` | line 157 — "script → tool \| same as agent" | absent |
+
+**Repro:** `make check` (gate `qa:wire-conformance`), or:
+```
+qa/.venv/bin/python qa/contract/wire_matrix_conformance.py
+```
+```
+contract (QA, from §3 prose): 26 allowed
+export   (wheel-core):        24 allowed
+```
+
+**Expected:** `wire_allowed(Endpoint, Vault, Read)` and `wire_allowed(Script, Tool, Read)` both
+true; `docs/schema/wire-matrix.json` carries 26 triples.
+**Actual:** both false and absent, so neither wire can be created by engine, API or UI.
+
+Only the ALLOWABILITY lands now (two rows plus tests). Bearer-auth behaviour and tool execution
+remain M2 per the milestone plan.
+
+**Note:** when SDK regenerates, Web's `wire-matrix.conformance.test.ts` goes red until they re-run
+`pnpm gen:types` and add plain-language strings for the two new rules. That is intended, and Web
+has been told to expect it.
+
+
+---
+
+## 005 — `main` is red on `rust:fmt`, blocking all merges · S3 (blocking) · API
+
+`cargo fmt --all -- --check` fails on `main` with **66 diffs across 18 files**, all in
+`crates/wheel-api` and `crates/wheel-host`.
+
+**Repro:** `make check` on a clean `main`, or `cargo fmt --all -- --check`.
+
+**Fix:** `cargo fmt --all` — seconds. No code change, no review needed.
+
+Files: `wheel-api/src/{lib,config,crypto,error,models,orchestrator,state}.rs`,
+`wheel-api/src/auth/claims.rs`, `wheel-api/src/http/hop.rs`,
+`wheel-api/src/routes/{ingress,projects,proxy}.rs`,
+`wheel-api/tests/{auth_verify,config_interlock}.rs`,
+`wheel-host/src/{main,proxy,store}.rs`, `wheel-host/src/sandbox/docker.rs`.
+
+Not a correctness defect, but it is the merge gate, so while it is red nobody can merge anything
+per §1 of the contract. Filed as blocking for that reason alone.

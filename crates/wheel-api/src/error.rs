@@ -109,7 +109,11 @@ impl IntoResponse for ApiError {
             _ => tracing::debug!(code, "request rejected"),
         }
 
-        (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+        (
+            status,
+            Json(json!({ "error": { "code": code, "message": message } })),
+        )
+            .into_response()
     }
 }
 

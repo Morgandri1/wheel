@@ -15,7 +15,10 @@ fn base_env() {
     std::env::set_var("CLERK_JWKS_URL", "https://clerk.example.test/jwks");
     std::env::set_var("CLERK_ISSUER", "https://clerk.example.test");
     // 32 zero bytes, base64.
-    std::env::set_var("API_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    std::env::set_var(
+        "API_MASTER_KEY",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
     std::env::set_var("WHEEL_HOST_URL", "http://host.internal:7100");
     std::env::set_var("WHEEL_HOST_SECRET", "host-secret");
     std::env::remove_var("AUTH_DEV_SECRET");
@@ -53,7 +56,10 @@ fn dev_secret_interlock_and_config_validation() {
     // A typo in WHEEL_ENV must not silently become dev *or* prod.
     base_env();
     std::env::set_var("WHEEL_ENV", "development");
-    assert!(Config::from_env().is_err(), "unrecognised WHEEL_ENV should refuse to boot");
+    assert!(
+        Config::from_env().is_err(),
+        "unrecognised WHEEL_ENV should refuse to boot"
+    );
 
     // Dev + secret is the one permitted combination.
     base_env();
@@ -80,19 +86,31 @@ fn dev_secret_interlock_and_config_validation() {
     // --- other fail-closed validation -----------------------------------------------------------
     base_env();
     std::env::set_var("API_MASTER_KEY", "c2hvcnQ="); // "short" — not 32 bytes
-    assert!(Config::from_env().is_err(), "short master key must be rejected");
+    assert!(
+        Config::from_env().is_err(),
+        "short master key must be rejected"
+    );
 
     base_env();
     std::env::set_var("API_MASTER_KEY", "!!!not base64!!!");
-    assert!(Config::from_env().is_err(), "non-base64 master key must be rejected");
+    assert!(
+        Config::from_env().is_err(),
+        "non-base64 master key must be rejected"
+    );
 
     base_env();
     std::env::remove_var("WHEEL_HOST_SECRET");
-    assert!(Config::from_env().is_err(), "missing host secret must be rejected");
+    assert!(
+        Config::from_env().is_err(),
+        "missing host secret must be rejected"
+    );
 
     base_env();
     std::env::remove_var("CLERK_ISSUER");
-    assert!(Config::from_env().is_err(), "missing issuer must be rejected");
+    assert!(
+        Config::from_env().is_err(),
+        "missing issuer must be rejected"
+    );
 
     // The master key must never be printed. `Secret` has no Display and a redacted Debug; assert
     // the host secret in particular cannot be stringified into a log line.

@@ -51,8 +51,7 @@ impl Store {
 
     pub async fn get(&self, id: &Uuid) -> Result<Option<ProjectRecord>> {
         let c = self.conn.lock().await;
-        let mut stmt =
-            c.prepare("SELECT engine_secret, vault_key FROM projects WHERE id = ?1")?;
+        let mut stmt = c.prepare("SELECT engine_secret, vault_key FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query(rusqlite::params![id.to_string()])?;
         match rows.next()? {
             None => Ok(None),
@@ -75,7 +74,10 @@ impl Store {
 
     pub async fn delete(&self, id: &Uuid) -> Result<()> {
         let c = self.conn.lock().await;
-        c.execute("DELETE FROM projects WHERE id = ?1", rusqlite::params![id.to_string()])?;
+        c.execute(
+            "DELETE FROM projects WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+        )?;
         Ok(())
     }
 

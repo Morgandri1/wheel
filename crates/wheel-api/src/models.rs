@@ -109,7 +109,10 @@ mod tests {
         assert!(validate_project_name("").is_err());
         assert!(validate_project_name("   ").is_err());
         assert!(validate_project_name(&"a".repeat(65)).is_err());
-        assert!(validate_project_name("bad\nname").is_err(), "control chars enable log forging");
+        assert!(
+            validate_project_name("bad\nname").is_err(),
+            "control chars enable log forging"
+        );
         assert!(validate_project_name("bad\u{0}name").is_err());
     }
 

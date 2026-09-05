@@ -41,7 +41,11 @@ pub fn sanitize_for_upstream(inbound: &HeaderMap, extra_forbidden_prefixes: &[&s
     let mut nominated: Vec<String> = Vec::new();
     for v in inbound.get_all("connection").iter() {
         if let Ok(s) = v.to_str() {
-            nominated.extend(s.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()));
+            nominated.extend(
+                s.split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty()),
+            );
         }
     }
 
@@ -104,7 +108,10 @@ mod tests {
             &[],
         );
         assert!(out.get("x-auth-token").is_none());
-        assert!(out.get("authorization").is_none(), "user token must not reach the engine");
+        assert!(
+            out.get("authorization").is_none(),
+            "user token must not reach the engine"
+        );
         assert!(out.get("x-project-id").is_none());
         assert_eq!(out.get("content-type").unwrap(), "application/json");
     }
@@ -121,7 +128,10 @@ mod tests {
             ]),
             &[],
         );
-        assert!(out.get("x-secret-thing").is_none(), "Connection-nominated header must be dropped");
+        assert!(
+            out.get("x-secret-thing").is_none(),
+            "Connection-nominated header must be dropped"
+        );
         assert!(out.get("transfer-encoding").is_none());
         assert!(out.get("upgrade").is_none());
         assert_eq!(out.get("x-keep").unwrap(), "yes");
@@ -130,10 +140,17 @@ mod tests {
     #[test]
     fn ingress_drops_forged_wheel_headers() {
         let out = sanitize_for_upstream(
-            &hm(&[("x-wheel-ingress", "1"), ("x-wheel-anything", "forged"), ("accept", "*/*")]),
+            &hm(&[
+                ("x-wheel-ingress", "1"),
+                ("x-wheel-anything", "forged"),
+                ("accept", "*/*"),
+            ]),
             &["x-wheel-"],
         );
-        assert!(out.get("x-wheel-ingress").is_none(), "public caller forged a trust marker");
+        assert!(
+            out.get("x-wheel-ingress").is_none(),
+            "public caller forged a trust marker"
+        );
         assert!(out.get("x-wheel-anything").is_none());
         assert_eq!(out.get("accept").unwrap(), "*/*");
     }

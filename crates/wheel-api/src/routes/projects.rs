@@ -108,7 +108,10 @@ pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Js
     Ok(Json(rows.into_iter().map(Project::from).collect()))
 }
 
-pub async fn get_one(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
+pub async fn get_one(
+    State(state): State<AppState>,
+    scope: ProjectScope,
+) -> ApiResult<Json<Project>> {
     // Reconcile the stored status against what the runtime actually reports, so a container that
     // died out from under us is not reported as running.
     let mut project = scope.project;
@@ -151,7 +154,10 @@ pub async fn update(
     Ok(Json(row.into()))
 }
 
-pub async fn destroy(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<axum::http::StatusCode> {
+pub async fn destroy(
+    State(state): State<AppState>,
+    scope: ProjectScope,
+) -> ApiResult<axum::http::StatusCode> {
     // Tear down the runtime first. If this fails we keep the row, so the container cannot be
     // orphaned beyond our knowledge — an orphan we have no record of is an orphan nobody cleans up.
     state
@@ -170,21 +176,44 @@ pub async fn destroy(State(state): State<AppState>, scope: ProjectScope) -> ApiR
 
 pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
     set_status(&state, &scope.project.id, ProjectStatus::Starting).await?;
-    state.orch.start(&scope.project.id).await.map_err(ApiError::Internal)?;
-    let observed = state.orch.status(&scope.project.id).await.unwrap_or(ProjectStatus::Starting);
+    state
+        .orch
+        .start(&scope.project.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    let observed = state
+        .orch
+        .status(&scope.project.id)
+        .await
+        .unwrap_or(ProjectStatus::Starting);
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }
 
 pub async fn stop(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
-    state.orch.stop(&scope.project.id).await.map_err(ApiError::Internal)?;
+    state
+        .orch
+        .stop(&scope.project.id)
+        .await
+        .map_err(ApiError::Internal)?;
     set_status(&state, &scope.project.id, ProjectStatus::Stopped).await?;
     reload(&state, &scope).await
 }
 
-pub async fn restart(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
-    state.orch.restart(&scope.project.id).await.map_err(ApiError::Internal)?;
-    let observed = state.orch.status(&scope.project.id).await.unwrap_or(ProjectStatus::Starting);
+pub async fn restart(
+    State(state): State<AppState>,
+    scope: ProjectScope,
+) -> ApiResult<Json<Project>> {
+    state
+        .orch
+        .restart(&scope.project.id)
+        .await
+        .map_err(ApiError::Internal)?;
+    let observed = state
+        .orch
+        .status(&scope.project.id)
+        .await
+        .unwrap_or(ProjectStatus::Starting);
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }

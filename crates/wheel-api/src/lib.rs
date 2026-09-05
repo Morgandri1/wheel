@@ -61,7 +61,10 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             axum::routing::any(routes::proxy::engine_proxy),
         )
         // Public ingress. No auth by design; gated on the project's `http` capability.
-        .route("/p/{project_id}/{*rest}", axum::routing::any(routes::ingress::ingress))
+        .route(
+            "/p/{project_id}/{*rest}",
+            axum::routing::any(routes::ingress::ingress),
+        )
         .layer(cors_layer(allowed_origins))
         .with_state(state)
 }

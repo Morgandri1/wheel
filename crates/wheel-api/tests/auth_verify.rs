@@ -79,7 +79,11 @@ async fn hs256_signed_with_rsa_public_key_is_rejected() {
     // talked into treating the token as HMAC, the attacker can sign tokens with a key they already
     // have. We must never reach an HMAC verifier for an RS256-issued tenant.
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
-    let t = sign_hs256(KID, key().public_der_b64.as_bytes(), &claims("user_mallory"));
+    let t = sign_hs256(
+        KID,
+        key().public_der_b64.as_bytes(),
+        &claims("user_mallory"),
+    );
     assert!(
         verify(&t, &cfg, &jwks).await.is_err(),
         "ALGORITHM CONFUSION: token signed with the public key as an HMAC secret was accepted"
@@ -91,7 +95,11 @@ async fn hs256_confusion_still_rejected_in_dev_mode() {
     // Even in dev, where an HS256 path exists, it verifies against the *dev secret* — not against
     // anything derived from the RSA key.
     let (cfg, jwks, _s) = fixture(Env::Dev, Some("the-real-dev-secret")).await;
-    let t = sign_hs256(KID, key().public_der_b64.as_bytes(), &claims("user_mallory"));
+    let t = sign_hs256(
+        KID,
+        key().public_der_b64.as_bytes(),
+        &claims("user_mallory"),
+    );
     assert!(verify(&t, &cfg, &jwks).await.is_err());
 }
 
@@ -104,7 +112,10 @@ async fn unknown_kid_flood_does_not_flood_the_jwks_endpoint() {
 
     for i in 0..50 {
         let t = sign_rs256(key(), &format!("attacker-kid-{i}"), &claims("user_mallory"));
-        assert!(verify(&t, &cfg, &jwks).await.is_err(), "unknown kid was accepted");
+        assert!(
+            verify(&t, &cfg, &jwks).await.is_err(),
+            "unknown kid was accepted"
+        );
     }
 
     let hits = server.hits.load(std::sync::atomic::Ordering::SeqCst);
@@ -131,7 +142,9 @@ async fn expired_token_is_rejected() {
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
     let mut c = claims("user_alice");
     c.exp = now() - 10;
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_err());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -139,7 +152,9 @@ async fn not_yet_valid_token_is_rejected() {
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
     let mut c = claims("user_alice");
     c.nbf = now() + 600;
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_err());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -147,7 +162,9 @@ async fn wrong_issuer_is_rejected() {
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
     let mut c = claims("user_alice");
     c.iss = "https://evil.example".into();
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_err());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -166,7 +183,9 @@ async fn tampered_payload_is_rejected() {
 async fn empty_sub_is_rejected() {
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
     let c = claims("");
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_err());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -175,17 +194,32 @@ async fn azp_outside_the_allowlist_is_rejected() {
     cfg.clerk_azp = vec!["https://wheel.dev".into()];
     let mut c = claims("user_alice");
     c.azp = Some("https://evil.example".into());
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_err());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_err());
 
     c.azp = Some("https://wheel.dev".into());
-    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks).await.is_ok());
+    assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
 async fn garbage_tokens_are_rejected_without_panicking() {
     let (cfg, jwks, _s) = fixture(Env::Prod, None).await;
-    for t in ["", ".", "..", "a.b.c", "not-a-jwt", "Bearer x", &"A".repeat(10_000)] {
-        assert!(verify(t, &cfg, &jwks).await.is_err(), "accepted garbage: {t:?}");
+    for t in [
+        "",
+        ".",
+        "..",
+        "a.b.c",
+        "not-a-jwt",
+        "Bearer x",
+        &"A".repeat(10_000),
+    ] {
+        assert!(
+            verify(t, &cfg, &jwks).await.is_err(),
+            "accepted garbage: {t:?}"
+        );
     }
 }
 
@@ -203,13 +237,28 @@ fn token_extraction_shapes() {
     };
 
     assert_eq!(token_from_headers(&mk("x-auth-token", "t")), Some("t"));
-    assert_eq!(token_from_headers(&mk("x-auth-token", "Bearer t")), Some("t"));
-    assert_eq!(token_from_headers(&mk("authorization", "Bearer t")), Some("t"));
+    assert_eq!(
+        token_from_headers(&mk("x-auth-token", "Bearer t")),
+        Some("t")
+    );
+    assert_eq!(
+        token_from_headers(&mk("authorization", "Bearer t")),
+        Some("t")
+    );
     // Scheme match is case-insensitive per RFC 7235.
-    assert_eq!(token_from_headers(&mk("authorization", "bearer t")), Some("t"));
-    assert_eq!(token_from_headers(&mk("authorization", "BEARER t")), Some("t"));
+    assert_eq!(
+        token_from_headers(&mk("authorization", "bearer t")),
+        Some("t")
+    );
+    assert_eq!(
+        token_from_headers(&mk("authorization", "BEARER t")),
+        Some("t")
+    );
     // Non-bearer schemes must not be mistaken for one.
-    assert_eq!(token_from_headers(&mk("authorization", "Basic dXNlcjpwdw==")), None);
+    assert_eq!(
+        token_from_headers(&mk("authorization", "Basic dXNlcjpwdw==")),
+        None
+    );
     assert_eq!(token_from_headers(&mk("x-auth-token", "")), None);
     assert_eq!(token_from_headers(&mk("x-auth-token", "   ")), None);
     assert_eq!(token_from_headers(&HeaderMap::new()), None);

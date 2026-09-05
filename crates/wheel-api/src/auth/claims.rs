@@ -31,7 +31,8 @@ pub async fn verify(
     cfg: &Config,
     jwks: &super::jwks::JwksCache,
 ) -> Result<VerifiedUser, ApiError> {
-    let header = decode_header(token).map_err(|_| ApiError::Unauthorized("malformed jwt header"))?;
+    let header =
+        decode_header(token).map_err(|_| ApiError::Unauthorized("malformed jwt header"))?;
 
     let claims = match header.alg {
         Algorithm::RS256 => {
@@ -50,10 +51,9 @@ pub async fn verify(
         // was supplied; `Config::from_env` refuses to start in any other combination, so this arm
         // is unreachable in production by construction rather than by this check alone.
         Algorithm::HS256 if cfg.env.is_dev() => {
-            let secret = cfg
-                .dev_secret
-                .as_deref()
-                .ok_or(ApiError::Unauthorized("HS256 presented but no dev secret configured"))?;
+            let secret = cfg.dev_secret.as_deref().ok_or(ApiError::Unauthorized(
+                "HS256 presented but no dev secret configured",
+            ))?;
             let key = DecodingKey::from_secret(secret.as_bytes());
             decode_with(token, &key, cfg, Algorithm::HS256)?
         }
@@ -125,7 +125,10 @@ pub fn token_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
             return Some(v);
         }
     }
-    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let (scheme, token) = auth.split_once(' ')?;
     // Scheme comparison is case-insensitive per RFC 7235.
     if !scheme.eq_ignore_ascii_case("bearer") {
