@@ -74,6 +74,32 @@ test("E2E-local-no-enumeration: the browser cannot tell a wrong password from no
   // string itself does not matter; that the two are the same string does.
   expect(noSuchUser).toBe(wrongPassword);
   expect(noSuchUser).not.toMatch(/no account|not found|unknown|does not exist|unregistered/i);
+  // Equality is only evidence while E2E-local-error-plumbing is green: see the note there.
+  expect(noSuchUser).toBeTruthy();
+});
+
+test("E2E-local-error-plumbing: the API's own message reaches the UI, not a fallback", async ({ page }) => {
+  // This exists because E2E-local-no-enumeration cannot stand on its own. It asserts that
+  // the wrong-password and unknown-account strings are EQUAL — and two copies of the client's
+  // generic fallback are equal. Web's mock once answered {error:"<string>"} where API.md says
+  // {error:{code,message}}, so every server message was discarded and the UI fell back; the
+  // enumeration test was green throughout, asserting nothing, and would have gone RED the day
+  // someone fixed the plumbing. That is the shape of test people learn to delete.
+  //
+  // It cannot be rescued by matching copy: local-auth.ts's 401 fallback is byte-identical to
+  // the server's 401 message, deliberately. So the only way to prove the pathway is live is to
+  // put a value on the wire that the fallback could not invent.
+  const sentinel = `server-said-${Date.now()}`;
+  await page.route(`${API}/v1/auth/login`, (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "invalid_credentials", message: sentinel } }),
+    }),
+  );
+  await page.goto("/sign-in");
+  await submit(page, SEEDED.email, "definitely-wrong");
+  await expect(page.getByTestId(T.authError)).toHaveText(sentinel);
 });
 
 test("E2E-local-pw-policy: the password rule is taught before a round trip", async ({ page }) => {

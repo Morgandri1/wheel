@@ -11,6 +11,12 @@ SKIP = 77
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 
+# Jobs allowed to be switched off, each with the reason and the EVENT that re-enables it —
+# the same discipline as the coverage exemptions, and for the same reason. `integration` sat
+# here as `if: false` from before the engine image existed; the image landed, the condition
+# did not, and 127 assertions ran only on one laptop while CI reported green.
+DISABLED_OK = {}
+
 def main():
     try:
         import yaml
@@ -50,11 +56,17 @@ def main():
             fails.append("job '%s' has no timeout-minutes — a hung job blocks the queue" % name)
 
     disabled = [n for n, j in jobs.items() if str(j.get("if", "")).strip().lower() == "false"]
+    for n in disabled:
+        if n not in DISABLED_OK:
+            fails.append(
+                "job '%s' is disabled with `if: false` and has no entry in DISABLED_OK — a "
+                "disabled job reports the same green as a passing one. If it must stay off, "
+                "add it below with the reason and the event that turns it back on." % n)
 
     print("ci.yml: %d job(s) — %s" % (len(jobs), ", ".join(sorted(jobs))))
     print("cancel-in-progress: %s" % (cip or "(unset)"))
     if disabled:
-        print("deliberately disabled: %s" % ", ".join(sorted(disabled)))
+        print("disabled: %s" % ", ".join(sorted(disabled)))
     if fails:
         print("\nci workflow lint: %d FAILED" % len(fails))
         for f in fails:

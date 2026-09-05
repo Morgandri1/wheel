@@ -152,12 +152,16 @@ jobs:
     name: integration (docker + fake harness)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Skipped until SDK lands the engine image; flipped on then.
-    if: false
+    # Was `if: false` while the engine image did not exist. The image landed, and the
+    # suite (127 assertions, incl. all 243 wire-matrix cells against a real engine) had
+    # been running only on my laptop — a disabled job reports the same green as a passing
+    # one, which is the exact failure this suite exists to catch. Enabled.
     strategy:
       fail-fast: false
+      # `process` is M3. It is left out rather than allowed to fail: a row that is red on
+      # every run teaches people to stop reading the column.
       matrix:
-        backend: [docker, process]   # M3 adds `process`; matrix is ready for it
+        backend: [docker]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
