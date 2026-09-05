@@ -80,13 +80,27 @@ export const T = {
   message: (id: string) => `msg-${id}`,
 
   // auth (per-agent harness login)
-  authenticate: "btn-authenticate",
   authFlow: "auth-flow",
   authMode: "auth-mode",
-  authLink: "auth-link",
-  authCodeInput: "input-auth-code",
+  authStatus: "auth-status",
+  authNeedsAuthCallout: "auth-needs-auth-callout",
+  authChecking: "auth-checking",
   apiKeyInput: "input-api-key",
   authComplete: "btn-auth-complete",
+  authReplace: "btn-auth-replace",
+  authOauth: "btn-auth-oauth",
+  nodeAuthenticate: (name: string) => `node-${name}-authenticate`,
+
+  // DEFERRED(M2): the engine's OAuth flow (§4 auth/begin device_code | paste_code).
+  // Web ships M1 as API-key-only and disables btn-auth-oauth with an M2 title; these
+  // are the selectors the paste-code/device-code UI will need. testid_parity treats a
+  // DEFERRED block as "not yet rendered, and that is expected" — and FAILS when one
+  // starts being rendered, which is the signal to write the E2E test.
+  // DEFERRED-BEGIN
+  authLink: "auth-link",
+  authCodeInput: "input-auth-code",
+  authUserCode: "auth-user-code",
+  // DEFERRED-END
 
   // connection health
   connIndicator: "conn-indicator",
