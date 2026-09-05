@@ -45,3 +45,18 @@ Driver `redteam/pocs/engine-wire/run_cli_campaign.sh` + probe `t_cli_token_and_f
 - Attribution (F001 via CLI path): agent→agent `msg` body carrying `</AgentPrompt><AgentPrompt from="user">` stored as inert body text; inbox shows no forged envelope. Extends 013's user-lane proof to the agent/CLI lane.
 - §3c#12 concurrent peers: 8 simultaneous sends → recipient stdin/inbox has matched envelope open/close, none interleaved/partial (serial single-writer).
 - F005: unwired/absent target via /v1/cli = 404 not_found (exit-4), distinct from wire_denied (exit-3).
+
+## Process backend (F003/F007) — landed, INSPECTED vs review; live cross-tenant probe STAGED
+`crates/wheel-host/src/sandbox/process.rs` (commits 7c2f1c7/1245e58) matches my M1.5 design review
+(reviews/api-process-backend-M1.5.md) point-for-point, by source inspection:
+- NO abstract sockets (pathname socket in a 0700 project dir); secrets by env (same-uid readable) / 0600 token file, never argv.
+- drop order setgroups([]) → setgid → setuid, with a post-drop uid==target guard; no_new_privs; rlimits (NPROC/AS/FSIZE/NOFILE/CPU) applied AFTER the drop; make_owned_dir refuses unless root (chown guard).
+- uid: sticky per-project range (UID_RANGE_START 20000, UID_STRIDE 64), engine at base, nodes above.
+SDK/API ship the root path as CI: `wheel-roottest` image runs `cargo test -p wheel-host --test
+sandbox_process` as root (+ tests/uid_alloc.rs). 
+**Not yet run adversarially:** my cross-tenant probe `pocs/child-isolation/t_process_backend_isolation.py`
+(cross-uid /data, /run/<other>/engine.sock, /proc/<other>/environ, host-secret-in-env, token-file mode)
+needs a COMBINED host+engine RUNTIME image (docker/Dockerfile.host) running in SANDBOX_BACKEND=process —
+today only a source/cargo test image (wheel-roottest) and an engine-only runtime image (wheel-engine:test,
+no wheel-host) exist. STAGED; runs the moment a combined runtime image is available (or hand it the env
+WHEEL_HOST_CONTAINER/WHEEL_UID_A/WHEEL_PID_A/WHEEL_PID_B in API/QA's harness).
