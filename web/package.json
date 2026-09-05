@@ -15,9 +15,9 @@
     "coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "gen:types": "tsx scripts/gen-types.ts",
-    "copy:monaco": "tsx scripts/copy-monaco.ts",
-    "prebuild": "tsx scripts/copy-monaco.ts",
-    "predev": "tsx scripts/copy-monaco.ts"
+    "copy:monaco": "node scripts/copy-monaco.mjs",
+    "prebuild": "node scripts/copy-monaco.mjs",
+    "predev": "node scripts/copy-monaco.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.9.6",
@@ -53,5 +53,8 @@
     "typescript": "^5.7.2",
     "vitest": "^2.1.8",
     "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": "22.x"
   }
 }

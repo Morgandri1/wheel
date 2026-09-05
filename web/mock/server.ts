@@ -202,6 +202,7 @@ async function engine(
       if (from.wires!.some((w) => w.to === to.id && w.type === body.type)) {
         throw new EngineRefusal(409, "that wire already exists");
       }
+      assertNoAmbiguousCredential(record, from, to, body.type);
       from.wires!.push({ to: to.id, type: body.type });
     } else {
       from.wires! = from.wires!.filter((w) => !(w.to === to.id && w.type === body.type));
@@ -295,9 +296,18 @@ async function engine(
     }
 
     if (method === "GET" && !step) {
+      // A vault-provided token beats anything typed into the panel: the engine exports vault keys
+      // into the child's environment at spawn, so if one is there, that IS the credential.
+      const vault = credentialVaultFor(record, node);
+      if (vault) {
+        json(res, 200, { authenticated: true, mode: "env", source: vault.name });
+        return true;
+      }
+      const authed = record.authenticated.has(node.id);
       json(res, 200, {
-        authenticated: record.authenticated.has(node.id),
-        account: record.authenticated.has(node.id) ? "you@example.com" : undefined,
+        authenticated: authed,
+        mode: authed ? "api_key" : null,
+        account: authed ? "you@example.com" : undefined,
       });
       return true;
     }
@@ -462,6 +472,50 @@ async function engine(
   }
 
   return false;
+}
+
+/**
+ * Contract: one vault per account. So an agent wired to two vaults that both hold the same key has
+ * no defined answer for which token lands in its environment, and the engine refuses the wire
+ * rather than silently picking one. Modelled here so the UI's refusal path is exercised in
+ * development instead of discovered against the real engine.
+ */
+function assertNoAmbiguousCredential(record: ProjectRecord, from: WheelNode, to: WheelNode, type: WireType) {
+  if (type !== "read" || from.type !== "agent" || to.type !== "vault") return;
+  const incoming = new Set(keysOf(record, to));
+  for (const wire of from.wires ?? []) {
+    if (wire.type !== "read") continue;
+    const other = record.nodes.find((n) => n.id === wire.to);
+    if (!other || other.type !== "vault") continue;
+    const clash = keysOf(record, other).find((k) => incoming.has(k));
+    if (clash) {
+      throw new EngineRefusal(
+        400,
+        `ambiguous credential ${clash}: ${from.name} would read it from both ${other.name} and ${to.name}`,
+        "ambiguous_credential",
+      );
+    }
+  }
+}
+
+/** Key names a vault node holds: whatever has been written, plus whatever its config declares. */
+function keysOf(record: ProjectRecord, vault: WheelNode): string[] {
+  const written = [...(record.vaults.get(vault.id) ?? [])];
+  const declared = vault.type === "vault" ? vault.config.keys ?? [] : [];
+  return [...new Set([...written, ...declared])];
+}
+
+/** The vault, if any, supplying this agent a harness credential through its environment. */
+const HARNESS_CREDENTIAL_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_API_KEY"];
+
+function credentialVaultFor(record: ProjectRecord, agent: WheelNode): WheelNode | null {
+  for (const wire of agent.wires ?? []) {
+    if (wire.type !== "read") continue;
+    const node = record.nodes.find((n) => n.id === wire.to);
+    if (!node || node.type !== "vault") continue;
+    if (keysOf(record, node).some((k) => HARNESS_CREDENTIAL_KEYS.includes(k))) return node;
+  }
+  return null;
 }
 
 // ── public API routes (§5) ──────────────────────────────────────────────────

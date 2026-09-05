@@ -19,16 +19,49 @@ import type { EngineApi } from "@/lib/api";
  * or a toast. What comes back is whether a credential is STORED — which is not the same as it
  * working, and the copy here is careful to say only the true one.
  */
+/**
+ * What a stored credential is, in words, per `AuthStatus.mode`.
+ *
+ * The engine's CredentialKind can grow — "env" arrived with vault-provided tokens after this
+ * file was written — so an unrecognised mode falls back to a truthful generic rather than
+ * rendering nothing or crashing. A client that breaks when a server enum gains a member is a
+ * client that forces lockstep deploys.
+ */
+function credentialLabel(mode: string | null | undefined, source: string | null | undefined, vaults: string[]): string {
+  if (mode === "env") {
+    // A token handed to the agent from a wired vault at spawn. Nobody typed it into this panel,
+    // so "Replace" would be wrong — the value lives in the vault and is edited there.
+    //
+    // The engine names the vault in `source`; the wire list is only a fallback for an engine that
+    // does not send it yet. Inference is a worse answer than a fact, and with one vault per
+    // account (contract) an agent can legitimately be wired to several — so guessing from wires
+    // can name the wrong one.
+    if (source) return `Credentials from vault ${source}`;
+    return vaults.length === 1
+      ? `Credentials from vault ${vaults[0]}`
+      : vaults.length > 1
+        ? `Credentials from a wired vault — one of ${vaults.join(", ")}`
+        : "Credentials from a wired vault";
+  }
+  if (mode === "api_key") return "Credentials saved · API key";
+  if (mode === "oauth_token") return "Credentials saved · setup-token";
+  if (mode === "oauth_session") return "Credentials saved · signed in";
+  return "Credentials saved";
+}
+
 export function AuthFlow({
   api,
   nodeId,
   needsAuth,
+  vaults = [],
   onAuthenticated,
 }: {
   api: EngineApi;
   nodeId: string;
   /** The agent tried to start and had no credentials — the one moment this panel is urgent. */
   needsAuth: boolean;
+  /** Names of vaults this agent has a read wire to, for the `env` mode hint. */
+  vaults?: string[];
   onAuthenticated: () => void;
 }) {
   const agent = api.agent(nodeId);
@@ -82,23 +115,38 @@ export function AuthFlow({
     }
   };
 
+  const authData = status.data as (typeof status.data & { source?: string | null }) | undefined;
+  const mode = authData?.mode as string | null | undefined;
+  const source = authData?.source;
+  const fromVault = mode === "env";
+
   if (authenticated && !replacing) {
     return (
       <div
         className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
         data-testid="auth-status"
         data-authenticated="true"
+        data-mode={mode ?? ""}
+        data-source={source ?? ""}
       >
         {/* SDK: `authenticated: true` means a credential is STORED, not that it works — only the
             harness's own probe can say that. "Connected" here would be a lie an expired token
             tells, and the support round-trip lands on us. */}
         <span className="text-micro text-ink-dim">
-          Credentials saved
+          {credentialLabel(mode, source, vaults)}
           {status.data?.account ? ` · ${status.data.account}` : ""}
         </span>
-        <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
-          Replace
-        </Button>
+        {fromVault ? (
+          // Nothing to replace here: the value lives in the vault node and is edited there.
+          // Offering "Replace" would invite someone to shadow their own vault by hand.
+          <span className="text-micro text-ink-faint" data-testid="auth-from-vault">
+            edit it in the vault
+          </span>
+        ) : (
+          <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
+            Replace
+          </Button>
+        )}
       </div>
     );
   }
