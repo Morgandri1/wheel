@@ -318,7 +318,10 @@ top-level event (the CLI nests tool output inside JSON strings; the agent-sdk br
 ```
 GET    /v1/board                          → { nodes: [Node+state], project: {...} }
 POST   /v1/nodes                          → create (validates name, type, config)
-PATCH  /v1/nodes/:id                      → name/position/config (partial)
+PATCH  /v1/nodes/:id                      → name/position/config (partial). Renaming an AGENT while it is running/starting → 409 `agent_running`
+                                            (its name is embedded in every peer's preamble and in its own session; stop or park it first — the UI disables
+                                            rename with that reason). Non-agent nodes rename any time: `t_<name>` tables rename atomically; peers using
+                                            the old name get exit 4 (missing) and re-read `wheel connections`. Wires/tokens key on id, never on name.
 DELETE /v1/nodes/:id                      → cascades wires; drops t_ table / chest dir
 POST   /v1/wires      {from,to,type}      → validated against the matrix
 DELETE /v1/wires      {from,to,type}

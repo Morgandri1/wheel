@@ -1,0 +1,25 @@
+# wheel-api — public gateway, api.wheel.dev, horizontally scaled.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "docker/Dockerfile.api"
+
+[deploy]
+# Stateless by construction: no in-memory state that matters across requests. The JWKS cache is
+# per-replica (it caches public keys, so the only cost is one extra fetch per replica per rotation)
+# and the ingress rate limiter counts in Postgres so the limit does not weaken as replicas scale.
+numReplicas = 2
+healthcheckPath = "/healthz"
+healthcheckTimeout = 10
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# Required env (set in the Railway service, not here):
+#   DATABASE_URL         — Railway Postgres
+#   CLERK_JWKS_URL, CLERK_ISSUER
+#   API_MASTER_KEY       — openssl rand -base64 32
+#   WHEEL_HOST_URL       — http://wheel-host.railway.internal:7100
+#   WHEEL_HOST_SECRET    — shared with the host service; never exposed to a sandbox
+#   PUBLIC_BASE_URL      — https://api.wheel.dev
+#   CORS_ALLOWED_ORIGINS — https://wheel.dev,https://www.wheel.dev
+#   WHEEL_ENV=prod       — and AUTH_DEV_SECRET must be UNSET, or the process refuses to boot

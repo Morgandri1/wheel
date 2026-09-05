@@ -1,0 +1,23 @@
+# wheel-host — sandbox supervisor. Exactly one replica, the biggest machine available.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "docker/Dockerfile.host"
+
+[deploy]
+# MUST stay at 1. The host owns per-project sandboxes and a sqlite state file on a Railway volume;
+# a second replica would fight it for both, and two supervisors reconciling the same projects would
+# start and stop each other's engines.
+numReplicas = 1
+healthcheckPath = "/host/v1/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# No public domain. Reachable only at wheel-host.railway.internal:7100 over private networking.
+# Railway volume mounted at /data (sqlite host.db + per-project data dirs).
+#
+# Required env:
+#   WHEEL_HOST_SECRET  — shared with the API; must never appear in a sandbox's environment
+#   SANDBOX_BACKEND    — "process" in production (no docker daemon on Railway); "docker" locally
+#   WHEEL_DATA_DIR     — /data
