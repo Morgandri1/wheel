@@ -27,8 +27,13 @@ fn param(name: &str, fill: Fill) -> ToolParam {
 
 fn cfg(base: &str, ops: Vec<ToolOperation>) -> NodeConfig {
     NodeConfig::Tool(ToolConfig {
+        kind: ToolKind::Http,
+        source: ToolSource {
+            format: ToolFormat::Openapi,
+            raw: "{}".into(),
+            imported_at: Timestamp::parse_rfc3339("2026-09-05T00:00:00Z").unwrap(),
+        },
         base_url: base.into(),
-        source_format: Some(ToolFormat::Openapi3),
         operations: ops,
     })
 }

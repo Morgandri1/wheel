@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+pub mod board;
+
 /// Open (creating if needed) and migrate the project database.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {

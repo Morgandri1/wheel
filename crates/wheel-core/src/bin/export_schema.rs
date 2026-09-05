@@ -40,6 +40,8 @@ fn main() -> std::io::Result<()> {
     write::<Position>(&dir, "position")?;
     write::<ToolConfig>(&dir, "tool-config")?;
     write::<ToolOperation>(&dir, "tool-operation")?;
+    write::<ToolSource>(&dir, "tool-source")?;
+    write::<EndpointAuth>(&dir, "endpoint-auth")?;
     // Runtime.
     write::<AgentState>(&dir, "agent-state")?;
     write::<NodeState>(&dir, "node-state")?;

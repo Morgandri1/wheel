@@ -86,6 +86,7 @@ fn every_node_type_round_trips_with_correct_tag() {
                 method: HttpMethod::Post,
                 path: "/hook".into(),
                 response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::None,
             }),
         ),
         (
@@ -98,11 +99,9 @@ fn every_node_type_round_trips_with_correct_tag() {
         ),
         (
             NodeType::Mcp,
-            NodeConfig::Mcp(McpConfig {
-                transport: McpTransport::Stdio,
-                command: Some("npx".into()),
+            NodeConfig::Mcp(McpConfig::Stdio {
+                command: "npx".into(),
                 args: Some(vec!["-y".into()]),
-                url: None,
                 env: None,
             }),
         ),
@@ -116,8 +115,13 @@ fn every_node_type_round_trips_with_correct_tag() {
         (
             NodeType::Tool,
             NodeConfig::Tool(ToolConfig {
+                kind: ToolKind::Http,
+                source: ToolSource {
+                    format: ToolFormat::Openapi,
+                    raw: "{}".into(),
+                    imported_at: Timestamp::parse_rfc3339("2026-09-05T00:00:00Z").unwrap(),
+                },
                 base_url: "https://api.example.com".into(),
-                source_format: Some(ToolFormat::Openapi3),
                 operations: vec![],
             }),
         ),

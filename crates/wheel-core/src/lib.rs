@@ -36,10 +36,10 @@ pub use message::{
 };
 pub use name::{validate_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES};
 pub use node::{
-    AgentConfig, Budget, ChestConfig, Column, ColumnType, CtxConfig, EndpointConfig, Harness,
-    HttpMethod, McpConfig, McpTransport, Node, NodeConfig, NodeType, Position, ResponseMode,
-    ScriptConfig, ScriptLanguage, TableConfig, VaultConfig, DEFAULT_IDLE_TIMEOUT_SECS,
-    DEFAULT_SCRIPT_TIMEOUT_SECS,
+    AgentConfig, Budget, ChestConfig, Column, ColumnType, CtxConfig, EndpointAuth, EndpointConfig,
+    Harness, HttpMethod, McpConfig, McpTransport, Node, NodeConfig, NodeType, Position,
+    ResponseMode, ScriptConfig, ScriptLanguage, TableConfig, VaultConfig,
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_SCRIPT_TIMEOUT_SECS,
 };
 pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, WireLine};
 pub use spawn::{ListenAddr, ListenAddrError};
@@ -48,10 +48,12 @@ pub use state::{
 };
 pub use timestamp::Timestamp;
 pub use tool::{
-    host_is_denied, ip_is_denied, Fill, FillMode, ParamLocation, ToolConfig, ToolFormat,
-    ToolMethod, ToolOperation, ToolParam,
+    host_is_denied, ip_is_denied, Fill, FillMode, ParamLocation, ToolConfig, ToolFormat, ToolKind,
+    ToolMethod, ToolOperation, ToolParam, ToolSource,
 };
-pub use validate::{normalize_chest_key, validate_config, validate_endpoint_path, ConfigError};
+pub use validate::{
+    normalize_chest_key, url_host, validate_config, validate_endpoint_path, ConfigError,
+};
 pub use wire::{allowed_wires, check_wire, wire_allowed, Wire, WireError, WireSpec, WireType};
 
 /// The implicit primary-key column every `table` node has, in addition to its

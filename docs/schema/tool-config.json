@@ -3,12 +3,17 @@
   "title": "ToolConfig",
   "type": "object",
   "required": [
-    "base_url"
+    "base_url",
+    "kind",
+    "source"
   ],
   "properties": {
     "base_url": {
       "description": "Absolute `http(s)` origin every operation is resolved against.",
       "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/ToolKind"
     },
     "operations": {
       "default": [],
@@ -17,17 +22,11 @@
         "$ref": "#/definitions/ToolOperation"
       }
     },
-    "source_format": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ToolFormat"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "source": {
+      "$ref": "#/definitions/ToolSource"
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "Fill": {
       "description": "How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.",
@@ -52,7 +51,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "FillMode": {
       "description": "How a field is filled when the operation is called (§3d).",
@@ -98,14 +98,49 @@
         "body"
       ]
     },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    },
     "ToolFormat": {
       "description": "The document format a tool node was imported from.",
-      "type": "string",
-      "enum": [
-        "openapi3",
-        "swagger2",
-        "postman21",
-        "insomnia4"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openapi",
+            "swagger2",
+            "postman",
+            "insomnia"
+          ]
+        },
+        {
+          "description": "Operations authored by hand in the UI rather than imported.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    },
+    "ToolKind": {
+      "description": "What kind of tool a `tool` node is (§3d / §3e).",
+      "oneOf": [
+        {
+          "description": "An imported HTTP spec the engine calls directly.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        {
+          "description": "Project-scoped mail relay through the API (§3e, M3).",
+          "type": "string",
+          "enum": [
+            "email"
+          ]
+        }
       ]
     },
     "ToolMethod": {
@@ -158,7 +193,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ToolParam": {
       "type": "object",
@@ -196,7 +232,30 @@
         "schema": {
           "description": "JSON Schema fragment for this field, used to build the MCP input schema."
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "ToolSource": {
+      "description": "Where a tool node's operations came from.\n\n`raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.",
+      "type": "object",
+      "required": [
+        "format",
+        "imported_at"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ToolFormat"
+        },
+        "imported_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "raw": {
+          "description": "The document as imported. Empty for `manual`.",
+          "default": "",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

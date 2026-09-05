@@ -27,6 +27,7 @@ const EXPECTED_ALLOWED: &[(N, W, N)] = &[
     (N::Endpoint, W::Send, N::Agent),
     (N::Endpoint, W::Write, N::Table),
     (N::Endpoint, W::Send, N::Script),
+    (N::Endpoint, W::Read, N::Vault),
     // script →
     (N::Script, W::Send, N::Agent),
     (N::Script, W::Read, N::Ctx),
@@ -38,6 +39,7 @@ const EXPECTED_ALLOWED: &[(N, W, N)] = &[
     (N::Script, W::Read, N::Vault),
     // tool → (§3d: a `vault` fill needs its own wire, so the dependency is
     // visible on the board instead of hidden inside an operation's config)
+    (N::Script, W::Read, N::Tool),
     (N::Tool, W::Read, N::Vault),
 ];
 
@@ -68,7 +70,7 @@ fn every_one_of_the_192_cells_matches_the_contract() {
 #[test]
 fn allowed_count_is_exactly_the_documented_set() {
     assert_eq!(allowed_wires().len(), EXPECTED_ALLOWED.len());
-    assert_eq!(EXPECTED_ALLOWED.len(), 24);
+    assert_eq!(EXPECTED_ALLOWED.len(), 26);
 }
 
 #[test]
@@ -110,10 +112,10 @@ fn a_tools_only_outgoing_wire_is_read_to_a_vault() {
             assert_eq!(wire_allowed(N::Tool, to, ty), expect, "tool --{ty}--> {to}");
         }
     }
-    // Only an agent may reach a tool, and only to read it.
+    // Only an agent or a script may reach a tool, and only to read it.
     for from in N::ALL {
         for ty in W::ALL {
-            let expect = from == N::Agent && ty == W::Read;
+            let expect = matches!(from, N::Agent | N::Script) && ty == W::Read;
             assert_eq!(
                 wire_allowed(from, N::Tool, ty),
                 expect,

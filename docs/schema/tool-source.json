@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolSource",
+  "description": "Where a tool node's operations came from.\n\n`raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.",
+  "type": "object",
+  "required": [
+    "format",
+    "imported_at"
+  ],
+  "properties": {
+    "format": {
+      "$ref": "#/definitions/ToolFormat"
+    },
+    "imported_at": {
+      "$ref": "#/definitions/Timestamp"
+    },
+    "raw": {
+      "description": "The document as imported. Empty for `manual`.",
+      "default": "",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ToolFormat": {
+      "description": "The document format a tool node was imported from.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openapi",
+            "swagger2",
+            "postman",
+            "insomnia"
+          ]
+        },
+        {
+          "description": "Operations authored by hand in the UI rather than imported.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    }
+  }
+}
