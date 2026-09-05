@@ -41,11 +41,15 @@ proven by API's e2e; re-confirmed incidentally.
    URL. Not a vuln today (nothing authenticates via the URL yet), but the browser-WS auth model is
    unresolved. When implemented, it MUST be single-use + expiring + project-bound — I will attack
    replay/cross-project/expiry then. Flagging so it isn't shipped as a plain JWT-in-URL.
-2. **WS-vs-HTTP is decided purely from client `Upgrade`/`Connection` headers**, so any engine route can
-   be coerced onto the WS-bridge path (observed: `/v1/board` + upgrade headers → 502 from the bridge,
-   not a client protocol switch). Harmless against the stub; confirm the real engine's non-WS routes
-   can't be driven into a half-open bridge that ties up a connection (slowloris-style) — a bounded
-   handshake timeout on the bridge covers it.
+2. **[FIXED — API, both hops]** WS-vs-HTTP is decided purely from client `Upgrade`/`Connection`
+   headers, so any route could be coerced onto the WS-bridge path and a slow upstream would hold the
+   connection. API added a 10 s ceiling on the upstream WS handshake in BOTH bridges (proxy.rs AND
+   wheel-host/src/proxy.rs — the host was the real hold-point behind the API). Verified by API against a
+   TCP-accept-then-silent listener (before: hangs; after: resolves in 10 s). Re-test note: you get 502,
+   not 504 — the host times out with a plain HTTP 504, which is not a valid WS handshake, so the API
+   correctly refuses it as bad gateway. NOT independently reproduced here (requires repointing the
+   upstream target, outside my read-only scope) — accepted as API-verified with evidence. Residual
+   (established bridge, no idle/lifetime cap) split out to finding 011.
 
 ## Note
 `/v1/cli/*` through the authenticated proxy: the proxy forwards it and the (bearer-gated) stub returned
