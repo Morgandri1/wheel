@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { deliveryOrder, displayState, nextForAgent } from "@/lib/message-state";
+import {
+  deliveryOrder,
+  displayState,
+  nextForAgent,
+  senderKind,
+  senderLabel,
+} from "@/lib/message-state";
 import type { Message, MessageSender } from "@/lib/schema";
 
 const AGENT = "agent-1";
@@ -97,5 +103,40 @@ describe("display state", () => {
     expect(d.state).toBe("blocked");
     expect(d.tone).toBe("error");
     expect(d.detail).toContain("harness context limit");
+  });
+});
+
+describe("how a sender is named", () => {
+  it("names a node sender by its address, and says what kind of node it is", () => {
+    expect(senderLabel(FROM_AGENT)).toBe("researcher");
+    expect(senderKind(FROM_AGENT)).toBe("agent");
+    const endpoint: MessageSender = { kind: "node", id: "e", name: "inbound", type: "endpoint" };
+    expect(senderLabel(endpoint)).toBe("inbound");
+    expect(senderKind(endpoint)).toBe("endpoint");
+  });
+
+  it("speaks to the operator in the second person about their own messages", () => {
+    expect(senderLabel(FROM_USER)).toBe("you");
+    expect(senderKind(FROM_USER)).toBe("user");
+  });
+
+  it("attributes engine-originated messages to the engine, not to a node", () => {
+    const system: MessageSender = { kind: "system" };
+    expect(senderLabel(system)).toBe("engine");
+    expect(senderKind(system)).toBe("system");
+  });
+});
+
+describe("naming a sender", () => {
+  it("names a node by its address, since that is what people wire and message", () => {
+    expect(senderLabel(FROM_AGENT)).toBe("researcher");
+    expect(senderKind(FROM_AGENT)).toBe("agent");
+  });
+
+  it("distinguishes the operator from the engine itself", () => {
+    expect(senderLabel(FROM_USER)).toBe("you");
+    expect(senderKind(FROM_USER)).toBe("user");
+    expect(senderLabel({ kind: "system" })).toBe("engine");
+    expect(senderKind({ kind: "system" })).toBe("system");
   });
 });

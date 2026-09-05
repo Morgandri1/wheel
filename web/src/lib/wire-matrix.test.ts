@@ -2,11 +2,16 @@ import { describe, expect, it } from "vitest";
 import { NODE_TYPES, WIRE_TYPES, type WireType } from "@/lib/schema";
 import {
   WIRE_MATRIX,
+  allowedWireRules,
+  hasIncomingWires,
+  impliesRead,
+  isInjection,
   allowedWireTypes,
   canConnect,
   connectableTargets,
   explainDenial,
   hasOutgoingWires,
+  impliesRead,
   isWireAllowed,
   wireRule,
 } from "@/lib/wire-matrix";
@@ -119,5 +124,65 @@ describe("explainDenial", () => {
     expect(explainDenial("researcher", "agent", "notes", "ctx", "send")).toBe(
       "A agent cannot send a ctx. Legal here: read, write.",
     );
+  });
+});
+
+describe("write implies read", () => {
+  it("says so on the keyspaces where §3 makes write the wider grant", () => {
+    for (const to of ["ctx", "table", "chest"] as const) {
+      expect(impliesRead("agent", to), `agent→${to}`).toBe(true);
+    }
+  });
+
+  it("says nothing of the sort where write is not on offer at all", () => {
+    expect(impliesRead("agent", "vault")).toBe(false);
+    expect(impliesRead("agent", "agent")).toBe(false);
+    expect(impliesRead("agent", "mcp")).toBe(false);
+    expect(impliesRead("table", "agent")).toBe(false);
+  });
+
+  it("is not claimed for endpoint → table, where write is the only thing granted", () => {
+    expect(allowedWireTypes("endpoint", "table")).toEqual(["write"]);
+    expect(impliesRead("endpoint", "table")).toBe(false);
+  });
+});
+
+describe("the helpers the popover and inspector call", () => {
+  it("hands the popover a rule per legal type, with its own language", () => {
+    const rules = allowedWireRules("agent", "ctx");
+    expect(rules.map((r) => r.type)).toEqual(["read", "write"]);
+    expect(new Set(rules.map((r) => r.grants)).size).toBe(2);
+    expect(allowedWireRules("agent", "endpoint")).toEqual([]);
+  });
+
+  it("says which types can be wired TO at all", () => {
+    expect(hasIncomingWires("agent")).toBe(true);
+    expect(hasIncomingWires("vault")).toBe(true);
+    expect(hasIncomingWires("tool")).toBe(true);
+    // Nothing may point at an endpoint: hits come in from outside, they are not routed to it.
+    expect(hasIncomingWires("endpoint")).toBe(false);
+  });
+
+  it("lists what a source can reach, without duplicates", () => {
+    const targets = connectableTargets("agent");
+    expect(new Set(targets).size).toBe(targets.length);
+    expect(targets).toContain("tool");
+    expect(targets).not.toContain("endpoint");
+    expect(connectableTargets("vault")).toEqual([]);
+  });
+
+  it("reports write-implies-read only where §3 says so", () => {
+    expect(impliesRead("agent", "ctx")).toBe(true);
+    expect(impliesRead("agent", "table")).toBe(true);
+    expect(impliesRead("agent", "chest")).toBe(true);
+    // A vault has no write wire at all, so there is nothing for read to be implied by.
+    expect(impliesRead("agent", "vault")).toBe(false);
+    expect(impliesRead("endpoint", "table")).toBe(false);
+  });
+
+  it("marks exactly one wire in the whole matrix as an injection", () => {
+    const injections = WIRE_MATRIX.filter((r) => isInjection(r.from, r.to, r.type));
+    expect(injections).toHaveLength(1);
+    expect(injections[0]).toMatchObject({ from: "ctx", to: "agent", type: "send" });
   });
 });

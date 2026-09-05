@@ -31,6 +31,7 @@ import {
   type ProjectRecord,
 } from "./state";
 import { seed } from "./fixtures";
+import { assertMatrixMatchesEngine } from "./assert-matrix";
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787);
 const ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"];
@@ -487,8 +488,11 @@ function attach(ws: WebSocket, record: ProjectRecord) {
   ws.on("error", () => record.listeners.delete(listener));
 }
 
+const allowedWireCount = assertMatrixMatchesEngine();
+
 server.listen(PORT, () => {
   const [first] = [...projects.values()];
   console.log(`mock api on http://localhost:${PORT}`);
   console.log(`seeded project: ${first?.project.name} (${first?.project.id})`);
+  console.log(`wire matrix agrees with the engine's export (${allowedWireCount} allowed triples)`);
 });
