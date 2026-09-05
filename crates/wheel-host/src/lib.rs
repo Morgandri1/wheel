@@ -34,6 +34,35 @@ pub struct HostState {
     pub http: reqwest::Client,
 }
 
+/// Build the sandbox backend named by configuration.
+///
+/// Kept in the library rather than in `main` so the selection — including the refusal to start on
+/// a backend that is not implemented — is testable. Starting with a backend that silently does
+/// nothing would look healthy while every project stayed dead.
+pub fn build_sandbox(cfg: &config::Config) -> anyhow::Result<Arc<dyn Sandbox>> {
+    Ok(match cfg.backend {
+        config::Backend::Docker => Arc::new(sandbox::docker::DockerSandbox::connect(cfg.clone())?),
+        config::Backend::External => Arc::new(sandbox::external::ExternalSandbox::new(
+            cfg.engine_base_url.clone(),
+        )),
+        config::Backend::Process => {
+            anyhow::bail!("the process sandbox backend is not implemented yet (M3)")
+        }
+    })
+}
+
+/// Assemble the running state: sandbox backend, durable store, and an http client for the proxy.
+pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
+    let sandbox = build_sandbox(&cfg)?;
+    let store = Arc::new(store::Store::open(&format!("{}/host.db", cfg.data_dir))?);
+    Ok(HostState {
+        cfg,
+        sandbox,
+        store,
+        http: reqwest::Client::new(),
+    })
+}
+
 /// Restart whatever was running before we went down.
 ///
 /// The host is deliberately a single instance, so nothing else will notice that a project's engine
