@@ -34,8 +34,45 @@ def api(method, path, body=None, token=None):
                  body=body, base=BASE, timeout=30)
 
 
+def _first_diff(got: bytes, want: bytes) -> str:
+    """Say WHERE two bodies diverge; "204800 != 204800" tells nobody anything."""
+    if got == want:
+        return ""
+    if len(got) != len(want):
+        return "length %d != %d" % (len(got), len(want))
+    for i, (a, b) in enumerate(zip(got, want)):
+        if a != b:
+            lo = max(0, i - 24)
+            return ("first difference at byte %d: got %r want %r | context got=%r want=%r"
+                    % (i, bytes([a]), bytes([b]), got[lo:i + 24], want[lo:i + 24]))
+    return "unknown difference"
+
+
 def sh(*args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def sh_bytes(*args, **kw):
+    """Capture stdout as RAW BYTES.
+
+    `text=True` turns on universal-newline translation, which rewrites a lone \r to \n —
+    a SAME-LENGTH substitution. A byte-exactness assertion made through it compares the
+    engine's output against a mangled copy of it and reports a failure with matching byte
+    counts, which is exactly how this first showed up. Anything asserting byte-exactness
+    has to read bytes.
+    """
+    return subprocess.run(args, capture_output=True, **kw)
+
+
+def sh_bytes(*args, **kw):
+    """Like sh(), but stdout stays RAW.
+
+    text=True enables universal-newline translation, which rewrites \r\n -> \n and a
+    lone \r -> \n. The byte-exactness fixture deliberately contains both, so comparing
+    a decoded string against the original reports a mismatch that the transport never
+    made — it nearly cost SDK a false S1. Byte claims must be tested in bytes.
+    """
+    return subprocess.run(args, capture_output=True, **kw)
 
 
 def wheel(node_id, *argv, env=None):
@@ -208,15 +245,20 @@ def main():
                     rec.get("bytes") == len(body), "receipt=%s want=%d" % (rec.get("bytes"), len(body)))
 
             if rec.get("id"):
-                got = sh("docker", "exec",
-                         "-e", "WHEEL_TOKEN_FILE=/data/run/%s/token" % bob,
-                         "-e", "WHEEL_ENGINE_URL=http://127.0.0.1:7000",
-                         NAME, "wheel", "inbox", rec["id"])
+                got = sh_bytes("docker", "exec",
+                               "-e", "WHEEL_TOKEN_FILE=/data/run/%s/token" % bob,
+                               "-e", "WHEEL_ENGINE_URL=http://127.0.0.1:7000",
+                               NAME, "wheel", "inbox", rec["id"])
                 R.check("MSG-inbox-reread: the recipient can re-read it, exit 0",
-                        got.returncode == 0, (got.stderr or "").strip()[:160])
+                        got.returncode == 0, (got.stderr or b"").decode("utf-8", "replace").strip()[:160])
+                out = got.stdout
+                # Strip at most ONE trailing newline — the one the CLI adds when printing.
+                # rstrip(b"\n") eats the body's OWN trailing newline too, which reported a
+                # 204799-vs-204800 mismatch on a body that had arrived perfectly intact.
+                trimmed = out[:-1] if out.endswith(b"\n") else out
+                exact = out == body or trimmed == body
                 R.check("MSG-inbox-reread: body comes back BYTE-IDENTICAL to what was sent",
-                        got.stdout.encode() == body or got.stdout.rstrip("\n").encode() == body,
-                        "got %d bytes, sent %d" % (len(got.stdout.encode()), len(body)))
+                        exact, _first_diff(out.rstrip(b"\n"), body))
         else:
             R.check("MSG-byte-exact fixture present", False, "missing " + FIXTURE)
 
@@ -238,11 +280,37 @@ def main():
                 st == 401, "got %s" % st)
 
         # ---- INJ: the ctx wired into alice reached her composed prompt --------
-        st, log, _ = api("GET", "/v1/agents/%s/log" % alice)
-        blob = json.dumps(log)
+        # The child writes system/init asynchronously after start, so reading the log
+        # once races it — an empty log is "not yet", not "absent". Poll to a deadline.
+        # Assert against the COMPOSED PROMPT FILE, not the log. §5b passes the preamble via a
+        # 0600 file rather than argv (argv is world-readable across uids), so the prompt file is
+        # what the child was actually handed. The log only shows it once the child has run and
+        # echoed system/init, so grepping the log races the child and reports "absent" for what
+        # is really "not yet" — which is exactly how this first failed, against a 24-byte log.
+        blob = ""
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            blob = sh("docker", "exec", NAME, "sh", "-c",
+                      "cat /data/run/*/prompt.txt 2>/dev/null || true").stdout
+            if "CANARY-CTX-7f3a" in blob:
+                break
+            st, log, _ = api("GET", "/v1/agents/%s/log" % alice)
+            blob += json.dumps(log)
+            if "CANARY-CTX-7f3a" in blob:
+                break
+            time.sleep(1)
+        # An empty log is a mystery unless we say WHY the agent produced nothing, so carry
+        # its status and last_error into the failure message instead of just a byte count.
+        _, board, _ = api("GET", "/v1/board")
+        state = {}
+        for n in (board or {}).get("nodes", []) or []:
+            if n.get("id") == alice:
+                state = n.get("state") or {}
+        why = "status=%s last_error=%s session=%s" % (
+            state.get("status"), str(state.get("last_error"))[:120], state.get("session_id"))
         R.check("INJ-on-start: the wired ctx canary appears in the agent's composed prompt",
                 "CANARY-CTX-7f3a" in blob,
-                "not found in %d bytes of log" % len(blob))
+                "not found in %d bytes of log; %s" % (len(blob), why))
         R.check("INJ-unwired-absent: the UNWIRED ctx never reaches the prompt",
                 "you must not read this" not in blob)
     finally:
