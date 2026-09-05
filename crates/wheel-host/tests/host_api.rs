@@ -100,6 +100,9 @@ fn test_config() -> Config {
         nano_cpus: 1_000_000_000,
         pids_limit: 512,
         start_timeout_secs: 30,
+        uid_range_start: 20_000,
+        uid_stride: 64,
+        run_dir: "/tmp/wheel-run-test".into(),
         engine_base_url: "http://127.0.0.1:1".into(),
     }
 }

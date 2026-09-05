@@ -43,22 +43,27 @@ pub struct HostState {
 /// Kept in the library rather than in `main` so the selection — including the refusal to start on
 /// a backend that is not implemented — is testable. Starting with a backend that silently does
 /// nothing would look healthy while every project stayed dead.
-pub fn build_sandbox(cfg: &config::Config) -> anyhow::Result<Arc<dyn Sandbox>> {
+pub fn build_sandbox(
+    cfg: &config::Config,
+    store: Arc<store::Store>,
+) -> anyhow::Result<Arc<dyn Sandbox>> {
     Ok(match cfg.backend {
         config::Backend::Docker => Arc::new(sandbox::docker::DockerSandbox::connect(cfg.clone())?),
         config::Backend::External => Arc::new(sandbox::external::ExternalSandbox::new(
             cfg.engine_base_url.clone(),
         )),
+        // The process backend allocates a uid per project, so it needs the durable store the
+        // allocation lives in — a uid derived fresh each boot would move a project's files.
         config::Backend::Process => {
-            anyhow::bail!("the process sandbox backend is not implemented yet (M3)")
+            Arc::new(sandbox::process::ProcessSandbox::new(cfg.clone(), store))
         }
     })
 }
 
 /// Assemble the running state: sandbox backend, durable store, and an http client for the proxy.
 pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
-    let sandbox = build_sandbox(&cfg)?;
     let store = Arc::new(store::Store::open(&format!("{}/host.db", cfg.data_dir))?);
+    let sandbox = build_sandbox(&cfg, store.clone())?;
     Ok(HostState {
         cfg,
         sandbox,

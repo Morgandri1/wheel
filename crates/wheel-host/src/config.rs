@@ -26,6 +26,12 @@ pub struct Config {
     pub nano_cpus: i64,
     pub pids_limit: i64,
     pub start_timeout_secs: u64,
+    /// First uid handed to a project in the process backend.
+    pub uid_range_start: u32,
+    /// How many consecutive uids each project owns: the engine at `base`, its nodes above it.
+    pub uid_stride: u32,
+    /// Where per-project engine sockets live. One 0700 directory per project underneath.
+    pub run_dir: String,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
 }
@@ -84,6 +90,9 @@ impl Config {
             nano_cpus: (parse_or("CONTAINER_CPUS", 1.0f64)? * 1e9) as i64,
             pids_limit: parse_or("CONTAINER_PIDS_LIMIT", 512i64)?,
             start_timeout_secs: parse_or("START_TIMEOUT_SECS", 30u64)?,
+            uid_range_start: parse_or("UID_RANGE_START", 20_000u32)?,
+            uid_stride: parse_or("UID_STRIDE", 64u32)?,
+            run_dir: var_or("WHEEL_RUN_DIR", "/run/wheel"),
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }

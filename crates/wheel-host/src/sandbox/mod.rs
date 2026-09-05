@@ -7,6 +7,7 @@
 
 pub mod docker;
 pub mod external;
+pub mod process;
 
 use anyhow::Result;
 use async_trait::async_trait;
