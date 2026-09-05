@@ -29,7 +29,7 @@ fi
 #             In CI that is a broken pipeline pretending to be a passing one, so strict
 #             mode FAILS on it. This is the distinction that keeps `check-strict` honest
 #             without making CI red for a reason no one can act on.
-PASS=(); FAIL=(); ABSENT=(); UNAVAIL=()
+PASS=(); FAIL=(); ABSENT=(); UNAVAIL=(); CONTENDED=()
 STRICT="${CHECK_STRICT:-0}"   # CI sets 1: UNAVAIL becomes a failure
 COVERAGE="${COVERAGE:-0}"     # coverage is opt-in locally (slow, memory-hungry); CI sets 1
 COV_MIN="${COV_MIN:-90}"      # ARCHITECTURE.md §0b
@@ -47,6 +47,9 @@ step() { # step <name> <cmd...>
   if [ $rc -eq 0 ]; then
     PASS+=("$name (${t1}s)")
     printf '%s  ✓ %s%s (%ss)\n' "$G" "$name" "$Z" "$t1"
+  elif [ $rc -eq 75 ]; then
+    CONTENDED+=("$name")
+    printf '%s  ⊘ %s did not run — another worktree held the cargo lock%s\n' "$Y" "$name" "$Z"
   elif [ $rc -eq 77 ]; then
     UNAVAIL+=("$name — the gate reported it could not run")
     printf '%s  ⊘ %s skipped (could not run)%s\n' "$Y" "$name" "$Z"
@@ -194,12 +197,25 @@ printf '%s──────── make check ────────%s\n' "$B"
 for p in "${PASS[@]:-}"; do [ -n "$p" ] && printf '%s  pass%s  %s\n' "$G" "$Z" "$p"; done
 for a in "${ABSENT[@]:-}"; do [ -n "$a" ] && printf '%s  n/a %s  %s\n' "$Y" "$Z" "$a"; done
 for u in "${UNAVAIL[@]:-}"; do [ -n "$u" ] && printf '%s  SKIP%s  %s\n' "$Y" "$Z" "$u"; done
+for c in "${CONTENDED[@]:-}"; do [ -n "$c" ] && printf '%s  LOCK%s  %s — another worktree held the cargo lock\n' "$Y" "$Z" "$c"; done
 for f in "${FAIL[@]:-}"; do [ -n "$f" ] && printf '%s  FAIL%s  %s\n' "$R" "$Z" "$f"; done
 echo
 
-NF=${#FAIL[@]}; NU=${#UNAVAIL[@]}; NA=${#ABSENT[@]}
+NF=${#FAIL[@]}; NU=${#UNAVAIL[@]}; NA=${#ABSENT[@]}; NC=${#CONTENDED[@]}
 if [ "$NF" -gt 0 ]; then
   printf '%s✗ make check FAILED — %d gate(s) red.%s Fix before merging to main.\n' "$R" "$NF" "$Z"
+  exit 1
+fi
+# Contention is not failure and not a skip: it is "no verdict yet". Six worktrees share one
+# cargo lock, so a busy host can turn every Rust gate into a not-run — and a mostly-green
+# check with a few grey lines is exactly what a person merges on. The run therefore exits
+# non-zero and says the word INCONCLUSIVE, because "I could not check" must never read as
+# "the check passed". Re-running is the whole fix; nothing is broken.
+if [ "$NC" -gt 0 ]; then
+  printf '%s✗ make check INCONCLUSIVE — %d gate(s) never ran: the cargo lock was held\n' "$R" "$NC"
+  printf '  by another worktree for longer than WHEEL_LOCK_TIMEOUT (%ss).%s\n' "${WHEEL_LOCK_TIMEOUT:-1800}" "$Z"
+  printf '  Nothing is broken and nothing is proven. Run it again when the host is quieter,\n'
+  printf '  or raise WHEEL_LOCK_TIMEOUT. Do NOT merge on this result.\n'
   exit 1
 fi
 if [ "$STRICT" = "1" ] && [ "$NU" -gt 0 ]; then
