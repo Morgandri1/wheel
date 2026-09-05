@@ -5,6 +5,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { isWireAllowed } from "@/lib/wire-matrix";
+import { deliveryOrder } from "@/lib/message-state";
 import type {
   AgentNode,
   AgentState,
@@ -218,14 +219,20 @@ export function deliver(record: ProjectRecord, to: AgentNode, fromName: string, 
   return message;
 }
 
+function emitMessage(record: ProjectRecord, message: Message) {
+  emit(record, { type: "message", project_id: record.project.id, ts: now(), message: { ...message } });
+}
+
 function drain(record: ProjectRecord, node: AgentNode) {
   const status = node.state?.status;
   if (status !== "idle") return;
-  const pending = record.messages.find((m) => m.to_node === node.name && m.state === "queued");
+  // §3c #12: the user's message is ordered ahead of queued agent/endpoint/script messages.
+  const pending = deliveryOrder(record.messages, node.name)[0];
   if (!pending) return;
 
   pending.delivered_at = now();
   pending.state = "delivered";
+  emitMessage(record, pending);
   setAgentState(record, node, { status: "running", last_activity: now() });
   appendLog(
     record,
@@ -243,6 +250,7 @@ function drain(record: ProjectRecord, node: AgentNode) {
   later(record, 1800, () => {
     pending.consumed_at = now();
     pending.state = "consumed";
+    emitMessage(record, pending);
     const reply = messageRow({
       from: node.name,
       fromType: "agent",

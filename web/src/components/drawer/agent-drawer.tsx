@@ -6,10 +6,21 @@ import { Button } from "@/components/ui";
 import { toastError } from "@/components/ui/toast";
 import { useBoardStore } from "@/store/board";
 import { AGENT_STATUS_META } from "@/lib/node-meta";
+import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
+import { displayState } from "@/lib/message-state";
+import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
 import type { EngineApi } from "@/lib/api";
-import type { WheelNode } from "@/lib/schema";
+import type { Message, WheelNode } from "@/lib/schema";
 
-export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi }) {
+export function AgentDrawer({
+  nodes,
+  api,
+  projectId,
+}: {
+  nodes: WheelNode[];
+  api: EngineApi;
+  projectId: string;
+}) {
   const tabs = useBoardStore((s) => s.drawerTabs);
   const activeTab = useBoardStore((s) => s.activeTab);
   const open = useBoardStore((s) => s.drawerOpen);
@@ -27,6 +38,11 @@ export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi
 
   const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const node = activeTab ? byId.get(activeTab) : null;
+
+  // §3c #12: the chat box is a draft until Send, kept per agent so a reload never eats it.
+  useEffect(() => {
+    setDraft(activeTab ? readDraft(projectId, activeTab) : "");
+  }, [activeTab, projectId]);
 
   // Backfill the log once per tab; the WS carries everything after that.
   useEffect(() => {
@@ -46,17 +62,30 @@ export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi
     ? messages.filter((m) => m.to_node === activeTab || m.from_node === activeTab)
     : [];
 
+  const body = draft.trim();
+  const bytes = byteLength(body);
+  // §3c #6: refuse before sending, and say how much to trim, rather than failing downstream.
+  const overLimit = checkLimit("messageBytes", bytes);
+
   const send = async () => {
-    if (!activeTab || !draft.trim()) return;
+    if (!activeTab || !body || overLimit) return;
     setSending(true);
     try {
-      await api.agent(activeTab).send(draft.trim());
+      await api.agent(activeTab).send(body);
+      // The row is created queued; the WS `message` event drives it to delivered and consumed.
       setDraft("");
+      clearDraft(projectId, activeTab);
     } catch (e) {
-      toastError(e, "Couldn't deliver that message.");
+      // Keep the draft: it is the person's text, and the send did not happen.
+      toastError(e, "Couldn't queue that message.");
     } finally {
       setSending(false);
     }
+  };
+
+  const onDraftChange = (value: string) => {
+    setDraft(value);
+    if (activeTab) writeDraft(projectId, activeTab, value);
   };
 
   return (
@@ -130,12 +159,23 @@ export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi
               <ul className="h-full overflow-y-auto p-3" data-testid="message-list">
                 {thread.length ? (
                   thread.map((m) => (
-                    <li key={m.id} className="mb-2.5 border-l-2 border-rule pl-2.5">
-                      <p className="text-micro text-ink-faint">
+                    <li
+                      key={m.id}
+                      data-testid={`msg-${m.id}`}
+                      className="mb-2.5 border-l-2 border-rule pl-2.5"
+                    >
+                      <p className="flex flex-wrap items-center gap-x-1.5 text-micro text-ink-faint">
                         <span className="ident text-ink-dim">{m.from_name ?? m.from_node}</span>
-                        {m.from_type ? ` · ${m.from_type}` : ""} ·{" "}
-                        {new Date(m.created_at).toLocaleTimeString()}
-                        {m.delivered_at ? "" : " · queued"}
+                        {m.from_type ? <span>{m.from_type}</span> : null}
+                        <span>{new Date(m.created_at).toLocaleTimeString()}</span>
+                        <MessageStatePill message={m} messages={thread} agentId={activeTab ?? ""} />
+                        <span
+                          className="ident text-ink-faint"
+                          data-testid={`msg-${m.id}-sha`}
+                          title={`sha256 ${m.sha256} · ${m.bytes} bytes as sent`}
+                        >
+                          {m.sha256.slice(0, 8)}
+                        </span>
                       </p>
                       <p className="whitespace-pre-wrap text-meta">{m.body}</p>
                     </li>
@@ -150,13 +190,23 @@ export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi
             )}
           </div>
 
-          <div className="flex shrink-0 items-end gap-2 border-t border-rule p-2">
+          <div className="shrink-0 border-t border-rule p-2">
+            {overLimit ? (
+              <p className="mb-1.5 text-micro text-[var(--danger)]" data-testid="chat-limit-error">
+                {overLimit}
+              </p>
+            ) : bytes > LIMITS.messageBytes * 0.8 ? (
+              <p className="mb-1.5 text-micro text-ink-dim" data-testid="chat-limit-warning">
+                {formatBytes(bytes)} of {formatBytes(LIMITS.messageBytes)}
+              </p>
+            ) : null}
+            <div className="flex items-end gap-2">
             <textarea
               data-testid="chat-input"
               rows={1}
               value={draft}
               placeholder={node ? `Message ${node.name}…` : "Pick an agent"}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => onDraftChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -168,14 +218,49 @@ export function AgentDrawer({ nodes, api }: { nodes: WheelNode[]; api: EngineApi
             <Button
               tone="primary"
               data-testid="chat-send"
-              disabled={!draft.trim() || sending || !activeTab}
+              disabled={!body || sending || !activeTab || Boolean(overLimit)}
               onClick={send}
             >
-              {sending ? "Sending…" : "Send"}
+              {sending ? "Queueing…" : "Send"}
             </Button>
+            </div>
           </div>
         </>
       ) : null}
     </section>
+  );
+}
+
+/** §3c #12: queued (next) → delivered → consumed, so the person sees exactly when it landed. */
+function MessageStatePill({
+  message,
+  messages,
+  agentId,
+}: {
+  message: Message;
+  messages: Message[];
+  agentId: string;
+}) {
+  const d = displayState(message, messages, agentId);
+  const color =
+    d.tone === "error"
+      ? "var(--danger)"
+      : d.tone === "done"
+        ? "var(--ink-faint)"
+        : d.tone === "live"
+          ? "var(--live)"
+          : d.tone === "next"
+            ? "var(--wire-send)"
+            : "var(--ink-dim)";
+  return (
+    <span
+      data-testid={`msg-${message.id}-state`}
+      data-state={d.state}
+      title={d.detail}
+      className="rounded-control border px-1 leading-[1.4]"
+      style={{ color, borderColor: color }}
+    >
+      {d.label}
+    </span>
   );
 }

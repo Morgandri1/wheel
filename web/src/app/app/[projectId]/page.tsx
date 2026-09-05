@@ -152,7 +152,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
             <Canvas nodes={nodes} api={api} onChanged={refetchBoard} />
             <Inspector node={selected} api={api} onChanged={refetchBoard} />
           </div>
-          <AgentDrawer nodes={nodes} api={api} />
+          <AgentDrawer nodes={nodes} api={api} projectId={projectId} />
         </>
       )}
     </div>
