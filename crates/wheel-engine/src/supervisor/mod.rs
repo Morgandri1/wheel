@@ -182,6 +182,12 @@ impl Supervisor {
             self.cfg.listen.client_url(),
         );
         cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
+        // Stored credentials, if any. Absent is not an error: the harness may
+        // hold OAuth credentials in its own config dir, and the authoritative
+        // answer is its probe rather than our guess.
+        for (k, v) in crate::auth::credential_env(&spec.config_dir, agent_cfg.harness) {
+            cmd.env(k, v);
+        }
 
         let mut child = cmd.spawn().context("spawning the harness")?;
         let stdin = child.stdin.take().expect("stdin was piped");
@@ -389,15 +395,39 @@ impl Supervisor {
                 // stderr is log material, never parsed as JSON.
                 log_line_bus(&bus, &conn, agent, "stderr", &line);
             }
-            // The child's stderr closed: classify why it went away. needs_auth
-            // is never inferred from an exit code alone.
+            // The child's stderr closed: classify why it went away.
+            //
+            // Both branches matter. Matching only Misconfigured here silently
+            // DROPPED needs_auth, so an agent with no credentials sat in
+            // whatever status it happened to hold and the operator was never
+            // told to authenticate.
             if !captured.is_empty() {
-                if let StartupFailure::Misconfigured(why) =
-                    harness.classify_startup_failure(None, &captured)
-                {
-                    let conn = db.lock().unwrap();
-                    set_status_db(&conn, agent, AgentStatus::Error, Some(why));
+                let (status, detail) = match harness.classify_startup_failure(None, &captured) {
+                    // Environmental, not poison: the queued message stays
+                    // queued and is delivered on the next start once the
+                    // operator authenticates. Marking it error would consume
+                    // the message and lose it.
+                    StartupFailure::NeedsAuth => (
+                        AgentStatus::NeedsAuth,
+                        Some("the harness has no usable credentials".to_string()),
+                    ),
+                    StartupFailure::Misconfigured(why) => (AgentStatus::Error, Some(why)),
+                };
+                let conn = db.lock().unwrap();
+                // Anything written to the dying child never ran a turn, so it
+                // goes back on the queue rather than being lost as though it
+                // had been handled.
+                let n = messages::requeue_all_undelivered(
+                    &conn,
+                    agent,
+                    "the harness exited before this message could be processed",
+                )
+                .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(agent = %agent, requeued = n, "returned in-flight messages to the queue");
                 }
+                set_status_db(&conn, agent, status, detail);
+                publish_state(&bus, &conn, agent);
             }
         });
     }

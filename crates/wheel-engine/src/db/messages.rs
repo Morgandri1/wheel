@@ -230,6 +230,39 @@ pub fn mark_error(conn: &Connection, id: Uuid, err: &str) -> Result<()> {
 
 /// Record why a message could not be delivered, without consuming it. It stays
 /// `queued` and visible — never silently dropped or truncated (§3c#11).
+/// Return a `delivered` message to `queued` because the child died before it
+/// could consume it.
+///
+/// The ONLY backwards transition, and deliberately not routed through
+/// [`advance`], which refuses to move a message backwards — that refusal is
+/// what makes "consumed exactly once" true and must not be weakened.
+///
+/// It is safe here precisely because delivery did NOT happen in any meaningful
+/// sense: the bytes went into the pipe of a process that then exited without
+/// producing a `result`, so no turn ever ran. Leaving it `delivered` would lose
+/// the message silently, which is the failure §3c#11 exists to prevent.
+/// A `consumed` message is never touched — that turn really did run.
+pub fn requeue_undelivered(conn: &Connection, id: Uuid, reason: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE messages
+         SET state = 'queued', delivered_at = NULL, last_error = ?2
+         WHERE id = ?1 AND state = 'delivered'",
+        params![id.to_string(), reason],
+    )?;
+    Ok(n > 0)
+}
+
+/// Return every `delivered`-but-unconsumed message for an agent to the queue.
+/// Used when a child dies: whatever was in flight never ran.
+pub fn requeue_all_undelivered(conn: &Connection, node: Uuid, reason: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE messages
+         SET state = 'queued', delivered_at = NULL, last_error = ?2
+         WHERE to_id = ?1 AND state = 'delivered'",
+        params![node.to_string(), reason],
+    )?)
+}
+
 pub fn set_last_error(conn: &Connection, id: Uuid, err: &str) -> Result<()> {
     conn.execute(
         "UPDATE messages SET last_error = ?2 WHERE id = ?1",

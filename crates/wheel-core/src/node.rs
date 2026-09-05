@@ -73,6 +73,18 @@ impl NodeType {
     }
 }
 
+impl NodeType {
+    /// "an" before a vowel sound, "a" otherwise — so messages read as English
+    /// rather than "a agent node". Only `agent` and `endpoint` need "an", but
+    /// the rule is written out so a new type gets it right by construction.
+    pub fn article(self) -> &'static str {
+        match self.as_str().chars().next() {
+            Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+            _ => "a",
+        }
+    }
+}
+
 impl std::fmt::Display for NodeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

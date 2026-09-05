@@ -475,3 +475,30 @@ fn the_lagged_frame_is_part_of_the_event_union() {
     let back: Event = serde_json::from_value(v).unwrap();
     assert_eq!(back, e);
 }
+
+/// Denials are read by people, so they should read as English. "a agent node"
+/// was a small but real papercut in the most-seen error message we have.
+#[test]
+fn denial_messages_use_the_right_article() {
+    let err = check_wire(
+        uid(1),
+        NodeType::Agent,
+        uid(2),
+        NodeType::Vault,
+        WireType::Write,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "an agent node may not have a write wire to a vault node"
+    );
+
+    // Both vowel-initial types get "an", every other type gets "a".
+    for t in NodeType::ALL {
+        let expected = match t {
+            NodeType::Agent | NodeType::Endpoint => "an",
+            _ => "a",
+        };
+        assert_eq!(t.article(), expected, "article for {t}");
+    }
+}

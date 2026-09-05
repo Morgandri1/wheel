@@ -272,6 +272,28 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
     Ok(s.unwrap_or_default())
 }
 
+/// Set an agent's status directly. Used by auth to move a node out of
+/// `needs_auth` once credentials arrive, so the queued message that stalled
+/// there is delivered on the next start rather than sitting forever.
+pub fn set_status(
+    conn: &Connection,
+    node: Uuid,
+    status: wheel_core::AgentStatus,
+    err: Option<&str>,
+) {
+    let _ = conn.execute(
+        "INSERT INTO agent_state (node_id,status,last_activity,last_error)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+        params![
+            node.to_string(),
+            status.as_str(),
+            Timestamp::now().to_rfc3339(),
+            err
+        ],
+    );
+}
+
 pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Result<bool> {
     let n = conn.execute(
         "DELETE FROM wires WHERE from_id=?1 AND to_id=?2 AND type=?3",

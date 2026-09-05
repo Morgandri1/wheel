@@ -76,7 +76,11 @@ fn caller(s: &AppState, h: &HeaderMap) -> Result<Caller, ApiError> {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "wire_denied",
-            format!("a {} node may not use the cli", c.node.node_type()),
+            format!(
+                "{} {} node may not use the cli",
+                c.node.node_type().article(),
+                c.node.node_type()
+            ),
         ));
     }
     Ok(c)

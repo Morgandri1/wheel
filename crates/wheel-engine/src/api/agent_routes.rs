@@ -251,3 +251,105 @@ fn status_body(s: &AppState, id: Uuid, fallback: AgentStatus) -> serde_json::Val
         None => serde_json::json!({ "status": fallback.as_str(), "session_id": null }),
     }
 }
+
+// --- auth (§4) --------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AuthComplete {
+    /// API-key mode. OAuth modes carry a `code` instead and land in M2.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// `POST /v1/agents/:id/auth/complete`
+///
+/// API-key mode today. The key is stored in the node's own credential
+/// directory, which is what lets two agents in one sandbox be two accounts.
+pub async fn auth_complete(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AuthComplete>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let harness = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let node = board::get(&conn, id)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+        node.config
+            .as_agent()
+            .ok_or_else(|| ApiError::invalid("not an agent node"))?
+            .harness
+    };
+
+    let Some(key) = body.api_key else {
+        // Be explicit rather than silently succeeding with no credential: a
+        // 200 here would leave the agent unauthenticated but looking fine.
+        return Err(ApiError::invalid(
+            "api_key is required; paste-code and device-code OAuth land in M2",
+        ));
+    };
+
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    crate::auth::store_api_key(&config_dir, &key).map_err(|e| ApiError::invalid(e.to_string()))?;
+    if harness == wheel_core::Harness::Codex {
+        crate::auth::ensure_codex_file_store(&config_dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+
+    // A queued message that stalled on needs_auth is an ENVIRONMENTAL failure,
+    // not a poison message, so it stays queued and the agent is moved back to
+    // stopped — the next start drains it (§ message delivery contract).
+    {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let st = board::agent_state(&conn, id).unwrap_or_default();
+        if st.status == wheel_core::AgentStatus::NeedsAuth {
+            board::set_status(&conn, id, wheel_core::AgentStatus::Stopped, None);
+        }
+    }
+    s.events.publish(wheel_core::Event::BoardChanged {
+        at: wheel_core::Timestamp::now(),
+    });
+
+    Ok(Json(serde_json::json!({
+        "authenticated": true,
+        "mode": "api_key",
+    })))
+}
+
+/// `GET /v1/agents/:id/auth`
+///
+/// Reports whether credentials are STORED, which is not the same as whether
+/// they work — only the harness's own probe can say that, and claiming
+/// otherwise would tell an operator they are authenticated right up until the
+/// first request fails.
+pub async fn auth_status(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let harness = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let node = board::get(&conn, id)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+        node.config
+            .as_agent()
+            .ok_or_else(|| ApiError::invalid("not an agent node"))?
+            .harness
+    };
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    let has_key = crate::auth::read_api_key(&config_dir).is_some();
+
+    Ok(Json(serde_json::json!({
+        "authenticated": crate::auth::has_stored_credentials(&config_dir, harness),
+        "mode": if has_key { "api_key" } else { "oauth" },
+    })))
+}
+
+/// `DELETE /v1/agents/:id/auth` — forget stored credentials.
+pub async fn auth_clear(State(s): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    crate::auth::clear_api_key(&config_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}

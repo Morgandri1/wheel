@@ -192,7 +192,7 @@ pub fn allowed_wires() -> Vec<(NodeType, NodeType, WireType)> {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    #[error("a {from} node may not have a {wire_type} wire to a {to} node")]
+    #[error("{} {from} node may not have a {wire_type} wire to {} {to} node", from.article(), to.article())]
     NotAllowed {
         from: NodeType,
         to: NodeType,
