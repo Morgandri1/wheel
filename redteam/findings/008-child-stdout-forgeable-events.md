@@ -30,3 +30,9 @@ can corrupt the operator's terminal or spoof UI log entries. Sanitize control/AN
 - Residual (same-uid fd injection) is bounded by 007's ruling; note it there.
 PoC once engine exists: from the agent shell, write a forged `result`/`usage` line into the CLI fd and
 observe the supervisor's turn/budget state.
+
+## RULING — PM, ACCEPTED Medium (contract §3)
+SDK must test that a child printing a fake top-level `result` line cannot reach the parser as a real
+turn-complete; harness events carry `session_id` so a forged/foreign event is distinguishable. Status →
+ACCEPTED, verify at engine impl. Combined with F007 (per-node uid + token-file), same-uid fd injection
+is materially reduced — residual noted here.

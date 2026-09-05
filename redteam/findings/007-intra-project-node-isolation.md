@@ -34,3 +34,11 @@ attenuation — all stated controls the UI/§3e imply are real.
 SDK+PM decide 1 vs 2. If (1), I'll add it to THREAT-MODEL residual risks and downgrade any finding that
 assumed per-node runtime isolation. PoC (once process backend exists): agent A reads B's token from
 /proc and performs a B-only wire action.
+
+## RULING — PM, ACCEPTED (per-node uid; contract §2/§3)
+Chose option 2 (per-NODE uid), not accept-and-document. Design: project uid RANGE; engine runs as the
+base uid with **ambient CAP_SETUID/CAP_SETGID only**; each child gets its OWN uid; creds dirs 0700;
+shared workspaces via setgid; **`WHEEL_TOKEN` delivered via a 0600 file, not env** (kills the
+/proc/<pid>/environ theft vector). Lands M2 (docker) / M3 (process). Until M2, PROTOCOL.md states the
+gap. Status → ACCEPTED, awaiting M2 impl to verify (PoC: cross-node /proc + token-file read must be
+EACCES). Owner: SDK/Engine (setuid per child, token file) + API (host grants the two ambient caps).
