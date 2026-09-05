@@ -3,15 +3,14 @@ import { NODE_TYPES, WIRE_TYPES, type WireType } from "@/lib/schema";
 import {
   WIRE_MATRIX,
   allowedWireRules,
-  hasIncomingWires,
-  impliesRead,
-  isInjection,
   allowedWireTypes,
   canConnect,
   connectableTargets,
   explainDenial,
+  hasIncomingWires,
   hasOutgoingWires,
   impliesRead,
+  isInjection,
   isWireAllowed,
   wireRule,
 } from "@/lib/wire-matrix";
@@ -184,5 +183,54 @@ describe("the helpers the popover and inspector call", () => {
     const injections = WIRE_MATRIX.filter((r) => isInjection(r.from, r.to, r.type));
     expect(injections).toHaveLength(1);
     expect(injections[0]).toMatchObject({ from: "ctx", to: "agent", type: "send" });
+  });
+});
+
+describe("helpers the board leans on", () => {
+  it("knows which types can originate a wire at all", () => {
+    expect(hasOutgoingWires("agent")).toBe(true);
+    expect(hasOutgoingWires("ctx")).toBe(true);
+    expect(hasOutgoingWires("endpoint")).toBe(true);
+    expect(hasOutgoingWires("script")).toBe(true);
+    expect(hasOutgoingWires("tool")).toBe(true);
+    for (const t of ["table", "vault", "chest", "mcp"] as const) {
+      expect(hasOutgoingWires(t), t).toBe(false);
+    }
+  });
+
+  it("knows which types can be pointed at", () => {
+    for (const t of ["agent", "ctx", "table", "vault", "chest", "script", "mcp", "tool"] as const) {
+      expect(hasIncomingWires(t), t).toBe(true);
+    }
+    // Nothing on the board may point at an endpoint; the internet does that.
+    expect(hasIncomingWires("endpoint")).toBe(false);
+  });
+
+  it("lists a source's reachable targets without repeating one that allows two wire types", () => {
+    const targets = connectableTargets("agent");
+    expect(new Set(targets).size).toBe(targets.length);
+    expect(targets).toContain("ctx");
+    expect(targets).toContain("tool");
+    expect(targets).not.toContain("endpoint");
+    expect(connectableTargets("vault")).toEqual([]);
+  });
+
+  it("returns the rules behind the offered types, in the same order", () => {
+    const rules = allowedWireRules("agent", "chest");
+    expect(rules.map((r) => r.type)).toEqual(allowedWireTypes("agent", "chest"));
+    expect(rules.every((r) => r.grants === r.outgoing)).toBe(true);
+  });
+
+  it("says where write quietly carries read with it", () => {
+    expect(impliesRead("agent", "chest")).toBe(true);
+    expect(impliesRead("agent", "table")).toBe(true);
+    // A wire with no write at all cannot imply anything.
+    expect(impliesRead("agent", "vault")).toBe(false);
+    expect(impliesRead("agent", "agent")).toBe(false);
+  });
+
+  it("names the legal types when only the wire type was wrong", () => {
+    expect(explainDenial("a", "agent", "notes", "ctx", "send")).toContain("read");
+    expect(explainDenial("a", "agent", "notes", "ctx")).toContain("notes");
   });
 });
