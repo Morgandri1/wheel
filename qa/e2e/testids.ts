@@ -6,46 +6,86 @@
  * do with whether the product works — which is how E2E suites earn their reputation and
  * then get ignored.
  *
- * QA proposes these names; Web owns them. If Web already has a convention, this file
- * changes and nothing else does.
+ * WEB OWNS THESE NAMES. This file previously carried names QA had proposed before Web
+ * shipped, and 21 of 27 did not exist — the suite would have failed wholesale, 30s into
+ * a browser launch, for reasons unrelated to the product. It is now reconciled against
+ * web/src, and `qa/contract/testid_parity.py` fails `make check` the moment it drifts
+ * again, in under a second and without launching anything.
  */
 export const T = {
-  // landing + auth
-  landingHero: "landing-hero",
-  signInButton: "sign-in",
-  appRoot: "app-root",
+  // landing + navigation
+  ctaApp: "cta-app",
+  linkHome: "link-home",
+  linkProjects: "link-projects",
 
   // projects
-  projectNew: "project-new",
-  projectNameInput: "project-name-input",
-  projectCreateSubmit: "project-create-submit",
-  projectCard: (id: string) => `project-card-${id}`,
-  projectStatus: "project-status",
+  projectList: "project-list",
+  projectNew: "btn-new-project",
+  projectNewEmpty: "btn-new-project-empty",
+  projectNameInput: "input-project-name",
+  projectCreateSubmit: "btn-create-project",
+  projectStart: "btn-start-project",
+  projectLink: (id: string) => `project-link-${id}`,
+  projectDeleteConfirmInput: "input-confirm-delete",
+  projectDeleteConfirm: "btn-confirm-delete",
 
   // board canvas
-  board: "board",
+  board: "board-canvas",
+  boardProjectName: "board-project-name",
+  palette: "palette",
   paletteNode: (type: string) => `palette-${type}`,
-  node: (name: string) => `node-${name}`,
-  nodeStatus: (name: string) => `node-status-${name}`,
-  wire: (from: string, to: string, type: string) => `wire-${from}-${to}-${type}`,
-  wireError: "wire-error",
+  node: (id: string) => `node-${id}`,
+  nodeName: (id: string) => `node-name-${id}`,
+  nodeStart: (id: string) => `btn-start-${id}`,
+  nodeStop: (id: string) => `btn-stop-${id}`,
+  nodeDelete: (id: string) => `btn-delete-${id}`,
+  wire: (id: string) => `wire-${id}`,
+  wireOption: (type: string) => `wire-option-${type}`,
+  wireLegend: "wire-legend",
+  widePopover: "wire-popover",
 
-  // inspector
-  inspector: "inspector",
-  inspectorField: (key: string) => `inspector-field-${key}`,
-  inspectorSave: "inspector-save",
+  // the UI's channel for a refused action (illegal wire, engine refusal)
+  toast: "toast",
 
-  // agent drawer
-  agentStart: "agent-start",
-  agentStop: "agent-stop",
-  agentLog: "agent-log",
-  agentLogLine: "agent-log-line",
+  // inspector — Web namespaces per node type rather than a generic field map
+  inspectorEmpty: "inspector-empty",
+  inspectorAgentHarness: "inspector-agent-harness",
+  inspectorAgentModel: "inspector-agent-model",
+  inspectorAgentSystemPrompt: "inspector-agent-system-prompt",
+  inspectorCtxMarkdown: "inspector-ctx-markdown",
+  ctxPreview: "ctx-preview",
+  agentSave: "btn-agent-save",
+  ctxSave: "btn-ctx-save",
+
+  // agent drawer, logs and chat
+  agentDrawer: "agent-drawer",
+  drawerToggle: "btn-drawer-toggle",
+  drawerTab: (name: string) => `drawer-tab-${name}`,
+  agentStart: "btn-agent-start",
+  agentStop: "btn-agent-stop",
+  agentRestart: "btn-agent-restart",
+  agentClear: "btn-agent-clear",
+  openLog: "btn-open-log",
+  logStream: "log-stream",
+  logLine: "log-line",
+  logEmpty: "log-empty",
   chatInput: "chat-input",
   chatSend: "chat-send",
-  messageRow: (id: string) => `message-${id}`,
-  messageState: (id: string) => `message-state-${id}`,
+  chatInterrupt: "chat-interrupt",
+  chatLimitWarning: "chat-limit-warning",
+  chatLimitError: "chat-limit-error",
+  messageList: "message-list",
+  message: (id: string) => `msg-${id}`,
 
-  // vault
-  vaultKeyRow: (key: string) => `vault-key-${key}`,
-  vaultValueInput: "vault-value-input",
+  // auth (per-agent harness login)
+  authenticate: "btn-authenticate",
+  authFlow: "auth-flow",
+  authMode: "auth-mode",
+  authLink: "auth-link",
+  authCodeInput: "input-auth-code",
+  apiKeyInput: "input-api-key",
+  authComplete: "btn-auth-complete",
+
+  // connection health
+  connIndicator: "conn-indicator",
 } as const;
