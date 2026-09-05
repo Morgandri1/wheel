@@ -86,7 +86,10 @@ test.describe("M1 vertical slice", () => {
       // E2E-inspector: selecting the ctx node shows its markdown, canary included.
       await page.getByTestId(T.node("house-style")).click();
       await expect(page.getByTestId(T.inspectorEmpty)).toHaveCount(0);
-      await expect(page.getByTestId(T.inspectorCtxMarkdown)).toHaveValue(
+      // Monaco is canvas-and-divs, not a form control, so the container has no `value` to read.
+      // Web publishes the editor's current text as an attribute for exactly this assertion.
+      await expect(page.getByTestId(T.inspectorCtxMarkdown)).toHaveAttribute(
+        "data-markdown",
         new RegExp(CTX_CANARY),
       );
     } finally {
