@@ -9,6 +9,14 @@ mint() is copied from infra/dev/e2e.py (API's implementation, per their instruct
 reuse rather than reinvent the token format).
 """
 import base64, hashlib, hmac, json, os, time, urllib.error, urllib.request, uuid
+from collections import namedtuple
+
+# Tuple-unpackable AND attribute-addressable: `st, body, hdrs = call(...)` and
+# `call(...).status` both work. Two suites were written against different shapes of this
+# return value; rather than rewrite one of them (and break whichever I did not run), the
+# value satisfies both.
+Response = namedtuple("Response", "status body headers")
+Response.json = property(lambda self: self.body)
 
 API = os.environ.get("WHEEL_API_URL", "http://localhost:8080")
 ISSUER = os.environ.get("CLERK_ISSUER", "https://dev.wheel.local")
@@ -59,13 +67,13 @@ def call(method, path, token=None, body=None, headers=None, base=None, timeout=6
     try:
         with urllib.request.urlopen(req, data, timeout=timeout) as r:
             txt = r.read().decode(errors="replace")
-            return r.status, (json.loads(txt) if txt.strip() else None), dict(r.headers)
+            return Response(r.status, (json.loads(txt) if txt.strip() else None), dict(r.headers))
     except urllib.error.HTTPError as e:
         txt = e.read().decode(errors="replace")
         try:
-            return e.code, json.loads(txt), dict(e.headers)
+            return Response(e.code, json.loads(txt), dict(e.headers))
         except Exception:
-            return e.code, txt, dict(e.headers)
+            return Response(e.code, txt, dict(e.headers))
     except urllib.error.URLError as e:
         raise RuntimeError("cannot reach %s%s — is the stack up? (%s)" % (base or API, path, e))
 
@@ -122,3 +130,19 @@ class Results:
                 print("  - %s %s" % (tid, detail))
             return 1
         return 0
+
+
+def api_up(timeout=3):
+    """Is the API reachable right now? Used by pytest suites to skip rather than error."""
+    try:
+        return call("GET", "/healthz", timeout=timeout)[0] == 200
+    except Exception:
+        return False
+
+
+def new_project(token, name="qa-project"):
+    """Create a project and return it, raising with the server's own words on failure."""
+    st, proj, _ = call("POST", "/v1/projects", token, {"name": name})
+    if st not in (200, 201) or not isinstance(proj, dict):
+        raise AssertionError("could not create project %r: %s %r" % (name, st, proj))
+    return proj

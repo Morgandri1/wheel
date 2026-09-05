@@ -54,6 +54,13 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/projects/{id}/start", post(routes::projects::start))
         .route("/v1/projects/{id}/stop", post(routes::projects::stop))
         .route("/v1/projects/{id}/restart", post(routes::projects::restart))
+        .route("/v1/projects/{id}/ws-ticket", post(routes::ws_ticket::mint))
+        // Registered before the engine wildcard: this one route also accepts a single-use ticket
+        // in the query string, because browsers cannot set headers on a WebSocket handshake.
+        .route(
+            "/v1/projects/{id}/engine/v1/events",
+            axum::routing::any(routes::proxy::engine_events),
+        )
         // Authenticated engine proxy. `any` because the engine control plane uses every verb, and
         // the WebSocket upgrade for /engine/v1/events arrives as a GET.
         .route(

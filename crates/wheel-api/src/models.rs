@@ -42,8 +42,21 @@ pub struct Project {
     pub name: String,
     pub capabilities: Capabilities,
     pub status: ProjectStatus,
+    /// Where this project's public ingress lives, per ARCHITECTURE §5. Derived from
+    /// `PUBLIC_BASE_URL` rather than stored, so it stays correct if the deployment moves.
+    /// Populated at the response boundary by `with_ingress_base`.
+    pub ingress_base_url: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Project {
+    /// Fill in the ingress URL for a response. Kept separate from the row conversion because the
+    /// public base URL is deployment configuration, not a property of the row.
+    pub fn with_ingress_base(mut self, public_base_url: &str) -> Self {
+        self.ingress_base_url = format!("{}/p/{}", public_base_url.trim_end_matches('/'), self.id);
+        self
+    }
 }
 
 /// Row shape as it comes out of postgres, before `capabilities` is parsed.
@@ -67,6 +80,7 @@ impl From<ProjectRow> for Project {
             // A malformed capabilities blob must fail closed (no public ingress), not panic and
             // not default to open.
             capabilities: serde_json::from_value(r.capabilities).unwrap_or_default(),
+            ingress_base_url: String::new(),
             status: match r.status.as_str() {
                 "starting" => ProjectStatus::Starting,
                 "running" => ProjectStatus::Running,

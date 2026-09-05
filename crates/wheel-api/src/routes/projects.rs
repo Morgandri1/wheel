@@ -105,7 +105,11 @@ pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Js
     .bind(user.id())
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(rows.into_iter().map(Project::from).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Project::from(r).with_ingress_base(&state.cfg.public_base_url))
+            .collect(),
+    ))
 }
 
 pub async fn get_one(
@@ -121,7 +125,7 @@ pub async fn get_one(
             project.status = observed;
         }
     }
-    Ok(Json(project))
+    Ok(Json(project.with_ingress_base(&state.cfg.public_base_url)))
 }
 
 pub async fn update(
@@ -151,7 +155,9 @@ pub async fn update(
     .bind(caps)
     .fetch_one(&state.db)
     .await?;
-    Ok(Json(row.into()))
+    Ok(Json(
+        Project::from(row).with_ingress_base(&state.cfg.public_base_url),
+    ))
 }
 
 pub async fn destroy(
@@ -181,11 +187,24 @@ pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiRes
         .start(&scope.project.id)
         .await
         .map_err(ApiError::Internal)?;
-    let observed = state
-        .orch
-        .status(&scope.project.id)
-        .await
-        .unwrap_or(ProjectStatus::Starting);
+    // A start that the host reported as successful, followed by a status of `stopped`, is not a
+    // stopped project — it is an inconsistency between the two, and reporting "stopped" invites the
+    // caller to sit in a poll loop that will never terminate. Surface it as `error` so the UI shows
+    // something is wrong instead of something is pending.
+    let observed = match state.orch.status(&scope.project.id).await {
+        Ok(ProjectStatus::Stopped) => {
+            tracing::warn!(
+                project_id = %scope.project.id,
+                "host reported a successful start but the sandbox is still stopped"
+            );
+            ProjectStatus::Error
+        }
+        Ok(other) => other,
+        Err(e) => {
+            tracing::warn!(project_id = %scope.project.id, error = ?e, "status probe after start failed");
+            ProjectStatus::Starting
+        }
+    };
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }
@@ -209,11 +228,24 @@ pub async fn restart(
         .restart(&scope.project.id)
         .await
         .map_err(ApiError::Internal)?;
-    let observed = state
-        .orch
-        .status(&scope.project.id)
-        .await
-        .unwrap_or(ProjectStatus::Starting);
+    // A start that the host reported as successful, followed by a status of `stopped`, is not a
+    // stopped project — it is an inconsistency between the two, and reporting "stopped" invites the
+    // caller to sit in a poll loop that will never terminate. Surface it as `error` so the UI shows
+    // something is wrong instead of something is pending.
+    let observed = match state.orch.status(&scope.project.id).await {
+        Ok(ProjectStatus::Stopped) => {
+            tracing::warn!(
+                project_id = %scope.project.id,
+                "host reported a successful start but the sandbox is still stopped"
+            );
+            ProjectStatus::Error
+        }
+        Ok(other) => other,
+        Err(e) => {
+            tracing::warn!(project_id = %scope.project.id, error = ?e, "status probe after start failed");
+            ProjectStatus::Starting
+        }
+    };
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }
@@ -236,5 +268,7 @@ async fn reload(state: &AppState, scope: &ProjectScope) -> ApiResult<Json<Projec
     .bind(scope.user.id())
     .fetch_one(&state.db)
     .await?;
-    Ok(Json(row.into()))
+    Ok(Json(
+        Project::from(row).with_ingress_base(&state.cfg.public_base_url),
+    ))
 }

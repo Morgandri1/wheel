@@ -7,8 +7,8 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use wheel_core::{
-    check_wire, validate_config, Node, NodeConfig, NodeName, NodeType, Position, Timestamp, Wire,
-    WireType,
+    check_wire, validate_config, AgentState, Node, NodeConfig, NodeName, NodeType, Position,
+    Timestamp, Wire, WireType,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -210,6 +210,66 @@ pub fn add_wire(
     )
     .map_err(|e| BoardError::NotFound(e.to_string()))?;
     Ok(())
+}
+
+/// Update a node's name, position and config in place. The node's TYPE is not
+/// updatable: `patch_node` re-tags any config patch with the existing type, so
+/// a node can never change what kind of thing it is.
+pub fn update(conn: &Connection, node: &Node) -> Result<(), BoardError> {
+    validate_config(&node.config)?;
+    let (ty, cfg) = split_config(&node.config);
+    conn.execute(
+        "UPDATE nodes SET name=?2, type=?3, config=?4, x=?5, y=?6, updated_at=?7 WHERE id=?1",
+        params![
+            node.id.to_string(),
+            node.name.as_str(),
+            ty,
+            cfg,
+            node.position.x,
+            node.position.y,
+            Timestamp::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            BoardError::NameTaken(node.name.to_string())
+        }
+        other => BoardError::NotFound(other.to_string()),
+    })?;
+    Ok(())
+}
+
+/// Observed state for an agent node. Absent rows read as the default
+/// (`stopped`, unhosted) rather than erroring, so a board read never fails
+/// because a state row has not been written yet.
+pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
+    let s = conn
+        .prepare(
+            "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd
+             FROM agent_state WHERE node_id = ?1",
+        )?
+        .query_row(params![node_id.to_string()], |r| {
+            let status: String = r.get(0)?;
+            let last_activity: Option<String> = r.get(2)?;
+            Ok(AgentState {
+                status: serde_json::from_value(serde_json::Value::String(status))
+                    .unwrap_or_default(),
+                session_id: r.get(1)?,
+                last_activity: last_activity
+                    .and_then(|t| wheel_core::Timestamp::parse_rfc3339(&t).ok()),
+                last_error: r.get(3)?,
+                hosted_on: r.get(4)?,
+                queued_messages: 0,
+                spend: Some(wheel_core::Spend {
+                    turns: r.get::<_, i64>(5)? as u64,
+                    usd: r.get(6)?,
+                }),
+            })
+        })
+        .optional()?;
+    Ok(s.unwrap_or_default())
 }
 
 pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Result<bool> {

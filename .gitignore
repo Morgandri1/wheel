@@ -22,3 +22,9 @@ __pycache__/
 # PM hand-off copies, not part of the tree
 /external.rs
 /host-fmt-plus-wip.patch
+qa/e2e/node_modules/
+qa/e2e/test-results/
+qa/e2e/playwright-report/
+qa/e2e/node_modules/
+qa/e2e/playwright-report/
+qa/e2e/test-results/

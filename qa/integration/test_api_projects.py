@@ -4,7 +4,7 @@ Ingress is the only route on the whole API that is deliberately unauthenticated,
 the most interesting surface here: the capability gate is the ONLY thing standing between the
 public internet and a tenant's container.
 """
-import uuid
+import json, uuid
 import pytest
 from wheel_client import call, mint, new_project, api_up
 
@@ -107,7 +107,9 @@ class TestIngress:
             "/p/%s/..\\v1\\board" % pid,
         ]:
             r = call("GET", path)
-            body = (r.body or "").lower()
+            # A JSON body parses to a dict; a refusal is usually text. Normalise both, or
+            # the assertion below crashes on the successful-traversal case it exists to catch.
+            body = (json.dumps(r.body) if isinstance(r.body, (dict, list)) else (r.body or "")).lower()
             assert not (r.status == 200 and '"nodes"' in body), \
                 "TRAVERSAL: %s reached the engine control plane" % path
 

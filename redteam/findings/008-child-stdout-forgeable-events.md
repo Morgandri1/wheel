@@ -36,3 +36,6 @@ SDK must test that a child printing a fake top-level `result` line cannot reach 
 turn-complete; harness events carry `session_id` so a forged/foreign event is distinguishable. Status →
 ACCEPTED, verify at engine impl. Combined with F007 (per-node uid + token-file), same-uid fd injection
 is materially reduced — residual noted here.
+
+## LIVE CONFIRMED-SECURE (2026-09-05, wheel-engine:test)
+A canned turn emitting a top-level `result` with a FOREIGN session_id + total_cost_usd:999.99 (agent max_usd:5.0) did NOT overwrite the engine session (stayed real-sid-123) and did NOT trip budget. Foreign-session events ignored; forged usage does not move accounting (finding 013).

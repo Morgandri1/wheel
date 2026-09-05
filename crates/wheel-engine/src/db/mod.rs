@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 pub mod board;
+pub mod messages;
 
 /// Open (creating if needed) and migrate the project database.
 pub fn open(path: &Path) -> Result<Connection> {

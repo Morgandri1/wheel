@@ -7,12 +7,12 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 
 | # | TESTPLAN | Sev | Owner | Status | Title |
 |---|----------|-----|-------|--------|-------|
-| 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | **S2** | SDK | **open** | Exported JSON Schema accepts 12 configs the contract forbids |
-| 002 | `NODE-type-closed` | S3 | SDK | **open** | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
+| 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | ~~S2~~ **S3** | SDK | ~~closed~~ | Exported JSON Schema accepts 12 configs the contract forbids |
+| 002 | `NODE-type-closed` | S3 | SDK | ~~closed~~ | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
 | 003 | `NODE-tool-config` | **S2** | SDK | ~~closed~~ | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
-| 005 | `make check` (`rust:fmt`) | S3 **blocking** | API | **open** | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
-| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ |
-| 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
+| 005 | `make check` (`rust:fmt`) | S3 | API | ~~closed~~ | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
+| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
+| 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar |
 
 ---
 
@@ -205,3 +205,54 @@ announced itself rather than waiting for someone to notice.
 contract 26 / export 26. Same mechanism: the `KNOWN_GAPS` entries failed once the rows appeared.
 Reported by Web (`endpoint→vault`), second row (`script→tool`) found by QA's contract-derived
 matrix.
+
+
+## 001 — RESOLVED, and downgraded S2 → S3 on evidence
+
+BUG-001 said the exported schema accepts 12 configs the contract forbids. That was true, but it
+was only half a finding: it established that ONE of two defences was loose, and said nothing
+about whether the other held. I had marked all 12 fixtures `_enforced_by: engine` and deferred
+the question until a real engine existed.
+
+`wheel-engine:test` now exists, so the question is answered rather than argued:
+**`qa/integration/test_engine_validation.py` POSTs all 12 to a live engine and all 12 are
+rejected** (35/35 green, including that all 20 valid fixtures are still accepted — a validator
+that rejects everything would also have "passed" the negative half).
+
+| Fixture | Engine |
+|---|---|
+| `config_unknown_key`, `state_in_config`, `vault_with_values` | rejected |
+| `endpoint_no_slash`, `endpoint_traversal`, `endpoint_auth_bad_mode`, `endpoint_auth_bearer_no_ref` | rejected |
+| `mcp_stdio_no_command`, `mcp_http_no_url`, `mcp_both` | rejected |
+| `script_zero_timeout`, `script_timeout_over_max` | rejected |
+
+So the engine — the authority — enforces the contract correctly, and no invalid config can be
+persisted. What remains is that the *published schema* is more permissive than the engine, which
+is a real defect for anyone generating a client from it (they will build a request the engine
+then refuses), but it is not a security hole and no defence has collapsed. **S3, closed.**
+
+ADVERSARY: please do not cite this as "defence in depth reduced to one layer" — it is one layer,
+and that layer holds, with a test to prove it. The accurate version is: the schema is advisory,
+the engine is authoritative, and the two disagree about strictness.
+
+## 002 — closed. `qa:contract-schema` now rejects `invalid/type_unknown`.
+
+## 005 — closed. `rust:fmt` is green on main; `make check` is 13/13.
+
+
+---
+
+## 001 — DOWNGRADED S2 -> S3 on evidence
+
+The engine DOES reject all twelve configs the exported schema accepts. Verified against a real
+`wheel-engine:test` container: `qa/integration/test_engine_validation.py`, 35/35 green, including
+`NODE-engine-rejects/*` for every one of the twelve.
+
+This resolves the open defence-in-depth question. The concern was that BUG-001 collapsed
+"rejected by engine AND api" to a single layer, leaving the surviving layer unverified. It is now
+verified, and it holds. So this is a published-contract defect — `docs/schema/*.json` is the
+artifact Web generates types from and third parties would validate against — not a security hole.
+
+Still worth fixing, for a reason the severity change should not obscure: a client that writes a
+config the schema calls valid gets a 400 from the engine. The schema currently promises something
+the product does not accept, which is a worse failure than a schema that is merely strict.

@@ -6,3 +6,9 @@
 !docker/
 crates/**/target/
 **/.DS_Store
+# A `*` exclusion also excludes the `qa` DIRECTORY itself, so re-including a
+# path inside it requires walking the parent back in first — otherwise docker
+# never descends into qa/ and `COPY qa/harness/...` fails with "not found".
+!qa
+qa/*
+!qa/harness

@@ -78,24 +78,64 @@ fn token(sub: &str) -> String {
 ///
 /// Tests that use this must run serially (`--test-threads=1`), since they share one database and
 /// each one truncates it.
+/// Prepare the schema exactly once per test binary, however many tests ask for it.
+///
+/// This used to drop and re-migrate on every call. Tests run in parallel, so that meant one test
+/// truncating the world while another was mid-request — the suite failed a different assertion on
+/// roughly every other run. A flaky security suite is worse than no suite, because people learn to
+/// read red as noise.
+///
+/// Isolation now comes from each test using a unique subject (see `user()`) rather than from
+/// destroying shared state, so concurrent tests simply cannot see each other's rows.
+///
+/// Reset the schema exactly once per test binary, not once per `app()` call.
+///
+/// Doing it per call was a real bug, not just waste. Tests run in parallel, so one test's
+/// `DROP TABLE ... CASCADE` deleted the tables out from under another test that was mid-request.
+/// The result was an intermittent failure in whichever test happened to be running — usually
+/// `stranger_cannot_mutate_or_proxy` — which reads as a flaky *security* check. Nothing is more
+/// corrosive than a boundary test that cries wolf, so the destructive reset is serialised here and
+/// per-test isolation comes from unique subjects instead.
 async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
-    let url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    // Skipping is a convenience for a laptop without a database, never for CI. These tests are the
+    // only thing covering the ownership boundary end to end, and a suite that quietly asserts
+    // nothing while reporting green is worse than one that fails — that is exactly how this file
+    // sat broken while `cargo test` stayed green.
+    let url = match std::env::var("TEST_DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) if std::env::var("CI").is_ok() => {
+            panic!("TEST_DATABASE_URL must be set in CI: these tests cover the tenancy boundary")
+        }
+        Err(_) => {
+            eprintln!("skipping {}: TEST_DATABASE_URL not set", module_path!());
+            return None;
+        }
+    };
+
+    // A pool per test, deliberately, and a small one.
+    //
+    // The obvious optimisation — one `static` pool shared by the whole binary — is wrong here, and
+    // silently so. Each `#[tokio::test]` runs on its own runtime; a shared pool gets bound to
+    // whichever runtime happened to create it, and once that runtime shuts down every later test
+    // sees "A Tokio 1.x context was found, but it is being shutdown" followed by pool timeouts.
+    // That failure is intermittent and reads like a boundary bug, which is the worst kind of
+    // fixture defect. Two connections per test keeps the total well inside the server's limit.
     let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&url)
         .await
         .expect("connect to TEST_DATABASE_URL");
 
-    // Drop the migration ledger along with the tables. Dropping only the tables would leave
-    // `_sqlx_migrations` claiming 0001 was already applied, so the migration is skipped and the
-    // tables never come back — every subsequent query then fails on a missing relation.
-    sqlx::query(
-        "DROP TABLE IF EXISTS ingress_rate_limits, project_secrets, projects, _sqlx_migrations CASCADE",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+    // Idempotent, so it is safe to run per test. Tests isolate from each other by using a unique
+    // subject per test (see `user()`) rather than by truncating shared tables, so no test needs a
+    // clean slate and none can pull the schema out from under another.
+    sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("run migrations");
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {
@@ -406,4 +446,189 @@ async fn ingress_is_closed_until_opted_in() {
     let ghost = uuid::Uuid::new_v4();
     let (status, _) = send(&app, "GET", &format!("/p/{ghost}/hello"), None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// --- WebSocket tickets ---------------------------------------------------------------------
+//
+// The ticket is the one credential we deliberately allow into a URL, so its guarantees carry more
+// weight than usual: it must be usable exactly once, expire quickly, and be useless against any
+// project other than the one it was minted for.
+
+#[tokio::test]
+async fn ws_ticket_is_single_use() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+
+    let (status, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"ws single use"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/ws-ticket"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "minting a ticket for my own project should succeed"
+    );
+    let ticket = body["ticket"].as_str().unwrap().to_string();
+    assert_eq!(body["expires_in"], 30);
+
+    // First redemption wins.
+    let first = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}/engine/v1/events?ticket={ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(
+        first.0,
+        StatusCode::UNAUTHORIZED,
+        "a fresh ticket must authenticate; got {:?}",
+        first
+    );
+
+    // Second must not. It fails as 401 rather than reaching the engine at all.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}/engine/v1/events?ticket={ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a ticket was accepted twice"
+    );
+}
+
+#[tokio::test]
+async fn ws_ticket_does_not_open_another_project() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+
+    let mut ids = Vec::new();
+    for name in ["ws project a", "ws project b"] {
+        let (status, proj) = send(
+            &app,
+            "POST",
+            "/v1/projects",
+            Some(&alice),
+            Some(json!({"name": name})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ids.push(proj["id"].as_str().unwrap().to_string());
+    }
+
+    let (_, body) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{}/ws-ticket", ids[0]),
+        Some(&alice),
+        None,
+    )
+    .await;
+    let ticket = body["ticket"].as_str().unwrap().to_string();
+
+    // Same owner, different project: still refused. Ownership is not the only binding.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{}/engine/v1/events?ticket={ticket}", ids[1]),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a ticket opened a different project's socket"
+    );
+}
+
+#[tokio::test]
+async fn ws_ticket_cannot_be_minted_for_someone_elses_project() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+    let mallory = token(&user("mallory"));
+
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"alice ws"})),
+    )
+    .await;
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/ws-ticket"),
+        Some(&mallory),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger minted a ticket for someone else's project"
+    );
+}
+
+#[tokio::test]
+async fn garbage_and_missing_tickets_are_refused() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"ws garbage"})),
+    )
+    .await;
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    for q in ["?ticket=not-a-real-ticket", "?ticket=", ""] {
+        let (status, _) = send(
+            &app,
+            "GET",
+            &format!("/v1/projects/{id}/engine/v1/events{q}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated events access via {q:?}"
+        );
+    }
 }
