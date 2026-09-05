@@ -6,3 +6,4 @@
 !docker/
 crates/**/target/
 **/.DS_Store
+!qa/harness/
