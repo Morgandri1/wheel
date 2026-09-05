@@ -195,6 +195,7 @@ Every command prints a one-line human result (and `--json` for machine output). 
    ## Board memory (durable, wire-gated)
      wheel read <node> · wheel write <node> "<value>" · wheel read/write <table>/<row> · wheel ls <table> · wheel secret get <vault>/<key> · wheel run <script>
    You can only read/write nodes you're wired to — run `wheel connections` to see yours.
+   The `# Context:` blocks below were captured when this session started; a ctx node may have changed since — `wheel read <ctx>` is always current.
    Your wires: → researcher  send   you can prompt it
                → notes      read   you can access its data
                ← inbox      send   it can prompt you
