@@ -186,6 +186,29 @@ mod tests {
             .collect()
     }
 
+    /// Credentials reach the child from `auth::credential_env` and nowhere
+    /// else. If a driver ever also set one of these, two variables would be
+    /// live at once and which won would be the harness's business, not ours.
+    #[test]
+    fn the_driver_sets_no_credential_variables_of_its_own() {
+        let spec = spec();
+        let names: Vec<String> = ClaudeDriver
+            .env(&spec)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CODEX_API_KEY",
+        ] {
+            assert!(
+                !names.iter().any(|k| k == var),
+                "{var} must come from stored credentials, not the driver"
+            );
+        }
+    }
+
     #[test]
     fn argv_matches_the_documented_invocation() {
         let a = argv_strings(&spec());

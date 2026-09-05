@@ -256,9 +256,13 @@ fn status_body(s: &AppState, id: Uuid, fallback: AgentStatus) -> serde_json::Val
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AuthComplete {
-    /// API-key mode. OAuth modes carry a `code` instead and land in M2.
+    /// A pasted credential: either a provider API key or the long-lived OAuth
+    /// token from `claude setup-token`. The engine tells them apart by prefix
+    /// and routes each to its own environment variable — the caller does not
+    /// have to know which it has, and cannot get it wrong by declaring it.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Paste-code OAuth (M2).
     #[serde(default)]
     pub code: Option<String>,
 }
@@ -292,7 +296,8 @@ pub async fn auth_complete(
     };
 
     let config_dir = s.cfg.creds_dir().join(id.to_string());
-    crate::auth::store_api_key(&config_dir, &key).map_err(|e| ApiError::invalid(e.to_string()))?;
+    let kind = crate::auth::store_token(&config_dir, &key, harness)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
     if harness == wheel_core::Harness::Codex {
         crate::auth::ensure_codex_file_store(&config_dir)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -312,9 +317,10 @@ pub async fn auth_complete(
         at: wheel_core::Timestamp::now(),
     });
 
-    Ok(Json(serde_json::json!({
-        "authenticated": true,
-        "mode": "api_key",
+    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+        authenticated: true,
+        mode: Some(kind),
+        account: None,
     })))
 }
 
@@ -339,17 +345,28 @@ pub async fn auth_status(
             .harness
     };
     let config_dir = s.cfg.creds_dir().join(id.to_string());
-    let has_key = crate::auth::read_api_key(&config_dir).is_some();
+    let authenticated = crate::auth::has_stored_credentials(&config_dir, harness);
+    // A stored token names its own kind. Otherwise credentials, if any, are
+    // the harness's own login on disk. Nothing stored reports `null` rather
+    // than a mode it does not have.
+    let mode = crate::auth::stored_token_kind(&config_dir, harness).or({
+        if authenticated {
+            Some(wheel_core::CredentialKind::OauthSession)
+        } else {
+            None
+        }
+    });
 
-    Ok(Json(serde_json::json!({
-        "authenticated": crate::auth::has_stored_credentials(&config_dir, harness),
-        "mode": if has_key { "api_key" } else { "oauth" },
+    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+        authenticated,
+        mode,
+        account: None,
     })))
 }
 
 /// `DELETE /v1/agents/:id/auth` — forget stored credentials.
 pub async fn auth_clear(State(s): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     let config_dir = s.cfg.creds_dir().join(id.to_string());
-    crate::auth::clear_api_key(&config_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    crate::auth::clear_token(&config_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }

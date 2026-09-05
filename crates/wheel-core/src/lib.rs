@@ -44,7 +44,8 @@ pub use node::{
 pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, WireLine};
 pub use spawn::{ListenAddr, ListenAddrError};
 pub use state::{
-    AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, NodeState, NodeWithState, Spend,
+    AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, CredentialKind, NodeState,
+    NodeWithState, Spend,
 };
 pub use timestamp::Timestamp;
 pub use tool::{

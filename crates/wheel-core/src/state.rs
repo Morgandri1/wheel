@@ -145,10 +145,44 @@ impl Serialize for NodeWithState {
 /// (`GET /v1/agents/:id/auth`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AuthStatus {
+    /// Whether credentials are STORED. Not whether they work: only the
+    /// harness's own probe can say that, and claiming otherwise would tell an
+    /// operator they are fine right up until the first request fails.
     pub authenticated: bool,
+    /// Which kind of credential is stored, or `null` when there is none.
+    pub mode: Option<CredentialKind>,
     /// Display-only account identifier (e.g. an email). Never a token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+}
+
+/// What kind of credential an agent node holds.
+///
+/// Distinct from [`AuthMode`], which is how a credential is *obtained*. The
+/// difference matters because the kind decides which environment variable
+/// carries it to the child, and the two Anthropic credentials are not
+/// interchangeable in that envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// A provider API key: `ANTHROPIC_API_KEY` / `CODEX_API_KEY`.
+    ApiKey,
+    /// A long-lived OAuth token from `claude setup-token`, used by
+    /// subscription accounts that have no API key: `CLAUDE_CODE_OAUTH_TOKEN`.
+    OauthToken,
+    /// The harness's own login credentials on disk, written by its OAuth flow.
+    /// Carried by the node's config dir, not by an environment variable.
+    OauthSession,
+}
+
+impl CredentialKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialKind::ApiKey => "api_key",
+            CredentialKind::OauthToken => "oauth_token",
+            CredentialKind::OauthSession => "oauth_session",
+        }
+    }
 }
 
 /// How an agent's harness can be authenticated headlessly

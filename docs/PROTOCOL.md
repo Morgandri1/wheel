@@ -115,8 +115,31 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 | Route | Body → Response | M |
 |---|---|---|
 | `POST /v1/agents/:id/auth/begin` | `{mode?}` → `AuthBegin {mode, url?, user_code?, instructions, session}` | M2 |
-| `POST /v1/agents/:id/auth/complete` | `{code?}` \| `{api_key?}` → `AuthStatus` | M2 |
-| `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, account?}` | M2 |
+| `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code M2 |
+| `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
+| `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |
+
+**`mode` is `CredentialKind`**: `"api_key"` · `"oauth_token"` · `"oauth_session"` · `null` when nothing is
+stored. It says what kind of credential the node holds, which is a different axis from `AuthMode` on
+`auth/begin` (how one is *obtained*) — the two share a field name and nothing else.
+
+`auth/complete {api_key}` carries **either** a provider API key **or** the long-lived OAuth token from
+`claude setup-token`, and the engine tells them apart by prefix rather than making the caller declare which it
+has:
+
+| Token | Kind | Env var handed to the child |
+|---|---|---|
+| `sk-ant-oat…` | `oauth_token` | `CLAUDE_CODE_OAUTH_TOKEN` |
+| anything else on a claude node (`sk-ant-api…`, a gateway key) | `api_key` | `ANTHROPIC_API_KEY` |
+| anything on a codex node | `api_key` | `CODEX_API_KEY` |
+
+Exactly one variable is ever set — exporting both would leave the winner to the harness's own precedence.
+The kind is re-derived from the stored token on every read, never recorded in a second file that could drift
+out of sync with it. A token beginning `sk-ant-` sent to a **codex** node is refused with `400`: it
+authenticates nothing there, and accepting it buys a node that starts, looks healthy, and fails on its first
+turn. Subscription accounts with no API key at all are the reason this path exists — `claude setup-token` is
+their only headless credential, and sent as `ANTHROPIC_API_KEY` it is rejected in a way that reads as bad
+credentials rather than a mis-addressed envelope.
 
 Credentials live per node under `<data>/creds/<node_id>/`; each child gets its own `CLAUDE_CONFIG_DIR` /
 `CODEX_HOME`, which is what lets two agent nodes in one sandbox be two different accounts (verified in a
@@ -130,7 +153,7 @@ The two harnesses need **opposite** flows, which is why `AuthMode` keeps them di
 | Who makes the code | the browser | the CLI |
 | `auth/begin` | spawn `claude auth login --claudeai` on pipes, read the authorize URL off stdout, keep the child alive (TTL 15 min) | run `codex login --device-auth`, return `url` + `user_code` |
 | `auth/complete` | write `<code>#<state>\n` to that child's stdin | returns current status; the engine is already polling |
-| API key | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` | **`CODEX_API_KEY`** — *not* `OPENAI_API_KEY`, which `codex doctor` reports as fine but which is not in the auth chain |
+| Pasted credential | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, routed by prefix (above) | **`CODEX_API_KEY`** — *not* `OPENAI_API_KEY`, which `codex doctor` reports as fine but which is not in the auth chain |
 | Safe probe | `claude auth status --json` (`loggedIn`, `authMethod`) | `codex login status` |
 | Unsafe probe | — | `codex exec` — proceeds unauthenticated and dies later on a runtime 401 |
 | Keyring | none on Linux; plain `0600` file | `CODEX_HOME` does **not** isolate the OS keyring — each node's `config.toml` must set `cli_auth_credentials_store = "file"` |

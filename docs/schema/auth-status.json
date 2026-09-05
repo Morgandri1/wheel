@@ -15,7 +15,47 @@
       ]
     },
     "authenticated": {
+      "description": "Whether credentials are STORED. Not whether they work: only the harness's own probe can say that, and claiming otherwise would tell an operator they are fine right up until the first request fails.",
       "type": "boolean"
+    },
+    "mode": {
+      "description": "Which kind of credential is stored, or `null` when there is none.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CredentialKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CredentialKind": {
+      "description": "What kind of credential an agent node holds.\n\nDistinct from [`AuthMode`], which is how a credential is *obtained*. The difference matters because the kind decides which environment variable carries it to the child, and the two Anthropic credentials are not interchangeable in that envelope.",
+      "oneOf": [
+        {
+          "description": "A provider API key: `ANTHROPIC_API_KEY` / `CODEX_API_KEY`.",
+          "type": "string",
+          "enum": [
+            "api_key"
+          ]
+        },
+        {
+          "description": "A long-lived OAuth token from `claude setup-token`, used by subscription accounts that have no API key: `CLAUDE_CODE_OAUTH_TOKEN`.",
+          "type": "string",
+          "enum": [
+            "oauth_token"
+          ]
+        },
+        {
+          "description": "The harness's own login credentials on disk, written by its OAuth flow. Carried by the node's config dir, not by an environment variable.",
+          "type": "string",
+          "enum": [
+            "oauth_session"
+          ]
+        }
+      ]
     }
   }
 }
