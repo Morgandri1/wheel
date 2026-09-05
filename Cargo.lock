@@ -3083,6 +3083,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wheel-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "hyper",
+ "hyper-util",
+ "rand 0.8.8",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wheel-core",
+]
+
+[[package]]
 name = "wheel-host"
 version = "0.1.0"
 dependencies = [

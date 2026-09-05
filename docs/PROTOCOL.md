@@ -118,10 +118,41 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 | `POST /v1/agents/:id/auth/complete` | `{code?}` \| `{api_key?}` → `AuthStatus` | M2 |
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, account?}` | M2 |
 
-Credentials live per node under `<data>/creds/<node_id>/` and each child is spawned with its own config dir, so
-two agent nodes in one sandbox can be two different accounts. `auth/complete` for a `device_code` flow is a
-**poll** (the engine is already polling; this returns current status), not a submit. Findings from the auth spike
-are being folded in; until a path is verified end-to-end the engine reports `needs_auth` rather than pretending.
+Credentials live per node under `<data>/creds/<node_id>/`; each child gets its own `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME`, which is what lets two agent nodes in one sandbox be two different accounts (verified in a
+container: two config dirs produce two independent `0600 .claude.json` trees).
+
+The two harnesses need **opposite** flows, which is why `AuthMode` keeps them distinct:
+
+| | `claude` | `codex` |
+|---|---|---|
+| Mode | `paste_code` — a **submit** | `device_code` — a **poll** |
+| Who makes the code | the browser | the CLI |
+| `auth/begin` | spawn `claude auth login --claudeai` on pipes, read the authorize URL off stdout, keep the child alive (TTL 15 min) | run `codex login --device-auth`, return `url` + `user_code` |
+| `auth/complete` | write `<code>#<state>\n` to that child's stdin | returns current status; the engine is already polling |
+| API key | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` | **`CODEX_API_KEY`** — *not* `OPENAI_API_KEY`, which `codex doctor` reports as fine but which is not in the auth chain |
+| Safe probe | `claude auth status --json` (`loggedIn`, `authMethod`) | `codex login status` |
+| Unsafe probe | — | `codex exec` — proceeds unauthenticated and dies later on a runtime 401 |
+| Keyring | none on Linux; plain `0600` file | `CODEX_HOME` does **not** isolate the OS keyring — each node's `config.toml` must set `cli_auth_credentials_store = "file"` |
+
+`claude auth login` needs **no reachable localhost**: the redirect URI is Anthropic-hosted
+(`platform.claude.com/oauth/code/callback`), the browser displays the code, and the container never receives a
+callback. Verified live: over a pipe with no TTY the CLI prints the URL and consumes a piped code (a fake one
+produced a real `400` from the token exchange, proving the mechanism rather than a hang).
+
+### Distinguishing `needs_auth` from misconfiguration — verified
+
+`bypassPermissions`-as-root and not-being-logged-in both exit 1, so the exit code alone is useless. The
+**stream** discriminates, and this is what the supervisor keys on:
+
+| Observation | Meaning |
+|---|---|
+| a `system`/`init` line on stdout, then failure | the process started fine — auth or runtime problem |
+| **no stdout at all** + exit 1 | misconfiguration (the root trap), **not** `needs_auth` |
+| `claude auth status --json` → `loggedIn:false` | authoritative `needs_auth` |
+
+`needs_auth` is only ever set from the explicit probe or an authenticated-failure signal — never inferred from
+an exit code.
 
 ### Data nodes
 
