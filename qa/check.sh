@@ -117,6 +117,9 @@ step "qa:wire-matrix" "$PY" qa/tools/gen_wire_matrix.py --check
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
   step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
+
+# wheel-core's exported matrix vs the ARCHITECTURE.md §3 matrix QA derives independently.
+step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
   # Runs today and self-skips until SDK exports the schema, so it goes green on its own.
   step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
 else
