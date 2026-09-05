@@ -87,6 +87,52 @@ export function seed(): ProjectRecord {
   ]);
   record.tables.set(findings.id, rows);
 
+  // MOCK_BULK_NODES=200 seeds a board at the size the non-negotiable names, so the 200-node
+  // target can be measured rather than asserted. Off by default — the storytelling board is
+  // what you want to develop against.
+  const bulk = Number(process.env.MOCK_BULK_NODES ?? 0);
+  if (bulk > 0) seedBulk(record, bulk);
+
   boardChanged(record);
   return record;
+}
+
+const BULK_STATUSES = ["stopped", "idle", "running", "parked", "needs_auth"] as const;
+
+/**
+ * A grid of agents wired into a chain, plus data nodes every fifth column. Named predictably so
+ * a test can address any of them, and laid out so the viewport is never empty at any zoom.
+ */
+function seedBulk(record: ProjectRecord, count: number) {
+  const perRow = Math.ceil(Math.sqrt(count));
+  const previous: string[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const col = i % perRow;
+    const row = Math.floor(i / perRow);
+    const position = { x: 900 + col * 260, y: -400 + row * 170 };
+    const node =
+      i % 5 === 4
+        ? makeNode("table", `bulk-table-${i}`, position, {
+            columns: [{ name: "value", type: "text" }],
+          })
+        : makeNode("agent", `bulk-agent-${i}`, position, {
+            harness: i % 2 ? "codex" : "claude",
+            system_prompt: "",
+            run_on_startup: false,
+            ephemeral_context: false,
+          });
+
+    if (node.type === "agent") {
+      node.state = {
+        kind: "agent",
+        status: BULK_STATUSES[i % BULK_STATUSES.length]!,
+      };
+    }
+
+    const prior = previous[previous.length - 1];
+    if (prior && node.type === "agent") node.wires!.push({ to: prior, type: "send" });
+    previous.push(node.id);
+    record.nodes.push(node);
+  }
 }
