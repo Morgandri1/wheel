@@ -15,7 +15,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% (host was 0.00% when filed) |
 | 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | **open** | `transcript` log lines are persisted but never emitted over the events WebSocket |
-| 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | **open** | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
+| 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | ~~closed~~ | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
 
 ---
 
@@ -350,6 +350,12 @@ did — a printer cannot fail, so it cannot gate. SDK asked for exactly this che
 ---
 
 ## 010 — The `wheel` CLI is not in the engine image · S1 · SDK
+
+**CLOSED** — verified against `wheel-engine:dev`/`:test` rebuilt at 10:59Z from c99ed40:
+`wheel`, `wheel-engine`, `wheel-host` and `python3` are all on PATH and `wheel --help` prints.
+The standing regression is `qa:image-contents` in `make check` plus the `Verify image contents`
+step in the docker-sandbox CI job, so a build that drops a required binary now fails instead of
+shipping green.
 
 `wheel-engine:test` (and `:dev`, same Dockerfile) contains `wheel-engine`, `wheel-host`,
 `claude`, `codex` and `python3` — but **no `wheel` binary**. Every CLI test fails with
