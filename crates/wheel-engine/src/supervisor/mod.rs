@@ -219,6 +219,15 @@ impl Supervisor {
             self.cfg.listen.client_url(),
         );
         cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
+
+        // A private crate cache per project. The toolchain in the image is
+        // shared and immutable; what a tenant FETCHES is not, and a shared
+        // CARGO_HOME would put one project's downloaded sources -- and its
+        // registry credentials, if it ever configures any -- where the next
+        // project can read them.
+        let cargo_home = self.cfg.data_dir.join("cargo");
+        std::fs::create_dir_all(&cargo_home).ok();
+        cmd.env("CARGO_HOME", &cargo_home);
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
         // answer is its probe rather than our guess.
