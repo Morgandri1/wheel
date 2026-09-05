@@ -11,5 +11,6 @@
     "language": "ruby",
     "source": "x"
   },
-  "_expect_reject": "NODE-script-lang"
+  "_expect_reject": "NODE-script-lang",
+  "_enforced_by": "schema"
 }

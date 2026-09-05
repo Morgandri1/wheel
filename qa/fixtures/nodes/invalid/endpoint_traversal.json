@@ -12,5 +12,7 @@
     "path": "/../v1/board",
     "response_mode": "ack"
   },
-  "_expect_reject": "NODE-endpoint-path"
+  "_expect_reject": "NODE-endpoint-path",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_endpoint_path"
 }

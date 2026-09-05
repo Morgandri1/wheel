@@ -103,5 +103,6 @@
         }
       }
     ]
-  }
+  },
+  "_pending": "tool type not in wheel-core yet (SDK shipped 8 types)"
 }
