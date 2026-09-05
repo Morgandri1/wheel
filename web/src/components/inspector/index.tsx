@@ -8,6 +8,7 @@ import { AuthFlow } from "@/components/inspector/auth-flow";
 import { CtxPanel } from "@/components/inspector/ctx-panel";
 import { EndpointPanel } from "@/components/inspector/endpoint-panel";
 import { TablePanel } from "@/components/inspector/table-panel";
+import { ToolPanel } from "@/components/inspector/tool-panel";
 import { useBoardStore } from "@/store/board";
 import type { EngineApi } from "@/lib/api";
 import type { AgentNode, Project, WheelNode } from "@/lib/schema";
@@ -70,6 +71,14 @@ export function Inspector({
           />
         ) : node.type === "table" ? (
           <TablePanel node={node} api={api} projectId={projectId} onChanged={onChanged} />
+        ) : node.type === "tool" ? (
+          <ToolPanel
+            node={node}
+            nodes={nodes}
+            api={api}
+            projectId={projectId}
+            onChanged={onChanged}
+          />
         ) : (
           <p className="text-meta text-ink-dim">
             {meta.blurb} The editor for {meta.label.toLowerCase()} nodes lands next — the node,
