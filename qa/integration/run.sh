@@ -127,16 +127,28 @@ for suite in qa/integration/test_*.py; do
   # plain script executes NOTHING, exits 0, and prints nothing — test_api_projects.py
   # had been silently not running for exactly that reason. Dispatch on the guard.
   out="$ARTIFACTS/$(basename "$suite" .py).log"
+  # `cmd | tee` reports TEE's exit status, not the suite's — so `|| rc=1` on a pipeline
+  # silently ignored every failing suite, and the only thing that could turn this runner
+  # red was the no-result-line guard below. PIPESTATUS is the fix; nothing else here was
+  # wrong, which is why it survived: the runner was correct on every run that passed.
   if grep -q '__main__' "$suite"; then
-    "$PY" "$suite" 2>&1 | tee "$out" || rc=1
+    "$PY" "$suite" 2>&1 | tee "$out"
   else
-    "$PY" -m pytest -q "$suite" 2>&1 | tee "$out" || rc=1
+    "$PY" -m pytest -q "$suite" 2>&1 | tee "$out"
   fi
+  suite_rc=${PIPESTATUS[0]}
 
-  # A suite that produces no result line is not a passing suite, it is a suite that did
-  # not run. That must never read as green.
-  if ! grep -qE "passed|failed|error|no tests ran" "$out"; then
-    echo "  !! $(basename "$suite") produced no result line — it did not run"
+  # 77 is the project-wide "I could not run" code: an acknowledged skip with a stated
+  # reason, not a pass and not a failure. Everything else non-zero is a failure.
+  if [ "$suite_rc" = "77" ]; then
+    echo "  -- $(basename "$suite") skipped (exit 77) — see the reason above"
+  elif [ "$suite_rc" != "0" ]; then
+    rc=1
+  # Only a suite that claims success has to prove it ran. A suite that exited 77 already
+  # told us why it produced nothing, and demanding a result line from it would push people
+  # to print a fake one.
+  elif ! grep -qE "passed|failed|error|no tests ran" "$out"; then
+    echo "  !! $(basename "$suite") exited 0 and produced no result line — it did not run"
     ran_nothing="$ran_nothing $(basename "$suite")"
     rc=1
   fi
