@@ -203,15 +203,50 @@ fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
 /// Frames are not inspected or re-encoded. The `message` event in particular must reach the UI
 /// byte-for-byte so a row can be correlated by its id; re-serialising JSON here could reorder keys
 /// or alter a body that the engine went to some trouble to deliver exactly.
+///
+/// The engine socket, whichever transport reached it.
+///
+/// Both arms carry a full-duplex WebSocket and differ only in what is underneath. Keeping them in
+/// one enum means the frame pump stays a single implementation, so the TCP and unix paths cannot
+/// drift into relaying frames differently.
+enum WsStream {
+    // Boxed: the TLS-capable TCP stream is far larger than the unix one, and an unboxed enum would
+    // pay that size on every connection including the unix ones we actually use in production.
+    Tcp(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ),
+    Unix(Box<tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>>),
+}
+
 async fn bridge_ws(
     state: HostState,
     engine_secret: String,
     upstream_http: String,
     req: Request,
 ) -> Response {
-    let ws_url = upstream_http
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    // In process mode the engine has no TCP endpoint at all: `upstream_http` names a unix socket,
+    // and the http->ws rewrite below would leave a `unix://` URI that no WebSocket client can dial.
+    // That is exactly what made the events socket 502 in production while ordinary HTTP over the
+    // same socket worked — the backend looked healthy and only the live board was dead.
+    let unix_socket = upstream_http
+        .strip_prefix("unix://")
+        .map(|rest| match rest.find("/v1/") {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/".to_string()),
+        });
+
+    let ws_url = match &unix_socket {
+        // A unix socket has no authority, but the handshake still needs a syntactically valid URI
+        // and a Host header, so this uses a placeholder that never resolves.
+        Some((_, path)) => format!("ws://engine{path}"),
+        None => upstream_http
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1),
+    };
 
     let host_hdr = ws_url
         .split("://")
@@ -242,12 +277,23 @@ async fn bridge_ws(
 
     // Connect upstream *before* accepting the client upgrade, so a dead engine surfaces as a clean
     // 502 rather than a WebSocket that opens and immediately closes.
-    let (engine_ws, _) = match tokio::time::timeout(
-        WS_HANDSHAKE_TIMEOUT,
-        tokio_tungstenite::connect_async(upstream_req),
-    )
-    .await
-    {
+    let connect = async {
+        match &unix_socket {
+            Some((sock, _)) => {
+                let stream = tokio::net::UnixStream::connect(sock)
+                    .await
+                    .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+                tokio_tungstenite::client_async(upstream_req, stream)
+                    .await
+                    .map(|(ws, resp)| (WsStream::Unix(Box::new(ws)), resp))
+            }
+            None => tokio_tungstenite::connect_async(upstream_req)
+                .await
+                .map(|(ws, resp)| (WsStream::Tcp(Box::new(ws)), resp)),
+        }
+    };
+
+    let (engine_ws, _) = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, connect).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::warn!(error = ?e, "engine websocket connect failed");
@@ -274,15 +320,19 @@ async fn bridge_ws(
         Err(e) => return e.into_response(),
     };
 
-    upgrade.on_upgrade(move |client| pump(client, engine_ws))
+    upgrade.on_upgrade(move |client| async move {
+        match engine_ws {
+            WsStream::Tcp(ws) => pump(client, *ws).await,
+            WsStream::Unix(ws) => pump(client, *ws).await,
+        }
+    })
 }
 
-async fn pump(
-    client: WebSocket,
-    engine: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) {
+/// Generic over the engine transport so TCP and unix sockets share one implementation.
+async fn pump<S>(client: WebSocket, engine: tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut client_tx, mut client_rx) = client.split();
     let (mut eng_tx, mut eng_rx) = engine.split();
 
