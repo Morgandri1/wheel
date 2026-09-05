@@ -17,8 +17,8 @@ help: ## show this help
 check: ## run every gate that can run (fmt, clippy, tests, web, qa) — RUN BEFORE MERGING
 	@bash qa/check.sh
 
-check-strict: ## like check, but a skipped gate is a failure (used by CI)
-	@CHECK_STRICT=1 bash qa/check.sh
+check-strict: ## CI gate: coverage enforced, and a gate that COULD NOT RUN is a failure
+	@CHECK_STRICT=1 COVERAGE=1 bash qa/check.sh
 
 ## ---------------------------------------------------------------- granular
 fmt: ## rustfmt the workspace (writes)

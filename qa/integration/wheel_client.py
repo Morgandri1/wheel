@@ -8,7 +8,7 @@ wrongly in both directions and the test passes.
 mint() is copied from infra/dev/e2e.py (API's implementation, per their instruction to
 reuse rather than reinvent the token format).
 """
-import base64, hashlib, hmac, json, os, time, urllib.error, urllib.request
+import base64, hashlib, hmac, json, os, time, urllib.error, urllib.request, uuid
 
 API = os.environ.get("WHEEL_API_URL", "http://localhost:8080")
 ISSUER = os.environ.get("CLERK_ISSUER", "https://dev.wheel.local")
@@ -18,6 +18,19 @@ BACKEND = os.environ.get("SANDBOX_BACKEND", "docker")
 
 def b64u(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def unique_sub(prefix="qa"):
+    """A fresh tenant id per call.
+
+    The API team hit this against a shared database: every test authenticating as the
+    literal "user_alice" piled projects under one id across tests AND across runs, until
+    a per-user project cap tripped. Worse, the resulting failure message claimed the list
+    endpoint had leaked another user's projects — the boundary was fine, the fixture was
+    not. A test whose failure message accuses the product of a leak it did not commit
+    costs someone an afternoon, so QA mints a unique sub rather than truncating tables.
+    """
+    return "%s_%s" % (prefix, uuid.uuid4().hex[:16])
 
 
 def mint(sub, iss=None, secret=None, alg="HS256", exp_delta=3600, nbf_delta=-60):

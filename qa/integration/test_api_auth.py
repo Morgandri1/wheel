@@ -10,7 +10,7 @@ just checking that both were rejected.
 """
 import sys, os, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, mint, api_healthy, Results, ISSUER
+from wheel_client import call, mint, api_healthy, unique_sub, Results, ISSUER
 
 R = Results()
 
@@ -18,8 +18,8 @@ R = Results()
 def main():
     api_healthy()
 
-    alice = mint("user_alice")
-    mallory = mint("user_mallory")
+    alice = mint(unique_sub("alice"))
+    mallory = mint(unique_sub("mallory"))
 
     # ---------------------------------------------------------------- unauthenticated
     st, _, _ = call("GET", "/v1/projects")
@@ -28,16 +28,16 @@ def main():
     st, _, _ = call("GET", "/v1/projects", "not-a-jwt")
     R.check("API-auth-invalid/garbage", st == 401, "garbage token -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint("u", exp_delta=-10))
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), exp_delta=-10))
     R.check("API-auth-invalid/expired", st == 401, "expired -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint("u", nbf_delta=3600))
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), nbf_delta=3600))
     R.check("API-auth-invalid/nbf", st == 401, "not-yet-valid -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint("u", iss="https://evil.example"))
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), iss="https://evil.example"))
     R.check("API-auth-invalid/issuer", st == 401, "wrong issuer -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint("u", secret=b"wrong-secret-entirely"))
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), secret=b"wrong-secret-entirely"))
     R.check("API-auth-wrong-key", st == 401, "wrong signing key -> %s" % st)
 
     # alg:none — the classic. Signature stripped, alg swapped.
@@ -46,7 +46,7 @@ def main():
         return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
     now = int(time.time())
     hdr = b64u(json.dumps({"alg": "none", "typ": "JWT"}).encode())
-    pay = b64u(json.dumps({"sub": "user_alice", "iss": ISSUER,
+    pay = b64u(json.dumps({"sub": unique_sub("alice"), "iss": ISSUER,
                            "exp": now + 3600, "nbf": now - 60}).encode())
     st, _, _ = call("GET", "/v1/projects", "%s.%s." % (hdr, pay))
     R.check("API-auth-alg-none", st == 401, "alg:none accepted -> %s" % st)

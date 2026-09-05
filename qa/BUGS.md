@@ -9,9 +9,9 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 |---|----------|-----|-------|--------|-------|
 | 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | **S2** | SDK | **open** | Exported JSON Schema accepts 12 configs the contract forbids |
 | 002 | `NODE-type-closed` | S3 | SDK | **open** | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
-| 003 | `NODE-tool-config` | **S2** | SDK | **open** | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
+| 003 | `NODE-tool-config` | **S2** | SDK | ~~closed~~ | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
 | 005 | `make check` (`rust:fmt`) | S3 **blocking** | API | **open** | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
-| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | **open** | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
+| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 
 ---
 
@@ -159,3 +159,18 @@ Files: `wheel-api/src/{lib,config,crypto,error,models,orchestrator,state}.rs`,
 
 Not a correctness defect, but it is the merge gate, so while it is red nobody can merge anything
 per §1 of the contract. Filed as blocking for that reason alone.
+
+
+---
+
+## CLOSED
+
+**003 · ToolConfig §3d divergence** — closed by SDK. `qa:contract-schema` now rejects both
+`tool_bad_kind` and `tool_bad_source_format`. Verified by the gate itself: the fixtures were
+tagged `_known_bug: BUG-003`, and a tracked gap that starts PASSING fails the build, so the fix
+announced itself rather than waiting for someone to notice.
+
+**004 · wire matrix missing two rows** — closed by SDK. `qa:wire-conformance` now reports
+contract 26 / export 26. Same mechanism: the `KNOWN_GAPS` entries failed once the rows appeared.
+Reported by Web (`endpoint→vault`), second row (`script→tool`) found by QA's contract-derived
+matrix.
