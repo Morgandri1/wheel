@@ -132,8 +132,8 @@ impl Harness for ClaudeDriver {
         }
     }
 
-    fn classify_startup_failure(&self, code: Option<i32>, stderr: &str) -> StartupFailure {
-        if stderr.contains(ROOT_REFUSAL) {
+    fn classify_startup_failure(&self, code: Option<i32>, output: &str) -> StartupFailure {
+        if output.contains(ROOT_REFUSAL) {
             return StartupFailure::Misconfigured(
                 "claude refuses --permission-mode bypassPermissions as root; \
                  run the child non-root or set IS_SANDBOX=1"
@@ -147,7 +147,7 @@ impl Harness for ClaudeDriver {
         // down an auth rabbit hole for a container that is simply broken. The
         // authoritative answer comes from `claude auth status --json` anyway;
         // this is only the fast path.
-        let lower = stderr.to_ascii_lowercase();
+        let lower = output.to_ascii_lowercase();
         for marker in ["not logged in", "invalid api key", "please run /login"] {
             if lower.contains(marker) {
                 return StartupFailure::NeedsAuth;
@@ -155,11 +155,11 @@ impl Harness for ClaudeDriver {
         }
 
         StartupFailure::Misconfigured(match code {
-            Some(c) if !stderr.trim().is_empty() => {
-                format!("harness exited {c}: {}", stderr.trim())
+            Some(c) if !output.trim().is_empty() => {
+                format!("harness exited {c}: {}", output.trim())
             }
             Some(c) => format!("harness exited {c} with no output"),
-            None => format!("harness terminated without an exit code: {}", stderr.trim()),
+            None => format!("harness terminated without an exit code: {}", output.trim()),
         })
     }
 }

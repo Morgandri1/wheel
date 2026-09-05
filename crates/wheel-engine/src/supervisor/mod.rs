@@ -35,6 +35,10 @@ use crate::{
     harness::{claude::ClaudeDriver, Harness, HarnessEvent, SpawnSpec, StartupFailure},
 };
 
+/// How much of a child's stdout is kept for classifying why it died. Enough
+/// for a CLI's error banner, small enough that a runaway child cannot grow it.
+const STARTUP_OUTPUT_TAIL: usize = 8 * 1024;
+
 mod prompt;
 pub use prompt::compose_prompt;
 
@@ -317,10 +321,26 @@ impl Supervisor {
         };
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            // The real CLI reports "Not logged in" on stdout, so the reaper
+            // needs this text to classify. Bounded: a chatty child must not be
+            // able to grow this without limit.
+            let mut tail = String::new();
+            // Whether a session ever started. A child that initialised and
+            // later exited did not FAIL to start, whatever it printed on the
+            // way — that distinction is what stops a normal shutdown after a
+            // noisy session being reported as an error.
+            let mut initialised = false;
             while let Ok(Some(line)) = lines.next_line().await {
+                if tail.len() + line.len() + 1 > STARTUP_OUTPUT_TAIL {
+                    let drop_to = tail.len().min(line.len() + 1);
+                    tail.drain(..drop_to);
+                }
+                tail.push_str(&line);
+                tail.push('\n');
                 let event = harness.parse_line(&line);
                 match event {
                     HarnessEvent::Init { session_id } => {
+                        initialised = true;
                         let mut g = slot.lock().await;
                         if let Some(r) = g.as_mut() {
                             r.session_id = Some(session_id.clone());
@@ -367,11 +387,35 @@ impl Supervisor {
                         // Scoped so the sqlite guard cannot be held across the
                         // await below: a rusqlite Connection is not Send, and
                         // holding its guard would make this task unspawnable.
+                        // A harness error is not automatically the MESSAGE's
+                        // fault. "Not logged in" arrives as a perfectly normal
+                        // `result` with is_error, and consuming the message on
+                        // that basis loses the operator's work to a setup
+                        // problem they are about to fix. Environmental
+                        // failures requeue; genuine task errors are consumed,
+                        // because poison must not loop.
+                        let environmental = is_error
+                            && matches!(
+                                harness.classify_startup_failure(
+                                    None,
+                                    text.as_deref().unwrap_or_default()
+                                ),
+                                StartupFailure::NeedsAuth
+                            );
+
                         {
                             let conn = db.lock().unwrap();
                             if let Some(mid) = finished {
-                                if is_error {
-                                    // Consumed, not requeued: poison must not loop.
+                                if environmental {
+                                    messages::requeue_undelivered(
+                                        &conn,
+                                        mid,
+                                        text.as_deref()
+                                            .unwrap_or("the harness could not run this turn"),
+                                    )
+                                    .ok();
+                                    publish_message(&bus, &conn, mid);
+                                } else if is_error {
                                     messages::mark_error(
                                         &conn,
                                         mid,
@@ -383,16 +427,25 @@ impl Supervisor {
                                     publish_message(&bus, &conn, mid);
                                 }
                             }
-                            set_status_db(
-                                &conn,
-                                agent,
-                                if is_error {
-                                    AgentStatus::Error
-                                } else {
-                                    AgentStatus::Idle
-                                },
-                                is_error.then(|| text.clone().unwrap_or_default()),
-                            );
+                            let (status, detail) = if environmental {
+                                (
+                                    AgentStatus::NeedsAuth,
+                                    Some("the harness has no usable credentials".to_string()),
+                                )
+                            } else if is_error {
+                                (AgentStatus::Error, Some(text.clone().unwrap_or_default()))
+                            } else {
+                                (AgentStatus::Idle, None)
+                            };
+                            set_status_db(&conn, agent, status, detail);
+                            publish_state(&bus, &conn, agent);
+                        }
+
+                        if environmental {
+                            // Nothing more can run until credentials exist, and
+                            // draining the queue into the same failure would
+                            // requeue every message in turn for no reason.
+                            continue;
                         }
 
                         // The turn is over. Either the context is discarded
@@ -418,7 +471,8 @@ impl Supervisor {
             }
 
             // stdout closed: the child is gone. Reap it.
-            self.reap(agent, slot, stderr_done, run_id).await;
+            self.reap(agent, slot, stderr_done, run_id, tail, initialised)
+                .await;
         });
     }
 
@@ -435,6 +489,8 @@ impl Supervisor {
         slot: Arc<AsyncMutex<Option<Running>>>,
         stderr_done: tokio::task::JoinHandle<String>,
         run_id: Uuid,
+        stdout_tail: String,
+        initialised: bool,
     ) {
         // Wait for stderr so the classification below sees the whole message.
         // Without this the two tasks race and the reason is a coin flip.
@@ -454,20 +510,46 @@ impl Supervisor {
         let in_flight = running.in_flight;
         drop(guard);
 
-        let (status, detail) = match self.harness.classify_startup_failure(None, &captured) {
-            // Environmental, not poison: the queued message stays queued and
-            // is delivered on the next start once the operator authenticates.
-            // Marking it error would consume the message and lose it.
-            StartupFailure::NeedsAuth => (
-                AgentStatus::NeedsAuth,
-                Some("the harness has no usable credentials".to_string()),
-            ),
-            StartupFailure::Misconfigured(why) if !captured.trim().is_empty() => {
-                (AgentStatus::Error, Some(why))
+        // BOTH streams: the real `claude` CLI announces "Not logged in ·
+        // Please run /login" on stdout and exits without a `result`, so a
+        // stderr-only classification calls the commonest failure an operator
+        // will ever see a misconfiguration and eats the queued message.
+        let output = format!("{}\n{}", captured, stdout_tail);
+
+        let settled = {
+            let conn = self.db.lock().unwrap();
+            board::agent_state(&conn, agent).unwrap_or_default().status
+        };
+        // Something may already have diagnosed this run — a `result` carrying
+        // an auth failure, say. The exit that follows is a consequence of that
+        // diagnosis, not a fresh one, so the cleanup below still happens but
+        // the status is left alone: "stopped" would erase the only status
+        // telling the operator what to do.
+        let already_diagnosed = matches!(
+            settled,
+            AgentStatus::NeedsAuth | AgentStatus::Error | AgentStatus::BudgetExhausted
+        );
+
+        let (status, detail) = if initialised {
+            // It started, so it did not fail to START. Whatever it printed
+            // during a working session is not a diagnosis of its exit, and a
+            // clean shutdown after a chatty session must not read as an error.
+            (AgentStatus::Stopped, None)
+        } else {
+            match self.harness.classify_startup_failure(None, &output) {
+                // Environmental, not poison: the queued message stays queued
+                // and is delivered on the next start once the operator
+                // authenticates. Marking it error would consume and lose it.
+                StartupFailure::NeedsAuth => (
+                    AgentStatus::NeedsAuth,
+                    Some("the harness has no usable credentials".to_string()),
+                ),
+                StartupFailure::Misconfigured(why) if !output.trim().is_empty() => {
+                    (AgentStatus::Error, Some(why))
+                }
+                // Exited with nothing to say at all.
+                StartupFailure::Misconfigured(_) => (AgentStatus::Stopped, None),
             }
-            // Exited with nothing to say. A clean shutdown looks exactly like
-            // this, so it is not reported as an error.
-            StartupFailure::Misconfigured(_) => (AgentStatus::Stopped, None),
         };
 
         {
@@ -486,7 +568,9 @@ impl Supervisor {
             }
             // A token outliving its process is a credential with no owner.
             let _ = crate::db::tokens::revoke(&conn, agent);
-            set_status_db(&conn, agent, status, detail);
+            if !already_diagnosed {
+                set_status_db(&conn, agent, status, detail);
+            }
             publish_state(&self.events, &conn, agent);
         }
     }
@@ -1097,6 +1181,142 @@ done
             count(&dir.join("runs")) == 1
         })
         .await;
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PM repro'd this against the REAL `claude` CLI: no credentials, and the
+    /// agent went to `error` with the queued message gone. The CLI announces
+    /// "Not logged in · Please run /login" on **stdout** and exits non-zero
+    /// with no `result` event, and the classifier was only ever shown stderr.
+    ///
+    /// The exact bytes the real CLI produces, on the stream it really uses.
+    #[tokio::test]
+    async fn the_real_cli_logged_out_banner_on_stdout_means_needs_auth() {
+        let (sup, id, dir) = shim_supervisor(
+            "loggedout",
+            "#!/bin/sh\necho 'Not logged in · Please run /login'\nexit 1\n",
+        );
+        enqueue(&sup, id, "please do the thing");
+
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to report needs_auth", || {
+            status_of(&sup, id) == AgentStatus::NeedsAuth
+        })
+        .await;
+
+        // ...and the operator's message is still there to be delivered once
+        // they authenticate. Consuming it would lose work to a fixable setup
+        // problem.
+        let queued = {
+            let conn = sup.db.lock().unwrap();
+            messages::has_queued(&conn, id).unwrap()
+        };
+        assert!(
+            queued,
+            "the queued message must survive an auth failure, not be consumed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same fix: including stdout in the diagnosis must
+    /// not make an ordinary session's chatter look like a failure.
+    #[tokio::test]
+    async fn a_chatty_session_that_exits_cleanly_is_not_an_error() {
+        let (sup, id, dir) = shim_supervisor(
+            "chatty",
+            "#!/bin/sh\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s9\"}'\n\
+             echo 'something that looks alarming but is just output'\n\
+             exit 0\n",
+        );
+        sup.start(id).await.unwrap();
+        until("the agent to settle", || {
+            matches!(
+                status_of(&sup, id),
+                AgentStatus::Stopped | AgentStatus::Error
+            )
+        })
+        .await;
+        assert_eq!(
+            status_of(&sup, id),
+            AgentStatus::Stopped,
+            "a child that initialised did not FAIL to start"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// API repro'd this twice in production: agent `error`, queued_messages 0,
+    /// last_error the BARE harness string. That bare string was the tell — no
+    /// startup-failure branch produces it, so the auth failure was arriving as
+    /// an ordinary `result` with is_error, and the turn handler was consuming
+    /// the operator's message as poison.
+    ///
+    /// An environmental failure is not the message's fault.
+    #[tokio::test]
+    async fn an_auth_failure_reported_as_a_turn_result_requeues_the_message() {
+        let (sup, id, dir) = shim_supervisor(
+            "authresult",
+            "#!/bin/sh\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\n\
+             while IFS= read -r line; do\n\
+               echo '{\"type\":\"result\",\"subtype\":\"error\",\"session_id\":\"s1\",\"is_error\":true,\"result\":\"Not logged in · Please run /login\"}'\n\
+             done\n",
+        );
+        enqueue(&sup, id, "work the operator does not want to lose");
+
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to report needs_auth", || {
+            status_of(&sup, id) == AgentStatus::NeedsAuth
+        })
+        .await;
+
+        let queued = {
+            let conn = sup.db.lock().unwrap();
+            messages::has_queued(&conn, id).unwrap()
+        };
+        assert!(
+            queued,
+            "an auth failure must requeue the message, not consume it as poison"
+        );
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other side of that judgement: a REAL task error is still poison and
+    /// must be consumed exactly once, or a failing message loops forever.
+    #[tokio::test]
+    async fn a_genuine_task_error_is_still_consumed_once() {
+        let (sup, id, dir) = shim_supervisor(
+            "poison",
+            "#!/bin/sh\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\n\
+             while IFS= read -r line; do\n\
+               echo '{\"type\":\"result\",\"subtype\":\"error\",\"session_id\":\"s1\",\"is_error\":true,\"result\":\"tool call failed: no such file\"}'\n\
+             done\n",
+        );
+        enqueue(&sup, id, "a message that genuinely fails");
+
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to report the error", || {
+            status_of(&sup, id) == AgentStatus::Error
+        })
+        .await;
+
+        let queued = {
+            let conn = sup.db.lock().unwrap();
+            messages::has_queued(&conn, id).unwrap()
+        };
+        assert!(
+            !queued,
+            "a genuine task error must be consumed, or it loops forever"
+        );
         sup.stop(id).await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
