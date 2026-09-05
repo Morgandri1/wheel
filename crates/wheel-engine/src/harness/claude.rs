@@ -16,6 +16,10 @@ pub struct ClaudeDriver;
 const ROOT_REFUSAL: &str = "cannot be used with root/sudo privileges";
 
 impl Harness for ClaudeDriver {
+    fn program(&self) -> &str {
+        "claude"
+    }
+
     fn argv(&self, spec: &SpawnSpec) -> Vec<OsString> {
         let mut a: Vec<OsString> = vec![
             "--print".into(),
