@@ -100,6 +100,13 @@ describe("signing in", () => {
     await expect(m.signIn("dev@wheel.dev", "nope")).rejects.toThrow(/30 seconds/);
   });
 
+  it("does not accuse the user, because the limit is keyed per account", async () => {
+    const m = await load();
+    vi.stubGlobal("fetch", vi.fn(async () => respond(429, {})));
+    // Someone else hammering your email throttles you; "too many attempts" would blame the wrong person.
+    await expect(m.signIn("dev@wheel.dev", "nope")).rejects.toThrow(/paused for this account/i);
+  });
+
   it("reports an unreachable API as offline, not as bad credentials", async () => {
     const m = await load();
     vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("failed to fetch"); }));

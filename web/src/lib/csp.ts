@@ -41,8 +41,14 @@ export function buildCsp({
     connect.add("http://127.0.0.1:*");
   }
 
-  const script = ["'self'", `'nonce-${nonce}'`, "'strict-dynamic'"];
+  // 'strict-dynamic' turns off host allowlisting, so 'self' stops meaning anything and every
+  // script must be nonced or loaded by a nonced one. That is what we want in production — and it
+  // is wrong in development, where Next serves its error overlay from un-nonced fallback chunks.
+  // With the policy on, a missing module rendered as a BLANK PAGE instead of Next's error, which
+  // cost real debugging time. Dev keeps the nonce and 'self'; production keeps 'strict-dynamic'.
+  const script = ["'self'", `'nonce-${nonce}'`];
   if (dev) script.push("'unsafe-eval'");
+  else script.push("'strict-dynamic'");
 
   const frame = ["'none'"];
 
