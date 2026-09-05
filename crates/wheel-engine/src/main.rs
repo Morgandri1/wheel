@@ -1,5 +1,11 @@
 //! `wheel-engine` — one process per project, inside its sandbox.
 
+// The storage layer lands ahead of the control plane and supervisor that call
+// it, so its constructors read as dead to the compiler until they are wired.
+// It is fully unit-tested in the meantime.
+// TODO remove when the supervisor is wired (M1)
+#![allow(dead_code)]
+
 use std::process::ExitCode;
 
 mod config;

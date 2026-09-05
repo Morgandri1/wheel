@@ -20,6 +20,10 @@ use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 
+/// Ceiling on the upstream WebSocket handshake. Generous for a healthy engine on the same private
+/// network, and short enough that a stalled peer cannot hold the connection open indefinitely.
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub async fn engine_proxy(
     State(state): State<AppState>,
     scope: ProjectScope,
@@ -146,12 +150,25 @@ async fn bridge_websocket(
         .body(())
         .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("building ws request")))?;
 
-    let (upstream, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| {
+    // Bound the upstream handshake (ADVERSARY: unbounded connect on the bridge path).
+    // A peer that completes the TCP connection and then simply never finishes the WebSocket
+    // handshake would otherwise pin this task, and the client's connection with it, for as long as
+    // it liked — one slow-loris connection per request, with no ceiling.
+    let connect = tokio::time::timeout(
+        WS_HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    );
+    let (upstream, _resp) = match connect.await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             tracing::warn!(error = ?e, "engine websocket connect failed");
-            ApiError::BadGateway("engine websocket unreachable")
-        })?;
+            return Err(ApiError::BadGateway("engine websocket unreachable"));
+        }
+        Err(_elapsed) => {
+            tracing::warn!("engine websocket handshake timed out");
+            return Err(ApiError::GatewayTimeout);
+        }
+    };
 
     Ok(upgrade.on_upgrade(move |client| pump(client, upstream)))
 }

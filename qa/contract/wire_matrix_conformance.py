@@ -23,8 +23,9 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 EXPORT = os.path.join(ROOT, "docs", "schema", "wire-matrix.json")
 QA_MATRIX = os.path.join(ROOT, "qa", "fixtures", "wire_matrix.json")
 KNOWN_GAPS = {
-    ("endpoint", "vault", "read"): "BUG-004",
-    ("script", "tool", "read"): "BUG-004",
+    # (from, to, type): "BUG-nnn" — entries here are open, filed divergences. An entry
+    # whose row has since appeared FAILS this gate, so a fixed bug cannot leave a marker
+    # rotting behind it. BUG-004's two rows were closed this way.
 }
 
 def main():

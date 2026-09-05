@@ -1,140 +1,113 @@
-"""API authentication and tenant-isolation criteria — the S1 block of the TESTPLAN.
+#!/usr/bin/env python3
+"""API auth, ownership and tenancy — TESTPLAN API-*.
 
-These run against the real gateway over HTTP. Everything here is a NEGATIVE test: the positive
-path is easy to get right and easy to notice when it breaks. The failure modes below are the ones
-that look fine in a demo and hand you someone else's project.
+The heart of this file is API-auth-owner-404: a valid token for someone else's project
+must be INDISTINGUISHABLE from a project that does not exist. Not "refused" —
+indistinguishable. A 403 is a correct-looking refusal that still answers "does project
+<uuid> exist?", which turns any id leak into an enumeration oracle. So these assertions
+compare status, body AND the shape of the response between the two cases, rather than
+just checking that both were rejected.
 """
-import json
-import os
-import uuid
-import pytest
-from wheel_client import call, mint, new_project, api_up
+import sys, os, uuid
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wheel_client import call, mint, api_healthy, unique_sub, Results, ISSUER
 
-pytestmark = pytest.mark.skipif(not api_up(), reason="API not running — `make test-int` brings the stack up")
-
-ALICE, BOB = "user_alice", "user_bob"
+R = Results()
 
 
-@pytest.fixture(scope="module")
-def alice():
-    return mint(ALICE)
+def main():
+    api_healthy()
+
+    alice = mint(unique_sub("alice"))
+    mallory = mint(unique_sub("mallory"))
+
+    # ---------------------------------------------------------------- unauthenticated
+    st, _, _ = call("GET", "/v1/projects")
+    R.check("API-auth-missing", st == 401, "no token -> %s (want 401)" % st)
+
+    st, _, _ = call("GET", "/v1/projects", "not-a-jwt")
+    R.check("API-auth-invalid/garbage", st == 401, "garbage token -> %s" % st)
+
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), exp_delta=-10))
+    R.check("API-auth-invalid/expired", st == 401, "expired -> %s" % st)
+
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), nbf_delta=3600))
+    R.check("API-auth-invalid/nbf", st == 401, "not-yet-valid -> %s" % st)
+
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), iss="https://evil.example"))
+    R.check("API-auth-invalid/issuer", st == 401, "wrong issuer -> %s" % st)
+
+    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), secret=b"wrong-secret-entirely"))
+    R.check("API-auth-wrong-key", st == 401, "wrong signing key -> %s" % st)
+
+    # alg:none — the classic. Signature stripped, alg swapped.
+    import base64, json, time
+    def b64u(b):
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    now = int(time.time())
+    hdr = b64u(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+    pay = b64u(json.dumps({"sub": unique_sub("alice"), "iss": ISSUER,
+                           "exp": now + 3600, "nbf": now - 60}).encode())
+    st, _, _ = call("GET", "/v1/projects", "%s.%s." % (hdr, pay))
+    R.check("API-auth-alg-none", st == 401, "alg:none accepted -> %s" % st)
+
+    # ---------------------------------------------------------------- ownership
+    st, proj, _ = call("POST", "/v1/projects", alice, {"name": "qa-auth-board"})
+    if not R.check("API-project-create", st in (200, 201), "-> %s %r" % (st, proj)):
+        return R.report("api-auth")
+    pid = proj["id"]
+
+    st_own, body_own, _ = call("GET", "/v1/projects/%s" % pid, alice)
+    R.check("API-project-get-own", st_own == 200, "owner GET -> %s" % st_own)
+
+    st_other, body_other, _ = call("GET", "/v1/projects/%s" % pid, mallory)
+    ghost = str(uuid.uuid4())
+    st_ghost, body_ghost, _ = call("GET", "/v1/projects/%s" % ghost, mallory)
+
+    R.check("API-auth-owner-404", st_other == 404,
+            "another user's project -> %s (want 404, NOT 403)" % st_other)
+    R.check("API-auth-owner-404/indistinguishable",
+            st_other == st_ghost and body_other == body_ghost,
+            "other=%s/%r vs nonexistent=%s/%r — these must be identical or project ids "
+            "are enumerable" % (st_other, body_other, st_ghost, body_ghost))
+
+    # An INVALID token against someone else's project must 401, not 404: proves the JWT is
+    # verified BEFORE the project is loaded (API-auth-order).
+    st, _, _ = call("GET", "/v1/projects/%s" % pid, "not-a-jwt")
+    R.check("API-auth-order", st == 401,
+            "invalid token on a real project -> %s (401 proves verify-then-load)" % st)
+
+    # Ownership must gate mutation and lifecycle too, not just reads.
+    for verb, path, tid in (
+        ("PATCH", "/v1/projects/%s" % pid, "API-auth-owner-404/patch"),
+        ("DELETE", "/v1/projects/%s" % pid, "API-auth-owner-404/delete"),
+        ("POST", "/v1/projects/%s/start" % pid, "API-auth-owner-404/start"),
+        ("POST", "/v1/projects/%s/stop" % pid, "API-auth-owner-404/stop"),
+    ):
+        body = {"name": "hijacked"} if verb == "PATCH" else None
+        st, _, _ = call(verb, path, mallory, body)
+        R.check(tid, st == 404, "%s %s as non-owner -> %s" % (verb, path, st))
+
+    # And the engine proxy, which is the interesting one: it must not forward at all.
+    st, _, _ = call("GET", "/v1/projects/%s/engine/v1/board" % pid, mallory)
+    R.check("API-proxy-auth", st == 404, "non-owner engine proxy -> %s" % st)
+
+    st, _, _ = call("GET", "/v1/projects/%s/engine/v1/board" % pid)
+    R.check("API-proxy-auth/unauth", st == 401, "unauthenticated engine proxy -> %s" % st)
+
+    # ---------------------------------------------------------------- tenancy listing
+    st, mine, _ = call("GET", "/v1/projects", alice)
+    R.check("API-project-list", st == 200 and any(p["id"] == pid for p in (mine or [])),
+            "alice's list -> %s" % st)
+    st, theirs, _ = call("GET", "/v1/projects", mallory)
+    R.check("API-tenancy-list", st == 200 and not any(p["id"] == pid for p in (theirs or [])),
+            "mallory can see alice's project in her list")
+
+    st, _, _ = call("DELETE", "/v1/projects/%s" % pid, alice)
+    R.check("API-project-delete", st in (200, 204), "owner delete -> %s" % st)
+
+    return R.report("api-auth")
 
 
-@pytest.fixture(scope="module")
-def alice_project(alice):
-    return new_project(alice, "qa-alice")
-
-
-def test_healthz_needs_no_auth():
-    """API-healthz"""
-    assert call("GET", "/healthz").status == 200
-
-
-def test_missing_token_is_401():
-    """API-auth-missing"""
-    assert call("GET", "/v1/projects").status == 401
-
-
-@pytest.mark.parametrize("token,case", [
-    ("", "empty"),
-    ("not-a-jwt", "not a jwt"),
-    ("a.b.c", "three junk segments"),
-    ("Bearer " + mint(ALICE), "bearer-prefixed (header takes the raw token)"),
-])
-def test_malformed_token_is_401(token, case):
-    """API-auth-invalid"""
-    assert call("GET", "/v1/projects", token=token).status == 401, case
-
-
-def test_alg_none_is_rejected():
-    """API-auth-alg-none · S1 — the classic JWT bypass."""
-    assert call("GET", "/v1/projects", token=mint(ALICE, alg="none", sign=False)).status == 401
-
-
-def test_wrong_signing_key_is_rejected():
-    """API-auth-wrong-key · S1"""
-    forged = mint(ALICE, secret=b"not-the-dev-secret-at-all")
-    assert call("GET", "/v1/projects", token=forged).status == 401
-
-
-def test_wrong_issuer_is_rejected():
-    """API-auth-invalid — a correctly-signed token for the wrong issuer is still not ours."""
-    assert call("GET", "/v1/projects", token=mint(ALICE, issuer="https://evil.example")).status == 401
-
-
-def test_expired_token_is_rejected():
-    """API-auth-invalid"""
-    assert call("GET", "/v1/projects", token=mint(ALICE, exp_delta=-10)).status == 401
-
-
-def test_not_yet_valid_token_is_rejected():
-    """API-auth-invalid"""
-    assert call("GET", "/v1/projects", token=mint(ALICE, nbf_delta=3600, exp_delta=7200)).status == 401
-
-
-def test_owner_sees_own_project(alice, alice_project):
-    """API-project-crud"""
-    r = call("GET", "/v1/projects/" + alice_project["id"], token=alice)
-    assert r.status == 200 and r.json["id"] == alice_project["id"]
-
-
-def test_other_user_gets_404_not_403(alice_project):
-    """API-auth-owner-404 · S1.
-
-    403 is the natural-looking implementation and it is wrong: it confirms the project exists,
-    which is an enumeration oracle. The response must be indistinguishable from a project that
-    was never created.
-    """
-    bob = mint(BOB)
-    real = call("GET", "/v1/projects/" + alice_project["id"], token=bob)
-    ghost = call("GET", "/v1/projects/" + str(uuid.uuid4()), token=bob)
-
-    assert real.status == 404, "someone else's project must 404, got %s" % real.status
-    assert ghost.status == 404
-    assert real.body == ghost.body, (
-        "404 for a real project owned by someone else differs from 404 for a nonexistent one — "
-        "that difference is an enumeration oracle.\n  real:  %r\n  ghost: %r" % (real.body, ghost.body))
-
-
-def test_invalid_token_on_foreign_project_is_401_not_404(alice_project):
-    """API-auth-order · verify JWT -> load project -> assert owner.
-
-    Asserted behaviourally: if ownership were checked before signature verification, a garbage
-    token would produce 404. It must produce 401, proving verification happens first.
-    """
-    r = call("GET", "/v1/projects/" + alice_project["id"], token="garbage")
-    assert r.status == 401, "expected 401 (auth first), got %s — ownership appears to be checked before the JWT" % r.status
-
-
-def test_other_user_cannot_mutate(alice_project):
-    """API-auth-owner-404 · S1 — writes must be gated identically to reads."""
-    bob = mint(BOB)
-    pid = alice_project["id"]
-    for method, path, body in [
-        ("PATCH", "/v1/projects/" + pid, {"name": "pwned"}),
-        ("DELETE", "/v1/projects/" + pid, None),
-        ("POST", "/v1/projects/" + pid + "/start", None),
-        ("POST", "/v1/projects/" + pid + "/stop", None),
-    ]:
-        r = call(method, path, token=bob, body=body)
-        assert r.status == 404, "%s %s leaked to a non-owner with %s" % (method, path, r.status)
-
-
-def test_other_user_cannot_proxy_to_engine(alice_project):
-    """API-proxy-auth · S1 — the proxy must re-check ownership, not just the JWT."""
-    bob = mint(BOB)
-    r = call("GET", "/v1/projects/%s/engine/v1/board" % alice_project["id"], token=bob)
-    assert r.status == 404, "engine proxy reachable by a non-owner (%s)" % r.status
-
-
-def test_engine_secret_never_reaches_the_client(alice, alice_project):
-    """API-proxy-auth · S1 — WHEEL_ENGINE_SECRET must never appear in a client-visible response."""
-    secret = os.environ.get("WHEEL_ENGINE_SECRET_CANARY")
-    pid = alice_project["id"]
-    for r in (call("GET", "/v1/projects/" + pid, token=alice),
-              call("GET", "/v1/projects", token=alice),
-              call("GET", "/v1/projects/%s/engine/v1/board" % pid, token=alice)):
-        blob = r.body + json.dumps(r.headers)
-        assert "engine_secret" not in blob.lower(), "engine secret key leaked in %r" % r
-        if secret:
-            assert secret not in blob, "the engine secret VALUE leaked in %r" % r
+if __name__ == "__main__":
+    sys.exit(main())

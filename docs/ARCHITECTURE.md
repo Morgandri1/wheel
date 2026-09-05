@@ -18,7 +18,7 @@ silently diverge.
 | QA                | QA engineer             | qa/, Makefile `check` targets, CI config, docs/TESTPLAN.md           |
 | ADVERSARY         | Red team                | redteam/ (threat model, findings, PoCs)                              |
 
-**Messaging.** Run `yoke connections` to see who you can reach. Everyone can reach PM. **SDK, API and Web now have direct wires to QA and ADVERSARY** (operator added them): send `BUG:` reports, fix notifications, fixture/test-hook requests, plan-review requests and harness questions DIRECTLY between dev ↔ QA ↔ ADVERSARY. PM is for rulings, contract changes, blockers, and `DONE:` on milestone deliverables only — CC PM on S1/S2 bugs, nothing else. Fewer messages = fewer spawned sessions = a machine that survives. Message format (one per message, first line is the tag):
+**Messaging.** Run `yoke connections` to see who you can reach. Everyone can reach PM. **SDK, API and Web have direct wires to QA and ADVERSARY, and SDK/Engine ↔ API and SDK/Engine ↔ Web are wired directly too** (operator added them): send `BUG:` reports, fix notifications, fixture/test-hook requests, plan-review requests and harness questions DIRECTLY between dev ↔ QA ↔ ADVERSARY; engine spawn contract, image tags, schema/log-stream questions and gate breakage go DIRECTLY SDK ↔ API / SDK ↔ Web. PM is for rulings, contract changes, blockers, and `DONE:` on milestone deliverables only — CC PM on S1/S2 bugs, nothing else. Fewer messages = fewer spawned sessions = a machine that survives. Message format (one per message, first line is the tag):
 - `STATUS: <what you finished / what's next>` — send at every meaningful milestone (at least every ~hour of work).
 - `BLOCKED: <what> — <what you need> — <what you're doing meanwhile>` — never sit idle; pick up unblocked work.
 - `QUESTION: <specific question + your recommended answer>` — always include your recommendation.
@@ -36,7 +36,7 @@ ownership area. Ship small, commit often, keep main green.
 
 1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
-3. **≥ 90 % test coverage** per crate and per package, enforced in `make check` (Rust: `cargo llvm-cov --workspace --fail-under-lines 90`; web: `vitest --coverage` with `lines: 90` threshold). Coverage below the bar is a failing check, not a warning.
+3. **≥ 90 % test coverage** per crate and per package. Enforced in **CI** (`make check-strict` on every push to origin: `cargo llvm-cov --fail-under-lines 90` per crate; web `vitest --coverage` with `lines: 90`) — coverage below the bar is a failing check, not a warning. Locally `make check` runs everything except coverage (it OOMs with six agents resident) and `make coverage` runs it deliberately. A red CI on `origin/main` is the owner's to fix within the hour; PM pushes `main` after merges so CI sees every merge.
 
 ## 1. Repository & workflow
 
@@ -48,6 +48,7 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+- **Build throughput on the shared dev host**: `~/.cargo/config.toml` sets one shared `target-dir` (`/Users/metatron/wheel-target`) and `jobs = 4` for every worktree — do not override them; `qa/check.sh` serialises cargo gates with `flock /tmp/wheel-cargo.lock`. Run long gates in the background and wait on completion; a foreground cargo killed by load is not a pass.
 - Toolchain (host is macOS, Docker present, **no cargo/node installed yet**): install Rust via
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y` (stable), Node 22 + pnpm via
   `brew install node pnpm` (or fnm). Python 3 is present. Docker Desktop/OrbStack is running.

@@ -41,6 +41,17 @@ fn dev_config(db_url: &str) -> Config {
     }
 }
 
+/// A fresh subject for each test.
+///
+/// These tests share one database, so a fixed id lets rows from earlier tests — and from earlier
+/// *runs* — pile up under the same user. That silently breaks every assertion of the form "what
+/// does this user have": the cap test hit its limit on leftovers, and the list test saw six
+/// projects where it expected one. A unique id per call keeps tests isolated and idempotent
+/// without truncating tables that other tests may be using concurrently.
+fn user(label: &str) -> String {
+    format!("user_{label}_{}", uuid::Uuid::new_v4())
+}
+
 fn token(sub: &str) -> String {
     #[derive(serde::Serialize)]
     struct C<'a> {
@@ -144,8 +155,8 @@ macro_rules! app_or_skip {
 #[tokio::test]
 async fn owner_sees_own_project_and_stranger_gets_404() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
-    let mallory = token("user_mallory");
+    let alice = token(&user("alice"));
+    let mallory = token(&user("mallory"));
 
     let (status, proj) = send(
         &app,
@@ -202,8 +213,8 @@ async fn owner_sees_own_project_and_stranger_gets_404() {
 #[tokio::test]
 async fn stranger_cannot_mutate_or_proxy() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
-    let mallory = token("user_mallory");
+    let alice = token(&user("alice"));
+    let mallory = token(&user("mallory"));
 
     let (_, proj) = send(
         &app,
@@ -247,7 +258,7 @@ async fn stranger_cannot_mutate_or_proxy() {
 #[tokio::test]
 async fn unauthenticated_requests_are_rejected() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
+    let alice = token(&user("alice"));
     let (_, proj) = send(
         &app,
         "POST",
@@ -275,8 +286,8 @@ async fn unauthenticated_requests_are_rejected() {
 #[tokio::test]
 async fn list_is_scoped_to_the_caller() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
-    let mallory = token("user_mallory");
+    let alice = token(&user("alice"));
+    let mallory = token(&user("mallory"));
 
     send(
         &app,
@@ -313,7 +324,7 @@ async fn list_is_scoped_to_the_caller() {
 #[tokio::test]
 async fn malformed_project_id_is_a_400_not_a_500() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
+    let alice = token(&user("alice"));
     for bad in ["not-a-uuid", "../../etc/passwd", "00000000", "%00"] {
         let (status, _) = send(
             &app,
@@ -333,7 +344,7 @@ async fn malformed_project_id_is_a_400_not_a_500() {
 #[tokio::test]
 async fn project_cap_is_enforced() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
+    let alice = token(&user("alice"));
     for i in 0..3 {
         let (status, _) = send(
             &app,
@@ -359,7 +370,7 @@ async fn project_cap_is_enforced() {
 #[tokio::test]
 async fn invalid_names_are_rejected() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
+    let alice = token(&user("alice"));
     for bad in ["", "   ", "a\nb", &"x".repeat(65)] {
         let (status, _) = send(
             &app,
@@ -376,7 +387,7 @@ async fn invalid_names_are_rejected() {
 #[tokio::test]
 async fn ingress_is_closed_until_opted_in() {
     let (app, _db) = app_or_skip!();
-    let alice = token("user_alice");
+    let alice = token(&user("alice"));
     let (_, proj) = send(
         &app,
         "POST",

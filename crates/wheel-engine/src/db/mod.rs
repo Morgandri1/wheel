@@ -124,7 +124,7 @@ mod tests {
     fn node_names_are_unique_at_the_storage_layer_too() {
         let conn = open_memory().unwrap();
         let now = "2026-09-05T00:00:00Z";
-        let mut insert = |id: &str, name: &str| {
+        let insert = |id: &str, name: &str| {
             conn.execute(
                 "INSERT INTO nodes (id,name,type,config,x,y,created_at,updated_at)
                  VALUES (?1,?2,'ctx','{}',0,0,?3,?3)",

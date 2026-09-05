@@ -124,9 +124,7 @@ pub fn get_by_name(conn: &Connection, name: &str) -> Result<Option<Node>> {
 /// Every node on the board, each with its outgoing wires attached.
 pub fn list(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare("SELECT * FROM nodes ORDER BY name")?;
-    let mut nodes: Vec<Node> = stmt
-        .query_map([], row_to_node)?
-        .collect::<Result<_, _>>()?;
+    let mut nodes: Vec<Node> = stmt.query_map([], row_to_node)?.collect::<Result<_, _>>()?;
     for n in &mut nodes {
         n.wires = wires_from(conn, n.id)?;
     }
@@ -196,13 +194,7 @@ pub fn add_wire(
         .flatten()
         .ok_or_else(|| BoardError::NotFound(to.to_string()))?;
 
-    check_wire(
-        from,
-        from_node.node_type(),
-        to,
-        to_node.node_type(),
-        ty,
-    )?;
+    check_wire(from, from_node.node_type(), to, to_node.node_type(), ty)?;
 
     // Idempotent: re-creating an existing wire is a no-op, not an error.
     conn.execute(

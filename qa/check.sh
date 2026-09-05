@@ -18,8 +18,16 @@ else
   B=""; R=""; G=""; Y=""; C=""; Z=""
 fi
 
-PASS=(); FAIL=(); SKIP=()
-STRICT="${CHECK_STRICT:-0}"   # CI sets 1: skips become failures
+# Two kinds of not-run, and the difference decides whether CI may go green:
+#   ABSENT  — the area does not exist yet (no web/package.json). Nobody can fix that by
+#             trying harder, so strict mode tolerates it and simply reports it.
+#   UNAVAIL — the gate itself could not run (no jsonschema, no cargo-llvm-cov, no docker).
+#             In CI that is a broken pipeline pretending to be a passing one, so strict
+#             mode FAILS on it. This is the distinction that keeps `check-strict` honest
+#             without making CI red for a reason no one can act on.
+PASS=(); FAIL=(); ABSENT=(); UNAVAIL=()
+STRICT="${CHECK_STRICT:-0}"   # CI sets 1: UNAVAIL becomes a failure
+COVERAGE="${COVERAGE:-0}"     # coverage is opt-in locally (slow, memory-hungry); CI sets 1
 COV_MIN="${COV_MIN:-90}"      # ARCHITECTURE.md §0b
 ONLY="${CHECK_ONLY:-}"        # e.g. CHECK_ONLY=rust
 
@@ -36,18 +44,24 @@ step() { # step <name> <cmd...>
     PASS+=("$name (${t1}s)")
     printf '%s  ✓ %s%s (%ss)\n' "$G" "$name" "$Z" "$t1"
   elif [ $rc -eq 77 ]; then
-    SKIP+=("$name — gate reported it could not run")
-    printf '%s  ⊘ %s skipped%s\n' "$Y" "$name" "$Z"
+    UNAVAIL+=("$name — the gate reported it could not run")
+    printf '%s  ⊘ %s skipped (could not run)%s\n' "$Y" "$name" "$Z"
   else
     FAIL+=("$name")
     printf '%s  ✗ %s FAILED%s (%ss, exit %d)\n' "$R" "$name" "$Z" "$t1" "$rc"
   fi
 }
 
-skip() { # skip <name> <why>
+skip() { # skip <name> <why> — the gate could not run (fails under CHECK_STRICT)
   if [ -n "$ONLY" ] && [[ "$1" != $ONLY* ]]; then return 0; fi
-  SKIP+=("$1 — $2")
+  UNAVAIL+=("$1 — $2")
   printf '%s  ⊘ %s skipped — %s%s\n' "$Y" "$1" "$2" "$Z"
+}
+
+skip_absent() { # skip_absent <name> <why> — the area does not exist yet (tolerated in strict)
+  if [ -n "$ONLY" ] && [[ "$1" != $ONLY* ]]; then return 0; fi
+  ABSENT+=("$1 — $2")
+  printf '%s  ⊘ %s not applicable — %s%s\n' "$Y" "$1" "$2" "$Z"
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -59,9 +73,9 @@ PY=python3
 # ----------------------------------------------------------------- rust
 RUST_CRATES=$(ls -d crates/*/Cargo.toml 2>/dev/null | wc -l | tr -d ' ')
 if [ "$RUST_CRATES" = "0" ]; then
-  skip "rust:fmt"    "no crates yet (crates/*/Cargo.toml)"
-  skip "rust:clippy" "no crates yet"
-  skip "rust:test"   "no crates yet"
+  skip_absent "rust:fmt"    "no crates yet (crates/*/Cargo.toml)"
+  skip_absent "rust:clippy" "no crates yet"
+  skip_absent "rust:test"   "no crates yet"
 elif ! have cargo; then
   skip "rust:fmt"    "cargo not installed — run 'make bootstrap'"
   skip "rust:clippy" "cargo not installed"
@@ -73,7 +87,11 @@ else
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
-  step "rust:coverage" "$PY" qa/tools/coverage_gate.py
+  if [ "$COVERAGE" = "1" ]; then
+    step "rust:coverage" "$PY" qa/tools/coverage_gate.py
+  else
+    skip_absent "rust:coverage" "opt-in locally: run 'make coverage' (CI enforces it via check-strict)"
+  fi
 fi
 
 # ----------------------------------------------------------------- web
@@ -81,9 +99,9 @@ web_script() { # does web/package.json define this script?
   [ -f web/package.json ] && node -e "process.exit(require('./web/package.json').scripts?.['$1']?0:1)" 2>/dev/null
 }
 if [ ! -f web/package.json ]; then
-  skip "web:lint"      "no web/package.json yet"
-  skip "web:typecheck" "no web/package.json yet"
-  skip "web:test"      "no web/package.json yet"
+  skip_absent "web:lint"      "no web/package.json yet"
+  skip_absent "web:typecheck" "no web/package.json yet"
+  skip_absent "web:test"      "no web/package.json yet"
 elif ! have pnpm; then
   skip "web:lint"      "pnpm not installed — run 'make bootstrap'"
   skip "web:typecheck" "pnpm not installed"
@@ -97,7 +115,7 @@ else
     else skip "web:$s" "no '$s' script in web/package.json"; fi
   done
   if web_script "coverage"; then step "web:coverage" pnpm -C web run coverage
-  else skip "web:coverage" "no 'coverage' script in web/package.json (§0b: vitest --coverage, lines: $COV_MIN)"; fi
+  else skip_absent "web:coverage" "no 'coverage' script in web/package.json (§0b: vitest --coverage, lines: $COV_MIN)"; fi
 fi
 
 # ----------------------------------------------------------------- qa's own
@@ -135,23 +153,27 @@ fi
 echo
 printf '%s──────── make check ────────%s\n' "$B" "$Z"
 for p in "${PASS[@]:-}"; do [ -n "$p" ] && printf '%s  pass%s  %s\n' "$G" "$Z" "$p"; done
-for s in "${SKIP[@]:-}"; do [ -n "$s" ] && printf '%s  SKIP%s  %s\n' "$Y" "$Z" "$s"; done
+for a in "${ABSENT[@]:-}"; do [ -n "$a" ] && printf '%s  n/a %s  %s\n' "$Y" "$Z" "$a"; done
+for u in "${UNAVAIL[@]:-}"; do [ -n "$u" ] && printf '%s  SKIP%s  %s\n' "$Y" "$Z" "$u"; done
 for f in "${FAIL[@]:-}"; do [ -n "$f" ] && printf '%s  FAIL%s  %s\n' "$R" "$Z" "$f"; done
 echo
 
-NF=${#FAIL[@]}; NS=${#SKIP[@]}
+NF=${#FAIL[@]}; NU=${#UNAVAIL[@]}; NA=${#ABSENT[@]}
 if [ "$NF" -gt 0 ]; then
   printf '%s✗ make check FAILED — %d gate(s) red.%s Fix before merging to main.\n' "$R" "$NF" "$Z"
   exit 1
 fi
-if [ "$NS" -gt 0 ]; then
-  if [ "$STRICT" = "1" ]; then
-    printf '%s✗ make check FAILED — %d gate(s) skipped and CHECK_STRICT=1.%s\n' "$R" "$NS" "$Z"
-    exit 1
-  fi
-  printf '%s✓ make check passed, but %d gate(s) were SKIPPED%s — coverage is partial.\n' "$Y" "$NS" "$Z"
-  printf '  This is expected while the tree is still being built out. It is NOT a\n'
-  printf '  statement that those areas are healthy — only that they do not exist yet.\n'
+if [ "$STRICT" = "1" ] && [ "$NU" -gt 0 ]; then
+  printf '%s✗ make check FAILED — %d gate(s) COULD NOT RUN and CHECK_STRICT=1.%s\n' "$R" "$NU" "$Z"
+  printf '  In CI a gate that cannot run is a broken pipeline pretending to be a passing\n'
+  printf '  one. Install the missing tooling (make bootstrap) rather than lowering the bar.\n'
+  exit 1
+fi
+if [ "$((NU + NA))" -gt 0 ]; then
+  printf '%s✓ make check passed, but %d gate(s) did not run%s (%d not applicable, %d unavailable).\n' \
+    "$Y" "$((NU + NA))" "$Z" "$NA" "$NU"
+  printf '  Expected while the tree is still being built out. It is NOT a statement that\n'
+  printf '  those areas are healthy — only that they could not be checked here.\n'
   exit 0
 fi
 printf '%s✓ make check passed — all gates green.%s\n' "$G" "$Z"

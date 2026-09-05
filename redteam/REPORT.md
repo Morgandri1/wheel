@@ -17,6 +17,8 @@ code review; PoCs in `redteam/pocs/` flip to CONFIRMED/CLOSED the moment `wheel-
 | 007 | High | Per-node token/creds isolation collapses within a project (same uid) | SDK+API | ACCEPTED → **per-node uid** (project uid range, ambient CAP_SETUID/SETGID only, 0700 creds, WHEEL_TOKEN via 0600 file). M2/M3. |
 | 009 | High | Node-config validation collapsed to ONE layer, and that layer is untested | SDK | OPEN. Schema accepts 12 forbidden configs (QA BUG-001); validate.rs 73% / state.rs 0% / ws 67% vs 90% mandate. Scoped: not "engine accepts .." — unverified. |
 | 008 | Medium | Child stdout is attacker-controlled → forgeable `result`/`usage`/`session_id` | SDK | ACCEPTED; budget/turn + session_id enforced supervisor-side; test a fake `result` can't reach the parser top-level. |
+| 011 | Medium | Established WS/proxy bridge: no idle timeout, lifetime, or per-project connection cap (shared-host DoS) | API | OPEN; recommend per-project conn cap + WS keepalive at M2, lifetime cap M3. |
+| 010 | Info | API tenancy + proxy/ingress campaign — **22 attacks resisted, 0 vulns** (live, WHEEL_ENV=dev) | API | RESISTED. Handshake-bound obs FIXED both hops. 1 must-verify: ws-ticket route unimplemented (browser-WS auth model). |
 
 ## Systemic themes
 1. **Attribution & control-stream integrity (001, 008).** The `<AgentPrompt>` envelope and the harness

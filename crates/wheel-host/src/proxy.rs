@@ -15,13 +15,21 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use uuid::Uuid;
 
-/// `ANY /host/v1/projects/{id}/engine/{*rest}` → the engine's `/v1/{rest}`.
+/// Ceiling on the upstream WebSocket handshake, so a stalled engine cannot hold a bridge
+/// half-open indefinitely.
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `ANY /host/v1/projects/{id}/engine/{*rest}` → the engine's `/{rest}`.
+///
+/// The suffix is forwarded verbatim. Callers address the control plane as
+/// `/v1/projects/<id>/engine/v1/board`, so `rest` already carries the engine's own `v1/` prefix;
+/// adding another here produced `/v1/v1/board` and a 404 from the engine.
 pub async fn engine(
     State(state): State<HostState>,
     Path((id, rest)): Path<(Uuid, String)>,
     req: Request,
 ) -> Response {
-    forward(state, id, format!("v1/{rest}"), req).await
+    forward(state, id, rest, req).await
 }
 
 /// `ANY /host/v1/projects/{id}/ingress/{*rest}` → the engine's `/ingress/{rest}`.
@@ -177,11 +185,25 @@ async fn bridge_ws(
 
     // Connect upstream *before* accepting the client upgrade, so a dead engine surfaces as a clean
     // 502 rather than a WebSocket that opens and immediately closes.
-    let (engine_ws, _) = match tokio_tungstenite::connect_async(upstream_req).await {
-        Ok(c) => c,
-        Err(e) => {
+    let (engine_ws, _) = match tokio::time::timeout(
+        WS_HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::connect_async(upstream_req),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             tracing::warn!(error = ?e, "engine websocket connect failed");
             return (StatusCode::BAD_GATEWAY, "engine websocket unreachable").into_response();
+        }
+        Err(_elapsed) => {
+            // An engine that accepts the socket and then stalls must not pin this task.
+            tracing::warn!("engine websocket handshake timed out");
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                "engine websocket handshake timed out",
+            )
+                .into_response();
         }
     };
 

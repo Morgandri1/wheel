@@ -18,6 +18,5 @@
     "operations": []
   },
   "_expect_reject": "NODE-tool-config",
-  "_enforced_by": "schema",
-  "_known_bug": "BUG-003"
+  "_enforced_by": "schema"
 }

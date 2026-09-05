@@ -9,9 +9,10 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 |---|----------|-----|-------|--------|-------|
 | 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | **S2** | SDK | **open** | Exported JSON Schema accepts 12 configs the contract forbids |
 | 002 | `NODE-type-closed` | S3 | SDK | **open** | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
-| 003 | `NODE-tool-config` | **S2** | SDK | **open** | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
+| 003 | `NODE-tool-config` | **S2** | SDK | ~~closed~~ | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
 | 005 | `make check` (`rust:fmt`) | S3 **blocking** | API | **open** | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
-| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | **open** | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
+| 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ |
+| 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar | `wire_allowed` is missing TWO contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 
 ---
 
@@ -159,3 +160,48 @@ Files: `wheel-api/src/{lib,config,crypto,error,models,orchestrator,state}.rs`,
 
 Not a correctness defect, but it is the merge gate, so while it is red nobody can merge anything
 per §1 of the contract. Filed as blocking for that reason alone.
+
+
+---
+
+## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
+
+First real numbers from CI (run 33955251384, bar 90%):
+
+| crate | lines | status |
+|---|---|---|
+| `wheel-api` | 29.36% (394/1342) | FAIL |
+| `wheel-core` | 68.34% (669/979) | FAIL |
+| `wheel-engine` | 74.79% (350/468) | EXEMPT — scaffolding (PM ruling); expires when the engine is bootable / `wheel-engine:test` exists |
+| `wheel-host` | **0.00% (0/688)** | FAIL |
+
+`wheel-host` is the one to fix first. It holds every project's engine secret, performs the
+setuid, and is the only process in the stack touching the docker socket — and no test exercises
+a single line of it. The others are under-tested; this one is untested, in the crate where that
+matters most.
+
+`wheel-core` at 68% matters for a specific reason: `validate.rs` is the code that must be
+enforcing the twelve rejections in BUG-001 that the exported schema does not. Untested branches
+there are the difference between "the schema is loose but the engine catches it" and "nothing
+catches it". Those twelve are marked `_enforced_by: engine` in the fixtures and will be asserted
+against a real engine once `wheel-engine:test` exists; coverage is the cheaper earlier signal.
+
+**Repro:** `make coverage`, or CI's `make check-strict`.
+
+**Note on the exemption:** it is declared in `qa/tools/coverage_gate.py` naming the crate, the
+reason and the event that expires it. If `wheel-engine` reaches 90% while still exempt, the gate
+FAILS and tells us to remove the exemption — a stale exemption cannot outlive its reason.
+
+---
+
+## CLOSED
+
+**003 · ToolConfig §3d divergence** — closed by SDK. `qa:contract-schema` now rejects both
+`tool_bad_kind` and `tool_bad_source_format`. Verified by the gate itself: the fixtures were
+tagged `_known_bug: BUG-003`, and a tracked gap that starts PASSING fails the build, so the fix
+announced itself rather than waiting for someone to notice.
+
+**004 · wire matrix missing two rows** — closed by SDK. `qa:wire-conformance` now reports
+contract 26 / export 26. Same mechanism: the `KNOWN_GAPS` entries failed once the rows appeared.
+Reported by Web (`endpoint→vault`), second row (`script→tool`) found by QA's contract-derived
+matrix.

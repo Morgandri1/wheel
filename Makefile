@@ -17,8 +17,8 @@ help: ## show this help
 check: ## run every gate that can run (fmt, clippy, tests, web, qa) — RUN BEFORE MERGING
 	@bash qa/check.sh
 
-check-strict: ## like check, but a skipped gate is a failure (used by CI)
-	@CHECK_STRICT=1 bash qa/check.sh
+check-strict: ## CI gate: coverage enforced, and a gate that COULD NOT RUN is a failure
+	@CHECK_STRICT=1 COVERAGE=1 bash qa/check.sh
 
 ## ---------------------------------------------------------------- granular
 fmt: ## rustfmt the workspace (writes)
@@ -56,14 +56,8 @@ test-live: ## OPT-IN: same suites against the REAL claude/codex CLIs. Costs mone
 	@WHEEL_LIVE=1 bash qa/integration/run.sh
 
 ## ---------------------------------------------------------------- setup
-bootstrap: ## install the toolchain (rust, node, pnpm) and the QA python venv
-	@command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-	@command -v pnpm  >/dev/null || brew install node pnpm
-	@cargo llvm-cov --version >/dev/null 2>&1 || cargo install cargo-llvm-cov
-	@python3 -m venv qa/.venv && qa/.venv/bin/pip install -q -r qa/requirements.txt
-	@test -x qa/.venv/bin/python || python3 -m venv qa/.venv
-	@qa/.venv/bin/pip install -q --disable-pip-version-check -r qa/requirements.txt
-	@echo "toolchain ready — you may need to restart your shell for PATH"
+bootstrap: ## install the toolchain (rust, node, pnpm, cargo-llvm-cov, QA venv)
+	@bash qa/bootstrap.sh
 
 clean: ## remove build artefacts
 	@rm -rf target web/.next web/node_modules
