@@ -3,6 +3,20 @@ import { Archivo, JetBrains_Mono } from "next/font/google";
 import { Providers } from "@/app/providers";
 import "./globals.css";
 
+/**
+ * Every route renders per request.
+ *
+ * The CSP nonce is minted per request by middleware, and a statically prerendered page was built
+ * before any request existed — its HTML carries no nonce, so the browser refuses Next's own
+ * bootstrap scripts and the page is blank. Verified rather than assumed: with prerendering on,
+ * the landing page served 0 nonces and 12 scripts were refused, while a dynamic route served 1
+ * and loaded cleanly.
+ *
+ * The cost is that the landing HTML is no longer CDN-cacheable; static assets still are. That is
+ * the price of a nonce-based policy with no 'unsafe-inline', which ADVERSARY R7 makes binding.
+ */
+export const dynamic = "force-dynamic";
+
 const archivo = Archivo({
   subsets: ["latin"],
   axes: ["wdth"],

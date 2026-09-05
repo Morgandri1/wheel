@@ -11,7 +11,7 @@ variables and no third-party account:
 | Variable | Value | Scope | Notes |
 |---|---|---|---|
 | `NEXT_PUBLIC_AUTH_MODE` | `local` | all | `mock` and `dev` are for local work only. Anything but `local` or `clerk` on a public deploy means no sign-in at all. |
-| `NEXT_PUBLIC_API_URL` | API's Railway domain, later `https://api.wheel.dev` | all | No trailing slash. |
+| `NEXT_PUBLIC_API_URL` | `https://wheel-api-production.up.railway.app`, later `https://api.wheel.dev` | all | No trailing slash. It is also baked into the CSP's `connect-src`, so a wrong value blocks every API call at the browser rather than failing at the API. |
 
 `NEXT_PUBLIC_*` values are baked into the client bundle at build time, so changing one needs a
 redeploy, not just a restart.
@@ -45,6 +45,35 @@ opens at `.../engine/v1/events?ticket=…`. A browser cannot set headers on a We
 so the ticket is the only way the socket authenticates. If the board loads but never goes live,
 check the ticket call in the network tab before suspecting the engine: a socket that opens and
 stays silent is an auth failure, not an engine failure.
+
+## Content Security Policy
+
+Set on every response by `src/middleware.ts` from `src/lib/csp.ts`, with a nonce minted per
+request: no inline script, no `eval`, `object-src`/`base-uri`/`frame-ancestors` all `'none'`,
+and `connect-src` limited to our own origin plus the API over both https and wss.
+(ADVERSARY R7, binding.)
+
+Three consequences worth knowing before someone rediscovers them the hard way:
+
+1. **Every route renders per request** (`export const dynamic = "force-dynamic"` in the root
+   layout). A prerendered page is built before any request exists, so its HTML carries no nonce
+   and the browser refuses Next's own bootstrap scripts. Measured, not assumed: with
+   prerendering, the landing page served 0 nonces and 12 scripts were refused. The cost is that
+   page HTML is not CDN-cacheable; static assets still are.
+2. **Monaco is served from `/monaco`, not from jsDelivr.** `@monaco-editor/react` fetches the
+   editor from a public CDN by default, which means a third party could serve executable code
+   into our origin — where it can read the session token. `scripts/copy-monaco.ts` copies the
+   editor into `public/` before every dev run and build (`predev` / `prebuild`); `public/monaco`
+   is generated and not committed. We found this because the policy blocked Monaco's stylesheet
+   while `'strict-dynamic'` was happily letting its script through.
+3. **`style-src` keeps `'unsafe-inline'`.** Server-rendered `style` attributes are subject to
+   `style-src`, CSP nonces do not apply to style attributes at all, and the exposure is CSS
+   injection rather than script execution. Named here so it reads as a decision.
+
+Markdown from a ctx node is rendered through `SafeMarkdown` (`rehype-sanitize`, with `href`
+narrowed to http/https/mailto). There is no `dangerouslySetInnerHTML` anywhere in `web/`.
+Verified in a browser on a production build: a ctx node containing `<script>`, `<img onerror>`
+and a `javascript:` link renders as inert text, with zero CSP violations and zero console errors.
 
 ## Where the session token lives, and the tradeoff
 
