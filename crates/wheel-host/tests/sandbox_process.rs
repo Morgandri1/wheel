@@ -131,12 +131,15 @@ async fn each_project_gets_a_private_tmpdir_inside_its_own_tree() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
+    // Inside the project's own 0700 tree, and distinct per project. Those two are the property.
     assert!(s.tmp_dir(&a).starts_with(s.project_dir(&a)));
     assert_ne!(s.tmp_dir(&a), s.tmp_dir(&b));
-    assert!(
-        !s.tmp_dir(&a).starts_with("/tmp/"),
-        "must not be the shared /tmp"
-    );
+
+    // Not the process-wide temp directory. Checked against `env::temp_dir()` rather than the
+    // literal "/tmp": on Linux `env::temp_dir()` *is* /tmp, so this test's own scratch directory
+    // lives under it, and a literal check failed in CI for a reason that had nothing to do with
+    // the code — it was asserting something about the fixture, not about the sandbox.
+    assert_ne!(s.tmp_dir(&a), std::env::temp_dir());
 }
 
 #[tokio::test]
