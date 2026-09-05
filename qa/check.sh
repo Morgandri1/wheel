@@ -20,6 +20,7 @@ fi
 
 PASS=(); FAIL=(); SKIP=()
 STRICT="${CHECK_STRICT:-0}"   # CI sets 1: skips become failures
+COV_MIN="${COV_MIN:-90}"      # ARCHITECTURE.md §0b
 ONLY="${CHECK_ONLY:-}"        # e.g. CHECK_ONLY=rust
 
 # A step exiting 77 means "I could not run" and is recorded as a SKIP, never a pass.
@@ -69,6 +70,12 @@ else
   step "rust:fmt"    cargo fmt --all -- --check
   step "rust:clippy" cargo clippy --workspace --all-targets -- -D warnings
   step "rust:test"   cargo test --workspace
+  # ARCHITECTURE.md §0b: >=90% lines per crate. A failing check, not a warning.
+  if cargo llvm-cov --version >/dev/null 2>&1; then
+    step "rust:coverage" cargo llvm-cov --workspace --fail-under-lines "$COV_MIN"
+  else
+    skip "rust:coverage" "cargo-llvm-cov not installed — run 'make bootstrap'"
+  fi
 fi
 
 # ----------------------------------------------------------------- web
@@ -91,6 +98,8 @@ else
     if web_script "$s"; then step "web:$s" pnpm -C web run "$s"
     else skip "web:$s" "no '$s' script in web/package.json"; fi
   done
+  if web_script "coverage"; then step "web:coverage" pnpm -C web run coverage
+  else skip "web:coverage" "no 'coverage' script in web/package.json (§0b: vitest --coverage, lines: $COV_MIN)"; fi
 fi
 
 # ----------------------------------------------------------------- qa's own
@@ -102,11 +111,18 @@ fi
 
 step "qa:wire-matrix" "$PY" qa/tools/gen_wire_matrix.py --check
 
-# Proves the schema contract test can actually fail, using scratch schemas. Runs today.
-step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
-
-# Runs today and self-skips until SDK exports the schema, so it goes green on its own.
-step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
+# The contract gates need `jsonschema` from qa/requirements.txt. A MISSING DEPENDENCY and a
+# BROKEN SCHEMA must never look the same: skip loudly here, and let CI (which bootstraps first,
+# and runs CHECK_STRICT=1) be the place where a skip is a hard failure.
+if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
+  # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
+  step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
+  # Runs today and self-skips until SDK exports the schema, so it goes green on its own.
+  step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
+else
+  skip "qa:contract-selftest" "jsonschema missing — run 'make bootstrap' (creates qa/.venv)"
+  skip "qa:contract-schema"   "jsonschema missing — run 'make bootstrap'"
+fi
 
 # ----------------------------------------------------------------- summary
 echo
