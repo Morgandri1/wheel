@@ -27,3 +27,10 @@
 
 ## PoC plan
 `redteam/pocs/004_ssrf_suite.py` + a mock metadata server on 169.254.169.254 (via loopback alias / mock host) and a rebinding DNS stub. Runs when executor exists.
+
+## Priority confirm-first vector (noted)
+The cheapest likely-confirmable SSRF is **re-validation AFTER DNS and AFTER every redirect** — a
+base_url that passes the hostname pre-filter but 30x-redirects to a blocked IP, or DNS-rebinds to
+loopback on the second resolution. The pre-filter alone is not the control (SDK plan agrees). Probe:
+`redteam/pocs/tool-ssrf/t_redirect_and_rebind.py` (+ mocks/metadata.py /rebind flip). Run this first
+the moment the stack boots.
