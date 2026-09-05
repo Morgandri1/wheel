@@ -39,6 +39,15 @@ function NodePlateInner({ data, selected }: NodeProps) {
   };
 
   const status = node.type === "agent" ? (node.state?.status ?? "stopped") : null;
+  /**
+   * §4: an agent's name is embedded in every peer's preamble and in its own session, so the
+   * engine answers 409 agent_running rather than renaming underneath it. Say so here instead
+   * of letting someone type a new name and have it bounce.
+   */
+  const renameLock =
+    status === "running" || status === "starting"
+      ? `Stop ${node.name} before renaming it — its name is baked into every peer's prompt.`
+      : null;
   const statusMeta = status ? AGENT_STATUS_META[status] : null;
 
   return (
@@ -86,9 +95,16 @@ function NodePlateInner({ data, selected }: NodeProps) {
             data-testid={`node-name-${node.name}`}
             onDoubleClick={(e) => {
               e.stopPropagation();
+              if (renameLock) {
+                setError(renameLock);
+                return;
+              }
+              setError(null);
               setEditing(true);
             }}
-            title="Double-click to rename"
+            title={renameLock ?? "Double-click to rename"}
+            aria-disabled={renameLock ? true : undefined}
+            data-rename-locked={renameLock ? "true" : undefined}
           >
             {node.name}
           </button>

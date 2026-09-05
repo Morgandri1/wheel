@@ -10,6 +10,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { TicketStore } from "./tickets";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { AgentNode, EngineEvent, WheelNode, WireType } from "@/lib/schema";
 import {
@@ -136,6 +137,10 @@ async function engine(
     if (method === "PATCH") {
       const patch = await readJson<Partial<Pick<WheelNode, "name" | "position" | "config">>>(req);
       if (patch.name && patch.name !== node.name) {
+        // §4: a running agent's name is embedded in every peer's preamble and in its own session.
+        if (node.type === "agent" && (node.state?.status === "running" || node.state?.status === "starting")) {
+          throw new EngineRefusal(409, "agent_running: stop or park the agent before renaming it");
+        }
         if (record.nodes.some((n) => n.name === patch.name && n.id !== node.id)) {
           throw new EngineRefusal(409, `a node called ${patch.name} already exists`);
         }
@@ -451,24 +456,8 @@ const server = createServer((req, res) => {
 
 // ── events websocket ────────────────────────────────────────────────────────
 
-/**
- * §5 ws-ticket: single-use, bound to one project, 30 s. Held in memory because that is exactly
- * what the real API can do too — a ticket outliving one handshake would defeat the point.
- */
-const tickets = new Map<string, { projectId: string; expires: number }>();
-
-function mintTicket(projectId: string): string {
-  const ticket = randomUUID();
-  tickets.set(ticket, { projectId, expires: Date.now() + 30_000 });
-  return ticket;
-}
-
-function redeemTicket(ticket: string | null, projectId: string): boolean {
-  if (!ticket) return false;
-  const found = tickets.get(ticket);
-  tickets.delete(ticket);
-  return Boolean(found) && found!.projectId === projectId && found!.expires > Date.now();
-}
+const tickets = new TicketStore();
+const mintTicket = (projectId: string) => tickets.mint(projectId, randomUUID());
 
 
 const wss = new WebSocketServer({ noServer: true });
@@ -478,7 +467,7 @@ server.on("upgrade", (req, socket, head) => {
   const match = /^\/v1\/projects\/([^/]+)\/engine\/v1\/events$/.exec(url.pathname);
   const record = match ? projects.get(match[1]!) : undefined;
 
-  const authorised = match ? redeemTicket(url.searchParams.get("ticket"), match[1]!) : false;
+  const authorised = match ? tickets.redeem(url.searchParams.get("ticket"), match[1]!) : false;
 
   if (!record || !authorised) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
