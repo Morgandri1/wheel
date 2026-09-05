@@ -87,6 +87,7 @@ IDs are `WM-<from>-<to>-<type>`, e.g. `WM-agent-ctx-read` (allow),
 | `WM-token-scope` | A node's token grants exactly its own wires: agent A's token used against agent B's wired nodes → exit 3. Token forgery / swapping is rejected. |
 | `WM-self-wire` | A node wired to itself is rejected for every type (incl. `agent→agent send` to self). |
 | `WM-dup-wire` | Creating an identical wire twice → 409 or idempotent 200, never two rows. |
+| `WM-export-conformance` | `docs/schema/wire-matrix.json` equals the §3 matrix QA derives independently from the prose. A row in the export but not the contract is always a failure (privilege question); a row in the contract but not the export is a missing feature. **QA's copy is derived from the SPEC, never from the export** — deriving from the export would check it against itself and could never detect divergence. This is what found BUG-004. |
 | `WM-cross-project` | A wire whose `to` is a node in ANOTHER project → 404/400, never created. **S1 if it succeeds.** |
 
 ---
