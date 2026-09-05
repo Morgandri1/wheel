@@ -8,6 +8,18 @@ use crate::crypto::Secret;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 
+/// Which identity provider verifies session tokens.
+///
+/// The two modes end at the same `VerifiedUser`, so everything downstream — the ownership
+/// extractor above all — is unaware of which one ran. Swapping providers is configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Built-in: users and passwords in our own database, HS256 sessions we issue.
+    Local,
+    /// External: RS256 tokens verified against a provider's JWKS.
+    Jwks,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Env {
     Dev,
@@ -33,6 +45,9 @@ pub struct Config {
     pub clerk_azp: Vec<String>,
     /// HS256 shared secret for local testing. Only ever populated when `env == Dev`.
     pub dev_secret: Option<String>,
+    pub auth_mode: AuthMode,
+    /// Signing key for locally issued sessions. Only meaningful when `auth_mode == Local`.
+    pub session_secret: Secret,
 
     // Crypto
     pub master_key: [u8; 32],
@@ -49,6 +64,20 @@ pub struct Config {
     pub ingress_rate_per_min: u32,
     pub ingress_body_limit_bytes: usize,
     pub proxy_timeout_secs: u64,
+}
+
+/// Derive the session signing key from the master key, with domain separation.
+///
+/// The label keeps this key distinct from every other use of the master key, so a weakness in one
+/// does not become a weakness in the other. Changing the label invalidates every issued session,
+/// which is a deliberate lever: it revokes everything at once without rotating the master key and
+/// re-encrypting every project secret.
+fn derive_session_key(master_key: &[u8; 32]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(master_key)
+        .expect("hmac accepts any key length");
+    mac.update(b"wheel/session-signing-key/v1");
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn var(key: &str) -> Result<String> {
@@ -105,6 +134,17 @@ impl Config {
             (_, None) => None,
         };
 
+        // Which provider verifies tokens. Unset in prod is refused rather than defaulted: guessing
+        // wrong means either rejecting every real user or accepting tokens from the wrong issuer,
+        // and both are worse than not starting.
+        let auth_mode = match std::env::var("AUTH_MODE").ok().as_deref() {
+            Some("local") => AuthMode::Local,
+            Some("jwks") => AuthMode::Jwks,
+            Some(other) => bail!("AUTH_MODE must be \"local\" or \"jwks\", got {other:?}"),
+            None if env == Env::Dev => AuthMode::Local,
+            None => bail!("AUTH_MODE must be set in production (\"local\" or \"jwks\")"),
+        };
+
         let master_key = {
             let raw = var("API_MASTER_KEY")?;
             let bytes = base64::engine::general_purpose::STANDARD
@@ -113,6 +153,31 @@ impl Config {
             let len = bytes.len();
             <[u8; 32]>::try_from(bytes.as_slice())
                 .map_err(|_| anyhow!("API_MASTER_KEY must decode to exactly 32 bytes, got {len}"))?
+        };
+
+        // A session secret is what stands between anyone and every account, so a short or absent
+        // one is refused rather than padded or derived silently.
+        // Session signing key.
+        //
+        // An explicit SESSION_SECRET wins, because it can be rotated independently. When it is
+        // absent the key is *derived* from API_MASTER_KEY rather than reusing it: the master key
+        // already encrypts project secrets, and using one key for two purposes means a weakness in
+        // either compromises both. HMAC with a fixed label gives domain separation for free, so
+        // the session key and the encryption key are unrelated even though one produces the other.
+        let session_secret = match auth_mode {
+            AuthMode::Local => match std::env::var("SESSION_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => {
+                    if s.len() < 32 {
+                        bail!("SESSION_SECRET must be at least 32 characters");
+                    }
+                    Secret::new(s)
+                }
+                None => Secret::new(derive_session_key(&master_key)),
+            },
+            AuthMode::Jwks => Secret::new(String::new()),
         };
 
         let clerk_azp = var_or("CLERK_AZP", "")
@@ -125,10 +190,13 @@ impl Config {
             env,
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
             database_url: var("DATABASE_URL")?,
-            clerk_jwks_url: var("CLERK_JWKS_URL")?,
-            clerk_issuer: var("CLERK_ISSUER")?,
+            // Only meaningful under AUTH_MODE=jwks; blank is fine and expected under local.
+            clerk_jwks_url: var_or("CLERK_JWKS_URL", ""),
+            clerk_issuer: var_or("CLERK_ISSUER", ""),
             clerk_azp,
             dev_secret,
+            auth_mode,
+            session_secret,
             master_key,
             host_url: var("WHEEL_HOST_URL")?.trim_end_matches('/').to_string(),
             host_secret: Secret::new(var("WHEEL_HOST_SECRET")?),
@@ -143,7 +211,16 @@ impl Config {
         if cfg.host_secret.expose().is_empty() {
             bail!("WHEEL_HOST_SECRET must not be empty: it is the only thing authenticating the API to the host");
         }
-        if cfg.clerk_issuer.is_empty() {
+        if cfg.auth_mode == AuthMode::Jwks
+            && (cfg.clerk_jwks_url.trim().is_empty() || cfg.clerk_issuer.trim().is_empty())
+        {
+            bail!(
+                "AUTH_MODE=jwks requires CLERK_JWKS_URL and CLERK_ISSUER to be set to real values. \
+                 A placeholder that looks like configuration is worse than a missing one: it boots, \
+                 and then rejects every token for a reason nobody can see."
+            );
+        }
+        if cfg.auth_mode == AuthMode::Jwks && cfg.clerk_issuer.is_empty() {
             bail!("CLERK_ISSUER must not be empty: it is what pins tokens to our tenant");
         }
         Ok(cfg)

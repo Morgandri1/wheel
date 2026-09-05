@@ -73,6 +73,7 @@ pub async fn build_state(cfg: Config, db: sqlx::PgPool, http: reqwest::Client) -
         http,
         orch,
         ingress_limiter,
+        auth_limiter: crate::http::authlimit::AuthLimiter::new(10, 50),
         engine_base_override: None,
     })
 }

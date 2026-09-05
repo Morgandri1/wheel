@@ -32,6 +32,8 @@ fn config(env: Env, jwks_url: &str, dev_secret: Option<&str>) -> Config {
         clerk_issuer: ISSUER.into(),
         clerk_azp: vec![],
         dev_secret: dev_secret.map(str::to_string),
+        auth_mode: wheel_api::config::AuthMode::Local,
+        session_secret: wheel_api::crypto::Secret::new("test-session-secret-at-least-32-chars"),
         master_key: [0u8; 32],
         host_url: "http://host.invalid".into(),
         host_secret: wheel_api::crypto::Secret::new("unused"),

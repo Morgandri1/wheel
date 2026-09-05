@@ -30,7 +30,10 @@ http = "1"
 http-body-util = "0.1"
 bytes = "1"
 hex = "0.4"
+argon2 = "0.5"
+hmac = "0.12"
 sha2 = "0.10"
+password-hash = { version = "0.5", features = ["rand_core"] }
 async-trait = "0.1"
 
 [dev-dependencies]

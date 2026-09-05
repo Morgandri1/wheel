@@ -47,6 +47,13 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
 pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
     Router::new()
         .route("/healthz", get(routes::health::healthz))
+        // Local auth. These 404 when AUTH_MODE is not `local`, so a provider swap cannot leave a
+        // second way in.
+        .route("/v1/auth/signup", post(routes::auth::signup))
+        .route("/v1/auth/login", post(routes::auth::login))
+        .route("/v1/auth/logout", post(routes::auth::logout))
+        .route("/v1/auth/me", get(routes::auth::me))
+        .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/projects", post(routes::projects::create))
         .route("/v1/projects", get(routes::projects::list))
         .route("/v1/projects/{id}", get(routes::projects::get_one))

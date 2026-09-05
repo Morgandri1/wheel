@@ -23,6 +23,10 @@ fn base_env() {
     std::env::set_var("WHEEL_HOST_SECRET", "host-secret");
     std::env::remove_var("AUTH_DEV_SECRET");
     std::env::remove_var("WHEEL_ENV");
+    // AUTH_MODE is required in prod (see the assertions at the end of this test); the interlock
+    // cases below are about AUTH_DEV_SECRET, so give them a valid mode to isolate what they check.
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::remove_var("SESSION_SECRET");
 }
 
 #[test]
@@ -105,11 +109,14 @@ fn dev_secret_interlock_and_config_validation() {
         "missing host secret must be rejected"
     );
 
+    // The issuer pins tokens to our tenant, so it is required — but only under the mode that uses
+    // it. Local auth issues its own sessions and needs no external provider settings at all.
     base_env();
+    std::env::set_var("AUTH_MODE", "jwks");
     std::env::remove_var("CLERK_ISSUER");
     assert!(
         Config::from_env().is_err(),
-        "missing issuer must be rejected"
+        "AUTH_MODE=jwks with no issuer must be rejected"
     );
 
     // The master key must never be printed. `Secret` has no Display and a redacted Debug; assert
@@ -121,4 +128,79 @@ fn dev_secret_interlock_and_config_validation() {
         !format!("{:?}", cfg.host_secret).contains("super-secret-host-value"),
         "host secret leaked through Debug"
     );
+
+    // --- AUTH_MODE ------------------------------------------------------------------------------
+    // Unset in production is refused rather than defaulted. Guessing wrong means either rejecting
+    // every real user or trusting tokens from an issuer we did not intend, and both are worse
+    // than not starting.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::remove_var("AUTH_MODE");
+    assert!(
+        Config::from_env().is_err(),
+        "AUTH_MODE unset in production must refuse to boot"
+    );
+
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "nonsense");
+    assert!(
+        Config::from_env().is_err(),
+        "an unknown AUTH_MODE must refuse to boot"
+    );
+
+    // A placeholder that looks like configuration is worse than a missing one: it boots, and then
+    // rejects every token for a reason nobody can see.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("CLERK_JWKS_URL", "");
+    std::env::set_var("CLERK_ISSUER", "");
+    assert!(
+        Config::from_env().is_err(),
+        "AUTH_MODE=jwks with empty provider settings must refuse to boot"
+    );
+
+    // Local auth needs no provider settings at all.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::remove_var("CLERK_JWKS_URL");
+    std::env::remove_var("CLERK_ISSUER");
+    let cfg = Config::from_env().expect("local auth should not require provider settings");
+    assert_eq!(cfg.auth_mode, wheel_api::config::AuthMode::Local);
+
+    // Session key: derived from the master key when unset, so there is no extra required secret,
+    // and distinct from the master key itself so one use cannot weaken the other.
+    assert!(
+        cfg.session_secret.expose().len() >= 32,
+        "derived session key is too short"
+    );
+    assert_ne!(
+        cfg.session_secret.expose().as_bytes(),
+        &cfg.master_key[..],
+        "the session key must not be the master key reused"
+    );
+
+    // An explicit secret wins, so it can be rotated on its own.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::set_var("SESSION_SECRET", "an-explicit-session-secret-32ch+");
+    assert_eq!(
+        Config::from_env().unwrap().session_secret.expose(),
+        "an-explicit-session-secret-32ch+"
+    );
+
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::set_var("SESSION_SECRET", "too-short");
+    assert!(
+        Config::from_env().is_err(),
+        "a short SESSION_SECRET must be refused"
+    );
+
+    std::env::remove_var("SESSION_SECRET");
+    std::env::remove_var("AUTH_MODE");
 }

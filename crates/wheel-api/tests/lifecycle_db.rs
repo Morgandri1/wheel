@@ -86,6 +86,8 @@ fn cfg(db_url: &str) -> Config {
         clerk_issuer: ISSUER.into(),
         clerk_azp: vec![],
         dev_secret: Some(DEV_SECRET.into()),
+        auth_mode: wheel_api::config::AuthMode::Jwks,
+        session_secret: wheel_api::crypto::Secret::new("test-session-secret-at-least-32-chars"),
         master_key: [5u8; 32],
         host_url: "http://host.invalid".into(),
         host_secret: Secret::new("host-secret"),
@@ -149,6 +151,7 @@ async fn app(orch: FakeOrch) -> Option<(Router, String)> {
         http: reqwest::Client::new(),
         orch: Arc::new(orch) as Arc<dyn Orchestrator>,
         ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(60),
+        auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: None,
     });
     Some((

@@ -37,10 +37,29 @@ impl FromRequestParts<AppState> for AuthUser {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
         let token = crate::auth::claims::token_from_headers(&parts.headers)
             .ok_or(ApiError::Unauthorized("no bearer token presented"))?;
-        let verified = crate::auth::claims::verify(token, &state.cfg, &state.jwks).await?;
-        Ok(AuthUser {
-            user_id: verified.user_id,
-        })
+
+        // The two providers end here, at the same user id. Everything downstream — ProjectScope
+        // above all — cannot tell which one ran, which is what makes swapping them configuration
+        // rather than a rewrite. A token minted by the mode we are *not* in fails: local sessions
+        // are HS256 against our own secret, jwks tokens are RS256 against the provider's keys.
+        let user_id = match state.cfg.auth_mode {
+            crate::config::AuthMode::Local => {
+                crate::auth::local::verify_session(
+                    &state.db,
+                    token,
+                    state.cfg.session_secret.expose(),
+                    &state.cfg.public_base_url,
+                )
+                .await?
+            }
+            crate::config::AuthMode::Jwks => {
+                crate::auth::claims::verify(token, &state.cfg, &state.jwks)
+                    .await?
+                    .user_id
+            }
+        };
+
+        Ok(AuthUser { user_id })
     }
 }
 
