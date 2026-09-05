@@ -291,6 +291,22 @@ export default function Landing() {
   );
 }
 
+/**
+ * Spoke endpoints, rounded to three decimals.
+ *
+ * The raw trig gives values like 13.199999999999999, and React compares the server's string to
+ * the client's when hydrating — any difference in how the two serialise the same float is a
+ * hydration mismatch and a console error on every load. Fixing the precision makes the two
+ * identical by construction rather than by luck.
+ */
+function spoke(degrees: number, radius: number) {
+  const radians = (degrees * Math.PI) / 180;
+  return {
+    x: Number((12 + radius * Math.cos(radians)).toFixed(3)),
+    y: Number((12 + radius * Math.sin(radians)).toFixed(3)),
+  };
+}
+
 /** The mark: a hub with spokes ending in connection points. */
 function WheelMark() {
   return (
@@ -300,10 +316,10 @@ function WheelMark() {
       {[0, 60, 120, 180, 240, 300].map((a) => (
         <line
           key={a}
-          x1={12 + 2.4 * Math.cos((a * Math.PI) / 180)}
-          y1={12 + 2.4 * Math.sin((a * Math.PI) / 180)}
-          x2={12 + 9.25 * Math.cos((a * Math.PI) / 180)}
-          y2={12 + 9.25 * Math.sin((a * Math.PI) / 180)}
+          x1={spoke(a, 2.4).x}
+          y1={spoke(a, 2.4).y}
+          x2={spoke(a, 9.25).x}
+          y2={spoke(a, 9.25).y}
           stroke="currentColor"
           strokeWidth="1.2"
         />

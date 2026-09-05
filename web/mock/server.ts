@@ -215,8 +215,19 @@ async function engine(
     }
 
     if (method === "GET" && action === "log") {
-      const since = url.searchParams.get("since");
-      const lines = since ? record.log.filter((l) => l.node_id === node.id && l.seq > Number(since)) : record.log.filter((l) => l.node_id === node.id);
+      // `since` is the resume cursor after a reconnect (seq is monotonic per agent); `stream`
+      // narrows to one voice — chiefly `transcript`, the bytes written to the child's stdin.
+      const since = Number(url.searchParams.get("since") ?? 0);
+      const stream = url.searchParams.get("stream");
+      if (stream && !LOG_STREAMS.includes(stream)) {
+        throw new EngineRefusal(400, `unknown stream ${stream} — one of ${LOG_STREAMS.join(", ")}`);
+      }
+      const lines = record.log.filter(
+        (l) =>
+          l.node_id === node.id &&
+          l.seq > since &&
+          (!stream || (l.stream as string) === stream),
+      );
       json(res, 200, { lines });
       return true;
     }
@@ -539,6 +550,8 @@ const server = createServer((req, res) => {
 const tickets = new TicketStore();
 const mintTicket = (projectId: string) => tickets.mint(projectId, randomUUID());
 
+
+const LOG_STREAMS = ["stdout", "stderr", "engine", "transcript"];
 
 const wss = new WebSocketServer({ noServer: true });
 

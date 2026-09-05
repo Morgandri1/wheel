@@ -12,12 +12,12 @@
  * React commit per log line.
  */
 import { API_URL, projects } from "@/lib/api";
-import type { EngineEvent } from "@/lib/schema";
+import type { EngineFrame } from "@/lib/schema";
 
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
 
 interface Handlers {
-  onBatch: (events: EngineEvent[]) => void;
+  onBatch: (events: EngineFrame[]) => void;
   onStatus: (status: ConnectionStatus) => void;
 }
 
@@ -29,7 +29,7 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
   let attempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  let queue: EngineEvent[] = [];
+  let queue: EngineFrame[] = [];
   let frame: number | null = null;
 
   const flush = () => {
@@ -40,7 +40,7 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
     handlers.onBatch(batch);
   };
 
-  const enqueue = (e: EngineEvent) => {
+  const enqueue = (e: EngineFrame) => {
     queue.push(e);
     // Guard against an unbounded burst while the tab is backgrounded and rAF is throttled.
     if (queue.length > 2000) queue.splice(0, queue.length - 2000);
@@ -84,7 +84,7 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
 
     ws.onmessage = (ev) => {
       try {
-        enqueue(JSON.parse(ev.data as string) as EngineEvent);
+        enqueue(JSON.parse(ev.data as string) as EngineFrame);
       } catch {
         /* a frame we can't parse is a frame we ignore */
       }

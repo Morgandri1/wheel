@@ -12,6 +12,7 @@ import type {
   AgentStatus,
   EngineEvent,
   LogLine,
+  LogStreamName,
   Message,
   MessageSender,
   NodeState,
@@ -51,10 +52,10 @@ export function emit(record: ProjectRecord, event: EngineEvent) {
 export function appendLog(
   record: ProjectRecord,
   nodeId: string,
-  stream: LogLine["stream"],
+  stream: LogStreamName,
   line: string,
 ) {
-  const entry: LogLine = { node_id: nodeId, seq: nextSeq(), stream, text: line, at: now() };
+  const entry = { node_id: nodeId, seq: nextSeq(), stream, text: line, at: now() } as LogLine;
   record.log.push(entry);
   if (record.log.length > 5000) record.log.splice(0, record.log.length - 5000);
   emit(record, { type: "log", line: entry });
@@ -233,14 +234,16 @@ function drain(record: ProjectRecord, node: AgentNode) {
   pending.state = "delivered";
   emitMessage(record, pending);
   setAgentState(record, node, { status: "running", last_activity: now() });
+  // §3c #10: the envelope IS what the engine writes to the child's stdin, so it belongs on the
+  // transcript stream. Emitting it as stdout would be a lie — stdout is what the agent SAYS.
   appendLog(
     record,
     node.id,
-    "stdout",
+    "transcript",
     `<AgentPrompt id="${pending.id}" from="${envelopeName(pending.from)}" type="${senderKind(pending.from)}">`,
   );
-  for (const line of pending.body.split("\n")) appendLog(record, node.id, "stdout", line);
-  appendLog(record, node.id, "stdout", "</AgentPrompt>");
+  for (const line of pending.body.split("\n")) appendLog(record, node.id, "transcript", line);
+  appendLog(record, node.id, "transcript", "</AgentPrompt>");
 
   later(record, 900, () => {
     appendLog(record, node.id, "stdout", `thinking about "${pending.body.slice(0, 48)}"`);

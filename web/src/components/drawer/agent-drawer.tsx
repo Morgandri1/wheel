@@ -10,7 +10,7 @@ import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
 import { displayState, senderKind, senderLabel } from "@/lib/message-state";
 import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
 import type { EngineApi } from "@/lib/api";
-import type { Message, WheelNode } from "@/lib/schema";
+import type { LogLine, LogStreamName, Message, WheelNode } from "@/lib/schema";
 
 export function AgentDrawer({
   nodes,
@@ -31,7 +31,7 @@ export function AgentDrawer({
   const messages = useBoardStore((s) => s.messages);
   const seedLog = useBoardStore((s) => s.seedLog);
 
-  const [view, setView] = useState<"log" | "messages">("log");
+  const [view, setView] = useState<"log" | "transcript" | "messages">("log");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const seeded = useRef(new Set<string>());
@@ -57,7 +57,14 @@ export function AgentDrawer({
 
   if (!tabs.length) return null;
 
-  const lines = activeTab ? (logs[activeTab] ?? []) : [];
+  const all = activeTab ? (logs[activeTab] ?? []) : [];
+  /**
+   * §3c #10. The transcript is the exact bytes written to the child's stdin, carried on the same
+   * log stream — so this is a filter, not a second subscription. Splitting it out matters because
+   * the operator's question is "what did the agent actually receive?", and the answer is drowned
+   * in stdout when the two are interleaved.
+   */
+  const lines = view === "transcript" ? all.filter(isTranscript) : all;
   const thread = activeTab
     ? messages.filter((m) => m.to === activeTab || (m.from.kind === "node" && m.from.id === activeTab))
     : [];
@@ -128,16 +135,21 @@ export function AgentDrawer({
         </div>
 
         <div className="flex items-center gap-1 px-2">
-          {(["log", "messages"] as const).map((v) => (
+          {(["log", "transcript", "messages"] as const).map((v) => (
             <button
               key={v}
               data-testid={`drawer-view-${v}`}
               onClick={() => setView(v)}
-              className={`px-2 py-0.5 text-micro transition-colors ${
+              title={
+                v === "transcript"
+                  ? "The exact bytes written to this agent's stdin"
+                  : undefined
+              }
+              className={`px-2 py-0.5 text-micro capitalize transition-colors ${
                 view === v ? "text-ink" : "text-ink-faint hover:text-ink-dim"
               }`}
             >
-              {v === "log" ? "Log" : "Messages"}
+              {v}
             </button>
           ))}
           <button
@@ -153,8 +165,8 @@ export function AgentDrawer({
       {open ? (
         <>
           <div className="min-h-0 flex-1">
-            {view === "log" ? (
-              <LogStream lines={lines} />
+            {view === "log" || view === "transcript" ? (
+              <LogStream lines={lines} empty={view === "transcript" ? TRANSCRIPT_EMPTY : undefined} />
             ) : (
               <ul className="h-full overflow-y-auto p-3" data-testid="message-list">
                 {thread.length ? (
@@ -280,3 +292,16 @@ function MessageStatePill({
     </span>
   );
 }
+
+/**
+ * docs/schema still types LogStream as stdout|stderr|engine, but the engine emits `transcript`
+ * on that field today (SDK confirmed, verified live). Widening here rather than editing the
+ * generated file keeps the drift visible and in one place — when the export catches up, this
+ * collapses to a plain comparison and the cast is what the compiler will flag.
+ */
+function isTranscript(line: LogLine): boolean {
+  return (line.stream as LogStreamName) === "transcript";
+}
+
+const TRANSCRIPT_EMPTY =
+  "Nothing written to this agent's stdin yet. Every message it receives shows up here, byte for byte.";

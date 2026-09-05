@@ -11,7 +11,7 @@ import { Inspector } from "@/components/inspector";
 import { AgentDrawer } from "@/components/drawer/agent-drawer";
 import { Header } from "@/components/header";
 import { Button, Empty, Skeleton } from "@/components/ui";
-import { toastError } from "@/components/ui/toast";
+import { toast, toastError } from "@/components/ui/toast";
 import type { ConnectionStatus } from "@/lib/events";
 
 const CONNECTION_LABEL: Record<ConnectionStatus, { text: string; color: string }> = {
@@ -58,8 +58,12 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
     return connectEvents(projectId, {
       onStatus: setConnection,
       onBatch: (events) => {
-        const { stateChanged, boardChanged } = applyEvents(events);
+        const { stateChanged, boardChanged, lagged } = applyEvents(events);
         if (stateChanged || boardChanged) refetchBoard();
+        // The engine dropped frames rather than let this tab stall its delivery loop. The socket
+        // is healthy and what we hold is stale, so say so plainly instead of leaving someone to
+        // wonder why the board went quiet.
+        if (lagged) toast("Reconnected to a busy board — refreshing what you can see.");
       },
     });
   }, [projectId, running, applyEvents, refetchBoard, setConnection]);
