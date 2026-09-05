@@ -8,6 +8,7 @@
 //! tenant's sandbox, so the bearer check is the first thing in the stack and applies to every
 //! route including the proxies.
 
+pub mod auth_limit;
 pub mod config;
 pub mod proxy;
 pub mod sandbox;
@@ -32,6 +33,9 @@ pub struct HostState {
     pub sandbox: Arc<dyn Sandbox>,
     pub store: Arc<store::Store>,
     pub http: reqwest::Client,
+    /// Throttles failed bearer attempts per peer (ADVERSARY: :7100 needs a rate limit as well as
+    /// a constant-time compare).
+    pub auth_limiter: Arc<auth_limit::AuthLimiter>,
 }
 
 /// Build the sandbox backend named by configuration.
@@ -60,6 +64,7 @@ pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
         sandbox,
         store,
         http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(auth_limit::AuthLimiter::new(cfg_auth_failure_budget())),
     })
 }
 
@@ -96,6 +101,27 @@ pub async fn reconcile_on_boot(state: &HostState) {
 /// Compared in constant time: a byte-by-byte early-exit comparison leaks the secret's prefix to
 /// anyone who can measure response timing across many attempts.
 pub async fn require_bearer(State(state): State<HostState>, req: Request, next: Next) -> Response {
+    // Peer address, when the server was built with connect info. Absent in unit tests, which
+    // exercise the router directly; those fall back to a fixed key so the limiter still applies.
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+
+    // Refuse before comparing. Past its budget, a peer learns nothing further — not even the
+    // timing of a comparison.
+    if !state.auth_limiter.may_attempt(peer) {
+        tracing::warn!(%peer, "refusing bearer attempt: peer is over its failure budget");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({"error": {"code": "rate_limited", "message": "Too many failed attempts."}}),
+            ),
+        )
+            .into_response();
+    }
+
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -104,14 +130,26 @@ pub async fn require_bearer(State(state): State<HostState>, req: Request, next: 
         .unwrap_or("");
 
     if !constant_time_eq(presented.as_bytes(), state.cfg.secret.as_bytes()) {
-        tracing::warn!("rejected host request with bad or missing bearer");
+        state.auth_limiter.record_failure(peer);
+        tracing::warn!(%peer, "rejected host request with bad or missing bearer");
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
+            Json(json!({"error": {"code": "unauthorized", "message": "Unauthorized."}})),
         )
             .into_response();
     }
     next.run(req).await
+}
+
+/// Failed bearer attempts allowed per peer per minute before the host stops answering them.
+///
+/// Generous by default: the legitimate caller is a single API that authenticates correctly every
+/// time, so this budget is only ever consumed by something guessing.
+fn cfg_auth_failure_budget() -> u32 {
+    std::env::var("HOST_AUTH_FAILURE_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

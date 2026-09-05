@@ -177,6 +177,7 @@ async fn harness(engine_base: String) -> (Router, Uuid) {
         sandbox: Arc::new(PointedSandbox(engine_base)),
         store,
         http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
     };
     (build_router(state), id)
 }
@@ -337,5 +338,52 @@ mod external {
         let rendered = format!("{s:?}");
         assert!(!rendered.contains("super-secret-engine-value"));
         assert!(!rendered.contains("super-secret-vault-value"));
+    }
+}
+
+// ---------------------------------------------------------------- bearer brute-force
+
+/// A constant-time compare stops the secret leaking through timing; it does nothing about an
+/// attacker simply trying secrets until one works. ADVERSARY asked for both on `:7100`.
+#[tokio::test]
+async fn repeated_bad_bearers_are_eventually_refused_outright() {
+    let (engine, _) = mock_engine().await;
+    let (app, id) = harness(engine).await;
+
+    let mut saw_429 = false;
+    for _ in 0..80 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/host/v1/projects/{id}"))
+            .header("authorization", "Bearer definitely-not-the-secret")
+            .body(Body::empty())
+            .unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            saw_429 = true;
+            break;
+        }
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a wrong bearer must not be accepted"
+        );
+    }
+    assert!(saw_429, "guessing the host bearer was never rate limited");
+}
+
+/// The budget must be spent by failures only — a correct caller is never throttled.
+#[tokio::test]
+async fn a_correct_bearer_is_never_throttled() {
+    let (engine, _) = mock_engine().await;
+    let (app, id) = harness(engine).await;
+
+    for i in 0..80 {
+        let (status, _) = send(&app, &format!("/host/v1/projects/{id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "legitimate request {i} was throttled"
+        );
     }
 }
