@@ -36,11 +36,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
+# --- dev toolchain ----------------------------------------------------------
+# Wheel is meant to build Wheel: an agent inside a sandbox needs the same tools
+# a developer has, or "wheel on wheel" means an agent that can read the repo and
+# not compile it.
+#
+# cc/pkg-config/libssl are not optional extras here -- rusqlite builds bundled
+# sqlite and ring builds its own asm, so without a C toolchain `cargo build`
+# fails deep in a dependency with an error that reads like a Rust problem.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libssl-dev make \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && npm i -g pnpm && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
+# The toolchain is installed ONCE and shared read-only; only the per-project
+# cache is private (CARGO_HOME, set per project at spawn -- see the supervisor).
+#
+# Deliberately not a RUSTUP_HOME per project: a toolchain is ~1 GB and immutable,
+# so a copy per project would cost gigabytes to isolate bytes that are identical
+# and contain nothing of the tenant's. What IS per-tenant -- fetched crates, the
+# registry index, build output -- lives under CARGO_HOME and is private.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+          --component clippy --component rustfmt \
+    && chmod -R a+rX /opt/rust
+
 # QA's fake harness is a python3 script, and script nodes need python3, so a
 # missing interpreter would fail at agent-run time rather than at build time.
 # Assert it here instead.
 RUN python3 -c "import sys; assert sys.version_info[0] == 3" \
-    && node --version && claude --version && codex --version
+    && node --version && claude --version && codex --version \
+    && git --version && gh --version && make --version | head -1 \
+    && pnpm --version && cargo --version && rustc --version \
+    && cargo clippy --version && cargo fmt --version && cc --version | head -1
 
 # Agents run NON-ROOT. `--permission-mode bypassPermissions` is refused as root
 # with exit 1 and EMPTY stdout — indistinguishable from "not logged in" — so
