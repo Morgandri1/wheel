@@ -102,7 +102,9 @@ impl IntoResponse for ApiError {
 
         // Log the real cause exactly once, here, at a level matching its severity.
         match &self {
-            ApiError::Internal(e) => tracing::error!(error = ?e, code, "request failed"),
+            ApiError::Internal(e) => {
+                tracing::error!(error = %format_args!("{e:#}"), code, "request failed")
+            }
             ApiError::Unauthorized(why) => tracing::debug!(reason = why, "auth rejected"),
             ApiError::Forbidden(why) => tracing::debug!(reason = why, "forbidden"),
             ApiError::BadGateway(why) => tracing::warn!(reason = why, "upstream unavailable"),

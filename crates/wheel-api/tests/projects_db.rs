@@ -96,48 +96,46 @@ fn token(sub: &str) -> String {
 /// `stranger_cannot_mutate_or_proxy` — which reads as a flaky *security* check. Nothing is more
 /// corrosive than a boundary test that cries wolf, so the destructive reset is serialised here and
 /// per-test isolation comes from unique subjects instead.
-static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-static POOL: tokio::sync::OnceCell<sqlx::PgPool> = tokio::sync::OnceCell::const_new();
-
 async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
-    let url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    // One pool for the whole binary, not one per test.
+    // Skipping is a convenience for a laptop without a database, never for CI. These tests are the
+    // only thing covering the ownership boundary end to end, and a suite that quietly asserts
+    // nothing while reporting green is worse than one that fails — that is exactly how this file
+    // sat broken while `cargo test` stayed green.
+    let url = match std::env::var("TEST_DATABASE_URL") {
+        Ok(u) => u,
+        Err(_) if std::env::var("CI").is_ok() => {
+            panic!("TEST_DATABASE_URL must be set in CI: these tests cover the tenancy boundary")
+        }
+        Err(_) => {
+            eprintln!("skipping {}: TEST_DATABASE_URL not set", module_path!());
+            return None;
+        }
+    };
+
+    // A pool per test, deliberately, and a small one.
     //
-    // Every test used to build its own pool of up to 5 connections. Run in parallel that is a
-    // demand for 5 x (number of tests) connections against a database other suites are also using,
-    // which exhausted the server and failed every test with PoolTimedOut — a failure that looks
-    // like a total boundary collapse but is purely a fixture problem.
-    let db = POOL
-        .get_or_init(|| async {
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(std::time::Duration::from_secs(10))
-                .connect(&url)
-                .await
-                .expect("connect to TEST_DATABASE_URL")
-        })
+    // The obvious optimisation — one `static` pool shared by the whole binary — is wrong here, and
+    // silently so. Each `#[tokio::test]` runs on its own runtime; a shared pool gets bound to
+    // whichever runtime happened to create it, and once that runtime shuts down every later test
+    // sees "A Tokio 1.x context was found, but it is being shutdown" followed by pool timeouts.
+    // That failure is intermittent and reads like a boundary bug, which is the worst kind of
+    // fixture defect. Two connections per test keeps the total well inside the server's limit.
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(&url)
         .await
-        .clone();
+        .expect("connect to TEST_DATABASE_URL");
 
-    {
-        let db = db.clone();
-        SCHEMA
-            .get_or_init(|| async move {
-                // The migration ledger is dropped alongside the tables: dropping only the tables
-                // would leave `_sqlx_migrations` claiming the migrations were applied, so they
-                // would be skipped and the tables would never come back.
-                sqlx::query(
-                    "DROP TABLE IF EXISTS ws_tickets, ingress_rate_limits, project_secrets, \
-                     projects, _sqlx_migrations CASCADE",
-                )
-                .execute(&db)
-                .await
-                .unwrap();
-                sqlx::migrate!("./migrations").run(&db).await.unwrap();
-            })
-            .await;
-    }
+    // Idempotent, so it is safe to run per test. Tests isolate from each other by using a unique
+    // subject per test (see `user()`) rather than by truncating shared tables, so no test needs a
+    // clean slate and none can pull the schema out from under another.
+    sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("run migrations");
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {
