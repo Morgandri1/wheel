@@ -66,7 +66,8 @@ services:
       WHEEL_HOST_URL: http://host:7100
       WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
       PUBLIC_BASE_URL: http://localhost:8080
-      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      # Next dev server on 3000, and 3100 for a second web instance.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3100}
       # Local HS256 tokens for testing without Clerk. Only honoured because WHEEL_ENV=dev;
       # the API refuses to boot if this is set with WHEEL_ENV=prod.
       AUTH_DEV_SECRET: ${AUTH_DEV_SECRET:-dev-only-hs256-secret}
