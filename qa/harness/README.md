@@ -1,8 +1,13 @@
 # Fake harness spec (QA → SDK)
 
-**Status:** implemented and working. `qa/harness/fake-claude` and `qa/harness/fake-codex` are
-executable Python 3 scripts with no third-party deps. **SDK does not need to write anything** —
-just bake them into a test image variant. This document is the contract between us.
+**Status:** implemented, working, and conformed to the contract in `docs/plans/qa.brief.md`
+(image `wheel-engine:test` via `--build-arg FAKE_HARNESS=1`; full composed system prompt as the
+first event; canned turns from `WHEEL_FAKE_SCRIPT=<jsonl>`).
+
+`qa/harness/fake-claude` and `qa/harness/fake-codex` are executable Python 3 scripts with no
+third-party deps. **SDK: if you have not started yours yet, take these** — they are done and
+verified against the real binary. If you have, tell me and I'll delete mine and write tests
+against yours instead. Either way we should not ship two. Routed via PM.
 
 ## 1. Why
 
@@ -16,17 +21,20 @@ which is the point: we test the engine's real parsing/supervision code path, not
 
 ## 2. What SDK needs to do
 
-Add a **test variant** of the image — same engine binary, different harness:
+Add a **test variant** of the image — same engine binary, different harness, gated on a build arg:
 
 ```dockerfile
-# docker/Dockerfile.test  (or: ARG HARNESS=real in the main Dockerfile)
-FROM wheel-engine:latest
-COPY qa/harness/fake-claude /usr/local/bin/claude
-COPY qa/harness/fake-codex  /usr/local/bin/codex
-RUN chmod +x /usr/local/bin/claude /usr/local/bin/codex
+ARG FAKE_HARNESS=0
+COPY qa/harness/fake-claude qa/harness/fake-codex /opt/wheel-fake/
+RUN if [ "$FAKE_HARNESS" = "1" ]; then \
+      install -m 0755 /opt/wheel-fake/fake-claude /usr/local/bin/claude && \
+      install -m 0755 /opt/wheel-fake/fake-codex  /usr/local/bin/codex  ; \
+    fi && rm -rf /opt/wheel-fake
 ```
 
-Built as **`wheel-engine:test`**. `make engine-image-test` (SDK's target) should produce it.
+Built as **`wheel-engine:test`** with `--build-arg FAKE_HARNESS=1`; `make engine-image-test`
+(SDK's target) should produce it. With the default `FAKE_HARNESS=0` the production image is
+byte-identical to today's and the fakes are **absent from the image entirely**.
 Requirement: `python3` must be on PATH in the image — the architecture doc already lists python
 in the container, so this should be free. If it isn't, tell me and I'll rewrite the fakes in
 POSIX sh + a tiny JSON emitter.
@@ -45,7 +53,8 @@ Everything else — engine binary, entrypoint, user, paths — stays byte-identi
 | `--output-format text\|json\|stream-json` | `stream-json` = emit the event stream below |
 | `--verbose` | accepted |
 | `--model <m>` | echoed back in `system/init` and every `assistant` message |
-| `--append-system-prompt <s>` / `--append-system-prompt-file <f>` | echoed in `system/init` as `_fake_system_prompt` |
+| `--system-prompt <s>` / `--system-prompt-file <f>` | part of the composed prompt echoed in event 1 |
+| `--append-system-prompt <s>` / `--append-system-prompt-file <f>` | appended to the composed prompt echoed in event 1 |
 | `--resume <session-id>` | reuses that `session_id` instead of a fresh one |
 | `--permission-mode <m>` | echoed in `system/init` |
 | `--mcp-config <json-or-path>` | server names echoed in `system/init.mcp_servers` |
@@ -62,7 +71,11 @@ to break every time SDK adds one.
 One JSON object per line, flushed immediately. Exactly the real event sequence:
 
 1. `{"type":"system","subtype":"init", "session_id", "model", "cwd", "tools", "mcp_servers",
-    "permissionMode", "claude_code_version", "_fake_system_prompt", ...}` — once, at startup.
+    "permissionMode", "claude_code_version", "system_prompt", ...}` — once, at startup.
+    **`system_prompt` carries the full composed system prompt verbatim** (`--system-prompt` +
+    `--append-system-prompt`, in that order). This is the primary hook for asserting that
+    ctx-node injection and the agent's configured `system_prompt` actually reached the child.
+    (`_fake_system_prompt` is kept as an alias for now; SDK, say if you'd rather I drop it.)
 2. Per turn: `{"type":"assistant","message":{...Anthropic message...},"session_id","uuid","timestamp","request_id"}`
 3. Per turn: `{"type":"result","subtype":"success"|"error_during_execution","is_error",
     "result":"<assistant text>","session_id","num_turns","duration_ms","total_cost_usd","usage",...}`
@@ -104,10 +117,29 @@ image or restart the container to test an error path. The fake strips them from 
 `PROTOCOL.md` (I saw `rate_limit_event` and `system/thinking_tokens` from the real binary today),
 and an engine that pattern-matches exhaustively on event type will fall over in production.
 
+## 5b. Canned turns — `WHEEL_FAKE_SCRIPT=<file.jsonl>`
+
+For scripted multi-turn scenarios. One JSON object per line = one turn, in order:
+
+```jsonl
+{"reply":"first answer"}
+{"reply":"slow one","sleep":2}
+{"is_error":true,"error":"rate limited"}
+{"events":[{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}],"reply":"after noise"}
+```
+
+Keys: `reply`, `is_error`, `error`, `sleep`, `exit`, `stderr`, `events` (raw events emitted
+verbatim before the assistant message). Directives still apply for anything the line omits.
+
+**Running past the end of the script is a hard failure** (exit 3, message on stderr) rather than a
+silent fallthrough — a test that sends more turns than it scripted is a broken test, and should
+say so instead of quietly passing.
+
 ## 6. Env vars
 
 | Var | Effect |
 |---|---|
+| `WHEEL_FAKE_SCRIPT` | JSONL of canned turns (§5b) |
 | `WHEEL_FAKE_SESSION_ID` | pin the session id (deterministic assertions) |
 | `WHEEL_FAKE_AUTH=needs_auth` | exit 1 with `Invalid API key · Please run /login` on stderr — drives the `needs_auth` state |
 | `WHEEL_FAKE_STRICT_AUTH=1` | require `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` to be set, else `needs_auth` |
@@ -133,3 +165,8 @@ changed after the turn completed, and the re-applied system prompt + ctx injecti
    (`<<FAKE:NOISE>>`) and non-JSON lines (`<<FAKE:GARBAGE>>`) without dying.
 5. `fake-codex` is **provisional** (see Q-HARNESS-CODEX) — the real `codex exec --json` event
    names are unverified. Not on the M1 path; let's pin it together before M2.
+6. **Ownership:** the brief says SDK is landing a fake harness. If that work hasn't started, take
+   this one. If it has, I'll drop mine and test against yours — but please keep the four
+   properties I actually need: composed system prompt in event 1, `WHEEL_FAKE_SCRIPT` canned
+   turns, a way to force error/exit/slow turns, and a raw capture of what the engine wrote to
+   stdin. Without that last one I can only test what the engine *believes* it sent.

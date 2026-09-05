@@ -16,6 +16,7 @@ Design rules:
 import json, os, sys, time, uuid, re, hashlib, datetime, signal
 
 VERSION = "2.1.261 (Claude Code)"
+SCRIPT_PATH = os.environ.get("WHEEL_FAKE_SCRIPT")  # JSONL of canned turns, one object per turn
 TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")  # optional: append every stdin line here
 
 def now_iso():
@@ -34,7 +35,7 @@ def die(msg, code=1):
 def parse_args(argv):
     a = {
         "print": False, "input_format": "text", "output_format": "text",
-        "verbose": False, "model": None, "system_prompt_append": None,
+        "verbose": False, "model": None, "system_prompt_append": None, "system_prompt": None,
         "resume": None, "prompt": None, "mcp_config": None, "cwd": os.getcwd(),
         "permission_mode": "default",
     }
@@ -48,6 +49,8 @@ def parse_args(argv):
         elif t == "--model":                       i += 1; a["model"] = argv[i]
         elif t == "--append-system-prompt":        i += 1; a["system_prompt_append"] = argv[i]
         elif t == "--append-system-prompt-file":   i += 1; a["system_prompt_append"] = _readfile(argv[i])
+        elif t == "--system-prompt":               i += 1; a["system_prompt"] = argv[i]
+        elif t == "--system-prompt-file":          i += 1; a["system_prompt"] = _readfile(argv[i])
         elif t == "--resume":                      i += 1; a["resume"] = argv[i]
         elif t == "--permission-mode":             i += 1; a["permission_mode"] = argv[i]
         elif t in ("--mcp-config", "--mcp-servers"): i += 1; a["mcp_config"] = argv[i]
@@ -61,6 +64,11 @@ def parse_args(argv):
             a["prompt"] = t
         i += 1
     return a
+
+def composed_system_prompt(a):
+    """Everything the engine handed us as system context, concatenated in order."""
+    parts = [p for p in (a.get("system_prompt"), a.get("system_prompt_append")) if p]
+    return "\n".join(parts) if parts else None
 
 def _readfile(p):
     try:
@@ -115,8 +123,10 @@ def main():
               "model": model, "permissionMode": a["permission_mode"], "slash_commands": [],
               "apiKeySource": "none", "claude_code_version": VERSION, "output_style": "default",
               "agents": [], "skills": [], "uuid": str(uuid.uuid4()),
-              # Wheel-specific: lets tests assert the engine passed the system prompt through.
-              "_fake_system_prompt": a["system_prompt_append"]})
+              # Wheel contract: the FIRST event carries the full composed system prompt verbatim,
+              # so tests can assert ctx-node injection + system_prompt actually reached the child.
+              "system_prompt": composed_system_prompt(a),
+              "_fake_system_prompt": composed_system_prompt(a)})
 
     turn = 0
     if a["input_format"] == "stream-json":
@@ -158,8 +168,47 @@ def _record(line):
         except OSError: pass
 
 # ---------------------------------------------------------------- response
+_SCRIPT = None
+
+def script_turn(turn):
+    """Canned turn `turn` (1-based) from WHEEL_FAKE_SCRIPT, or None.
+
+    Each line is one JSON object: {"reply","is_error","sleep","exit","stderr","events":[raw]}.
+    Running past the end of the script is an ERROR, not a silent fallthrough - a test that
+    sends more turns than it scripted is a broken test and must fail loudly.
+    """
+    global _SCRIPT
+    if not SCRIPT_PATH:
+        return None
+    if _SCRIPT is None:
+        _SCRIPT = []
+        try:
+            with open(SCRIPT_PATH) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#"):
+                        _SCRIPT.append(json.loads(ln))
+        except OSError as e:
+            die("cannot read WHEEL_FAKE_SCRIPT %s: %s" % (SCRIPT_PATH, e), 2)
+        except json.JSONDecodeError as e:
+            die("malformed WHEEL_FAKE_SCRIPT %s: %s" % (SCRIPT_PATH, e), 2)
+    if turn - 1 < len(_SCRIPT):
+        return _SCRIPT[turn - 1]
+    die("WHEEL_FAKE_SCRIPT exhausted: got turn %d, script has %d" % (turn, len(_SCRIPT)), 3)
+
 def respond(user_text, turn, session_id, model, stream):
     d = directives(user_text)
+    canned = script_turn(turn)
+    if canned:
+        # Canned turns take precedence; directives still work for anything unspecified.
+        for k, flag in (("sleep", "SLEEP"), ("exit", "EXIT"), ("stderr", "STDERR"), ("reply", "REPLY")):
+            if k in canned and canned[k] is not None:
+                d[flag] = str(canned[k])
+        if canned.get("is_error"):
+            d["ERROR"] = str(canned.get("error") or canned.get("reply") or "fake error")
+        for raw in canned.get("events") or []:
+            if stream:
+                emit(raw)
 
     if "SLEEP" in d:
         time.sleep(float(d["SLEEP"] or 1))
@@ -217,10 +266,22 @@ def respond(user_text, turn, session_id, model, stream):
     else:
         sys.stdout.write(reply + "\n"); sys.stdout.flush()
 
+def _quiet_broken_pipe():
+    """Engine closing our stdout on stop must not print a Python traceback."""
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+
 if __name__ == "__main__":
     try:
         main()
     except BrokenPipeError:
-        sys.exit(0)
+        _quiet_broken_pipe(); sys.exit(0)
     except KeyboardInterrupt:
-        sys.exit(130)
+        _quiet_broken_pipe(); sys.exit(130)
+    finally:
+        _quiet_broken_pipe()
