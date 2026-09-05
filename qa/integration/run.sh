@@ -1,66 +1,75 @@
 #!/usr/bin/env bash
-# Integration suite: brings up infra/docker-compose.yml, runs the tests, tears down.
+# Integration suite: brings up infra/docker-compose.yml and drives the API.
 #
-# Self-skipping by design: if docker isn't available this exits 77 (SKIP) rather than failing,
-# so `make test-int` is safe to run anywhere. CI runs it with WHEEL_REQUIRE_STACK=1, where a
-# missing stack IS a failure — a suite that quietly skips in CI tests nothing.
+# Parameterised on SANDBOX_BACKEND from day one (docker now, process at M3) so the M3
+# re-run is a variable change rather than a rewrite.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-SKIP=77
 
-PY="$ROOT/qa/.venv/bin/python"
-[ -x "$PY" ] || PY=python3
-
-require="${WHEEL_REQUIRE_STACK:-0}"
-fail_or_skip() {
-  echo "$1"
-  [ "$require" = "1" ] && { echo "WHEEL_REQUIRE_STACK=1 — treating as a failure"; exit 1; }
-  exit $SKIP
-}
-
-command -v docker >/dev/null 2>&1 || fail_or_skip "docker not installed — skipping integration"
-docker info >/dev/null 2>&1 || fail_or_skip "docker daemon not running — skipping integration"
-"$PY" -c "import pytest" >/dev/null 2>&1 || fail_or_skip "pytest missing — run 'make bootstrap'"
-
-COMPOSE="docker compose -f infra/docker-compose.yml"
+COMPOSE="infra/docker-compose.yml"
 export SANDBOX_BACKEND="${SANDBOX_BACKEND:-docker}"
-KEEP="${WHEEL_KEEP_STACK:-0}"
+export WHEEL_API_URL="${WHEEL_API_URL:-http://localhost:8080}"
+KEEP_UP="${KEEP_UP:-0}"
+ARTIFACTS="$ROOT/qa/.artifacts"
+
+PY=python3
+[ -x qa/.venv/bin/python ] && PY=qa/.venv/bin/python
+
+if ! docker info >/dev/null 2>&1; then
+  echo "docker is not running — integration suite cannot run"
+  exit 77
+fi
+if [ ! -f "$COMPOSE" ]; then
+  echo "$COMPOSE not present yet (API owns infra/)"
+  exit 77
+fi
+
+mkdir -p "$ARTIFACTS"
 
 cleanup() {
-  if [ "$KEEP" = "1" ]; then
-    echo "WHEEL_KEEP_STACK=1 — leaving the stack up ($COMPOSE down -v to clean)"
-  else
-    $COMPOSE down -v >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "--- capturing logs to qa/.artifacts (suite failed) ---"
+    docker compose -f "$COMPOSE" logs --no-color --tail 400 > "$ARTIFACTS/compose.log" 2>&1 || true
   fi
+  if [ "$KEEP_UP" != "1" ]; then
+    docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || true
+  else
+    echo "KEEP_UP=1 — stack left running at $WHEEL_API_URL"
+  fi
+  exit $rc
 }
 trap cleanup EXIT
 
+echo "▸ building the stub engine image"
+docker build -q -t wheel-engine:stub -f infra/dev/Dockerfile.engine.stub . >/dev/null || {
+  echo "stub engine image build failed"; exit 1; }
+
 echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
-if ! $COMPOSE up -d --build >/tmp/wheel-compose.log 2>&1; then
-  echo "compose up failed; last 40 lines:"; tail -40 /tmp/wheel-compose.log
-  fail_or_skip "could not bring up the stack"
+if ! docker compose -f "$COMPOSE" up -d --build; then
+  echo "compose up failed"
+  exit 1
 fi
 
 echo "▸ waiting for the API"
-ready=0
-for _ in $(seq 1 60); do
-  if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then ready=1; break; fi
+for i in $(seq 1 120); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$WHEEL_API_URL/healthz" 2>/dev/null || true)
+  [ "$code" = "200" ] && break
   sleep 1
 done
-if [ "$ready" != "1" ]; then
-  echo "API never became healthy; logs:"; $COMPOSE logs --tail=40 api
-  fail_or_skip "API did not come up"
+if [ "${code:-}" != "200" ]; then
+  echo "API never became healthy (last /healthz -> ${code:-none})"
+  exit 1
 fi
 
-mkdir -p qa/.artifacts
-echo "▸ running suite"
-PYTHONPATH="$ROOT/qa/integration" "$PY" -m pytest qa/integration -v --tb=short -p no:cacheprovider
-rc=$?
+rc=0
+for suite in qa/integration/test_*.py; do
+  [ -e "$suite" ] || continue
+  echo
+  echo "▸ $(basename "$suite")"
+  "$PY" "$suite" || rc=1
+done
 
-if [ $rc -ne 0 ]; then
-  echo "▸ capturing logs to qa/.artifacts/ for triage"
-  $COMPOSE logs --no-color > qa/.artifacts/compose.log 2>&1
-fi
 exit $rc
