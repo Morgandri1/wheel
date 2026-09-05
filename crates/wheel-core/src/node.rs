@@ -97,9 +97,10 @@ impl Position {
 // ---------------------------------------------------------------------------
 
 /// Which CLI backs an agent node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
+    #[default]
     Claude,
     Codex,
 }
@@ -119,7 +120,7 @@ impl std::fmt::Display for Harness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct AgentConfig {
     pub harness: Harness,
     /// Harness-specific model id. `None` = the CLI's own default.
@@ -135,6 +136,30 @@ pub struct AgentConfig {
     /// prompt and ctx injections, before draining the next queued message.
     #[serde(default)]
     pub ephemeral_context: bool,
+    /// Stop the process after this long idle and resume the session on the next
+    /// message (§3c#14 idle parking). `None` uses
+    /// [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u32>,
+    /// Spend ceiling. On reach, the engine stops the agent with
+    /// `status: budget_exhausted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+}
+
+/// Per-agent spend ceiling (§3e). Either field may be set independently.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct Budget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+}
+
+impl AgentConfig {
+    pub fn idle_timeout_secs(&self) -> u32 {
+        self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -239,6 +264,9 @@ impl ScriptLanguage {
 }
 
 pub const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 60;
+
+/// Idle parking default (§3c#14).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ScriptConfig {

@@ -36,14 +36,15 @@ pub use message::{
 };
 pub use name::{validate_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES};
 pub use node::{
-    AgentConfig, ChestConfig, Column, ColumnType, CtxConfig, EndpointConfig, Harness, HttpMethod,
-    McpConfig, McpTransport, Node, NodeConfig, NodeType, Position, ResponseMode, ScriptConfig,
-    ScriptLanguage, TableConfig, VaultConfig, DEFAULT_SCRIPT_TIMEOUT_SECS,
+    AgentConfig, Budget, ChestConfig, Column, ColumnType, CtxConfig, EndpointConfig, Harness,
+    HttpMethod, McpConfig, McpTransport, Node, NodeConfig, NodeType, Position, ResponseMode,
+    ScriptConfig, ScriptLanguage, TableConfig, VaultConfig, DEFAULT_IDLE_TIMEOUT_SECS,
+    DEFAULT_SCRIPT_TIMEOUT_SECS,
 };
 pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, WireLine};
 pub use spawn::{ListenAddr, ListenAddrError};
 pub use state::{
-    AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, NodeState, NodeWithState,
+    AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, NodeState, NodeWithState, Spend,
 };
 pub use timestamp::Timestamp;
 pub use tool::{
