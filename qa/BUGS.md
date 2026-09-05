@@ -17,7 +17,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | ~~closed~~ | `transcript` log lines are persisted but never emitted over the events WebSocket |
 | 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | ~~closed~~ | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
 | 011 | `ENG-one-process`, `ENG-park-resume`, `MSG-delivered-means-delivered` | **S1** | SDK | ~~closed~~ | After any failed start, every later start was a silent no-op — and a turn could be written to a dead child's stdin and marked delivered |
-| 012 | `make check` (`web:test`) | S4 | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
+| 012 | `make check` (`web:test`) | ~~S4~~ **S3** | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
 | 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
 
 ---
@@ -439,12 +439,18 @@ credential and respawn to observe routing at all.
 
 ---
 
-## 012 — `web:test` fails on any node newer than CI's · S4 · Web
+## 012 — `web:test` fails on any node newer than CI's · S3 (raised from S4) · Web
 
-Not a product bug — the code is fine and CI is right — but a gate whose verdict depends on
-the developer's node version is not a gate, and this one costs whoever hits it the time to
-work out that they are debugging their runtime rather than the product. I lost that time
-today, which is why it is written down instead of remembered.
+**Raised to S3 2026-09-05.** Still not a product bug — the code is fine and CI is right —
+but I filed it as polish and then watched it make my own `make check` red twice, and the
+second time I nearly merged on the assumption that the red was known rather than reading it.
+That is the actual cost: `make check` is the pre-merge gate for five agents, and a gate that
+is red for a reason unrelated to your change trains everyone to merge past it. The failure
+mode is not the 30 tests, it is the next real failure nobody looks at.
+
+A gate whose verdict depends on the developer's node version is not a gate, and this one
+costs whoever hits it the time to work out they are debugging their runtime rather than the
+product. I lost that time today, which is why it is written down instead of remembered.
 
 **Repro:** `pnpm -C web test` on node ≥ 22.4 (mine is v26.8.1).
 30 failures in `src/lib/local-auth.test.tsx`, all `TypeError: Cannot read properties of

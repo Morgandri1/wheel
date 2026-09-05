@@ -15,7 +15,7 @@ board and the log, but the transcript is a stream the operator can read in the U
 secret pasted into a prompt would land there and nowhere else. A canary that is only
 grepped where you remembered to look is not a canary.
 """
-import json, os, subprocess, sys, time, uuid
+import hashlib, json, os, subprocess, sys, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wheel_client import Results
 
@@ -25,6 +25,7 @@ PORT = int(os.environ.get("WHEEL_ENGINE_VAULT_PORT", "17414"))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-vault-secret-at-least-16ch"
 NAME = "qa-engine-vault"
+ENV_DUMP = "/data/qa-vault-env.jsonl"
 TRANSCRIPT = "/data/qa-vault-transcript.jsonl"
 
 # Distinctive enough to grep for in a sqlite file, and long enough that it cannot appear
@@ -74,6 +75,8 @@ def start_engine():
            "-e", "WHEEL_ROLE=engine",
            "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
            "-e", "WHEEL_FAKE_TRANSCRIPT=" + TRANSCRIPT,
+           "-e", "WHEEL_FAKE_ENV_DUMP=" + ENV_DUMP,
+           "-e", "WHEEL_FAKE_ENV_DUMP_KEYS=" + KEY,
            "-p", "%d:7000" % PORT, "wheel-engine:test")
     if p.returncode != 0:
         return "could not start wheel-engine:test: " + p.stderr.strip()[:200]
@@ -190,19 +193,42 @@ def main():
                 "the denial message leaked the value")
 
         # ---- exported into the child's env, for wired agents only
+        #
+        # Asserted from inside the child, via WHEEL_FAKE_ENV_DUMP. Reading the child's
+        # environment any other way means printing the secret into a test log — trading the
+        # leak under test for one we caused — so the dump records env NAMES plus a sha256 of
+        # the keys we name, and never a value. "This child received exactly this secret" is
+        # then provable without the plaintext existing anywhere a later grep could find it.
+        #
+        # The previous version of this block was `R.check(..., True)` with a comment saying
+        # it was "asserted below via the child". It was not asserted anywhere. An
+        # unconditional check is worse than no check: it occupies the ID, so the criterion
+        # reads as covered in the traceability table while testing nothing.
         http("POST", "/v1/agents/%s/start" % wired)
         http("POST", "/v1/agents/%s/start" % unwired)
-        time.sleep(3)
-        for label, aid, want in (("wired", wired, True), ("unwired", unwired, False)):
-            st, body = http("GET", "/v1/agents/%s/log" % aid)
-            lines = (body or {}).get("lines") or []
-            got = any(KEY in (l.get("text") or "") for l in lines)
-            if want:
-                R.check("SEC-vault-env-scope/%s" % label, True)  # asserted below via the child
-            else:
-                R.check("SEC-vault-env-scope/%s" % label, not got,
-                        "the unwired agent's log mentions %s" % KEY)
+        time.sleep(8)
 
+        rc, dump = exec_in("sh", "-c", "cat %s 2>/dev/null || true" % ENV_DUMP)
+        recs = [json.loads(l) for l in dump.splitlines() if l.strip()]
+        if not R.check("SEC-vault-env-scope/spawned", bool(recs),
+                       "no env dump — neither child spawned, so nothing here is evidence"):
+            return R.report("engine-vault")
+        R.check("SEC-vault-env-scope/dump-clean", CANARY not in dump,
+                "the env dump contains the plaintext — the harness itself is leaking")
+
+        want_digest = hashlib.sha256(CANARY.encode()).hexdigest()
+        with_key = [r for r in recs if (r.get("digests") or {}).get(KEY)]
+        R.check("SEC-vault-env-scope/wired",
+                any((r["digests"][KEY] or {}).get("sha256") == want_digest for r in with_key),
+                "no spawned child received %s with the stored value; %d dump record(s)"
+                % (KEY, len(recs)))
+        R.check("SEC-vault-env-scope/unwired", len(with_key) <= 1,
+                "%d children received %s — an agent with no wire to the vault got the secret"
+                % (len(with_key), KEY))
+        R.check("SEC-vault-env-scope/name-hidden",
+                sum(1 for r in recs if KEY in (r.get("env_names") or [])) <= 1,
+                "more than one child has %s in its environment by NAME — an absent value is "
+                "not enough, the name alone tells an agent which secrets exist" % KEY)
         # ---- never in the transcript: the exact bytes written to the child's stdin
         http("POST", "/v1/agents/%s/send" % wired, {"body": "vault probe"})
         time.sleep(4)
