@@ -157,6 +157,10 @@ export type Event =
   | {
       denial: WireDenial;
       type: "wire.denied";
+    }
+  | {
+      hint: string;
+      type: "lagged";
     };
 
 /**
@@ -235,7 +239,7 @@ export type MessageState = "queued" | "delivered" | "consumed";
  * Where a log line came from.
  */
 
-export type LogStream = ("stdout" | "stderr") | "engine";
+export type LogStream = ("stdout" | "stderr") | "engine" | "transcript";
 
 /**
  * What a wire permits. Wires are directional and stored on the *source* node.

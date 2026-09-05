@@ -1,17 +1,30 @@
 "use client";
 
 /**
- * Hands Clerk's session token to the plain-function API client. Rendered only when
- * NEXT_PUBLIC_AUTH_MODE=clerk, so the app runs with no Clerk instance configured.
+ * Clerk, mounted only when it is configured.
+ *
+ * ClerkProvider throws without a publishable key, and useAuth() throws without ClerkProvider —
+ * so mock and dev modes must not render either. That is why this is one component rather than a
+ * provider in the root layout: the whole Clerk tree is conditional in a single place.
  */
 import { useEffect } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { ClerkProvider, useAuth } from "@clerk/nextjs";
 import { setTokenGetter } from "@/lib/auth";
 
-export function ClerkTokenBridge() {
+/** Hands Clerk's session token to the plain-function API client, refetched per request. */
+function TokenBridge() {
   const { getToken } = useAuth();
   useEffect(() => {
     setTokenGetter(() => getToken());
   }, [getToken]);
   return null;
+}
+
+export function ClerkGate({ children }: { children: React.ReactNode }) {
+  return (
+    <ClerkProvider>
+      <TokenBridge />
+      {children}
+    </ClerkProvider>
+  );
 }
