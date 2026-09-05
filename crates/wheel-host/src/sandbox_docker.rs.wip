@@ -1,0 +1,209 @@
+//! bollard-backed orchestration.
+//!
+//! Every Docker object name here derives from a `Uuid` that came out of our own database, never
+//! from client input. That is the property that makes this safe: there is no path by which a
+//! caller-supplied string reaches an image reference, a mount source, a container name, or a
+//! command argument.
+
+use super::{EngineSecrets, Orchestrator};
+use crate::config::Config;
+use crate::models::ProjectStatus;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use bollard::query_parameters as qp;
+use bollard::Docker;
+use std::collections::HashMap;
+use uuid::Uuid;
+
+pub struct DockerOrchestrator {
+    docker: Docker,
+    cfg: Config,
+}
+
+impl DockerOrchestrator {
+    pub fn new(docker: Docker, cfg: Config) -> Self {
+        Self { docker, cfg }
+    }
+}
+
+#[async_trait]
+impl Orchestrator for DockerOrchestrator {
+    async fn provision(&self, project_id: &Uuid, secrets: &EngineSecrets) -> Result<()> {
+        let name = self.cfg.container_name(project_id);
+        let volume = self.cfg.volume_name(project_id);
+
+        // Volume first; creating an existing volume is a no-op in Docker.
+        self.docker
+            .create_volume(bollard::models::VolumeCreateOptions {
+                name: Some(volume.clone()),
+                labels: Some(HashMap::from([
+                    ("wheel.project".to_string(), project_id.to_string()),
+                ])),
+                ..Default::default()
+            })
+            .await
+            .context("creating project volume")?;
+
+        if self.inspect(project_id).await?.is_some() {
+            return Ok(()); // already provisioned
+        }
+
+        let host_config = bollard::models::HostConfig {
+            // Least privilege: drop every capability, forbid privilege escalation via setuid
+            // binaries, and cap the blast radius of a runaway agent.
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges".to_string()]),
+            memory: Some(self.cfg.container_memory_bytes),
+            nano_cpus: Some(self.cfg.container_nano_cpus),
+            pids_limit: Some(self.cfg.container_pids_limit),
+            network_mode: Some(self.cfg.docker_network.clone()),
+            binds: Some(vec![format!("{volume}:/data")]),
+            restart_policy: Some(bollard::models::RestartPolicy {
+                name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                ..Default::default()
+            }),
+            // Deliberately no `port_bindings`: the engine must never be reachable from the host
+            // network. All access is proxied through the API.
+            ..Default::default()
+        };
+
+        let config = bollard::models::ContainerCreateBody {
+            image: Some(self.cfg.engine_image.clone()),
+            env: Some(vec![
+                format!("WHEEL_PROJECT_ID={project_id}"),
+                format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret.expose()),
+                format!("WHEEL_VAULT_KEY={}", secrets.vault_key.expose()),
+            ]),
+            labels: Some(HashMap::from([(
+                "wheel.project".to_string(),
+                project_id.to_string(),
+            )])),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+
+        self.docker
+            .create_container(
+                Some(qp::CreateContainerOptions {
+                    name: Some(name),
+                    ..Default::default()
+                }),
+                config,
+            )
+            .await
+            .context("creating project container")?;
+        Ok(())
+    }
+
+    async fn start(&self, project_id: &Uuid) -> Result<()> {
+        let name = self.cfg.container_name(project_id);
+        match self
+            .docker
+            .start_container(&name, None::<qp::StartContainerOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            // 304 = already started. Idempotency matters: the reconciler and a user click can race.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(e) => Err(e).context("starting project container"),
+        }
+    }
+
+    async fn stop(&self, project_id: &Uuid) -> Result<()> {
+        let name = self.cfg.container_name(project_id);
+        match self
+            .docker
+            .stop_container(&name, None::<qp::StopContainerOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(e).context("stopping project container"),
+        }
+    }
+
+    async fn restart(&self, project_id: &Uuid) -> Result<()> {
+        self.docker
+            .restart_container(&self.cfg.container_name(project_id), None::<qp::RestartContainerOptions>)
+            .await
+            .context("restarting project container")?;
+        Ok(())
+    }
+
+    async fn destroy(&self, project_id: &Uuid) -> Result<()> {
+        let name = self.cfg.container_name(project_id);
+        if let Err(e) = self
+            .docker
+            .remove_container(
+                &name,
+                Some(qp::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            match e {
+                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {}
+                other => return Err(other).context("removing project container"),
+            }
+        }
+        if let Err(e) = self
+            .docker
+            .remove_volume(
+                &self.cfg.volume_name(project_id),
+                Some(qp::RemoveVolumeOptions { force: true }),
+            )
+            .await
+        {
+            match e {
+                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {}
+                other => return Err(other).context("removing project volume"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn status(&self, project_id: &Uuid) -> Result<ProjectStatus> {
+        Ok(match self.inspect(project_id).await? {
+            None => ProjectStatus::Stopped,
+            Some(state) => match state.as_str() {
+                "running" => ProjectStatus::Running,
+                "created" | "restarting" => ProjectStatus::Starting,
+                "paused" | "exited" | "removing" | "dead" => ProjectStatus::Stopped,
+                _ => ProjectStatus::Error,
+            },
+        })
+    }
+}
+
+impl DockerOrchestrator {
+    /// Returns the container's state string, or `None` if there is no such container.
+    async fn inspect(&self, project_id: &Uuid) -> Result<Option<String>> {
+        match self
+            .docker
+            .inspect_container(
+                &self.cfg.container_name(project_id),
+                None::<qp::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(c) => Ok(c
+                .state
+                .and_then(|s| s.status)
+                .map(|s| s.to_string().to_ascii_lowercase())),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(e).context("inspecting project container"),
+        }
+    }
+}
