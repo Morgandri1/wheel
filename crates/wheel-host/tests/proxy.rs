@@ -254,3 +254,98 @@ fn assert_enveloped(body: &str, code: &str) {
         "every envelope needs a human-readable message: {body}"
     );
 }
+
+// --- the websocket bridge -----------------------------------------------------------------------
+
+/// An engine that accepts a socket and echoes frames back unchanged.
+async fn mock_engine_ws() -> String {
+    let app = Router::new().route(
+        "/v1/events",
+        axum::routing::get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                while let Some(Ok(msg)) = socket.recv().await {
+                    if socket.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// Serve the host router on a real port; a websocket upgrade cannot travel through `oneshot`.
+async fn serve_host(engine_base: &str) -> (String, Uuid) {
+    let (app, id) = harness(engine_base).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("ws://{addr}"), id)
+}
+
+fn ws_request(url: &str, bearer: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+    let host = url.split("://").nth(1).unwrap().split('/').next().unwrap();
+    tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("Host", host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", generate_key())
+        .body(())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_frames_cross_the_host_bridge_verbatim() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let engine = mock_engine_ws().await;
+    let (base, id) = serve_host(&engine).await;
+
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+    let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .expect("the host should bridge a websocket to the engine");
+
+    // The `message` event is correlated by id downstream, so anything that re-encodes JSON on this
+    // hop is a defect even when every field survives.
+    let payload = r#"{"type":"message","id":"018f-7c1e","body":"quote \" slash \\ ☃ 🎡"}"#;
+    socket.send(Message::Text(payload.into())).await.unwrap();
+    let echoed = socket.next().await.expect("a reply").expect("no error");
+    assert_eq!(echoed.into_text().unwrap().as_str(), payload);
+}
+
+#[tokio::test]
+async fn the_websocket_bridge_still_requires_the_bearer() {
+    let engine = mock_engine_ws().await;
+    let (base, id) = serve_host(&engine).await;
+
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+    assert!(
+        tokio_tungstenite::connect_async(ws_request(&url, "wrong-secret"))
+            .await
+            .is_err(),
+        "an upgrade must not be a way around the bearer gate"
+    );
+}
+
+#[tokio::test]
+async fn a_websocket_to_an_unknown_project_is_refused() {
+    let engine = mock_engine_ws().await;
+    let (base, _id) = serve_host(&engine).await;
+
+    let url = format!(
+        "{base}/host/v1/projects/{}/engine/v1/events",
+        Uuid::new_v4()
+    );
+    assert!(tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .is_err());
+}

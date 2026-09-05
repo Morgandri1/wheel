@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod boot;
 pub mod config;
 pub mod crypto;
 pub mod error;
