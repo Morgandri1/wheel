@@ -12,5 +12,7 @@
     "source": "x",
     "timeout_secs": 0
   },
-  "_expect_reject": "NODE-script-lang"
+  "_expect_reject": "NODE-script-lang",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_script"
 }

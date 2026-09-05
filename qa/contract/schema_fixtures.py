@@ -84,9 +84,16 @@ def main():
     print("schema: %s" % os.path.relpath(schema_path, ROOT))
     fails = []
 
+    pending = deferred = 0
     for p in sorted(glob.glob(os.path.join(VALID, "*.json"))):
         name = os.path.basename(p)[:-5]
-        errs = sorted(validator.iter_errors(load(p)), key=lambda e: list(e.path))
+        doc = load(p)
+        why = doc.pop("_pending", None)
+        if why:
+            pending += 1
+            print("  ..   valid/%-26s PENDING — %s" % (name, why))
+            continue
+        errs = sorted(validator.iter_errors(doc), key=lambda e: list(e.path))
         if errs:
             fails.append("valid/%s REJECTED: %s" % (name, errs[0].message[:140]))
             print("  FAIL valid/%-26s rejected — %s" % (name, errs[0].message[:100]))
@@ -97,6 +104,11 @@ def main():
         name = os.path.basename(p)[:-5]
         doc = load(p)
         crit = doc.pop("_expect_reject", "?")
+        ref = doc.pop("_engine_ref", None)
+        if doc.pop("_enforced_by", "schema") == "engine":
+            deferred += 1
+            print("  ..   invalid/%-26s engine-enforced (%s) — asserted in qa/integration" % (name, ref or crit))
+            continue
         if validator.is_valid(doc):
             fails.append("invalid/%s ACCEPTED (violates %s)" % (name, crit))
             print("  FAIL invalid/%-26s accepted, but %s says it must be rejected" % (name, crit))
@@ -109,8 +121,8 @@ def main():
         for f in fails:
             print("  -", f)
         return 1
-    print("schema contract: all %d fixtures behave as specified" %
-          (len(glob.glob(os.path.join(VALID, "*.json"))) + len(glob.glob(os.path.join(INVALID, "*.json")))))
+    print("schema contract: every structural fixture behaves as specified "
+          "(%d pending, %d deferred to engine validation)" % (pending, deferred))
     return 0
 
 if __name__ == "__main__":

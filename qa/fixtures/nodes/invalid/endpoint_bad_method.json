@@ -12,5 +12,6 @@
     "path": "/x",
     "response_mode": "ack"
   },
-  "_expect_reject": "NODE-endpoint-path"
+  "_expect_reject": "NODE-endpoint-path",
+  "_enforced_by": "schema"
 }

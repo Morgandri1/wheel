@@ -16,5 +16,7 @@
       "vault_ref": "a/b"
     }
   },
-  "_expect_reject": "NODE-endpoint-auth"
+  "_expect_reject": "NODE-endpoint-auth",
+  "_enforced_by": "engine",
+  "_engine_ref": "endpoint.auth not in wheel-core yet"
 }

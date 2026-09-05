@@ -37,5 +37,6 @@
       }
     ]
   },
-  "_expect_reject": "NODE-tool-config"
+  "_expect_reject": "NODE-tool-config",
+  "_enforced_by": "schema"
 }

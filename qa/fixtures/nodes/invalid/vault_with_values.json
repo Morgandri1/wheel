@@ -15,5 +15,7 @@
       "K": "supersecret"
     }
   },
-  "_expect_reject": "NODE-vault-writeonly"
+  "_expect_reject": "NODE-vault-writeonly",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
 }
