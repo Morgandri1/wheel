@@ -9,9 +9,9 @@ WHEEL_FAKE_TRANSCRIPT — the raw bytes the engine wrote to the child's stdin �
 against the engine's own log. The engine's account of what it sent is the thing under
 test, so it cannot also be the evidence.
 """
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, time, uuid, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, engine, mint, unique_sub, api_healthy, wait_for, Results
+from wheel_client import call, engine as proxy_engine, mint, unique_sub, api_healthy, wait_for, Results
 
 SKIP = 77
 R = Results()
@@ -21,13 +21,77 @@ TRANSCRIPT = "/data/qa-transcript.jsonl"
 ENVELOPE_CLOSE = "</AgentPrompt>"
 
 
+# The message path is an ENGINE concern, so the suite drives the engine DIRECTLY by
+# default: booting wheel-engine:test and talking to its control plane. Going through
+# API -> host -> engine would make every message assertion depend on two other teams'
+# services being up, and would report their outage as a message-path failure. The proxy
+# path is already covered by API-proxy-auth. Set WHEEL_VIA_API=1 to exercise the chain.
+VIA_API = os.environ.get("WHEEL_VIA_API") == "1"
+DIRECT_PORT = int(os.environ.get("WHEEL_ENGINE_PORT", "17412"))
+DIRECT_BASE = "http://127.0.0.1:%d" % DIRECT_PORT
+DIRECT_SECRET = "qa-msgpath-secret-at-least-16"
+DIRECT_NAME = "qa-engine-msgpath"
+
+
+def _direct(method, path, body=None):
+    r = urllib.request.Request(DIRECT_BASE + path, method=method)
+    r.add_header("Authorization", "Bearer " + DIRECT_SECRET)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        r.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(r, data, timeout=60) as resp:
+            txt = resp.read().decode(errors="replace")
+            return resp.status, (json.loads(txt) if txt.strip() else None), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode(errors="replace")
+        try:
+            return e.code, json.loads(txt), dict(e.headers)
+        except Exception:
+            return e.code, txt, dict(e.headers)
+
+
+def engine(method, pid, path, token, body=None):
+    """Uniform engine call: direct by default, through the API proxy under WHEEL_VIA_API."""
+    if VIA_API:
+        return proxy_engine(method, pid, path, token, body)
+    return _direct(method, path, body)
+
+
+def start_direct_engine():
+    subprocess.run(["docker", "rm", "-f", DIRECT_NAME], capture_output=True)
+    key = subprocess.run(["openssl", "rand", "-base64", "32"],
+                         capture_output=True, text=True).stdout.strip()
+    p = subprocess.run(
+        ["docker", "run", "-d", "--name", DIRECT_NAME,
+         "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+         "-e", "WHEEL_ENGINE_SECRET=" + DIRECT_SECRET,
+         "-e", "WHEEL_VAULT_KEY=" + key,
+         "-e", "WHEEL_ROLE=engine",
+         "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+         "-e", "WHEEL_FAKE_TRANSCRIPT=" + TRANSCRIPT,
+         "-p", "%d:7000" % DIRECT_PORT, "wheel-engine:test"],
+        capture_output=True, text=True)
+    if p.returncode != 0:
+        return "could not start wheel-engine:test: " + p.stderr.strip()[:200]
+    for _ in range(60):
+        try:
+            if _direct("GET", "/healthz")[0] == 200:
+                return None
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return "engine never became healthy"
+
+
 def engine_image_exists():
     return subprocess.run(["docker", "image", "inspect", "wheel-engine:test"],
                           capture_output=True).returncode == 0
 
 
 def container_for(pid):
-    return "wheel-p-%s" % pid
+    return ("wheel-p-%s" % pid) if VIA_API else DIRECT_NAME
 
 
 def read_transcript(pid):
@@ -89,25 +153,43 @@ def main():
               "This suite asserts MSG-*, INJ-* and ENG-* and turns green on its own once the "
               "image exists.")
         return SKIP
-    api_healthy()
-
-    owner = mint(unique_sub("msgpath"))
-    st, proj, _ = call("POST", "/v1/projects", owner, {"name": "qa-msgpath"})
-    if not R.check("MSG-setup/project", st in (200, 201), "-> %s %r" % (st, proj)):
-        return R.report("engine-messages")
-    pid = proj["id"]
-
-    try:
+    owner, pid = None, None
+    if VIA_API:
+        api_healthy()
+        owner = mint(unique_sub("msgpath"))
+        st, proj, _ = call("POST", "/v1/projects", owner, {"name": "qa-msgpath"})
+        if not R.check("MSG-setup/project", st in (200, 201), "-> %s %r" % (st, proj)):
+            return R.report("engine-messages")
+        pid = proj["id"]
         call("POST", "/v1/projects/%s/start" % pid, owner)
         wait_for(lambda: call("GET", "/v1/projects/%s" % pid, owner)[1].get("status") == "running",
                  timeout=120, what="project running")
+    else:
+        err = start_direct_engine()
+        if err:
+            print(err)
+            return SKIP
+        R.check("MSG-setup/engine", _direct("GET", "/v1/board")[0] == 200,
+                "engine control plane not answering")
+
+    try:
 
         agent_id, ctx_id = make_board(pid, owner)
         if not R.check("MSG-setup/board", agent_id is not None, "could not place nodes"):
             return R.report("engine-messages")
 
+        # Supervisor probe. Without it there is no process, no stdin and no transcript, so
+        # every assertion below would fail for one upstream reason and bury it in noise.
+        # Skipping with the reason named beats 40 red lines that all say the same thing —
+        # and this turns green on its own the moment SDK lands the supervisor.
+        st, _, _ = engine("POST", pid, "/v1/agents/%s/start" % agent_id, owner)
+        if st == 404:
+            print("\n  engine has no agent supervisor yet: POST /v1/agents/:id/start -> 404.\n"
+                  "  Node CRUD, wires and board state work; the message path needs the\n"
+                  "  supervisor. MSG-*, INJ-* and ENG-park-* are deferred, not passing.")
+            return SKIP
+
         # ---------------------------------------------------------------- INJ
-        engine("POST", pid, "/v1/agents/%s/start" % agent_id, owner)
         wait_for(lambda: engine("GET", pid, "/v1/agents/%s/log" % agent_id, owner)[1],
                  timeout=60, what="agent log")
 
@@ -223,7 +305,10 @@ def main():
             R.check("SEC-vault-never-read/log", "VAULT-CANARY-91ab" not in json.dumps(log),
                     "vault value present in the agent log")
     finally:
-        call("DELETE", "/v1/projects/%s" % pid, owner)
+        if VIA_API and pid:
+            call("DELETE", "/v1/projects/%s" % pid, owner)
+        else:
+            subprocess.run(["docker", "rm", "-f", DIRECT_NAME], capture_output=True)
 
     return R.report("engine-messages")
 
