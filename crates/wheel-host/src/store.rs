@@ -36,6 +36,14 @@ impl Store {
                -- Base uid of this project's range, for the process backend. UNIQUE because two
                -- projects sharing a uid would mean two tenants sharing a filesystem identity.
                uid_base         INTEGER UNIQUE
+             );
+             -- The uid watermark lives outside the projects table on purpose. Deriving the next
+             -- uid from max(uid_base) looked right and was not: deleting a project removes its
+             -- uid_base, so the maximum falls back and the next project is handed a uid whose
+             -- files may still be on disk. This row only ever climbs.
+             CREATE TABLE IF NOT EXISTS uid_watermark (
+               id       INTEGER PRIMARY KEY CHECK (id = 1),
+               next_uid INTEGER NOT NULL
              );",
         )?;
         // Migrate databases created before uid allocation existed. sqlite has no
@@ -77,13 +85,16 @@ impl Store {
     ///
     /// Two properties matter, and both are about not letting one tenant inherit another's identity:
     ///
-    /// * **Never recycled while the row exists.** A uid is a filesystem identity. Handing a
-    ///   freed uid to a new project would give it ownership of any stray file the old one left
-    ///   behind, so allocation is sticky for the life of the project row.
-    /// * **Allocated under one transaction.** `max(uid_base) + stride` read separately from the
-    ///   insert is a race: two concurrent provisions would compute the same base and one would
-    ///   silently win, leaving two projects sharing a uid. The UNIQUE constraint is the backstop,
-    ///   but the transaction is what makes it not happen.
+    /// * **Never recycled, even after the project is deleted.** A uid is a filesystem identity,
+    ///   so handing a freed one to a new project would give that tenant ownership of anything the
+    ///   old one left on disk. The next uid therefore comes from a watermark that only climbs, not
+    ///   from `max(uid_base)` — deleting a row removes its uid_base, and the maximum would fall
+    ///   back and re-issue it. That version passed on a laptop only because the test needed root
+    ///   and was being skipped.
+    /// * **Allocated under one transaction.** Reading the watermark and writing it back separately
+    ///   is a race: two concurrent provisions would take the same base and one would silently win,
+    ///   leaving two projects sharing a uid. The UNIQUE constraint is the backstop, the
+    ///   transaction is what stops it happening.
     ///
     /// Each project owns `stride` consecutive uids: the engine runs at `base`, and per-node
     /// children get `base + 1 ..= base + stride - 1` (ADVERSARY F007 — the isolation boundary is
@@ -105,14 +116,21 @@ impl Store {
             return Ok(base as u32);
         }
 
-        let highest: Option<i64> =
-            tx.query_row("SELECT max(uid_base) FROM projects", [], |r| r.get(0))?;
-        let base = match highest {
-            None => range_start,
-            Some(h) => (h as u32)
-                .checked_add(stride)
-                .context("uid range exhausted")?,
-        };
+        // Seed the watermark on first use, then take it. Deliberately NOT `max(uid_base)`:
+        // deleting a project removes its uid_base, so the maximum falls back and the next project
+        // is handed a uid whose files may still be on disk. This row only ever climbs.
+        tx.execute(
+            "INSERT OR IGNORE INTO uid_watermark (id, next_uid) VALUES (1, ?1)",
+            rusqlite::params![range_start as i64],
+        )?;
+        let base = tx.query_row("SELECT next_uid FROM uid_watermark WHERE id = 1", [], |r| {
+            r.get::<_, i64>(0)
+        })? as u32;
+        let next = base.checked_add(stride).context("uid range exhausted")?;
+        tx.execute(
+            "UPDATE uid_watermark SET next_uid = ?1 WHERE id = 1",
+            rusqlite::params![next as i64],
+        )?;
 
         let updated = tx.execute(
             "UPDATE projects SET uid_base = ?2 WHERE id = ?1",
