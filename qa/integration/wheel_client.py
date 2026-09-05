@@ -41,6 +41,20 @@ def unique_sub(prefix="qa"):
     return "%s_%s" % (prefix, uuid.uuid4().hex[:16])
 
 
+def sub_of(token):
+    """The `sub` claim of a token we hold, read from the token rather than remembered.
+
+    `owner_id == the JWT sub` is the property worth asserting; `owner_id == "user_alice"` is
+    that property with a dev-mode implementation detail baked in, and it fails under local
+    auth where the sub is a generated uuid. Reading the claim keeps the assertion true in
+    both modes. No signature check here on purpose — the API verified it, and this is a test
+    reading its own token.
+    """
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload.encode()))["sub"]
+
+
 def mint(sub, iss=None, secret=None, alg="HS256", exp_delta=3600, nbf_delta=-60):
     """Mint a dev token. Non-default args exist so the auth NEGATIVE cases are expressible."""
     header = b64u(json.dumps({"alg": alg, "typ": "JWT"}).encode())
