@@ -213,7 +213,7 @@ claude --print
        --output-format stream-json
        --verbose
        --permission-mode bypassPermissions
-       --append-system-prompt <composed preamble>
+       --append-system-prompt-file <path>
        [--model <model>]        # omitted entirely when config.model is null
        [--mcp-config <path>]    # only when >=1 mcp node is wired
        [--resume <session_id>]  # resume only; never on a fresh start
@@ -224,7 +224,14 @@ claude --print
 - `--verbose` is **required** for stream-json output, not optional.
 - `--permission-mode bypassPermissions`: an interactive permission prompt would deadlock a headless child
   forever. This means an agent's tools are unrestricted *inside its sandbox* — the sandbox boundary is therefore
-  the entire security story, and this is called out to ADVERSARY as a design-level fact.
+  the entire security story (ADVERSARY finding 002, accepted).
+- **The prompt is passed as a file, never as argv.** `argv` is world-readable across uids, and the composed
+  preamble contains injected ctx. The engine writes it into the node's `0700` config dir and passes the path.
+- **`bypassPermissions` is refused when running as root**: exit 1 with *empty stdout* and
+  `--dangerously-skip-permissions cannot be used with root/sudo privileges` on stderr. That exit is
+  indistinguishable from an unauthenticated CLI, so children run **non-root with `IS_SANDBOX=1`**, and
+  `needs_auth` is **never** inferred from an exit code alone — only from stderr or an explicit probe
+  (`claude auth status --json`).
 
 **Stdin, one line per turn**, newline-terminated, flushed, nothing else ever written:
 
@@ -242,7 +249,7 @@ exhaustively would fall over in production.
 | `system` / `init` | Record `session_id`, `model`; status → `idle`. |
 | `assistant` | Append text to the log. |
 | `user` | Tool results — append to the log. |
-| `result` | **Turn complete.** `is_error` → status `error` + `last_error`; else in-flight message → `consumed`, status → `idle`, then ephemeral clear if configured, then deliver next queued. |
+| `result` | **Turn complete.** Usage fields feed `state.spend` and the agent `budget`. `is_error` → status `error` + `last_error`; else in-flight message → `consumed`, status → `idle`, then ephemeral clear if configured, then deliver next queued. |
 | anything else | Logged verbatim, ignored. |
 
 A **non-JSON line on stdout is never fatal**: it is logged verbatim as a `stdout` line and the stream continues.
@@ -298,6 +305,25 @@ tells them to prefer it.
 
 ---
 
+## 5b. Idle parking and lifecycle (§3c#14)
+
+Compute frugality is an operator directive, not an optimisation: one live process per agent forever is what
+made YOKE unusable. So:
+
+- After `idle_timeout_secs` (default 300, `0` disables) the supervisor **stops the process and keeps the
+  session id**. Status `idle → parked`. The next message resumes with `--resume <session_id>`, so parking
+  never loses context — except under `ephemeral_context`, where the context was being cleared anyway.
+- A parked agent has **no live process**, and that is healthy. Nothing may treat process liveness as a proxy
+  for agent health.
+- Per-host cap on concurrently `running` agents (env, default 32) with a fair queue. `run_on_startup` starts
+  agents **parked**, not running.
+- `budget: {max_turns?, max_usd?}` → on reach, status `budget_exhausted`; the engine will not self-restart.
+- The engine idles at ~0 CPU: no polling loops anywhere — channels, WS and inotify only.
+
+Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_exhausted | error`, plus
+`hosted_on` (`"cloud"` | runner id | `null`). **`null` means unhosted, which is a loud, alarming state** —
+an agent nobody can run is broken, and the UI says so rather than showing it as merely stopped.
+
 ## 6. Limits (§3c#6)
 
 Enforced client-side *before* sending, so callers get a clear error rather than discovering a limit by failing —
@@ -337,8 +363,29 @@ Guarantees the engine makes to the host:
 - `SIGTERM` → stops children, flushes sqlite, exits within **15 s**.
 - In `process` mode it runs as the uid the host already dropped to; it does not attempt privilege changes itself.
 
-Children are spawned with `WHEEL_TOKEN`, `WHEEL_ENGINE_URL`, `WHEEL_NODE`, plus the keys of every wired vault as
-env vars. Never `WHEEL_ENGINE_SECRET`.
+Children are spawned with `WHEEL_TOKEN_FILE`, `WHEEL_ENGINE_URL`, `WHEEL_NODE`, plus the keys of every wired
+vault. Never `WHEEL_ENGINE_SECRET`.
+
+**The capability token is passed as a `0600` file, not an environment variable** (ADVERSARY finding 007).
+`/proc/<pid>/environ` is readable by the same uid, so an env token would hand every co-resident child every
+other child's authority. Paired with a **per-node uid** (each child gets its own uid from the project's range;
+the engine holds ambient `CAP_SETUID`/`CAP_SETGID` only; credential dirs are `0700`; shared workspaces are
+setgid), a file only the token's own uid can read is the real boundary.
+
+**Gap, stated deliberately:** per-node uid separation lands in **M2** for the docker backend and **M3** for the
+process backend. Until then all of a project's children share one uid, so the token file is a defence in depth
+rather than a boundary, and a compromised child can reach its siblings' tokens. This is a known, accepted,
+time-boxed gap — not an oversight.
+
+### Forged harness events (ADVERSARY finding 008)
+
+An agent controls its own stdout, so it can print a line that looks like a top-level `result` event and try to
+end its own turn early, skip accounting, or desynchronise the delivery loop. Two rules:
+
+- A `result` is accepted as turn-complete only when its `session_id` matches the session the supervisor
+  started. Forged or foreign events are logged and ignored.
+- **Budget and turn counting are enforced supervisor-side**, from the supervisor's own record of turns
+  delivered — never from usage numbers reported by the child.
 
 ---
 

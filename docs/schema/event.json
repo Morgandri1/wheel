@@ -144,6 +144,20 @@
           ]
         },
         {
+          "description": "Process stopped after `idle_timeout_secs` to save compute (§3c#14). The session id is retained and the next message resumes it transparently, so parking never loses context.",
+          "type": "string",
+          "enum": [
+            "parked"
+          ]
+        },
+        {
+          "description": "Stopped because the agent's `budget` was reached. Requires operator action; the engine will not restart it on its own.",
+          "type": "string",
+          "enum": [
+            "budget_exhausted"
+          ]
+        },
+        {
           "description": "Child exited unexpectedly or the harness reported a fatal error; `last_error` carries the detail.",
           "type": "string",
           "enum": [
@@ -391,6 +405,14 @@
             "status"
           ],
           "properties": {
+            "hosted_on": {
+              "description": "Where this agent's process lives: `\"cloud\"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "type": "string",
               "enum": [
@@ -427,6 +449,17 @@
                 "null"
               ]
             },
+            "spend": {
+              "description": "Observed spend, from the harness's usage events. Drives `budget`.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Spend"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "status": {
               "$ref": "#/definitions/AgentStatus"
             }
@@ -448,6 +481,23 @@
         "chest",
         "tool"
       ]
+    },
+    "Spend": {
+      "description": "Accumulated cost for an agent's current lifetime.",
+      "type": "object",
+      "properties": {
+        "turns": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "usd": {
+          "default": 0.0,
+          "type": "number",
+          "format": "double"
+        }
+      }
     },
     "Timestamp": {
       "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",

@@ -26,7 +26,18 @@ pub const ENV_ROLE: &str = "WHEEL_ROLE";
 
 // --- passed to agent children, not to the engine ---------------------------
 
-/// Per-node capability token given to an agent/script child.
+/// Path to a `0600` file holding the child's per-node capability token.
+///
+/// The token is passed as a FILE, not as an env var (ADVERSARY finding 007):
+/// `/proc/<pid>/environ` is readable by the same uid, so an env var would leak
+/// every co-resident child's token to any of them. Combined with a per-node
+/// uid, a file the token's own uid alone can read is the actual boundary.
+pub const ENV_TOKEN_FILE: &str = "WHEEL_TOKEN_FILE";
+
+/// Legacy env-var form of the capability token.
+///
+/// Kept only so the CLI can emit a clear error if it finds one: it must never
+/// be set by the engine. See [`ENV_TOKEN_FILE`].
 pub const ENV_TOKEN: &str = "WHEEL_TOKEN";
 /// Where the `wheel` CLI should reach its engine.
 pub const ENV_ENGINE_URL: &str = "WHEEL_ENGINE_URL";

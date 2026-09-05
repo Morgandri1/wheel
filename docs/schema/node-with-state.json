@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "NodeWithState",
-  "description": "A node plus its observed state, as returned by `GET /v1/board`.",
+  "description": "A node plus its observed state: `GET /v1/board` returns `{ ...node, state }`.\n\n`state` is always present and is **null for non-agent node types** — not omitted.",
   "type": "object",
   "oneOf": [
     {
@@ -184,6 +184,7 @@
       "$ref": "#/definitions/Position"
     },
     "state": {
+      "default": null,
       "anyOf": [
         {
           "$ref": "#/definitions/NodeState"
@@ -210,6 +211,17 @@
         "system_prompt"
       ],
       "properties": {
+        "budget": {
+          "description": "Spend ceiling. On reach, the engine stops the agent with `status: budget_exhausted`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Budget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "ephemeral_context": {
           "description": "Clear the session after every completed turn, re-applying the system prompt and ctx injections, before draining the next queued message.",
           "default": false,
@@ -217,6 +229,15 @@
         },
         "harness": {
           "$ref": "#/definitions/Harness"
+        },
+        "idle_timeout_secs": {
+          "description": "Stop the process after this long idle and resume the session on the next message (§3c#14 idle parking). `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
         },
         "model": {
           "description": "Harness-specific model id. `None` = the CLI's own default.",
@@ -275,6 +296,20 @@
           ]
         },
         {
+          "description": "Process stopped after `idle_timeout_secs` to save compute (§3c#14). The session id is retained and the next message resumes it transparently, so parking never loses context.",
+          "type": "string",
+          "enum": [
+            "parked"
+          ]
+        },
+        {
+          "description": "Stopped because the agent's `budget` was reached. Requires operator action; the engine will not restart it on its own.",
+          "type": "string",
+          "enum": [
+            "budget_exhausted"
+          ]
+        },
+        {
           "description": "Child exited unexpectedly or the harness reported a fatal error; `last_error` carries the detail.",
           "type": "string",
           "enum": [
@@ -282,6 +317,27 @@
           ]
         }
       ]
+    },
+    "Budget": {
+      "description": "Per-agent spend ceiling (§3e). Either field may be set independently.",
+      "type": "object",
+      "properties": {
+        "max_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
     },
     "ChestConfig": {
       "description": "Chest has no configuration; its content lives on disk under `/data/chest/<node_id>/` and is indexed in sqlite.",
@@ -507,6 +563,14 @@
             "status"
           ],
           "properties": {
+            "hosted_on": {
+              "description": "Where this agent's process lives: `\"cloud\"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "type": "string",
               "enum": [
@@ -541,6 +605,17 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "spend": {
+              "description": "Observed spend, from the harness's usage events. Drives `budget`.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Spend"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "status": {
@@ -628,6 +703,23 @@
         "ts",
         "js"
       ]
+    },
+    "Spend": {
+      "description": "Accumulated cost for an agent's current lifetime.",
+      "type": "object",
+      "properties": {
+        "turns": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "usd": {
+          "default": 0.0,
+          "type": "number",
+          "format": "double"
+        }
+      }
     },
     "TableConfig": {
       "type": "object",

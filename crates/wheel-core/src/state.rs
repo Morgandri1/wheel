@@ -24,6 +24,13 @@ pub enum AgentStatus {
     Running,
     /// Child is alive and waiting for input.
     Idle,
+    /// Process stopped after `idle_timeout_secs` to save compute (§3c#14). The
+    /// session id is retained and the next message resumes it transparently, so
+    /// parking never loses context.
+    Parked,
+    /// Stopped because the agent's `budget` was reached. Requires operator
+    /// action; the engine will not restart it on its own.
+    BudgetExhausted,
     /// Child exited unexpectedly or the harness reported a fatal error;
     /// `last_error` carries the detail.
     Error,
@@ -37,6 +44,8 @@ impl AgentStatus {
             AgentStatus::NeedsAuth => "needs_auth",
             AgentStatus::Running => "running",
             AgentStatus::Idle => "idle",
+            AgentStatus::Parked => "parked",
+            AgentStatus::BudgetExhausted => "budget_exhausted",
             AgentStatus::Error => "error",
         }
     }
@@ -58,7 +67,7 @@ impl std::fmt::Display for AgentStatus {
 }
 
 /// Observed state of an `agent` node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct AgentState {
     pub status: AgentStatus,
     /// The harness's own session identifier for the current session. Changes
@@ -72,24 +81,64 @@ pub struct AgentState {
     /// Messages persisted but not yet delivered into the child.
     #[serde(default)]
     pub queued_messages: u32,
+    /// Where this agent's process lives: `"cloud"`, a local runner id, or
+    /// `None` for **unhosted** — a first-class alarming state, not an absence
+    /// (§3e). An agent nobody can run is a broken agent and the UI says so.
+    #[serde(default)]
+    pub hosted_on: Option<String>,
+    /// Observed spend, from the harness's usage events. Drives `budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<Spend>,
+}
+
+/// Accumulated cost for an agent's current lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct Spend {
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub usd: f64,
 }
 
 /// `state` as reported next to a node on `GET /v1/board`. Only agent nodes
 /// currently carry state; the enum leaves room for others (e.g. table row
 /// counts) without a breaking change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum NodeState {
     Agent(AgentState),
 }
 
-/// A node plus its observed state, as returned by `GET /v1/board`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// A node plus its observed state: `GET /v1/board` returns `{ ...node, state }`.
+///
+/// `state` is always present and is **null for non-agent node types** — not
+/// omitted.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct NodeWithState {
     #[serde(flatten)]
     pub node: crate::node::Node,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub state: Option<NodeState>,
+}
+
+/// Serialized by hand: serde's `flatten` silently DROPS an `Option::None` field
+/// instead of writing null, so a ctx node's board entry would come back with no
+/// `state` key at all. Web must be able to tell "this node has no state" from
+/// "the board hasn't loaded yet", so the key is always emitted.
+/// Deserialization keeps the derive — a missing key defaults to `None`.
+impl Serialize for NodeWithState {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        let mut v = serde_json::to_value(&self.node).map_err(S::Error::custom)?;
+        let obj = v
+            .as_object_mut()
+            .ok_or_else(|| S::Error::custom("a node must serialize to a JSON object"))?;
+        obj.insert(
+            "state".into(),
+            serde_json::to_value(&self.state).map_err(S::Error::custom)?,
+        );
+        v.serialize(s)
+    }
 }
 
 /// Whether an agent's harness currently holds usable credentials
