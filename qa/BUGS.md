@@ -14,6 +14,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% (host was 0.00% when filed) |
+| 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | **open** | `transcript` log lines are persisted but never emitted over the events WebSocket |
 
 ---
 
@@ -310,3 +311,36 @@ config the schema calls valid gets a 400 from the engine. The schema currently p
 the product does not accept, which is a worse failure than a schema that is merely strict.
 
 
+
+
+---
+
+## 009 — `transcript` log lines never reach the events WebSocket · S2 · SDK
+
+The engine persists `stream: "transcript"` log lines to the database but does not emit them on
+`GET /v1/events`. A WS consumer sees only `stdout`.
+
+**Repro** (needs a live stack — this is the check that found it):
+```
+node qa/live/ws_streams_parity.mjs
+```
+```
+  WS log streams : stdout
+  DB log streams : transcript, stdout
+  FAIL every DB stream also arrived over the WS — missing over WS: transcript
+```
+
+**Expected:** every stream persisted to the DB also arrives over the WS, so a live consumer and a
+replay of `GET /v1/agents/:id/log` agree.
+**Actual:** `transcript` is DB-only.
+
+**Why S2 rather than cosmetic:** §3c #10 requires Web's agent drawer to show "the exact bytes
+written to a child's stdin". That is the `transcript` stream. As it stands Web cannot render it
+live — it would have to poll the log endpoint and reconcile against the WS, which is the kind of
+divergence that produces a UI that is quietly wrong rather than obviously broken. It also weakens
+`ENG-events-replay`: WS and replay are supposed to be two views of one log.
+
+**Provenance:** adapted from SDK's own `ws-live2.mjs` probe, with the deliberate change that this
+version ASSERTS and exits non-zero instead of printing the two sides for a human to compare.
+SDK's e2e passed this bug because it asserted that *a* log event arrived rather than WHICH streams
+did — a printer cannot fail, so it cannot gate. SDK asked for exactly this check to live in `qa/`.

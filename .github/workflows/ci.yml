@@ -100,6 +100,41 @@ jobs:
       # An area that does not exist yet (no web/) is reported, not failed.
       - run: make check-strict
 
+  # API's crates/wheel-host/tests/sandbox_docker.rs creates and destroys real containers
+  # and asserts the hardening rather than trusting it: cap_drop ALL with exactly
+  # SETUID+SETGID (the COUNT is asserted, so a third capability cannot creep in),
+  # no-new-privileges, memory and pid caps, and that no port is published.
+  #
+  # It lives in its own job, not in `check`, because the image is a release build and
+  # `check` must stay fast. WHEEL_CI_HAS_DOCKER=1 is set HERE and only here, following
+  # API's own convention: the flag asserts "the dependency was promised", so it belongs
+  # where the daemon and the image genuinely exist. Setting it in `check` — which builds
+  # no image — would fail for a missing dependency nobody promised, which is the same
+  # mistake as keying on CI itself.
+  docker-sandbox:
+    name: docker sandbox (wheel-host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-docker-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-docker-${{ runner.os }}-
+
+      - name: Build wheel-engine:dev
+        run: make engine-image
+
+      - name: Docker-backed sandbox tests
+        env:
+          WHEEL_CI_HAS_DOCKER: "1"
+        run: cargo test -p wheel-host
+
   integration:
     name: integration (docker + fake harness)
     runs-on: ubuntu-latest

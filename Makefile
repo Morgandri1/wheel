@@ -8,7 +8,7 @@ SHELL := /bin/bash
 export PATH := $(HOME)/.cargo/bin:/opt/homebrew/bin:$(PATH)
 
 .PHONY: help check check-strict fmt clippy test-rust coverage web-lint web-typecheck web-test \
-        qa-selftest test-int test-e2e test-live bootstrap clean
+        qa-selftest test-int test-e2e test-live test-live-ws bootstrap clean
 
 help: ## show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -51,6 +51,9 @@ test-int: ## integration suite (docker; needs wheel-engine:test + compose)
 
 test-e2e: ## Playwright end-to-end suite
 	@bash qa/e2e/run.sh
+
+test-live-ws: ## WS-vs-DB log stream parity against a running stack (needs infra/docker-compose.yml up)
+	@node qa/live/ws_streams_parity.mjs
 
 test-live: ## OPT-IN: same suites against the REAL claude/codex CLIs. Costs money. Never in CI.
 	@WHEEL_LIVE=1 bash qa/integration/run.sh

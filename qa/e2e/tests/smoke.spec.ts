@@ -47,6 +47,12 @@ test.describe("M1 vertical slice", () => {
   });
 
   test("E2E-place-nodes + E2E-inspector: the board renders server state", async ({ page }) => {
+    // This test starts a real sandbox. Per §4b the host blocks on /start until the engine's
+    // healthz is green, up to 30s, so the default 30s budget is spent before the assertions
+    // begin. Raised deliberately rather than trimming the test: starting the project IS the
+    // precondition for the board rendering server state.
+    test.setTimeout(120_000);
+
     const project = await createProject(`e2e-slice-${Date.now().toString(36)}`);
     try {
       const ctx = await addNode(project.id, {
@@ -68,7 +74,7 @@ test.describe("M1 vertical slice", () => {
       await addWire(project.id, ctx.id, agent.id, "send");
 
       await startProject(project.id);
-    await page.goto(`/app/${project.id}`);
+      await page.goto(`/app/${project.id}`);
       await expect(page.getByTestId(T.board)).toBeVisible();
       await expect(page.getByTestId(T.node("house-style"))).toBeVisible();
       await expect(page.getByTestId(T.node("researcher"))).toBeVisible();
