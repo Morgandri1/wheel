@@ -34,10 +34,13 @@ def main():
                 print("with_lock: gave up after %.0fs waiting for %s" % (waited, lockfile),
                       file=sys.stderr)
                 os.close(fd)
-                # 77 = "the gate could not run", which qa/check.sh reports as a skip.
-                # Losing a lock race is not the same as a failing gate, and reporting it
-                # as red would train people to ignore red.
-                return 77
+                # 75, not 77. Both mean "did not run", but they need different words:
+                # 77 is "this gate cannot run here" (no cargo-llvm-cov, no docker) and is
+                # answered by installing something. 75 is "another worktree held the lock
+                # longer than I waited" — transient, and answered by running it again.
+                # Collapsing them let a fully contended run report every Rust gate as an
+                # ordinary skip, which locally reads as a passing check.
+                return 75
             if not announced and not quiet:
                 # Say so once: a silent 4-minute wait looks identical to a hang.
                 print("  … waiting for the cargo lock (another worktree is building)",
