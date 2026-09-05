@@ -151,6 +151,9 @@ pub const fn wire_allowed(from: NodeType, to: NodeType, ty: WireType) -> bool {
         (N::Endpoint, N::Table, W::Write) => true,
         // script invoked with the request; response_mode:script returns stdout
         (N::Endpoint, N::Script, W::Send) => true,
+        // Resolve the endpoint's `auth.vault_ref` bearer secret (§3). Without
+        // this row `auth: {mode: "bearer"}` is unimplementable.
+        (N::Endpoint, N::Vault, W::Read) => true,
 
         // --- script outgoing ------------------------------------------------
         // `wheel msg` from inside the script (scoped to ITS wires)
@@ -160,6 +163,8 @@ pub const fn wire_allowed(from: NodeType, to: NodeType, ty: WireType) -> bool {
         (N::Script, N::Table, W::Read | W::Write) => true,
         (N::Script, N::Chest, W::Read | W::Write) => true,
         (N::Script, N::Vault, W::Read) => true,
+        // "script → tool | same as agent" (§3).
+        (N::Script, N::Tool, W::Read) => true,
 
         // --- everything else is denied --------------------------------------
         // In particular: table, vault, chest and mcp have NO outgoing wires;

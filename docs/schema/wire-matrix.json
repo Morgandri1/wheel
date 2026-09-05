@@ -77,6 +77,11 @@
       "type": "send"
     },
     {
+      "from": "endpoint",
+      "to": "vault",
+      "type": "read"
+    },
+    {
       "from": "script",
       "to": "agent",
       "type": "send"
@@ -115,6 +120,11 @@
       "from": "script",
       "to": "chest",
       "type": "write"
+    },
+    {
+      "from": "script",
+      "to": "tool",
+      "type": "read"
     },
     {
       "from": "tool",
