@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Wire",
+  "description": "An outgoing wire, as stored on its source node (`Node::wires`).",
+  "type": "object",
+  "required": [
+    "to",
+    "type"
+  ],
+  "properties": {
+    "to": {
+      "description": "Target node id.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "type": {
+      "$ref": "#/definitions/WireType"
+    }
+  },
+  "definitions": {
+    "WireType": {
+      "description": "What a wire permits. Wires are directional and stored on the *source* node.",
+      "oneOf": [
+        {
+          "description": "Read the target's data (`wheel read`, `table query`, `chest get|ls`, `secret get`, `run <script>`, MCP attachment).",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Mutate the target's data. For `table` and `chest`, write **implies** read — see [`WireType::satisfies`].",
+          "type": "string",
+          "enum": [
+            "write"
+          ]
+        },
+        {
+          "description": "Deliver a message to the target (agent→agent, endpoint→agent, script→agent) or, for `ctx`→`agent`, inject context into its prompt.",
+          "type": "string",
+          "enum": [
+            "send"
+          ]
+        }
+      ]
+    }
+  }
+}

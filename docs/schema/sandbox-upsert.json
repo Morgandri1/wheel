@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxUpsert",
+  "description": "`PUT /host/v1/projects/:id` — idempotent create-or-update of a sandbox record. The API holds these secrets encrypted in Postgres and hands them to the host here; the host is the only process that has them at runtime.",
+  "type": "object",
+  "required": [
+    "engine_secret",
+    "vault_key"
+  ],
+  "properties": {
+    "capabilities": {
+      "default": {
+        "http": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "engine_secret": {
+      "description": "Bearer the host must present to this project's engine control plane.",
+      "type": "string"
+    },
+    "vault_key": {
+      "description": "Base64 per-project key the engine uses to encrypt vault values at rest.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "Per-project capabilities, toggled by the owner through the API.",
+      "type": "object",
+      "properties": {
+        "http": {
+          "description": "Public ingress at `/p/<project_id>/*` is served only when this is true.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

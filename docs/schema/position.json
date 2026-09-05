@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Position",
+  "description": "Board coordinates. Floats because the canvas pans/zooms continuously.",
+  "type": "object",
+  "required": [
+    "x",
+    "y"
+  ],
+  "properties": {
+    "x": {
+      "type": "number",
+      "format": "double"
+    },
+    "y": {
+      "type": "number",
+      "format": "double"
+    }
+  }
+}

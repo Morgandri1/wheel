@@ -1,0 +1,130 @@
+{
+  "$comment": "Generated from wheel_core::wire_allowed. Default DENY: any triple absent from `allowed` is rejected.",
+  "allowed": [
+    {
+      "from": "agent",
+      "to": "agent",
+      "type": "send"
+    },
+    {
+      "from": "agent",
+      "to": "ctx",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "ctx",
+      "type": "write"
+    },
+    {
+      "from": "agent",
+      "to": "table",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "table",
+      "type": "write"
+    },
+    {
+      "from": "agent",
+      "to": "script",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "mcp",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "vault",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "chest",
+      "type": "read"
+    },
+    {
+      "from": "agent",
+      "to": "chest",
+      "type": "write"
+    },
+    {
+      "from": "ctx",
+      "to": "agent",
+      "type": "send"
+    },
+    {
+      "from": "endpoint",
+      "to": "agent",
+      "type": "send"
+    },
+    {
+      "from": "endpoint",
+      "to": "table",
+      "type": "write"
+    },
+    {
+      "from": "endpoint",
+      "to": "script",
+      "type": "send"
+    },
+    {
+      "from": "script",
+      "to": "agent",
+      "type": "send"
+    },
+    {
+      "from": "script",
+      "to": "ctx",
+      "type": "read"
+    },
+    {
+      "from": "script",
+      "to": "ctx",
+      "type": "write"
+    },
+    {
+      "from": "script",
+      "to": "table",
+      "type": "read"
+    },
+    {
+      "from": "script",
+      "to": "table",
+      "type": "write"
+    },
+    {
+      "from": "script",
+      "to": "vault",
+      "type": "read"
+    },
+    {
+      "from": "script",
+      "to": "chest",
+      "type": "read"
+    },
+    {
+      "from": "script",
+      "to": "chest",
+      "type": "write"
+    }
+  ],
+  "node_types": [
+    "agent",
+    "ctx",
+    "table",
+    "endpoint",
+    "script",
+    "mcp",
+    "vault",
+    "chest"
+  ],
+  "wire_types": [
+    "read",
+    "write",
+    "send"
+  ]
+}
