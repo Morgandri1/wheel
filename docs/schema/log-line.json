@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LogLine",
+  "description": "One line of agent output. `seq` is monotonic per agent and is the cursor used by `GET /v1/agents/:id/log?since=<seq>`.",
+  "type": "object",
+  "required": [
+    "at",
+    "node_id",
+    "seq",
+    "stream",
+    "text"
+  ],
+  "properties": {
+    "at": {
+      "$ref": "#/definitions/Timestamp"
+    },
+    "node_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "stream": {
+      "$ref": "#/definitions/LogStream"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "LogStream": {
+      "description": "Where a log line came from.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "stdout",
+            "stderr"
+          ]
+        },
+        {
+          "description": "Emitted by the engine itself (spawn, exit, session clear, ...).",
+          "type": "string",
+          "enum": [
+            "engine"
+          ]
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

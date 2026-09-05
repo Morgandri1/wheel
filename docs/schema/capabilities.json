@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Capabilities",
+  "description": "Per-project capabilities, toggled by the owner through the API.",
+  "type": "object",
+  "properties": {
+    "http": {
+      "description": "Public ingress at `/p/<project_id>/*` is served only when this is true.",
+      "default": false,
+      "type": "boolean"
+    }
+  }
+}

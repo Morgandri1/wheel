@@ -36,9 +36,12 @@ You own the heart of Wheel: `crates/wheel-core`, `crates/wheel-engine`, `crates/
      Claude Code — check `claude auth login` / `claude setup-token` / paste-code fallback; Codex — check `codex login --device-auth` and `codex login --with-api-key`.
      v1 must support **(a)** API key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) and **(b)** a device-code or paste-code OAuth flow surfaced through `/v1/agents/:id/auth/begin`.
      Persist credentials under `/data/creds/<node_id>/` and point each child at its own `HOME`/config dir so two agents can be different accounts. Report findings to PM as soon as you know what works.
-3. **`wheel-cli`** (`wheel` binary): `msg <agent> <text|--stdin>`, `read <ctx>`, `write <ctx> --file`, `table query <t> "<sql>"`, `secret get <vault>/<key>`,
-   `chest get|put|ls|rm`, `run <script> [args]`, `ctx clear`, `whoami`, `connections` (mirrors `yoke` ergonomics — agents will love familiarity). Exit 3 on wire denial with a one-line explanation.
-4. **`docker/Dockerfile`**: debian-slim base, `claude` + `codex` CLIs (installed via npm in the image — that's fine, the engine itself is Rust), python3, node 22, tsx, non-root `agent` user, engine as PID 1, `/data` volume, healthcheck `GET /healthz`. `make engine-image` builds `wheel-engine:dev`.
+3. **`wheel-cli`** (`wheel` binary): implement the yoke-shaped grammar in §3 exactly (`whoami`, `connections`, `msg`, `read`, `write`, `rm`, `ls`,
+   `query`, `secret get`, `run`, `ctx clear`), `--json` everywhere, exit 3 on wire denial with a one-line reason, `--stdin`/`--file` for values.
+   Talk to the engine over `WHEEL_ENGINE_URL` (http in docker mode, `unix://` socket in process mode) with `WHEEL_TOKEN`.
+   The agent preamble + `<AgentPrompt>` envelope in §3 are the exact strings — write them as a template with golden tests.
+3b. **Engine spawn contract** (§4b): implement `WHEEL_LISTEN` tcp/unix, `WHEEL_DATA_DIR`, 10s healthz, clean SIGTERM, non-zero exit with reason. `wheel-host` itself is API's — you provide this contract and review their process-backend design (setuid/socket perms) when asked.
+4. **`docker/Dockerfile.host`** (single image for host+engine+cli; also used by the docker backend with `wheel-engine` as entrypoint): debian-slim base, `claude` + `codex` CLIs (installed via npm in the image — that's fine, the engine itself is Rust), python3, node 22, tsx, non-root `agent` user, engine as PID 1, `/data` volume, healthcheck `GET /healthz`. `make engine-image` builds `wheel-engine:dev`.
 5. **`docs/PROTOCOL.md`**: every control-plane route with request/response JSON, every event shape, every CLI command, error codes.
 
 ## Non-negotiables
@@ -48,6 +51,6 @@ You own the heart of Wheel: `crates/wheel-core`, `crates/wheel-engine`, `crates/
 - When you change `wheel-core` JSON shape, regenerate `docs/schema/` in the same commit and message PM (Web regenerates TS types).
 
 ## Suggested plan shape
-M1 (day 1): wheel-core + schema export → engine with sqlite, board CRUD, wires, agent start/stop for `claude`, message delivery, injection, `wheel msg`/`read`, events WS, Dockerfile.
-M2: codex, ephemeral context, table/chest/vault/script/mcp/endpoint/ingress, auth flows.
-M3: hardening from ADVERSARY findings, resource limits (cgroup/ulimit for scripts & agents), log rotation.
+M1 (day 1): wheel-core + schema export → engine with sqlite, board CRUD, wires, agent start/stop for `claude`, message delivery, injection, `wheel msg`/`read`/`write`/`whoami`/`connections`, events WS, Dockerfile.host. (wheel-host is API's.)
+M2: codex, ephemeral context, table/chest/vault/script/mcp/endpoint/ingress, auth flows, **tool nodes (§3d)**: `wheel-core` ToolOperation/Fill types; parsers for OpenAPI 3 (`openapiv3` crate), Swagger 2 (convert), Postman v2.1, Insomnia v4 (serde + mappers) with fixture-based tests (petstore + a real Postman export + a real Insomnia export); executor (reqwest, SSRF deny-list with DNS-resolution check, timeouts, size caps, masked curl rendering); `wheel tool ls|call`; MCP tool generation `<tool>__<op>` from agent-fill fields.
+M3: `process` sandbox backend for Railway, hardening from ADVERSARY findings, resource limits (ulimit for scripts & agents), log rotation.

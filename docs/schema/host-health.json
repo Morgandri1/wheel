@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HostHealth",
+  "description": "`GET /host/v1/healthz`",
+  "type": "object",
+  "required": [
+    "ok",
+    "projects_running",
+    "sandbox_backend"
+  ],
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "projects_running": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "sandbox_backend": {
+      "$ref": "#/definitions/SandboxBackend"
+    }
+  },
+  "definitions": {
+    "SandboxBackend": {
+      "description": "Which sandbox implementation the host is running.",
+      "oneOf": [
+        {
+          "description": "Local dev / any VM with a docker daemon: one container per project, engine reachable over TCP on the container network.",
+          "type": "string",
+          "enum": [
+            "docker"
+          ]
+        },
+        {
+          "description": "Production (Railway): one unix uid per project, engine reachable only over a unix socket owned by that uid.",
+          "type": "string",
+          "enum": [
+            "process"
+          ]
+        }
+      ]
+    }
+  }
+}
