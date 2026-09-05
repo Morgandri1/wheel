@@ -21,6 +21,7 @@ import { WireEdge, type WireData } from "@/components/board/wire-edge";
 import { Palette } from "@/components/board/palette";
 import { Legend } from "@/components/board/legend";
 import { WirePopover } from "@/components/board/wire-popover";
+import { CommandPalette } from "@/components/board/command-palette";
 import { NODE_META } from "@/lib/node-meta";
 import { canConnect, explainDenial, isInjection } from "@/lib/wire-matrix";
 import { suggestName } from "@/lib/validate";
@@ -40,7 +41,7 @@ interface CanvasProps {
 }
 
 function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
-  const { screenToFlowPosition, getViewport } = useReactFlow();
+  const { screenToFlowPosition, getViewport, setCenter } = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
   const select = useBoardStore((s) => s.select);
   const selectedNodeId = useBoardStore((s) => s.selectedNodeId);
@@ -56,6 +57,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   const [confirmDelete, setConfirmDelete] = useState<WheelNode | null>(null);
   const [pendingTool, setPendingTool] = useState<{ position: Position } | null>(null);
   const [toolUrl, setToolUrl] = useState("");
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const rename = useCallback(
     async (id: string, name: string) => {
@@ -257,11 +259,39 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
     [getViewport, place],
   );
 
-  // Delete removes the selection; nodes that own data ask first.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = document.activeElement;
-      if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
+      const typing = Boolean(el && /^(INPUT|TEXTAREA)$/.test(el.tagName));
+
+      // Cmd+K works even while typing — it is how you get out of wherever you are.
+      if ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setPaletteOpen((open) => !open);
+        return;
+      }
+
+      // Esc backs out of exactly one thing at a time, innermost first, so it is predictable.
+      if (e.key === "Escape") {
+        if (paletteOpen) return; // the palette closes itself
+        if (pendingWire) {
+          setPendingWire(null);
+          return;
+        }
+        if (confirmDelete) {
+          setConfirmDelete(null);
+          return;
+        }
+        if (pendingTool) {
+          setPendingTool(null);
+          setToolUrl("");
+          return;
+        }
+        if (!typing && selectedNodeId) select(null);
+        return;
+      }
+
+      if (typing) return;
       if ((e.key !== "Delete" && e.key !== "Backspace") || !selectedNodeId) return;
       const node = byId.get(selectedNodeId);
       if (!node) return;
@@ -282,7 +312,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [api, byId, onChanged, select, selectedNodeId]);
+  }, [api, byId, onChanged, select, selectedNodeId, paletteOpen, pendingWire, confirmDelete, pendingTool, setPendingWire]);
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -330,6 +360,18 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
         {pendingWire ? (
           <WirePopover pending={pendingWire} onPick={commitWire} onCancel={() => setPendingWire(null)} />
         ) : null}
+
+        <CommandPalette
+          open={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          nodes={nodes}
+          onPlace={placeCentre}
+          onSelect={(id) => {
+            select(id);
+            const node = byId.get(id);
+            if (node) setCenter(node.position.x + 104, node.position.y + 28, { zoom: 1, duration: 200 });
+          }}
+        />
 
         {pendingTool ? (
           <div className="plate absolute left-1/2 top-6 z-40 w-[380px] -translate-x-1/2 p-4" data-testid="tool-base-url-prompt">
