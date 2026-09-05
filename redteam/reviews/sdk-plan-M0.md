@@ -1,40 +1,39 @@
-# Plan review — docs/plans/sdk.md (ADVERSARY, §0b)
+# §0b adversarial review — docs/plans/sdk.md (M0)
 
-**Verdict: strong, security-first plan. No blocker to M1.** One High design finding (007), one Medium
-(008), plus four must-verify items and two endorsements. Nothing here should stop M1 code; items are
-"prove it in the impl / test".
+Reviewer: ADVERSARY. Verdict: **strong, security-first plan; approved to proceed with 2 new findings
+and 3 must-verify items.** None block M1 start; all must be settled before the relevant M1/M2 code merges.
 
-## New findings this review surfaced
-- **007 (High):** one uid per project ⇒ same-uid agents can steal each other's node tokens/creds via
-  /proc → per-node wire scoping and §3e attenuation are not runtime-enforced within a project. Likely a
-  documented-residual (PM ruling), not a code bug. See findings/007.
-- **008 (Medium):** supervisor trusts child stdout for turn/budget/session; same-uid /proc/fd1 write
-  lets the agent forge those events (budget evasion, session hijack, log injection). See findings/008.
+## New findings (own files)
+- **007 (High)** intra-project same-uid defeats per-node token/creds isolation → any injected agent
+  assumes every sibling node's wires; §3e attenuation not runtime-enforced within a project. Needs a PM
+  residual-risk ruling (accept+document, or per-node uid).
+- **008 (Medium)** child stdout is attacker-controlled (same-uid fd injection) → forgeable `result`/
+  `usage`/`session_id`; enforce budget & session server-side, don't trust child-reported usage.
 
-## Must-verify in the implementation (High if missed)
-1. **user-SQL authorizer must be PER-CALL table-scoped, not just read-only.** A single read-only
-   connection still sees every `t_*` and `sqlite_master`. `wheel query t_mine "SELECT * FROM t_other"`
-   must be denied by the authorizer for THIS call's allowed table only; also deny ATTACH, PRAGMA,
-   load_extension, readfile/writefile, and sqlite_master. (Cross-node table read = wire bypass.)
-2. **No prompt/secret/paste-code/message-body in argv** (PM's 003 ruling; /proc/pid/cmdline is
-   cross-uid readable). `Harness::argv` must pass system prompt + preamble + ctx via a file in the
-   node's 0700 dir; the claude adapter must not use `--append-system-prompt <text>`. Verify with a
-   test asserting argv contains no secret/prompt bytes.
-3. **Token rotation must INVALIDATE the old token at start**, not just mint a new one; and the built-in
-   MCP server + any child script must receive the new token or fail closed. Confirm old token → 401.
-4. **Auth paste_code path must not be a second stdin writer** (§3c#12). "write the code to the pending
-   child's stdin" has to go through the single-writer actor or a pre-delivery lifecycle state, never a
-   side channel that can race a queued message.
+## Must-verify before the code lands (High if missed)
+1. **User-SQL authorizer must be PER-CALL table-scoped**, not just globally read-only. One read-only
+   connection still sees every `t_*` and `sqlite_master`; the authorizer callback must reject any table
+   other than the exact `t_<node>` for THIS call, reject `sqlite_master`, ATTACH, PRAGMA, `load_extension`,
+   `readfile`/`writefile`, and non-SELECT. Else `wheel query mytable "SELECT * FROM t_other"` reads a
+   node I have no wire to (cross-node data leak, bypassing the matrix).
+2. **argv carries no prompt/secret/paste-code/message bytes** (PM 003 ruling — /proc/<pid>/cmdline is
+   world/cross-uid readable). `Harness::argv` must pass system prompt + preamble + ctx via file, the auth
+   paste-code and message bodies via stdin — never as argv. Confirm the claude adapter uses a file, not
+   `--append-system-prompt <text>`.
+3. **Auth paste-code path must go through the single-writer actor** (§3c#12). The plan says auth "writes
+   to the pending child's stdin" — that must be the SAME actor that owns stdin, in a pre-delivery
+   lifecycle state, not a second writer racing a queued message.
 
 ## Endorsements (keep as-is)
-- **Open Q1 script→tool: keep DENIED.** Least privilege; opening it widens the SSRF/egress surface to
-  the script sandbox. Don't open without a concrete need.
-- **Open Q2 two method enums: keep separate.** Sharing HttpMethod would silently widen the endpoint
-  contract to PATCH/HEAD/OPTIONS. Also: engine must reject endpoint methods outside GET/POST/PUT/DELETE.
-- Single capability choke point (`caps/`), deny-as-events, one writer, spawn mutex, permissive parser
-  with `Unknown` as a normal variant, droppable WS subscribers — all correct and directly answer §3c.
+- Open Q1 `script → tool`: **keep DENIED** (least privilege; open only on explicit need).
+- Open Q2 two method enums (`ToolMethod` vs `HttpMethod`): **keep separate** — sharing widens the
+  endpoint GET/POST/PUT/DELETE contract to PATCH/HEAD/OPTIONS. Also validate endpoint config rejects
+  non-{GET,POST,PUT,DELETE}.
+- Token rotation every start: good — confirm the OLD token is **invalidated** at rotation (fail-closed
+  for in-flight children), not merely superseded.
+- Single caps choke point, read-only SQL conn, droppable WS subscribers, permissive `Unknown` parser:
+  all correct.
 
-## Confirmed good
-- PROTOCOL.md 001 escaping (`</AgentPrompt>`→`<\/AgentPrompt>`, case-insensitive on decoded bytes,
-  engine-set attrs, inbox reads pre-escape original from sqlite) resists my full fixture set
-  (redteam/pocs/envelope-forgery). No un-escape ambiguity since storage is pre-escape. 
+## Cross-refs
+001 (envelope, now incl. escaping the OPENING tag + preamble authority note), 002 (untrusted RCE),
+003 (uid/egress), 004 (tool SSRF resolve-and-pin), 005 (shared MCP+CLI authz fn).
