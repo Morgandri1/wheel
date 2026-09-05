@@ -440,6 +440,19 @@ point of failure (v1 accepts this; host reconciles on restart).
   - QA: the full integration suite under `SANDBOX_BACKEND=process` (host image, locally and in CI), plus a Railway smoke against the deployed API.
   - ADVERSARY: F003/F007 live review of the process backend the moment it boots locally; then the deployed stack (private-network reach, secrets in env).
   - Operator provides: Clerk production keys (JWKS URL, issuer, publishable key), DNS for `wheel.dev`/`api.wheel.dev`, Vercel access.
+- **M1.6 — WHEEL ON WHEEL (operator: ASAP, right after M1.5).** A project `wheel-dev` on the Railway deployment whose agents run
+  continuously and develop Wheel itself (clone the repo, work on branches, open PRs; GitHub CI is the gate). Required pieces:
+  - SDK: **Vault node** (encrypted at rest with `WHEEL_VAULT_KEY`; `PUT /v1/vault/:id/:key` write-only; agent→vault `read` wire exports the keys
+    into the child env at spawn and serves `wheel secret get <vault>/<key>`; values never appear on `/v1/board`, logs, or transcripts). A
+    vault-delivered `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CODEX_API_KEY` counts as authentication (`GET auth` → `mode:"env"`), so
+    agents on a hosted board log in with no UI step. **Dev toolchain in the image**: `git`, `gh`, `rustup` (stable + clippy + rustfmt), `pnpm`,
+    `make`, `docker` CLI absent (no daemon) — with per-project `CARGO_HOME`/`RUSTUP_HOME` under the project data dir so builds cache per tenant.
+  - API: Railway host sized for cargo builds (memory/CPU per §5b), volume sized for toolchains + target dirs; per-project rlimits allow rustc.
+  - Web: vault inspector writes via `PUT /v1/vault/:id/:key` (write-only field), agent inspector shows `mode:"env"` as authenticated.
+  - QA: VAULT-* IDs (encryption at rest, write-only, wire-gated read, env export, never on board/logs/transcript) + a `wheel-on-wheel` smoke
+    (an agent with a vault-provided token clones the repo and runs `cargo test -p wheel-core`).
+  - PM: `docs/WHEEL-ON-WHEEL.md` — the bootstrap board (nodes, wires, system prompts, run_on_startup flags) and `infra/bootstrap-board.sh`
+    that creates it through the public API; secrets are entered by the operator through the vault inspector, never committed.
 - **M2 — All node types + full wire matrix + ingress + vault/chest/table/script/mcp + `tool` (spec import, fills, executor, MCP exposure) + ephemeral context + run_on_startup.**
 - **M3 — Hardening (red-team findings fixed), `process` sandbox backend on Railway, landing page, deploy (Railway ×2 + Vercel), docs.**
 
