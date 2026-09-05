@@ -130,6 +130,12 @@ jobs:
       - name: Build wheel-engine:dev
         run: make engine-image
 
+      # The image shipped without the `wheel` binary once: Dockerfile.host built the wrong
+      # bin name and `|| true` swallowed the error, so the build stayed green and the CLI
+      # was simply absent. This asserts the image contains what it must, every build.
+      - name: Verify image contents
+        run: make image-verify-prod
+
       - name: Docker-backed sandbox tests
         env:
           WHEEL_CI_HAS_DOCKER: "1"
