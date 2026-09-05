@@ -71,6 +71,9 @@ if [ "$ENGINE_IMAGE" = "wheel-engine:test" ] && \
   exit 1
 fi
 
+WANT_ENGINE_IMAGE="${ENGINE_IMAGE:-wheel-engine:test}"
+export ENGINE_IMAGE="$WANT_ENGINE_IMAGE"
+
 api_healthy() {
   [ "$(curl -s -o /dev/null -w '%{http_code}' "$WHEEL_API_URL/healthz" 2>/dev/null || true)" = "200" ]
 }
@@ -80,9 +83,26 @@ api_healthy() {
 # which is a miserable way to find out. So: reuse a healthy stack, and if we do have to
 # bring one up, retry once — a collision is usually a concurrent run mid-flight, not a
 # broken compose file.
+# What the host would launch for a project. A reused stack keeps whatever it was started
+# with, so a stack running the stub engine looks perfectly healthy and every lifecycle test
+# fails with a 500 that says nothing. Read it back rather than assuming our export applied.
+running_engine_image() {
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$(docker compose -f "$COMPOSE" ps -q host 2>/dev/null)" 2>/dev/null |
+    sed -n 's/^ENGINE_IMAGE=//p' | head -1
+}
+
 if api_healthy; then
-  echo "▸ reusing the stack already running at $WHEEL_API_URL"
-  OWN_STACK=0
+  found="$(running_engine_image)"
+  if [ -n "$found" ] && [ "$found" != "$WANT_ENGINE_IMAGE" ]; then
+    echo "▸ a stack is running but its host launches '$found', not '$WANT_ENGINE_IMAGE' — recreating"
+    docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1 || true
+    OWN_STACK=1
+    docker compose -f "$COMPOSE" up -d --build
+  else
+    echo "▸ reusing the stack already running at $WHEEL_API_URL (engine ${found:-unknown})"
+    OWN_STACK=0
+  fi
 else
   OWN_STACK=1
   echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
@@ -97,7 +117,7 @@ else
   # nothing updated the default, so every project start 500s with "No such image". Pin the
   # image the suite actually verified rather than inheriting a default — the suite should
   # not depend on someone else's placeholder either way.
-  export ENGINE_IMAGE="${ENGINE_IMAGE:-wheel-engine:test}"
+  export ENGINE_IMAGE="$WANT_ENGINE_IMAGE"
   # infra/docker-compose.yml defaults ENGINE_IMAGE to wheel-engine:stub, and nothing in the
   # Makefile builds that tag — so every project start 500s with "No such image" on a clean
   # machine. The integration suite already requires the real wheel-engine:test, so point the
