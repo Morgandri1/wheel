@@ -223,6 +223,18 @@ impl From<&Config> for Rlimits {
 impl Sandbox for ProcessSandbox {
     /// Create the project's uid, directories and socket directory. Idempotent.
     async fn provision(&self, id: &Uuid, _secrets: &Secrets) -> Result<()> {
+        // A unix socket path has to fit in `sockaddr_un.sun_path`, which is about 104 bytes. Past
+        // that, `bind` fails at start with an error that says nothing about the real cause, so
+        // check it here where we can name the offending path and the setting that produced it.
+        let socket = self.socket_path(id);
+        let len = socket.as_os_str().len();
+        anyhow::ensure!(
+            len < 100,
+            "engine socket path is {len} bytes and must stay under 100 \
+             (sockaddr_un limit): {} — shorten WHEEL_RUN_DIR",
+            socket.display()
+        );
+
         let uid = self.uid_for(id).await?;
         // One gid per project, numerically equal to its base uid: the shared workspaces in §3e are
         // group-writable within a project, and nothing outside it shares the group.
