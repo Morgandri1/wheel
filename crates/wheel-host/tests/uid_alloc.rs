@@ -141,3 +141,57 @@ async fn a_zero_stride_is_refused() {
     let id = project(&s).await;
     assert!(s.allocate_uid(&id, RANGE_START, 0).await.is_err());
 }
+
+#[tokio::test]
+async fn deleting_the_only_project_does_not_reset_the_counter() {
+    // The case the previous test missed, and the one that was actually broken.
+    //
+    // `a_freed_uid_is_not_recycled_onto_a_new_project` keeps a second project alive, so a
+    // max(uid_base)-based allocator still sees a high value and looks correct. Delete the *only*
+    // project and the maximum falls back to nothing, handing the next tenant the uid whose files
+    // are still on disk. That version shipped, and the only test that caught it needed root — so
+    // this one exists to catch it on any machine.
+    let s = store();
+    let first = project(&s).await;
+    let base = s.allocate_uid(&first, RANGE_START, STRIDE).await.unwrap();
+
+    s.delete(&first).await.unwrap();
+    assert!(
+        s.get(&first).await.unwrap().is_none(),
+        "precondition: the store should now hold no projects at all"
+    );
+
+    let second = project(&s).await;
+    let next = s.allocate_uid(&second, RANGE_START, STRIDE).await.unwrap();
+    assert!(
+        next > base,
+        "uid {next} was reissued after deleting the only project (previous {base}): a new tenant \
+         would inherit the old one's files"
+    );
+}
+
+#[tokio::test]
+async fn the_watermark_survives_reopening_the_database() {
+    // The host restarts. If the counter lived only in memory, or were recomputed from the rows,
+    // every restart after a deletion would begin handing out used uids again.
+    let path = std::env::temp_dir().join(format!("wheel-uid-persist-{}.db", Uuid::new_v4()));
+    let path = path.to_str().unwrap().to_string();
+
+    let base = {
+        let s = Store::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        s.upsert(&id, "e", "v").await.unwrap();
+        let base = s.allocate_uid(&id, RANGE_START, STRIDE).await.unwrap();
+        s.delete(&id).await.unwrap();
+        base
+    };
+
+    let s = Store::open(&path).unwrap();
+    let id = Uuid::new_v4();
+    s.upsert(&id, "e", "v").await.unwrap();
+    let next = s.allocate_uid(&id, RANGE_START, STRIDE).await.unwrap();
+    assert!(
+        next > base,
+        "the watermark reset across a restart: {next} <= {base}"
+    );
+}

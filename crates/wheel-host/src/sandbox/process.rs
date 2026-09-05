@@ -206,11 +206,22 @@ impl Rlimits {
     }
 }
 
+/// How much virtual address space a project may map, as a multiple of its memory budget.
+///
+/// `RLIMIT_AS` caps *address space*, not resident memory, and that distinction matters: a Rust
+/// runtime reserves far more virtual space than it ever commits — thread stacks, allocator arenas,
+/// and every `mmap` the sqlite and TLS stacks make. Setting this equal to the memory budget looks
+/// tight and correct, and then fails as an allocation error deep inside a dependency, which is
+/// close to undiagnosable in production. The multiplier keeps it a real ceiling on runaway growth
+/// while leaving room for reservations that cost no physical memory.
+const ADDRESS_SPACE_MULTIPLIER: u64 = 8;
+
 impl From<&Config> for Rlimits {
     fn from(cfg: &Config) -> Self {
         Rlimits {
             nproc: cfg.pids_limit.max(1) as u64,
-            address_space: cfg.memory_bytes.max(1) as u64,
+            address_space: (cfg.memory_bytes.max(1) as u64)
+                .saturating_mul(ADDRESS_SPACE_MULTIPLIER),
             fsize: 2 * 1024 * 1024 * 1024,
             nofile: 4096,
             // Generous: agents are long-lived, so this is a runaway ceiling, not a scheduler.
