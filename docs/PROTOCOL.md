@@ -106,6 +106,14 @@ so the two cannot disagree. Self-wires are rejected. Creating a wire that alread
 The supervisor holds a per-agent mutex across spawn, so concurrent starts cannot race into two processes.
 **A message never starts a process** — it enqueues.
 
+**The unix socket admits only its own uid and root.** In process mode the socket is the tenant boundary, so
+it carries two locks: mode `0600` in a `0700` directory (who *may* connect) and a `SO_PEERCRED` check on every
+accepted connection (who *did*). Anything else is closed immediately and logged with the peer's uid and pid.
+Root is admitted because the host proxies API traffic through this socket and runs privileged in process mode.
+The second lock exists because the first is a file permission, and file permissions are lost to umasks, chmods
+and restored backups; verified in a container by deliberately making the socket `0666` in a `0777` directory
+and confirming another uid is still refused.
+
 **A dead child is reaped, and a start after a failure really starts.** The supervisor owns the process, so it
 is the only thing that decides an agent is no longer running: when the child's pipes close, its slot is
 cleared, anything written to it that never ran a turn goes back to `queued`, its node token is revoked, and the
