@@ -58,6 +58,11 @@ export async function tryWire(project: string, from: string, to: string, type: s
   return { status: res.status, body: await res.text() };
 }
 
+/** The board page renders a running project; a stopped one shows a start affordance. */
+export async function startProject(id: string) {
+  await call("POST", `/v1/projects/${id}/start`).catch(() => undefined);
+}
+
 export async function board(project: string) {
   return call<{ nodes: Node[] }>("GET", `/v1/projects/${project}/engine/v1/board`);
 }

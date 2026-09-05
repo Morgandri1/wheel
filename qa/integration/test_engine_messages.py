@@ -255,25 +255,85 @@ def main():
         else:
             R.skip("MSG-byte-exact", "envelope-integrity.bin missing")
 
-        # ---------------------------------------------------------------- one process
-        for i in range(10):
-            engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner, {"body": "burst-%d" % i})
-        time.sleep(5)
-        p = subprocess.run(["docker", "exec", container_for(pid), "sh", "-c",
-                            "ps -eo args | grep -c '[c]laude' || true"], capture_output=True, text=True)
-        n = (p.stdout or "0").strip()
-        R.check("ENG-one-process", n in ("0", "1"),
-                "10 rapid messages produced %s harness processes (want exactly one, or zero "
-                "if parked)" % n)
+        # ------------------------------------------------- §3c #13: one process per agent
+        # YOKE's defect: each delivered message launched another `claude --continue`, so N
+        # quick messages meant N processes of one agent editing one worktree at once. The
+        # sends must therefore actually be concurrent — a sequential loop would pass even
+        # against an engine that spawns per message, because each spawn would finish first.
+        import threading
+        burst_errors = []
+
+        def fire(i):
+            try:
+                engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner,
+                       {"body": "burst-%d" % i})
+            except Exception as exc:                      # noqa: BLE001 - reported, not raised
+                burst_errors.append("%d: %r" % (i, exc))
+
+        threads = [threading.Thread(target=fire, args=(i,)) for i in range(10)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        span_ms = (time.time() - t0) * 1000
+        R.check("ENG-one-process/burst-sent", not burst_errors,
+                "sends failed: %s" % "; ".join(burst_errors[:3]))
+        if span_ms > 100:
+            print("  note  burst took %.0fms (>100ms); still a valid concurrency test, but "
+                  "the engine had more slack than §3c#13 describes" % span_ms)
+
+        # Poll rather than sleep: a fixed sleep either flakes under load or wastes time.
+        def process_count():
+            q = subprocess.run(["docker", "exec", container_for(pid), "sh", "-c",
+                                "ps -eo args | grep -c '[c]laude' || true"],
+                               capture_output=True, text=True)
+            return (q.stdout or "0").strip()
+
+        worst = "0"
+        for _ in range(20):
+            n = process_count()
+            if n.isdigit() and int(n) > int(worst):
+                worst = n
+            if n.isdigit() and int(n) > 1:
+                break
+            time.sleep(0.5)
+        R.check("ENG-one-process", worst.isdigit() and int(worst) <= 1,
+                "%s concurrent harness processes for one agent (want at most one; §3c#13). "
+                "N messages must never mean N processes." % worst)
 
         def all_delivered():
             t = json.dumps([envelope_text(e) for e in read_transcript(pid)])
             return all(("burst-%d" % i) in t for i in range(10))
         try:
             wait_for(all_delivered, timeout=120, what="all 10 burst messages delivered")
-            R.check("MSG-queue-drain-order", True)
+            R.check("ENG-one-process/ten-turns", True)
         except AssertionError as e:
-            R.check("MSG-queue-drain-order", False, str(e)[:160])
+            R.check("ENG-one-process/ten-turns", False,
+                    "not all 10 messages reached stdin: %s" % str(e)[:140])
+
+        # Every burst message must appear exactly once. A message delivered twice is as
+        # broken as one dropped, and a redelivery loop is how a poison message burns a
+        # budget silently.
+        texts = [envelope_text(e) for e in read_transcript(pid)]
+        dupes = [i for i in range(10)
+                 if sum(1 for t in texts if ("burst-%d" % i) in t) > 1]
+        R.check("MSG-exactly-once", not dupes,
+                "burst messages delivered more than once: %s" % dupes)
+
+        # Strictly serial: one whole JSON line per turn, never interleaved bytes.
+        R.check("MSG-single-writer/burst",
+                all("__unparseable__" not in e for e in read_transcript(pid)),
+                "stdin contains a partial or interleaved write after a 10-message burst")
+
+        # ---------------------------------------------------------------- priority lane
+        # Every /v1/agents/:id/send is from=user, so the user-vs-agent lane cannot be
+        # exercised until agent->agent sends exist (the `wheel` CLI / /v1/cli, not landed).
+        # Deferring is honest; asserting user-beats-user would prove nothing.
+        R.skip("MSG-priority-user",
+               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
+        R.skip("MSG-priority-order",
+               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
 
         # ---------------------------------------------------------------- queue while stopped
         engine("POST", pid, "/v1/agents/%s/stop" % agent_id, owner)
