@@ -61,3 +61,18 @@ bootstrap: ## install the toolchain (rust, node, pnpm, cargo-llvm-cov, QA venv)
 
 clean: ## remove build artefacts
 	@rm -rf target web/.next web/node_modules
+
+# --- SDK: images -----------------------------------------------------------
+.PHONY: engine-image engine-image-test image-verify-prod
+
+engine-image: ## build wheel-engine:dev (production layout)
+	docker build -f docker/Dockerfile.host -t wheel-engine:dev .
+
+engine-image-test: engine-image ## build wheel-engine:test (QA fake harnesses)
+	docker build -f docker/Dockerfile.test --build-arg BASE=wheel-engine:dev -t wheel-engine:test .
+
+image-verify-prod: engine-image ## assert the fakes are absent from the production image
+	@docker run --rm --entrypoint sh wheel-engine:dev -c \
+	  'head -1 /usr/local/bin/claude | grep -q "fake-claude" && { echo "FAIL: fake harness in production image"; exit 1; }; \
+	   claude --version >/dev/null || { echo "FAIL: real claude missing"; exit 1; }; \
+	   echo "ok: production image ships the real claude, not the fake"'

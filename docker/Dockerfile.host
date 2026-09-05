@@ -1,0 +1,70 @@
+# The single Wheel image: engine + cli + host, plus the agent harnesses.
+#
+# One image, two roles (WHEEL_ROLE, §4b): `engine` is what the docker sandbox
+# backend runs per project, `host` is the sandbox supervisor. Building both from
+# one tree means the engine the host launches is always the engine it was built
+# against.
+
+# --- build ------------------------------------------------------------------
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# wheel-host is API's crate and may not exist yet; build what is present.
+RUN cargo build --release --bin wheel-engine \
+    && (cargo build --release --bin wheel-cli 2>/dev/null || true) \
+    && (cargo build --release --bin wheel-host 2>/dev/null || true)
+
+# --- runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim
+
+# node is required by the claude CLI (engines: node >= 22) and by `ts`/`js`
+# script nodes; python3 backs `python` script nodes AND the QA fake harness.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git python3 python3-venv procps \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm i -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
+# QA's fake harness is a python3 script, and script nodes need python3, so a
+# missing interpreter would fail at agent-run time rather than at build time.
+# Assert it here instead.
+RUN python3 -c "import sys; assert sys.version_info[0] == 3" \
+    && node --version && claude --version
+
+# Agents run NON-ROOT. `--permission-mode bypassPermissions` is refused as root
+# with exit 1 and EMPTY stdout — indistinguishable from "not logged in" — so
+# running as root would make every agent look permanently unauthenticated.
+# IS_SANDBOX=1 is belt and braces for the same guard.
+RUN useradd --create-home --uid 10001 --shell /bin/bash agent
+ENV IS_SANDBOX=1
+
+COPY --from=build /src/target/release/wheel-engine /usr/local/bin/wheel-engine
+COPY --from=build /src/target/release/wheel-cl[i] /usr/local/bin/
+COPY --from=build /src/target/release/wheel-hos[t] /usr/local/bin/
+
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+RUN mkdir -p /data && chown agent:agent /data
+VOLUME ["/data"]
+
+ENV WHEEL_ROLE=engine \
+    WHEEL_DATA_DIR=/data \
+    WHEEL_LISTEN=tcp://0.0.0.0:7000 \
+    WHEEL_LOG=json
+EXPOSE 7000
+
+USER agent
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:7000/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

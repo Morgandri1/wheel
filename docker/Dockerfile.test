@@ -1,0 +1,16 @@
+# wheel-engine:test — identical to :dev except the agent harnesses are QA's
+# deterministic fakes. They speak the same stream-json protocol, so the engine
+# cannot tell the difference and tests exercise the real supervision path
+# rather than a mock of it.
+#
+# These fakes must NEVER be in the production image: `make image-verify-prod`
+# asserts that.
+ARG BASE=wheel-engine:dev
+FROM ${BASE}
+
+USER root
+COPY qa/harness/fake-claude /usr/local/bin/claude
+COPY qa/harness/fake-codex  /usr/local/bin/codex
+RUN chmod +x /usr/local/bin/claude /usr/local/bin/codex \
+    && python3 -c "import sys; assert sys.version_info[0]==3"
+USER agent
