@@ -114,12 +114,18 @@ step "qa:wire-matrix" "$PY" qa/tools/gen_wire_matrix.py --check
 # The contract gates need `jsonschema` from qa/requirements.txt. A MISSING DEPENDENCY and a
 # BROKEN SCHEMA must never look the same: skip loudly here, and let CI (which bootstraps first,
 # and runs CHECK_STRICT=1) be the place where a skip is a hard failure.
+# Pure stdlib — deliberately OUTSIDE the jsonschema guard. It was briefly nested inside it,
+# which meant the gate silently vanished (not even reported as skipped) on a machine without
+# the venv. A gate that disappears is worse than one that fails.
+step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
+
+# Engine routes: ARCHITECTURE.md §4 vs docs/PROTOCOL.md (and a live engine when
+# WHEEL_ENGINE_URL is set, for 404-vs-405).
+step "qa:route-parity" "$PY" qa/contract/route_parity.py
+
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
   step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
-
-# wheel-core's exported matrix vs the ARCHITECTURE.md §3 matrix QA derives independently.
-step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
   # Runs today and self-skips until SDK exports the schema, so it goes green on its own.
   step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
 else
