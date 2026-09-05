@@ -96,20 +96,29 @@ export const PALETTE_ORDER: NodeType[] = [
   "tool",
 ];
 
+/**
+ * Wires are told apart by STROKE first: read solid, write solid in the accent, send dashed.
+ * Hue carries one bit only — does this wire mutate the thing at the other end — so the board
+ * stays legible in the system's two colours, and to anyone who cannot separate them.
+ */
 export const WIRE_META: Record<WireType, { label: string; color: string; dash: string }> = {
   read: { label: "read", color: "var(--wire-read)", dash: "0" },
   write: { label: "write", color: "var(--wire-write)", dash: "0" },
-  send: { label: "send", color: "var(--wire-send)", dash: "5 4" },
+  send: { label: "send", color: "var(--wire-send)", dash: "6 5" },
 };
 
+/**
+ * Status in two colours. Anything the board is actively doing, or that wants a person, takes the
+ * accent; anything resting takes the quiet ink. Parked is deliberately quiet — §3c #14 makes it a
+ * HEALTHY processless state, and dressing it as a warning would have operators chasing nothing.
+ */
 export const AGENT_STATUS_META: Record<AgentStatus, { label: string; color: string; pulse: boolean }> = {
   stopped: { label: "Stopped", color: "var(--ink-faint)", pulse: false },
-  starting: { label: "Starting", color: "var(--wire-write)", pulse: true },
+  starting: { label: "Starting", color: "var(--live)", pulse: true },
   needs_auth: { label: "Needs sign-in", color: "var(--danger)", pulse: false },
   running: { label: "Running", color: "var(--live)", pulse: true },
-  idle: { label: "Idle", color: "var(--live)", pulse: false },
-  // §3c #14: the process is stopped but the session is kept, so the next message resumes it.
+  idle: { label: "Idle", color: "var(--ink-dim)", pulse: false },
   parked: { label: "Parked", color: "var(--ink-faint)", pulse: false },
-  budget_exhausted: { label: "Out of budget", color: "var(--wire-write)", pulse: false },
+  budget_exhausted: { label: "Out of budget", color: "var(--danger)", pulse: false },
   error: { label: "Error", color: "var(--danger)", pulse: false },
 };

@@ -19,7 +19,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NodePlate, type PlateData } from "@/components/board/node-plate";
 import { WireEdge, type WireData } from "@/components/board/wire-edge";
 import { Palette } from "@/components/board/palette";
-import { Legend } from "@/components/board/legend";
 import { WirePopover } from "@/components/board/wire-popover";
 import { CommandPalette } from "@/components/board/command-palette";
 import { NODE_META } from "@/lib/node-meta";
@@ -341,7 +340,8 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
           defaultEdgeOptions={{ type: "wire" }}
           connectionLineStyle={{ stroke: "var(--rule-strong)", strokeWidth: 1.5 }}
         >
-          <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--grid-dot)" />
+          {/* A ruled grid, not dots — the system draws structure with lines. */}
+          <Background variant={BackgroundVariant.Lines} gap={40} lineWidth={1} color="var(--grid-dot)" />
           <MiniMap
             pannable
             zoomable
@@ -354,8 +354,6 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
           />
           <Controls className="!border !border-rule !bg-[var(--panel-1)] [&_button]:!border-rule [&_button]:!bg-[var(--panel-1)] [&_button]:!fill-[var(--ink-dim)]" />
         </ReactFlow>
-
-        <Legend />
 
         {pendingWire ? (
           <WirePopover pending={pendingWire} onPick={commitWire} onCancel={() => setPendingWire(null)} />

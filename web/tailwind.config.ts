@@ -22,6 +22,8 @@ const config: Config = {
         "ink-faint": "var(--ink-faint)",
         live: "var(--live)",
         danger: "var(--danger)",
+        accent: "var(--accent)",
+        "accent-deep": "var(--accent-deep)",
         read: "var(--wire-read)",
         write: "var(--wire-write)",
         send: "var(--wire-send)",
@@ -39,7 +41,7 @@ const config: Config = {
         h2: ["2.125rem", { lineHeight: "1.12" }],
         h1: ["3.25rem", { lineHeight: "1.02" }],
       },
-      borderRadius: { plate: "2px", control: "3px" },
+      borderRadius: { plate: "0px", control: "0px" },
       boxShadow: {
         // The only "shadow" in the system: a milled-edge highlight, not a drop shadow.
         plate: "inset 0 1px 0 0 var(--plate-highlight)",

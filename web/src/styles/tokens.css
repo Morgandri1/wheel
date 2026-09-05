@@ -1,63 +1,91 @@
+/*
+ * Modernist — the board's tokens, from the Claude Design project (wheel-modernist/Board.dc.html).
+ *
+ * The app used to run a separate "Patchbay" palette while the landing ran this one; the board
+ * mockup settles it, and one system across both is the better answer anyway. The token NAMES are
+ * unchanged, so every component picked this up without being rewritten — that seam is the reason
+ * the restyle is a file rather than a refactor.
+ *
+ * Two colours do all the work: ink and one red. Wires are told apart by stroke, not by hue —
+ * read solid, send dashed, write in the accent — because a board that needs five colours to be
+ * legible is a board you have to decode. Dark mode is the mockup's own remap: the neutral ramp
+ * inverts, and the wires go white while the accent stays put.
+ */
+
 :root {
   color-scheme: light;
 
-  --panel-0: #f1f2ed;
-  --panel-1: #ffffff;
-  --panel-2: #e6e8e1;
-  --rule: #c6cbc2;
-  --rule-strong: #a9b0a5;
-  --ink: #171c1a;
-  --ink-dim: #5c6963;
-  --ink-faint: #8b968f;
-  --live: #0e8f68;
-  --danger: #c8382c;
-  --plate-highlight: rgba(255, 255, 255, 0.9);
-  --grid-dot: #ccd1c8;
+  --panel-0: #f3f2f2; /* the canvas ground */
+  --panel-1: #f8f4f4; /* node cards, palette, inspector */
+  --panel-2: #eae7e7; /* hover, hairlines, grid */
+  --rule: color-mix(in srgb, #201e1d 40%, transparent);
+  --rule-strong: #201e1d; /* node outlines: full ink in light */
+  --ink: #201e1d;
+  --ink-dim: #7d7979;
+  --ink-faint: #9b9797;
 
-  --wire-read: #1e6fbf;
-  --wire-write: #a76a06;
-  --wire-send: #7b3fc4;
+  --accent: #ec3013;
+  --accent-deep: #ae1800; /* small text on the light ground — 6.4:1 where the base is 3.8:1 */
+  --live: #ec3013; /* running is the accent; this system has no green */
+  --danger: #ae1800;
 
-  /* Node-type tints. Deliberately low-chroma: the saturated end of the palette belongs to
-     wires, so a node never competes with the connection it sits on. */
-  --t-agent: #2f6f5e;
-  --t-ctx: #6b6b45;
-  --t-table: #3f5f7d;
-  --t-endpoint: #8a5340;
-  --t-script: #4c6b3d;
-  --t-mcp: #5f4a72;
-  --t-vault: #7a6420;
-  --t-chest: #3d6a72;
-  --t-tool: #7d4a5e;
+  --plate-highlight: transparent; /* Modernist draws edges, never lights them */
+  --grid-dot: #eae7e7;
+
+  /* Wires: hue carries only "does it mutate"; the stroke carries the rest. */
+  --wire-read: #201e1d;
+  --wire-write: #ec3013;
+  --wire-send: #201e1d;
+
+  /* Node types are told apart by glyph. The kicker is one colour on every card, as drawn. */
+  --t-agent: #ae1800;
+  --t-ctx: #ae1800;
+  --t-table: #ae1800;
+  --t-endpoint: #ae1800;
+  --t-script: #ae1800;
+  --t-mcp: #ae1800;
+  --t-vault: #ae1800;
+  --t-chest: #ae1800;
+  --t-tool: #ae1800;
+
+  --code-bg: #201e1d;
+  --code-ink: #eae7e7;
 }
 
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --panel-0: #161b19;
-  --panel-1: #1f2624;
-  --panel-2: #262f2c;
-  --rule: #33403c;
-  --rule-strong: #4a5a55;
-  --ink: #e6ebe7;
-  --ink-dim: #8fa09a;
-  --ink-faint: #6b7a75;
-  --live: #4ed6a9;
-  --danger: #f2645a;
-  --plate-highlight: rgba(255, 255, 255, 0.045);
-  --grid-dot: #2b3532;
+  --panel-0: #2d2b2b; /* neutral-900 */
+  --panel-1: #444141; /* neutral-800 */
+  --panel-2: #3a3737;
+  --rule: color-mix(in srgb, #d7d3d3 16%, transparent);
+  --rule-strong: #5a5656; /* quiet grey outlines — no white glare */
+  --ink: #d7d3d3; /* neutral-300 */
+  --ink-dim: #bab6b6;
+  --ink-faint: #9b9797;
 
-  --wire-read: #63b3f5;
-  --wire-write: #e9a23b;
-  --wire-send: #c77dff;
+  --accent: #ec3013;
+  --accent-deep: #ff9783; /* accent-400: the readable step on dark */
+  --live: #ec3013;
+  --danger: #ff9783;
 
-  --t-agent: #7fb5a6;
-  --t-ctx: #aaa98c;
-  --t-table: #8fa3b8;
-  --t-endpoint: #c19a8b;
-  --t-script: #9aae8b;
-  --t-mcp: #a392b0;
-  --t-vault: #bfae86;
-  --t-chest: #8fb0b6;
-  --t-tool: #c092a4;
+  --plate-highlight: transparent;
+  --grid-dot: #3a3737;
+
+  --wire-read: #f8f4f4;
+  --wire-write: #ec3013;
+  --wire-send: #f8f4f4;
+
+  --t-agent: #ff9783;
+  --t-ctx: #ff9783;
+  --t-table: #ff9783;
+  --t-endpoint: #ff9783;
+  --t-script: #ff9783;
+  --t-mcp: #ff9783;
+  --t-vault: #ff9783;
+  --t-chest: #ff9783;
+  --t-tool: #ff9783;
+
+  --code-bg: #232120;
+  --code-ink: #bab6b6;
 }

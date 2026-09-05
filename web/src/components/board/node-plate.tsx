@@ -54,23 +54,42 @@ function NodePlateInner({ data, selected }: NodeProps) {
     <div
       data-testid={`node-${node.name}`}
       data-node-type={node.type}
-      className="plate w-[208px] select-none"
-      style={{
-        borderColor: selected ? "var(--rule-strong)" : undefined,
-        outline: selected ? "1px solid var(--wire-read)" : undefined,
-        outlineOffset: "1px",
-      }}
+      className="plate relative w-[190px] select-none"
+      style={{ borderColor: selected ? "var(--accent)" : undefined }}
       onDoubleClick={() => node.type === "agent" && onOpenLog(node.id)}
     >
+      {/* Selection is four accent corner marks rather than a glow: the system draws, it does
+          not light, and the marks read at any zoom. */}
+      {selected
+        ? ([
+            "-left-[5px] -top-[5px]",
+            "-right-[5px] -top-[5px]",
+            "-left-[5px] -bottom-[5px]",
+            "-right-[5px] -bottom-[5px]",
+          ].map((at) => (
+            <span
+              key={at}
+              aria-hidden
+              className={`absolute ${at} h-2 w-2 bg-[var(--accent)]`}
+            />
+          )))
+        : null}
+
       <Handle
         type="target"
         position={Position.Left}
         className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)]"
       />
 
-      <div className="flex items-center gap-2 border-b border-rule px-2.5 py-2">
+      <div className="flex items-center gap-2 border-b border-rule px-2.5 py-1.5">
         <span style={{ color: meta.tint }} className="shrink-0">
-          <Glyph path={meta.glyph} />
+          <Glyph path={meta.glyph} size={13} />
+        </span>
+        <span
+          className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.14em]"
+          style={{ color: meta.tint }}
+        >
+          {meta.label}
         </span>
         {editing ? (
           <input
@@ -91,7 +110,7 @@ function NodePlateInner({ data, selected }: NodeProps) {
           />
         ) : (
           <button
-            className="ident min-w-0 flex-1 truncate text-left text-ink"
+            className="ident min-w-0 flex-1 truncate text-left text-[13px] font-semibold text-ink"
             data-testid={`node-name-${node.name}`}
             onDoubleClick={(e) => {
               e.stopPropagation();
@@ -109,7 +128,6 @@ function NodePlateInner({ data, selected }: NodeProps) {
             {node.name}
           </button>
         )}
-        <span className="text-micro text-ink-faint">{meta.label}</span>
       </div>
 
       <div className="px-2.5 py-2">
