@@ -62,7 +62,7 @@ export function Inspector({
 
       <div className="flex flex-col gap-5 p-4">
         {node.type === "agent" ? (
-          <AgentPanel node={node} api={api} onChanged={onChanged} />
+          <AgentPanel node={node} nodes={nodes} api={api} onChanged={onChanged} />
         ) : node.type === "ctx" ? (
           <CtxPanel node={node} api={api} onChanged={onChanged} />
         ) : node.type === "endpoint" ? (
@@ -99,14 +99,27 @@ export function Inspector({
 
 function AgentPanel({
   node,
+  nodes,
   api,
   onChanged,
 }: {
   node: AgentNode;
+  nodes: WheelNode[];
   api: EngineApi;
   onChanged: () => void;
 }) {
   const agent = useMemo(() => api.agent(node.id), [api, node.id]);
+  // §3: a vault read wire is what puts a token in the agent's environment at spawn, so the wires
+  // are where the answer to "which vault did this credential come from" actually lives.
+  const wiredVaults = useMemo(
+    () =>
+      (node.wires ?? [])
+        .filter((w) => w.type === "read")
+        .map((w) => nodes.find((n) => n.id === w.to))
+        .filter((n): n is WheelNode => n?.type === "vault")
+        .map((n) => n.name),
+    [node.wires, nodes],
+  );
   const openTab = useBoardStore((s) => s.openTab);
   const [prompt, setPrompt] = useState(node.config.system_prompt);
   const [model, setModel] = useState(node.config.model ?? "");
@@ -170,7 +183,13 @@ function AgentPanel({
         </p>
       ) : null}
 
-      <AuthFlow api={api} nodeId={node.id} needsAuth={status === "needs_auth"} onAuthenticated={onChanged} />
+      <AuthFlow
+        api={api}
+        nodeId={node.id}
+        needsAuth={status === "needs_auth"}
+        vaults={wiredVaults}
+        onAuthenticated={onChanged}
+      />
 
       <Field label="Harness">
         <Select

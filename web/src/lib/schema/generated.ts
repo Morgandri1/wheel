@@ -79,6 +79,14 @@ export interface AuthBegin {
 }
 
 /**
+ * What kind of credential an agent node holds.
+ *
+ * Distinct from [`AuthMode`], which is how a credential is *obtained*. The difference matters because the kind decides which environment variable carries it to the child, and the two Anthropic credentials are not interchangeable in that envelope.
+ */
+
+export type CredentialKind = "api_key" | "oauth_token" | "oauth_session";
+
+/**
  * Whether an agent's harness currently holds usable credentials (`GET /v1/agents/:id/auth`).
  */
 
@@ -87,7 +95,14 @@ export interface AuthStatus {
    * Display-only account identifier (e.g. an email). Never a token.
    */
   account?: string | null;
+  /**
+   * Whether credentials are STORED. Not whether they work: only the harness's own probe can say that, and claiming otherwise would tell an operator they are fine right up until the first request fails.
+   */
   authenticated: boolean;
+  /**
+   * Which kind of credential is stored, or `null` when there is none.
+   */
+  mode?: CredentialKind | null;
 }
 
 /**

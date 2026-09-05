@@ -12,10 +12,13 @@ import type { WireType } from "@/lib/schema";
  */
 export function WirePopover({
   pending,
+  error,
   onPick,
   onCancel,
 }: {
   pending: PendingWire;
+  /** An engine refusal for this wire. Shown here rather than in a toast — see below. */
+  error?: { code: string; message: string } | null;
   onPick: (type: WireType) => void;
   onCancel: () => void;
 }) {
@@ -46,6 +49,8 @@ export function WirePopover({
         What may <span className="ident text-ink-dim">{pending.fromType}</span> do to{" "}
         <span className="ident text-ink-dim">{pending.toType}</span>?
       </p>
+      {error ? <WireRefusal error={error} /> : null}
+
       <ul className="flex flex-col">
         {options.map((t) => {
           const rule = wireRule(pending.fromType, pending.toType, t)!;
@@ -83,6 +88,40 @@ export function WirePopover({
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+/**
+ * Why the engine said no, in the place the person is still looking.
+ *
+ * A toast is wrong for this: it disappears while they are reading it, and every one of these
+ * refusals needs an action from them — pick a different vault, rename a key, choose another wire
+ * type. The engine's own message is shown verbatim because it is the authority and its wording
+ * is specific; we only add the sentence that says what to DO, which the engine has no way to know.
+ */
+function WireRefusal({ error }: { error: { code: string; message: string } }) {
+  // Contract: one vault per account, so an agent wired to two vaults holding the same key has no
+  // defined answer for which token it gets. The engine refuses rather than picking one, and this
+  // is the only refusal where the fix is not "choose a different wire".
+  const ambiguous = /ambiguous credential/i.test(error.message) || error.code === "ambiguous_credential";
+  return (
+    <div
+      data-testid="wire-error"
+      data-code={error.code}
+      className="mx-1 mb-1 border-l-2 px-2 py-1.5"
+      style={{ borderColor: "var(--danger)" }}
+    >
+      <p className="text-micro" style={{ color: "var(--danger)" }}>
+        {error.message}
+      </p>
+      {ambiguous ? (
+        <p className="mt-1 text-micro text-ink-dim">
+          Two vaults on this agent would supply the same key, and there is no correct answer for
+          which one wins. Unwire the other vault, or rename the key in one of them — one vault per
+          account is the pattern.
+        </p>
+      ) : null}
     </div>
   );
 }

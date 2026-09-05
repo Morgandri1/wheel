@@ -47,6 +47,8 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   const openTab = useBoardStore((s) => s.openTab);
   const pendingWire = useBoardStore((s) => s.pendingWire);
   const setPendingWire = useBoardStore((s) => s.setPendingWire);
+  /** An engine refusal for the wire being drawn, kept beside the popover rather than in a toast. */
+  const [wireError, setWireError] = useState<{ code: string; message: string } | null>(null);
 
   const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const takenNames = useMemo(() => nodes.map((n) => n.name), [nodes]);
@@ -183,6 +185,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
         return;
       }
       const rect = wrapper.current?.getBoundingClientRect();
+      setWireError(null);
       setPendingWire({
         from: from.id,
         to: to.id,
@@ -198,13 +201,17 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
     async (type: WireType) => {
       if (!pendingWire) return;
       const { from, to } = pendingWire;
-      setPendingWire(null);
+      setWireError(null);
       try {
         await api.createWire(from, to, type);
+        setPendingWire(null);
         onChanged();
       } catch (e) {
-        // The engine is the authority. If it disagrees with our matrix, say so plainly.
-        toastError(e, "The engine rejected that wire.");
+        // The engine is the authority. A refusal stays IN the popover rather than in a toast:
+        // this is an error the person has to act on — pick a different vault, rename a key — and
+        // a toast disappears while they are still reading it.
+        const err = e as { code?: string; message?: string };
+        setWireError({ code: err.code ?? "", message: err.message || "The engine rejected that wire." });
         onChanged();
       }
     },
@@ -362,7 +369,15 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
         </ReactFlow>
 
         {pendingWire ? (
-          <WirePopover pending={pendingWire} onPick={commitWire} onCancel={() => setPendingWire(null)} />
+          <WirePopover
+            pending={pendingWire}
+            error={wireError}
+            onPick={commitWire}
+            onCancel={() => {
+              setPendingWire(null);
+              setWireError(null);
+            }}
+          />
         ) : null}
 
         <CommandPalette

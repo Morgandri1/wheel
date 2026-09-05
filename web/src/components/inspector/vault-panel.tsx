@@ -57,18 +57,13 @@ export function VaultPanel({
 
       <div>
         <p className="mb-1.5 text-micro font-medium text-ink-dim">
-          Keys ({keys.length})
+          Keys ({keys.length}) — set a new value for any of them
         </p>
         {keys.length ? (
           <ul className="border border-rule" data-testid="vault-keys">
             {keys.map((k) => (
-              <li
-                key={k}
-                data-testid={`vault-key-${k}`}
-                className="flex items-center justify-between gap-2 border-b border-rule px-2.5 py-1.5 last:border-b-0"
-              >
-                <span className="ident text-micro text-ink">{k}</span>
-                <span className="text-micro text-ink-faint">set</span>
+              <li key={k} data-testid={`vault-key-${k}`} className="border-b border-rule last:border-b-0">
+                <KeyRow name={k} node={node} api={api} onChanged={onChanged} />
               </li>
             ))}
           </ul>
@@ -81,6 +76,7 @@ export function VaultPanel({
 
       <form
         className="flex flex-col gap-3 border-t border-rule pt-4"
+        data-testid="vault-add-form"
         onSubmit={(e) => {
           e.preventDefault();
           if (key && value && !keyError) void save();
@@ -125,5 +121,79 @@ export function VaultPanel({
         </div>
       </form>
     </>
+  );
+}
+
+/**
+ * One key, with its own write-only value field.
+ *
+ * Contract: multiple accounts per provider means one vault per account, so a vault holds a small
+ * set of keys that get rotated in place. Making someone retype the key name to replace a value
+ * they can see listed right there is the kind of friction that leads to typos and a second,
+ * near-identical key nobody notices.
+ *
+ * There is no getter to call and no state that holds a value after it is sent — the field empties
+ * itself, and what is stored is never rendered anywhere.
+ */
+function KeyRow({
+  name,
+  node,
+  api,
+  onChanged,
+}: {
+  name: string;
+  node: VaultNode;
+  api: EngineApi;
+  onChanged: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (!value || saving) return;
+    setSaving(true);
+    try {
+      await api.putSecret(node.id, name, value);
+      setValue("");
+      onChanged();
+      toast(`Replaced ${name}.`);
+    } catch (e) {
+      toastError(e, `Couldn't store ${name}.`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2 px-2.5 py-1.5">
+      <span className="ident w-[38%] shrink-0 truncate text-micro text-ink" title={name}>
+        {name}
+      </span>
+      <Input
+        type="password"
+        mono
+        autoComplete="off"
+        placeholder="new value"
+        aria-label={`New value for ${name}`}
+        data-testid={`vault-value-${name}`}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void save();
+          }
+        }}
+      />
+      <Button
+        size="sm"
+        tone="ghost"
+        data-testid={`btn-vault-set-${name}`}
+        disabled={!value || saving}
+        onClick={save}
+      >
+        {saving ? "…" : "Set"}
+      </Button>
+    </div>
   );
 }
