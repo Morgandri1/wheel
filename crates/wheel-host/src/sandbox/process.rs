@@ -148,13 +148,24 @@ fn drop_privileges(uid: u32, gid: u32, limits: &Rlimits) -> std::io::Result<()> 
                 rlim_cur: value,
                 rlim_max: value,
             };
-            if libc::setrlimit(resource, &lim) != 0 {
+            if libc::setrlimit(resource as _, &lim) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
         }
     }
     Ok(())
 }
+
+/// The type of an `RLIMIT_*` constant, which is not the same on every platform.
+///
+/// glibc takes `__rlimit_resource_t` (a `u32`) while macOS and the BSDs take `c_int`. Hardcoding
+/// either one compiles on the machine you wrote it on and fails on the other — which is exactly
+/// what happened here: this built clean on macOS and broke CI on Linux with `expected u32, found
+/// i32`. The alias keeps the difference in one place instead of at every call site.
+#[cfg(all(unix, target_env = "gnu", target_os = "linux"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(all(target_env = "gnu", target_os = "linux"))))]
+type RlimitResource = libc::c_int;
 
 /// Per-child resource ceilings, tuned for sandboxes that compile code.
 ///
@@ -190,17 +201,23 @@ pub struct Rlimits {
 
 impl Rlimits {
     #[cfg(unix)]
-    fn as_pairs(&self) -> Vec<(libc::c_int, libc::rlim_t)> {
+    /// Returns `(resource, value)` pairs with the resource as `u32`.
+    ///
+    /// The type is not incidental: glibc declares `setrlimit(__rlimit_resource_t, ...)` where that
+    /// is a `c_uint`, while macOS declares `setrlimit(c_int, ...)`. Typing these as `c_int` builds
+    /// on a mac and fails to compile on Linux — which is exactly how this shipped a host image
+    /// with no host binary in it. The call site casts with `as _` so both targets are satisfied.
+    fn as_pairs(&self) -> Vec<(u32, libc::rlim_t)> {
         let mut v = vec![
-            (libc::RLIMIT_NPROC, self.nproc as libc::rlim_t),
-            (libc::RLIMIT_FSIZE, self.fsize as libc::rlim_t),
-            (libc::RLIMIT_NOFILE, self.nofile as libc::rlim_t),
+            (libc::RLIMIT_NPROC as u32, self.nproc as libc::rlim_t),
+            (libc::RLIMIT_FSIZE as u32, self.fsize as libc::rlim_t),
+            (libc::RLIMIT_NOFILE as u32, self.nofile as libc::rlim_t),
         ];
         if let Some(bytes) = self.address_space {
-            v.push((libc::RLIMIT_AS, bytes as libc::rlim_t));
+            v.push((libc::RLIMIT_AS as u32, bytes as libc::rlim_t));
         }
         if let Some(secs) = self.cpu {
-            v.push((libc::RLIMIT_CPU, secs as libc::rlim_t));
+            v.push((libc::RLIMIT_CPU as u32, secs as libc::rlim_t));
         }
         v
     }
