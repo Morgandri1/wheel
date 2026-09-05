@@ -20,6 +20,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 012 | `make check` (`web:test`) | ~~S4~~ **S3** | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
 | 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
 | 014 | `API-lifecycle`, `API-project-crud` | S3 | API | **open** | `infra/docker-compose.yml` defaults `ENGINE_IMAGE` to `wheel-engine:stub`, an image nobody builds — every project start 500s on a checked-out stack |
+| 015 | `make check` (`rust:clippy`) | **S2** | API | **open** | Linux-only clippy break in `wheel-host` rlimits: `as u32` is required on macOS and redundant on glibc, and `-D warnings` makes redundant fatal |
 
 ---
 
@@ -579,3 +580,31 @@ in a comment, where nothing enforces it.
 
 The rule I am applying from here: a placeholder must fail, or carry its expiry somewhere a
 program reads. A comment saying "until X lands" is a note to a person who will not be looking.
+
+---
+
+## 015 — `main` is red on `rust:clippy`, Linux only · S2 · API
+
+`crates/wheel-host/src/sandbox/process.rs`, `Rlimits::as_pairs`: `libc::RLIMIT_NPROC as u32`
+and five siblings. On glibc `RLIMIT_NPROC` is already `u32`, so clippy fires
+`unnecessary_cast` — fatal under `-D warnings`. On macOS the same cast is `c_int -> u32` and
+required. Fix: `as _`, which infers correctly on both and clippy does not flag.
+
+Second failure in a row from the same three lines: 87a99d4 fixed an E0308 on Linux by adding
+the casts, and the casts are themselves a Linux lint error.
+
+**The finding underneath the bug, which is the one worth acting on.** All six of us develop on
+one macOS host, so `make check` locally cannot catch a Linux-only break — by construction, not
+by oversight. Both of these reached `main` with a green local gate, and the first shipped a
+host image with no host binary in it. Our pre-merge gate is macOS-shaped and production is
+Linux, so for anything touching `libc`, `#[cfg]`, or the container images, "green locally"
+carries no information at all.
+
+Proposed to API (their crate pays for it, so their call): either a `cargo check --target
+x86_64-unknown-linux-gnu` step in `make check` that exits 77 where the target is not
+installed, or a Linux `cargo clippy` folded into the `docker-sandbox` job, which already has
+a Linux container and would return the verdict in ~2 minutes instead of at CI time.
+
+This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
+faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
+that means less than the person reading it believes.
