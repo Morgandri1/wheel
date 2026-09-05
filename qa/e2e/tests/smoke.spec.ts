@@ -25,16 +25,11 @@ test.describe("M1 vertical slice", () => {
     await page.goto("/");
     await expect(page.getByTestId(T.ctaApp)).toBeVisible();
 
-    // BUG-007 (Web, S3, open): WheelMark computes SVG spoke coordinates with Math.cos/Math.sin
-    // and the last digit differs between the Node renderer and browser V8, so React reports a
-    // hydration mismatch. It is INTERMITTENT — whether the two engines round identically varies
-    // per platform and run — which is why this is a targeted allowlist rather than test.fail():
-    // an expected-failure annotation goes red on the runs where the bug does not reproduce, and
-    // a skip would stop checking the page altogether. Every OTHER console error still fails.
-    const known = (e: string) => /hydrat|hydration-mismatch/i.test(e);
-    const unexpected = errors.filter((e) => !known(e));
-    expect(unexpected, `console errors on landing:\n${unexpected.join("\n")}`).toEqual([]);
-    if (errors.some(known)) console.log("note: BUG-007 hydration mismatch reproduced this run");
+    // BUG-007's allowlist is gone: WheelMark now rounds its spoke coordinates to three decimals
+    // before emitting, so the server and the browser serialise the same string by construction
+    // rather than by luck. Hydration errors fail this test again, which is the point — the
+    // allowlist could not tell a fixed bug from a returning one.
+    expect(errors, `console errors on landing:\n${errors.join("\n")}`).toEqual([]);
   });
 
   test("E2E-signin: the landing CTA reaches the projects list", async ({ page }) => {
