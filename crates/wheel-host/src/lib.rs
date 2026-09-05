@@ -14,6 +14,7 @@ pub mod proxy;
 pub mod sandbox;
 pub mod store;
 
+use anyhow::Context as _;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -68,7 +69,12 @@ pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
         cfg,
         sandbox,
         store,
-        http: reqwest::Client::new(),
+        // Same reasoning as the API's client: this one reaches tenant engines from a network
+        // that also holds Postgres, so an upstream redirect must never choose our next hop.
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("building the engine http client")?,
         auth_limiter: std::sync::Arc::new(auth_limit::AuthLimiter::new(cfg_auth_failure_budget())),
     })
 }
