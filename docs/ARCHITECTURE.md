@@ -28,7 +28,7 @@ through PM unless you have a direct wire. Message format (one per message, first
 - `BUG: <title> | severity | repro steps | expected vs actual` (QA/ADVERSARY → owner via PM).
 - `PROPOSAL: <change to shared contract>` — PM will accept/reject.
 
-**Working rhythm.** (1) Read this contract and your role brief in full. (2) Write a plan to `docs/plans/<role>.md`
+**Working rhythm.** (0) **Your injected CTX copy may be stale** — a stale copy is indistinguishable from a current one from inside a session. Step 1 of EVERY session and after every context clear: `yoke read <YOUR>-CTX` and treat that as truth. (1) Read this contract and your role brief in full. (2) Write a plan to `docs/plans/<role>.md`
 (milestones, file layout, open questions, risks) and send PM a `STATUS:` summarising it. (3) Execute the plan.
 Do not wait for PM to approve the plan unless you have a blocking `QUESTION:` — you have authority within your
 ownership area. Ship small, commit often, keep main green.
@@ -82,7 +82,14 @@ wheel/
   enforced engine-side or kernel-side. The sandbox boundary is the whole security story (ADVERSARY finding 002, accepted).
 - **Agents run as child processes** of the engine: `claude` CLI and `codex` CLI binaries baked into the container
   image. No Node SDKs in the Rust engine — we drive the CLIs' stream-JSON / JSONL protocols over stdin/stdout.
-  Operator ask: evaluate `srothgan/claude-code-rust` (a Rust TUI wrapping the official Agent SDK) — SDK runs a ≤1 h spike on whether its Rust↔Agent-SDK bridge is reusable as a library for our supervisor and gives a cleaner session/turn/interrupt protocol than raw stream-json; adopt only if it does. It does not remove Node from the image.
+  **Operator directive — compute frugality.** YOKE keeps one full Claude Code process alive per agent forever and spawns more per message; it is
+  killing the operator's machine and will cost real money in the cloud. Wheel must be cheap: (a) **Harness driver: use the agent-sdk bridge from
+  `github.com/srothgan/claude-code-rust`** (its Rust↔Agent-SDK bridge, not its TUI — the CLI UI is irrelevant, only headless turns + OAuth matter).
+  SDK adopts it as the driver if a ≤2 h spike shows it is lighter or equal per agent (measure RSS + startup + tokens/turn vs `claude -p --input-format stream-json`)
+  and supports session resume + interrupt; otherwise document why and stay on stream-json. (b) **Idle parking (§3c #14)**: an agent's process is stopped after
+  `idle_timeout_secs` (default 300) and resumed transparently (`--resume <session_id>` / SDK session) on the next message — `status: parked`. (c) Per-host
+  cap on concurrently RUNNING agents (env, default 32) with a fair queue; `run_on_startup` starts them parked, not running. (d) One process per agent, ever (§3c #13).
+  (e) The engine itself must idle at ~0 CPU: no polling loops — inotify/WS/channels only.
 - **Storage inside the container**: one sqlite file `/data/wheel.db` (nodes, wires, messages, runtime state, Table-node
   data, vault ciphertext, chest index). Chest blobs on disk `/data/chest/<node_id>/`. Scripts on disk `/data/scripts/<node_id>/`.
 - **One sandbox per project, one `wheel-engine` process per sandbox.** Sandboxes are created by `wheel-host` through a
@@ -107,10 +114,10 @@ All nodes share these traits (per spec): `name`, `position`, `wires`, `type`. Ca
   "config": { ... }                // tagged by `type`, see below
 }
 ```
-Runtime state (NOT stored in config; reported alongside as `state`): agents → `status` (`stopped | starting | needs_auth | running | idle | error`), `session_id`, `last_activity`, `last_error`.
+Runtime state (NOT stored in config; reported alongside as `state`, and `state: null` for non-agent types): agents → `status` (`stopped | starting | needs_auth | running | idle | parked | budget_exhausted | error`), `session_id`, `last_activity`, `last_error`, `hosted_on`. `GET /v1/board` returns each node as `{ ...node, state }`.
 
 Per-type `config`:
-- `agent`:    `{ harness: "claude" | "codex", model?: string, system_prompt: string, run_on_startup: bool, ephemeral_context: bool,
+- `agent`:    `{ harness: "claude" | "codex", model?: string, system_prompt: string, run_on_startup: bool, ephemeral_context: bool, idle_timeout_secs?: n /* default 300 */,
                may_place?: bool /* §3e, default false */, budget?: { max_turns?: n, max_usd?: x }, workspaces?: [{ path, git?: { url, ref?, vault_ref? } }], runtime?: "cloud" | "local" /* default cloud */ }`
   All nodes may also carry `owner_node?: <node id>` (set when placed by an agent, §3e).
 - `ctx`:      `{ markdown: string }`
@@ -222,6 +229,7 @@ We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in th
 | 10 | Operator couldn't see that a message was mangled. | Web's agent drawer shows every message (body, sha256, state, from/to) and, per agent, the exact bytes written to stdin (transcript view). | Web · M2 |
 | 11 | Long messages truncated somewhere between sender and recipient's context. | Engine never truncates; if a harness limit would be exceeded the message stays `queued` with `last_error`, is surfaced in the UI, and is never silently clipped. | M1 |
 | 12 | **User input races agent prompts**: the operator's typed message and inbound agent messages both hit the harness's stdin and interleave mid-turn. | **Single writer.** The engine's per-agent delivery loop is the ONLY thing that ever writes to a child's stdin. The user's chat box is a client-side draft (kept in `localStorage` per agent, survives reload) until Send; Send creates a normal `messages` row (`from=user`, `type=user`) via `POST /v1/agents/:id/send` and returns its id. Delivery is strictly serial: one message per turn, the next written only after the harness's `result`. User messages are ordered **ahead of** queued agent/endpoint/script messages (priority lane) but are never injected mid-turn. The UI shows the message as `queued (next)` / `delivered` / `consumed` so the user sees exactly when it landed. Explicit interrupt is a separate, deliberate action (`POST /v1/agents/:id/interrupt` → engine cancels the in-flight turn per the harness's protocol, then delivers the user's message) — never implicit. | M1 (queue+priority) · interrupt M2 |
+| 14 | **Every agent holds a live process forever** (and each message spawns another) — the machine dies and cloud compute bills explode. | **Idle parking**: after `idle_timeout_secs` (default 300, per-agent config) the harness process is stopped; the session id is kept; the next message resumes the session transparently (`status: parked → starting → running`). Parking never loses context (resume) unless `ephemeral_context` is set, in which case the context was cleared anyway. Per-host running cap with fair queue. | M1 |
 | 13 | **Delivery spawns concurrent sessions**: each delivered message launched another `claude --continue` for the same agent, so N quick messages = N processes of one agent editing one worktree at once. | **Exactly one harness process per agent node at any time**, owned by the supervisor; a message never starts a process — it is enqueued, and the (single) session consumes it when idle. Start is idempotent (a second start while running is a no-op returning the existing session). The supervisor holds a per-agent mutex around spawn; `state.pid`/`session_id` are unique per node and shown in the UI. A test proves that 10 messages sent within 100 ms produce one process and 10 sequential turns. | M1 |
 
 
@@ -304,6 +312,7 @@ POST   /v1/agents/:id/start|stop|restart|clear
 POST   /v1/agents/:id/send  {body}        → user → agent message
 GET    /v1/agents/:id/log?since=<cursor>  → JSON lines (also streamed on /v1/events)
 POST   /v1/agents/:id/auth/begin          → { mode: "device_code"|"paste_code"|"api_key", url?, user_code?, instructions }
+                                            NATIVE FLOW = OAuth with the user's normal account (operator directive; API keys are a hidden advanced fallback).
                                             claude = paste_code (browser shows a code, user SUBMITS it back); codex = device_code (CLI shows a code, user
                                             enters it in the browser, engine POLLS). Both stay distinct shapes. API-key mode: claude ANTHROPIC_API_KEY or
                                             CLAUDE_CODE_OAUTH_TOKEN; codex CODEX_API_KEY (NOT OPENAI_API_KEY — codex ignores it for auth). Safe probes:
@@ -363,9 +372,12 @@ DELETE /v1/projects/:id                                              → stops +
 POST   /v1/projects/:id/start | /stop | /restart                     → sandbox lifecycle (→ host)
 ANY    /v1/projects/:id/engine/*                                     → authenticated proxy → host /host/v1/projects/:id/engine/* (incl. WS /engine/v1/events)
 ANY    /p/:project_id/*                                              → PUBLIC ingress → host /host/v1/projects/:id/ingress/* (403 if capability `http` disabled; rate-limited)
+POST   /v1/projects/:id/ws-ticket                                    → { ticket, expires_in: 30 } single-use, bound to (user, project); the events WS
+                                                                       is opened as /v1/projects/:id/engine/v1/events?ticket=… (browsers cannot set headers on
+                                                                       a WS handshake and the JWT must never be in a URL)
 GET    /healthz
 ```
-- `Project`: `{ id, owner_id, name, capabilities: { http: bool }, status: "stopped"|"starting"|"running"|"error", created_at, updated_at }`.
+- `Project`: `{ id, owner_id, name, capabilities: { http: bool }, status: "stopped"|"starting"|"running"|"error", ingress_base_url: "https://api.wheel.dev/p/<id>", created_at, updated_at }`.
 - API state in Postgres: `projects`, `project_secrets` (engine secret, vault master key — encrypted with API master key from env).
   The API never talks to docker and never talks to an engine directly — everything goes through the host. The API must be safe to run as N replicas
   (no in-memory state that matters; per-replica JWKS cache is fine; rate limits may be per-replica in v1, note it in API.md).
