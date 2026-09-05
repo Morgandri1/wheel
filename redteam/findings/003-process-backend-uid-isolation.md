@@ -1,35 +1,26 @@
-# 003 — Process backend: one kernel + one container for all tenants
+# 003 — Process backend: uid-per-project is the ONLY tenant isolation
 
-- **Severity:** Critical (once process backend exists) — highest system impact
-- **Owner:** API (wheel-host) + SDK/Engine (spawn/setuid contract)
-- **Status:** OPEN — design review (pre-code). Test matrix pre-written; runs the day the backend lands.
-- **Boundary:** TB6.
+- **Severity:** Critical (design-level; realizes at M3 when backend lands)
+- **Type:** DESIGN review of §2 process backend + §5b + §5b residual-risk note.
+- **Owner:** API (wheel-host) + SDK/Engine (drops-to-uid contract)
+- **Status:** OPEN (pre-write test matrix)
+- **Boundary:** TB7 tenant ↔ tenant.
 
 ## Claim
-In prod (§5b) every project's engine, agents, scripts and MCP servers run as `process` sandboxes on
-ONE Railway machine, in ONE container (host runs as root, setuids per project), sharing one kernel and
-one private network. Isolation reduces to: (a) per-project uid correctness, (b) filesystem perms, (c)
-egress filtering. There is NO namespace/container boundary between tenants. A single gap in any of
-these is a full cross-tenant breach — and every agent is a bypassPermissions RCE (see 002).
+In prod there is no container-per-tenant: all projects share ONE kernel and ONE container, isolated only by a per-project unix uid, dir mode 0700, and a uid-owned engine.sock. This is a weak boundary against an actively hostile agent (see 002). Any gap = cross-tenant compromise of A5/A6, and reaching *.railway.internal exposes A3/A9.
 
-## Attack surface / required invariants (each becomes a test)
-1. **uid enforcement for EVERY child** — agent, script, MCP `command`. If any child path forgets the
-   setuid drop, it runs as root or another uid. Test: from each child type, `id` must equal the project
-   uid; `/data/projects/<other>` (0700) and `/run/wheel/<other>/engine.sock` must be EACCES.
-2. **/proc leakage** — `/proc/<pid>/environ` of another tenant's engine/agent exposes A3/A4/A5/A6.
-   Mitigation: `hidepid=2` mount (or equivalent) so a uid can't see others' /proc. Test: cross-uid
-   `cat /proc/<other-pid>/environ` must fail.
-3. **Egress** — agents/scripts reaching `*.railway.internal` = Postgres (A10) and host `:7100` (A2).
-   Must be blocked by egress policy (the SSRF deny-list covers the tool executor, but raw agent shell
-   `curl http://wheel-host.railway.internal:7100` is NOT behind the tool executor). This needs a
-   network-level egress control, not just app-level deny-lists. **Flag: contract's SSRF deny-list
-   protects the tool node but not arbitrary agent/script outbound — that is a gap.**
-4. **Host secret** (A2) must never be in any sandbox env or reachable file.
-5. **rlimits / fork bomb** — a project must not starve the shared machine (nproc, cpu, mem, fsize,
-   nofile). Test: fork bomb + big-file write from one project; others stay responsive.
-6. **setuid-drop correctness** — supplementary groups cleared (`setgroups`), `no_new_privs` set, real
-   AND effective + saved uid all dropped, cwd not left in another project's dir.
+## Must-hold invariants (each becomes a test the day the backend exists)
+1. EVERY child (agent, script, MCP server) runs as the project uid — not just the engine. Verify via /proc/<pid>/status Uid line for each spawned pid.
+2. `/data/projects/<other>` unreadable/unwritable cross-uid (0700 + correct owner; no world/group bits; parent dir not traversable to enumerate ids).
+3. `/run/wheel/<other>/engine.sock` un-connectable cross-uid (socket file perms + SO_PEERCRED check in engine — engine should also verify peer uid, defense in depth).
+4. `/proc/<pid>/environ` of another tenant's pids unreadable → requires `hidepid=2` mount or equivalent; WITHOUT it, A2/A4/A5/A8 leak trivially. **Flag: contract does not mention hidepid.**
+5. No egress to *.railway.internal / host :7100 / Postgres from inside a sandbox — needs a network namespace or egress firewall per project; contract's §5b residual note acknowledges the risk but states no control. **Flag: define the control.**
+6. rlimits (nproc, nofile, cpu, as) + a pids cgroup so one tenant cannot fork-bomb the shared machine.
+7. setuid drop correctness in host: setgroups([]) to clear supplementary groups, set gid before uid, set no_new_privs, verify with a re-exec probe.
 
-## Proposed action
-Pre-write pocs/process-backend/ matrix now (skipped until backend exists). Raise item #3 (arbitrary
-agent egress to railway.internal) as a distinct HIGH now — it is a design gap, not just an impl bug.
+## Open questions for PM/API
+- Is there a per-project network namespace, or only uid? (Determines whether TB7 net attacks are even mitigated.)
+- Is `hidepid` planned for the /proc mount?
+
+## PoC plan
+`redteam/pocs/003_cross_tenant_matrix.sh` — create projects A,B; from A's script node attempt each of 1-7 against B; assert denials. Pre-written now; runs at M3.
