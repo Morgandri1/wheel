@@ -6,7 +6,7 @@
  * not enough — the person needs to know whether theirs is the one going in next, or sitting behind
  * someone else's. This module derives that from the message rows we already have.
  */
-import type { Message, MessageSender, MessageState } from "@/lib/schema";
+import type { AgentStatus, Message, MessageSender, MessageState } from "@/lib/schema";
 
 export interface MessageDisplayState {
   state: MessageState | "blocked";
@@ -52,6 +52,8 @@ export function displayState(
   message: Message,
   messages: readonly Message[],
   agentId: string,
+  /** The recipient's live status. Without it a stuck queue cannot say WHY it is stuck. */
+  agentStatus?: AgentStatus,
 ): MessageDisplayState {
   if (message.last_error) {
     return {
@@ -78,7 +80,28 @@ export function displayState(
       tone: "live",
     };
   }
-  if (nextForAgent(messages, agentId)?.id === message.id) {
+  const ahead = deliveryOrder(messages, agentId).findIndex((m) => m.id === message.id);
+  const isNext = nextForAgent(messages, agentId)?.id === message.id;
+
+  // SDK: an agent that cannot authenticate goes to `needs_auth` and its queue is PRESERVED rather
+  // than eaten — a message here is safe, not lost. But "goes in as soon as the current turn
+  // finishes" would be a lie: there is no turn, and none is coming until someone saves a
+  // credential. A wrong explanation sends people looking in the wrong place, so the blocker is
+  // named instead.
+  // Only when the caller actually told us the status. Treating "not told" as "stopped" would
+  // invent a blocker we have no evidence for, which is the same class of lie in the other
+  // direction.
+  const blocked = agentStatus ? BLOCKED_BY_AGENT[agentStatus] : undefined;
+  if (blocked) {
+    return {
+      state: "queued",
+      label: "Queued",
+      detail: ahead > 0 ? `${blocked} ${ahead} ahead of this one.` : blocked,
+      tone: "pending",
+    };
+  }
+
+  if (isNext) {
     return {
       state: "queued",
       label: "Queued (next)",
@@ -86,7 +109,6 @@ export function displayState(
       tone: "next",
     };
   }
-  const ahead = deliveryOrder(messages, agentId).findIndex((m) => m.id === message.id);
   return {
     state: "queued",
     label: "Queued",
@@ -97,3 +119,14 @@ export function displayState(
     tone: "pending",
   };
 }
+
+/**
+ * Why a queue cannot drain, by agent status. A status absent from this map is one where delivery
+ * is either happening or about to, and the ordinary "queued (next)" wording is the truthful one.
+ */
+const BLOCKED_BY_AGENT: Partial<Record<AgentStatus, string>> = {
+  needs_auth: "Held safely until this agent has credentials — nothing is lost.",
+  stopped: "Held until the agent is started.",
+  budget_exhausted: "Held until this agent's budget is raised or reset.",
+  error: "Held until the agent recovers or is restarted.",
+};

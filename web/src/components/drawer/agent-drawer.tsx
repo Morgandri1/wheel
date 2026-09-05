@@ -10,7 +10,7 @@ import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
 import { displayState, senderKind, senderLabel } from "@/lib/message-state";
 import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
 import type { EngineApi } from "@/lib/api";
-import type { Message, WheelNode } from "@/lib/schema";
+import type { AgentStatus, Message, WheelNode } from "@/lib/schema";
 
 export function AgentDrawer({
   nodes,
@@ -180,7 +180,12 @@ export function AgentDrawer({
                         <span className="ident text-ink-dim">{senderLabel(m.from)}</span>
                         <span>{senderKind(m.from)}</span>
                         <span>{new Date(m.created_at).toLocaleTimeString()}</span>
-                        <MessageStatePill message={m} messages={thread} agentId={activeTab ?? ""} />
+                        <MessageStatePill
+                          message={m}
+                          messages={thread}
+                          agentId={activeTab ?? ""}
+                          agentStatus={node?.state?.status}
+                        />
                         <span
                           className="ident text-ink-faint"
                           data-testid={`msg-${m.id}-sha`}
@@ -264,12 +269,14 @@ function MessageStatePill({
   message,
   messages,
   agentId,
+  agentStatus,
 }: {
   message: Message;
   messages: Message[];
   agentId: string;
+  agentStatus?: AgentStatus;
 }) {
-  const d = displayState(message, messages, agentId);
+  const d = displayState(message, messages, agentId, agentStatus);
   const color =
     d.tone === "error"
       ? "var(--danger)"
