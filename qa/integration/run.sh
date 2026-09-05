@@ -110,11 +110,35 @@ if [ "${code:-}" != "200" ]; then
 fi
 
 rc=0
+ran_nothing=""
 for suite in qa/integration/test_*.py; do
   [ -e "$suite" ] || continue
   echo
   echo "▸ $(basename "$suite")"
-  "$PY" "$suite" || rc=1
+
+  # Two styles live here: script-style modules with a __main__ guard that print their
+  # own summary, and pytest-style modules with fixtures. Running a pytest module as a
+  # plain script executes NOTHING, exits 0, and prints nothing — test_api_projects.py
+  # had been silently not running for exactly that reason. Dispatch on the guard.
+  out="$ARTIFACTS/$(basename "$suite" .py).log"
+  if grep -q '__main__' "$suite"; then
+    "$PY" "$suite" 2>&1 | tee "$out" || rc=1
+  else
+    "$PY" -m pytest -q "$suite" 2>&1 | tee "$out" || rc=1
+  fi
+
+  # A suite that produces no result line is not a passing suite, it is a suite that did
+  # not run. That must never read as green.
+  if ! grep -qE "passed|failed|error|no tests ran" "$out"; then
+    echo "  !! $(basename "$suite") produced no result line — it did not run"
+    ran_nothing="$ran_nothing $(basename "$suite")"
+    rc=1
+  fi
 done
+
+if [ -n "$ran_nothing" ]; then
+  echo
+  echo "suites that reported nothing:$ran_nothing"
+fi
 
 exit $rc
