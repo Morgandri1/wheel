@@ -330,3 +330,11 @@ export function explainDenial(
 export function isInjection(from: NodeType, to: NodeType, type: WireType): boolean {
   return wireRule(from, to, type)?.injection === true;
 }
+
+/**
+ * §3: on ctx, table and chest a `write` wire carries `read` with it, so the popover
+ * can say that choosing write is not the narrower grant it looks like.
+ */
+export function impliesRead(from: NodeType, to: NodeType): boolean {
+  return wireRule(from, to, "write")?.implies?.includes("read") ?? false;
+}
