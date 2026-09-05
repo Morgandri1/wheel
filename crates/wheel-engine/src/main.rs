@@ -17,6 +17,7 @@ mod config;
 mod db;
 mod events;
 mod harness;
+mod peercred;
 mod supervisor;
 
 use anyhow::Context;
@@ -114,6 +115,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             // accident; that must not be what we depend on.
             std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 .context("restricting the engine socket to its own uid")?;
+
+            // Second lock on the same door: the mode above says who MAY
+            // connect, this says who DID. If the mode is ever loosened by a
+            // umask, a chmod, or a host that recreates the directory, this is
+            // what still refuses another tenant.
+            let listener = peercred::PeerCredListener::new(listener);
 
             tracing::info!(path = %path.display(), mode = "0600", "listening");
             axum::serve(listener, app)
