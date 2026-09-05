@@ -70,12 +70,10 @@ else
   step "rust:fmt"    cargo fmt --all -- --check
   step "rust:clippy" cargo clippy --workspace --all-targets -- -D warnings
   step "rust:test"   cargo test --workspace
-  # ARCHITECTURE.md §0b: >=90% lines per crate. A failing check, not a warning.
-  if cargo llvm-cov --version >/dev/null 2>&1; then
-    step "rust:coverage" cargo llvm-cov --workspace --fail-under-lines "$COV_MIN"
-  else
-    skip "rust:coverage" "cargo-llvm-cov not installed — run 'make bootstrap'"
-  fi
+  # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
+  # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
+  # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
+  step "rust:coverage" "$PY" qa/tools/coverage_gate.py
 fi
 
 # ----------------------------------------------------------------- web
