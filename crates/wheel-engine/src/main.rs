@@ -73,6 +73,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         db,
         events,
     };
+    // Before serving: agents configured to run on startup come up parked, and
+    // any message left queued by the previous run resumes exactly the agents
+    // that have work waiting.
+    state.supervisor.start_configured_agents().await;
+
     let app = api::router(state);
 
     match listen {

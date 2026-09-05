@@ -338,7 +338,7 @@ pub async fn msg(
     });
     // A message never starts a process (§3c#13): this only nudges an already
     // running agent to drain.
-    let _ = s.supervisor.pump_queue(msg.to).await;
+    let _ = s.supervisor.deliver(msg.to).await;
 
     Ok((StatusCode::ACCEPTED, Json(MessageReceipt::from(&msg))))
 }
