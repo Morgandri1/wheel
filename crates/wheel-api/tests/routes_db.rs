@@ -105,7 +105,11 @@ fn token(sub: &str) -> String {
 async fn app(engine: String) -> Option<Router> {
     let url = match std::env::var("TEST_DATABASE_URL") {
         Ok(u) => u,
-        Err(_) if std::env::var("CI").is_ok() => panic!("TEST_DATABASE_URL must be set in CI"),
+        // Gated on a promised database, not on being in CI: keying this off `CI` asserts every CI
+        // job has Postgres, which reddened main once already.
+        Err(_) if std::env::var("WHEEL_CI_HAS_DB").as_deref() == Ok("1") => {
+            panic!("WHEEL_CI_HAS_DB=1 but TEST_DATABASE_URL is unset")
+        }
         Err(_) => {
             eprintln!("skipping {}: TEST_DATABASE_URL not set", module_path!());
             return None;
