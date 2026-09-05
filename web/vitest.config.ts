@@ -19,6 +19,7 @@ export default defineConfig({
       include: [
         "src/lib/wire-matrix.ts",
         "src/lib/limits.ts",
+        "src/lib/local-auth.ts",
         "src/lib/message-state.ts",
         "src/lib/validate.ts",
       ],

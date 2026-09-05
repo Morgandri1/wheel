@@ -84,6 +84,10 @@ export class EngineRefusal extends Error {
   constructor(
     readonly status: number,
     message: string,
+    /** Machine-readable, per the API's error envelope. Defaults to `http_<status>`. */
+    readonly code?: string,
+    /** Response headers the client is expected to read, e.g. Retry-After on a 429. */
+    readonly headers?: Record<string, string>,
   ) {
     super(message);
   }

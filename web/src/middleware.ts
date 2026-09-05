@@ -6,7 +6,10 @@ import { NextResponse, type NextFetchEvent, type NextRequest } from "next/server
  * `clerkMiddleware()` on its own only populates auth; without the protect() call below an
  * unauthenticated visitor reaches the board and only finds out when the API 401s.
  *
- * In mock/dev auth mode this is a no-op, so the board runs locally with no Clerk instance.
+ * In every other mode this is a no-op. Local mode cannot be guarded here at all: its session
+ * lives in localStorage and the edge has no cookie to read, so /app is gated in the browser by
+ * SessionGate instead. That gate is a routing courtesy either way — the boundary is the API,
+ * which refuses anything without a valid x-auth-token.
  */
 const isProtected = createRouteMatcher(["/app", "/app/(.*)"]);
 

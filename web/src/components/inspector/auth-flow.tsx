@@ -14,9 +14,10 @@ import type { EngineApi } from "@/lib/api";
  * device or paste-code exchange; that lands in M2, and its buttons are present-but-disabled with
  * the reason rather than hidden — an absent control is something people hunt for.
  *
- * The key is write-only in the strongest sense available: it is posted and the field is cleared,
- * it is never read back (no route returns it), and it is never put in a URL, a query key or a
- * toast. What comes back is whether the agent is authenticated, and optionally which account.
+ * The credential is write-only in the strongest sense available: it is posted and the field is
+ * cleared, it is never read back (no route returns it), and it is never put in a URL, a query key
+ * or a toast. What comes back is whether a credential is STORED — which is not the same as it
+ * working, and the copy here is careful to say only the true one.
  */
 export function AuthFlow({
   api,
@@ -69,12 +70,13 @@ export function AuthFlow({
       setReplacing(false);
       setJustSaved(true);
       if (next.authenticated) {
-        toast("Agent authenticated. Start it to pick up any queued messages.");
+        toast("Credentials saved. Start the agent to pick up any queued messages.");
         onAuthenticated();
       }
       await status.refetch();
     } catch (e) {
-      toastError(e, "The engine would not accept that key.");
+      // The engine explains a rejected credential in words (wrong harness, empty value); say what it said.
+      toastError(e, "The engine would not accept that credential.");
     } finally {
       setBusy(false);
     }
@@ -87,9 +89,12 @@ export function AuthFlow({
         data-testid="auth-status"
         data-authenticated="true"
       >
+        {/* SDK: `authenticated: true` means a credential is STORED, not that it works — only the
+            harness's own probe can say that. "Connected" here would be a lie an expired token
+            tells, and the support round-trip lands on us. */}
         <span className="text-micro text-ink-dim">
-          Authenticated
-          {status.data?.account ? ` · ${status.data.account}` : " · API key"}
+          Credentials saved
+          {status.data?.account ? ` · ${status.data.account}` : ""}
         </span>
         <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
           Replace
@@ -106,17 +111,18 @@ export function AuthFlow({
           className="text-micro"
           style={{ color: "var(--danger)" }}
         >
-          This agent has no credentials, so it stopped at startup. Anything sent to it is queued
-          and will be delivered once it is authenticated and restarted.
+          This agent has no usable credentials, so it stopped at startup. Nothing sent to it was
+          lost — messages stay queued and are delivered once a credential is saved and the agent
+          is restarted.
         </p>
       ) : null}
 
       <Field
-        label={replacing ? "New API key" : "API key"}
+        label={replacing ? "New key or token" : "API key or setup-token"}
         hint={
           replacing
-            ? "Replaces the key already stored for this agent."
-            : "Stored in the agent's own credentials directory. Never shown again, by anything."
+            ? "Replaces the credential already stored for this agent."
+            : "An sk-ant- API key, or the token from `claude setup-token`. Stored in the agent's own credentials directory and never shown again, by anything."
         }
       >
         <Input
@@ -126,7 +132,7 @@ export function AuthFlow({
           autoComplete="off"
           spellCheck={false}
           data-testid="input-api-key"
-          placeholder="sk-…"
+          placeholder="sk-ant-… or a setup-token"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
           onKeyDown={(e) => {
@@ -143,7 +149,7 @@ export function AuthFlow({
           disabled={!apiKey.trim() || busy}
           onClick={save}
         >
-          {busy ? "Checking…" : "Save key"}
+          {busy ? "Saving…" : "Save credential"}
         </Button>
         {replacing ? (
           <Button size="sm" tone="ghost" onClick={() => { setReplacing(false); setApiKey(""); }}>
@@ -152,7 +158,7 @@ export function AuthFlow({
         ) : null}
         {justSaved && !authenticated ? (
           <span className="text-micro text-ink-faint" data-testid="auth-checking">
-            Waiting for the harness to confirm…
+            Saving…
           </span>
         ) : null}
       </div>
