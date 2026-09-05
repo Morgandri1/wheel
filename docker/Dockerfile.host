@@ -55,7 +55,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
     && test -x /usr/local/bin/wheel && /usr/local/bin/wheel --help >/dev/null
 
 RUN mkdir -p /data && chown agent:agent /data
-VOLUME ["/data"]
+# No `VOLUME ["/data"]`: Railway rejects the directive outright ("docker VOLUME is not supported,
+# use Railway Volumes") and fails the build. Nothing depended on it — compose mounts a named
+# volume at /data explicitly, and Railway attaches its own — so the declaration only ever created
+# an anonymous volume when someone forgot to mount one.
 
 ENV WHEEL_ROLE=engine \
     WHEEL_DATA_DIR=/data \
