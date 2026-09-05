@@ -302,6 +302,16 @@ impl Sandbox for ProcessSandbox {
             }
         }
 
+        // Record the uid we are dropping to. This is the line that proves per-project isolation is
+        // actually happening in an environment where nobody can attach a shell — without it, the
+        // only evidence is that nothing has gone wrong yet.
+        tracing::info!(
+            project = %id,
+            uid,
+            gid,
+            socket = %socket.display(),
+            "spawning engine under its own uid"
+        );
         let child = cmd.spawn().context("spawning wheel-engine")?;
         self.children.lock().await.insert(*id, child);
 
