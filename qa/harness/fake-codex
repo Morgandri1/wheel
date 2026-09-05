@@ -11,12 +11,49 @@ import json, os, sys, uuid, time, re, hashlib
 
 DIRECTIVE = re.compile(r"<<FAKE:([A-Z_]+)(?:=([^>]*))?>>")
 TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")
+ENV_DUMP = os.environ.get("WHEEL_FAKE_ENV_DUMP")
+
+# Duplicated from fake-claude rather than shared: both files are installed standalone on
+# the image's PATH, so a sibling import would not resolve. §4 makes this worth testing for
+# codex specifically — it authenticates with CODEX_API_KEY and IGNORES OPENAI_API_KEY, so a
+# key routed to the obvious-looking variable fails as "not logged in".
+CRED_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+CONFIG_VARS = ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN", "IS_SANDBOX")
+
+def credential_class(v):
+    if v.startswith("sk-ant-oat"): return "oauth_token"
+    if v.startswith("sk-ant-api"): return "api_key"
+    if v.startswith("sk-ant-"): return "anthropic_unknown"
+    if v.startswith("sk-"): return "openai_style"
+    return "opaque"
+
+def env_dump():
+    """One JSONL record per spawn: which credential vars were set, never their values."""
+    if not ENV_DUMP: return
+    creds = {}
+    for name in CRED_VARS:
+        v = os.environ.get(name)
+        if v is None: continue
+        creds[name] = {"bytes": len(v.encode()), "sha256": hashlib.sha256(v.encode()).hexdigest(),
+                       "class": credential_class(v)}
+    rec = {"pid": os.getpid(), "argv0": os.path.basename(sys.argv[0]),
+           "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+           "credentials": creds, "credential_vars_set": sorted(creds),
+           "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
+           "argv": sys.argv[1:]}
+    try:
+        with open(ENV_DUMP, "a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except OSError as e:
+        sys.stderr.write("fake-codex: cannot write WHEEL_FAKE_ENV_DUMP %s: %s\n" % (ENV_DUMP, e))
+        sys.exit(2)
 
 def emit(o):
     sys.stdout.write(json.dumps(o, separators=(",", ":")) + "\n"); sys.stdout.flush()
 
 def main():
     argv = sys.argv[1:]
+    env_dump()
     if "--version" in argv:
         print("codex-cli 0.149.1"); return 0
     # `codex exec [--json] [-c k=v]... [PROMPT]`

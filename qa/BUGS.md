@@ -13,9 +13,11 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 005 | `make check` (`rust:fmt`) | S3 | API | ~~closed~~ | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
-| 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% (host was 0.00% when filed) |
+| 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: 4 crates below the bar (latest main: wheel-api 89.02%, wheel-cli 0.00%, wheel-core 70.51%, wheel-host 68.33%) |
 | 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | **open** | `transcript` log lines are persisted but never emitted over the events WebSocket |
 | 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | ~~closed~~ | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
+| 011 | `ENG-one-process`, `ENG-park-resume`, `MSG-delivered-means-delivered` | **S1** | SDK | ~~closed~~ | After any failed start, every later start was a silent no-op — and a turn could be written to a dead child's stdin and marked delivered |
+| 012 | `make check` (`web:test`) | S4 | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
 
 ---
 
@@ -397,3 +399,73 @@ lands — but together they turned "the agent's entire interface is missing" int
 build. This is the same shape as the silent test skips API and I have both been removing today.
 `qa/contract/image_contents.py` now asserts the image's contents explicitly, so the next missing
 binary is a red gate rather than a discovery three hours later.
+
+
+---
+
+## 011 — After a failed start, every later start was a silent no-op · S1 · SDK · CLOSED
+
+**Found and fixed by SDK, not by QA.** Recorded here because §3c #15 makes this file the
+system of record and a message is only a notification. Fixed in `0c8341f`, on `main` at
+`158500f`.
+
+**Repro (pre-fix):**
+```
+1. create an agent node with no credentials stored
+2. POST /v1/agents/:id/start            -> child dies, status needs_auth   (correct)
+3. POST /v1/agents/:id/auth/complete {"api_key": "sk-ant-api03-…"}
+4. POST /v1/agents/:id/start            -> 200 OK, {"status":"stopped"}, and NO process
+```
+Expected a new child. Actual: nothing, forever; an engine restart was the only recovery.
+
+**Cause:** nothing cleared an agent's supervisor slot when its child exited, so `start` took
+the "already running" early return for a process that no longer existed. The same root cause
+let `pump_queue` write a turn into a dead child's stdin and mark it `delivered` — §3c #15
+inverted, since `delivered` is defined as "the bytes reached the child's stdin".
+
+**Fix:** one owner for a child's death — clear the slot, reap, requeue in-flight messages,
+revoke the node token, record why. A silent exit is now `stopped` rather than `error`, since
+a clean shutdown looks identical from outside. Three supervisor tests against a stub binary,
+including ten-starts-one-process for §3c #13.
+
+**What QA takes from it.** My suites did not catch this, and the reason is worth naming: every
+lifecycle test I had drove `start` from a *clean* state. The recovery path — start after a
+failure — was never exercised, so a permanently wedged agent was invisible to the whole suite.
+`ENG-start-after-failure` is now in TESTPLAN §5a and `test_engine_auth_routing.py` drives
+exactly that sequence (auth → start → re-auth → start) on every run, because it has to store a
+credential and respawn to observe routing at all.
+
+
+---
+
+## 012 — `web:test` fails on any node newer than CI's · S4 · Web
+
+Not a product bug — the code is fine and CI is right — but a gate whose verdict depends on
+the developer's node version is not a gate, and this one costs whoever hits it the time to
+work out that they are debugging their runtime rather than the product. I lost that time
+today, which is why it is written down instead of remembered.
+
+**Repro:** `pnpm -C web test` on node ≥ 22.4 (mine is v26.8.1).
+30 failures in `src/lib/local-auth.test.tsx`, all `TypeError: Cannot read properties of
+undefined (reading 'clear')` at `window.localStorage.clear()`, alongside node's own warning:
+`ExperimentalWarning: localStorage is not available because --localstorage-file was not provided`.
+
+**Cause:** node ≥ 22.4 defines a built-in experimental `globalThis.localStorage` that yields
+`undefined` unless `--localstorage-file` is passed. vitest's jsdom environment populates
+globals from the jsdom window but does not overwrite a key that already exists, so node's
+broken getter wins over jsdom's working `Storage`. jsdom itself is fine — constructing a
+`JSDOM` by hand gives a real `localStorage`. **Confirmed by bisecting the runtime, not the
+code:** identical tree, node 22.13.0 → 116/116 pass; node 26.8.1 → 30 fail.
+
+**Suggested fix (Web's call, one line):** a `setupFiles` entry in `web/vitest.config.ts` that
+redefines `globalThis.localStorage` from the jsdom window when the global is not a `Storage`.
+Pinning node in `.nvmrc` or `engines` helps the honest case but does not stop the gate lying
+to someone who ignores it.
+
+**Two things I fixed on my side rather than leaving to the next person:**
+1. `qa/check.sh` **prepended** `/opt/homebrew/bin` to `PATH`, so a developer who deliberately
+   selected node 22 to match CI silently got homebrew's node 26 anyway — the gate answered
+   about a runtime nobody chose. Those entries are a fallback for finding cargo/pnpm, never
+   an override, so they are appended now.
+2. `make check` prints the running node major when it differs from the 22 that CI pins, and
+   says to suspect the runtime first if a web gate is red locally and green on CI.

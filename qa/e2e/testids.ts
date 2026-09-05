@@ -102,6 +102,22 @@ export const T = {
   authUserCode: "auth-user-code",
   // DEFERRED-END
 
+  // local email/password auth (§2 AUTH_MODE=local). Web's names, from their f6a02d2.
+  // Only the `local-auth` Playwright project uses these: NEXT_PUBLIC_AUTH_MODE is inlined
+  // at build time, so they are rendered by a different server than the default suite's.
+  authScreen: "auth-screen",
+  authForm: "auth-form",
+  emailInput: "input-email",
+  passwordInput: "input-password",
+  authSubmit: "btn-auth-submit",
+  authError: "auth-error",
+  authSwitch: "link-auth-switch",
+  sessionBadge: "session-badge",
+  signOut: "btn-sign-out",
+  sessionLoading: "session-loading",
+  sessionRedirecting: "session-redirecting",
+  authWrongMode: "auth-wrong-mode",
+
   // connection health
   connIndicator: "conn-indicator",
 } as const;
