@@ -17,6 +17,8 @@ import type {
   NodeType,
   Position,
   Project,
+  ToolFormat,
+  ToolOperation,
   WheelNode,
   WireType,
 } from "@/lib/schema";
@@ -203,6 +205,43 @@ export function engineApi(projectId: string) {
           expect: "void",
         }),
     }),
+
+    /** §3d. The engine is the only spec parser — web never re-implements one. */
+    tools: {
+      /** Normalized preview for a document that has not been saved to a node yet. */
+      preview: (raw: string, format?: ToolFormat) =>
+        request<{ operations: ToolOperation[]; base_url?: string; format: ToolFormat }>(
+          engine(projectId, "/tools/import"),
+          { ...p, method: "POST", body: { raw, format } },
+        ),
+
+      /** Re-import into an existing node: diffs by method+path and keeps the fills already set. */
+      reimport: (nodeId: string, raw: string, format?: ToolFormat) =>
+        request<{ operations: ToolOperation[]; added: string[]; removed: string[]; kept: string[] }>(
+          engine(projectId, `/tools/${nodeId}/import`),
+          { ...p, method: "POST", body: { raw, format } },
+        ),
+
+      /** Exactly what an agent would see: enabled ops, agent-mode fields only. */
+      ops: (nodeId: string) =>
+        request<{ operations: { id: string; description?: string; input_schema: unknown }[] }>(
+          engine(projectId, `/tools/${nodeId}/ops`),
+          p,
+        ),
+
+      /** Run an operation as the user. dry_run returns the equivalent curl instead of sending. */
+      call: (nodeId: string, op: string, args: Record<string, unknown>, dryRun = false) =>
+        request<{
+          status?: number;
+          headers?: Record<string, string>;
+          body?: unknown;
+          curl?: string;
+        }>(engine(projectId, `/tools/${nodeId}/call`), {
+          ...p,
+          method: "POST",
+          body: { op, args, dry_run: dryRun },
+        }),
+    },
 
     /**
      * Vault values are write-only. There is deliberately no getter here — not a missing feature,

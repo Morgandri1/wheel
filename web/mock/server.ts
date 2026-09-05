@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { TicketStore } from "./tickets";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { AgentNode, EngineEvent, WheelNode, WireType } from "@/lib/schema";
+import type { AgentNode, EngineEvent, ToolOperation, WheelNode, WireType } from "@/lib/schema";
 import {
   EngineRefusal,
   OWNER,
@@ -32,6 +32,7 @@ import {
 } from "./state";
 import { seed } from "./fixtures";
 import { assertMatrixMatchesEngine } from "./assert-matrix";
+import { agentInputSchema, mergeOperations, parseSpec } from "./tools";
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787);
 const ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"];
@@ -256,6 +257,78 @@ async function engine(
       });
       return true;
     }
+  }
+
+  // §3d tool routes. The engine is the only real parser; ./tools is a stand-in so the inspector
+  // can be built now, and is what gets deleted when the engine's importer lands.
+  if (path === "/v1/tools/import" && method === "POST") {
+    const { raw } = await readJson<{ raw: string; format?: string }>(req);
+    json(res, 200, parseSpec(raw ?? ""));
+    return true;
+  }
+
+  const toolImport = /^\/v1\/tools\/([^/]+)\/import$/.exec(path);
+  if (toolImport && method === "POST") {
+    const node = findNode(record, toolImport[1]!);
+    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
+    const { raw } = await readJson<{ raw: string }>(req);
+    const parsed = parseSpec(raw ?? "");
+    const diff = mergeOperations(node.config.operations ?? [], parsed.operations);
+    node.config = { ...node.config, base_url: parsed.base_url, operations: diff.operations };
+    boardChanged(record);
+    json(res, 200, diff);
+    return true;
+  }
+
+  const toolOps = /^\/v1\/tools\/([^/]+)\/ops$/.exec(path);
+  if (toolOps && method === "GET") {
+    const node = findNode(record, toolOps[1]!);
+    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
+    json(res, 200, {
+      operations: (node.config.operations ?? [])
+        .filter((op) => op.enabled !== false)
+        .map((op) => ({
+          id: op.id,
+          description: op.summary ?? undefined,
+          input_schema: agentInputSchema(op),
+        })),
+    });
+    return true;
+  }
+
+  const toolCall = /^\/v1\/tools\/([^/]+)\/call$/.exec(path);
+  if (toolCall && method === "POST") {
+    const node = findNode(record, toolCall[1]!);
+    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
+    const { op: opId, args = {}, dry_run } = await readJson<{
+      op: string;
+      args?: Record<string, unknown>;
+      dry_run?: boolean;
+    }>(req);
+    const op = (node.config.operations ?? []).find((o) => o.id === opId);
+    if (!op) throw new EngineRefusal(404, "no such operation");
+
+    // §3d rule 1: an agent-supplied field that is not agent-mode is rejected outright, and the
+    // denial is an event rather than a silent drop.
+    const agentFields = new Set(
+      (op.params ?? []).filter((pm) => (pm.fill?.mode ?? "agent") === "agent").map((pm) => pm.name),
+    );
+    const extra = Object.keys(args).filter((k) => !agentFields.has(k));
+    if (extra.length) {
+      throw new EngineRefusal(400, `fields not open to the caller: ${extra.join(", ")}`);
+    }
+
+    const url = renderUrl(node.config.base_url ?? "", op, args);
+    if (dry_run) {
+      json(res, 200, { curl: renderCurl(node.config.base_url ?? "", op, args) });
+      return true;
+    }
+    json(res, 200, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: { ok: true, note: "mock response — the engine performs the real request", url },
+    });
+    return true;
   }
 
   const vaultMatch = /^\/v1\/vault\/([^/]+)\/(.+)$/.exec(path);
@@ -496,3 +569,41 @@ server.listen(PORT, () => {
   console.log(`seeded project: ${first?.project.name} (${first?.project.id})`);
   console.log(`wire matrix agrees with the engine's export (${allowedWireCount} allowed triples)`);
 });
+
+/** §3d rule 3: static and vault fills are authoritative, and are masked wherever we render them. */
+function renderUrl(baseUrl: string, op: ToolOperation, args: Record<string, unknown>): string {
+  let path = op.path;
+  const query: string[] = [];
+
+  for (const param of op.params ?? []) {
+    const mode = param.fill?.mode ?? "agent";
+    if (mode === "hidden") continue;
+    const value =
+      mode === "static"
+        ? (param.fill?.value ?? "")
+        : mode === "vault"
+          ? "<from vault>"
+          : String(args[param.name] ?? "");
+    if (param.location === "path") path = path.replace(`{${param.name}}`, encodeURIComponent(value));
+    if (param.location === "query" && value) {
+      query.push(`${encodeURIComponent(param.name)}=${encodeURIComponent(value)}`);
+    }
+  }
+
+  return `${baseUrl.replace(/\/$/, "")}${path}${query.length ? `?${query.join("&")}` : ""}`;
+}
+
+function renderCurl(baseUrl: string, op: ToolOperation, args: Record<string, unknown>): string {
+  const parts = [`curl -X ${op.method}`];
+  for (const param of op.params ?? []) {
+    if (param.location !== "header") continue;
+    const mode = param.fill?.mode ?? "agent";
+    if (mode === "hidden") continue;
+    // Never render a secret, not even into something the person asked to copy.
+    const value =
+      mode === "vault" ? "****" : mode === "static" ? (param.fill?.value ?? "") : String(args[param.name] ?? "");
+    parts.push(`-H '${param.name}: ${value}'`);
+  }
+  parts.push(`'${renderUrl(baseUrl, op, args)}'`);
+  return parts.join(" ");
+}
