@@ -5,6 +5,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { engineAllowsWire } from "./engine-matrix";
+import { defaultConfigFor } from "@/lib/node-defaults";
 import { deliveryOrder, senderKind } from "@/lib/message-state";
 import type {
   AgentNode,
@@ -122,34 +123,6 @@ export function createProject(name: string): ProjectRecord {
   };
   projects.set(id, record);
   return record;
-}
-
-/**
- * §3 per-type config. The engine fills these in when a node is created without one, so a node
- * is never half-formed on the board — a tool with no `operations` array would crash any client
- * that trusted the schema.
- */
-export function defaultConfigFor(type: NodeType): unknown {
-  switch (type) {
-    case "agent":
-      return { harness: "claude", system_prompt: "", run_on_startup: false, ephemeral_context: false };
-    case "ctx":
-      return { markdown: "" };
-    case "table":
-      return { columns: [{ name: "value", type: "text" }] };
-    case "endpoint":
-      return { method: "POST", path: "/hook", response_mode: "ack" };
-    case "script":
-      return { language: "python", source: "print('hello from wheel')\n", timeout_secs: 60 };
-    case "mcp":
-      return { transport: "stdio", command: "" };
-    case "vault":
-      return { keys: [] };
-    case "tool":
-      return { kind: "http", base_url: "", operations: [] };
-    default:
-      return {};
-  }
 }
 
 export function makeNode(

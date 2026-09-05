@@ -24,6 +24,7 @@ import { WirePopover } from "@/components/board/wire-popover";
 import { NODE_META } from "@/lib/node-meta";
 import { canConnect, explainDenial, isInjection } from "@/lib/wire-matrix";
 import { suggestName } from "@/lib/validate";
+import { newNodeInput } from "@/lib/node-defaults";
 import { useBoardStore } from "@/store/board";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
@@ -53,6 +54,8 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   /** Positions being dragged right now; they win over the server's copy until drag ends. */
   const [dragged, setDragged] = useState<Record<string, Position>>({});
   const [confirmDelete, setConfirmDelete] = useState<WheelNode | null>(null);
+  const [pendingTool, setPendingTool] = useState<{ position: Position } | null>(null);
+  const [toolUrl, setToolUrl] = useState("");
 
   const rename = useCallback(
     async (id: string, name: string) => {
@@ -201,14 +204,16 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
     [api, onChanged, pendingWire, setPendingWire],
   );
 
-  const place = useCallback(
-    async (type: NodeType, position: Position) => {
+  const create = useCallback(
+    async (type: NodeType, position: Position, config?: Record<string, unknown>) => {
+      const input = newNodeInput(type, suggestName(type, takenNames), {
+        x: Math.round(position.x),
+        y: Math.round(position.y),
+      });
       try {
-        const created = await api.createNode({
-          name: suggestName(type, takenNames),
-          type,
-          position: { x: Math.round(position.x), y: Math.round(position.y) },
-        });
+        const created = await api.createNode(
+          config ? { ...input, config: { ...input.config, ...config } } : input,
+        );
         onChanged();
         select(created.id);
       } catch (e) {
@@ -216,6 +221,19 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
       }
     },
     [api, onChanged, select, takenNames],
+  );
+
+  const place = useCallback(
+    (type: NodeType, position: Position) => {
+      // A tool with no base URL is not a tool, and the engine refuses one — so ask for it at
+      // placement rather than creating something invalid and reporting the engine's 400.
+      if (type === "tool") {
+        setPendingTool({ position });
+        return;
+      }
+      void create(type, position);
+    },
+    [create],
   );
 
   const onDrop = useCallback(
@@ -311,6 +329,54 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
 
         {pendingWire ? (
           <WirePopover pending={pendingWire} onPick={commitWire} onCancel={() => setPendingWire(null)} />
+        ) : null}
+
+        {pendingTool ? (
+          <div className="plate absolute left-1/2 top-6 z-40 w-[380px] -translate-x-1/2 p-4" data-testid="tool-base-url-prompt">
+            <p className="mb-2 text-meta">
+              Where do this tool&apos;s requests go? Every operation is resolved against it.
+            </p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const url = toolUrl.trim();
+                if (!/^https?:\/\/\S+$/.test(url)) return;
+                const at = pendingTool.position;
+                setPendingTool(null);
+                setToolUrl("");
+                void create("tool", at, { base_url: url });
+              }}
+            >
+              <input
+                autoFocus
+                data-testid="input-tool-base-url"
+                className="ident w-full rounded-control border border-rule bg-[var(--panel-0)] px-2.5 py-1.5 text-meta text-ink placeholder:text-ink-faint focus:border-[var(--wire-read)] focus:outline-none"
+                placeholder="https://api.example.com"
+                value={toolUrl}
+                onChange={(e) => setToolUrl(e.target.value)}
+              />
+              <div className="mt-3 flex justify-end gap-2">
+                <button
+                  type="button"
+                  className="h-7 rounded-control border border-transparent px-2.5 text-micro text-ink-dim hover:text-ink"
+                  onClick={() => {
+                    setPendingTool(null);
+                    setToolUrl("");
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  data-testid="btn-place-tool"
+                  disabled={!/^https?:\/\/\S+$/.test(toolUrl.trim())}
+                  className="h-7 rounded-control border border-rule bg-[var(--panel-2)] px-2.5 text-micro disabled:opacity-40"
+                >
+                  Place tool
+                </button>
+              </div>
+            </form>
+          </div>
         ) : null}
 
         {confirmDelete ? (
