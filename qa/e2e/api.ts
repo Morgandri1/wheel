@@ -36,9 +36,16 @@ export async function deleteProject(id: string) {
   await call("DELETE", `/v1/projects/${id}`).catch(() => undefined);
 }
 
+let placed = 0;
+
 export async function addNode(project: string, node: Partial<Node> & { name: string; type: string }) {
+  // Lay unpositioned nodes out on a grid. Two nodes at one point is not a board: the upper one
+  // covers the lower one completely and swallows its clicks, so the test that notices is
+  // whichever one clicks first. An explicit position in `node` still wins — the spread is last.
+  const fallback = { x: (placed % 4) * 280, y: Math.floor(placed / 4) * 200 };
+  placed += 1;
   return call<Node>("POST", `/v1/projects/${project}/engine/v1/nodes`, {
-    position: { x: 0, y: 0 },
+    position: fallback,
     config: {},
     ...node,
   });
