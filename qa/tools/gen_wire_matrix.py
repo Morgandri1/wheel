@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expand the wire-matrix contract into all 8x8x3 = 192 cells.
+"""Expand the wire-matrix contract into all 9x9x3 = 243 cells.
 
 SINGLE SOURCE OF TRUTH for wire authorisation expectations. docs/TESTPLAN.md and the
 integration suite both consume qa/fixtures/wire_matrix.json, so the doc and the tests
@@ -11,7 +11,7 @@ API and the engine.
 """
 import json, os, sys
 
-NODE_TYPES = ["agent", "ctx", "table", "endpoint", "script", "mcp", "vault", "chest"]
+NODE_TYPES = ["agent", "ctx", "table", "endpoint", "script", "mcp", "vault", "chest", "tool"]
 WIRE_TYPES = ["read", "write", "send"]
 
 # (from, to, type) -> why it is allowed. Everything else is denied.
@@ -26,6 +26,7 @@ ALLOWED = {
     ("agent", "chest", "write"):  "wheel chest put|rm; write implies read",
     ("agent", "script", "read"):  "wheel run <script> [args...]",
     ("agent", "mcp", "read"):     "MCP server attached to the harness config at next start",
+    ("agent", "tool", "read"):    "wheel tool ls/call; enabled ops also exposed as MCP <tool>__<op>",
     ("ctx", "agent", "send"):     "INJECTION: ctx markdown prepended to the agent's prompt",
     ("endpoint", "agent", "send"):  "each HTTP hit delivered as a message",
     ("endpoint", "table", "write"): "JSON body inserted as a row",
@@ -38,6 +39,8 @@ ALLOWED = {
     ("script", "vault", "read"):  "same as agent",
     ("script", "chest", "read"):  "same as agent",
     ("script", "chest", "write"): "same as agent",
+    ("script", "tool", "read"):   "same as agent",
+    ("tool", "vault", "read"):    "tool resolves {mode:vault} fills from that vault at call time",
 }
 
 # Why a whole row is empty - used to give denied cells a readable rationale.
@@ -49,7 +52,11 @@ NO_OUTGOING = {
     "mcp":   "mcp has no outgoing wires",
 }
 
+TOOL_ONLY = "tool's only outgoing wire is read->vault"
+
 def deny_reason(f, t, w):
+    if f == "tool":
+        return TOOL_ONLY
     if f in NO_OUTGOING:
         return NO_OUTGOING[f]
     if f == "endpoint":
@@ -77,8 +84,8 @@ def build():
 def main():
     cells = build()
     n_allow = sum(1 for c in cells if c["expect"] == "allow")
-    assert len(cells) == 192, len(cells)
-    assert len(set(c["id"] for c in cells)) == 192, "duplicate ids"
+    assert len(cells) == 243, len(cells)
+    assert len(set(c["id"] for c in cells)) == 243, "duplicate ids"
     assert n_allow == len(ALLOWED), (n_allow, len(ALLOWED))
 
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
