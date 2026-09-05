@@ -13,6 +13,8 @@ use std::{
 mod api;
 mod config;
 mod db;
+mod harness;
+mod supervisor;
 
 use config::Config;
 use wheel_core::ListenAddr;
