@@ -17,7 +17,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # wheel-host is API's crate and may not exist yet; build what is present.
 RUN cargo build --release --bin wheel-engine \
-    && (cargo build --release --bin wheel-cli 2>/dev/null || true) \
+    && cargo build --release --bin wheel \
     && (cargo build --release --bin wheel-host 2>/dev/null || true)
 
 # --- runtime ----------------------------------------------------------------
@@ -47,11 +47,12 @@ RUN useradd --create-home --uid 10001 --shell /bin/bash agent
 ENV IS_SANDBOX=1
 
 COPY --from=build /src/target/release/wheel-engine /usr/local/bin/wheel-engine
-COPY --from=build /src/target/release/wheel-cl[i] /usr/local/bin/
+COPY --from=build /src/target/release/wheel /usr/local/bin/wheel
 COPY --from=build /src/target/release/wheel-hos[t] /usr/local/bin/
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+    && test -x /usr/local/bin/wheel && /usr/local/bin/wheel --help >/dev/null
 
 RUN mkdir -p /data && chown agent:agent /data
 VOLUME ["/data"]
