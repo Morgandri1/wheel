@@ -51,8 +51,11 @@ async fn docker_ready() -> bool {
 macro_rules! require_docker {
     () => {
         if !docker_ready().await {
-            if std::env::var("CI").is_ok() {
-                panic!("CI must provide a docker daemon and the {IMAGE} image for these tests");
+            // Keyed on a promised daemon, not on CI. Asserting that every CI job has Docker and a
+            // built image is the same mistake that turned main red over Postgres: the check has to
+            // depend on the capability it needs, and the job that provides it says so.
+            if std::env::var("WHEEL_CI_HAS_DOCKER").as_deref() == Ok("1") {
+                panic!("WHEEL_CI_HAS_DOCKER=1 but no docker daemon or {IMAGE} is not built");
             }
             eprintln!("skipping: no docker daemon or {IMAGE} not built");
             return;
