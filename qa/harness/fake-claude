@@ -132,11 +132,25 @@ def env_dump(a):
             continue
         creds[name] = {"bytes": len(v.encode()), "sha256": hashlib.sha256(v.encode()).hexdigest(),
                        "class": credential_class(v)}
+    # Vault keys are exported under names the board chooses, so a fixed list cannot cover
+    # them. Names are not secret and values are; record every NAME, and a sha256 only for
+    # the names the test asks about (WHEEL_FAKE_ENV_DUMP_KEYS=a,b,c). That is enough to
+    # prove "the child received exactly this secret under exactly this name" without the
+    # secret existing anywhere a later grep could find it.
+    asked = [k for k in (os.environ.get("WHEEL_FAKE_ENV_DUMP_KEYS") or "").split(",") if k]
+    digests = {}
+    for name in asked:
+        v = os.environ.get(name)
+        digests[name] = None if v is None else {
+            "bytes": len(v.encode()), "sha256": hashlib.sha256(v.encode()).hexdigest()}
+
     rec = {"ts": now_iso(), "pid": os.getpid(), "argv0": os.path.basename(sys.argv[0]),
            "uid": os.geteuid() if hasattr(os, "geteuid") else None,
            "permission_mode": a.get("permission_mode"), "resume": a.get("resume"),
            "credentials": creds,
            "credential_vars_set": sorted(creds),
+           "env_names": sorted(os.environ),
+           "digests": digests,
            "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
            "argv": sys.argv[1:]}
     try:

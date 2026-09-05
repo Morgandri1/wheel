@@ -432,6 +432,10 @@ the calling agent must never see (fill precedence).
 | `SEC-vault-write-only` | `PUT /v1/vault/:id/:key` is the only way in; there is no read route. | **S1** |
 | `SEC-vault-at-rest` | Values are encrypted at rest with a per-project key; the canary does not appear in raw `/data/wheel.db` bytes. | **S1** |
 | `SEC-vault-env-scope` | Vault keys are exported into the env of agents **wired to that vault only**; an unwired agent's env has neither the key nor the value. | **S1** |
+| `SEC-vault-not-in-transcript` | The sentinel never appears in the **transcript** — the exact bytes the engine wrote to the child's stdin. The board and the log were already grepped; the transcript is a third place an operator reads, and a secret pasted into a prompt would land there and nowhere else. A canary grepped only where you remembered to look is not a canary. | **S1** |
+| `SEC-vault-wire-gated` | An agent with no `read` wire to a vault gets **exit 3** from `wheel secret get` — not an empty string, not a null, not a zero-length env var. Failing open here is silent: the agent proceeds with an unauthenticated request and the operator sees a remote 401, not a wire problem. | **S1** |
+| `SEC-vault-at-rest/grep-works` | The at-rest scan can find something it is *supposed* to find (the key NAME) in the same bytes. Without it, `SEC-vault-at-rest` passes when the scan is broken, when the file is empty, and when the DB moved — three ways to certify encryption that was never tested. | **S1** |
+| `SEC-vault-keys-are-names` | A vault node's `config.keys` still lists key NAMES on the board after a value is written — write-only must not become invisible. | S2 |
 | `SEC-table-isolation` | `wheel table query` cannot read another table node's `t_` table, or any engine-internal table (`nodes`, `wires`, `messages`, vault ciphertext) — via plain name, `ATTACH`, `pragma`, `sqlite_master`, CTE, or subquery. | **S1** |
 | `SEC-table-readonly` | A read wire cannot mutate: INSERT/UPDATE/DELETE/DROP/ATTACH/pragma writes all rejected. | **S1** |
 | `SEC-table-injection` | Table and column names derived from node names cannot inject SQL (`NODE-name-charset` is the defence; assert the failure mode too). | **S1** |
@@ -522,6 +526,29 @@ carries S1 criteria, and an S1 nobody runs is an S1 nobody catches.
 | `E2E-injection-visible` | The ctx markdown is visible in the agent's log/transcript view, proving injection end-to-end through the UI. |
 | `E2E-vault-masked` | Vault values are never rendered, even in DOM or network responses. **S1.** |
 | `E2E-testids` | Every assertion uses a stable `data-testid`. New ones requested from Web via PM — never by scraping text. |
+
+---
+
+## 11b. WOW — Wheel building Wheel (M1.6, operator priority)
+
+The acceptance test for the product rather than for a component: an agent inside a sandbox,
+handed a git token from a vault node, clones this repository and runs `cargo test -p
+wheel-core` — the same gate its own authors run. If that passes, the sandbox is a real
+development environment and not a demo.
+
+**Status: deferred, and committed anyway.** `wheel-engine:test` has `git` but not `cargo`
+or `gh`, so every ID below reports SKIP naming the missing tool. The suite is in the tree
+now so that it turns green or red on its own the day SDK lands a toolchain image, instead
+of waiting for someone to remember it existed. Opt-in via `WHEEL_WOW=1`: it clones over the
+network and compiles, which is minutes, and a gate developers run before every merge has to
+be seconds.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `WOW-vault-token` | The agent receives a git credential from a `vault` node it is wired to, and only from there — not from a baked-in image credential and not from the engine's own environment. | **S1** |
+| `WOW-clone` | The agent clones the repository into its workspace from inside the sandbox. | S2 |
+| `WOW-cargo-test` | `cargo test -p wheel-core` runs to completion inside the sandbox and its exit code reaches the agent. | S2 |
+| `WOW-no-token-in-log` | The git token appears in no log line, no transcript, no event, and no `git remote -v` output the agent can print. Cloning with a token in the URL is the ordinary way to do this and it writes the secret into `.git/config`. | **S1** |
 
 ---
 

@@ -86,6 +86,12 @@ if api_healthy; then
 else
   OWN_STACK=1
   echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
+  # infra/docker-compose.yml declares the `wheel` network external on purpose, so compose
+  # adopts one the host may already have created for per-project engine containers. Nothing
+  # creates it on a clean machine, which is why the first CI run of this job died on
+  # "network wheel declared as external, but could not be found" while every laptop passed:
+  # our laptops had the network left over. Creating it is setup, not product behaviour.
+  docker network create wheel >/dev/null 2>&1 || true
   docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1 || true
   if ! docker compose -f "$COMPOSE" up -d --build; then
     echo "  compose up failed — retrying once in 20s in case another run was mid-flight"
