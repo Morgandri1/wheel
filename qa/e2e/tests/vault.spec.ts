@@ -45,7 +45,7 @@ test("E2E-vault-masked: a written vault value never comes back to the browser", 
     await startProject(project.id);
     await page.goto(`/app/${project.id}`);
     await expect(page.getByTestId(T.board)).toBeVisible();
-    await page.getByTestId(T.node(vault.id)).click();
+    await page.getByTestId(T.node("secrets")).click();
 
     // The key NAME is expected to be visible; the value must not be, anywhere.
     await expect(page.getByTestId(T.inspectorEmpty)).toHaveCount(0);
