@@ -21,3 +21,23 @@ An `mcp` node with `transport:"stdio", command, args, env` causes the engine to 
 
 ## PoC plan
 `redteam/pocs/005_mcp_exec.sh` — mcp node with command=/bin/sh reading secrets; assert it runs as project uid, cannot reach engine.sock/wheel.db, and mcp.url=169.254.169.254 (MOCKED) is denied.
+
+## Regression checklist for QA (the MCP-surface "mapping" — each line = one test)
+Surface: built-in MCP server (`wheel mcp-serve`, stdio, node token) attached to EVERY agent; tools
+msg/read/write/rm/ls/query/secret_get/run/ctx_clear/inbox/whoami/connections + `<tool>__<op>` (§3d).
+1. **MCP-authz-parity:** for every cell of the 9×9×3 matrix, MCP tool allow/deny == CLI `/v1/cli/*`
+   allow/deny (same shared authz fn). Any divergence = privilege drift.
+2. **MCP-token-scope:** the node token used by the MCP server authorizes ONLY that node's wires; a
+   token from node A presented via B's MCP server (or after A is deleted/renamed/rewired) → denied.
+3. **MCP-field-rejection:** `<tool>__<op>` schema exposes ONLY `agent`-mode fields; supplying a
+   `static`/`vault`/`hidden` field (exact, case-variant, dup key, JSON-pointer collision) → 400 +
+   denial event, identical to the CLI path. Vault/static values never echoed in the MCP result.
+4. **MCP-no-stdin-write:** `msg`/`ctx_clear` over MCP go through the durable queue + single-writer
+   delivery loop; the MCP server never writes a child's stdin (§3c#12). Assert via WHEEL_FAKE_TRANSCRIPT:
+   no line originates from an MCP call outside the delivery loop's framing.
+5. **MCP-inbox-scope:** `inbox` returns ONLY messages where `to_node == caller`; guessing a sibling's
+   message id → denied/404 (authz by recipient, not by id lookup).
+6. **MCP-rogue-config:** an agent that edits its own harness MCP config to add a server gains NO
+   ambient authority — all enforcement is on the token server-side (ties to 002).
+7. **MCP-query-scope:** `query` over MCP is read-only, single-table, per-call scoped exactly like the
+   CLI authorizer (cross-ref sdk-review must-verify #1).
