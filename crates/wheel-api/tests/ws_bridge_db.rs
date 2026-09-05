@@ -60,6 +60,7 @@ async fn serve_api(engine: String) -> Option<(String, sqlx::PgPool)> {
         http: reqwest::Client::new(),
         orch: Arc::new(NoopOrchestrator) as Arc<dyn Orchestrator>,
         ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(60),
+        auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: Some(engine),
     });
 

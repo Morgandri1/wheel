@@ -17,6 +17,7 @@ pub struct Inner {
     pub http: reqwest::Client,
     pub orch: Arc<dyn Orchestrator>,
     pub ingress_limiter: RateLimiter,
+    pub auth_limiter: crate::http::authlimit::AuthLimiter,
     /// Test hook: when set, every project's engine resolves to this base URL instead of the
     /// docker-network hostname. Only ever populated by the test harness.
     pub engine_base_override: Option<String>,
