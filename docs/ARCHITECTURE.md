@@ -33,6 +33,12 @@ through PM unless you have a direct wire. Message format (one per message, first
 Do not wait for PM to approve the plan unless you have a blocking `QUESTION:` — you have authority within your
 ownership area. Ship small, commit often, keep main green.
 
+## 0b. Quality rules (operator-mandated, non-negotiable)
+
+1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
+2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
+3. **≥ 90 % test coverage** per crate and per package, enforced in `make check` (Rust: `cargo llvm-cov --workspace --fail-under-lines 90`; web: `vitest --coverage` with `lines: 90` threshold). Coverage below the bar is a failing check, not a warning.
+
 ## 1. Repository & workflow
 
 - Monorepo at `/Users/metatron/wheel` (git, branch `main`). PM has seeded it. Never rewrite history on `main`.
