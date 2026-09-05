@@ -9,3 +9,7 @@ node_modules/
 *.db-shm
 /data/
 .DS_Store
+qa/.venv/
+qa/.artifacts/
+__pycache__/
+.pytest_cache/

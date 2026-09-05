@@ -1,0 +1,22 @@
+{
+  "id": "c7af93bf-7810-4e4c-87f5-135fe31eb92c",
+  "name": "fs",
+  "type": "mcp",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "/data"
+    ],
+    "env": {
+      "FOO": "bar"
+    }
+  }
+}

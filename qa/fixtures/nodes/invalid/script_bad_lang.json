@@ -1,0 +1,15 @@
+{
+  "id": "704ee963-e05a-4562-8943-695a3dab7544",
+  "name": "s1",
+  "type": "script",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "language": "ruby",
+    "source": "x"
+  },
+  "_expect_reject": "NODE-script-lang"
+}

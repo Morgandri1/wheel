@@ -1,0 +1,14 @@
+{
+  "id": "3e5d63cc-2188-47cf-81b2-93f9d696745a",
+  "name": "m1",
+  "type": "mcp",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "transport": "stdio"
+  },
+  "_expect_reject": "NODE-mcp-transport"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "e472c1d3-5349-4e73-8235-5b2e97faad18",
+  "name": "house-style",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "# House style\n\n- Be terse.\n"
+  }
+}

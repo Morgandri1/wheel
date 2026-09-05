@@ -1,0 +1,16 @@
+{
+  "id": "bdc02ce5-598a-43c5-863c-4fc7fb77f0c3",
+  "name": "e3",
+  "type": "endpoint",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "method": "TRACE",
+    "path": "/x",
+    "response_mode": "ack"
+  },
+  "_expect_reject": "NODE-endpoint-path"
+}

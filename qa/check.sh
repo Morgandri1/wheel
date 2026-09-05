@@ -22,17 +22,24 @@ PASS=(); FAIL=(); SKIP=()
 STRICT="${CHECK_STRICT:-0}"   # CI sets 1: skips become failures
 ONLY="${CHECK_ONLY:-}"        # e.g. CHECK_ONLY=rust
 
+# A step exiting 77 means "I could not run" and is recorded as a SKIP, never a pass.
+# A gate that cannot run must not look like a gate that passed.
 step() { # step <name> <cmd...>
   local name="$1"; shift
   if [ -n "$ONLY" ] && [[ "$name" != $ONLY* ]]; then return 0; fi
   printf '%s▸ %s%s\n' "$C" "$name" "$Z"
-  local t0 t1; t0=$SECONDS
-  if "$@"; then
-    t1=$((SECONDS-t0)); PASS+=("$name (${t1}s)")
+  local t0 t1 rc; t0=$SECONDS
+  "$@"; rc=$?
+  t1=$((SECONDS-t0))
+  if [ $rc -eq 0 ]; then
+    PASS+=("$name (${t1}s)")
     printf '%s  ✓ %s%s (%ss)\n' "$G" "$name" "$Z" "$t1"
+  elif [ $rc -eq 77 ]; then
+    SKIP+=("$name — gate reported it could not run")
+    printf '%s  ⊘ %s skipped%s\n' "$Y" "$name" "$Z"
   else
-    t1=$((SECONDS-t0)); FAIL+=("$name")
-    printf '%s  ✗ %s FAILED%s (%ss)\n' "$R" "$name" "$Z" "$t1"
+    FAIL+=("$name")
+    printf '%s  ✗ %s FAILED%s (%ss, exit %d)\n' "$R" "$name" "$Z" "$t1" "$rc"
   fi
 }
 
@@ -43,6 +50,10 @@ skip() { # skip <name> <why>
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Prefer the QA venv (jsonschema, requests, pytest) when it exists; `make bootstrap` creates it.
+PY=python3
+[ -x qa/.venv/bin/python ] && PY=qa/.venv/bin/python
 
 # ----------------------------------------------------------------- rust
 RUST_CRATES=$(ls -d crates/*/Cargo.toml 2>/dev/null | wc -l | tr -d ' ')
@@ -84,18 +95,18 @@ fi
 
 # ----------------------------------------------------------------- qa's own
 if have python3; then
-  step "qa:harness-selftest" python3 qa/harness/selftest.py
+  step "qa:harness-selftest" "$PY" qa/harness/selftest.py
 else
   skip "qa:harness-selftest" "python3 not installed"
 fi
 
-step "qa:wire-matrix" python3 qa/tools/gen_wire_matrix.py --check
+step "qa:wire-matrix" "$PY" qa/tools/gen_wire_matrix.py --check
 
-if ls docs/schema/*.json >/dev/null 2>&1; then
-  step "qa:contract-schema" python3 qa/contract/schema_fixtures.py
-else
-  skip "qa:contract-schema" "docs/schema/*.json not exported yet (SDK)"
-fi
+# Proves the schema contract test can actually fail, using scratch schemas. Runs today.
+step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
+
+# Runs today and self-skips until SDK exports the schema, so it goes green on its own.
+step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
 
 # ----------------------------------------------------------------- summary
 echo

@@ -1,0 +1,17 @@
+{
+  "id": "a7fb1abd-4fa4-4714-88e0-b4ee1733849f",
+  "name": "coder",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "harness": "codex",
+    "model": null,
+    "system_prompt": "You write code.",
+    "run_on_startup": false,
+    "ephemeral_context": true
+  }
+}
