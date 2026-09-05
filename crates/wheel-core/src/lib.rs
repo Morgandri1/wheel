@@ -21,6 +21,7 @@ pub mod preamble;
 pub mod spawn;
 pub mod state;
 pub mod timestamp;
+pub mod tool;
 pub mod validate;
 pub mod wire;
 
@@ -45,6 +46,10 @@ pub use state::{
     AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, NodeState, NodeWithState,
 };
 pub use timestamp::Timestamp;
+pub use tool::{
+    host_is_denied, ip_is_denied, Fill, FillMode, ParamLocation, ToolConfig, ToolFormat,
+    ToolMethod, ToolOperation, ToolParam,
+};
 pub use validate::{normalize_chest_key, validate_config, validate_endpoint_path, ConfigError};
 pub use wire::{allowed_wires, check_wire, wire_allowed, Wire, WireError, WireSpec, WireType};
 

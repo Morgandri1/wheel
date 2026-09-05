@@ -1,0 +1,202 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolConfig",
+  "type": "object",
+  "required": [
+    "base_url"
+  ],
+  "properties": {
+    "base_url": {
+      "description": "Absolute `http(s)` origin every operation is resolved against.",
+      "type": "string"
+    },
+    "operations": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ToolOperation"
+      }
+    },
+    "source_format": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ToolFormat"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "Fill": {
+      "description": "How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.",
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/FillMode"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vault_ref": {
+          "description": "`<vault node name>/<key>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "FillMode": {
+      "description": "How a field is filled when the operation is called (§3d).",
+      "oneOf": [
+        {
+          "description": "The agent supplies it; appears in the operation's input schema.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        },
+        {
+          "description": "A value the operator typed. Never shown to the agent.",
+          "type": "string",
+          "enum": [
+            "static"
+          ]
+        },
+        {
+          "description": "Resolved at call time from a wired vault. Never shown to the agent and never returned by `/v1/board`.",
+          "type": "string",
+          "enum": [
+            "vault"
+          ]
+        },
+        {
+          "description": "Omitted from the request entirely.",
+          "type": "string",
+          "enum": [
+            "hidden"
+          ]
+        }
+      ]
+    },
+    "ParamLocation": {
+      "description": "Where a parameter goes in the HTTP request.",
+      "type": "string",
+      "enum": [
+        "header",
+        "path",
+        "query",
+        "cookie",
+        "body"
+      ]
+    },
+    "ToolFormat": {
+      "description": "The document format a tool node was imported from.",
+      "type": "string",
+      "enum": [
+        "openapi3",
+        "swagger2",
+        "postman21",
+        "insomnia4"
+      ]
+    },
+    "ToolMethod": {
+      "description": "Methods a tool operation may use. Deliberately a separate enum from [`crate::node::HttpMethod`]: `endpoint` nodes are contractually limited to GET/POST/PUT/DELETE (§3), while imported specs routinely contain PATCH and HEAD. Sharing one enum would silently widen the endpoint contract.",
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS"
+      ]
+    },
+    "ToolOperation": {
+      "description": "One callable operation. Exposed over MCP as `<tool name>__<id>`.",
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "path"
+      ],
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable identifier, unique within the node. Charset is restricted because it is concatenated into an MCP tool name.",
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/definitions/ToolMethod"
+        },
+        "params": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ToolParam"
+          }
+        },
+        "path": {
+          "description": "Path template relative to `base_url`, e.g. `/users/{id}`.",
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ToolParam": {
+      "type": "object",
+      "required": [
+        "location",
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fill": {
+          "default": {
+            "mode": "agent"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/Fill"
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/definitions/ParamLocation"
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "JSON Schema fragment for this field, used to build the MCP input schema."
+        }
+      }
+    }
+  }
+}

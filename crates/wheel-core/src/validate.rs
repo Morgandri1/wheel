@@ -1,7 +1,10 @@
 //! Validation shared by the engine and the API so the two cannot disagree
 //! about what a legal node config is.
 
-use crate::node::{EndpointConfig, NodeConfig, ScriptConfig, TableConfig};
+use crate::{
+    node::{EndpointConfig, NodeConfig, ScriptConfig, TableConfig},
+    tool::{Fill, FillMode, ToolConfig},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -37,6 +40,20 @@ pub enum ConfigError {
     BadVaultKey(String),
     #[error("agent system_prompt is too long (max {max} bytes)")]
     SystemPromptTooLong { max: usize },
+    #[error("tool base_url must be an absolute http:// or https:// URL")]
+    ToolBadBaseUrl,
+    #[error("tool base_url host {0:?} is not reachable: private, loopback or internal addresses are denied")]
+    ToolDeniedHost(String),
+    #[error("duplicate tool operation id {0:?}")]
+    DuplicateOperation(String),
+    #[error("tool operation id {0:?} must match ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$")]
+    BadOperationId(String),
+    #[error("tool operation {0:?} path must start with '/'")]
+    ToolBadPath(String),
+    #[error("field {0:?} has fill mode 'static' but no value")]
+    StaticFillMissingValue(String),
+    #[error("field {0:?} has fill mode 'vault' but vault_ref is missing or not '<vault>/<key>'")]
+    BadVaultRef(String),
 }
 
 pub const MAX_ENDPOINT_PATH: usize = 512;
@@ -171,7 +188,90 @@ pub fn validate_config(cfg: &NodeConfig) -> Result<(), ConfigError> {
             Ok(())
         }
         NodeConfig::Chest(_) => Ok(()),
+        NodeConfig::Tool(t) => validate_tool(t),
     }
+}
+
+fn validate_fill(field: &str, fill: &Fill) -> Result<(), ConfigError> {
+    match fill.mode {
+        FillMode::Static => {
+            if fill.value.is_none() {
+                return Err(ConfigError::StaticFillMissingValue(field.to_string()));
+            }
+        }
+        FillMode::Vault => {
+            let ok = fill
+                .vault_ref
+                .as_deref()
+                .and_then(Fill::parse_vault_ref)
+                .is_some();
+            if !ok {
+                return Err(ConfigError::BadVaultRef(field.to_string()));
+            }
+        }
+        FillMode::Agent | FillMode::Hidden => {}
+    }
+    Ok(())
+}
+
+fn validate_tool(cfg: &ToolConfig) -> Result<(), ConfigError> {
+    let rest = cfg
+        .base_url
+        .strip_prefix("https://")
+        .or_else(|| cfg.base_url.strip_prefix("http://"))
+        .ok_or(ConfigError::ToolBadBaseUrl)?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    // Strip a port, but not the colons of a bracketed IPv6 literal.
+    let host_only = if host.starts_with('[') {
+        host.split(']')
+            .next()
+            .unwrap_or(host)
+            .trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    if host_only.is_empty() {
+        return Err(ConfigError::ToolBadBaseUrl);
+    }
+    if crate::tool::host_is_denied(host_only) {
+        return Err(ConfigError::ToolDeniedHost(host_only.to_string()));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for op in &cfg.operations {
+        let id_ok = !op.id.is_empty()
+            && op
+                .id
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && op
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !id_ok {
+            return Err(ConfigError::BadOperationId(op.id.clone()));
+        }
+        if !seen.insert(op.id.as_str()) {
+            return Err(ConfigError::DuplicateOperation(op.id.clone()));
+        }
+        if !op.path.starts_with('/') {
+            return Err(ConfigError::ToolBadPath(op.id.clone()));
+        }
+        if op.path.split('/').any(|seg| seg == "..") {
+            return Err(ConfigError::PathTraversal);
+        }
+        for p in &op.params {
+            validate_fill(&format!("{}.{}", op.id, p.name), &p.fill)?;
+        }
+    }
+    Ok(())
 }
 
 /// Normalise and validate a chest blob key: relative, no `..`, no absolute

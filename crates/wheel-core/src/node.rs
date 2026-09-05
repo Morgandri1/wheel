@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     name::{Ident, NodeName},
+    tool::ToolConfig,
     wire::Wire,
 };
 
@@ -41,10 +42,11 @@ pub enum NodeType {
     Mcp,
     Vault,
     Chest,
+    Tool,
 }
 
 impl NodeType {
-    pub const ALL: [NodeType; 8] = [
+    pub const ALL: [NodeType; 9] = [
         NodeType::Agent,
         NodeType::Ctx,
         NodeType::Table,
@@ -53,6 +55,7 @@ impl NodeType {
         NodeType::Mcp,
         NodeType::Vault,
         NodeType::Chest,
+        NodeType::Tool,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -65,6 +68,7 @@ impl NodeType {
             NodeType::Mcp => "mcp",
             NodeType::Vault => "vault",
             NodeType::Chest => "chest",
+            NodeType::Tool => "tool",
         }
     }
 }
@@ -297,6 +301,7 @@ pub enum NodeConfig {
     Mcp(McpConfig),
     Vault(VaultConfig),
     Chest(ChestConfig),
+    Tool(ToolConfig),
 }
 
 impl NodeConfig {
@@ -310,6 +315,7 @@ impl NodeConfig {
             NodeConfig::Mcp(_) => NodeType::Mcp,
             NodeConfig::Vault(_) => NodeType::Vault,
             NodeConfig::Chest(_) => NodeType::Chest,
+            NodeConfig::Tool(_) => NodeType::Tool,
         }
     }
 
