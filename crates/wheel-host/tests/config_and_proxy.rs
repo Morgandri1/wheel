@@ -390,3 +390,134 @@ async fn a_correct_bearer_is_never_throttled() {
         );
     }
 }
+
+// ---------------------------------------------------------------- unix-socket transport
+
+/// The process backend gives the engine no TCP endpoint at all, so the proxy has to speak HTTP
+/// over a unix socket. These prove the socket path is actually dialled, and that the credential
+/// swap and the verbatim-path rule hold there too — the properties are the same, the transport is
+/// not.
+mod unix_transport {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct SocketSandbox(String);
+
+    #[async_trait::async_trait]
+    impl Sandbox for SocketSandbox {
+        async fn provision(&self, _: &Uuid, _: &Secrets) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start(&self, _: &Uuid, _: &Secrets) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Uuid) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn restart(&self, _: &Uuid, _: &Secrets) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn destroy(&self, _: &Uuid) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn status(&self, _: &Uuid) -> anyhow::Result<Status> {
+            Ok(Status::Running)
+        }
+        fn engine_base(&self, _: &Uuid) -> String {
+            format!("unix://{}", self.0)
+        }
+    }
+
+    /// A minimal engine on a unix socket that records what it was sent.
+    async fn socket_engine(path: String) -> Seen {
+        let seen = Seen::default();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // Same posture SDK sets on the real engine: 0600, explicit, not inherited from a umask.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let s = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                    if let Some(first) = text.lines().next() {
+                        if let Some(p) = first.split_whitespace().nth(1) {
+                            *s.path.lock().unwrap() = Some(p.to_string());
+                        }
+                    }
+                    for line in text.lines() {
+                        if let Some(v) = line.strip_prefix("authorization: ") {
+                            *s.auth.lock().unwrap() = Some(v.trim().to_string());
+                        }
+                    }
+                    let body = br#"{"nodes":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        seen
+    }
+
+    async fn harness_socket(sock: String) -> (Router, Uuid) {
+        let path = std::env::temp_dir().join(format!("wheel-usock-{}.db", Uuid::new_v4()));
+        let store = Arc::new(Store::open(path.to_str().unwrap()).unwrap());
+        let id = Uuid::new_v4();
+        store.upsert(&id, ENGINE_SECRET, "vault-key").await.unwrap();
+
+        let state = HostState {
+            cfg: cfg(),
+            sandbox: Arc::new(SocketSandbox(sock)),
+            store,
+            http: reqwest::Client::new(),
+            auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(1000)),
+        };
+        (build_router(state), id)
+    }
+
+    #[tokio::test]
+    async fn proxies_over_a_unix_socket_and_still_swaps_the_bearer() {
+        let sock = std::env::temp_dir()
+            .join(format!("wheel-eng-{}.sock", Uuid::new_v4()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let seen = socket_engine(sock.clone()).await;
+        let (app, id) = harness_socket(sock).await;
+
+        let (status, body) = send(&app, &format!("/host/v1/projects/{id}/engine/v1/board")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("nodes"), "body: {body}");
+
+        assert_eq!(
+            seen.auth.lock().unwrap().clone().unwrap(),
+            format!("Bearer {ENGINE_SECRET}"),
+            "the engine secret must be injected over the socket too"
+        );
+        assert_eq!(
+            seen.path.lock().unwrap().clone().unwrap(),
+            "/v1/board",
+            "the path must be forwarded verbatim over the socket as well"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_socket_is_an_enveloped_502() {
+        let (app, id) = harness_socket("/tmp/wheel-does-not-exist.sock".into()).await;
+        let (status, body) = send(&app, &format!("/host/v1/projects/{id}/engine/v1/board")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON, not a bare string");
+        assert_eq!(v["error"]["code"], "engine_unreachable");
+    }
+}

@@ -115,6 +115,25 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         }
     };
 
+    // In process mode the engine has no TCP endpoint at all — `engine_base` names a unix socket,
+    // which reqwest cannot dial. Route those over the socket instead of failing to parse a URL.
+    // Note this reads the socket from `base`, not from `upstream`: `upstream` already has the
+    // request path appended, so stripping the scheme off it would yield "<socket>/v1/board" and
+    // try to connect to a path that does not exist.
+    if let Some(socket) = base.strip_prefix("unix://") {
+        return forward_over_socket(
+            socket,
+            &suffix,
+            &query,
+            method,
+            headers,
+            body,
+            &rec.engine_secret,
+            id,
+        )
+        .await;
+    }
+
     let resp = match state
         .http
         .request(method, &upstream)
@@ -305,4 +324,126 @@ async fn pump(
         _ = to_engine => {},
         _ = to_client => {},
     }
+}
+
+/// Speak HTTP/1.1 to an engine listening on a unix socket.
+///
+/// The socket is mode 0600 and owned by the project uid, inside a 0700 directory — SDK sets that
+/// explicitly after bind rather than inheriting a umask, because under `umask 000` the inherited
+/// mode was 0777 and on a shared kernel that is reachable by every tenant. The host runs as root
+/// and so passes the permission check without anything being widened; if this ever starts failing,
+/// the fix is to run the proxy as the project uid, never to loosen the mode.
+#[allow(clippy::too_many_arguments)]
+async fn forward_over_socket(
+    socket: &str,
+    suffix: &str,
+    query: &str,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+    engine_secret: &str,
+    id: Uuid,
+) -> Response {
+    use http_body_util::BodyExt;
+    use hyper_util::rt::TokioIo;
+
+    let stream = match tokio::net::UnixStream::connect(socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(project = %id, error = ?e, socket, "engine socket unreachable");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine is not reachable.",
+            );
+        }
+    };
+
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(project = %id, error = ?e, "engine handshake failed");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine is not reachable.",
+            );
+        }
+    };
+    // The connection task drives the socket; dropping it would stall the request.
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = hyper::Request::builder()
+        .method(method)
+        .uri(format!("/{suffix}{query}"))
+        // A unix socket has no authority, but HTTP/1.1 still requires a Host header.
+        .header("host", "engine")
+        .header("authorization", format!("Bearer {engine_secret}"));
+    for (k, v) in headers.iter() {
+        builder = builder.header(k, v);
+    }
+
+    let request = match builder.body(http_body_util::Full::new(body)) {
+        Ok(r) => r,
+        Err(_) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "The request could not be forwarded.",
+            )
+        }
+    };
+
+    let upstream = match sender.send_request(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(project = %id, error = ?e, "engine request failed");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine is not reachable.",
+            );
+        }
+    };
+
+    let status = upstream.status();
+    let (parts, incoming) = upstream.into_parts();
+    let collected = match incoming.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine closed the connection.",
+            )
+        }
+    };
+
+    let mut out = Response::builder().status(status);
+    for (k, v) in parts.headers.iter() {
+        let n = k.as_str().to_ascii_lowercase();
+        if matches!(
+            n.as_str(),
+            "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "content-length"
+        ) {
+            continue;
+        }
+        out = out.header(k, v);
+    }
+    out.body(Body::from(collected)).unwrap_or_else(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "An unexpected error occurred.",
+        )
+    })
 }

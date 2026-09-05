@@ -3137,6 +3137,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bollard",
+ "bytes",
  "futures-util",
  "http",
  "http-body-util",
