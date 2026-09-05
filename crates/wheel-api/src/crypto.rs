@@ -58,7 +58,9 @@ pub fn open(master_key: &[u8; 32], sealed: &[u8]) -> Result<Secret> {
         .decrypt(Nonce::from_slice(nonce_bytes), ct)
         // A failure here means the key rotated, the row was tampered with, or the blob is
         // corrupt. All three are operator problems; none should reveal which to a client.
-        .map_err(|_| anyhow::anyhow!("aead decryption failed (wrong master key or tampered ciphertext)"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("aead decryption failed (wrong master key or tampered ciphertext)")
+        })?;
     Ok(Secret::new(
         String::from_utf8(pt).context("decrypted secret was not valid utf-8")?,
     ))
@@ -85,7 +87,10 @@ mod tests {
         let s = Secret::new("same-plaintext");
         let a = seal(&key(), &s).unwrap();
         let b = seal(&key(), &s).unwrap();
-        assert_ne!(a, b, "nonce reuse: identical plaintext produced identical ciphertext");
+        assert_ne!(
+            a, b,
+            "nonce reuse: identical plaintext produced identical ciphertext"
+        );
     }
 
     #[test]
@@ -99,7 +104,10 @@ mod tests {
         let mut sealed = seal(&key(), &Secret::new("x")).unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
-        assert!(open(&key(), &sealed).is_err(), "GCM tag did not reject tampering");
+        assert!(
+            open(&key(), &sealed).is_err(),
+            "GCM tag did not reject tampering"
+        );
     }
 
     #[test]

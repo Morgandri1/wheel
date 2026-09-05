@@ -37,14 +37,19 @@ impl DockerSandbox {
     async fn inspect_state(&self, id: &Uuid) -> Result<Option<String>> {
         match self
             .docker
-            .inspect_container(&self.cfg.container_name(id), None::<qp::InspectContainerOptions>)
+            .inspect_container(
+                &self.cfg.container_name(id),
+                None::<qp::InspectContainerOptions>,
+            )
             .await
         {
             Ok(c) => Ok(c
                 .state
                 .and_then(|s| s.status)
                 .map(|s| s.to_string().to_ascii_lowercase())),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(None),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
             Err(e) => Err(e).context("inspecting container"),
         }
     }
@@ -164,12 +169,17 @@ impl Sandbox for DockerSandbox {
 
         match self
             .docker
-            .start_container(&self.cfg.container_name(id), None::<qp::StartContainerOptions>)
+            .start_container(
+                &self.cfg.container_name(id),
+                None::<qp::StartContainerOptions>,
+            )
             .await
         {
             Ok(()) => {}
             // 304 = already started. Idempotent: a user click and a reconcile can race.
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {}
             Err(e) => return Err(e).context("starting container"),
         }
         self.await_healthy(id).await
@@ -178,12 +188,19 @@ impl Sandbox for DockerSandbox {
     async fn stop(&self, id: &Uuid) -> Result<()> {
         match self
             .docker
-            .stop_container(&self.cfg.container_name(id), None::<qp::StopContainerOptions>)
+            .stop_container(
+                &self.cfg.container_name(id),
+                None::<qp::StopContainerOptions>,
+            )
             .await
         {
             Ok(()) => Ok(()),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => Ok(()),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
             Err(e) => Err(e).context("stopping container"),
         }
     }
@@ -198,22 +215,33 @@ impl Sandbox for DockerSandbox {
             .docker
             .remove_container(
                 &self.cfg.container_name(id),
-                Some(qp::RemoveContainerOptions { force: true, v: false, ..Default::default() }),
+                Some(qp::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
             )
             .await
         {
             match e {
-                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {}
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => {}
                 other => return Err(other).context("removing container"),
             }
         }
         if let Err(e) = self
             .docker
-            .remove_volume(&self.cfg.volume_name(id), Some(qp::RemoveVolumeOptions { force: true }))
+            .remove_volume(
+                &self.cfg.volume_name(id),
+                Some(qp::RemoveVolumeOptions { force: true }),
+            )
             .await
         {
             match e {
-                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {}
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => {}
                 other => return Err(other).context("removing volume"),
             }
         }

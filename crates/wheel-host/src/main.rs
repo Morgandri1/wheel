@@ -50,6 +50,9 @@ async fn main() -> Result<()> {
 
     let sandbox: Arc<dyn Sandbox> = match cfg.backend {
         Backend::Docker => Arc::new(sandbox::docker::DockerSandbox::connect(cfg.clone())?),
+        Backend::External => Arc::new(sandbox::external::ExternalSandbox::new(
+            cfg.engine_base_url.clone(),
+        )),
         Backend::Process => {
             // M3. Failing loudly beats starting with a backend that silently does nothing.
             anyhow::bail!("the process sandbox backend is not implemented yet (M3)")
@@ -69,13 +72,25 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/host/v1/healthz", get(healthz))
-        .route("/host/v1/projects/{id}", put(put_project).get(get_project).delete(delete_project))
+        .route(
+            "/host/v1/projects/{id}",
+            put(put_project).get(get_project).delete(delete_project),
+        )
         .route("/host/v1/projects/{id}/start", axum::routing::post(start))
         .route("/host/v1/projects/{id}/stop", axum::routing::post(stop))
-        .route("/host/v1/projects/{id}/restart", axum::routing::post(restart))
+        .route(
+            "/host/v1/projects/{id}/restart",
+            axum::routing::post(restart),
+        )
         .route("/host/v1/projects/{id}/engine/{*rest}", any(proxy::engine))
-        .route("/host/v1/projects/{id}/ingress/{*rest}", any(proxy::ingress))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), require_bearer))
+        .route(
+            "/host/v1/projects/{id}/ingress/{*rest}",
+            any(proxy::ingress),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
@@ -96,7 +111,10 @@ async fn reconcile_on_boot(state: &HostState) {
             return;
         }
     };
-    tracing::info!(count = wanted.len(), "reconciling projects that were running");
+    tracing::info!(
+        count = wanted.len(),
+        "reconciling projects that were running"
+    );
     for rec in wanted {
         let secrets = Secrets {
             engine_secret: rec.engine_secret.clone(),
@@ -123,7 +141,11 @@ async fn require_bearer(State(state): State<HostState>, req: Request, next: Next
 
     if !constant_time_eq(presented.as_bytes(), state.cfg.secret.as_bytes()) {
         tracing::warn!("rejected host request with bad or missing bearer");
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response();
     }
     next.run(req).await
 }

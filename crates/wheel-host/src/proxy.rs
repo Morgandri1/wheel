@@ -43,7 +43,11 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
     };
 
     let base = state.sandbox.engine_base(&id);
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let upstream = format!("{base}/{suffix}{query}");
 
     // The events stream arrives here as a WebSocket upgrade rather than a normal request.
@@ -57,7 +61,16 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
     // below. Forwarding the host secret to a tenant's engine would hand every tenant the key to
     // every other tenant's sandbox.
     headers.remove(axum::http::header::AUTHORIZATION);
-    for h in ["connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "host", "content-length"] {
+    for h in [
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+        "te",
+        "trailer",
+        "host",
+        "content-length",
+    ] {
         headers.remove(h);
     }
 
@@ -88,7 +101,13 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         let n = k.as_str().to_ascii_lowercase();
         if matches!(
             n.as_str(),
-            "connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" | "trailer" | "content-length"
+            "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "content-length"
         ) {
             continue;
         }
@@ -107,7 +126,10 @@ fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
     let connection = headers
         .get(axum::http::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")));
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        });
     upgrade && connection
 }
 

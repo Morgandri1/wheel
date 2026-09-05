@@ -40,7 +40,8 @@ ownership area. Ship small, commit often, keep main green.
 
 ## 1. Repository & workflow
 
-- Monorepo at `/Users/metatron/wheel` (git, branch `main`). PM has seeded it. Never rewrite history on `main`.
+- Monorepo at `/Users/metatron/wheel` (git, branch `main`), origin `https://github.com/Morgandri1/wheel.git`. Never rewrite history on `main`.
+  Agents merge to `main` locally as before; **PM pushes `main` to origin** after merges (you may `git push origin main` yourself after a merge — fast-forward only, never force). Never edit files in the main worktree; the three `M` files someone leaves there break other people's merges.
 - Each agent works in its own **git worktree** so we don't fight over one index:
   `git -C /Users/metatron/wheel worktree add /Users/metatron/wheel-wt/<role> -b <role>/main` (role = sdk | api | web | qa | redteam).
 - Integrate frequently: rebase your branch on `main`, run `make check` (QA owns it; until it exists run your own
