@@ -351,6 +351,7 @@ pub async fn auth_complete(
     Ok(Json(serde_json::json!(wheel_core::AuthStatus {
         authenticated: true,
         mode: Some(kind),
+        source: None,
         account: None,
     })))
 }
@@ -458,6 +459,7 @@ async fn finish_paste_code(
     Ok(Json(serde_json::json!(wheel_core::AuthStatus {
         authenticated: true,
         mode: Some(wheel_core::CredentialKind::OauthSession),
+        source: None,
         account: None,
     })))
 }
@@ -484,6 +486,39 @@ pub async fn auth_status(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let harness = agent_harness(&s, id)?;
+    // A vault wins over a pasted credential: it is the thing the operator can
+    // see and change on the board, and it is how a project runs several
+    // accounts. Reporting the pasted one while the vault supplies the value
+    // the child actually runs with would be a lie about which account is live.
+    let vault_source = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        crate::vault::credential_source(&conn, id, harness).unwrap_or(None)
+    };
+    if let Some(source) = vault_source {
+        return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+            authenticated: true,
+            mode: Some(wheel_core::CredentialKind::Env),
+            source: Some(source),
+            account: None,
+        })));
+    }
+
+    // A wired vault wins: it is the thing the operator can see and change on
+    // the board, and it is how one project runs several accounts of the same
+    // provider. A pasted credential is the fallback, not the other way round.
+    let vault_source = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        crate::vault::credential_source(&conn, id, harness).unwrap_or(None)
+    };
+    if let Some(source) = vault_source {
+        return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+            authenticated: true,
+            mode: Some(wheel_core::CredentialKind::Env),
+            source: Some(source),
+            account: None,
+        })));
+    }
+
     let config_dir = s.cfg.creds_dir().join(id.to_string());
     let authenticated = crate::auth::has_stored_credentials(&config_dir, harness);
     // A stored token names its own kind. Otherwise credentials, if any, are
@@ -500,6 +535,7 @@ pub async fn auth_status(
     Ok(Json(serde_json::json!(wheel_core::AuthStatus {
         authenticated,
         mode,
+        source: None,
         account: None,
     })))
 }

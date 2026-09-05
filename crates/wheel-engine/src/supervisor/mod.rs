@@ -69,6 +69,9 @@ type AgentSlots = Arc<AsyncMutex<HashMap<Uuid, AgentSlot>>>;
 
 pub struct Supervisor {
     cfg: Arc<Config>,
+    /// Parsed once at construction: a project with an unusable vault key
+    /// should fail loudly at boot, not on the first secret read.
+    vault_key: Option<crate::vault::VaultKey>,
     db: Arc<Mutex<rusqlite::Connection>>,
     agents: AgentSlots,
     harness: Arc<dyn Harness>,
@@ -92,13 +95,28 @@ impl Supervisor {
         events: Arc<crate::events::Bus>,
         harness: Arc<dyn Harness>,
     ) -> Self {
+        let vault_key = cfg.vault_key.as_deref().and_then(|raw| {
+            match crate::vault::VaultKey::from_base64(raw) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    tracing::error!(error = %e, "vault key unusable; secrets will be unavailable");
+                    None
+                }
+            }
+        });
         Self {
             cfg,
+            vault_key,
             db,
             agents: Arc::new(AsyncMutex::new(HashMap::new())),
             harness,
             events,
         }
+    }
+
+    /// The project's vault key, if it has a usable one.
+    pub fn vault_key(&self) -> Option<&crate::vault::VaultKey> {
+        self.vault_key.as_ref()
     }
 
     pub fn events(&self) -> &Arc<crate::events::Bus> {
@@ -208,6 +226,26 @@ impl Supervisor {
             cmd.env(k, v);
         }
 
+        // Wired vaults, last, so a vault-supplied credential wins over a
+        // pasted one: the vault is the thing the operator can see and change
+        // on the board, and it is how a project runs several accounts.
+        //
+        // The third and final ambiguity check. The wire and the write are both
+        // refused earlier, but only this one is guaranteed to run before a
+        // child exists — a board restored from an export, or wires written
+        // before this rule existed, reach here without passing either.
+        let vault_env = match &self.vault_key {
+            Some(vk) => {
+                let conn = self.db.lock().unwrap();
+                crate::vault::env_for_agent(&conn, vk, agent)?
+            }
+            None => Vec::new(),
+        };
+        let secrets: Vec<String> = vault_env.iter().map(|(_, v)| v.clone()).collect();
+        for (k, v) in vault_env {
+            cmd.env(k, v);
+        }
+
         let mut child = cmd.spawn().context("spawning the harness")?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -227,9 +265,9 @@ impl Supervisor {
         // stderr is logged by its own task; the stdout task waits for it and
         // is the single owner of "this child has died", so the slot is cleared
         // and the status settled exactly once, in a defined order.
-        let stderr_done = self.pump_stderr(agent, stderr);
+        let stderr_done = self.pump_stderr(agent, stderr, secrets.clone());
         self.clone()
-            .pump_stdout(agent, stdout, slot.clone(), stderr_done, run_id);
+            .pump_stdout(agent, stdout, slot.clone(), stderr_done, run_id, secrets);
 
         Ok(AgentStatus::Starting)
     }
@@ -307,6 +345,7 @@ impl Supervisor {
         slot: Arc<AsyncMutex<Option<Running>>>,
         stderr_done: tokio::task::JoinHandle<String>,
         run_id: Uuid,
+        secrets: Vec<String>,
     ) {
         let db = self.db.clone();
         let harness = self.harness.clone();
@@ -331,6 +370,11 @@ impl Supervisor {
             // noisy session being reported as an error.
             let mut initialised = false;
             while let Ok(Some(line)) = lines.next_line().await {
+                // A child that prints its own environment must not put a
+                // secret into the log or the transcript. Accidental-echo
+                // protection only: an agent that can read a value can also
+                // transform it past this.
+                let line = crate::vault::redact(&line, &secrets);
                 if tail.len() + line.len() + 1 > STARTUP_OUTPUT_TAIL {
                     let drop_to = tail.len().min(line.len() + 1);
                     tail.drain(..drop_to);
@@ -583,6 +627,7 @@ impl Supervisor {
         &self,
         agent: Uuid,
         stderr: tokio::process::ChildStderr,
+        secrets: Vec<String>,
     ) -> tokio::task::JoinHandle<String> {
         let db = self.db.clone();
         let bus = self.events.clone();
@@ -590,6 +635,7 @@ impl Supervisor {
             let mut lines = BufReader::new(stderr).lines();
             let mut captured = String::new();
             while let Ok(Some(line)) = lines.next_line().await {
+                let line = crate::vault::redact(&line, &secrets);
                 captured.push_str(&line);
                 captured.push('\n');
                 let conn = db.lock().unwrap();

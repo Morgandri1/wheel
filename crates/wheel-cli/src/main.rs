@@ -115,6 +115,45 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
             )
         }
 
+        "secret" => {
+            let sub = rest.first().map(String::as_str).unwrap_or("");
+            match sub {
+                "get" => {
+                    let addr = rest
+                        .get(1)
+                        .ok_or_else(|| usage("secret get needs <vault>/<key>"))?;
+                    show(
+                        engine.get(&format!("/v1/cli/secret?addr={}", urlencode(addr)))?,
+                        json_out,
+                        render_secret,
+                    )
+                }
+                "list" => {
+                    let node = rest
+                        .get(1)
+                        .ok_or_else(|| usage("secret list needs <vault>"))?;
+                    show(
+                        engine.get(&format!("/v1/cli/secret/keys?node={}", urlencode(node)))?,
+                        json_out,
+                        render_keys,
+                    )
+                }
+                // `set` is deliberately absent: vaults are read-only to
+                // agents (§3e), and an agent that could write one could
+                // rewrite the credential another agent runs as.
+                "set" => {
+                    eprintln!(
+                        "wheel: agents cannot write vaults; ask the operator to set it in the UI"
+                    );
+                    Ok(1)
+                }
+                _ => {
+                    eprintln!("wheel: secret needs `get <vault>/<key>` or `list <vault>`\n");
+                    Ok(1)
+                }
+            }
+        }
+
         "inbox" => {
             let path = match rest.first() {
                 Some(id) => format!("/v1/cli/inbox?id={}", urlencode(id)),
@@ -128,6 +167,32 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
             print!("{USAGE}");
             Ok(1)
         }
+    }
+}
+
+/// A secret prints RAW, with no decoration and no trailing context: the whole
+/// point is `TOKEN=$(wheel secret get v/KEY)`, and a friendly prefix would end
+/// up inside the credential.
+/// Prints the bare value and nothing else, so `$(wheel secret get v/K)` is
+/// the secret rather than the secret plus a label.
+fn render_secret(v: &serde_json::Value) {
+    println!(
+        "{}",
+        v.get("value").and_then(|x| x.as_str()).unwrap_or_default()
+    );
+}
+
+/// Names only. A vault never lists its values, here or anywhere.
+fn render_keys(v: &serde_json::Value) {
+    let keys: Vec<&str> = v
+        .get("keys")
+        .and_then(|k| k.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        println!("no keys");
+    } else {
+        println!("{}", keys.join("\n"));
     }
 }
 

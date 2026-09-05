@@ -20,6 +20,7 @@ mod harness;
 mod oauth;
 mod peercred;
 mod supervisor;
+mod vault;
 
 use anyhow::Context;
 use config::Config;

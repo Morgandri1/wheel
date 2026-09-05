@@ -200,6 +200,11 @@ pub struct LsQuery {
     pub prefix: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct NodeQuery {
+    pub node: String,
+}
+
 // --- read / write ----------------------------------------------------------
 
 /// `GET /v1/cli/read?addr=<node>[/<row>]`
@@ -232,6 +237,60 @@ pub async fn read(
 #[derive(Debug, Deserialize)]
 pub struct AddrQuery {
     pub addr: String,
+}
+
+/// `GET /v1/cli/secret?addr=<vault>/<key>`
+///
+/// Wire-gated like every other read: the caller's token resolves to a node,
+/// and a vault it has no read wire to is exit 3, not an empty answer.
+pub async fn secret_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<AddrQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let (name, key) = split_address(&q.addr);
+    let key = key.ok_or_else(|| ApiError::invalid("secret get needs <vault>/<key>"))?;
+
+    let vk = s
+        .supervisor
+        .vault_key()
+        .ok_or_else(|| ApiError::internal("this project has no usable vault key"))?;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = me
+        .require(&conn, name, WireType::Read)
+        .map_err(|d| deny(&s, Some(&me), d))?;
+    if !matches!(node.config, wheel_core::NodeConfig::Vault(_)) {
+        return Err(ApiError::invalid(format!("{} is not a vault", node.name)));
+    }
+
+    let value = crate::vault::get(&conn, vk, node.id, key)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        // Exit 4 territory: the vault is reachable, the key is not there.
+        .ok_or_else(|| ApiError::not_found(format!("{}/{} is not set", node.name, key)))?;
+
+    Ok(Json(
+        serde_json::json!({ "node": node.name, "key": key, "value": value }),
+    ))
+}
+
+/// `GET /v1/cli/secret/keys?node=<vault>` — names only, never values.
+pub async fn secret_keys(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<NodeQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = me
+        .require(&conn, &q.node, WireType::Read)
+        .map_err(|d| deny(&s, Some(&me), d))?;
+    if !matches!(node.config, wheel_core::NodeConfig::Vault(_)) {
+        return Err(ApiError::invalid(format!("{} is not a vault", node.name)));
+    }
+    let keys =
+        crate::vault::list_keys(&conn, node.id).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "node": node.name, "keys": keys })))
 }
 
 #[derive(Debug, Deserialize)]

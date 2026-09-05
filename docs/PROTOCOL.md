@@ -123,6 +123,52 @@ that already holds its replacement. Before this, a slot left occupied made every
 no-op — `200 OK`, no process — which is exactly the path an operator walks when authenticating for the first
 time.
 
+### Vault nodes — secrets, and credentials per account
+
+```
+PUT    /v1/vault/:id/:key   {value}   → {key, stored: true}   write-only
+DELETE /v1/vault/:id/:key             → 204
+GET    /v1/vault/:id                  → {keys: [...]}         NAMES only
+GET    /v1/cli/secret?addr=<vault>/<key>   → {node, key, value}   wire-gated, agents
+GET    /v1/cli/secret/keys?node=<vault>    → {node, keys}         wire-gated, agents
+```
+
+Values are encrypted at rest with AES-256-GCM under the project's `WHEEL_VAULT_KEY`, and each
+ciphertext is bound to its vault id and key name — a row copied to another key or another node fails
+to decrypt rather than quietly becoming that other secret. Values never appear on `GET /v1/board`,
+in a log line, or in a transcript.
+
+A key whose name is one of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CODEX_API_KEY` is a
+**credential**: it is exported into the child's environment at spawn, so an agent with a read wire to
+a vault holding one is authenticated without anything being pasted into the UI. That is how one
+project runs several accounts of the same provider — **one vault per account**, and an agent uses the
+vault it is wired to. A vault-supplied credential wins over a pasted one: the vault is the thing the
+operator can see and change on the board. `GET .../auth` then reports
+`{authenticated: true, mode: "env", source: "<vault name>"}` — the name, never the value.
+
+**Ambiguity is refused, never resolved.** An agent wired to two vaults that both define the same key
+has no correct answer; resolving it would choose an account on the user's behalf and say nothing. It
+is rejected in three places, because there are three ways to reach the same broken state:
+
+| Where | Response |
+|---|---|
+| creating the second `agent → vault (read)` wire | `409 ambiguous_credential`, naming the key and both vaults |
+| `PUT /v1/vault/:id/:key` adding a key another wired vault already supplies | `409 ambiguous_credential` |
+| agent start | refused with the same reason — the only check guaranteed to run for a board restored from an export, or wired before this rule existed |
+
+The rule covers **any** duplicate key, not only the three credential names: every vault key is
+exported as an environment variable, so two vaults defining `FOO` is the same silent coin-flip. The
+message says `ambiguous credential <KEY>` for a recognised credential and `ambiguous vault key <KEY>`
+otherwise. Two *different* agents may of course use different vaults for the same key — the check is
+per agent, or the multi-account feature would forbid itself.
+
+Vaults are **read-only to agents** (§3e): `wheel secret get` and `wheel secret list` work, `set` does
+not. An agent that could write a vault could rewrite the credential another agent runs as.
+
+Secrets an agent can read are redacted from its log and transcript lines. That is
+**accidental-echo protection, not a containment boundary** — an agent that can read a value can
+transform it past any matcher. It exists because children print their own environment constantly.
+
 ### `run_on_startup` — parked, not running
 
 An agent configured `run_on_startup` comes up **`parked`** at engine boot: logically on, no process (§2 —
@@ -150,7 +196,7 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 
 | Route | Body → Response | M |
 |---|---|---|
-| `POST /v1/agents/:id/auth/begin` | `{mode?}` → `AuthBegin {mode, url?, user_code?, instructions, session}` | **M2, first** |
+| `POST /v1/agents/:id/auth/begin` | → `AuthBegin {mode, url, instructions, session}` (claude only) | **M1** |
 | `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code M2 |
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
 | `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |
@@ -158,6 +204,40 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 **`mode` is `CredentialKind`**: `"api_key"` · `"oauth_token"` · `"oauth_session"` · `null` when nothing is
 stored. It says what kind of credential the node holds, which is a different axis from `AuthMode` on
 `auth/begin` (how one is *obtained*) — the two share a field name and nothing else.
+
+#### Paste-code OAuth (`claude`)
+
+Two calls with a **live child process between them**, which is the only real complexity in this flow:
+
+1. `POST auth/begin` spawns `claude auth login --claudeai` with the node's own `CLAUDE_CONFIG_DIR`/`HOME`, reads
+   the authorize URL off its stdout and returns `{mode:"paste_code", url, instructions, session}`. The child is
+   left alive, blocked reading stdin.
+2. The user opens the URL, signs in, and the Anthropic-hosted callback shows them a code. `POST auth/complete
+   {code, session?}` writes it to that child's stdin and waits for it to exit.
+
+The engine parses the URL by looking for `https://`, not for the sentence around it — the CLI's wording
+("If the browser didn't open, visit: ") is cosmetic and has no contract behind it. Verified against the real
+bytes of `claude 2.1.261`, which are pinned in a test.
+
+`session` is optional but recommended: it stops a stale browser tab completing a login the user already
+restarted. A second `auth/begin` kills the first child rather than leaking a process per retry, and a login
+that is abandoned is evicted after **15 minutes**.
+
+| Outcome | Response |
+|---|---|
+| success | `200 AuthStatus {authenticated:true, mode:"oauth_session"}` |
+| no login in flight, expired, or superseded `session` | `409 {"error":{"code":"expired"}}` |
+| the CLI rejected the code | `400` carrying **the CLI's own reason**, not a generic failure |
+| the CLI never printed a URL, or never answered | `502` / `504` |
+| the CLI exited 0 but wrote no credentials | `502` — success here would leave an agent that looks signed in and fails on its first turn |
+
+`codex` signs in by device code, which is a poll rather than a submit; `auth/begin` on a codex node returns
+`400` saying so rather than a paste-code envelope nothing can satisfy.
+
+**Authenticating resumes the agent.** Saving a credential on a `needs_auth` agent moves it to `parked` and
+delivers anything queued immediately — no restart, no second call. With an empty queue it stays parked and
+costs nothing. The agent was started by someone who wanted it running, and a stuck queue behind a solved
+problem is not a state worth making an operator clear by hand.
 
 `auth/complete {api_key}` carries **either** a provider API key **or** the long-lived OAuth token from
 `claude setup-token`, and the engine tells them apart by prefix rather than making the caller declare which it

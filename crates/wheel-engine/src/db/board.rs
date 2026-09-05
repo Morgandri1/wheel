@@ -13,6 +13,10 @@ use wheel_core::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum BoardError {
+    /// Two vaults an agent can read supply the same key. Refused rather than
+    /// resolved: choosing one silently bills a real person's account.
+    #[error("{0}")]
+    Ambiguous(String),
     #[error("no such node: {0}")]
     NotFound(String),
     #[error("a node named {0:?} already exists")]
@@ -195,6 +199,19 @@ pub fn add_wire(
         .ok_or_else(|| BoardError::NotFound(to.to_string()))?;
 
     check_wire(from, from_node.node_type(), to, to_node.node_type(), ty)?;
+
+    // Refuse a second vault that would supply a key the agent already gets
+    // from another one. Caught here, at the moment the operator makes the
+    // wire, because the alternative is an agent that looks correctly
+    // configured and silently runs as whichever account won.
+    if from_node.node_type() == NodeType::Agent
+        && to_node.node_type() == NodeType::Vault
+        && ty == WireType::Read
+    {
+        if let Ok(Some(a)) = crate::vault::find_ambiguity(conn, from, Some(to)) {
+            return Err(BoardError::Ambiguous(a.to_string()));
+        }
+    }
 
     // Idempotent: re-creating an existing wire is a no-op, not an error.
     conn.execute(
