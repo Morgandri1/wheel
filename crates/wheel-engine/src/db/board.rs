@@ -245,6 +245,18 @@ pub fn update(conn: &Connection, node: &Node) -> Result<(), BoardError> {
 /// (`stopped`, unhosted) rather than erroring, so a board read never fails
 /// because a state row has not been written yet.
 pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
+    // Counted, not assumed. This was hardcoded 0, and the UI shows it: an
+    // operator authenticating a blocked agent read "0 queued" and concluded
+    // their message had been lost, which -- while a real data-loss bug was
+    // being fixed -- told a scarier story than the truth.
+    let queued: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE to_id = ?1 AND state = 'queued'",
+            params![node_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let s = conn
         .prepare(
             "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd
@@ -261,7 +273,7 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
                     .and_then(|t| wheel_core::Timestamp::parse_rfc3339(&t).ok()),
                 last_error: r.get(3)?,
                 hosted_on: r.get(4)?,
-                queued_messages: 0,
+                queued_messages: queued as u32,
                 spend: Some(wheel_core::Spend {
                     turns: r.get::<_, i64>(5)? as u64,
                     usd: r.get(6)?,
@@ -466,5 +478,43 @@ mod tests {
         create(&c, &n).unwrap();
         assert_eq!(get_by_name(&c, "house-style").unwrap().unwrap().id, n.id);
         assert!(get_by_name(&c, "nope").unwrap().is_none());
+    }
+
+    /// `queued_messages` was hardcoded 0 while a real data-loss bug was being
+    /// fixed, so the field said "your message is gone" at exactly the moment
+    /// an operator was checking whether it was. The number the UI shows must
+    /// come from the messages table, not from a literal.
+    #[test]
+    fn queued_messages_counts_what_is_actually_queued() {
+        let c = mem();
+        let a = agent("counted");
+        let b = agent("other");
+        create(&c, &a).unwrap();
+        create(&c, &b).unwrap();
+        assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 0);
+
+        for body in ["one", "two"] {
+            crate::db::messages::enqueue(&c, MessageSender::User, a.id, body.into(), None).unwrap();
+        }
+        crate::db::messages::enqueue(&c, MessageSender::User, b.id, "theirs".into(), None).unwrap();
+
+        assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 2);
+        // ...and it is per agent, not a board-wide total.
+        assert_eq!(agent_state(&c, b.id).unwrap().queued_messages, 1);
+
+        // A delivered message is no longer waiting, and a requeued one is
+        // waiting again -- which is the needs_auth path an operator watches.
+        let m = crate::db::messages::next_for_delivery(&c, a.id, 0)
+            .unwrap()
+            .unwrap();
+        crate::db::messages::advance(&c, m.id, MessageState::Delivered).unwrap();
+        assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 1);
+
+        crate::db::messages::requeue_all_undelivered(&c, a.id, "harness died").unwrap();
+        assert_eq!(
+            agent_state(&c, a.id).unwrap().queued_messages,
+            2,
+            "a requeued message must count as queued again"
+        );
     }
 }
