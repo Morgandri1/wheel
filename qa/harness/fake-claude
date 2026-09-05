@@ -76,6 +76,22 @@ def _readfile(p):
     except OSError: return None
 
 # ---------------------------------------------------------------- auth gate
+ROOT_REFUSAL = ("--dangerously-skip-permissions cannot be used with root/sudo "
+                "privileges for security reasons")
+
+def root_refusal_guard(a):
+    """Reproduce the real CLI's refusal of bypassPermissions when running as root.
+
+    Verified live by SDK: exit 1, EMPTY stdout, that exact stderr. Byte-identical in
+    exit code to an unauthenticated CLI, so a supervisor that infers needs_auth from
+    the exit code alone reports needs_auth forever for what is really a privilege
+    misconfiguration. WHEEL_FAKE_ROOT=1 forces it without needing a root container.
+    """
+    forced = os.environ.get("WHEEL_FAKE_ROOT") == "1"
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if (forced or is_root) and a.get("permission_mode") == "bypassPermissions":
+        die(ROOT_REFUSAL, 1)
+
 def auth_state():
     """Mirrors the engine's needs_auth flow. WHEEL_FAKE_AUTH=needs_auth|ok."""
     st = os.environ.get("WHEEL_FAKE_AUTH", "ok")
@@ -120,6 +136,8 @@ def main():
     if os.environ.get("WHEEL_FAKE_ROOT_REFUSAL") == "1" or (
             a["permission_mode"] == "bypassPermissions" and os.environ.get("WHEEL_FAKE_UID") == "0"):
         die("--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons", 1)
+
+    root_refusal_guard(a)
 
     if auth_state() == "needs_auth":
         # Real CLI exits non-zero with a login prompt on stderr; engine maps -> needs_auth.

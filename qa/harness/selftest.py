@@ -172,6 +172,17 @@ def t_no_secrets_in_argv():
         check("system prompt can be supplied by FILE (not argv)",
               ev.get("system_prompt") == "SECRET-CANARY-IN-FILE", repr(ev.get("system_prompt")))
 
+def t_root_refusal():
+    """ENG-root-refusal: reproduce the real CLI's refusal of bypassPermissions as root."""
+    p = run(SJ + ["--permission-mode", "bypassPermissions"], turn("x"), env={"WHEEL_FAKE_ROOT": "1"})
+    check("root+bypassPermissions exits 1", p.returncode == 1, str(p.returncode))
+    check("root refusal has EMPTY stdout", p.stdout.strip() == "", p.stdout[:120])
+    check("root refusal names the real reason",
+          "root/sudo" in p.stderr and "dangerously-skip-permissions" in p.stderr, p.stderr[:160])
+    check("root refusal is NOT an auth message", "login" not in p.stderr.lower())
+    p = run(SJ + ["--permission-mode", "default"], turn("x"), env={"WHEEL_FAKE_ROOT": "1"})
+    check("no refusal without bypassPermissions", p.returncode == 0)
+
 def t_transcript():
     with tempfile.TemporaryDirectory() as d:
         tp = os.path.join(d, "t.jsonl")

@@ -60,6 +60,7 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 | `NODE-tool-config` | `tool`: `kind: "http"`, valid `base_url`, `operations[]` each with unique slug `id`, method, path, `enabled`, and a `Fill` for every param/body field. Bad `fill.mode` → 400. |
 | `NODE-vault-writeonly` | `vault.config.keys` lists key NAMES only; values are never accepted here. |
 | `NODE-schema-roundtrip` | Every node type round-trips create → `GET /v1/board` → update → read without field loss or type coercion. |
+| `NODE-state-always-present` | `GET /v1/board` returns every node as `{...node, state}` with `state` **always present** — `null` for non-agent types, never omitted. A consumer must not have to distinguish "absent" from "null". |
 
 ---
 
@@ -200,6 +201,23 @@ container with an empty board (`ENG-route-*`), then behaviourally.
 | `ENG-spawn-listen` | `WHEEL_LISTEN=tcp://…` and `unix://…` both work; in process mode the socket is owned by the project uid, mode-restricted, and **not** reachable over TCP. |
 | `ENG-sigterm` | SIGTERM stops children and flushes sqlite within 15s, exits 0; no data loss, no orphaned harness processes. |
 | `ENG-restart-persist` | Board, messages, table data and chest blobs all survive an engine restart. |
+
+### 5a. Agent lifecycle — statuses, idle parking, and the root trap (§3c #13/#14)
+
+Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_exhausted | error`.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ENG-root-refusal` | Running the harness as **uid 0** with `--permission-mode bypassPermissions` is refused by the real CLI: exit 1, **empty stdout**, stderr `--dangerously-skip-permissions cannot be used with root/sudo privileges`. The engine must report a **configuration error**, NOT `needs_auth`. The exit code is identical to an unauthenticated CLI, so anything inferring auth state from the exit code alone will report `needs_auth` forever for a privilege misconfiguration — an unfixable-looking bug. Driven by `WHEEL_FAKE_ROOT=1`, no root container needed. | S2 |
+| `ENG-nonroot-child` | Children are spawned non-root and with `IS_SANDBOX=1`. | **S1** |
+| `ENG-needs-auth-source` | `needs_auth` is derived from stderr or an explicit probe (`claude auth status --json`), never from the exit code alone. Asserted by making a non-auth failure exit 1 and checking the agent does NOT land in `needs_auth`. | S2 |
+| `ENG-park-idle` | After `idle_timeout_secs` (default 300) an idle agent transitions `idle → parked` and its harness **process is stopped**. A parked agent having no live process is correct, not a crash. | S2 |
+| `ENG-park-resume` | The next message resumes a parked agent (`parked → starting → running`) with `--resume`, and the **same `session_id`** comes back — proving context was preserved rather than silently reset. | S2 |
+| `ENG-park-no-loss` | A message that arrives while parked is not lost and is delivered exactly once after resume. | **S1** |
+| `ENG-park-ephemeral` | With `ephemeral_context: true`, parking does not resurrect context that was meant to be cleared. | S2 |
+| `ENG-one-process` | **Exactly one harness process per agent at any time.** 10 messages sent within 100 ms produce ONE process and 10 sequential turns. Start is idempotent: a second start while running is a no-op returning the existing session. | **S1** |
+| `ENG-budget` | `budget.max_turns` / `max_usd` exhaustion → `budget_exhausted`, process stopped, event emitted; no further turns run. | S2 |
+| `ENG-health-not-liveness` | No test (and no engine health check) uses "a process is alive" as a proxy for "the agent is healthy" — `parked` is healthy and processless. | S3 |
 
 ---
 
