@@ -12,10 +12,12 @@ export interface PlateData extends Record<string, unknown> {
   takenNames: string[];
   onRename: (id: string, name: string) => void;
   onOpenLog: (id: string) => void;
+  /** Select the node so the inspector's Authenticate panel is in front of the person. */
+  onAuthenticate: (id: string) => void;
 }
 
 function NodePlateInner({ data, selected }: NodeProps) {
-  const { node, takenNames, onRename, onOpenLog } = data as PlateData;
+  const { node, takenNames, onRename, onOpenLog, onAuthenticate } = data as PlateData;
   const meta = NODE_META[node.type];
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(node.name);
@@ -153,12 +155,28 @@ function NodePlateInner({ data, selected }: NodeProps) {
               </span>
               {statusMeta!.label}
             </span>
-            <span
-              data-testid={`node-${node.name}-harness`}
-              className="border border-rule px-1.5 py-px text-micro text-ink-dim"
-            >
-              {node.config.harness === "claude" ? "Claude" : "Codex"}
-            </span>
+            {status === "needs_auth" ? (
+              /* The one status where the plate can offer the fix rather than only report the
+                 problem: one click puts the key field in front of the person. */
+              <button
+                data-testid={`node-${node.name}-authenticate`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAuthenticate(node.id);
+                }}
+                className="border px-1.5 py-px text-micro"
+                style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+              >
+                Authenticate
+              </button>
+            ) : (
+              <span
+                data-testid={`node-${node.name}-harness`}
+                className="border border-rule px-1.5 py-px text-micro text-ink-dim"
+              >
+                {node.config.harness === "claude" ? "Claude" : "Codex"}
+              </span>
+            )}
           </div>
         ) : node.type === "ctx" ? (
           <p className="line-clamp-2 text-micro text-ink-dim">

@@ -27,6 +27,7 @@ import {
   now,
   projects,
   startAgent,
+  setAgentState,
   stopAgent,
   type ProjectRecord,
 } from "./state";
@@ -260,9 +261,17 @@ async function engine(
     if (method === "POST" && step === "complete") {
       const body = await readJson<{ code?: string; api_key?: string }>(req);
       if (!body.code && !body.api_key) throw new EngineRefusal(400, "no code or api key supplied");
+      if (body.api_key && body.api_key.trim().length < 8) {
+        throw new EngineRefusal(400, "that key is too short to be real");
+      }
       record.authenticated.add(node.id);
       appendLog(record, node.id, "engine", "credentials accepted");
-      if (node.state?.status === "needs_auth") startAgent(record, node);
+      // Authenticating does NOT start a process. Queued messages are preserved and delivered
+      // after the agent is restarted, so the mock leaves it stopped and the UI has to say so —
+      // auto-starting here would hide the one step the person still has to take.
+      if (node.state?.status === "needs_auth") {
+        setAgentState(record, node, { status: "stopped" });
+      }
       json(res, 200, { authenticated: true, account: "you@example.com" });
       return true;
     }

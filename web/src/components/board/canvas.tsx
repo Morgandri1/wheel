@@ -78,9 +78,15 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
         type: "plate",
         position: dragged[n.id] ?? n.position,
         selected: n.id === selectedNodeId,
-        data: { node: n, takenNames, onRename: rename, onOpenLog: openTab } satisfies PlateData,
+        data: {
+          node: n,
+          takenNames,
+          onRename: rename,
+          onOpenLog: openTab,
+          onAuthenticate: select,
+        } satisfies PlateData,
       })),
-    [nodes, dragged, selectedNodeId, takenNames, rename, openTab],
+    [nodes, dragged, selectedNodeId, takenNames, rename, openTab, select],
   );
 
   const removeWire = useCallback(

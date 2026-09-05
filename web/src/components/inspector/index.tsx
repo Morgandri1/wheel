@@ -170,7 +170,7 @@ function AgentPanel({
         </p>
       ) : null}
 
-      <AuthFlow api={api} nodeId={node.id} onAuthenticated={onChanged} />
+      <AuthFlow api={api} nodeId={node.id} needsAuth={status === "needs_auth"} onAuthenticated={onChanged} />
 
       <Field label="Harness">
         <Select
