@@ -16,7 +16,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
-bollard = "0.19"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
