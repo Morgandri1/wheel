@@ -77,8 +77,12 @@ wheel/
 - **Web: Next.js 15 (App Router) + TypeScript + Tailwind + `@xyflow/react`** (board canvas) + TanStack Query + Clerk React.
 - **Auth: Clerk** (hosted; email/password + Google/GitHub/SAML SSO). Web obtains a Clerk session JWT; API verifies it
   against Clerk JWKS (`RS256`), using `sub` as the user id. No home-grown password storage.
+- **Security principle: an agent is untrusted remote code execution inside its sandbox.** Agents run with `--permission-mode bypassPermissions`
+  (a headless child would deadlock on prompts), so NOTHING relies on the agent restraining itself: every wire check, secret, and tenant boundary is
+  enforced engine-side or kernel-side. The sandbox boundary is the whole security story (ADVERSARY finding 002, accepted).
 - **Agents run as child processes** of the engine: `claude` CLI and `codex` CLI binaries baked into the container
   image. No Node SDKs in the Rust engine — we drive the CLIs' stream-JSON / JSONL protocols over stdin/stdout.
+  Operator ask: evaluate `srothgan/claude-code-rust` (a Rust TUI wrapping the official Agent SDK) — SDK runs a ≤1 h spike on whether its Rust↔Agent-SDK bridge is reusable as a library for our supervisor and gives a cleaner session/turn/interrupt protocol than raw stream-json; adopt only if it does. It does not remove Node from the image.
 - **Storage inside the container**: one sqlite file `/data/wheel.db` (nodes, wires, messages, runtime state, Table-node
   data, vault ciphertext, chest index). Chest blobs on disk `/data/chest/<node_id>/`. Scripts on disk `/data/scripts/<node_id>/`.
 - **One sandbox per project, one `wheel-engine` process per sandbox.** Sandboxes are created by `wheel-host` through a
@@ -234,8 +238,8 @@ body field** how it is filled:
 Rules: (1) `wheel tool ls` / the MCP tool schema expose ONLY `agent`-mode fields; the engine rejects any extra or non-agent field the caller tries to
 supply (400, logged as a denial event). (2) Fill precedence: `vault`/`static` are authoritative — an agent can never override them. (3) The engine
 executes the request itself (reqwest; 30s timeout; ≤5 MiB response; follows ≤3 redirects) and returns `{status, headers, body}` to the caller;
-`--curl` / the UI "copy as curl" render the exact equivalent `curl` with static/vault values masked. (4) **SSRF policy**: `base_url` and every
-redirect target must resolve to a public IP — loopback, RFC1918, link-local, `*.railway.internal`, `*.internal`, and the host's own addresses are
+`--curl` / the UI "copy as curl" render the exact equivalent `curl` with static/vault values masked. (4) **SSRF policy** (applies equally to `mcp.url` and to any URL an agent-supplied field can influence): `base_url` and every
+redirect target must resolve to a public IP — resolve once, pin the IP for the connection (defeats DNS rebinding), re-validate on every redirect hop, normalise IPv6-mapped/octal/decimal/shorthand forms — — loopback, RFC1918, link-local, `*.railway.internal`, `*.internal`, and the host's own addresses are
 denied (project-level allowlist may be added later; v1 is deny). (5) Import is idempotent per node: re-import diffs operations by `method+path`,
 keeps existing fills, flags removed/added ops in the UI. (6) Every call is logged as an event `{tool, op, status, duration_ms, bytes}` — never the
 resolved secret values. (7) MCP exposure: when an agent starts, each `read`-wired tool node contributes its enabled ops to the built-in MCP server
@@ -300,6 +304,12 @@ POST   /v1/agents/:id/start|stop|restart|clear
 POST   /v1/agents/:id/send  {body}        → user → agent message
 GET    /v1/agents/:id/log?since=<cursor>  → JSON lines (also streamed on /v1/events)
 POST   /v1/agents/:id/auth/begin          → { mode: "device_code"|"paste_code"|"api_key", url?, user_code?, instructions }
+                                            claude = paste_code (browser shows a code, user SUBMITS it back); codex = device_code (CLI shows a code, user
+                                            enters it in the browser, engine POLLS). Both stay distinct shapes. API-key mode: claude ANTHROPIC_API_KEY or
+                                            CLAUDE_CODE_OAUTH_TOKEN; codex CODEX_API_KEY (NOT OPENAI_API_KEY — codex ignores it for auth). Safe probes:
+                                            `claude auth status --json`, `codex login status`. Isolation per node: CLAUDE_CONFIG_DIR / CODEX_HOME with
+                                            cli_auth_credentials_store="file". Children run NON-ROOT + IS_SANDBOX=1 (bypassPermissions is refused as root
+                                            with an exit identical to "not logged in" — needs_auth is NEVER inferred from exit code alone, only from stderr/probe).
 POST   /v1/agents/:id/auth/complete {code?|api_key?}
 GET    /v1/agents/:id/auth                → { authenticated: bool, account?: string }
 PUT    /v1/vault/:id/:key   {value}       → write-only
@@ -365,12 +375,18 @@ GET    /healthz
 | Piece      | Where                     | Notes |
 |------------|---------------------------|-------|
 | `web`      | **Vercel**                | Next.js. Env: `NEXT_PUBLIC_API_URL=https://api.wheel.dev`, Clerk keys. Domain `wheel.dev`. |
-| `wheel-api`| **Railway**, N replicas   | Stateless. Public domain `api.wheel.dev`. Railway Postgres. Reaches the host over Railway private networking at `http://wheel-host.railway.internal:7100`. Built from `docker/Dockerfile.api`. |
-| `wheel-host` | **Railway**, exactly 1 replica, the biggest machine available | Runs every project's engine + agents as `process` sandboxes. Railway volume mounted at `/data`. **No public domain.** Built from `docker/Dockerfile.host` (root inside the container so it can `setuid` per project; drops to the project uid for every child). |
+| `wheel-api`| **Railway**, N replicas   | Stateless. Public domain `api.wheel.dev`. Railway Postgres. Reaches the host at `WHEEL_HOST_URL` (the host's HTTPS domain) with the host bearer. Built from `docker/Dockerfile.api`. |
+| `wheel-host` | **Railway, in its OWN Railway project** (separate private network from the API + Postgres — ADVERSARY finding 003), exactly 1 replica, the biggest machine available | Runs every project's engine + agents as `process` sandboxes. Railway volume mounted at `/data`. Reached by the API over its Railway-issued HTTPS domain with `WHEEL_HOST_SECRET` bearer + TLS (private networking does not cross projects); the host accepts nothing without that bearer. Agents inside sandboxes therefore cannot reach Postgres or API internals at all — only the host's own `:7100` (bearer-gated) and the public internet. Built from `docker/Dockerfile.host` (root inside the container so it can `setuid` per project; drops to the project uid for every child). |
 
 Local dev = `infra/docker-compose.yml`: postgres + api + host (host with `SANDBOX_BACKEND=docker` and the docker socket mounted, OR `process` to mirror prod).
 Railway config lives in `infra/railway/<service>/railway.toml` (or `railway.json`); one Railway service per piece; the web is not on Railway.
-Residual risks to track (ADVERSARY): all tenants share one kernel and one private network (agents could reach `*.railway.internal` — Postgres must be password-protected and the host secret must never be in a sandbox's env); a single host is a single point of failure (v1 accepts this; host reconciles on restart).
+Residual risks to track (ADVERSARY): all tenants share one kernel; per-uid egress filtering (nftables `owner` match / per-project netns) is
+possible only if the Railway container has `CAP_NET_ADMIN` or unprivileged user namespaces — API runs a **capability spike** on Railway
+(`capsh --print`, `unshare -rn true`, `mount -o remount,hidepid=2 /proc`) and we adopt whichever isolation the platform actually grants;
+until then the posture is: nothing sensitive is on the host's network (own Railway project), `:7100` is bearer-gated, `/proc/<pid>/environ`
+is kernel-protected per uid, and **no secret or prompt content ever goes on a command line** (argv is world-readable across uids — the system
+prompt/preamble/ctx are passed via a file in the node's 0700 config dir, never `--append-system-prompt <text>`). A single host is a single
+point of failure (v1 accepts this; host reconciles on restart).
 
 ## 6. Milestones
 
