@@ -181,7 +181,10 @@ pub enum StateError {
     #[error("no such message")]
     NotFound,
     #[error("illegal message transition {from} -> {to}")]
-    Illegal { from: MessageState, to: MessageState },
+    Illegal {
+        from: MessageState,
+        to: MessageState,
+    },
 }
 
 /// Move a message forward. Refuses any transition the contract does not allow,
@@ -250,10 +253,9 @@ pub fn inbox(
         "SELECT * FROM messages WHERE to_id = ?1 AND created_at > ?2
          ORDER BY created_at LIMIT ?3",
     )?;
-    let rows = stmt.query_map(
-        params![node.to_string(), since, limit as i64],
-        |r| row_to_message(conn, r),
-    )?;
+    let rows = stmt.query_map(params![node.to_string(), since, limit as i64], |r| {
+        row_to_message(conn, r)
+    })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 

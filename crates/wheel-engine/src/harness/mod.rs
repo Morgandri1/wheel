@@ -39,7 +39,10 @@ pub enum HarnessEvent {
     /// Session started; carries the session id everything else is checked against.
     Init { session_id: String },
     /// Assistant output to show in the log.
-    Text { session_id: Option<String>, text: String },
+    Text {
+        session_id: Option<String>,
+        text: String,
+    },
     /// The turn finished. THE turn-complete signal.
     Result {
         session_id: Option<String>,

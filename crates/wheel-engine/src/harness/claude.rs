@@ -4,14 +4,18 @@ use std::ffi::OsString;
 
 use super::{Harness, HarnessEvent, SpawnSpec, StartupFailure};
 
-pub struct Claude;
+/// The Claude Code driver.
+///
+/// Named `ClaudeDriver` rather than `Claude` so it never reads as the product
+/// name in call sites like `ClaudeDriver.parse_line(..)`.
+pub struct ClaudeDriver;
 
 /// Substring of the refusal `claude` prints when `bypassPermissions` is used as
 /// root. That case exits 1 with EMPTY stdout — identical to being logged out —
 /// so this string is the only thing that tells the two apart.
 const ROOT_REFUSAL: &str = "cannot be used with root/sudo privileges";
 
-impl Harness for Claude {
+impl Harness for ClaudeDriver {
     fn argv(&self, spec: &SpawnSpec) -> Vec<OsString> {
         let mut a: Vec<OsString> = vec![
             "--print".into(),
@@ -75,7 +79,9 @@ impl Harness for Claude {
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             // Not JSON. Log it and carry on — never fatal.
-            return HarnessEvent::Unknown { raw: line.to_string() };
+            return HarnessEvent::Unknown {
+                raw: line.to_string(),
+            };
         };
         let session_id = v
             .get("session_id")
@@ -88,7 +94,9 @@ impl Harness for Claude {
                     Some(session_id) => HarnessEvent::Init { session_id },
                     // An init without a session id is unusable for the
                     // session-matching F008 relies on, so it is not an init.
-                    None => HarnessEvent::Unknown { raw: line.to_string() },
+                    None => HarnessEvent::Unknown {
+                        raw: line.to_string(),
+                    },
                 }
             }
             Some("assistant") => {
@@ -109,22 +117,18 @@ impl Harness for Claude {
             }
             Some("result") => HarnessEvent::Result {
                 session_id,
-                is_error: v
-                    .get("is_error")
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false),
-                text: v
-                    .get("result")
-                    .and_then(|r| r.as_str())
-                    .map(str::to_string),
+                is_error: v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
+                text: v.get("result").and_then(|r| r.as_str()).map(str::to_string),
             },
             // Everything else — including event types we have never seen — is
             // log material, not an error.
-            _ => HarnessEvent::Unknown { raw: line.to_string() },
+            _ => HarnessEvent::Unknown {
+                raw: line.to_string(),
+            },
         }
     }
 
-    fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
+    fn classify_startup_failure(&self, code: Option<i32>, stderr: &str) -> StartupFailure {
         if stderr.contains(ROOT_REFUSAL) {
             return StartupFailure::Misconfigured(
                 "claude refuses --permission-mode bypassPermissions as root; \
@@ -132,7 +136,27 @@ impl Harness for Claude {
                     .into(),
             );
         }
-        StartupFailure::NeedsAuth
+
+        // Only a RECOGNISED auth message means needs_auth. Everything else —
+        // including an unrecognised error and a bare exit 1 with no output — is
+        // misconfiguration, because guessing needs_auth would send the operator
+        // down an auth rabbit hole for a container that is simply broken. The
+        // authoritative answer comes from `claude auth status --json` anyway;
+        // this is only the fast path.
+        let lower = stderr.to_ascii_lowercase();
+        for marker in ["not logged in", "invalid api key", "please run /login"] {
+            if lower.contains(marker) {
+                return StartupFailure::NeedsAuth;
+            }
+        }
+
+        StartupFailure::Misconfigured(match code {
+            Some(c) if !stderr.trim().is_empty() => {
+                format!("harness exited {c}: {}", stderr.trim())
+            }
+            Some(c) => format!("harness exited {c} with no output"),
+            None => format!("harness terminated without an exit code: {}", stderr.trim()),
+        })
     }
 }
 
@@ -155,7 +179,7 @@ mod tests {
     }
 
     fn argv_strings(s: &SpawnSpec) -> Vec<String> {
-        Claude
+        ClaudeDriver
             .argv(s)
             .into_iter()
             .map(|o| o.to_string_lossy().into_owned())
@@ -214,7 +238,7 @@ mod tests {
 
     #[test]
     fn each_node_gets_its_own_config_dir_so_agents_can_be_different_accounts() {
-        let env = Claude.env(&spec());
+        let env = ClaudeDriver.env(&spec());
         let get = |k: &str| {
             env.iter()
                 .find(|(n, _)| n == k)
@@ -230,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_turn_is_exactly_one_newline_terminated_json_line() {
-        let line = Claude.encode_turn("<AgentPrompt id=\"1\">\nhi\n</AgentPrompt>");
+        let line = ClaudeDriver.encode_turn("<AgentPrompt id=\"1\">\nhi\n</AgentPrompt>");
         assert!(line.ends_with('\n'));
         assert_eq!(line.matches('\n').count(), 1);
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
@@ -243,9 +267,8 @@ mod tests {
 
     #[test]
     fn init_result_and_assistant_are_recognised() {
-        let init = Claude.parse_line(
-            r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus"}"#,
-        );
+        let init = ClaudeDriver
+            .parse_line(r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus"}"#);
         assert_eq!(
             init,
             HarnessEvent::Init {
@@ -253,7 +276,7 @@ mod tests {
             }
         );
 
-        let asst = Claude.parse_line(
+        let asst = ClaudeDriver.parse_line(
             r#"{"type":"assistant","session_id":"s1","message":{"content":[{"type":"text","text":"hello"}]}}"#,
         );
         assert_eq!(
@@ -265,7 +288,7 @@ mod tests {
         );
 
         let res =
-            Claude.parse_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1"}"#);
+            ClaudeDriver.parse_line(r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1"}"#);
         assert_eq!(
             res,
             HarnessEvent::Result {
@@ -291,7 +314,7 @@ mod tests {
             r#"[1,2,3]"#,
         ] {
             assert!(
-                matches!(Claude.parse_line(line), HarnessEvent::Unknown { .. }),
+                matches!(ClaudeDriver.parse_line(line), HarnessEvent::Unknown { .. }),
                 "{line:?} should parse as Unknown, not panic or error"
             );
         }
@@ -301,7 +324,7 @@ mod tests {
     fn an_init_without_a_session_id_is_not_treated_as_an_init() {
         // F008 keys turn-completion on session_id, so an init we cannot bind to
         // a session is useless and must not set one.
-        let e = Claude.parse_line(r#"{"type":"system","subtype":"init","model":"opus"}"#);
+        let e = ClaudeDriver.parse_line(r#"{"type":"system","subtype":"init","model":"opus"}"#);
         assert!(matches!(e, HarnessEvent::Unknown { .. }));
     }
 
@@ -309,13 +332,73 @@ mod tests {
     fn a_root_refusal_is_misconfiguration_not_needs_auth() {
         // Both exit 1; only stderr distinguishes them. Getting this wrong makes
         // every container report needs_auth forever.
-        let root = Claude.classify_startup_failure(
+        let root = ClaudeDriver.classify_startup_failure(
             Some(1),
             "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons",
         );
         assert!(matches!(root, StartupFailure::Misconfigured(_)));
 
-        let logged_out = Claude.classify_startup_failure(Some(1), "");
-        assert_eq!(logged_out, StartupFailure::NeedsAuth);
+        // A recognised auth message, and only that, means needs_auth.
+        assert_eq!(
+            ClaudeDriver.classify_startup_failure(Some(1), "Not logged in · Please run /login"),
+            StartupFailure::NeedsAuth
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    /// The trap that would otherwise report every misconfigured container as
+    /// needing auth forever: running as root and being logged out BOTH exit 1,
+    /// and the root refusal writes NOTHING to stdout.
+    #[test]
+    fn the_root_refusal_is_misconfiguration_not_needs_auth() {
+        let f = ClaudeDriver.classify_startup_failure(
+            Some(1),
+            "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons",
+        );
+        match f {
+            StartupFailure::Misconfigured(m) => {
+                assert!(m.contains("non-root") || m.contains("IS_SANDBOX"));
+            }
+            other => panic!("root refusal must not be {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genuine_auth_failures_are_recognised() {
+        for stderr in [
+            "Not logged in · Please run /login",
+            "Invalid API key · Please run /login",
+            "NOT LOGGED IN",
+        ] {
+            assert_eq!(
+                ClaudeDriver.classify_startup_failure(Some(1), stderr),
+                StartupFailure::NeedsAuth,
+                "{stderr:?} should be needs_auth"
+            );
+        }
+    }
+
+    /// An unrecognised failure must NOT be guessed as needs_auth: that would
+    /// send the operator down an auth rabbit hole for a broken container.
+    #[test]
+    fn an_unrecognised_failure_defaults_to_misconfigured() {
+        for (code, stderr) in [
+            (Some(127), "claude: command not found"),
+            (Some(2), "some new error we have never seen"),
+            (None, "killed"),
+            (Some(1), ""),
+        ] {
+            assert!(
+                matches!(
+                    ClaudeDriver.classify_startup_failure(code, stderr),
+                    StartupFailure::Misconfigured(_)
+                ),
+                "{stderr:?} must not be guessed as needs_auth"
+            );
+        }
     }
 }
