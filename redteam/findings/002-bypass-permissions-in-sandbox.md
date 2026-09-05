@@ -21,3 +21,9 @@ For agents to be useful headless (run scripts, edit worktree, call tools) they w
 
 ## PoC plan
 `redteam/pocs/002_hostile_shell.sh` run as a script node: attempt to read /data/wheel.db, connect engine.sock/:7000 with no token and with own token to a non-wired endpoint, read sibling env, spawn fork bomb (rlimit check). Assert all denied.
+
+## Cross-ref (from api.md review): token-type discrimination at the engine
+The API's authenticated proxy forwards any path — including `v1/cli/*` — to the engine with the HOST/engine
+bearer. So invariant #2 has a second half: `/v1/cli/*` must require a per-NODE token AND reject the
+host/engine bearer; control-plane routes must reject node tokens. The API cannot enforce this (it correctly
+forwards); the engine must. Verify at engine impl. Owner: SDK/Engine.
