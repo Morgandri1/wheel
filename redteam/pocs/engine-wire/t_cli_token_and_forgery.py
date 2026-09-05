@@ -121,6 +121,21 @@ def main():
         st, b = call("GET", "/v1/cli/read?addr=no-such-node-xyz", bearer=TOK_A)
         check("4 F005 unwired/absent target denied via /v1/cli", st in (403, 404, 400), f"status={st} {b[:50]}")
 
+    # === ROTATION / STOP invalidation (PM: "deleted/rotated tokens dead") ===
+    # Optional: set WHEEL_AGENT_A_ID to exercise it. TOK_A is the PRE-restart token; a restart re-mints
+    # (invalidating the prior) and a stop deletes it, so the held token must go dead after each.
+    _sec = os.environ.get("WHEEL_ENGINE_SECRET")
+    _aid = os.environ.get("WHEEL_AGENT_A_ID")
+    if TOK_A and _aid and _sec:
+        call("POST", f"/v1/agents/{_aid}/restart", bearer=_sec); time.sleep(1.0)
+        st, _ = call("GET", "/v1/cli/whoami", bearer=TOK_A)
+        check("5 rotated (pre-restart) node token is dead", st in (401, 403), f"status={st}")
+        call("POST", f"/v1/agents/{_aid}/stop", bearer=_sec); time.sleep(0.5)
+        st, _ = call("GET", "/v1/cli/whoami", bearer=TOK_A)
+        check("5 stopped agent's node token stays dead", st in (401, 403), f"status={st}")
+    else:
+        print("SKIP 5: set WHEEL_AGENT_A_ID (+ WHEEL_ENGINE_SECRET) to exercise rotation/stop invalidation")
+
     if findings:
         print(f"\n{len(findings)} FINDING(S)")
         return 1
