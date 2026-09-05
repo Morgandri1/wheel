@@ -25,6 +25,7 @@ enum Target {
 }
 
 /// A response, reduced to what the CLI needs to decide an exit code.
+#[derive(Debug)]
 pub struct Reply {
     pub status: u16,
     pub body: serde_json::Value,
@@ -173,4 +174,192 @@ fn read_token() -> Result<String> {
         "no node token: {} is not set. Are you running inside an agent or a script?",
         wheel_core::spawn::ENV_TOKEN_FILE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn engine_on(sock: PathBuf) -> Engine {
+        Engine {
+            target: Target::Unix(sock),
+            token: "test-token".into(),
+        }
+    }
+
+    /// Serve one canned HTTP response and hand back what the client sent.
+    fn serve_once(sock: &PathBuf, response: &'static str) -> std::thread::JoinHandle<String> {
+        let listener = UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut got = String::new();
+            // Read only what is buffered: the client half-closes nothing, so
+            // reading to EOF here would deadlock against its own read.
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().ok();
+            got
+        })
+    }
+
+    fn tmp_sock(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "wheel-transport-{name}-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn a_unix_round_trip_parses_status_and_body() {
+        let sock = tmp_sock("ok");
+        let server = serve_once(
+            &sock,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"node\":\"notes\"}",
+        );
+        let reply = engine_on(sock.clone()).get("/v1/cli/whoami").unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body["node"], "notes");
+
+        let sent = server.join().unwrap();
+        assert!(sent.starts_with("GET /v1/cli/whoami HTTP/1.1"), "{sent:?}");
+        // The token travels as a bearer header, and `Connection: close` is what
+        // lets the body be read to EOF without chunked decoding.
+        assert!(
+            sent.contains("Authorization: Bearer test-token"),
+            "{sent:?}"
+        );
+        assert!(sent.contains("Connection: close"), "{sent:?}");
+        std::fs::remove_file(&sock).ok();
+    }
+
+    /// A 4xx is an ANSWER — the CLI turns it into an exit code. Flattening it
+    /// into a transport error would lose the engine's reason and the exit code
+    /// with it, so a wire denial would surface as "could not reach the engine".
+    #[test]
+    fn an_error_status_comes_back_as_a_reply_not_an_error() {
+        let sock = tmp_sock("denied");
+        let _server = serve_once(
+            &sock,
+            "HTTP/1.1 403 Forbidden\r\n\r\n{\"error\":{\"code\":\"wire_denied\",\"message\":\"no wire\"}}",
+        );
+        let reply = engine_on(sock.clone()).get("/v1/cli/read").unwrap();
+        assert_eq!(reply.status, 403);
+        assert_eq!(reply.body["error"]["code"], "wire_denied");
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn a_post_sends_a_content_length_and_the_json_body() {
+        let sock = tmp_sock("post");
+        let server = serve_once(&sock, "HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}");
+        let reply = engine_on(sock.clone())
+            .post("/v1/cli/msg", serde_json::json!({"to": "peer"}))
+            .unwrap();
+        assert_eq!(reply.status, 200);
+
+        let sent = server.join().unwrap();
+        let payload = r#"{"to":"peer"}"#;
+        assert!(
+            sent.contains(&format!("Content-Length: {}", payload.len())),
+            "{sent:?}"
+        );
+        assert!(
+            sent.ends_with(payload),
+            "body must be sent verbatim: {sent:?}"
+        );
+        std::fs::remove_file(&sock).ok();
+    }
+
+    /// An empty or non-JSON body is null, not a crash: the engine answers 204
+    /// with no body on some routes, and a parse panic there would turn a
+    /// successful call into a failure.
+    #[test]
+    fn a_body_that_is_not_json_becomes_null_rather_than_panicking() {
+        let sock = tmp_sock("empty");
+        let _server = serve_once(&sock, "HTTP/1.1 204 No Content\r\n\r\n");
+        let reply = engine_on(sock.clone()).get("/v1/cli/ls").unwrap();
+        assert_eq!(reply.status, 204);
+        assert_eq!(reply.body, serde_json::Value::Null);
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn an_unparseable_status_line_is_an_error_not_a_guess() {
+        let sock = tmp_sock("garbage");
+        let _server = serve_once(&sock, "not http at all\r\n\r\n");
+        assert!(engine_on(sock.clone()).get("/v1/cli/ls").is_err());
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn a_missing_socket_says_which_socket() {
+        let err = engine_on(PathBuf::from("/definitely/not/a/socket"))
+            .get("/v1/cli/whoami")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/definitely/not/a/socket"), "{err}");
+    }
+
+    /// ADVERSARY F007. The token must come from a 0600 FILE, because
+    /// `/proc/<pid>/environ` is readable by any process of the same uid — an
+    /// env token would hand every co-resident child every sibling's authority.
+    ///
+    /// All three branches in one test on purpose: they mutate process-wide
+    /// environment, and running them in parallel would let one clear what
+    /// another just set.
+    #[test]
+    fn the_token_comes_from_a_file_and_an_env_token_is_refused_loudly() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file_var = wheel_core::spawn::ENV_TOKEN_FILE;
+        let env_var = wheel_core::spawn::ENV_TOKEN;
+        let saved = (std::env::var(file_var).ok(), std::env::var(env_var).ok());
+
+        std::env::remove_var(file_var);
+        std::env::remove_var(env_var);
+        let err = read_token().unwrap_err().to_string();
+        assert!(err.contains("no node token"), "{err}");
+
+        // The legacy env var must be REFUSED, not quietly accepted: falling
+        // back to it would undo F007 the first time something set it.
+        std::env::set_var(env_var, "sekrit");
+        let err = read_token().unwrap_err().to_string();
+        assert!(err.contains("/proc"), "the refusal must say why: {err}");
+        assert!(
+            !err.contains("sekrit"),
+            "the refusal must not echo the token"
+        );
+
+        // A file wins, and trailing whitespace from an editor is not part of it.
+        let dir = std::env::temp_dir().join(format!("wheel-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "  abc123\n").unwrap();
+        std::env::set_var(file_var, &path);
+        assert_eq!(read_token().unwrap(), "abc123");
+
+        // A named but unreadable file is an error naming the path, not a
+        // silent fallback to the env var that is still set.
+        std::env::set_var(file_var, "/definitely/not/a/token");
+        let err = read_token().unwrap_err().to_string();
+        assert!(err.contains("/definitely/not/a/token"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        match saved.0 {
+            Some(v) => std::env::set_var(file_var, v),
+            None => std::env::remove_var(file_var),
+        }
+        match saved.1 {
+            Some(v) => std::env::set_var(env_var, v),
+            None => std::env::remove_var(env_var),
+        }
+    }
 }
