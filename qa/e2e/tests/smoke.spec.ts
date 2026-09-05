@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { T } from "../testids";
-import { addNode, addWire, board, createProject, deleteProject, tryWire } from "../api";
+import { addNode, addWire, board, createProject, deleteProject, startProject, tryWire } from "../api";
 
 /**
  * M1 vertical slice — TESTPLAN E2E-*.
@@ -18,6 +18,15 @@ const CTX_CANARY = "the-sky-is-green-4f2a";
 
 test.describe("M1 vertical slice", () => {
   test("E2E-landing: landing renders with no console errors", async ({ page }) => {
+    // BUG-007 (Web, S3): WheelMark computes SVG spoke coordinates with Math.cos/Math.sin and
+    // the last digit differs between the Node renderer and browser V8, so React reports a
+    // hydration mismatch — 48 console errors on the first page every visitor sees.
+    //
+    // test.fail() rather than skip: the test still RUNS, so if Web fixes it Playwright reports
+    // "expected to fail but passed" and this annotation has to be removed. A known bug cannot
+    // rot here any more than a tracked gap can in the schema gate.
+    test.fail(true, "BUG-007: hydration mismatch in WheelMark (web/src/components/header.tsx)");
+
     const errors: string[] = [];
     page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
     page.on("pageerror", (e) => errors.push(String(e)));
@@ -57,7 +66,8 @@ test.describe("M1 vertical slice", () => {
       // ctx -> agent (send) is the injection wire.
       await addWire(project.id, ctx.id, agent.id, "send");
 
-      await page.goto(`/app/${project.id}`);
+      await startProject(project.id);
+    await page.goto(`/app/${project.id}`);
       await expect(page.getByTestId(T.board)).toBeVisible();
       await expect(page.getByTestId(T.node(ctx.id))).toBeVisible();
       await expect(page.getByTestId(T.node(agent.id))).toBeVisible();

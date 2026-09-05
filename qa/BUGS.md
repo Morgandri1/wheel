@@ -12,6 +12,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 003 | `NODE-tool-config` | **S2** | SDK | ~~closed~~ | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
 | 005 | `make check` (`rust:fmt`) | S3 | API | ~~closed~~ | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
+| 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar |
 
 ---
@@ -191,6 +192,38 @@ against a real engine once `wheel-engine:test` exists; coverage is the cheaper e
 **Note on the exemption:** it is declared in `qa/tools/coverage_gate.py` naming the crate, the
 reason and the event that expires it. If `wheel-engine` reaches 90% while still exempt, the gate
 FAILS and tells us to remove the exemption — a stale exemption cannot outlive its reason.
+
+---
+
+## 007 — Landing page hydration mismatch from trig floating-point · S3 · Web
+
+`E2E-landing` fails: 48 console errors, all from one React hydration mismatch.
+
+**Cause** (from the CI trace, `web/src/components/header.tsx`, `WheelMark`): the SVG spoke
+coordinates are computed with `Math.cos`/`Math.sin`, and the result differs in the last digit
+between the Node server renderer and browser V8:
+
+```
++  y2={3.9892650149939453}     (client)
+-  y2="3.9892650149939435"     (server)
+```
+
+React serialises the server value as a string and compares; the two differ, so the whole tree is
+flagged as "hydrated but some attributes did not match. This won't be patched up."
+
+Trig is not required to be bit-identical across JS engines, so this will reproduce on any
+server/client pair, intermittently by platform — the kind of bug that is nearly impossible to find
+by looking, and easy to fix once seen.
+
+**Fix:** round to a fixed precision so both sides emit the same string, e.g.
+`const p = (n: number) => n.toFixed(3);` and use `x1={p(...)}`. Three decimals is far finer than
+a 24-unit viewBox can show.
+
+**Why it is worth fixing rather than muting:** "this won't be patched up" means React keeps the
+server DOM for that subtree, so any client-side state it depends on can silently diverge. It is
+also 48 console errors on the first page every visitor sees, which buries real errors.
+
+**Repro:** CI e2e job, or `make test-e2e` on a machine that can launch chromium.
 
 ---
 
