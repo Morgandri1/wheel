@@ -41,16 +41,13 @@ async fn pump(mut socket: WebSocket, s: AppState) {
                 // slow browser must never stall the supervisor. The client
                 // refetches GET /v1/board to resynchronise.
                 Err(RecvError::Lagged(_)) => {
-                    let _ = socket
-                        .send(Message::Text(
-                            serde_json::json!({
-                                "type": "lagged",
-                                "hint": "events were dropped; refetch GET /v1/board"
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await;
+                    let frame = wheel_core::Event::Lagged {
+                        hint: wheel_core::LAGGED_HINT.to_string(),
+                    };
+                    let Ok(json) = serde_json::to_string(&frame) else { continue };
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
                     continue;
                 }
                 Err(RecvError::Closed) => break,

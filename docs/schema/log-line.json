@@ -47,6 +47,13 @@
           "enum": [
             "engine"
           ]
+        },
+        {
+          "description": "The exact bytes the engine wrote to the child's stdin (§3c#10).\n\nCarried on the same stream as everything else deliberately: a separate subscription would double the reconnect and cursor logic for no gain. `stdout` is what the agent SAID; `transcript` is what it was HANDED.",
+          "type": "string",
+          "enum": [
+            "transcript"
+          ]
         }
       ]
     },

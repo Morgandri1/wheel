@@ -18,6 +18,12 @@ pub enum LogStream {
     Stderr,
     /// Emitted by the engine itself (spawn, exit, session clear, ...).
     Engine,
+    /// The exact bytes the engine wrote to the child's stdin (§3c#10).
+    ///
+    /// Carried on the same stream as everything else deliberately: a separate
+    /// subscription would double the reconnect and cursor logic for no gain.
+    /// `stdout` is what the agent SAID; `transcript` is what it was HANDED.
+    Transcript,
 }
 
 /// One line of agent output. `seq` is monotonic per agent and is the cursor
@@ -64,4 +70,18 @@ pub enum Event {
     /// A capability check failed.
     #[serde(rename = "wire.denied")]
     WireDenied { denial: WireDenial },
+    /// This subscriber fell behind and events were dropped.
+    ///
+    /// Transport-level rather than a board fact, but it travels on the same
+    /// socket and so belongs in the same union: a client that types the union
+    /// from the schema and meets an undeclared frame will take its default
+    /// branch, and the natural default — tear down and reconnect — is exactly
+    /// wrong here. The socket is healthy and merely behind. Refetch
+    /// `GET /v1/board` and keep the connection.
+    #[serde(rename = "lagged")]
+    Lagged { hint: String },
 }
+
+/// The message accompanying [`Event::Lagged`], in one place so the engine and
+/// the docs cannot drift.
+pub const LAGGED_HINT: &str = "events were dropped; refetch GET /v1/board";
