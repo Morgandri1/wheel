@@ -37,18 +37,38 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      - uses: pnpm/action-setup@v4
+      # Web is not on main yet. actions/setup-node resolves cache-dependency-path at
+      # setup time and hard-fails when web/pnpm-lock.yaml is absent, which killed the
+      # whole run in 17s and masked the real gate failures behind it. Both steps are
+      # conditional, and caching only turns on once the lockfile actually exists.
+      - id: web
+        run: |
+          if [ -f web/package.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -f web/pnpm-lock.yaml ]; then echo "lock=true" >> "$GITHUB_OUTPUT"
+          else echo "lock=false" >> "$GITHUB_OUTPUT"; fi
+
+      - if: steps.web.outputs.present == 'true'
+        uses: pnpm/action-setup@v4
         with: { version: 9 }
-      - uses: actions/setup-node@v4
+      - if: steps.web.outputs.present == 'true' && steps.web.outputs.lock == 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
+      - if: steps.web.outputs.present == 'true' && steps.web.outputs.lock != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       # Bootstrap first: qa/.venv is gitignored, and without it the schema contract
       # gate SKIPS. A skipped gate on main is a blind spot — it hid BUG-003.
       - run: make bootstrap
-      - run: make check
+      # check-strict: coverage enforced per crate (§0b), and a gate that COULD NOT RUN is
+      # a failure here — in CI that is a broken pipeline pretending to be a passing one.
+      # An area that does not exist yet (no web/) is reported, not failed.
+      - run: make check-strict
 
   integration:
     name: integration (docker + fake harness)
