@@ -1,62 +1,41 @@
-/* Patchbay tokens — docs/plans/web.md §1. Dark is canonical; light is tuned, not inverted. */
-:root,
+:root {
+  color-scheme: light;
+
+  --panel-0: #f1f2ed;
+  --panel-1: #ffffff;
+  --panel-2: #e6e8e1;
+  --rule: #c6cbc2;
+  --rule-strong: #a9b0a5;
+  --ink: #171c1a;
+  --ink-dim: #5c6963;
+  --ink-faint: #8b968f;
+  --live: #0e8f68;
+  --danger: #c8382c;
+  --plate-highlight: rgba(255, 255, 255, 0.9);
+  --grid-dot: #ccd1c8;
+
+  --wire-read: #1e6fbf;
+  --wire-write: #a76a06;
+  --wire-send: #7b3fc4;
+}
+
 [data-theme="dark"] {
-  --panel-0: #161b19; /* canvas ground: green-shifted graphite */
-  --panel-1: #1f2624; /* node plates, inspector, drawer */
-  --panel-2: #283130; /* raised: inputs, hovered rows */
+  color-scheme: dark;
+
+  --panel-0: #161b19;
+  --panel-1: #1f2624;
+  --panel-2: #262f2c;
   --rule: #33403c;
-  --rule-strong: #4a5b56;
+  --rule-strong: #4a5a55;
   --ink: #e6ebe7;
   --ink-dim: #8fa09a;
-  --ink-faint: #64756f;
+  --ink-faint: #6b7a75;
   --live: #4ed6a9;
-  --alarm: #f2645a;
-  --edge-hi: rgb(255 255 255 / 0.045);
-  --dot: #2b3532;
+  --danger: #f2645a;
+  --plate-highlight: rgba(255, 255, 255, 0.045);
+  --grid-dot: #2b3532;
 
   --wire-read: #63b3f5;
   --wire-write: #e9a23b;
   --wire-send: #c77dff;
-
-  /* Node-type keys. Muted on purpose: they identify, the wire accents signal. */
-  --type-agent: #6fd3b0;
-  --type-ctx: #d8cba0;
-  --type-table: #7fb4e8;
-  --type-endpoint: #e39a78;
-  --type-script: #b9a6e8;
-  --type-mcp: #8fcbd9;
-  --type-vault: #d9a0b4;
-  --type-chest: #c0cba0;
-
-  color-scheme: dark;
-}
-
-[data-theme="light"] {
-  --panel-0: #f1f2ed; /* bone — deliberately not cream */
-  --panel-1: #ffffff;
-  --panel-2: #e9ebe4;
-  --rule: #c6cbc2;
-  --rule-strong: #9ba49c;
-  --ink: #171c1a;
-  --ink-dim: #5c6963;
-  --ink-faint: #8a958f;
-  --live: #0e8f68;
-  --alarm: #c33a30;
-  --edge-hi: rgb(255 255 255 / 0.9);
-  --dot: #d3d7cf;
-
-  --wire-read: #2775c4;
-  --wire-write: #a96a05;
-  --wire-send: #8b3fd4;
-
-  --type-agent: #17795d;
-  --type-ctx: #7a6a2c;
-  --type-table: #2a5f96;
-  --type-endpoint: #a3502f;
-  --type-script: #5b4696;
-  --type-mcp: #256b7c;
-  --type-vault: #93365a;
-  --type-chest: #5a6b2c;
-
-  color-scheme: light;
 }
