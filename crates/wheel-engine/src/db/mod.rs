@@ -12,6 +12,7 @@ use rusqlite::Connection;
 
 pub mod board;
 pub mod messages;
+pub mod tokens;
 
 /// Open (creating if needed) and migrate the project database.
 pub fn open(path: &Path) -> Result<Connection> {
