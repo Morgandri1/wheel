@@ -208,6 +208,7 @@ We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in th
 | 9 | No threading. | `wheel msg --reply-to <id>`; envelope gains `reply_to="<id>"`; Web groups threads. | M2 (nice-to-have) |
 | 10 | Operator couldn't see that a message was mangled. | Web's agent drawer shows every message (body, sha256, state, from/to) and, per agent, the exact bytes written to stdin (transcript view). | Web · M2 |
 | 11 | Long messages truncated somewhere between sender and recipient's context. | Engine never truncates; if a harness limit would be exceeded the message stays `queued` with `last_error`, is surfaced in the UI, and is never silently clipped. | M1 |
+| 12 | **User input races agent prompts**: the operator's typed message and inbound agent messages both hit the harness's stdin and interleave mid-turn. | **Single writer.** The engine's per-agent delivery loop is the ONLY thing that ever writes to a child's stdin. The user's chat box is a client-side draft (kept in `localStorage` per agent, survives reload) until Send; Send creates a normal `messages` row (`from=user`, `type=user`) via `POST /v1/agents/:id/send` and returns its id. Delivery is strictly serial: one message per turn, the next written only after the harness's `result`. User messages are ordered **ahead of** queued agent/endpoint/script messages (priority lane) but are never injected mid-turn. The UI shows the message as `queued (next)` / `delivered` / `consumed` so the user sees exactly when it landed. Explicit interrupt is a separate, deliberate action (`POST /v1/agents/:id/interrupt` → engine cancels the in-flight turn per the harness's protocol, then delivers the user's message) — never implicit. | M1 (queue+priority) · interrupt M2 |
 
 
 ### 3d. Tool nodes — imported HTTP specs as agent tools (operator requirement; owner: SDK engine/import, Web UI)
@@ -238,7 +239,7 @@ Milestone: **M2** (core types + import parsers + executor + CLI + UI); MCP expos
 - `ephemeral_context: true` → when the agent finishes its turn (harness emits result/idle), engine clears context
   (new session), re-applies system prompt + injected ctx nodes, then continues draining the queue. Agents can also
   request this via `wheel ctx clear`.
-- Messages from the UI ("chat" with an agent) are `from_node = user`.
+- Messages from the UI ("chat" with an agent) are `from_node = user`, go through the same queue as everything else, and take the priority lane (§3c #12). There is exactly one stdin writer per agent; nothing else may write to the child.
 
 ## 4. Engine control plane (inside the sandbox; `:7000` in docker mode, unix socket in process mode; bearer `WHEEL_ENGINE_SECRET`) — SDK owns, host+API proxy, Web consumes
 
