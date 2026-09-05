@@ -12,7 +12,7 @@ cannot quietly outlive its reason.
 
 Runs one instrumented build for the whole workspace and splits the result per crate.
 """
-import json, os, subprocess, sys, collections
+import json, os, shutil, subprocess, sys, tempfile, collections
 
 SKIP = 77
 MIN = float(os.environ.get("COV_MIN", "90"))
@@ -28,7 +28,10 @@ def main():
         print("cargo-llvm-cov not installed — run 'make bootstrap'")
         return SKIP
 
-    out = os.path.join(ROOT, "target", "qa-coverage.json")
+    # NOT <repo>/target: ~/.cargo/config.toml points every worktree at one shared
+    # target-dir, so <repo>/target may not exist and llvm-cov fails to create the report.
+    tmp = tempfile.mkdtemp(prefix="wheel-cov-")
+    out = os.path.join(tmp, "qa-coverage.json")
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
          # PM-approved, requested by API, owned here rather than in their crates so the
@@ -53,6 +56,7 @@ def main():
 
     with open(out) as f:
         data = json.load(f)
+    shutil.rmtree(tmp, ignore_errors=True)
 
     # Sum per crate from per-file line counts; a crate is crates/<name>/...
     per = collections.defaultdict(lambda: [0, 0])   # crate -> [covered, total]
