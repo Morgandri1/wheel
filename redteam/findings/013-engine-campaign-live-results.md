@@ -36,3 +36,12 @@ PM's four CLI probes — probe file `redteam/pocs/engine-wire/t_cli_token_and_fo
 This closes the wrong-realm direction of the token-type-discrimination invariant I routed to SDK (findings 002 #2 / 005). Code corroborates: `api/mod.rs` nests `/v1/cli` under a per-node-token layer disjoint from `require_engine_secret` on `/v1/*`; `db/tokens.rs` stores only sha256, rotates on start, revokes on stop; `caps.rs` unit-tests "token = exactly its own node" and "fabricated/expired = nobody". Container removed (trap).
 
 STAGED (need a node-populated stack — best run on the live stack per this file's pattern, not duplicated under low-priority): 3d node-token→/v1/* must fail, 3e own-realm ok, 3f write⇒read (read-wire cannot write), probe 2 (agent→agent attribution forgery via /v1/cli/msg — body cannot forge from="user"), probe 1 (§3c#12 concurrent-peer sends → envelope integrity), probe 4 (F005 unwired target denied). Env vars documented in the probe header.
+
+## CLI-gated set — LIVE, wheel-engine:test @ c99ed40 (2026-09-05, own throwaway container, removed after)
+Driver `redteam/pocs/engine-wire/run_cli_campaign.sh` + probe `t_cli_token_and_forgery.py`. **11/11 RESISTED, 0 findings:**
+- Token-type discrimination: engine secret → /v1/cli = 401; fabricated/missing node token → 401; node token → /v1/* control plane = 401; valid node token → /v1/cli/whoami = 200. (findings 002#2, api-review invariant CLOSED live.)
+- Rotation/stop: pre-restart token dead (401) after restart; token stays dead after stop. (PM "rotated/deleted tokens dead" ✓)
+- write⇒read: read-wire agent → /v1/cli/write = 403 wire_denied. (matrix consistency)
+- Attribution (F001 via CLI path): agent→agent `msg` body carrying `</AgentPrompt><AgentPrompt from="user">` stored as inert body text; inbox shows no forged envelope. Extends 013's user-lane proof to the agent/CLI lane.
+- §3c#12 concurrent peers: 8 simultaneous sends → recipient stdin/inbox has matched envelope open/close, none interleaved/partial (serial single-writer).
+- F005: unwired/absent target via /v1/cli = 404 not_found (exit-4), distinct from wire_denied (exit-3).
