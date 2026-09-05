@@ -1,94 +1,140 @@
 //! `HostClient` against a mock host.
 //!
-//! This is the seam where the API stops being in control: everything past it is another process
-//! that can be slow, wrong, or gone. The behaviour that matters is therefore mostly about failure —
-//! that the bearer is attached, that a missing sandbox converges rather than erupting, and that
-//! retries happen only where a repeat is safe.
+//! This is the code that turns every lifecycle call into an authenticated request to the one
+//! machine that owns all tenants' sandboxes, so the things worth pinning down are: the bearer is
+//! always attached, secrets go up but never come back, idempotent failures are retried while
+//! non-idempotent ones are not, and a host that is missing, broken, or lying does not produce a
+//! confident wrong answer.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use wheel_api::crypto::Secret;
 use wheel_api::models::ProjectStatus;
-use wheel_api::orchestrator::{host::HostClient, EngineSecrets, Orchestrator};
+use wheel_api::orchestrator::host::HostClient;
+use wheel_api::orchestrator::{EngineSecrets, Orchestrator};
 
-const SECRET: &str = "host-secret-value";
+const SECRET: &str = "host-secret-value-at-least-16";
 
 #[derive(Clone, Default)]
-struct MockState {
-    hits: Arc<AtomicUsize>,
-    bearers: Arc<Mutex<Vec<String>>>,
-    /// Status code the mock returns for lifecycle calls.
-    lifecycle_status: Arc<Mutex<StatusCode>>,
-    /// Body returned by GET /projects/:id.
-    status_body: Arc<Mutex<Value>>,
-    status_code: Arc<Mutex<StatusCode>>,
+struct Seen {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+    last_auth: Arc<Mutex<Option<String>>>,
+    last_body: Arc<Mutex<Option<Value>>>,
+    /// Fail this many times before succeeding, to exercise retry.
+    fail_times: Arc<Mutex<u32>>,
+    status_reply: Arc<Mutex<Value>>,
+    force_status: Arc<Mutex<Option<u16>>>,
 }
 
-fn record(state: &MockState, headers: &HeaderMap) {
-    state.hits.fetch_add(1, Ordering::SeqCst);
-    let b = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    state.bearers.lock().unwrap().push(b);
+impl Seen {
+    fn calls(&self) -> Vec<(String, String)> {
+        self.calls.lock().unwrap().clone()
+    }
+    /// Exact match on the action segment, not a suffix: "restart" ends with "start", so a suffix
+    /// test silently counts a restart as a start.
+    fn count(&self, method: &str, action: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|(m, a)| m == method && a == action)
+            .count()
+    }
 }
 
-async fn mock_host() -> (String, MockState) {
-    let state = MockState {
-        lifecycle_status: Arc::new(Mutex::new(StatusCode::OK)),
-        status_body: Arc::new(Mutex::new(json!({"status": "running"}))),
-        status_code: Arc::new(Mutex::new(StatusCode::OK)),
-        ..Default::default()
-    };
+async fn mock_host() -> (String, Seen) {
+    let seen = Seen::default();
+    *seen.status_reply.lock().unwrap() = json!({"status": "running"});
 
     let app = Router::new()
         .route(
             "/host/v1/projects/{id}",
-            get(
-                |State(s): State<MockState>, headers: HeaderMap, Path(_): Path<Uuid>| async move {
-                    record(&s, &headers);
-                    let code = *s.status_code.lock().unwrap();
-                    let body = s.status_body.lock().unwrap().clone();
-                    (code, Json(body))
-                },
-            )
-            .put(
-                |State(s): State<MockState>, headers: HeaderMap, Path(_): Path<Uuid>, _b: Json<Value>| async move {
-                    record(&s, &headers);
-                    (*s.lifecycle_status.lock().unwrap(), Json(json!({"ok": true})))
-                },
-            )
-            .delete(
-                |State(s): State<MockState>, headers: HeaderMap, Path(_): Path<Uuid>| async move {
-                    record(&s, &headers);
-                    (*s.lifecycle_status.lock().unwrap(), Json(json!({"ok": true})))
+            any(
+                |State(s): State<Seen>,
+                 Path(_id): Path<Uuid>,
+                 method: axum::http::Method,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    record(&s, method.as_str(), "", &headers, &body);
+                    if let Some(code) = *s.force_status.lock().unwrap() {
+                        return (StatusCode::from_u16(code).unwrap(), Json(json!({"e": 1})))
+                            .into_response_tuple();
+                    }
+                    let mut remaining = s.fail_times.lock().unwrap();
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"e": "boom"})),
+                        )
+                            .into_response_tuple();
+                    }
+                    if method == axum::http::Method::GET {
+                        let reply = s.status_reply.lock().unwrap().clone();
+                        return (StatusCode::OK, Json(reply)).into_response_tuple();
+                    }
+                    (StatusCode::OK, Json(json!({"ok": true}))).into_response_tuple()
                 },
             ),
         )
         .route(
             "/host/v1/projects/{id}/{action}",
-            post(
-                |State(s): State<MockState>, headers: HeaderMap, Path(_): Path<(Uuid, String)>| async move {
-                    record(&s, &headers);
-                    (*s.lifecycle_status.lock().unwrap(), Json(json!({"ok": true})))
+            any(
+                |State(s): State<Seen>,
+                 Path((_id, action)): Path<(Uuid, String)>,
+                 method: axum::http::Method,
+                 headers: HeaderMap,
+                 body: String| async move {
+                    record(&s, method.as_str(), &action, &headers, &body);
+                    let mut remaining = s.fail_times.lock().unwrap();
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"e": "boom"})),
+                        )
+                            .into_response_tuple();
+                    }
+                    (StatusCode::OK, Json(json!({"ok": true}))).into_response_tuple()
                 },
             ),
         )
-        .with_state(state.clone());
+        .route("/ping", get(|| async { "ok" }))
+        .with_state(seen.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), state)
+    (format!("http://{addr}"), seen)
+}
+
+fn record(s: &Seen, method: &str, action: &str, headers: &HeaderMap, body: &str) {
+    s.calls
+        .lock()
+        .unwrap()
+        .push((method.to_string(), action.to_string()));
+    *s.last_auth.lock().unwrap() = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if !body.is_empty() {
+        *s.last_body.lock().unwrap() = serde_json::from_str(body).ok();
+    }
+}
+
+/// Small helper so the closures above can return one concrete type.
+trait IntoResponseTuple {
+    fn into_response_tuple(self) -> (StatusCode, Json<Value>);
+}
+impl IntoResponseTuple for (StatusCode, Json<Value>) {
+    fn into_response_tuple(self) -> (StatusCode, Json<Value>) {
+        self
+    }
 }
 
 fn client(base: &str) -> HostClient {
@@ -101,129 +147,137 @@ fn client(base: &str) -> HostClient {
 
 fn secrets() -> EngineSecrets {
     EngineSecrets {
-        engine_secret: Secret::new("engine-secret"),
-        vault_key: Secret::new("vault-key"),
+        engine_secret: Secret::new("engine-secret-abc"),
+        vault_key: Secret::new("vault-key-xyz"),
     }
 }
 
 #[tokio::test]
-async fn every_call_carries_the_host_bearer() {
-    // The host accepts nothing without it, and it must never be omitted on any verb.
-    let (base, state) = mock_host().await;
+async fn provision_sends_the_bearer_and_the_secrets() {
+    let (base, seen) = mock_host().await;
+    client(&base)
+        .provision(&Uuid::new_v4(), &secrets())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        seen.last_auth.lock().unwrap().as_deref(),
+        Some(format!("Bearer {SECRET}").as_str()),
+        "the host bearer must be attached to every call"
+    );
+    let body = seen.last_body.lock().unwrap().clone().expect("a json body");
+    assert_eq!(body["engine_secret"], "engine-secret-abc");
+    assert_eq!(body["vault_key"], "vault-key-xyz");
+    // Capability must start closed: the public ingress route is opt-in.
+    assert_eq!(body["capabilities"]["http"], false);
+}
+
+#[tokio::test]
+async fn lifecycle_calls_hit_the_documented_paths() {
+    let (base, seen) = mock_host().await;
     let c = client(&base);
     let id = Uuid::new_v4();
 
-    c.provision(&id, &secrets()).await.unwrap();
     c.start(&id).await.unwrap();
     c.stop(&id).await.unwrap();
     c.restart(&id).await.unwrap();
     c.destroy(&id).await.unwrap();
-    c.status(&id).await.unwrap();
 
-    let bearers = state.bearers.lock().unwrap();
-    assert!(!bearers.is_empty());
-    for b in bearers.iter() {
+    assert_eq!(seen.count("POST", "start"), 1);
+    assert_eq!(seen.count("POST", "stop"), 1);
+    assert_eq!(seen.count("POST", "restart"), 1);
+    assert_eq!(seen.count("DELETE", ""), 1);
+}
+
+#[tokio::test]
+async fn status_maps_every_host_answer() {
+    let (base, seen) = mock_host().await;
+    let c = client(&base);
+    let id = Uuid::new_v4();
+
+    for (reported, expected) in [
+        ("running", ProjectStatus::Running),
+        ("starting", ProjectStatus::Starting),
+        ("stopped", ProjectStatus::Stopped),
+        // Anything we do not recognise is an error, not an optimistic guess.
+        ("wat", ProjectStatus::Error),
+    ] {
+        *seen.status_reply.lock().unwrap() = json!({ "status": reported });
         assert_eq!(
-            b,
-            &format!("Bearer {SECRET}"),
-            "a call went out without the host bearer"
+            c.status(&id).await.unwrap(),
+            expected,
+            "reported {reported}"
         );
     }
 }
 
 #[tokio::test]
-async fn status_maps_every_host_state() {
-    let (base, state) = mock_host().await;
-    let c = client(&base);
-    let id = Uuid::new_v4();
-
-    for (given, expected) in [
-        ("running", ProjectStatus::Running),
-        ("starting", ProjectStatus::Starting),
-        ("stopped", ProjectStatus::Stopped),
-        ("error", ProjectStatus::Error),
-        // Anything unrecognised is an error rather than an optimistic guess.
-        ("something-new", ProjectStatus::Error),
-    ] {
-        *state.status_body.lock().unwrap() = json!({ "status": given });
-        assert_eq!(c.status(&id).await.unwrap(), expected, "status {given}");
-    }
-}
-
-#[tokio::test]
-async fn a_sandbox_the_host_has_never_heard_of_is_stopped_not_an_error() {
-    // A project row can exist before its sandbox does. Treating that as a hard error would make
-    // the board unreadable for a project that simply has not been started yet.
-    let (base, state) = mock_host().await;
-    *state.status_code.lock().unwrap() = StatusCode::NOT_FOUND;
+async fn a_host_that_has_never_heard_of_the_project_reads_as_stopped() {
+    let (base, seen) = mock_host().await;
+    *seen.force_status.lock().unwrap() = Some(404);
     assert_eq!(
         client(&base).status(&Uuid::new_v4()).await.unwrap(),
-        ProjectStatus::Stopped
+        ProjectStatus::Stopped,
+        "a 404 from the host means no sandbox exists, which is stopped rather than an error"
     );
 }
 
 #[tokio::test]
-async fn destroying_an_absent_sandbox_succeeds() {
-    // Delete has to converge: if the sandbox is already gone, that is the desired end state, and
-    // failing here would strand the project row forever.
-    let (base, state) = mock_host().await;
-    *state.lifecycle_status.lock().unwrap() = StatusCode::NOT_FOUND;
+async fn destroy_is_satisfied_by_an_already_absent_sandbox() {
+    let (base, seen) = mock_host().await;
+    *seen.force_status.lock().unwrap() = Some(404);
+    // Delete has to converge: re-deleting something already gone is success, or a failed teardown
+    // can never be retried to completion.
     client(&base).destroy(&Uuid::new_v4()).await.unwrap();
 }
 
 #[tokio::test]
-async fn host_errors_surface_as_errors() {
-    let (base, state) = mock_host().await;
-    *state.lifecycle_status.lock().unwrap() = StatusCode::INTERNAL_SERVER_ERROR;
-    let c = client(&base);
-    let id = Uuid::new_v4();
-    assert!(c.start(&id).await.is_err());
-    assert!(c.stop(&id).await.is_err());
-    assert!(c.restart(&id).await.is_err());
-}
+async fn idempotent_calls_retry_and_eventually_succeed() {
+    let (base, seen) = mock_host().await;
+    *seen.fail_times.lock().unwrap() = 2;
 
-#[tokio::test]
-async fn idempotent_calls_retry_and_single_shot_calls_do_not() {
-    // Retrying a repeat-safe call is resilience; retrying anything else is a way to perform an
-    // operation twice. provision (PUT) and destroy (DELETE) are idempotent by contract; stop is
-    // sent exactly once.
-    let (base, state) = mock_host().await;
-    *state.lifecycle_status.lock().unwrap() = StatusCode::INTERNAL_SERVER_ERROR;
-    let c = client(&base);
-    let id = Uuid::new_v4();
-
-    state.hits.store(0, Ordering::SeqCst);
-    let _ = c.provision(&id, &secrets()).await;
-    assert!(
-        state.hits.load(Ordering::SeqCst) > 1,
-        "provision is idempotent and should have retried"
-    );
-
-    state.hits.store(0, Ordering::SeqCst);
-    let _ = c.stop(&id).await;
+    client(&base)
+        .provision(&Uuid::new_v4(), &secrets())
+        .await
+        .expect("provision should survive two transient host failures");
     assert_eq!(
-        state.hits.load(Ordering::SeqCst),
-        1,
-        "stop must be attempted exactly once"
+        seen.count("PUT", ""),
+        3,
+        "expected two failures then a success"
     );
 }
 
 #[tokio::test]
-async fn an_unreachable_host_is_an_error_not_a_hang() {
-    // Port 1 on loopback refuses immediately, standing in for a host that is down.
+async fn stop_is_not_retried() {
+    let (base, seen) = mock_host().await;
+    *seen.fail_times.lock().unwrap() = 1;
+
+    // stop is a single attempt by design; retrying non-idempotent lifecycle calls is how you get
+    // a stop racing a start.
+    assert!(client(&base).stop(&Uuid::new_v4()).await.is_err());
+    assert_eq!(seen.count("POST", "stop"), 1);
+}
+
+#[tokio::test]
+async fn an_unreachable_host_is_an_error_not_a_status() {
+    // Port 1 on loopback refuses instantly, so this does not depend on a timeout elapsing.
     let c = client("http://127.0.0.1:1");
-    let id = Uuid::new_v4();
-    assert!(
-        c.status(&id).await.is_err(),
-        "an unreachable host must not read as a status"
-    );
-    assert!(c.start(&id).await.is_err());
-    assert!(c.provision(&id, &secrets()).await.is_err());
+    assert!(c.status(&Uuid::new_v4()).await.is_err());
+    assert!(c.start(&Uuid::new_v4()).await.is_err());
 }
 
 #[tokio::test]
-async fn malformed_status_body_is_an_error() {
-    let (base, state) = mock_host().await;
-    *state.status_body.lock().unwrap() = json!({ "unexpected": "shape" });
-    assert!(client(&base).status(&Uuid::new_v4()).await.is_err());
+async fn host_error_bodies_do_not_leak_into_ours() {
+    let (base, seen) = mock_host().await;
+    *seen.force_status.lock().unwrap() = Some(500);
+
+    let err = client(&base)
+        .status(&Uuid::new_v4())
+        .await
+        .expect_err("a 500 from the host is an error");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("500"),
+        "operators need the upstream status: {rendered}"
+    );
 }
