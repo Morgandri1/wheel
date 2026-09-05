@@ -15,6 +15,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% (host was 0.00% when filed) |
 | 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | **open** | `transcript` log lines are persisted but never emitted over the events WebSocket |
+| 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | **open** | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
 
 ---
 
@@ -344,3 +345,49 @@ divergence that produces a UI that is quietly wrong rather than obviously broken
 version ASSERTS and exits non-zero instead of printing the two sides for a human to compare.
 SDK's e2e passed this bug because it asserted that *a* log event arrived rather than WHICH streams
 did — a printer cannot fail, so it cannot gate. SDK asked for exactly this check to live in `qa/`.
+
+
+---
+
+## 010 — The `wheel` CLI is not in the engine image · S1 · SDK
+
+`wheel-engine:test` (and `:dev`, same Dockerfile) contains `wheel-engine`, `wheel-host`,
+`claude`, `codex` and `python3` — but **no `wheel` binary**. Every CLI test fails with
+`exec: "wheel": executable file not found in $PATH`.
+
+**Repro:**
+```
+docker run --rm --entrypoint sh wheel-engine:test -c 'command -v wheel || echo MISSING'
+python3 qa/contract/image_contents.py     # new gate, fails on exactly this
+python3 qa/integration/test_engine_cli.py # 17 failed, 4 passed
+```
+
+**Root cause — two silent-failure layers in `docker/Dockerfile.host`.** The crate is
+`wheel-cli`, but its binary is named `wheel` (`[[bin]] name = "wheel"`):
+
+```dockerfile
+# line 20 — there is no binary called wheel-cli, so this fails, and `|| true` swallows it
+&& (cargo build --release --bin wheel-cli 2>/dev/null || true)
+
+# line 50 — the [i] glob means "copy only if it exists"; /src/target/release/wheel-cli
+# never exists, so nothing is copied and the build still succeeds
+COPY --from=build /src/target/release/wheel-cl[i] /usr/local/bin/
+```
+
+**Fix (two lines):**
+```dockerfile
+&& cargo build --release --bin wheel \
+COPY --from=build /src/target/release/wheel /usr/local/bin/wheel
+```
+
+**Why S1:** §3 makes the wire set a node's capability set, and the CLI is how a node exercises
+it — `msg`, `read`, `write`, `inbox`, `secret get`, `run`. With no binary, an agent cannot reach
+the board at all. The vertical slice's "`wheel msg` between two agents works" is unachievable as
+shipped, so this blocks M1.
+
+**Process point, which is the more useful half:** nothing failed. `|| true` and the optional-glob
+`COPY` are each individually reasonable — they exist so the image can build before every crate
+lands — but together they turned "the agent's entire interface is missing" into a successful
+build. This is the same shape as the silent test skips API and I have both been removing today.
+`qa/contract/image_contents.py` now asserts the image's contents explicitly, so the next missing
+binary is a red gate rather than a discovery three hours later.

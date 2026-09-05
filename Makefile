@@ -74,10 +74,15 @@ engine-image: ## build wheel-engine:dev (production layout)
 engine-image-test: engine-image ## build wheel-engine:test (QA fake harnesses)
 	docker build -f docker/Dockerfile.test --build-arg BASE=wheel-engine:dev -t wheel-engine:test .
 
-image-verify-prod: engine-image ## assert the fakes are absent from the production image
+image-verify-prod: engine-image ## assert the image ships what it must, and no fakes
 	@docker run --rm --entrypoint sh wheel-engine:dev -c '\
+	  for b in wheel wheel-engine wheel-host python3; do \
+	    command -v $$b >/dev/null || { echo "FAIL: $$b missing from the image"; exit 1; }; \
+	  done; \
+	  wheel --help >/dev/null 2>&1 || wheel --version >/dev/null 2>&1 || \
+	    { echo "FAIL: wheel is present but not runnable"; exit 1; }; \
 	  test ! -e /usr/local/bin/claude || { echo "FAIL: something shadows claude in the production image"; exit 1; }; \
 	  test ! -e /usr/local/bin/codex  || { echo "FAIL: something shadows codex in the production image"; exit 1; }; \
 	  claude --version | grep -qi fake && { echo "FAIL: claude is a fake in the production image"; exit 1; }; \
 	  claude --version | grep -q "Claude Code" || { echo "FAIL: real claude missing"; exit 1; }; \
-	  echo "ok: production image ships the real claude ($$(claude --version))"'
+	  echo "ok: image ships wheel + wheel-engine + wheel-host + python3, and the real claude ($$(claude --version))"'
