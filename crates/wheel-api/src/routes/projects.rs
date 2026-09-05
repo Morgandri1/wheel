@@ -187,11 +187,24 @@ pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiRes
         .start(&scope.project.id)
         .await
         .map_err(ApiError::Internal)?;
-    let observed = state
-        .orch
-        .status(&scope.project.id)
-        .await
-        .unwrap_or(ProjectStatus::Starting);
+    // A start that the host reported as successful, followed by a status of `stopped`, is not a
+    // stopped project — it is an inconsistency between the two, and reporting "stopped" invites the
+    // caller to sit in a poll loop that will never terminate. Surface it as `error` so the UI shows
+    // something is wrong instead of something is pending.
+    let observed = match state.orch.status(&scope.project.id).await {
+        Ok(ProjectStatus::Stopped) => {
+            tracing::warn!(
+                project_id = %scope.project.id,
+                "host reported a successful start but the sandbox is still stopped"
+            );
+            ProjectStatus::Error
+        }
+        Ok(other) => other,
+        Err(e) => {
+            tracing::warn!(project_id = %scope.project.id, error = ?e, "status probe after start failed");
+            ProjectStatus::Starting
+        }
+    };
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }
@@ -215,11 +228,24 @@ pub async fn restart(
         .restart(&scope.project.id)
         .await
         .map_err(ApiError::Internal)?;
-    let observed = state
-        .orch
-        .status(&scope.project.id)
-        .await
-        .unwrap_or(ProjectStatus::Starting);
+    // A start that the host reported as successful, followed by a status of `stopped`, is not a
+    // stopped project — it is an inconsistency between the two, and reporting "stopped" invites the
+    // caller to sit in a poll loop that will never terminate. Surface it as `error` so the UI shows
+    // something is wrong instead of something is pending.
+    let observed = match state.orch.status(&scope.project.id).await {
+        Ok(ProjectStatus::Stopped) => {
+            tracing::warn!(
+                project_id = %scope.project.id,
+                "host reported a successful start but the sandbox is still stopped"
+            );
+            ProjectStatus::Error
+        }
+        Ok(other) => other,
+        Err(e) => {
+            tracing::warn!(project_id = %scope.project.id, error = ?e, "status probe after start failed");
+            ProjectStatus::Starting
+        }
+    };
     set_status(&state, &scope.project.id, observed).await?;
     reload(&state, &scope).await
 }

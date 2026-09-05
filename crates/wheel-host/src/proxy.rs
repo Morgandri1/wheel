@@ -15,6 +15,20 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use uuid::Uuid;
 
+/// Uniform error body, matching the shape the API and the engine both use:
+/// `{"error":{"code","message"}}`.
+///
+/// These responses are relayed to the client verbatim by the API's proxy, so a bare string here
+/// surfaces to the browser as an untyped body that no client can branch on. Every failure that can
+/// escape this module therefore has to carry the envelope.
+fn err(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
 /// Ceiling on the upstream WebSocket handshake, so a stalled engine cannot hold a bridge
 /// half-open indefinitely.
 const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -43,11 +57,11 @@ pub async fn ingress(
 
 async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Response {
     if suffix.split('/').any(|seg| seg == "..") {
-        return (StatusCode::BAD_REQUEST, "path traversal is not permitted").into_response();
+        return err(StatusCode::BAD_REQUEST, "bad_request", "Path traversal is not permitted.");
     }
 
     let Ok(Some(rec)) = state.store.get(&id).await else {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+        return err(StatusCode::NOT_FOUND, "not_found", "The requested resource does not exist.");
     };
 
     let base = state.sandbox.engine_base(&id);
@@ -84,7 +98,7 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
 
     let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+        Err(_) => return err(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", "Request body exceeds the maximum allowed size."),
     };
 
     let resp = match state
@@ -99,7 +113,7 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(project = %id, error = ?e, "engine proxy failed");
-            return (StatusCode::BAD_GATEWAY, "engine unreachable").into_response();
+            return err(StatusCode::BAD_GATEWAY, "engine_unreachable", "The project engine is not reachable.");
         }
     };
 
@@ -123,7 +137,7 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
     }
     builder
         .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or_else(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "An unexpected error occurred."))
 }
 
 fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
@@ -194,7 +208,7 @@ async fn bridge_ws(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::warn!(error = ?e, "engine websocket connect failed");
-            return (StatusCode::BAD_GATEWAY, "engine websocket unreachable").into_response();
+            return err(StatusCode::BAD_GATEWAY, "engine_unreachable", "The project engine websocket is not reachable.");
         }
         Err(_elapsed) => {
             // An engine that accepts the socket and then stalls must not pin this task.
