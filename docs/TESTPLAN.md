@@ -429,6 +429,7 @@ the calling agent must never see (fill precedence).
 | ID | Criterion | Sev |
 |---|---|---|
 | `SEC-vault-never-read` | Vault values never appear in `GET /v1/board`, any node/config response, the WS stream, or any log line. Asserted by writing a canary value and grepping every response body and the whole log. | **S1** |
+| `SEC-vault-write` | `PUT /v1/vault/:id/:key {value}` stores a value and answers 2xx. Not a secrecy property — the precondition for every one below it, which is why the suite skips the whole group by name when this is 404 rather than letting them pass with nothing stored. | S2 |
 | `SEC-vault-write-only` | `PUT /v1/vault/:id/:key` is the only way in; there is no read route. | **S1** |
 | `SEC-vault-at-rest` | Values are encrypted at rest with a per-project key; the canary does not appear in raw `/data/wheel.db` bytes. | **S1** |
 | `SEC-vault-env-scope` | Vault keys are exported into the env of agents **wired to that vault only**; an unwired agent's env has neither the key nor the value. | **S1** |

@@ -10,7 +10,7 @@ just checking that both were rejected.
 """
 import sys, os, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, mint, api_healthy, unique_sub, Results, ISSUER
+from wheel_client import call, mint, session_for, api_healthy, unique_sub, Results, ISSUER
 
 R = Results()
 
@@ -18,8 +18,13 @@ R = Results()
 def main():
     api_healthy()
 
-    alice = mint(unique_sub("alice"))
-    mallory = mint(unique_sub("mallory"))
+    alice = session_for(unique_sub("alice"))
+    mallory = session_for(unique_sub("mallory"))
+    # Whether a MINTED dev token is honoured decides which negatives mean anything: under
+    # AUTH_MODE=local every HS256 dev token is refused by design, so "expired is refused",
+    # "wrong issuer is refused" and "wrong key is refused" all pass without testing a single
+    # one of those properties.
+    dev_tokens_live = call("GET", "/v1/projects", mint(unique_sub("probe")))[0] != 401
 
     # ---------------------------------------------------------------- positive control
     # EVERY assertion below is "this token is refused", and all of them pass against an API
@@ -43,17 +48,24 @@ def main():
     st, _, _ = call("GET", "/v1/projects", "not-a-jwt")
     R.check("API-auth-invalid/garbage", st == 401, "garbage token -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), exp_delta=-10))
-    R.check("API-auth-invalid/expired", st == 401, "expired -> %s" % st)
+    if dev_tokens_live:
+        st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), exp_delta=-10))
+        R.check("API-auth-invalid/expired", st == 401, "expired -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), nbf_delta=3600))
-    R.check("API-auth-invalid/nbf", st == 401, "not-yet-valid -> %s" % st)
+        st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), nbf_delta=3600))
+        R.check("API-auth-invalid/nbf", st == 401, "not-yet-valid -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), iss="https://evil.example"))
-    R.check("API-auth-invalid/issuer", st == 401, "wrong issuer -> %s" % st)
+        st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), iss="https://evil.example"))
+        R.check("API-auth-invalid/issuer", st == 401, "wrong issuer -> %s" % st)
 
-    st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), secret=b"wrong-secret-entirely"))
-    R.check("API-auth-wrong-key", st == 401, "wrong signing key -> %s" % st)
+        st, _, _ = call("GET", "/v1/projects", mint(unique_sub("u"), secret=b"wrong-secret-entirely"))
+        R.check("API-auth-wrong-key", st == 401, "wrong signing key -> %s" % st)
+    else:
+        why = ("the API refuses dev HS256 tokens (AUTH_MODE=local), so each of these would "
+               "pass without exercising the property it names")
+        for tid in ("API-auth-invalid/expired", "API-auth-invalid/nbf",
+                    "API-auth-invalid/issuer", "API-auth-wrong-key"):
+            R.skip(tid, why)
 
     # alg:none — the classic. Signature stripped, alg swapped.
     import base64, json, time

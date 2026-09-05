@@ -165,6 +165,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The suite's python deps (websocket-client, jsonschema, pytest) live in qa/.venv.
+      # Without this, test_engine_events.py exits 77 "websocket-client not installed" and
+      # the events WS is not checked at all — a gate that skips is not a gate that passes.
+      - run: make bootstrap
       - run: make engine-image-test
       - run: make test-int
         env:

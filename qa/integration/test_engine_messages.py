@@ -11,7 +11,7 @@ test, so it cannot also be the evidence.
 """
 import json, os, subprocess, sys, time, uuid, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, engine as proxy_engine, mint, unique_sub, api_healthy, wait_for, Results
+from wheel_client import call, engine as proxy_engine, mint, session_for, unique_sub, api_healthy, wait_for, Results
 
 SKIP = 77
 R = Results()
@@ -199,7 +199,7 @@ def main():
     owner, pid = None, None
     if VIA_API:
         api_healthy()
-        owner = mint(unique_sub("msgpath"))
+        owner = session_for(unique_sub("msgpath"))
         st, proj, _ = call("POST", "/v1/projects", owner, {"name": "qa-msgpath"})
         if not R.check("MSG-setup/project", ok(st), "-> %s %r" % (st, proj)):
             return R.report("engine-messages")
