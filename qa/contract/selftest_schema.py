@@ -99,7 +99,15 @@ def run_against(schema):
 def main():
     fails = []
 
-    p = run_against(PERMISSIVE)
+    # If the runner itself cannot run (no jsonschema), this selftest cannot run either.
+    # Exit 77 = SKIP. Treating "could not run" as "failed" is what turned main red.
+    probe = run_against(PERMISSIVE)
+    if probe.returncode == 77:
+        print(probe.stdout.strip() or "runner reported it could not run")
+        print("cannot self-test without jsonschema — run `make bootstrap`")
+        return 77
+
+    p = probe
     if p.returncode == 0:
         fails.append("permissive schema was ACCEPTED — the contract test has no teeth")
         print("  FAIL permissive schema passed; it should have been caught")

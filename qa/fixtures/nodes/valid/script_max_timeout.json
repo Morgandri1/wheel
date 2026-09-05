@@ -1,0 +1,15 @@
+{
+  "id": "50000000-0000-4000-8000-000000000001",
+  "name": "slow",
+  "type": "script",
+  "position": {
+    "x": 1.0,
+    "y": 2.0
+  },
+  "wires": [],
+  "config": {
+    "language": "ts",
+    "source": "console.log(1)",
+    "timeout_secs": 300
+  }
+}

@@ -53,9 +53,11 @@ test-live: ## OPT-IN: same suites against the REAL claude/codex CLIs. Costs mone
 	@WHEEL_LIVE=1 bash qa/integration/run.sh
 
 ## ---------------------------------------------------------------- setup
-bootstrap: ## install the toolchain (rust, node, pnpm)
+bootstrap: ## install the toolchain (rust, node, pnpm) and the QA python venv
 	@command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 	@command -v pnpm  >/dev/null || brew install node pnpm
+	@test -x qa/.venv/bin/python || python3 -m venv qa/.venv
+	@qa/.venv/bin/pip install -q --disable-pip-version-check -r qa/requirements.txt
 	@echo "toolchain ready — you may need to restart your shell for PATH"
 
 clean: ## remove build artefacts

@@ -1,0 +1,19 @@
+{
+  "id": "e1000000-0000-4000-8000-000000000002",
+  "name": "hook-noref",
+  "type": "endpoint",
+  "position": {
+    "x": 1.0,
+    "y": 2.0
+  },
+  "wires": [],
+  "config": {
+    "method": "POST",
+    "path": "/x",
+    "response_mode": "ack",
+    "auth": {
+      "mode": "bearer"
+    }
+  },
+  "_expect_reject": "NODE-endpoint-auth"
+}
