@@ -50,11 +50,12 @@ docs/API.md
 - [x] Migrations + projects CRUD (name 1–64, per-user cap default 20)
 - [x] Engine proxy (HTTP + WS bridge) and public ingress route
 - [x] `infra/docker-compose.yml`, `docker/Dockerfile.api`, Railway configs
-- [ ] Database-backed integration tests (ownership 404s, proxy hygiene end-to-end)
-- [ ] `crates/wheel-host`: `Sandbox` trait + docker backend, host API on :7100, sqlite state, boot reconcile
-- [ ] Host client (PUT/start/stop/restart/DELETE/status), jittered retry on idempotent calls only
-- [ ] Engine proxy HTTP, then WS bridge for `/engine/v1/events`
-- [ ] `infra/docker-compose.yml`, smoke: create project → container running → proxied `GET /v1/board`
+- [x] Database-backed integration tests (ownership 404s, cross-tenant routes, ingress gate)
+- [x] `crates/wheel-host`: `Sandbox` trait + docker backend, host API on :7100, sqlite state, boot reconcile, WS bridge
+- [ ] E2E against the live stack (`infra/dev/e2e.py`) — blocked only on the docker image build
+- [x] Host client (PUT/start/stop/restart/DELETE/status), jittered retry on idempotent calls only
+- [x] Engine proxy HTTP, then WS bridge for `/engine/v1/events` (both API→host and host→engine hops)
+- [x] `infra/docker-compose.yml` + Railway configs + `docker/Dockerfile.api`
 
 ### M2 — public surface
 - [ ] `/p/:project_id/*` ingress: capability gate, header scrubbing, rate limit, 5 MiB cap

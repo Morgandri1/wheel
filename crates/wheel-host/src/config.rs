@@ -61,7 +61,9 @@ impl Config {
                 // This backend isolates nothing; it forwards to a URL. Allowing it outside dev
                 // would mean shipping a "sandbox" that is not a sandbox.
                 if var_or("WHEEL_ENV", "prod") != "dev" {
-                    bail!("SANDBOX_BACKEND=external requires WHEEL_ENV=dev; it provides no isolation");
+                    bail!(
+                        "SANDBOX_BACKEND=external requires WHEEL_ENV=dev; it provides no isolation"
+                    );
                 }
                 Backend::External
             }
