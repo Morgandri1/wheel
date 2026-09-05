@@ -21,6 +21,7 @@ export default defineConfig({
         "src/lib/limits.ts",
         "src/lib/local-auth.ts",
         "src/lib/csp.ts",
+        "src/lib/events.ts",
         "src/lib/message-state.ts",
         "src/lib/validate.ts",
       ],
