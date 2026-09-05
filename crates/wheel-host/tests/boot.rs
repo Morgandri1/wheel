@@ -15,22 +15,43 @@ fn cfg(backend: Backend, data_dir: &str) -> Config {
         nano_cpus: 1_000_000_000,
         pids_limit: 512,
         start_timeout_secs: 30,
+        uid_range_start: 20_000,
+        uid_stride: 64,
+        run_dir: "/tmp/wheel-run-test".into(),
         engine_base_url: "http://127.0.0.1:7000".into(),
     }
 }
 
+fn store_in(dir: &str) -> std::sync::Arc<wheel_host::store::Store> {
+    std::fs::create_dir_all(dir).unwrap();
+    std::sync::Arc::new(
+        wheel_host::store::Store::open(&format!("{dir}/host.db")).expect("open store"),
+    )
+}
+
 #[test]
-fn the_process_backend_refuses_to_start_rather_than_pretending() {
-    // Starting on an unimplemented backend would report healthy while every project stayed dead.
-    let err = wheel_host::build_sandbox(&cfg(Backend::Process, "/tmp"))
-        .err()
-        .expect("process backend is not implemented yet");
-    assert!(err.to_string().contains("not implemented"), "{err}");
+fn the_process_backend_addresses_its_engine_by_unix_socket() {
+    // Not a host:port. On a shared kernel every loopback port is reachable by every other tenant,
+    // so a TCP endpoint here would undo the isolation the backend exists to provide.
+    let dir = std::env::temp_dir().join(format!("wheel-boot-{}", uuid::Uuid::new_v4()));
+    let dir = dir.to_str().unwrap();
+    let sandbox =
+        wheel_host::build_sandbox(&cfg(Backend::Process, dir), store_in(dir)).expect("process");
+    let base = sandbox.engine_base(&uuid::Uuid::new_v4());
+    assert!(base.starts_with("unix://"), "got {base}");
+    assert!(base.ends_with("engine.sock"), "got {base}");
+    assert!(
+        !base.contains("127.0.0.1"),
+        "a loopback address leaked into the engine base: {base}"
+    );
 }
 
 #[test]
 fn the_external_backend_points_at_its_configured_engine() {
-    let sandbox = wheel_host::build_sandbox(&cfg(Backend::External, "/tmp")).expect("external");
+    let dir = std::env::temp_dir().join(format!("wheel-boot-{}", uuid::Uuid::new_v4()));
+    let dir = dir.to_str().unwrap();
+    let sandbox =
+        wheel_host::build_sandbox(&cfg(Backend::External, dir), store_in(dir)).expect("external");
     assert_eq!(
         sandbox.engine_base(&uuid::Uuid::new_v4()),
         "http://127.0.0.1:7000"

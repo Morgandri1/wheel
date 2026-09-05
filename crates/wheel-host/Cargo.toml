@@ -29,6 +29,11 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 http = "1"
+libc = "0.2"
+hyperlocal = "0.9"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
+hyper = { version = "1", features = ["client", "http1"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
