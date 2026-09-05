@@ -226,6 +226,23 @@ def t_env_dump():
         check("codex dumps too (§4: it uses CODEX_API_KEY, not OPENAI_API_KEY)",
               r["credential_vars_set"] == ["CODEX_API_KEY"], str(r["credential_vars_set"]))
 
+    # Vault keys arrive under board-chosen names, so the dump records every env NAME and a
+    # digest only for the names a test names. SEC-vault-env-scope is built on this.
+    with tempfile.TemporaryDirectory() as d:
+        dump = os.path.join(d, "vault.jsonl")
+        run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": dump,
+                                "WHEEL_FAKE_ENV_DUMP_KEYS": "STRIPE_KEY,ABSENT_KEY",
+                                "STRIPE_KEY": "sentinel-vault-value"})
+        r = json.loads(open(dump).read().splitlines()[0])
+        check("every env NAME is recorded", "STRIPE_KEY" in r["env_names"])
+        check("a named key's value is digested, not stored",
+              r["digests"]["STRIPE_KEY"]["sha256"] ==
+              hashlib.sha256(b"sentinel-vault-value").hexdigest())
+        check("the vault VALUE never reaches the dump",
+              "sentinel-vault-value" not in open(dump).read())
+        check("a key that is absent is recorded as absent, not omitted",
+              "ABSENT_KEY" in r["digests"] and r["digests"]["ABSENT_KEY"] is None)
+
     # A dump that cannot be written must be loud: a missing record reads as "no credential".
     p = run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": "/nonexistent-dir-xyz/env.jsonl"})
     check("an unwritable dump path fails loudly", p.returncode == 2, str(p.returncode))
