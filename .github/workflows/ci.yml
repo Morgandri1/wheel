@@ -99,13 +99,15 @@ jobs:
     name: e2e (playwright)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: false   # flipped on when Web lands the board UI
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with: { version: 9 }
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
+      # Browsers cannot be launched on the shared dev host under six resident agents
+      # (chromium dies with "spawn Unknown system error -88"), so this suite runs here,
+      # where it has the machine to itself.
       - run: make test-e2e
       - if: failure()
         uses: actions/upload-artifact@v4

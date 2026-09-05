@@ -142,6 +142,11 @@ step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
 # WHEEL_ENGINE_URL is set, for 404-vs-405).
 step "qa:route-parity" "$PY" qa/contract/route_parity.py
 
+# Every data-testid the E2E suite selects must exist in web/src. Playwright can
+# only report this by launching a browser and failing 30s in; the same drift is
+# detectable statically in under a second, so it is caught here instead.
+step "qa:testid-parity" "$PY" qa/contract/testid_parity.py
+
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
   step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
