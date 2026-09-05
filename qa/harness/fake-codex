@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""fake-codex — deterministic stand-in for the `codex` CLI (`codex exec --json`).
+
+PROVISIONAL: the real codex JSONL event names below are modelled on
+codex-cli 0.149.x `codex exec --json` (thread/turn/item events). They have NOT
+yet been verified against the real binary (that needs an authenticated login).
+SDK: confirm before M2 wires up harness:"codex"; QA will re-pin this file then.
+Tracked as TESTPLAN open question Q-HARNESS-CODEX.
+"""
+import json, os, sys, uuid, time, re, hashlib
+
+DIRECTIVE = re.compile(r"<<FAKE:([A-Z_]+)(?:=([^>]*))?>>")
+TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")
+
+def emit(o):
+    sys.stdout.write(json.dumps(o, separators=(",", ":")) + "\n"); sys.stdout.flush()
+
+def main():
+    argv = sys.argv[1:]
+    if "--version" in argv:
+        print("codex-cli 0.149.1"); return 0
+    # `codex exec [--json] [-c k=v]... [PROMPT]`
+    if argv and argv[0] in ("exec", "e"):
+        argv = argv[1:]
+    prompt, i = None, 0
+    while i < len(argv):
+        t = argv[i]
+        if t in ("--json", "--experimental-json"): pass
+        elif t in ("-c", "--config", "-m", "--model", "-o", "--output-last-message",
+                   "--output-schema", "--sandbox", "--cd", "-C"): i += 1
+        elif t.startswith("-"): pass
+        else: prompt = t
+        i += 1
+
+    thread_id = os.environ.get("WHEEL_FAKE_SESSION_ID") or str(uuid.uuid4())
+    emit({"type": "thread.started", "thread_id": thread_id})
+
+    turn = 0
+    if prompt is not None:
+        turn += 1; respond(prompt, turn, thread_id)
+    else:
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if not line.strip(): continue
+            if TRANSCRIPT:
+                try:
+                    with open(TRANSCRIPT, "a") as f: f.write(line + "\n")
+                except OSError: pass
+            try:
+                o = json.loads(line); text = o.get("message") or o.get("text") or line
+                if isinstance(text, list):
+                    text = "\n".join(b.get("text", "") for b in text if isinstance(b, dict))
+            except json.JSONDecodeError:
+                text = line
+            turn += 1; respond(text, turn, thread_id)
+    return 0
+
+def respond(text, turn, thread_id):
+    d = {m.group(1): (m.group(2) if m.group(2) is not None else "") for m in DIRECTIVE.finditer(text or "")}
+    if "SLEEP" in d: time.sleep(float(d["SLEEP"] or 1))
+    if "EXIT" in d: sys.exit(int(d["EXIT"] or 1))
+    reply = d.get("REPLY", "[fake-codex] turn %d: %s" % (turn, (text or "").strip()))
+    reply = DIRECTIVE.sub("", reply).strip()
+    emit({"type": "turn.started"})
+    emit({"type": "item.completed", "item": {"id": "item_" + hashlib.sha256(reply.encode()).hexdigest()[:12],
+          "type": "agent_message", "text": reply}})
+    if "ERROR" in d:
+        emit({"type": "turn.failed", "error": {"message": d.get("ERROR") or "fake error"}})
+    else:
+        emit({"type": "turn.completed", "usage": {"input_tokens": max(1, len(text or "") // 4),
+              "cached_input_tokens": 0, "output_tokens": max(1, len(reply) // 4)}})
+
+if __name__ == "__main__":
+    try: sys.exit(main())
+    except BrokenPipeError: sys.exit(0)
+    except KeyboardInterrupt: sys.exit(130)
