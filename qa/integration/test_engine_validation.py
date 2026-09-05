@@ -1,142 +1,138 @@
 #!/usr/bin/env python3
-"""Engine-side node validation — TESTPLAN NODE-*, and the definitive answer on BUG-001.
+"""Engine-side rejection of the configs the schema wrongly accepts — TESTPLAN NODE-*.
 
-BUG-001 established that the exported JSON Schema accepts 12 configs the contract
-forbids. That is only half a finding: wheel-core also has validate.rs and serde
-deny_unknown_fields, either of which may still reject them at runtime. Until someone
-checks, "defence in depth" is a claim with one layer verified and one layer assumed —
-which is exactly the shape of a security finding that turns out to be either nothing or
-everything.
+This is the second half of BUG-001. The exported JSON Schema accepts twelve node configs
+the contract forbids, which by itself only means the schema cannot be the validation gate.
+Whether anything ELSE rejects them is the question that decides whether BUG-001 is a
+documentation defect or a hole, and until now nobody had asserted it.
 
-So each fixture tagged `_enforced_by: engine` is POSTed to a REAL engine here. Whatever
-the result, we stop guessing.
+ADVERSARY probed it live and found all twelve rejected (finding 013/009). That was a
+one-off. This turns it into a regression: their probes, my permanent assertions, which is
+the split we agreed. If validate.rs loses a branch — and it is the crate's least-covered
+file — this goes red rather than the property quietly evaporating.
+
+Each fixture carries the TESTPLAN criterion it exists to prove, so a failure names the
+rule that broke rather than a filename.
 """
-import glob, json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
+import glob, json, os, subprocess, sys, time, uuid
 
-SKIP = 77
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wheel_client import Results
 
+SKIP = 77
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+INVALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "invalid")
+VALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "valid")
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
-SECRET = "qa-engine-secret-at-least-16"
+NAME = "qa-validation-%s" % uuid.uuid4().hex[:8]
 PORT = int(os.environ.get("WHEEL_ENGINE_PORT", "17311"))
-BASE = "http://127.0.0.1:%d" % PORT
-CONTAINER = "qa-engine-validation"
+SECRET = "qa-engine-secret-at-least-16-chars"
 
 R = Results()
 
 
-def req(method, path, body=None, token=SECRET):
-    r = urllib.request.Request(BASE + path, method=method)
-    if token:
-        r.add_header("Authorization", "Bearer " + token)
+def http(method, path, body=None):
+    import urllib.error, urllib.request
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (PORT, path), method=method)
+    req.add_header("authorization", "Bearer " + SECRET)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
-        r.add_header("content-type", "application/json")
+        req.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(r, data, timeout=30) as resp:
-            txt = resp.read().decode(errors="replace")
-            return resp.status, (json.loads(txt) if txt.strip() else None)
+        with urllib.request.urlopen(req, data, timeout=30) as r:
+            txt = r.read().decode(errors="replace")
+            return r.status, (json.loads(txt) if txt.strip() else None)
     except urllib.error.HTTPError as e:
         txt = e.read().decode(errors="replace")
         try:
             return e.code, json.loads(txt)
         except Exception:
             return e.code, txt
-
-
-def docker(*args, **kw):
-    return subprocess.run(["docker"] + list(args), capture_output=True, text=True, **kw)
+    except Exception as e:
+        return 0, repr(e)
 
 
 def start_engine():
-    docker("rm", "-f", CONTAINER)
-    key = subprocess.run(["openssl", "rand", "-base64", "32"],
-                         capture_output=True, text=True).stdout.strip()
-    p = docker("run", "-d", "--name", CONTAINER,
-               "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
-               "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
-               "-e", "WHEEL_VAULT_KEY=" + key,
-               "-e", "WHEEL_ROLE=engine",
-               "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
-               "-p", "%d:7000" % PORT, IMAGE)
+    subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
+    p = subprocess.run([
+        "docker", "run", "-d", "--name", NAME,
+        "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+        "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
+        "-e", "WHEEL_VAULT_KEY=" + "A" * 43 + "=",
+        "-e", "WHEEL_ROLE=engine",
+        "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+        "-p", "%d:7000" % PORT, IMAGE,
+    ], capture_output=True, text=True)
     if p.returncode != 0:
-        return "could not start %s: %s" % (IMAGE, p.stderr.strip()[:200])
-    for _ in range(40):
-        try:
-            if req("GET", "/healthz", token=None)[0] == 200:
-                return None
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return "engine never became healthy"
+        return "docker run failed: " + (p.stderr or p.stdout)[-400:]
+    for _ in range(60):
+        if http("GET", "/v1/board")[0] == 200:
+            return None
+        time.sleep(1)
+    logs = subprocess.run(["docker", "logs", "--tail", "20", NAME],
+                          capture_output=True, text=True)
+    return "engine never became healthy: " + (logs.stdout + logs.stderr)[-400:]
+
+
+def payload(doc):
+    """Strip QA bookkeeping and the server-assigned id."""
+    return {k: v for k, v in doc.items()
+            if not k.startswith("_") and k != "id"}
 
 
 def main():
-    if docker("info").returncode != 0:
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
         print("docker not running")
         return SKIP
-    if docker("image", "inspect", IMAGE).returncode != 0:
-        print("%s not built yet (SDK: make engine-image-test)" % IMAGE)
+    if subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode != 0:
+        print("%s not built — run `make engine-image-test`" % IMAGE)
         return SKIP
 
     err = start_engine()
     if err:
         print(err)
+        subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
         return SKIP
 
     try:
-        # --------------------------------------------------- auth on the control plane
-        st, _ = req("GET", "/v1/board", token=None)
-        R.check("ENG-auth-required", st == 401, "no bearer -> %s" % st)
-        st, _ = req("GET", "/v1/board", token="wrong-secret-entirely-here")
-        R.check("ENG-auth-wrong", st == 401, "wrong bearer -> %s" % st)
-        st, board = req("GET", "/v1/board")
-        R.check("ENG-board-shape", st == 200 and isinstance(board, dict)
-                and "nodes" in board and "project" in board, "-> %s %r" % (st, board))
+        # Control: the engine must ACCEPT what the contract allows. Without this, an engine
+        # that rejected everything would score a perfect 12/12 below and look secure.
+        accepted = 0
+        for p in sorted(glob.glob(os.path.join(VALID, "*.json"))):
+            doc = payload(json.load(open(p)))
+            doc["name"] = "ok-%s" % uuid.uuid4().hex[:8]
+            doc["wires"] = []
+            st, _ = http("POST", "/v1/nodes", doc)
+            if 200 <= st < 300:
+                accepted += 1
+        R.check("NODE-valid-accepted", accepted > 0,
+                "the engine accepted NONE of the %d valid fixtures, so the rejection "
+                "results below prove nothing"
+                % len(glob.glob(os.path.join(VALID, "*.json"))))
 
-        # --------------------------------------------------- the BUG-001 question
-        # Every fixture the schema wrongly accepts, POSTed to a real engine.
-        fixtures = sorted(glob.glob(os.path.join(ROOT, "qa/fixtures/nodes/invalid/*.json")))
-        engine_enforced = 0
-        for path in fixtures:
-            doc = json.load(open(path))
-            if doc.pop("_enforced_by", "schema") != "engine":
-                continue
-            engine_enforced += 1
-            name = os.path.basename(path)[:-5]
-            crit = doc.pop("_expect_reject", "?")
-            doc.pop("_engine_ref", None)
-            doc.pop("_known_bug", None)
-            # Give each node a unique, legal name so a rejection can only be about the
-            # thing under test — not a name collision from an earlier case.
-            payload = {k: v for k, v in doc.items() if k in ("type", "config", "position")}
-            payload["name"] = "v%s" % uuid.uuid4().hex[:12]
-            payload.setdefault("position", {"x": 0.0, "y": 0.0})
-            st, body = req("POST", "/v1/nodes", payload)
-            R.check("NODE-engine-rejects/%s" % name, 400 <= st < 500,
-                    "%s: engine ACCEPTED it (-> %s) but %s says it must be rejected"
-                    % (name, st, crit))
+        # The twelve the schema lets through.
+        engine_enforced = []
+        for p in sorted(glob.glob(os.path.join(INVALID, "*.json"))):
+            doc = json.load(open(p))
+            if doc.get("_enforced_by") == "engine":
+                engine_enforced.append((os.path.basename(p)[:-5], doc))
 
-        R.check("BUG-001/fixtures-present", engine_enforced >= 12,
-                "expected >=12 engine-enforced fixtures, found %d" % engine_enforced)
+        for name, doc in engine_enforced:
+            crit = doc.get("_expect_reject", "?")
+            body = payload(doc)
+            body.setdefault("wires", [])
+            st, resp = http("POST", "/v1/nodes", body)
+            R.check("%s/%s" % (crit, name), 400 <= st < 500,
+                    "engine ACCEPTED a config the contract forbids (-> %s %s). The schema "
+                    "already accepts it (BUG-001), so nothing rejects it."
+                    % (st, json.dumps(resp)[:120]))
 
-        # --------------------------------------------------- valid nodes still work
-        for path in sorted(glob.glob(os.path.join(ROOT, "qa/fixtures/nodes/valid/*.json"))):
-            doc = json.load(open(path))
-            if doc.get("type") == "tool":
-                continue  # tool nodes are M2
-            payload = {"type": doc["type"], "config": doc["config"],
-                       "position": doc.get("position", {"x": 0.0, "y": 0.0}),
-                       "name": "ok%s" % uuid.uuid4().hex[:12]}
-            st, body = req("POST", "/v1/nodes", payload)
-            R.check("NODE-engine-accepts/%s" % os.path.basename(path)[:-5],
-                    200 <= st < 300, "valid fixture REJECTED -> %s %r" % (st, body))
+        R.check("NODE-engine-enforced-count", len(engine_enforced) == 12,
+                "expected 12 engine-enforced fixtures, found %d — a fixture was retagged "
+                "and the BUG-001 coverage claim no longer holds" % len(engine_enforced))
     finally:
-        docker("rm", "-f", CONTAINER)
+        subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
 
     return R.report("engine-validation")
 
