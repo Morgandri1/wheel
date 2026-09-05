@@ -91,7 +91,7 @@ All nodes share these traits (per spec): `name`, `position`, `wires`, `type`. Ca
 {
   "id": "uuid",
   "name": "researcher",            // unique per project; ^[a-z0-9][a-z0-9-_]{0,62}$ ; this is the address agents use
-  "type": "agent",                 // agent | ctx | table | endpoint | script | mcp | vault | chest
+  "type": "agent",                 // agent | ctx | table | endpoint | script | mcp | vault | chest | tool
   "position": { "x": 120.0, "y": 340.0 },
   "wires": [ { "to": "<node id>", "type": "read" } ],   // OUTGOING wires only; type: read | write | send
   "config": { ... }                // tagged by `type`, see below
@@ -108,6 +108,13 @@ Per-type `config`:
 - `mcp`:      `{ transport: "stdio" | "http", command?: string, args?: string[], url?: string, env?: {k: v} }`
 - `vault`:    `{ keys: string[] }` — values are WRITE-ONLY through the API (`PUT /vault/<node>/<key>`), never returned to the UI; stored encrypted at rest with a per-project key.
 - `chest`:    `{}` — blob store; keys are relative paths, no `..`, no absolute paths, max 50 MiB per blob (v1).
+- `tool`:     `{ kind: "http", source: { format: "openapi"|"swagger2"|"postman"|"insomnia"|"manual", raw: string, imported_at }, base_url: string,
+               operations: [ { id: string /* slug, unique in node */, method, path /* may contain {param} */, summary?: string, enabled: bool,
+                 params: [ { name, in: "path"|"query"|"header"|"cookie", schema: <json-schema subset>, required: bool, fill: Fill } ],
+                 body?: { content_type: "application/json"|"application/x-www-form-urlencoded"|"multipart/form-data"|"text/plain", schema: <json-schema>,
+                          fills: { "<json-pointer or dotted path>": Fill } } } ] }`
+              where `Fill = { mode: "agent" } | { mode: "static", value } | { mode: "vault", ref: "<vault name>/<key>" } | { mode: "hidden" }`
+              (default `agent` for everything on import). See §3d.
 
 ### Wire semantics matrix (default DENY — anything not listed is rejected at creation time by engine AND api)
 
@@ -121,13 +128,16 @@ Per-type `config`:
 | agent → chest        | `wheel read <chest>/<path>` (`--out f`), `wheel ls <chest> [prefix]` | + `wheel write <chest>/<path> --file f`, `wheel rm <chest>/<path>` (`write` implies `read`) | — |
 | agent → script       | `wheel run <script> [args…]` (stdout/stderr/exit code returned) | —                   | —                                                          |
 | agent → mcp          | MCP server is attached to the agent's harness config at next start | —           | —                                                          |
+| agent → tool         | `wheel tool ls <tool>` / `wheel tool call <tool> <op> '<json>'`; every enabled op also appears as MCP tool `<tool>__<op>` | — | —                                     |
+| script → tool        | same as agent                               | —                                      | —                                                          |
+| tool → vault         | tool may resolve `{mode:"vault"}` fills from that vault at call time | —             | —                                                          |
 | endpoint → agent     | —                                           | —                                      | each HTTP hit is delivered as a message (method, path, headers subset, body) |
 | endpoint → table     | —                                           | JSON body inserted as a row            | —                                                          |
 | endpoint → script    | —                                           | —                                      | script invoked with the request; with `response_mode: script` its stdout is the HTTP response body |
 | script → agent       | —                                           | —                                      | `wheel msg` from inside the script (script runs with a token scoped to ITS wires) |
 | script → table/chest/vault/ctx | same as agent                     | same as agent                          | —                                                          |
 
-ctx, table, vault, chest, mcp have no other outgoing wires. Agents may **only** act on nodes they are wired to; the
+ctx, table, vault, chest, mcp have no other outgoing wires; tool's only outgoing wire is `read` → vault. Agents may **only** act on nodes they are wired to; the
 engine checks this on every CLI call using the per-process token — a node's wire set is its capability set.
 
 
@@ -148,6 +158,8 @@ wheel ls    <node> [prefix]               table row keys / chest paths
 wheel query <table> "<SELECT …>"          read-only SQL escape hatch, scoped to that one table
 wheel secret get <vault>/<key>            vault value (also exported as env at spawn)
 wheel run   <script> [args…]              invoke a Script node as a tool; stdout returned
+wheel tool ls   <tool>                    list enabled operations + the JSON schema of the fields I must fill
+wheel tool call <tool> <op> '<json args>' [--curl]   execute; returns {status, headers, body}; --curl prints the equivalent curl command instead of sending
 wheel ctx clear                           ask the engine to clear my context (ephemeral pattern)
 ```
 Table nodes therefore always have an implicit primary key column `key TEXT` plus the configured `columns`; `wheel write t/<row>` upserts by key.
@@ -197,6 +209,28 @@ We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in th
 | 10 | Operator couldn't see that a message was mangled. | Web's agent drawer shows every message (body, sha256, state, from/to) and, per agent, the exact bytes written to stdin (transcript view). | Web · M2 |
 | 11 | Long messages truncated somewhere between sender and recipient's context. | Engine never truncates; if a harness limit would be exceeded the message stays `queued` with `last_error`, is surfaced in the UI, and is never silently clipped. | M1 |
 
+
+### 3d. Tool nodes — imported HTTP specs as agent tools (operator requirement; owner: SDK engine/import, Web UI)
+
+Users import an **OpenAPI 3.x / Swagger 2 / Postman Collection v2.1 / Insomnia v4** document (paste, upload, or URL) as a `tool` node.
+The engine normalizes it into `operations[]` (§3 config) — the engine is the ONLY parser (`POST /v1/tools/import {format?, raw}` → normalized
+operations for preview; Web never re-implements parsing). Then, per operation, the user decides **for every header, path/query/cookie param and
+body field** how it is filled:
+- `agent` (default) — the agent must supply it; it appears in the op's input schema.
+- `static` — a value the user typed; never shown to the agent.
+- `vault` — resolved at call time from `<vault>/<key>`; requires a `tool → vault (read)` wire; never shown to the agent or returned by `/v1/board`.
+- `hidden` — omitted from the request entirely.
+Rules: (1) `wheel tool ls` / the MCP tool schema expose ONLY `agent`-mode fields; the engine rejects any extra or non-agent field the caller tries to
+supply (400, logged as a denial event). (2) Fill precedence: `vault`/`static` are authoritative — an agent can never override them. (3) The engine
+executes the request itself (reqwest; 30s timeout; ≤5 MiB response; follows ≤3 redirects) and returns `{status, headers, body}` to the caller;
+`--curl` / the UI "copy as curl" render the exact equivalent `curl` with static/vault values masked. (4) **SSRF policy**: `base_url` and every
+redirect target must resolve to a public IP — loopback, RFC1918, link-local, `*.railway.internal`, `*.internal`, and the host's own addresses are
+denied (project-level allowlist may be added later; v1 is deny). (5) Import is idempotent per node: re-import diffs operations by `method+path`,
+keeps existing fills, flags removed/added ops in the UI. (6) Every call is logged as an event `{tool, op, status, duration_ms, bytes}` — never the
+resolved secret values. (7) MCP exposure: when an agent starts, each `read`-wired tool node contributes its enabled ops to the built-in MCP server
+(§3c #1) as tools named `<tool>__<op>` with description = op summary and input schema = agent fields; Claude/Codex then call them natively.
+Milestone: **M2** (core types + import parsers + executor + CLI + UI); MCP exposure lands with §3c #1.
+
 ### Message delivery contract
 - Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
 - Delivery into a running agent: engine writes a user turn to the child's stdin using the `<AgentPrompt …>` envelope above.
@@ -224,6 +258,10 @@ GET    /v1/agents/:id/auth                → { authenticated: bool, account?: s
 PUT    /v1/vault/:id/:key   {value}       → write-only
 GET    /v1/tables/:id/rows?limit&offset   → for the UI table viewer;  POST /v1/tables/:id/query {sql} (read-only)
 GET    /v1/chests/:id/ls?prefix ; GET /v1/chests/:id/blob?key ; PUT /v1/chests/:id/blob?key (raw body)
+POST   /v1/tools/import   {format?, raw}    → { operations: [...] } normalized preview (no node created); format auto-detected if omitted
+POST   /v1/tools/:id/import {format?, raw}  → re-import into an existing node (diff by method+path, keep fills)
+GET    /v1/tools/:id/ops                    → enabled ops + agent-field schemas (what an agent would see)
+POST   /v1/tools/:id/call {op, args, dry_run?} → UI test call as the user; returns {status, headers, body} or the curl string
 GET    /v1/events   (WebSocket)           → { type: "node.state"|"message"|"log"|"board.changed", ... }
 ANY    /ingress/*                         → endpoint nodes (only reachable via API /p/<project>/ → host → engine)
 POST   /v1/cli/*                          → used by the `wheel` binary; bearer = per-node token (WHEEL_TOKEN env)
@@ -295,7 +333,7 @@ Residual risks to track (ADVERSARY): all tenants share one kernel and one privat
   start it, send it a message from the UI, watch it reply in the log, `wheel msg` between two agents works.
   SDK: engine + host (docker backend) + cli + image. API: auth + projects + host client + proxy + WS. Web: board with agent & ctx nodes,
   inspector, start/stop, chat, log. QA: `make check`, smoke test of the slice. ADVERSARY: threat model + first probes.
-- **M2 — All node types + full wire matrix + ingress + vault/chest/table/script/mcp + ephemeral context + run_on_startup.**
+- **M2 — All node types + full wire matrix + ingress + vault/chest/table/script/mcp + `tool` (spec import, fills, executor, MCP exposure) + ephemeral context + run_on_startup.**
 - **M3 — Hardening (red-team findings fixed), `process` sandbox backend on Railway, landing page, deploy (Railway ×2 + Vercel), docs.**
 
 Ship M1 before polishing anything. Prefer working end-to-end over complete-in-isolation.

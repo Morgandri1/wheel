@@ -24,7 +24,8 @@ and `docs/TESTPLAN.md`. Your job: nothing reaches `main` broken, and the spec is
 ## Non-negotiables
 - Tests are deterministic and hermetic (no real Anthropic/OpenAI calls in CI — fake harness only; a separate opt-in `make test-live` may hit real CLIs).
 - Never edit product code to make a test pass — file a BUG. You may add `data-testid`s / test hooks via a PROPOSAL to the owner.
-- Coverage of the wire matrix is exhaustive: 8×8×3 = 192 cells, each asserted allowed or denied exactly as the table says.
+- Coverage of the wire matrix is exhaustive: 9×9×3 = 243 cells (the `tool` type is the 9th), each asserted allowed or denied exactly as the table says.
+- Tool nodes (§3d, M2): fixture specs for OpenAPI 3, Swagger 2, Postman v2.1, Insomnia v4 → identical normalized ops; fill precedence (agent can't override static/vault); extra/non-agent fields rejected; vault values absent from board/logs/curl output; SSRF deny-list (loopback/RFC1918/link-local/*.internal, incl. via redirect and via DNS); re-import keeps fills.
 - Don't wait for features to exist: write the test plan and the harness now, tests go red→green as devs land work. Message PM with `STATUS:` listing which TESTPLAN IDs are green.
 
 ## Suggested plan shape
