@@ -167,6 +167,7 @@ async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> {
         "sandbox_backend": match state.cfg.backend {
             Backend::Docker => "docker",
             Backend::Process => "process",
+            Backend::External => "external",
         },
     }))
 }
