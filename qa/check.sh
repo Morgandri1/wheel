@@ -152,6 +152,9 @@ else
   skip "qa:contract-schema"   "jsonschema missing — run 'make bootstrap'"
 fi
 
+# E2E is heavy (browser download, two dev servers) so it is not part of `make check`.
+# `make test-e2e` runs it; CI has its own job.
+
 # ----------------------------------------------------------------- summary
 echo
 printf '%s──────── make check ────────%s\n' "$B" "$Z"
