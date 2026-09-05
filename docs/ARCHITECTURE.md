@@ -106,7 +106,9 @@ All nodes share these traits (per spec): `name`, `position`, `wires`, `type`. Ca
 Runtime state (NOT stored in config; reported alongside as `state`): agents → `status` (`stopped | starting | needs_auth | running | idle | error`), `session_id`, `last_activity`, `last_error`.
 
 Per-type `config`:
-- `agent`:    `{ harness: "claude" | "codex", model?: string, system_prompt: string, run_on_startup: bool, ephemeral_context: bool }`
+- `agent`:    `{ harness: "claude" | "codex", model?: string, system_prompt: string, run_on_startup: bool, ephemeral_context: bool,
+               may_place?: bool /* §3e, default false */, budget?: { max_turns?: n, max_usd?: x }, workspaces?: [{ path, git?: { url, ref?, vault_ref? } }], runtime?: "cloud" | "local" /* default cloud */ }`
+  All nodes may also carry `owner_node?: <node id>` (set when placed by an agent, §3e).
 - `ctx`:      `{ markdown: string }`
 - `table`:    `{ columns: [{ name: string, type: "text"|"integer"|"real"|"blob"|"json" }] }` → sqlite table `t_<node.name>` (engine renames on node rename)
 - `endpoint`: `{ method: "GET"|"POST"|"PUT"|"DELETE", path: string /* leading slash, no `..` */, response_mode: "ack" | "script", auth: { mode: "none" } | { mode: "bearer", vault_ref: "<vault>/<key>" } /* M2; bearer requires an endpoint→vault read wire; mismatch → 401 with no body */ }`
@@ -126,7 +128,7 @@ Per-type `config`:
 
 | from → to            | read                                        | write                                  | send                                                       |
 |----------------------|---------------------------------------------|----------------------------------------|------------------------------------------------------------|
-| agent → agent        | —                                           | —                                      | `wheel msg <agent> "..."` delivers into the target's inbox |
+| agent → agent        | —                                           | manage: `wheel start|stop|update|remove`, `grant … to` (§3e) | `wheel msg <agent> "..."` delivers into the target's inbox |
 | agent → ctx          | `wheel read <ctx>` returns the markdown     | `wheel write <ctx> "…"\|--file f.md`  | —                                                          |
 | ctx → agent          | —                                           | —                                      | **INJECTION**: ctx markdown is prepended to the agent's prompt on start and after every context clear |
 | agent → table        | `wheel read <t>/<row>`, `wheel ls <t>`, `wheel query <t> "<SELECT…>"` (read-only SQL) | + `wheel write <t>/<row> '<json>'` upsert, `wheel rm <t>/<row>` (`write` implies `read`) | — |
@@ -239,6 +241,39 @@ keeps existing fills, flags removed/added ops in the UI. (6) Every call is logge
 resolved secret values. (7) MCP exposure: when an agent starts, each `read`-wired tool node contributes its enabled ops to the built-in MCP server
 (§3c #1) as tools named `<tool>__<op>` with description = op summary and input schema = agent fields; Claude/Codex then call them natively.
 Milestone: **M2** (core types + import parsers + executor + CLI + UI); MCP exposure lands with §3c #1.
+
+
+### 3e. YOKE parity — everything yoke does, Wheel does (operator directive: "add anything that is yoke")
+
+Wheel is yoke v2, so yoke's whole feature surface maps onto Wheel. Items marked M1/M2 are binding for those milestones; M3+ are committed scope, not wishes.
+The grammar stays yoke's; the implementation follows §3c's hardening.
+
+| yoke                                                     | Wheel                                                                                                                                                   | Owner | Milestone |
+|----------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|-------|-----------|
+| `whoami`, `connections`, `list`                          | `wheel whoami`, `wheel connections`, `wheel list` (every agent on my board: name, status, session, hosted-where)                                        | SDK   | M1 |
+| `msg` (`--wait`, `--stdin/--file`), durable queued ids   | §3 + §3c: `wheel msg` returns `{id, sha256, bytes, state}`; `--wait[=SECS]` / `--wait-consumed`; durable, inbox re-read                                 | SDK   | M1 / M2 |
+| `--as <agent>` operator attribution                      | UI/API sends carry `from=user`; operator CLI (below) `--as` is allowed only for the project owner and is recorded as `on_behalf_of`                        | SDK/API | M3 |
+| `read/write/ls <node>[/<row>]` node-as-keyspace          | §3 CLI grammar, identical                                                                                                                               | SDK   | M1 |
+| `secret get/list` (`set` for operator)                   | `wheel secret get <vault>/<key>`, `wheel secret list <vault>` (names only). `set` is UI/API/operator-CLI only — vaults stay read-only to agents (spec)    | SDK   | M1 / M2 |
+| `run <script>`                                           | `wheel run <script> [args]`                                                                                                                             | SDK   | M2 |
+| `tool list`, `tool <id> --help`, `tool <id> <args>` (self-describing registry; **the wire is the capability**) | `wheel tool list` enumerates EVERY tool-like node I'm wired to (script, tool/http ops, mcp, email) with one-line usage; `wheel tool <node> --help` prints its schema; `wheel tool call …` invokes. Same registry feeds the per-agent MCP server (§3c #1) so LLMs get typed tools. | SDK | M2 |
+| Email tool node (`email send`, wire-gated relay, idempotency key) | `tool` node `kind: "email"` — project-scoped relay through the API's mail provider (Resend/Postmark, API owns), `wheel email send --to --subject [--idempotency-key] <body>`; From is forced to `<project-slug>@mail.wheel.dev`; wire-gated | SDK+API | M3 |
+| Webhook listener (`webhook test`)                        | `endpoint` nodes + `wheel endpoint test <endpoint> --body …` (fires the endpoint locally as if from ingress)                                              | SDK   | M2 |
+| `place agent|context|table|script <name> [gx gy] --near self --prompt --budget --projects` (agents create nodes at runtime) | **Dynamic workflows.** `wheel place <type> <name> [--near self] [--config <json>] [--prompt …] [--budget …]` — an agent may create nodes if its config has `may_place: true`; the placed node is *owned* by the placer (`owner_node` field), auto-wired placer→child per a sensible default (`send` for agents, `read`+`write` for data nodes), positioned next to the placer, and appears live on the board. Owned nodes can be `wheel update`d / `wheel remove`d by their owner only. Per-project cap on placed nodes (default 50). | SDK (engine) · Web (render live) | M2 |
+| `grant <node> to <agent>` / `revoke` (capability attenuation) | `wheel grant <node> to <agent> [--as read|write|send]` — I may grant a capability I HOLD, never stronger than mine (write ⊃ read; a `send` can't become `read`), only to agents I own or am wired to; `wheel revoke <node> from <agent>`. Grants are real wires with `granted_by` set, shown distinctly on the board; revoking the grantor's own wire cascades. | SDK | M2 |
+| `wire`/`unwire` (admin)                                  | UI/API for users; from the CLI only via `grant`/`revoke` and only within the rules above                                                                 | SDK   | M2 |
+| `start`/`stop`/`update`/`remove` an agent                | `wheel start|stop <agent>`, `wheel update <agent> --prompt …`, `wheel remove <node>` — allowed for nodes I own (placed) or when I hold a `write` wire to that agent (new matrix cell: agent → agent `write` = manage) | SDK | M2 |
+| `--budget N` per agent                                   | agent config `budget: { max_turns?: n, max_usd?: x }` — engine stops the agent with `status: budget_exhausted` and an event; UI shows spend (from harness usage events) | SDK · Web | M2 |
+| `--projects "d1,d2"` (working directories)               | agent config `workspaces: [{ path, git?: { url, ref, vault_ref? } }]` — the engine materialises them under `/data/projects/<id>/ws/<name>` (clone on first start, with a vault-held token if private) and sets the child's cwd to the first. Shared workspaces between agents are allowed (same path). | SDK · Web | M2 |
+| `--runtime tui|cloud` (host an agent on a connected client) | **Local runners.** agent config `runtime: "cloud" | "local"`. `wheel connect <project>` on the user's own machine (operator CLI, below) attaches as a runner: local-runtime agents are spawned THERE (the user's own `claude`/`codex` login, own filesystem), while the board, messages, wires and data stay in the cloud engine, bridged over an authenticated WebSocket. Runner offline ⇒ agent `status: unhosted` (yoke's `hosted=false`, surfaced loudly in the UI — we lost hours to a silent unhosted agent). | SDK · API · Web | M3 |
+| `login --url/--key`, `login --token`, `sso login`, `swarms` (the same CLI works as operator from a laptop) | **Operator mode of the same `wheel` binary**: `wheel login` (Clerk device flow), `wheel projects`, `wheel use <project>`, then every §3 command runs from the laptop against api.wheel.dev → host → engine with the user's authority (not a node's). `wheel token <agent>` mints a node token for debugging (owner only, shown once). | API · SDK | M3 |
+| `init` → `<name>.swarm.toml` (declarative swarm)          | **Board-as-code.** `wheel.toml` describes nodes (type, name, position, config) and wires. `wheel export` / `wheel import`, `POST /v1/projects/:id/export|import`, UI "Export / Import / Duplicate project", and **templates** (a gallery of starter boards). Secrets export as key names only. | SDK (format+engine) · API · Web | M3 |
+| `token <agent>` (admin cap tokens)                        | node tokens exist (§3); operator `wheel token` as above                                                                                                 | SDK   | M3 |
+| `grid` coordinates + pipe tiles                           | free `position {x,y}` + drawn wires; no pipe tiles (the board renders wires directly)                                                                  | —     | — |
+| Agent statuses `Active/Waiting/Idle`, `hosted`            | `state.status` (§3) + `hosted_on: "cloud" | "<runner id>" | null`; `unhosted` is a first-class, alarming state                                            | SDK · Web | M1 (status) · M3 (runner) |
+| `prompt` (deprecated alias)                               | not carried                                                                                                                                              | —     | — |
+
+Matrix additions from this section: `agent → agent (write)` = manage (start/stop/update/remove/grant-to); grant-created wires carry `granted_by`.
 
 ### Message delivery contract
 - Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
