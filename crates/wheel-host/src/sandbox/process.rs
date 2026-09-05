@@ -395,7 +395,7 @@ impl Sandbox for ProcessSandbox {
 }
 
 /// Probe `/healthz` over the engine's unix socket.
-async fn healthz_over_socket(socket: &std::path::Path) -> bool {
+pub(crate) async fn healthz_over_socket(socket: &std::path::Path) -> bool {
     let Ok(stream) = tokio::net::UnixStream::connect(socket).await else {
         return false;
     };
@@ -412,5 +412,91 @@ async fn healthz_over_socket(socket: &std::path::Path) -> bool {
     match stream.read(&mut buf).await {
         Ok(n) if n > 0 => buf[..n].starts_with(b"HTTP/1.1 200"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one HTTP response on a unix socket, then close.
+    async fn socket_answering(path: std::path::PathBuf, response: &'static str) {
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+    }
+
+    /// Short on purpose: a unix socket path must fit in `sun_path`, which is 104 bytes on macOS
+    /// and 108 on Linux. The system temp directory plus a full uuid overruns it, and the failure
+    /// is an opaque "path must be shorter than SUN_LEN" from bind rather than anything about the
+    /// test. `/tmp` and eight hex characters leave plenty of room.
+    fn sock(name: &str) -> std::path::PathBuf {
+        let id = Uuid::new_v4().simple().to_string();
+        std::path::PathBuf::from(format!(
+            "/tmp/wh-{}-{}.sock",
+            &name[..2.min(name.len())],
+            &id[..8]
+        ))
+    }
+
+    /// Readiness has to mean the engine answered, not merely that a process exists. Reporting a
+    /// project `running` because a child was spawned would tell an operator their board is live
+    /// while every request to it fails.
+    #[tokio::test]
+    async fn healthz_is_true_only_for_a_200() {
+        let p = sock("ok");
+        socket_answering(p.clone(), "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+        assert!(healthz_over_socket(&p).await);
+    }
+
+    #[tokio::test]
+    async fn a_non_200_is_not_ready() {
+        // An engine that is up but failing its own health check is not ready, and treating any
+        // reply as success would mask exactly the startup faults this probe exists to catch.
+        for status in [
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+        ] {
+            let p = sock("bad");
+            socket_answering(p.clone(), status).await;
+            assert!(!healthz_over_socket(&p).await, "accepted {status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_is_not_there_is_not_ready() {
+        // The ordinary case while an engine is still starting, and the permanent case if it died.
+        assert!(!healthz_over_socket(&sock("absent")).await);
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_says_nothing_is_not_ready() {
+        // A listener that accepts and never replies. Without the read actually being checked this
+        // would hang or, worse, count as ready.
+        let p = sock("silent");
+        let listener = tokio::net::UnixListener::bind(&p).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Hold the connection open, say nothing, then drop it.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(stream);
+            }
+        });
+        assert!(!healthz_over_socket(&p).await);
+    }
+
+    #[tokio::test]
+    async fn garbage_on_the_socket_is_not_ready() {
+        let p = sock("garbage");
+        socket_answering(p.clone(), "this is not http at all").await;
+        assert!(!healthz_over_socket(&p).await);
     }
 }

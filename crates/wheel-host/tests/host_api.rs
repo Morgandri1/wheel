@@ -38,6 +38,9 @@ struct FakeSandbox {
     calls: Arc<Mutex<Calls>>,
     status: Status,
     fail_start: bool,
+    fail_stop: bool,
+    fail_restart: bool,
+    fail_destroy: bool,
     engine_base: String,
 }
 
@@ -47,6 +50,9 @@ impl FakeSandbox {
             calls: Arc::new(Mutex::new(Calls::default())),
             status: Status::Running,
             fail_start: false,
+            fail_stop: false,
+            fail_restart: false,
+            fail_destroy: false,
             engine_base: "http://127.0.0.1:1".into(),
         }
     }
@@ -69,14 +75,23 @@ impl Sandbox for FakeSandbox {
     }
     async fn stop(&self, id: &Uuid) -> anyhow::Result<()> {
         self.calls.lock().unwrap().stopped.push(*id);
+        if self.fail_stop {
+            anyhow::bail!("stop failed");
+        }
         Ok(())
     }
     async fn restart(&self, id: &Uuid, _: &Secrets) -> anyhow::Result<()> {
         self.calls.lock().unwrap().restarted.push(*id);
+        if self.fail_restart {
+            anyhow::bail!("restart failed");
+        }
         Ok(())
     }
     async fn destroy(&self, id: &Uuid) -> anyhow::Result<()> {
         self.calls.lock().unwrap().destroyed.push(*id);
+        if self.fail_destroy {
+            anyhow::bail!("destroy failed");
+        }
         Ok(())
     }
     async fn status(&self, _: &Uuid) -> anyhow::Result<Status> {
@@ -455,4 +470,149 @@ async fn restart_round_trips() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(calls.lock().unwrap().restarted, vec![id]);
+}
+
+// ---------------------------------------------------------------- failure branches
+
+/// A sandbox that cannot be destroyed must keep its record.
+///
+/// Deleting the row anyway would strand the sandbox: a project nothing has a record of is a
+/// project nobody will ever clean up, and on the process backend that means a uid, a data
+/// directory and possibly a live engine with no owner.
+#[tokio::test]
+async fn a_failed_destroy_keeps_the_record() {
+    let mut sandbox = FakeSandbox::new();
+    sandbox.fail_destroy = true;
+    let (app, _calls, store) = harness(sandbox);
+    let id = Uuid::new_v4();
+
+    call(
+        &app,
+        "PUT",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        Some(secrets()),
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        store.get(&id).await.unwrap().is_some(),
+        "the record was deleted even though its sandbox is still out there"
+    );
+}
+
+/// A failing stop is reported, not swallowed.
+#[tokio::test]
+async fn a_failed_stop_is_an_error_but_still_clears_intent() {
+    let mut sandbox = FakeSandbox::new();
+    sandbox.fail_stop = true;
+    let (app, _calls, store) = harness(sandbox);
+    let id = Uuid::new_v4();
+
+    call(
+        &app,
+        "PUT",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        Some(secrets()),
+    )
+    .await;
+    call(
+        &app,
+        "POST",
+        &format!("/host/v1/projects/{id}/start"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert!(is_desired_running(&store, &id).await);
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/host/v1/projects/{id}/stop"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Intent is cleared before the sandbox is touched, deliberately: the operator asked for it to
+    // be stopped, so a reboot must not bring it back just because the stop itself failed.
+    assert!(
+        !is_desired_running(&store, &id).await,
+        "a failed stop left the project marked desired-running; a reboot would resurrect it"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_restart_is_reported() {
+    let mut sandbox = FakeSandbox::new();
+    sandbox.fail_restart = true;
+    let (app, _calls, _store) = harness(sandbox);
+    let id = Uuid::new_v4();
+
+    call(
+        &app,
+        "PUT",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        Some(secrets()),
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/host/v1/projects/{id}/restart"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Deleting something that was never provisioned succeeds.
+///
+/// Delete has to converge. The API calls it during project teardown, and failing because the
+/// sandbox is already gone would leave the caller unable to finish removing the project.
+#[tokio::test]
+async fn deleting_an_unknown_project_still_succeeds() {
+    let (app, calls, _store) = harness(FakeSandbox::new());
+    let unknown = Uuid::new_v4();
+
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/host/v1/projects/{unknown}"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        calls.lock().unwrap().destroyed.contains(&unknown),
+        "destroy should still be attempted for an unknown record, in case a sandbox exists"
+    );
+}
+
+/// healthz names the backend, and needs the bearer like everything else.
+#[tokio::test]
+async fn healthz_reports_the_backend_in_use() {
+    let (app, _calls, _store) = harness(FakeSandbox::new());
+    let (status, body) = call(&app, "GET", "/host/v1/healthz", Some(SECRET), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(
+        body["sandbox_backend"], "docker",
+        "the operator needs to know which backend answered, not just that something did"
+    );
 }
