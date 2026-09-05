@@ -103,6 +103,11 @@ fn test_config() -> Config {
         uid_range_start: 20_000,
         uid_stride: 64,
         run_dir: "/tmp/wheel-run-test".into(),
+        rlimit_nproc: 4096,
+        rlimit_address_space_bytes: None,
+        rlimit_fsize_bytes: 8 * 1024 * 1024 * 1024,
+        rlimit_nofile: 16384,
+        rlimit_cpu_secs: None,
         engine_base_url: "http://127.0.0.1:1".into(),
     }
 }
