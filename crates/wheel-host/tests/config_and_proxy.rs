@@ -30,6 +30,8 @@ fn config_validation() {
         std::env::remove_var("SANDBOX_BACKEND");
         std::env::remove_var("WHEEL_ENV");
         std::env::remove_var("ENGINE_BASE_URL");
+        std::env::remove_var("RAILWAY_PUBLIC_DOMAIN");
+        std::env::remove_var("ALLOW_PUBLIC_DOMAIN");
     }
 
     base();
@@ -79,6 +81,34 @@ fn config_validation() {
     std::env::set_var("SANDBOX_BACKEND", "external");
     std::env::set_var("WHEEL_ENV", "dev");
     assert_eq!(Config::from_env().unwrap().backend, Backend::External);
+
+    // The host must never be internet-reachable (§5b): it fronts every tenant's engine behind a
+    // single bearer. Not hypothetical — a bare `railway domain` with this service linked attached
+    // one by accident and nothing noticed. Refusing to boot turns a silent exposure into an
+    // obvious outage, which is the right trade here.
+    base();
+    std::env::set_var(
+        "RAILWAY_PUBLIC_DOMAIN",
+        "wheel-host-production.up.railway.app",
+    );
+    assert!(
+        Config::from_env().is_err(),
+        "a public domain on the sandbox supervisor must stop the process, not be logged"
+    );
+
+    // Deliberate exposure stays possible, but only as an explicit act.
+    base();
+    std::env::set_var(
+        "RAILWAY_PUBLIC_DOMAIN",
+        "wheel-host-production.up.railway.app",
+    );
+    std::env::set_var("ALLOW_PUBLIC_DOMAIN", "1");
+    assert!(Config::from_env().is_ok());
+
+    // An empty value is Railway saying "no domain", not a domain named "".
+    base();
+    std::env::set_var("RAILWAY_PUBLIC_DOMAIN", "");
+    assert!(Config::from_env().is_ok());
 
     base();
     let cfg = Config::from_env().unwrap();

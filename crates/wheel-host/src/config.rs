@@ -56,6 +56,26 @@ impl Config {
         let secret = var("WHEEL_HOST_SECRET")?;
         // This secret is the *only* thing standing between anything that can reach this port and
         // full control of every tenant's sandbox. A short or absent one is not a warning.
+        // The host must never be reachable from the internet (§5b). Railway sets
+        // RAILWAY_PUBLIC_DOMAIN only when a public domain exists, so its presence means someone
+        // has exposed the sandbox supervisor — every tenant's engine, behind one bearer.
+        //
+        // This is not hypothetical: a bare `railway domain` with this service linked created one
+        // by accident, and nothing in the system would have noticed. Refusing to boot turns a
+        // silent exposure into an obvious outage, which is the trade you want for this process.
+        // ALLOW_PUBLIC_DOMAIN exists only so a deliberate future topology is not blocked by me.
+        if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+            let domain = domain.trim();
+            if !domain.is_empty() && var_or("ALLOW_PUBLIC_DOMAIN", "0") != "1" {
+                bail!(
+                    "refusing to start: a public domain ({domain}) is attached to this host. \
+                     The sandbox supervisor must be reachable on private networking only — it \
+                     fronts every tenant's engine behind a single bearer. Remove the domain, or \
+                     set ALLOW_PUBLIC_DOMAIN=1 if this is deliberate."
+                );
+            }
+        }
+
         if secret.len() < 16 {
             bail!("WHEEL_HOST_SECRET must be at least 16 characters");
         }
