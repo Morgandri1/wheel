@@ -162,6 +162,65 @@ Explicit origin allowlist from `CORS_ALLOWED_ORIGINS`. Never wildcard-with-crede
 authenticates with a header rather than cookies, so `allow_credentials` is never needed, and an
 explicit list keeps a hostile page from scripting the API with a user's token.
 
+## Running the API natively (no Docker) — for the web team
+
+The containerised stack rebuilds the Rust image on every change, which is a poor inner loop for
+frontend work. This runs the same two binaries directly against the stub engine.
+
+```bash
+cargo build -p wheel-api -p wheel-host
+
+# 1. Postgres (any local instance; create a database first)
+#    docker run -d --name wheel-pg -p 55432:5432 \
+#      -e POSTGRES_USER=wheel -e POSTGRES_PASSWORD=wheel -e POSTGRES_DB=wheel_dev postgres:17-alpine
+
+# 2. Stub engine on :7000
+python3 infra/dev/stub_engine.py &
+
+# 3. Host on :7100
+WHEEL_ENV=dev SANDBOX_BACKEND=external ENGINE_BASE_URL=http://127.0.0.1:7000 \
+WHEEL_HOST_SECRET=dev-host-secret-at-least-16-chars BIND_ADDR=127.0.0.1:7100 \
+WHEEL_DATA_DIR=/tmp/wheel-host-data ./target/debug/wheel-host &
+
+# 4. API on :8080
+WHEEL_ENV=dev BIND_ADDR=127.0.0.1:8080 \
+DATABASE_URL=postgres://wheel:wheel@127.0.0.1:55432/wheel_dev \
+CLERK_ISSUER=https://dev.wheel.local AUTH_DEV_SECRET=dev-only-hs256-secret \
+API_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+WHEEL_HOST_URL=http://127.0.0.1:7100 WHEEL_HOST_SECRET=dev-host-secret-at-least-16-chars \
+CORS_ALLOWED_ORIGINS=http://localhost:3000 ./target/debug/wheel-api
+```
+
+`SANDBOX_BACKEND=external` points the host at an engine someone else started, instead of creating
+containers. It refuses to load unless `WHEEL_ENV=dev`, because it performs no isolation at all.
+
+### Minting a token without Clerk
+
+With `AUTH_DEV_SECRET` set and `WHEEL_ENV=dev`, the API accepts HS256 tokens. `sub` is the user id,
+so two different `sub` values are two different tenants — which is how to exercise the ownership
+boundary locally. Claims: `{sub, iss, exp, nbf}`, where `iss` must equal `CLERK_ISSUER` exactly.
+A ten-line reference implementation lives in `infra/dev/e2e.py` (`mint()`); copy it rather than
+rewriting it.
+
+Sanity check the whole chain, including the boundary cases, with:
+
+```bash
+python3 infra/dev/e2e.py
+```
+
+### Opening the events WebSocket
+
+Browsers cannot set headers on a WebSocket handshake, and the session JWT must never appear in a
+URL where it would be captured by proxy and server logs. So the socket is opened with a ticket:
+
+```
+POST /v1/projects/{id}/ws-ticket        -> { "ticket": "...", "expires_in": 30 }
+ws://localhost:8080/v1/projects/{id}/engine/v1/events?ticket=<ticket>
+```
+
+The ticket is single-use, expires in 30 seconds, and is bound to the (user, project) pair it was
+minted for.
+
 ## Local development
 
 ```bash
