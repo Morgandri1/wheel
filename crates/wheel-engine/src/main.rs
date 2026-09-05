@@ -17,6 +17,7 @@ mod config;
 mod db;
 mod events;
 mod harness;
+mod oauth;
 mod peercred;
 mod supervisor;
 
@@ -73,6 +74,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg,
         db,
         events,
+        logins: Arc::new(oauth::LoginSessions::default()),
     };
     // Before serving: agents configured to run on startup come up parked, and
     // any message left queued by the previous run resumes exactly the agents
