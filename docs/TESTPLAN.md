@@ -126,6 +126,25 @@ The envelope written to the child's stdin is exactly one compact JSON line:
 | `MSG-durable-restart` | `messages` rows (id, sha256, bytes, state, timestamps, last_error) survive container restart. | S2 |
 | `MSG-error-turn` | `result.is_error=true` → agent `status=error`, `last_error` = `result.result`; the message is still marked consumed (not redelivered in a loop). | S2 |
 
+### 3a. Single writer & the user priority lane (§3c #12)
+
+The engine's per-agent delivery loop is the **only** thing that ever writes to a child's stdin.
+User messages take a priority lane ahead of queued agent/endpoint/script messages, but are
+**never** injected mid-turn. All of these are asserted from `WHEEL_FAKE_TRANSCRIPT` — the raw
+bytes the child received — because the engine's own view of what it sent is the thing under test.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MSG-single-writer` | The transcript is always a sequence of **whole JSON lines**. No interleaved, split or partial writes, ever — under concurrent sends, ingress hits, script sends and UI sends at once. Asserted by parsing every transcript line strictly and byte-counting. | **S1** |
+| `MSG-no-midturn` | Agent is mid-turn (scripted slow turn via `WHEEL_FAKE_SCRIPT` `{"sleep":N}`); a user message sent during it appears in the transcript **only after** that turn's `result` event. Not one byte earlier. | **S1** |
+| `MSG-priority-user` | With 3 agent messages already queued and 1 user message sent after them, the **user's is delivered first**; the 3 then drain in their original order. | S2 |
+| `MSG-priority-order` | Two rapid user sends arrive **in send order**, each as its own turn — the priority lane is FIFO within itself, not a stack. | S2 |
+| `MSG-priority-no-starve` | A steady stream of user messages does not starve queued agent messages forever; document and assert the fairness rule. | S3 |
+| `MSG-queued-next` | The message the delivery loop will send next reports state `queued (next)`, so the UI can show the user exactly when their message lands. | S3 |
+| `MSG-stdin-sole-path` | No path other than the delivery loop can reach a child's stdin — not the log/exec routes, not the built-in MCP server, not script nodes. Asserted by attempting each. | **S1** |
+| `MSG-interrupt` | `POST /v1/agents/:id/interrupt` cancels the in-flight turn per the harness protocol and then delivers the user's message. Never implicit — no other action interrupts a turn. *(M2)* | S2 |
+| `MSG-draft-local` | The chat box draft is client-side only (localStorage per agent, survives reload) and creates no `messages` row until Send. *(Web)* | S3 |
+
 ---
 
 ## 4. INJ — ctx injection & ephemeral context (§3)
@@ -278,6 +297,7 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `COMMS-threading` | 9 | `--reply-to <id>` sets envelope `reply_to`. *(M2)* |
 | `COMMS-observability` | 10 | Web shows body, sha256, state, from/to, and the exact stdin transcript per agent. *(Web M2)* |
 | `COMMS-no-truncate` | 11 | `MSG-no-truncate`. |
+| `COMMS-single-writer` | 12 | `MSG-single-writer` + `MSG-no-midturn` + `MSG-priority-*` + `MSG-stdin-sole-path`; interrupt is `MSG-interrupt`. |
 
 ---
 
@@ -322,6 +342,7 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `Q-MSG-ERROR-REDELIVER` | When a turn errors, is the message consumed or retried? | Consumed exactly once + `last_error`. Infinite redelivery of a poison message is worse than losing one. |
 | `Q-TABLE-CEILING` | Documented ceiling for `script.timeout_secs` and max rows returned by `table query`? | 300s and 10k rows; both need to be in PROTOCOL.md so `CLI-limits-clientside` can enforce them. |
 | `Q-ENDPOINT-AUTH` | Can an ingress endpoint require a shared secret? | Out of scope for M1/M2, but worth a line in the threat model — a public write path into a table is an obvious abuse target. |
+| `Q-PRIORITY-FAIRNESS` | What stops a stream of user messages starving queued agent messages indefinitely (`MSG-priority-no-starve`)? | Drain at most N user messages before letting one queued message through, or timestamp-age escalation. Needs a rule from SDK before I can assert one. |
 
 ---
 
