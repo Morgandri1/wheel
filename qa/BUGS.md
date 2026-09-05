@@ -18,6 +18,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | ~~closed~~ | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
 | 011 | `ENG-one-process`, `ENG-park-resume`, `MSG-delivered-means-delivered` | **S1** | SDK | ~~closed~~ | After any failed start, every later start was a silent no-op — and a turn could be written to a dead child's stdin and marked delivered |
 | 012 | `make check` (`web:test`) | S4 | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
+| 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
 
 ---
 
@@ -469,3 +470,42 @@ to someone who ignores it.
    an override, so they are appended now.
 2. `make check` prints the running node major when it differs from the 22 that CI pins, and
    says to suspect the runtime first if a web gate is red locally and green on CI.
+
+---
+
+## 013 — The integration suite has never run in CI · S2 · QA (mine) · CLOSED
+
+Filed against myself. The ledger is the system of record (§3c #15), and this is the same
+failure I have filed against three other people this week, so it belongs here in the same form.
+
+**Repro (before the fix):** `gh run view <any main run> --json jobs` →
+`integration (docker + fake harness): skipped`, on every run since the workflow was written.
+
+**Cause.** The job carried:
+```yaml
+    # Skipped until SDK lands the engine image; flipped on then.
+    if: false
+```
+The image landed at 10:59Z. Nobody flipped it. I wrote the condition, I got the image, I ran
+the suite by hand, I reported 127/127 green — and I never went back to the workflow.
+
+**Impact.** For the whole M1 window, 127 assertions — all 243 wire-matrix cells against a real
+engine, the byte-exactness fixture, the credential-routing suite — existed and passed only on
+my laptop. CI reported green throughout, and that green meant less than everyone reading it
+believed. In the GitHub UI a disabled job and a passing job render the same unless you open
+the job list, which is what makes this worse than an ordinary red.
+
+**Fix (main @ 08d9ad8).**
+1. `integration` enabled, `backend: [docker]`. `process` is left out of the matrix rather than
+   allowed to fail: a row that is red on every run is how people learn to stop reading the
+   column. It joins at M3 with the backend it tests.
+2. `qa/contract/ci_workflow_lint.py` now **fails** on any job with `if: false` that has no
+   entry in `DISABLED_OK` naming the reason and the EVENT that re-enables it — the same
+   discipline PM ruled for coverage exemptions. Verified the rule fires by disabling a job
+   and watching the gate go red.
+
+**The part worth keeping.** The lint *already* detected disabled jobs. It printed them under
+`deliberately disabled:` as informational output, and I stopped reading the line. Informational
+output is not a gate; if it were worth printing it was worth failing on. That is the same
+lesson as exit 77 (a gate that cannot run must not look like a gate that passed) arriving from
+a direction I had not covered: a gate that *reports* a problem without failing on it.
