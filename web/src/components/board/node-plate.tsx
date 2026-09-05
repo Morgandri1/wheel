@@ -190,12 +190,51 @@ function NodePlateInner({ data, selected }: NodeProps) {
 }
 
 /** Memoised on the node identity so a state tick on one agent doesn't re-render 200 plates. */
+/**
+ * Everything a plate actually draws, as one comparable string.
+ *
+ * Object identity is useless here: every board refetch parses fresh JSON, so `prev === next` is
+ * false for all 200 nodes on every tick and the memo does nothing. Comparing the rendered fields
+ * means one agent going idle re-renders one plate instead of the whole board.
+ */
+export function plateSignature(node: WheelNode): string {
+  const state = node.type === "agent" ? `${node.state?.status}|${node.state?.last_error ?? ""}` : "";
+  return `${node.id}|${node.name}|${node.type}|${state}|${summary(node)}`;
+}
+
+/** The one line of config each plate shows — and therefore the only config it depends on. */
+function summary(node: WheelNode): string {
+  switch (node.type) {
+    case "agent":
+      return node.config.harness;
+    case "ctx":
+      return node.config.markdown;
+    case "endpoint":
+      return `${node.config.method} ${node.config.path}`;
+    case "table":
+      return String((node.config.columns ?? []).length);
+    case "script":
+      return node.config.language;
+    case "vault":
+      return String((node.config.keys ?? []).length);
+    case "mcp":
+      return node.config.transport === "stdio" ? node.config.command : node.config.url;
+    case "tool": {
+      const ops = node.config.operations ?? [];
+      return `${ops.filter((o) => o.enabled !== false).length}/${ops.length}`;
+    }
+    default:
+      return "";
+  }
+}
+
 export const NodePlate = memo(NodePlateInner, (a, b) => {
-  const pa = (a.data as PlateData).node;
-  const pb = (b.data as PlateData).node;
+  const da = a.data as PlateData;
+  const db = b.data as PlateData;
   return (
     a.selected === b.selected &&
-    pa === pb &&
-    (a.data as PlateData).takenNames === (b.data as PlateData).takenNames
+    plateSignature(da.node) === plateSignature(db.node) &&
+    // Only matters while renaming, and only for the node being renamed.
+    da.takenNames.length === db.takenNames.length
   );
 });
