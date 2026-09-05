@@ -17,7 +17,11 @@ export interface WireRule {
   type: WireType;
   /** Short imperative for the wire-type popover. */
   label: string;
-  /** Plain language from the source's point of view — `wheel connections` style. */
+  /**
+   * Plain language from the source's point of view — `wheel connections` style.
+   * `grants` is the same sentence; the popover and the inspector read it under that
+   * name because there it answers "what does picking this give me?".
+   */
   outgoing: string;
   /** Plain language from the target's point of view. */
   incoming: string;
@@ -244,10 +248,19 @@ export const WIRE_MATRIX: readonly WireRule[] = [
   },
 ] as const;
 
+/**
+ * `grants` is `outgoing` under the name the popover wants. Derived rather than
+ * typed twice, so the two can never drift.
+ */
+export const WIRE_RULES: readonly (WireRule & { grants: string })[] = WIRE_MATRIX.map((rule) => ({
+  ...rule,
+  grants: rule.outgoing,
+}));
+
 const key = (from: NodeType, to: NodeType, type: WireType) => `${from}>${to}:${type}`;
 
-const RULES_BY_KEY = new Map<string, WireRule>(
-  WIRE_MATRIX.map((rule) => [key(rule.from, rule.to, rule.type), rule]),
+const RULES_BY_KEY = new Map<string, WireRule & { grants: string }>(
+  WIRE_RULES.map((rule) => [key(rule.from, rule.to, rule.type), rule]),
 );
 
 /** Every wire type legal from `from` to `to`, in read/write/send order. */
@@ -255,15 +268,22 @@ export function allowedWireTypes(from: NodeType, to: NodeType): WireType[] {
   return WIRE_MATRIX.filter((r) => r.from === from && r.to === to).map((r) => r.type);
 }
 
-export function allowedWireRules(from: NodeType, to: NodeType): WireRule[] {
-  return WIRE_MATRIX.filter((r) => r.from === from && r.to === to);
+export function allowedWireRules(
+  from: NodeType,
+  to: NodeType,
+): (WireRule & { grants: string })[] {
+  return WIRE_RULES.filter((r) => r.from === from && r.to === to);
 }
 
 export function isWireAllowed(from: NodeType, to: NodeType, type: WireType): boolean {
   return RULES_BY_KEY.has(key(from, to, type));
 }
 
-export function wireRule(from: NodeType, to: NodeType, type: WireType): WireRule | undefined {
+export function wireRule(
+  from: NodeType,
+  to: NodeType,
+  type: WireType,
+): (WireRule & { grants: string }) | undefined {
   return RULES_BY_KEY.get(key(from, to, type));
 }
 
@@ -295,11 +315,18 @@ export function explainDenial(
   fromType: NodeType,
   toName: string,
   toType: NodeType,
-  type: WireType,
+  /** Omitted while dragging, before a wire type has been chosen. */
+  type?: WireType,
 ): string {
   const legal = allowedWireTypes(fromType, toType);
   if (legal.length === 0) {
     return `No wire can go from ${fromType} to ${toType}. ${fromName} cannot reach ${toName}.`;
   }
+  if (!type) return `${fromName} → ${toName} supports ${legal.join(", ")}.`;
   return `A ${fromType} cannot ${type} a ${toType}. Legal here: ${legal.join(", ")}.`;
+}
+
+/** ctx → agent (send) is prepended to the prompt rather than delivered — drawn as an injection. */
+export function isInjection(from: NodeType, to: NodeType, type: WireType): boolean {
+  return wireRule(from, to, type)?.injection === true;
 }

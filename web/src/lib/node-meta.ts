@@ -1,158 +1,103 @@
-import type {
-  AgentConfig,
-  ChestConfig,
-  CtxConfig,
-  EndpointConfig,
-  McpConfig,
-  NodeType,
-  ScriptConfig,
-  TableConfig,
-  VaultConfig,
-  WheelNode,
-} from "@/lib/schema";
+import type { AgentStatus, NodeType, WireType } from "@/lib/schema";
 
-export type GlyphKey =
-  | "agent"
-  | "ctx"
-  | "table"
-  | "endpoint"
-  | "script"
-  | "mcp"
-  | "vault"
-  | "chest";
-
+/**
+ * One place that knows what each node type looks like and is called.
+ *
+ * Glyphs are drawn on a 16×16 grid at 1.4px stroke — schematic marks, not icons from a set.
+ * Type tints are low-chroma on purpose: saturated colour is reserved for wires, so a node
+ * plate never competes with the connection running through it.
+ */
 export interface NodeMeta {
   type: NodeType;
-  /** What a person calls it. */
   label: string;
-  /** One line, written for someone who has never seen Wheel. */
+  /** What this node is, in the person's terms — shown in the palette and on empty inspectors. */
   blurb: string;
-  glyph: GlyphKey;
-  colorVar: string;
-  /** Keyboard shortcut in the palette. */
-  hotkey: string;
+  tint: string;
+  glyph: string;
 }
 
 export const NODE_META: Record<NodeType, NodeMeta> = {
   agent: {
     type: "agent",
     label: "Agent",
-    blurb: "A Claude Code or Codex process. It reads its wires and acts.",
-    glyph: "agent",
-    colorVar: "--type-agent",
-    hotkey: "a",
+    blurb: "A Claude or Codex process. Give it a prompt, wire it to what it may touch.",
+    tint: "var(--t-agent)",
+    glyph: "M4 5h8v6H4z M6 5V3 M10 5V3 M6 13v-2 M10 13v-2 M2 7h2 M2 9h2 M12 7h2 M12 9h2",
   },
   ctx: {
     type: "ctx",
     label: "Context",
-    blurb: "Markdown. Wire it to an agent and it is prepended to every prompt.",
-    glyph: "ctx",
-    colorVar: "--type-ctx",
-    hotkey: "c",
+    blurb: "Markdown that gets prepended to an agent's prompt every time it starts.",
+    tint: "var(--t-ctx)",
+    glyph: "M4 2h6l2 2v10H4z M10 2v2h2 M6 7h4 M6 9.5h4 M6 12h2",
   },
   table: {
     type: "table",
     label: "Table",
-    blurb: "Rows agents can read and write, keyed by a name they choose.",
-    glyph: "table",
-    colorVar: "--type-table",
-    hotkey: "t",
+    blurb: "A SQL table agents can query, and write to if you let them.",
+    tint: "var(--t-table)",
+    glyph: "M2.5 3h11v10h-11z M2.5 6.5h11 M2.5 9.75h11 M6.5 3v10 M10 3v10",
   },
   endpoint: {
     type: "endpoint",
     label: "Endpoint",
     blurb: "A public URL. Each hit becomes a message, a row, or a script run.",
-    glyph: "endpoint",
-    colorVar: "--type-endpoint",
-    hotkey: "e",
+    tint: "var(--t-endpoint)",
+    glyph: "M1.5 8h7 M6 5.5 8.5 8 6 10.5 M11 3h3.5v10H11",
   },
   script: {
     type: "script",
     label: "Script",
-    blurb: "Python or TypeScript an agent can call as a tool.",
-    glyph: "script",
-    colorVar: "--type-script",
-    hotkey: "s",
+    blurb: "Python, TypeScript or JavaScript an agent can call like a tool.",
+    tint: "var(--t-script)",
+    glyph: "M2.5 3h11v10h-11z M5 6.5 7 8.5 5 10.5 M8.5 10.5h3",
   },
   mcp: {
     type: "mcp",
     label: "MCP server",
-    blurb: "Tools from an MCP server, attached to whichever agents you wire.",
-    glyph: "mcp",
-    colorVar: "--type-mcp",
-    hotkey: "m",
+    blurb: "An MCP server attached to an agent's harness at its next start.",
+    tint: "var(--t-mcp)",
+    glyph: "M5.5 2v3.5 M10.5 2v3.5 M3.5 5.5h9v3a4.5 4.5 0 0 1-9 0z M8 13v1.5",
   },
   vault: {
     type: "vault",
     label: "Vault",
-    blurb: "Secrets. You can set them; nothing reads them back out to you.",
-    glyph: "vault",
-    colorVar: "--type-vault",
-    hotkey: "v",
+    blurb: "Secrets. You set them; you never read them back. Agents get them as env vars.",
+    tint: "var(--t-vault)",
+    glyph: "M4 7V5a4 4 0 0 1 8 0v2 M2.5 7h11v7h-11z M8 9.5v2",
   },
   chest: {
     type: "chest",
     label: "Chest",
-    blurb: "Files. Agents put them here to hand to each other or to you.",
-    glyph: "chest",
-    colorVar: "--type-chest",
-    hotkey: "h",
+    blurb: "Files. Agents list, read, and — with a write wire — put and remove them.",
+    tint: "var(--t-chest)",
+    glyph: "M2 5.5 8 2.5l6 3v7L8 15.5l-6-3z M2 5.5 8 8.5l6-3 M8 8.5v7",
   },
 };
 
-/** Palette order: the two you need for anything, then storage, then edges. */
+/** Palette order: the two you need for a first board, then the rest by how often they're reached for. */
 export const PALETTE_ORDER: NodeType[] = [
   "agent",
   "ctx",
   "table",
-  "chest",
-  "vault",
-  "script",
   "endpoint",
+  "script",
   "mcp",
+  "vault",
+  "chest",
 ];
 
-export const DEFAULT_CONFIG: {
-  agent: AgentConfig;
-  ctx: CtxConfig;
-  table: TableConfig;
-  endpoint: EndpointConfig;
-  script: ScriptConfig;
-  mcp: McpConfig;
-  vault: VaultConfig;
-  chest: ChestConfig;
-} = {
-  agent: {
-    harness: "claude",
-    system_prompt: "",
-    run_on_startup: false,
-    ephemeral_context: false,
-  },
-  ctx: { markdown: "" },
-  table: { columns: [] },
-  endpoint: { method: "POST", path: "/hook", response_mode: "ack" },
-  script: { language: "python", source: "", timeout_secs: 60 },
-  mcp: { transport: "stdio", command: "", args: [] },
-  vault: { keys: [] },
-  chest: {} as ChestConfig,
+export const WIRE_META: Record<WireType, { label: string; color: string; dash: string }> = {
+  read: { label: "read", color: "var(--wire-read)", dash: "0" },
+  write: { label: "write", color: "var(--wire-write)", dash: "0" },
+  send: { label: "send", color: "var(--wire-send)", dash: "5 4" },
 };
 
-export function defaultConfigFor(type: NodeType): WheelNode["config"] {
-  return structuredClone(DEFAULT_CONFIG[type]) as WheelNode["config"];
-}
-
-export const STATUS_META: Record<
-  string,
-  { label: string; tone: "idle" | "busy" | "live" | "alarm"; hint: string }
-> = {
-  stopped: { label: "Stopped", tone: "idle", hint: "Not running. Start it to deliver its queued messages." },
-  starting: { label: "Starting", tone: "busy", hint: "The engine is spawning the harness." },
-  needs_auth: {
-    label: "Needs sign-in",
-    tone: "alarm",
-    hint: "The harness has no credentials yet. Authenticate to continue.",
-  },
-  running: { label: "Running", tone: "live", hint: "Working on a turn." },
-  idle: { label: "Idle", tone: "live", hint: "Up and waiting for a message." },
-  error: { label: "Error", tone: "alarm", hint: "The harness exited. Check the log." },
+export const AGENT_STATUS_META: Record<AgentStatus, { label: string; color: string; pulse: boolean }> = {
+  stopped: { label: "Stopped", color: "var(--ink-faint)", pulse: false },
+  starting: { label: "Starting", color: "var(--wire-write)", pulse: true },
+  needs_auth: { label: "Needs sign-in", color: "var(--danger)", pulse: false },
+  running: { label: "Running", color: "var(--live)", pulse: true },
+  idle: { label: "Idle", color: "var(--live)", pulse: false },
+  error: { label: "Error", color: "var(--danger)", pulse: false },
 };

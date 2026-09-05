@@ -17,6 +17,17 @@
   --wire-read: #1e6fbf;
   --wire-write: #a76a06;
   --wire-send: #7b3fc4;
+
+  /* Node-type tints. Deliberately low-chroma: the saturated end of the palette belongs to
+     wires, so a node never competes with the connection it sits on. */
+  --t-agent: #2f6f5e;
+  --t-ctx: #6b6b45;
+  --t-table: #3f5f7d;
+  --t-endpoint: #8a5340;
+  --t-script: #4c6b3d;
+  --t-mcp: #5f4a72;
+  --t-vault: #7a6420;
+  --t-chest: #3d6a72;
 }
 
 [data-theme="dark"] {
@@ -38,4 +49,13 @@
   --wire-read: #63b3f5;
   --wire-write: #e9a23b;
   --wire-send: #c77dff;
+
+  --t-agent: #7fb5a6;
+  --t-ctx: #aaa98c;
+  --t-table: #8fa3b8;
+  --t-endpoint: #c19a8b;
+  --t-script: #9aae8b;
+  --t-mcp: #a392b0;
+  --t-vault: #bfae86;
+  --t-chest: #8fb0b6;
 }

@@ -176,17 +176,29 @@ export interface Board {
   project: Project;
 }
 
+/** §3c: delivery is observable. `consumed` = the harness reported the turn complete. */
+export const MESSAGE_STATES = ["queued", "delivered", "consumed"] as const;
+export type MessageState = (typeof MESSAGE_STATES)[number];
+
+/** Mirrors the engine's `messages` row (§3c "Message delivery contract"). */
 export interface Message {
   id: string;
   from_node: string;
   to_node: string;
   body: string;
+  /** sha256 of the body as sent, so a mangled delivery is visible rather than guessed at. */
+  sha256: string;
+  bytes: number;
+  reply_to?: string | null;
+  state: MessageState;
   created_at: string;
   delivered_at?: string | null;
-  acked_at?: string | null;
+  consumed_at?: string | null;
+  /** Set when delivery could not proceed; the message stays queued and is never truncated. */
+  last_error?: string | null;
   /** Denormalised by the engine for display. */
   from_name?: string;
-  from_type?: NodeType | "user";
+  from_type?: NodeType | "user" | "system";
 }
 
 export type LogStream = "stdout" | "stderr" | "system";
