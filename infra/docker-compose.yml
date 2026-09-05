@@ -1,0 +1,83 @@
+# Local development stack: postgres + api + host.
+#
+# The security-relevant line in this file is the docker socket mount: it is on the **host** service
+# only. Anything that can reach the docker socket can trivially escape to the machine (mount the
+# root filesystem into a new container), so the internet-facing API must never see it. That is why
+# the API is a pure gateway and the host is the only thing that touches a container runtime.
+
+name: wheel
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wheel
+      POSTGRES_PASSWORD: wheel
+      POSTGRES_DB: wheel
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wheel"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [wheel]
+
+  host:
+    build:
+      context: ..
+      # SDK owns docker/Dockerfile.host (the full image with engine + cli + claude + codex).
+      # Until that lands, this dev image builds just the supervisor so the stack can run.
+      dockerfile: infra/dev/Dockerfile.host.dev
+    environment:
+      SANDBOX_BACKEND: docker
+      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
+      # SDK's real engine owns the wheel-engine:dev tag. Until their build lands this stack runs
+      # against the stub in infra/dev/, tagged separately so the two can never be confused.
+      ENGINE_IMAGE: ${ENGINE_IMAGE:-wheel-engine:stub}
+      DOCKER_NETWORK: wheel
+      BIND_ADDR: 0.0.0.0:7100
+      RUST_LOG: info,wheel_host=debug
+    volumes:
+      # The docker socket lives HERE and nowhere else in this stack.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - hostdata:/data
+    # No published ports: the host is reachable only from the API on the private network,
+    # mirroring production where it has no public domain.
+    expose: ["7100"]
+    networks: [wheel]
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      WHEEL_ENV: dev
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://wheel:wheel@postgres:5432/wheel
+      # Dev defaults: with AUTH_DEV_SECRET set, HS256 tokens are verified locally and the
+      # JWKS endpoint is never contacted. `iss` is still validated, so minted tokens must carry
+      # exactly CLERK_ISSUER.
+      CLERK_JWKS_URL: ${CLERK_JWKS_URL:-http://localhost/unused-jwks}
+      CLERK_ISSUER: ${CLERK_ISSUER:-https://dev.wheel.local}
+      API_MASTER_KEY: ${API_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      WHEEL_HOST_URL: http://host:7100
+      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
+      PUBLIC_BASE_URL: http://localhost:8080
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      # Local HS256 tokens for testing without Clerk. Only honoured because WHEEL_ENV=dev;
+      # the API refuses to boot if this is set with WHEEL_ENV=prod.
+      AUTH_DEV_SECRET: ${AUTH_DEV_SECRET:-dev-only-hs256-secret}
+      RUST_LOG: info,wheel_api=debug
+    ports: ["8080:8080"]
+    networks: [wheel]
+
+volumes:
+  pgdata:
+  hostdata:
+
+networks:
+  wheel:
+    name: wheel

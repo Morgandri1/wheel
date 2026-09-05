@@ -1,6 +1,6 @@
 {
   "id": "7cb2e0ad-2ed4-4ac8-873b-90e5b9188507",
-  "name": "reseаrcher",
+  "name": "rese\u0430rcher",
   "type": "ctx",
   "position": {
     "x": 120.0,
@@ -10,5 +10,6 @@
   "config": {
     "markdown": "x"
   },
-  "_expect_reject": "NODE-name-charset"
+  "_expect_reject": "NODE-name-charset",
+  "_enforced_by": "schema"
 }

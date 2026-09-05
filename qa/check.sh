@@ -20,6 +20,7 @@ fi
 
 PASS=(); FAIL=(); SKIP=()
 STRICT="${CHECK_STRICT:-0}"   # CI sets 1: skips become failures
+COV_MIN="${COV_MIN:-90}"      # ARCHITECTURE.md §0b
 ONLY="${CHECK_ONLY:-}"        # e.g. CHECK_ONLY=rust
 
 # A step exiting 77 means "I could not run" and is recorded as a SKIP, never a pass.
@@ -69,6 +70,10 @@ else
   step "rust:fmt"    cargo fmt --all -- --check
   step "rust:clippy" cargo clippy --workspace --all-targets -- -D warnings
   step "rust:test"   cargo test --workspace
+  # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
+  # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
+  # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
+  step "rust:coverage" "$PY" qa/tools/coverage_gate.py
 fi
 
 # ----------------------------------------------------------------- web
@@ -91,6 +96,8 @@ else
     if web_script "$s"; then step "web:$s" pnpm -C web run "$s"
     else skip "web:$s" "no '$s' script in web/package.json"; fi
   done
+  if web_script "coverage"; then step "web:coverage" pnpm -C web run coverage
+  else skip "web:coverage" "no 'coverage' script in web/package.json (§0b: vitest --coverage, lines: $COV_MIN)"; fi
 fi
 
 # ----------------------------------------------------------------- qa's own
@@ -102,11 +109,27 @@ fi
 
 step "qa:wire-matrix" "$PY" qa/tools/gen_wire_matrix.py --check
 
-# Proves the schema contract test can actually fail, using scratch schemas. Runs today.
-step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
+# The contract gates need `jsonschema` from qa/requirements.txt. A MISSING DEPENDENCY and a
+# BROKEN SCHEMA must never look the same: skip loudly here, and let CI (which bootstraps first,
+# and runs CHECK_STRICT=1) be the place where a skip is a hard failure.
+# Pure stdlib — deliberately OUTSIDE the jsonschema guard. It was briefly nested inside it,
+# which meant the gate silently vanished (not even reported as skipped) on a machine without
+# the venv. A gate that disappears is worse than one that fails.
+step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
 
-# Runs today and self-skips until SDK exports the schema, so it goes green on its own.
-step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
+# Engine routes: ARCHITECTURE.md §4 vs docs/PROTOCOL.md (and a live engine when
+# WHEEL_ENGINE_URL is set, for 404-vs-405).
+step "qa:route-parity" "$PY" qa/contract/route_parity.py
+
+if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
+  # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
+  step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
+  # Runs today and self-skips until SDK exports the schema, so it goes green on its own.
+  step "qa:contract-schema" "$PY" qa/contract/schema_fixtures.py
+else
+  skip "qa:contract-selftest" "jsonschema missing — run 'make bootstrap' (creates qa/.venv)"
+  skip "qa:contract-schema"   "jsonschema missing — run 'make bootstrap'"
+fi
 
 # ----------------------------------------------------------------- summary
 echo

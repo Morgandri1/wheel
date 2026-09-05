@@ -15,5 +15,7 @@
     "status": "running",
     "session_id": "forged"
   },
-  "_expect_reject": "NODE-state-not-config"
+  "_expect_reject": "NODE-state-not-config",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
 }

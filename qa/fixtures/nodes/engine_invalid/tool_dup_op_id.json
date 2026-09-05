@@ -1,0 +1,36 @@
+{
+  "id": "b0b2c3d4-0000-4000-8000-000000000004",
+  "name": "tool-dup-op-id",
+  "type": "tool",
+  "position": {
+    "x": 12.0,
+    "y": 34.0
+  },
+  "wires": [],
+  "config": {
+    "kind": "http",
+    "source": {
+      "format": "openapi",
+      "raw": "{\"openapi\":\"3.0.0\"}",
+      "imported_at": "2026-09-05T00:00:00Z"
+    },
+    "base_url": "https://a.example.com",
+    "operations": [
+      {
+        "id": "same",
+        "method": "GET",
+        "path": "/a",
+        "enabled": true,
+        "params": []
+      },
+      {
+        "id": "same",
+        "method": "GET",
+        "path": "/b",
+        "enabled": true,
+        "params": []
+      }
+    ]
+  },
+  "_expect_reject": "TOOL-op-slug-unique"
+}

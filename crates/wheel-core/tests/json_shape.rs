@@ -23,6 +23,7 @@ fn agent_node_matches_the_contract_example() {
             system_prompt: "be brief".into(),
             run_on_startup: false,
             ephemeral_context: false,
+            ..Default::default()
         }),
     };
     let v = serde_json::to_value(&node).unwrap();
@@ -61,6 +62,7 @@ fn every_node_type_round_trips_with_correct_tag() {
                 system_prompt: "hi".into(),
                 run_on_startup: true,
                 ephemeral_context: true,
+                ..Default::default()
             }),
         ),
         (
@@ -84,6 +86,7 @@ fn every_node_type_round_trips_with_correct_tag() {
                 method: HttpMethod::Post,
                 path: "/hook".into(),
                 response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::None,
             }),
         ),
         (
@@ -96,11 +99,9 @@ fn every_node_type_round_trips_with_correct_tag() {
         ),
         (
             NodeType::Mcp,
-            NodeConfig::Mcp(McpConfig {
-                transport: McpTransport::Stdio,
-                command: Some("npx".into()),
+            NodeConfig::Mcp(McpConfig::Stdio {
+                command: "npx".into(),
                 args: Some(vec!["-y".into()]),
-                url: None,
                 env: None,
             }),
         ),
@@ -114,8 +115,13 @@ fn every_node_type_round_trips_with_correct_tag() {
         (
             NodeType::Tool,
             NodeConfig::Tool(ToolConfig {
+                kind: ToolKind::Http,
+                source: ToolSource {
+                    format: ToolFormat::Openapi,
+                    raw: "{}".into(),
+                    imported_at: Timestamp::parse_rfc3339("2026-09-05T00:00:00Z").unwrap(),
+                },
                 base_url: "https://api.example.com".into(),
-                source_format: Some(ToolFormat::Openapi3),
                 operations: vec![],
             }),
         ),
@@ -171,6 +177,7 @@ fn optional_agent_fields_are_omitted_when_none() {
         system_prompt: String::new(),
         run_on_startup: false,
         ephemeral_context: false,
+        ..Default::default()
     });
     let v = serde_json::to_value(&cfg).unwrap();
     assert!(
@@ -342,4 +349,91 @@ fn listen_addr_parses_both_sandbox_backends() {
     ] {
         assert!(ListenAddr::parse(bad).is_err(), "{bad:?} must be rejected");
     }
+}
+
+#[test]
+fn board_reports_state_as_null_for_non_agent_nodes_not_omitted() {
+    // §3: `GET /v1/board` returns `{ ...node, state }`, state null for
+    // non-agents. Web branches on it, and an omitted key reads as
+    // "not loaded yet" rather than "has no state".
+    let nws = NodeWithState {
+        node: Node::new(
+            uid(7),
+            NodeName::new("notes").unwrap(),
+            Position::default(),
+            NodeConfig::Ctx(CtxConfig {
+                markdown: String::new(),
+            }),
+        ),
+        state: None,
+    };
+    let v = serde_json::to_value(&nws).unwrap();
+    assert!(v.get("state").is_some(), "state key must be present");
+    assert_eq!(v["state"], json!(null));
+    // Node fields are flattened alongside, not nested.
+    assert_eq!(v["type"], json!("ctx"));
+    assert_eq!(v["name"], json!("notes"));
+
+    let agent = NodeWithState {
+        node: Node::new(
+            uid(8),
+            NodeName::new("worker").unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        ),
+        state: Some(NodeState::Agent(AgentState {
+            status: AgentStatus::Parked,
+            hosted_on: Some("cloud".into()),
+            ..Default::default()
+        })),
+    };
+    let v = serde_json::to_value(&agent).unwrap();
+    assert_eq!(v["state"]["status"], json!("parked"));
+    assert_eq!(v["state"]["hosted_on"], json!("cloud"));
+}
+
+#[test]
+fn all_agent_statuses_serialize_as_the_contract_spells_them() {
+    let expect = [
+        (AgentStatus::Stopped, "stopped"),
+        (AgentStatus::Starting, "starting"),
+        (AgentStatus::NeedsAuth, "needs_auth"),
+        (AgentStatus::Running, "running"),
+        (AgentStatus::Idle, "idle"),
+        (AgentStatus::Parked, "parked"),
+        (AgentStatus::BudgetExhausted, "budget_exhausted"),
+        (AgentStatus::Error, "error"),
+    ];
+    for (s, want) in expect {
+        assert_eq!(serde_json::to_value(s).unwrap(), json!(want));
+        assert_eq!(s.as_str(), want);
+    }
+    // A parked agent has no live process; is_live must not claim otherwise, or
+    // the supervisor would try to write to a stdin that isn't there.
+    assert!(!AgentStatus::Parked.is_live());
+    assert!(!AgentStatus::BudgetExhausted.is_live());
+    assert!(AgentStatus::Idle.is_live());
+    assert!(AgentStatus::Running.is_live());
+}
+
+#[test]
+fn unhosted_is_representable_and_distinct_from_cloud() {
+    // §3e: `unhosted` is a first-class alarming state, not an absence.
+    let s = AgentState::default();
+    assert_eq!(s.hosted_on, None);
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v.get("hosted_on").is_some(), "hosted_on must be present");
+    assert_eq!(v["hosted_on"], json!(null));
+}
+
+#[test]
+fn idle_timeout_defaults_to_300_and_zero_disables_parking() {
+    let c = AgentConfig::default();
+    assert_eq!(c.idle_timeout_secs(), DEFAULT_IDLE_TIMEOUT_SECS);
+    assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 300);
+    let c = AgentConfig {
+        idle_timeout_secs: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(c.idle_timeout_secs(), 0);
 }

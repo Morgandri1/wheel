@@ -38,6 +38,7 @@
       ]
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "Fill": {
       "description": "How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.",
@@ -62,7 +63,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "FillMode": {
       "description": "How a field is filled when the operation is called (§3d).",
@@ -157,7 +159,8 @@
         "schema": {
           "description": "JSON Schema fragment for this field, used to build the MCP input schema."
         }
-      }
+      },
+      "additionalProperties": false
     }
   }
 }

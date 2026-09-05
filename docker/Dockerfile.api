@@ -1,0 +1,18 @@
+# wheel-api — stateless gateway. Deployed to Railway with N replicas.
+
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+RUN cargo build --release -p wheel-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    # Unprivileged: this process needs no root capability, and it is the internet-facing one.
+    && useradd --system --uid 10001 --no-create-home wheel
+COPY --from=build /src/target/release/wheel-api /usr/local/bin/wheel-api
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/wheel-api"]

@@ -7,7 +7,7 @@ SHELL := /bin/bash
 
 export PATH := $(HOME)/.cargo/bin:/opt/homebrew/bin:$(PATH)
 
-.PHONY: help check check-strict fmt clippy test-rust web-lint web-typecheck web-test \
+.PHONY: help check check-strict fmt clippy test-rust coverage web-lint web-typecheck web-test \
         qa-selftest test-int test-e2e test-live bootstrap clean
 
 help: ## show this help
@@ -39,6 +39,9 @@ web-typecheck: ## web typecheck
 web-test: ## web unit tests
 	@CHECK_ONLY=web:test bash qa/check.sh
 
+coverage: ## coverage gate only (§0b: >=90% lines)
+	@CHECK_ONLY=rust:coverage bash qa/check.sh
+
 qa-selftest: ## test the fake harness itself
 	@python3 qa/harness/selftest.py
 
@@ -53,9 +56,13 @@ test-live: ## OPT-IN: same suites against the REAL claude/codex CLIs. Costs mone
 	@WHEEL_LIVE=1 bash qa/integration/run.sh
 
 ## ---------------------------------------------------------------- setup
-bootstrap: ## install the toolchain (rust, node, pnpm)
+bootstrap: ## install the toolchain (rust, node, pnpm) and the QA python venv
 	@command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 	@command -v pnpm  >/dev/null || brew install node pnpm
+	@cargo llvm-cov --version >/dev/null 2>&1 || cargo install cargo-llvm-cov
+	@python3 -m venv qa/.venv && qa/.venv/bin/pip install -q -r qa/requirements.txt
+	@test -x qa/.venv/bin/python || python3 -m venv qa/.venv
+	@qa/.venv/bin/pip install -q --disable-pip-version-check -r qa/requirements.txt
 	@echo "toolchain ready — you may need to restart your shell for PATH"
 
 clean: ## remove build artefacts

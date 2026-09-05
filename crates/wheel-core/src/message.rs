@@ -160,34 +160,53 @@ impl From<&Message> for MessageReceipt {
     }
 }
 
-/// Escape any literal `</AgentPrompt>` (or case variant) in a body, so a
-/// hostile body cannot close the envelope early and inject text the model would
-/// read as engine-generated framing (§3c#5).
+/// Neutralise any `<AgentPrompt` or `</AgentPrompt` sequence in a body
+/// (ADVERSARY finding 001).
 ///
-/// Scheme: the `/` of a closing `</agentprompt` (any case) is backslash-escaped,
-/// yielding `<\/AgentPrompt>`. Matching is case-insensitive because the model —
-/// the actual consumer — does not care about tag case even though XML does.
+/// Both tags matter, for different attacks:
+/// - a forged **closing** tag ends the envelope early, so following body text
+///   appears to the model as engine-authored framing;
+/// - a forged **opening** tag starts what looks like a *new, authentic* message
+///   with attribution the attacker chose.
 ///
-/// This is intentionally *not* reversible in the engine: the recipient sees the
-/// escaped form, and `wheel inbox <id>` returns the original body from sqlite
-/// (§3c#2), so nothing is lost.
+/// Escaping only the closing tag would leave the second, which is the more
+/// useful attack. So the `<` of either form is backslash-escaped, yielding
+/// `<\AgentPrompt` / `<\/AgentPrompt`.
+///
+/// Matching is case-insensitive on the **decoded bytes** we are about to write,
+/// because the model — the actual consumer — does not care about tag case even
+/// though XML does.
+///
+/// This is deliberately not reversed on read: the recipient sees the escaped
+/// form, and `wheel inbox <id>` returns the original body from sqlite (§3c#2),
+/// so nothing is lost.
 pub fn escape_envelope_body(body: &str) -> String {
     const TAG: &str = "agentprompt";
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < body.len() {
-        let rest = &body[i..];
-        if bytes[i] == b'<'
-            && body.len() >= i + 2 + TAG.len()
-            && bytes[i + 1] == b'/'
-            && body[i + 2..i + 2 + TAG.len()].eq_ignore_ascii_case(TAG)
-        {
-            out.push_str("<\\/");
-            i += 2;
-            continue;
+        if bytes[i] == b'<' {
+            // Optional '/' immediately after '<', then the tag name.
+            let after = i + 1;
+            let name_at = if after < body.len() && bytes[after] == b'/' {
+                after + 1
+            } else {
+                after
+            };
+            if body.len() >= name_at + TAG.len()
+                && body[name_at..name_at + TAG.len()].eq_ignore_ascii_case(TAG)
+            {
+                // Consume only the '<'; the rest is emitted as ordinary text.
+                out.push_str("<\\");
+                i += 1;
+                continue;
+            }
         }
-        let c = rest.chars().next().expect("index is on a char boundary");
+        let c = body[i..]
+            .chars()
+            .next()
+            .expect("index is on a char boundary");
         out.push(c);
         i += c.len_utf8();
     }

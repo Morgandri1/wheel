@@ -53,12 +53,14 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 | `NODE-agent-config` | `agent`: `harness ∈ {claude, codex}`, `system_prompt` required, `run_on_startup`/`ephemeral_context` bool, `model` optional-nullable. Bad harness → 400. |
 | `NODE-table-columns` | `table`: column `type ∈ {text,integer,real,blob,json}`; bad type → 400; column names validated against the same charset rule (SQL injection via column name → 400). |
 | `NODE-endpoint-path` | `endpoint`: `path` must lead with `/`, contain no `..`, no `//`, no null byte; `method ∈ {GET,POST,PUT,DELETE}`; `response_mode ∈ {ack,script}`. |
+| `NODE-endpoint-auth` | `auth` is `{mode:"none"}` or `{mode:"bearer", vault_ref}`; `bearer` without `vault_ref` → 400; any other mode → 400. |
 | `NODE-endpoint-path-collide` | Two endpoints with the same method+path → 409. |
 | `NODE-script-lang` | `script`: `language ∈ {python,ts,js}`; `timeout_secs` defaults to 60, must be > 0 and ≤ a documented ceiling. |
 | `NODE-mcp-transport` | `mcp`: `stdio` requires `command`; `http` requires `url`; supplying both/neither → 400. |
 | `NODE-tool-config` | `tool`: `kind: "http"`, valid `base_url`, `operations[]` each with unique slug `id`, method, path, `enabled`, and a `Fill` for every param/body field. Bad `fill.mode` → 400. |
 | `NODE-vault-writeonly` | `vault.config.keys` lists key NAMES only; values are never accepted here. |
 | `NODE-schema-roundtrip` | Every node type round-trips create → `GET /v1/board` → update → read without field loss or type coercion. |
+| `NODE-state-always-present` | `GET /v1/board` returns every node as `{...node, state}` with `state` **always present** — `null` for non-agent types, never omitted. A consumer must not have to distinguish "absent" from "null". |
 
 ---
 
@@ -66,17 +68,17 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 
 All **243** cells (9 node types × 9 × 3 wire types) are enumerated in
 **`qa/fixtures/wire_matrix.json`**, generated from the contract by
-`qa/tools/gen_wire_matrix.py`. **25 allow, 218 deny.** `make check` fails if the fixture drifts
+`qa/tools/gen_wire_matrix.py`. **26 allow, 217 deny.** `make check` fails if the fixture drifts
 from the generator, so the doc, the fixture and the tests can't disagree.
 
 IDs are `WM-<from>-<to>-<type>`, e.g. `WM-agent-ctx-read` (allow),
-`WM-table-agent-send` (deny). `tool`'s only outgoing wire is `read`→`vault`.
+`WM-table-agent-send` (deny). `tool`'s and `endpoint`'s only outgoing `read` wire is → `vault`.
 
 | ID | Criterion |
 |---|---|
-| `WM-create-allow` | Each of the 25 allowed cells: `POST /v1/wires` → 201, wire appears in `GET /v1/board` on the FROM node's outgoing list. |
-| `WM-create-deny` | Each of the 218 denied cells: `POST /v1/wires` → 4xx with a machine-readable reason; no wire row is created. |
-| `WM-engine-deny` | Same 218, posted directly to the **engine** control plane, bypassing the API → rejected. Independent defence. |
+| `WM-create-allow` | Each of the 26 allowed cells: `POST /v1/wires` → 201, wire appears in `GET /v1/board` on the FROM node's outgoing list. |
+| `WM-create-deny` | Each of the 217 denied cells: `POST /v1/wires` → 4xx with a machine-readable reason; no wire row is created. |
+| `WM-engine-deny` | Same 217, posted directly to the **engine** control plane, bypassing the API → rejected. Independent defence. |
 | `WM-enforce-runtime` | For each allowed cell, the corresponding `wheel` CLI call succeeds; for each denied cell, it fails with **exit 3** and touches nothing. |
 | `WM-write-implies-read` | A `write` wire to table/chest grants read too (`wheel table query` works with only `write` wired). |
 | `WM-read-not-write` | A `read` wire does NOT grant write: INSERT via a read-only table wire → exit 3; `wheel chest put` → exit 3; `wheel write <ctx>` → exit 3. |
@@ -85,6 +87,7 @@ IDs are `WM-<from>-<to>-<type>`, e.g. `WM-agent-ctx-read` (allow),
 | `WM-token-scope` | A node's token grants exactly its own wires: agent A's token used against agent B's wired nodes → exit 3. Token forgery / swapping is rejected. |
 | `WM-self-wire` | A node wired to itself is rejected for every type (incl. `agent→agent send` to self). |
 | `WM-dup-wire` | Creating an identical wire twice → 409 or idempotent 200, never two rows. |
+| `WM-export-conformance` | `docs/schema/wire-matrix.json` equals the §3 matrix QA derives independently from the prose. A row in the export but not the contract is always a failure (privilege question); a row in the contract but not the export is a missing feature. **QA's copy is derived from the SPEC, never from the export** — deriving from the export would check it against itself and could never detect divergence. This is what found BUG-004. |
 | `WM-cross-project` | A wire whose `to` is a node in ANOTHER project → 404/400, never created. **S1 if it succeeds.** |
 
 ---
@@ -125,7 +128,11 @@ The envelope written to the child's stdin is exactly one compact JSON line:
 | `MSG-inbox-scope` | An agent's inbox shows only ITS messages. Reading another node's inbox → exit 3. | **S1** |
 | `MSG-from-user` | UI chat messages arrive with `from_node = user`, envelope `type="user"`. | S3 |
 | `MSG-durable-restart` | `messages` rows (id, sha256, bytes, state, timestamps, last_error) survive container restart. | S2 |
-| `MSG-error-turn` | `result.is_error=true` → agent `status=error`, `last_error` = `result.result`; the message is still marked consumed (not redelivered in a loop). | S2 |
+| `MSG-error-turn` | `result.is_error=true` → agent `status=error`, `last_error` = `result.result`; the message is marked `consumed` with `error=true`. | S2 |
+| `MSG-poison-once` | **A message is consumed exactly once and never redelivered**, even when its turn errored. Assert across a restart: a poison message must not resurrect and loop forever. | **S1** |
+| `MSG-fairness-user-cap` | The user lane drains at most **3 consecutive** user messages before one normal-lane message is delivered. | S2 |
+| `MSG-fairness-aging` | A normal-lane message older than **60 s** is promoted to the front, so user chatter cannot starve agent traffic indefinitely. | S2 |
+| `MSG-priority-lane` | User messages are ordered ahead of queued agent/endpoint/script messages, but are never injected mid-turn (single writer). | S2 |
 
 ### 3a. Single writer & the user priority lane (§3c #12)
 
@@ -153,7 +160,7 @@ bytes the child received — because the engine's own view of what it sent is th
 | ID | Criterion |
 |---|---|
 | `INJ-on-start` | ctx markdown from every `ctx→agent send` wire is present in the composed system prompt at start — asserted from the fake's **first event**, i.e. what the child actually received. |
-| `INJ-multi-ctx` | Multiple wired ctx nodes are all injected, in a defined, stable order (document the order; assert it). |
+| `INJ-multi-ctx` | Multiple wired ctx nodes are all injected as `\n\n# Context: <ctx name>\n<markdown>`, **ordered by ctx node name in byte order** — stable and board-position-independent. Asserted by wiring ctx nodes created out of order and checking the composed prompt. |
 | `INJ-after-clear` | Injection is re-applied after every context clear, not just the first start. |
 | `INJ-edit-visible` | Editing a ctx node's markdown changes what the next start/clear injects. |
 | `INJ-unwired-absent` | A ctx node NOT wired to the agent never appears in its prompt. **S1** if it leaks. |
@@ -196,6 +203,23 @@ container with an empty board (`ENG-route-*`), then behaviourally.
 | `ENG-sigterm` | SIGTERM stops children and flushes sqlite within 15s, exits 0; no data loss, no orphaned harness processes. |
 | `ENG-restart-persist` | Board, messages, table data and chest blobs all survive an engine restart. |
 
+### 5a. Agent lifecycle — statuses, idle parking, and the root trap (§3c #13/#14)
+
+Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_exhausted | error`.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ENG-root-refusal` | Running the harness as **uid 0** with `--permission-mode bypassPermissions` is refused by the real CLI: exit 1, **empty stdout**, stderr `--dangerously-skip-permissions cannot be used with root/sudo privileges`. The engine must report a **configuration error**, NOT `needs_auth`. The exit code is identical to an unauthenticated CLI, so anything inferring auth state from the exit code alone will report `needs_auth` forever for a privilege misconfiguration — an unfixable-looking bug. Driven by `WHEEL_FAKE_ROOT=1`, no root container needed. | S2 |
+| `ENG-nonroot-child` | Children are spawned non-root and with `IS_SANDBOX=1`. | **S1** |
+| `ENG-needs-auth-source` | `needs_auth` is derived from stderr or an explicit probe (`claude auth status --json`), never from the exit code alone. Asserted by making a non-auth failure exit 1 and checking the agent does NOT land in `needs_auth`. | S2 |
+| `ENG-park-idle` | After `idle_timeout_secs` (default 300) an idle agent transitions `idle → parked` and its harness **process is stopped**. A parked agent having no live process is correct, not a crash. | S2 |
+| `ENG-park-resume` | The next message resumes a parked agent (`parked → starting → running`) with `--resume`, and the **same `session_id`** comes back — proving context was preserved rather than silently reset. | S2 |
+| `ENG-park-no-loss` | A message that arrives while parked is not lost and is delivered exactly once after resume. | **S1** |
+| `ENG-park-ephemeral` | With `ephemeral_context: true`, parking does not resurrect context that was meant to be cleared. | S2 |
+| `ENG-one-process` | **Exactly one harness process per agent at any time.** 10 messages sent within 100 ms produce ONE process and 10 sequential turns. Start is idempotent: a second start while running is a no-op returning the existing session. | **S1** |
+| `ENG-budget` | `budget.max_turns` / `max_usd` exhaustion → `budget_exhausted`, process stopped, event emitted; no further turns run. | S2 |
+| `ENG-health-not-liveness` | No test (and no engine health check) uses "a process is alive" as a proxy for "the agent is healthy" — `parked` is healthy and processless. | S3 |
+
 ---
 
 ## 6. CLI — the `wheel` binary (§3c)
@@ -221,6 +245,9 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 | `CLI-run` | `wheel run <script>` returns stdout, stderr and exit code faithfully. |
 | `CLI-inbox` | `wheel inbox` / `wheel inbox <id>` per `MSG-inbox-*`. |
 | `CLI-limits-clientside` | Over-limit bodies are refused locally with a clear message **before** any network call. |
+| `CLI-ceiling-rows` | `wheel read <table>` / `query` return at most **10,000 rows** per call; more requires `--limit/--offset`. The cap is applied, not silently truncating a claimed-complete result. |
+| `CLI-ceiling-keys` | `wheel ls` returns at most **10,000 keys**, paged the same way. |
+| `CLI-ceiling-timeout` | `script.timeout_secs` > 300 is refused. |
 
 ---
 
@@ -240,6 +267,9 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 | `API-proxy-auth` | `/v1/projects/:id/engine/*` enforces the same auth+ownership before proxying, and never leaks `WHEEL_ENGINE_SECRET` to the client. | **S1** |
 | `API-proxy-ws` | WS `/engine/v1/events` proxies bidirectionally and closes cleanly when the container stops. | S3 |
 | `API-route-parity` | Every route in `docs/API.md` exists (404-vs-405 probe) and no undocumented route does. | S3 |
+| `API-dev-interlock-boot` | The dev-auth bypass is interlocked at BOOT, not per request: an API started with `AUTH_DEV_SECRET` set while `WHEEL_ENV != dev` **exits non-zero**. Asserted for `WHEEL_ENV` unset (unset counts as prod — the permissive default is the one that kills you), for a typo (`development`), and for prod. Empty `AUTH_DEV_SECRET` is treated as absent, never as an empty HMAC key. API owns `config_interlock.rs`; QA asserts it independently, from outside the process, because a guarantee this load-bearing should not be checked only by the code that makes it. | **S1** |
+| `API-dev-token-hermetic` | The HS256 + `AUTH_DEV_SECRET` path (claims `{sub, iss, exp, nbf}`, `iss` matching `CLERK_ISSUER` exactly) authenticates in dev mode. Two different `sub` values are two tenants — this is how `API-auth-owner-404` is tested without Clerk. Mint via `infra/dev/e2e.py:mint()` (API's implementation, reused not rewritten). | S2 |
+| `API-alg-confusion` | In prod any non-RS256 `alg` is rejected on sight, including HS256 signed with the RSA **public** key. | **S1** |
 | `API-healthz` | `GET /healthz` needs no auth and reports dependency health honestly. | S4 |
 
 ---
@@ -258,6 +288,9 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 | `ING-to-table` | `endpoint→table write`: JSON body inserted as a row; malformed JSON → 400, no partial row. | S2 |
 | `ING-to-script-ack` | `response_mode: ack` returns immediately without waiting for the script. | S3 |
 | `ING-to-script-body` | `response_mode: script` returns the script's stdout as the response body. | S3 |
+| `ING-auth-bearer` | With `auth.mode="bearer"`, a request with no / wrong bearer → **401 with no body** (no oracle about the expected token); correct bearer passes. | **S1** |
+| `ING-auth-bearer-wire` | `bearer` requires an `endpoint→vault read` wire; without it the endpoint fails closed (401), never open. | **S1** |
+| `ING-auth-bearer-timing` | Bearer comparison is constant-time; no timing oracle. | S2 |
 | `ING-ratelimit` | Documented rate limit is enforced and returns 429. | S3 |
 | `ING-header-filter` | Only the documented header subset is forwarded; `Authorization`/cookies are not leaked into the agent's prompt. | **S1** |
 
@@ -385,6 +418,9 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `PERF-soak` | A 30-minute soak with agents messaging continuously: no fd/memory/zombie growth. *(M3)* |
 | `PERF-msg-latency` | Message → stdin latency within the documented budget; one agent process sustains 10 sequential turns without leak or slowdown. |
 | `PERF-check-budget` | `make check` stays under 3 minutes. |
+| `GATE-coverage-rust` | §0b: `cargo llvm-cov --workspace --fail-under-lines 90` runs in `make check` and **fails** the check below 90%, per crate. |
+| `GATE-coverage-web` | §0b: `vitest --coverage` with a `lines: 90` threshold, failing the check below the bar. |
+| `GATE-adversary-review` | §0b: every merged milestone deliverable is handed to ADVERSARY as a `DONE:`; plans reviewed before M1 merges. |
 
 ---
 
@@ -393,11 +429,11 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | ID | Question | My recommendation |
 |---|---|---|
 | `Q-HARNESS-CODEX` | Real `codex exec --json` event names are unverified; `fake-codex` is provisional. | Leave it. M1 is claude-only; SDK + QA pin it before M2. **PM/SDK agreed (A6).** |
-| `Q-INJ-ORDER` | In what order are multiple ctx nodes injected, and where does `system_prompt` sit relative to them? | Define it as: `system_prompt` first, then ctx nodes ordered by node name (stable, board-position-independent). Needs SDK confirmation to become `INJ-multi-ctx`. |
-| `Q-MSG-ERROR-REDELIVER` | When a turn errors, is the message consumed or retried? | Consumed exactly once + `last_error`. Infinite redelivery of a poison message is worse than losing one. |
-| `Q-TABLE-CEILING` | Documented ceiling for `script.timeout_secs` and max rows returned by `table query`? | 300s and 10k rows; both need to be in PROTOCOL.md so `CLI-limits-clientside` can enforce them. |
+| ~~`Q-INJ-ORDER`~~ | **RESOLVED** by PM: ctx blocks ordered by ctx node name, byte order. Now asserted as `INJ-multi-ctx`. | — |
+| ~~`Q-MSG-ERROR-REDELIVER`~~ | **RESOLVED** by PM, as recommended: consumed exactly once, `error=true`, never redelivered. Now `MSG-poison-once`. | — |
+| ~~`Q-TABLE-CEILING`~~ | **RESOLVED** by PM, as recommended: 300 s and 10,000 rows/keys. Now `CLI-ceiling-*`. | — |
 | `Q-TOOL-ALLOWLIST` | §3d says v1 SSRF policy is deny-all-private with "project allowlist maybe later". Does anything legitimately need to call a private address in v1? | Keep v1 deny with no escape hatch. An allowlist is the feature most likely to be added carelessly later and re-open every `TOOL-ssrf-*` case; better to add it deliberately with its own tests. |
-| `Q-ENDPOINT-AUTH` | Can an ingress endpoint require a shared secret? | Out of scope for M1/M2, but worth a line in the threat model — a public write path into a table is an obvious abuse target. |
+| ~~`Q-ENDPOINT-AUTH`~~ | **RESOLVED** by PM: `auth: {mode:"bearer", vault_ref}` in M2, requiring an `endpoint→vault read` wire. Now `ING-auth-bearer*`. | — |
 | `Q-PRIORITY-FAIRNESS` | What stops a stream of user messages starving queued agent messages indefinitely (`MSG-priority-no-starve`)? | Drain at most N user messages before letting one queued message through, or timestamp-age escalation. Needs a rule from SDK before I can assert one. |
 
 ---

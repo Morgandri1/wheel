@@ -34,7 +34,7 @@ You own the heart of Wheel: `crates/wheel-core`, `crates/wheel-engine`, `crates/
    - **Ingress** `/ingress/*`: route by method+path to endpoint nodes; fan out per that node's wires; `response_mode: script` returns script stdout, else `202 {"queued": true}`.
    - **Auth spike (do this early, it's the riskiest unknown)**: both CLIs' OAuth flows redirect to `localhost`. Find the headless path:
      Claude Code — check `claude auth login` / `claude setup-token` / paste-code fallback; Codex — check `codex login --device-auth` and `codex login --with-api-key`.
-     v1 must support **(a)** API key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) and **(b)** a device-code or paste-code OAuth flow surfaced through `/v1/agents/:id/auth/begin`.
+     **OAuth with the user's normal Anthropic / OpenAI account is THE native flow** (paste-code for Claude, device-code for Codex) via `/v1/agents/:id/auth/begin`; API keys are a hidden advanced fallback only.
      Persist credentials under `/data/creds/<node_id>/` and point each child at its own `HOME`/config dir so two agents can be different accounts. Report findings to PM as soon as you know what works.
 3. **`wheel-cli`** (`wheel` binary): implement the yoke-shaped grammar in §3 exactly (`whoami`, `connections`, `msg`, `read`, `write`, `rm`, `ls`,
    `query`, `secret get`, `run`, `ctx clear`), `--json` everywhere, exit 3 on wire denial with a one-line reason, `--stdin`/`--file` for values.

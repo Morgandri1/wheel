@@ -12,5 +12,7 @@
     "command": "x",
     "url": "https://e.com"
   },
-  "_expect_reject": "NODE-mcp-transport"
+  "_expect_reject": "NODE-mcp-transport",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_config (McpConfig)"
 }

@@ -81,6 +81,7 @@ impl std::fmt::Display for NodeType {
 
 /// Board coordinates. Floats because the canvas pans/zooms continuously.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Position {
     pub x: f64,
     pub y: f64,
@@ -97,9 +98,10 @@ impl Position {
 // ---------------------------------------------------------------------------
 
 /// Which CLI backs an agent node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
+    #[default]
     Claude,
     Codex,
 }
@@ -119,7 +121,8 @@ impl std::fmt::Display for Harness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub harness: Harness,
     /// Harness-specific model id. `None` = the CLI's own default.
@@ -135,9 +138,35 @@ pub struct AgentConfig {
     /// prompt and ctx injections, before draining the next queued message.
     #[serde(default)]
     pub ephemeral_context: bool,
+    /// Stop the process after this long idle and resume the session on the next
+    /// message (§3c#14 idle parking). `None` uses
+    /// [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u32>,
+    /// Spend ceiling. On reach, the engine stops the agent with
+    /// `status: budget_exhausted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+}
+
+/// Per-agent spend ceiling (§3e). Either field may be set independently.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+}
+
+impl AgentConfig {
+    pub fn idle_timeout_secs(&self) -> u32 {
+        self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CtxConfig {
     pub markdown: String,
 }
@@ -167,6 +196,7 @@ impl ColumnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Column {
     /// Validated with a sqlite-safe charset so it is safe to quote into DDL.
     /// Unlike a node name this may be `user`, `system`, ... — the node
@@ -177,6 +207,7 @@ pub struct Column {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TableConfig {
     pub columns: Vec<Column>,
 }
@@ -211,12 +242,32 @@ pub enum ResponseMode {
     Script,
 }
 
+/// How an endpoint authenticates inbound public requests (§3, M2).
+///
+/// Internally tagged so the two shapes are structurally distinct: `bearer`
+/// cannot exist without a `vault_ref`, and `none` cannot carry one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum EndpointAuth {
+    /// Public. Anyone who can reach the ingress URL can call it.
+    #[default]
+    None,
+    /// Requires a bearer token matching the secret at `vault_ref`. Needs an
+    /// `endpoint → vault (read)` wire; a mismatch is a 401 with no body.
+    Bearer { vault_ref: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
     pub method: HttpMethod,
-    /// Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`].
+    /// Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`],
+    /// and constrained in the exported schema so the static gate catches it too.
+    #[schemars(regex(pattern = r"^(?!.*(?:^|/)\.\.(?:/|$))/[^\s?#]*$"))]
     pub path: String,
     pub response_mode: ResponseMode,
+    #[serde(default)]
+    pub auth: EndpointAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -240,11 +291,16 @@ impl ScriptLanguage {
 
 pub const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 60;
 
+/// Idle parking default (§3c#14).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u32 = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptConfig {
     pub language: ScriptLanguage,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300))]
     pub timeout_secs: Option<u32>,
 }
 
@@ -262,23 +318,54 @@ pub enum McpTransport {
     Http,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-pub struct McpConfig {
-    pub transport: McpTransport,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
+/// MCP server config, tagged by transport.
+///
+/// Modelled as an enum rather than a struct of optionals so that "stdio
+/// requires command", "http requires url" and "never both" are *structural* —
+/// they hold in the exported JSON Schema and in the Rust type, not only in a
+/// runtime check the API might forget to call. The JSON shape is unchanged:
+/// `{"transport":"stdio","command":...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "transport", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpConfig {
+    Stdio {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<BTreeMap<String, String>>,
+    },
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<BTreeMap<String, String>>,
+    },
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig::Stdio {
+            command: String::new(),
+            args: None,
+            env: None,
+        }
+    }
+}
+
+impl McpConfig {
+    pub fn transport(&self) -> McpTransport {
+        match self {
+            McpConfig::Stdio { .. } => McpTransport::Stdio,
+            McpConfig::Http { .. } => McpTransport::Http,
+        }
+    }
 }
 
 /// Vault config carries only the *key names*. Values are write-only through
 /// `PUT /v1/vault/:id/:key`, stored encrypted, and never returned by
 /// `GET /v1/board`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VaultConfig {
     pub keys: Vec<String>,
 }
@@ -286,6 +373,7 @@ pub struct VaultConfig {
 /// Chest has no configuration; its content lives on disk under
 /// `/data/chest/<node_id>/` and is indexed in sqlite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ChestConfig {}
 
 /// Per-type configuration, adjacently tagged so that it serializes as the

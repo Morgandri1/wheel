@@ -36,14 +36,42 @@ impl ToolMethod {
     }
 }
 
+/// What kind of tool a `tool` node is (§3d / §3e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolKind {
+    /// An imported HTTP spec the engine calls directly.
+    #[default]
+    Http,
+    /// Project-scoped mail relay through the API (§3e, M3).
+    Email,
+}
+
 /// The document format a tool node was imported from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum ToolFormat {
-    Openapi3,
+    Openapi,
     Swagger2,
-    Postman21,
-    Insomnia4,
+    Postman,
+    Insomnia,
+    /// Operations authored by hand in the UI rather than imported.
+    Manual,
+}
+
+/// Where a tool node's operations came from.
+///
+/// `raw` is retained deliberately: §3d rule 5 requires re-import to diff
+/// operations by `method+path` and keep existing fills, and you cannot diff
+/// against a previous spec that was never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSource {
+    pub format: ToolFormat,
+    /// The document as imported. Empty for `manual`.
+    #[serde(default)]
+    pub raw: String,
+    pub imported_at: crate::timestamp::Timestamp,
 }
 
 /// Where a parameter goes in the HTTP request.
@@ -76,6 +104,7 @@ pub enum FillMode {
 /// How one field is filled. `value`/`vault_ref` are meaningful only for their
 /// corresponding mode; [`crate::validate::validate_config`] enforces that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Fill {
     pub mode: FillMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +136,7 @@ impl Fill {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToolParam {
     pub name: String,
     pub location: ParamLocation,
@@ -123,6 +153,7 @@ pub struct ToolParam {
 
 /// One callable operation. Exposed over MCP as `<tool name>__<id>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToolOperation {
     /// Stable identifier, unique within the node. Charset is restricted because
     /// it is concatenated into an MCP tool name.
@@ -168,11 +199,12 @@ impl ToolOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToolConfig {
+    pub kind: ToolKind,
+    pub source: ToolSource,
     /// Absolute `http(s)` origin every operation is resolved against.
     pub base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_format: Option<ToolFormat>,
     #[serde(default)]
     pub operations: Vec<ToolOperation>,
 }

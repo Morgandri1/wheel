@@ -1,0 +1,23 @@
+{
+  "id": "b0b2c3d4-0000-4000-8000-000000000000",
+  "name": "tool-bad-kind",
+  "type": "tool",
+  "position": {
+    "x": 12.0,
+    "y": 34.0
+  },
+  "wires": [],
+  "config": {
+    "kind": "grpc",
+    "source": {
+      "format": "openapi",
+      "raw": "{\"openapi\":\"3.0.0\"}",
+      "imported_at": "2026-09-05T00:00:00Z"
+    },
+    "base_url": "https://a.example.com",
+    "operations": []
+  },
+  "_expect_reject": "NODE-tool-config",
+  "_enforced_by": "schema",
+  "_known_bug": "BUG-003"
+}

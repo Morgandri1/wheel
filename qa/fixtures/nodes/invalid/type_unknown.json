@@ -8,5 +8,6 @@
   },
   "wires": [],
   "config": {},
-  "_expect_reject": "NODE-type-closed"
+  "_expect_reject": "NODE-type-closed",
+  "_enforced_by": "schema"
 }

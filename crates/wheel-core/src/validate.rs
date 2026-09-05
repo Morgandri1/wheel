@@ -58,7 +58,7 @@ pub enum ConfigError {
 
 pub const MAX_ENDPOINT_PATH: usize = 512;
 pub const MAX_TABLE_COLUMNS: usize = 64;
-pub const MAX_SCRIPT_TIMEOUT_SECS: u32 = 600;
+pub const MAX_SCRIPT_TIMEOUT_SECS: u32 = 300;
 pub const MAX_SYSTEM_PROMPT: usize = 128 * 1024;
 
 /// Endpoint paths become public URLs (`/p/<project>/<path>`) and are matched
@@ -158,19 +158,26 @@ pub fn validate_config(cfg: &NodeConfig) -> Result<(), ConfigError> {
         NodeConfig::Endpoint(e) => validate_endpoint(e),
         NodeConfig::Script(s) => validate_script(s),
         NodeConfig::Mcp(m) => {
-            use crate::node::McpTransport;
-            match m.transport {
-                McpTransport::Stdio => {
-                    if m.command.as_deref().unwrap_or("").trim().is_empty() {
+            use crate::node::McpConfig;
+            // The enum already makes "stdio has no url" structural; what is
+            // left is that the present field is non-empty and well-formed.
+            match m {
+                McpConfig::Stdio { command, .. } => {
+                    if command.trim().is_empty() {
                         return Err(ConfigError::McpMissingCommand);
                     }
                 }
-                McpTransport::Http => {
-                    let url = m.url.as_deref().unwrap_or("");
+                McpConfig::Http { url, .. } => {
                     if url.trim().is_empty() {
                         return Err(ConfigError::McpMissingUrl);
                     }
                     if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(ConfigError::McpBadUrl);
+                    }
+                    // An MCP server URL is an outbound target like a tool's
+                    // base_url, so the same SSRF pre-filter applies.
+                    let host = crate::validate::url_host(url).unwrap_or_default();
+                    if crate::tool::host_is_denied(&host) {
                         return Err(ConfigError::McpBadUrl);
                     }
                 }
@@ -214,20 +221,15 @@ fn validate_fill(field: &str, fill: &Fill) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_tool(cfg: &ToolConfig) -> Result<(), ConfigError> {
-    let rest = cfg
-        .base_url
+/// Extract the bare host from an `http(s)://` URL: no scheme, no userinfo, no
+/// port, IPv6 literals unbracketed. Shared by tool `base_url` and mcp `url`,
+/// which are both outbound targets subject to the same SSRF pre-filter.
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url
         .strip_prefix("https://")
-        .or_else(|| cfg.base_url.strip_prefix("http://"))
-        .ok_or(ConfigError::ToolBadBaseUrl)?;
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("");
-    // Strip a port, but not the colons of a bracketed IPv6 literal.
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
     let host_only = if host.starts_with('[') {
         host.split(']')
             .next()
@@ -237,10 +239,16 @@ fn validate_tool(cfg: &ToolConfig) -> Result<(), ConfigError> {
         host.split(':').next().unwrap_or(host)
     };
     if host_only.is_empty() {
-        return Err(ConfigError::ToolBadBaseUrl);
+        None
+    } else {
+        Some(host_only.to_string())
     }
-    if crate::tool::host_is_denied(host_only) {
-        return Err(ConfigError::ToolDeniedHost(host_only.to_string()));
+}
+
+fn validate_tool(cfg: &ToolConfig) -> Result<(), ConfigError> {
+    let host = url_host(&cfg.base_url).ok_or(ConfigError::ToolBadBaseUrl)?;
+    if crate::tool::host_is_denied(&host) {
+        return Err(ConfigError::ToolDeniedHost(host));
     }
 
     let mut seen = std::collections::BTreeSet::new();

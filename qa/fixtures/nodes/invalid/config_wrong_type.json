@@ -10,5 +10,6 @@
   "config": {
     "markdown": "not an agent config"
   },
-  "_expect_reject": "NODE-config-tagged"
+  "_expect_reject": "NODE-config-tagged",
+  "_enforced_by": "schema"
 }

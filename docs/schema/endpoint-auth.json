@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EndpointAuth",
+  "description": "How an endpoint authenticates inbound public requests (§3, M2).\n\nInternally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.",
+  "oneOf": [
+    {
+      "description": "Public. Anyone who can reach the ingress URL can call it.",
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Requires a bearer token matching the secret at `vault_ref`. Needs an `endpoint → vault (read)` wire; a mismatch is a 401 with no body.",
+      "type": "object",
+      "required": [
+        "mode",
+        "vault_ref"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "bearer"
+          ]
+        },
+        "vault_ref": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

@@ -12,5 +12,6 @@
     "run_on_startup": false,
     "ephemeral_context": false
   },
-  "_expect_reject": "NODE-agent-config"
+  "_expect_reject": "NODE-agent-config",
+  "_enforced_by": "schema"
 }

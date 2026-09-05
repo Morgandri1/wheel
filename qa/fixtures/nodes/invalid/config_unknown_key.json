@@ -11,5 +11,7 @@
     "markdown": "x",
     "surprise": true
   },
-  "_expect_reject": "NODE-config-unknown-key"
+  "_expect_reject": "NODE-config-unknown-key",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
 }

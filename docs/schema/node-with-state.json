@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "NodeWithState",
-  "description": "A node plus its observed state, as returned by `GET /v1/board`.",
+  "description": "A node plus its observed state: `GET /v1/board` returns `{ ...node, state }`.\n\n`state` is always present and is **null for non-agent node types** — not omitted.",
   "type": "object",
   "oneOf": [
     {
@@ -184,6 +184,7 @@
       "$ref": "#/definitions/Position"
     },
     "state": {
+      "default": null,
       "anyOf": [
         {
           "$ref": "#/definitions/NodeState"
@@ -210,6 +211,17 @@
         "system_prompt"
       ],
       "properties": {
+        "budget": {
+          "description": "Spend ceiling. On reach, the engine stops the agent with `status: budget_exhausted`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Budget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "ephemeral_context": {
           "description": "Clear the session after every completed turn, re-applying the system prompt and ctx injections, before draining the next queued message.",
           "default": false,
@@ -217,6 +229,15 @@
         },
         "harness": {
           "$ref": "#/definitions/Harness"
+        },
+        "idle_timeout_secs": {
+          "description": "Stop the process after this long idle and resume the session on the next message (§3c#14 idle parking). `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
         },
         "model": {
           "description": "Harness-specific model id. `None` = the CLI's own default.",
@@ -234,7 +255,8 @@
           "description": "Appended to the harness's own system prompt, then followed by the markdown of every `ctx` node wired `send` into this agent.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "AgentStatus": {
       "description": "Lifecycle of an agent node's child process.",
@@ -275,6 +297,20 @@
           ]
         },
         {
+          "description": "Process stopped after `idle_timeout_secs` to save compute (§3c#14). The session id is retained and the next message resumes it transparently, so parking never loses context.",
+          "type": "string",
+          "enum": [
+            "parked"
+          ]
+        },
+        {
+          "description": "Stopped because the agent's `budget` was reached. Requires operator action; the engine will not restart it on its own.",
+          "type": "string",
+          "enum": [
+            "budget_exhausted"
+          ]
+        },
+        {
           "description": "Child exited unexpectedly or the harness reported a fatal error; `last_error` carries the detail.",
           "type": "string",
           "enum": [
@@ -283,9 +319,32 @@
         }
       ]
     },
+    "Budget": {
+      "description": "Per-agent spend ceiling (§3e). Either field may be set independently.",
+      "type": "object",
+      "properties": {
+        "max_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
     "ChestConfig": {
       "description": "Chest has no configuration; its content lives on disk under `/data/chest/<node_id>/` and is indexed in sqlite.",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "Column": {
       "type": "object",
@@ -305,7 +364,8 @@
         "type": {
           "$ref": "#/definitions/ColumnType"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ColumnType": {
       "description": "Column type of a `table` node, mapped onto a sqlite storage class.",
@@ -337,7 +397,49 @@
         "markdown": {
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "EndpointAuth": {
+      "description": "How an endpoint authenticates inbound public requests (§3, M2).\n\nInternally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.",
+      "oneOf": [
+        {
+          "description": "Public. Anyone who can reach the ingress URL can call it.",
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Requires a bearer token matching the secret at `vault_ref`. Needs an `endpoint → vault (read)` wire; a mismatch is a 401 with no body.",
+          "type": "object",
+          "required": [
+            "mode",
+            "vault_ref"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            },
+            "vault_ref": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "EndpointConfig": {
       "type": "object",
@@ -347,17 +449,29 @@
         "response_mode"
       ],
       "properties": {
+        "auth": {
+          "default": {
+            "mode": "none"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/EndpointAuth"
+            }
+          ]
+        },
         "method": {
           "$ref": "#/definitions/HttpMethod"
         },
         "path": {
-          "description": "Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`].",
-          "type": "string"
+          "description": "Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`], and constrained in the exported schema so the static gate catches it too.",
+          "type": "string",
+          "pattern": "^(?!.*(?:^|/)\\.\\.(?:/|$))/[^\\s?#]*$"
         },
         "response_mode": {
           "$ref": "#/definitions/ResponseMode"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Fill": {
       "description": "How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.",
@@ -382,7 +496,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "FillMode": {
       "description": "How a field is filled when the operation is called (§3d).",
@@ -442,51 +557,73 @@
       "pattern": "^[a-z0-9][a-z0-9_]{0,62}$"
     },
     "McpConfig": {
-      "type": "object",
-      "required": [
-        "transport"
-      ],
-      "properties": {
-        "args": {
-          "type": [
-            "array",
-            "null"
+      "description": "MCP server config, tagged by transport.\n\nModelled as an enum rather than a struct of optionals so that \"stdio requires command\", \"http requires url\" and \"never both\" are *structural* — they hold in the exported JSON Schema and in the Rust type, not only in a runtime check the API might forget to call. The JSON shape is unchanged: `{\"transport\":\"stdio\",\"command\":...}`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "command",
+            "transport"
           ],
-          "items": {
-            "type": "string"
-          }
+          "properties": {
+            "args": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "command": {
+              "type": "string"
+            },
+            "env": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "transport": {
+              "type": "string",
+              "enum": [
+                "stdio"
+              ]
+            }
+          },
+          "additionalProperties": false
         },
-        "command": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "env": {
-          "type": [
-            "object",
-            "null"
+        {
+          "type": "object",
+          "required": [
+            "transport",
+            "url"
           ],
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "transport": {
-          "$ref": "#/definitions/McpTransport"
-        },
-        "url": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "properties": {
+            "env": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "transport": {
+              "type": "string",
+              "enum": [
+                "http"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         }
-      }
-    },
-    "McpTransport": {
-      "type": "string",
-      "enum": [
-        "stdio",
-        "http"
       ]
     },
     "NodeName": {
@@ -507,6 +644,14 @@
             "status"
           ],
           "properties": {
+            "hosted_on": {
+              "description": "Where this agent's process lives: `\"cloud\"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "type": "string",
               "enum": [
@@ -543,6 +688,17 @@
                 "null"
               ]
             },
+            "spend": {
+              "description": "Observed spend, from the harness's usage events. Drives `budget`.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Spend"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "status": {
               "$ref": "#/definitions/AgentStatus"
             }
@@ -577,7 +733,8 @@
           "type": "number",
           "format": "double"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ResponseMode": {
       "description": "What an endpoint returns to the HTTP caller.",
@@ -617,9 +774,11 @@
             "null"
           ],
           "format": "uint32",
-          "minimum": 0.0
+          "maximum": 300.0,
+          "minimum": 1.0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ScriptLanguage": {
       "type": "string",
@@ -628,6 +787,23 @@
         "ts",
         "js"
       ]
+    },
+    "Spend": {
+      "description": "Accumulated cost for an agent's current lifetime.",
+      "type": "object",
+      "properties": {
+        "turns": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "usd": {
+          "default": 0.0,
+          "type": "number",
+          "format": "double"
+        }
+      }
     },
     "TableConfig": {
       "type": "object",
@@ -641,7 +817,8 @@
             "$ref": "#/definitions/Column"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Timestamp": {
       "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
@@ -651,12 +828,17 @@
     "ToolConfig": {
       "type": "object",
       "required": [
-        "base_url"
+        "base_url",
+        "kind",
+        "source"
       ],
       "properties": {
         "base_url": {
           "description": "Absolute `http(s)` origin every operation is resolved against.",
           "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ToolKind"
         },
         "operations": {
           "default": [],
@@ -665,26 +847,50 @@
             "$ref": "#/definitions/ToolOperation"
           }
         },
-        "source_format": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ToolFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "source": {
+          "$ref": "#/definitions/ToolSource"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ToolFormat": {
       "description": "The document format a tool node was imported from.",
-      "type": "string",
-      "enum": [
-        "openapi3",
-        "swagger2",
-        "postman21",
-        "insomnia4"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openapi",
+            "swagger2",
+            "postman",
+            "insomnia"
+          ]
+        },
+        {
+          "description": "Operations authored by hand in the UI rather than imported.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    },
+    "ToolKind": {
+      "description": "What kind of tool a `tool` node is (§3d / §3e).",
+      "oneOf": [
+        {
+          "description": "An imported HTTP spec the engine calls directly.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        {
+          "description": "Project-scoped mail relay through the API (§3e, M3).",
+          "type": "string",
+          "enum": [
+            "email"
+          ]
+        }
       ]
     },
     "ToolMethod": {
@@ -737,7 +943,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ToolParam": {
       "type": "object",
@@ -775,7 +982,30 @@
         "schema": {
           "description": "JSON Schema fragment for this field, used to build the MCP input schema."
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "ToolSource": {
+      "description": "Where a tool node's operations came from.\n\n`raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.",
+      "type": "object",
+      "required": [
+        "format",
+        "imported_at"
+      ],
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/ToolFormat"
+        },
+        "imported_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "raw": {
+          "description": "The document as imported. Empty for `manual`.",
+          "default": "",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "VaultConfig": {
       "description": "Vault config carries only the *key names*. Values are write-only through `PUT /v1/vault/:id/:key`, stored encrypted, and never returned by `GET /v1/board`.",
@@ -790,7 +1020,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Wire": {
       "description": "An outgoing wire, as stored on its source node (`Node::wires`).",
