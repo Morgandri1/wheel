@@ -270,7 +270,8 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 | `API-dev-interlock-boot` | The dev-auth bypass is interlocked at BOOT, not per request: an API started with `AUTH_DEV_SECRET` set while `WHEEL_ENV != dev` **exits non-zero**. Asserted for `WHEEL_ENV` unset (unset counts as prod — the permissive default is the one that kills you), for a typo (`development`), and for prod. Empty `AUTH_DEV_SECRET` is treated as absent, never as an empty HMAC key. API owns `config_interlock.rs`; QA asserts it independently, from outside the process, because a guarantee this load-bearing should not be checked only by the code that makes it. | **S1** |
 | `API-dev-token-hermetic` | The HS256 + `AUTH_DEV_SECRET` path (claims `{sub, iss, exp, nbf}`, `iss` matching `CLERK_ISSUER` exactly) authenticates in dev mode. Two different `sub` values are two tenants — this is how `API-auth-owner-404` is tested without Clerk. Mint via `infra/dev/e2e.py:mint()` (API's implementation, reused not rewritten). | S2 |
 | `API-alg-confusion` | In prod any non-RS256 `alg` is rejected on sight, including HS256 signed with the RSA **public** key. | **S1** |
-| `API-healthz` | `GET /healthz` needs no auth and reports dependency health honestly. | S4 |
+| `API-healthz` | `GET /healthz` needs no auth. | S4 |
+| `API-healthz-dependency` | `/healthz` reflects DEPENDENCY health, not just process liveness: while Postgres is unreachable it must not report `ok`. Observed 2026-09-05 after an OrbStack restart — `/healthz` returned `{"status":"ok"}` for a window in which `POST /v1/projects` returned 500. Not filed as a bug (transient, and not deterministically reproducible), but it matters at N replicas: a load balancer keeps a replica in rotation for exactly as long as its health endpoint lies. Test by pausing the postgres container and asserting `/healthz` degrades. | S3 |
 
 ---
 
