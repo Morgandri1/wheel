@@ -15,13 +15,17 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use uuid::Uuid;
 
-/// `ANY /host/v1/projects/{id}/engine/{*rest}` → the engine's `/v1/{rest}`.
+/// `ANY /host/v1/projects/{id}/engine/{*rest}` → the engine's `/{rest}`.
+///
+/// The suffix is forwarded verbatim. Callers address the control plane as
+/// `/v1/projects/<id>/engine/v1/board`, so `rest` already carries the engine's own `v1/` prefix;
+/// adding another here produced `/v1/v1/board` and a 404 from the engine.
 pub async fn engine(
     State(state): State<HostState>,
     Path((id, rest)): Path<(Uuid, String)>,
     req: Request,
 ) -> Response {
-    forward(state, id, format!("v1/{rest}"), req).await
+    forward(state, id, rest, req).await
 }
 
 /// `ANY /host/v1/projects/{id}/ingress/{*rest}` → the engine's `/ingress/{rest}`.
