@@ -102,6 +102,25 @@
           ]
         }
       }
+    },
+    {
+      "description": "This subscriber fell behind and events were dropped.\n\nTransport-level rather than a board fact, but it travels on the same socket and so belongs in the same union: a client that types the union from the schema and meets an undeclared frame will take its default branch, and the natural default — tear down and reconnect — is exactly wrong here. The socket is healthy and merely behind. Refetch `GET /v1/board` and keep the connection.",
+      "type": "object",
+      "required": [
+        "hint",
+        "type"
+      ],
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "lagged"
+          ]
+        }
+      }
     }
   ],
   "definitions": {
@@ -212,6 +231,13 @@
           "type": "string",
           "enum": [
             "engine"
+          ]
+        },
+        {
+          "description": "The exact bytes the engine wrote to the child's stdin (§3c#10).\n\nCarried on the same stream as everything else deliberately: a separate subscription would double the reconnect and cursor logic for no gain. `stdout` is what the agent SAID; `transcript` is what it was HANDED.",
+          "type": "string",
+          "enum": [
+            "transcript"
           ]
         }
       ]
