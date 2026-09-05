@@ -284,9 +284,13 @@ pub struct AuthComplete {
     /// have to know which it has, and cannot get it wrong by declaring it.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Paste-code OAuth (M2).
+    /// Paste-code OAuth: what the browser showed the user.
     #[serde(default)]
     pub code: Option<String>,
+    /// The handle from `auth/begin`. Optional, but supplying it stops a stale
+    /// browser tab completing a login the user has already restarted.
+    #[serde(default)]
+    pub session: Option<Uuid>,
 }
 
 /// `POST /v1/agents/:id/auth/complete`
@@ -298,22 +302,19 @@ pub async fn auth_complete(
     Path(id): Path<Uuid>,
     Json(body): Json<AuthComplete>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let harness = {
-        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let node = board::get(&conn, id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
-        node.config
-            .as_agent()
-            .ok_or_else(|| ApiError::invalid("not an agent node"))?
-            .harness
-    };
+    let harness = agent_harness(&s, id)?;
+
+    // Paste-code OAuth: the code goes to the child that `auth/begin` left
+    // waiting, and the CLI writes its own credentials into the node's dir.
+    if let Some(code) = body.code {
+        return finish_paste_code(&s, id, body.session, &code).await;
+    }
 
     let Some(key) = body.api_key else {
         // Be explicit rather than silently succeeding with no credential: a
         // 200 here would leave the agent unauthenticated but looking fine.
         return Err(ApiError::invalid(
-            "api_key is required; paste-code and device-code OAuth land in M2",
+            "supply either api_key (a provider key or a `claude setup-token`) or code (paste-code OAuth)",
         ));
     };
 
@@ -325,15 +326,23 @@ pub async fn auth_complete(
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
 
-    // A queued message that stalled on needs_auth is an ENVIRONMENTAL failure,
-    // not a poison message, so it stays queued and the agent is moved back to
-    // stopped — the next start drains it (§ message delivery contract).
-    {
+    // An agent that stalled on needs_auth was already started by someone who
+    // wanted it running, so saving a credential resumes it rather than leaving
+    // a stuck queue for the operator to poke. `parked` is the honest status
+    // for that: logically on, no process — and `deliver` below spawns one only
+    // if a message is actually waiting, so an agent with an empty queue costs
+    // nothing while it sits authenticated.
+    let was_blocked = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
         let st = board::agent_state(&conn, id).unwrap_or_default();
-        if st.status == wheel_core::AgentStatus::NeedsAuth {
-            board::set_status(&conn, id, wheel_core::AgentStatus::Stopped, None);
+        let blocked = st.status == wheel_core::AgentStatus::NeedsAuth;
+        if blocked {
+            board::set_status(&conn, id, wheel_core::AgentStatus::Parked, None);
         }
+        blocked
+    };
+    if was_blocked {
+        let _ = s.supervisor.deliver(id).await;
     }
     s.events.publish(wheel_core::Event::BoardChanged {
         at: wheel_core::Timestamp::now(),
@@ -346,6 +355,124 @@ pub async fn auth_complete(
     })))
 }
 
+/// The harness an agent node is configured for, or a 404/400 that says why not.
+fn agent_harness(s: &AppState, id: Uuid) -> ApiResult<wheel_core::Harness> {
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = board::get(&conn, id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+    Ok(node
+        .config
+        .as_agent()
+        .ok_or_else(|| ApiError::invalid("not an agent node"))?
+        .harness)
+}
+
+/// `POST /v1/agents/:id/auth/begin`
+///
+/// Starts a real sign-in against the user's own Anthropic account and returns
+/// the URL they must visit. The CLI's redirect target is Anthropic-hosted, so
+/// the container never needs a reachable localhost: the browser shows a code
+/// and the user pastes it back through `auth/complete`.
+///
+/// The child stays alive between the two calls — that is the whole reason this
+/// is stateful — and is killed if the user never returns.
+pub async fn auth_begin(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<wheel_core::AuthBegin>> {
+    let harness = agent_harness(&s, id)?;
+    if harness != wheel_core::Harness::Claude {
+        // Codex signs in by device code, which is a poll rather than a submit
+        // and is a different shape end to end. Saying so beats returning a
+        // paste-code envelope that nothing on the other side can satisfy.
+        return Err(ApiError::invalid(
+            "codex uses device-code login, which is not implemented yet;              use auth/complete with an api_key for now",
+        ));
+    }
+
+    s.logins.evict_expired().await;
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    let program = s.supervisor.harness_program().to_string();
+
+    let (session, url) = s
+        .logins
+        .begin(id, &program, &config_dir)
+        .await
+        .map_err(login_error)?;
+
+    Ok(Json(wheel_core::AuthBegin {
+        mode: wheel_core::AuthMode::PasteCode,
+        url: Some(url),
+        user_code: None,
+        instructions: "Open the link, sign in to your Anthropic account, then paste the code \
+                       it shows you back here."
+            .to_string(),
+        session,
+    }))
+}
+
+async fn finish_paste_code(
+    s: &AppState,
+    id: Uuid,
+    session: Option<Uuid>,
+    code: &str,
+) -> ApiResult<Json<serde_json::Value>> {
+    if code.trim().is_empty() {
+        return Err(ApiError::invalid("the code is empty"));
+    }
+    s.logins
+        .complete(id, session, code)
+        .await
+        .map_err(login_error)?;
+
+    let harness = agent_harness(s, id)?;
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    if !crate::auth::has_stored_credentials(&config_dir, harness) {
+        // The CLI exited happily but wrote nothing we can find. Reporting
+        // success here would leave an agent that looks signed in and fails on
+        // its first turn.
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "harness_error",
+            "the login reported success but left no credentials",
+        ));
+    }
+
+    let was_blocked = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let st = board::agent_state(&conn, id).unwrap_or_default();
+        let blocked = st.status == wheel_core::AgentStatus::NeedsAuth;
+        if blocked {
+            board::set_status(&conn, id, wheel_core::AgentStatus::Parked, None);
+        }
+        blocked
+    };
+    if was_blocked {
+        let _ = s.supervisor.deliver(id).await;
+    }
+    s.events.publish(wheel_core::Event::BoardChanged {
+        at: wheel_core::Timestamp::now(),
+    });
+
+    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+        authenticated: true,
+        mode: Some(wheel_core::CredentialKind::OauthSession),
+        account: None,
+    })))
+}
+
+fn login_error(e: crate::oauth::LoginError) -> ApiError {
+    use crate::oauth::LoginError as L;
+    match e {
+        // Gone, not malformed: the client should start again, not retry.
+        L::NoSession | L::Expired => ApiError::new(StatusCode::CONFLICT, "expired", e.to_string()),
+        L::Rejected(_) => ApiError::invalid(e.to_string()),
+        L::Timeout => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string()),
+        L::Spawn(m) => ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", m),
+    }
+}
+
 /// `GET /v1/agents/:id/auth`
 ///
 /// Reports whether credentials are STORED, which is not the same as whether
@@ -356,16 +483,7 @@ pub async fn auth_status(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let harness = {
-        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let node = board::get(&conn, id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
-        node.config
-            .as_agent()
-            .ok_or_else(|| ApiError::invalid("not an agent node"))?
-            .harness
-    };
+    let harness = agent_harness(&s, id)?;
     let config_dir = s.cfg.creds_dir().join(id.to_string());
     let authenticated = crate::auth::has_stored_credentials(&config_dir, harness);
     // A stored token names its own kind. Otherwise credentials, if any, are

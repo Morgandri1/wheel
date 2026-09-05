@@ -41,6 +41,9 @@ pub struct AppState {
     /// Fan-out for `/v1/events`. Publishing never blocks, so a slow browser
     /// cannot stall the supervisor.
     pub events: Arc<crate::events::Bus>,
+    /// Logins waiting for a pasted code. Each holds a live child process, so
+    /// this is state with a cost and a TTL, not a cache.
+    pub logins: Arc<crate::oauth::LoginSessions>,
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
@@ -153,6 +156,7 @@ pub fn router(state: AppState) -> Router {
             "/agents/{id}/auth/complete",
             post(agent_routes::auth_complete),
         )
+        .route("/agents/{id}/auth/begin", post(agent_routes::auth_begin))
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -1,0 +1,465 @@
+//! Paste-code OAuth: signing an agent node in to a real Anthropic account.
+//!
+//! The CLI's login is interactive, but not in a way that needs a terminal. Run
+//! headless it prints an authorize URL, then blocks reading a code on stdin:
+//!
+//! ```text
+//! Opening browser to sign in…
+//! If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?...&state=...
+//! Paste code here if prompted >
+//! ```
+//!
+//! The redirect target is Anthropic-hosted, so the container never needs a
+//! reachable localhost — the browser shows the user a code and they paste it
+//! back. That makes the flow two calls with a LIVE CHILD between them, which
+//! is the only real complexity here: `auth/begin` must keep a process alive
+//! until `auth/complete` feeds it, and must not leak one if that never comes.
+
+use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
+
+use anyhow::{bail, Context, Result};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin},
+    sync::Mutex,
+    time::Instant,
+};
+use uuid::Uuid;
+
+/// How long a login may sit unfinished. The user has to visit a URL, sign in
+/// and copy a code; generous, but not unbounded — the child is a real process.
+pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait for the CLI to print its authorize URL.
+const URL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the CLI to accept or reject a pasted code.
+const CODE_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct Pending {
+    session: Uuid,
+    url: String,
+    started: Instant,
+    child: Child,
+    stdin: ChildStdin,
+    /// Everything the child has said, for diagnosing a rejected code.
+    output: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoginError {
+    #[error("no login is in progress for this agent; call auth/begin first")]
+    NoSession,
+    #[error("this login expired; call auth/begin again")]
+    Expired,
+    #[error("that code was not accepted: {0}")]
+    Rejected(String),
+    #[error("the login did not finish in time")]
+    Timeout,
+    #[error("{0}")]
+    Spawn(String),
+}
+
+#[derive(Default)]
+pub struct LoginSessions {
+    inner: Mutex<HashMap<Uuid, Pending>>,
+}
+
+impl LoginSessions {
+    /// Start a login and return the URL the user must visit.
+    ///
+    /// Any login already in flight for this node is killed first: a second
+    /// `begin` means the user gave up on the first, and leaving that child
+    /// alive would leak a process per retry.
+    pub async fn begin(
+        &self,
+        node: Uuid,
+        program: &str,
+        config_dir: &Path,
+    ) -> Result<(Uuid, String), LoginError> {
+        self.cancel(node).await;
+
+        std::fs::create_dir_all(config_dir).ok();
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(["auth", "login", "--claudeai"])
+            // The node's own config dir, so this login belongs to this agent
+            // and not to every agent in the sandbox.
+            .env("CLAUDE_CONFIG_DIR", config_dir)
+            .env("HOME", config_dir)
+            .env("IS_SANDBOX", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| LoginError::Spawn(format!("could not start {program}: {e}")))?;
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let output = output.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if let Ok(mut o) = output.lock() {
+                        o.push_str(&l);
+                        o.push('\n');
+                    }
+                }
+            });
+        }
+
+        // Read stdout until the URL appears, then keep draining in the
+        // background — a child whose pipe fills up would block forever.
+        let mut reader = BufReader::new(stdout);
+        let url = match tokio::time::timeout(URL_TIMEOUT, read_authorize_url(&mut reader)).await {
+            Ok(Ok(url)) => url,
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                return Err(LoginError::Spawn(e.to_string()));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(LoginError::Timeout);
+            }
+        };
+        {
+            let output = output.clone();
+            tokio::spawn(async move {
+                let mut lines = reader.lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if let Ok(mut o) = output.lock() {
+                        o.push_str(&l);
+                        o.push('\n');
+                    }
+                }
+            });
+        }
+
+        let session = Uuid::new_v4();
+        self.inner.lock().await.insert(
+            node,
+            Pending {
+                session,
+                url: url.clone(),
+                started: Instant::now(),
+                child,
+                stdin,
+                output,
+            },
+        );
+        Ok((session, url))
+    }
+
+    /// Feed the pasted code to the waiting child and report what it made of it.
+    pub async fn complete(
+        &self,
+        node: Uuid,
+        session: Option<Uuid>,
+        code: &str,
+    ) -> Result<(), LoginError> {
+        let mut pending = {
+            let mut guard = self.inner.lock().await;
+            guard.remove(&node).ok_or(LoginError::NoSession)?
+        };
+
+        if pending.started.elapsed() > SESSION_TTL {
+            let _ = pending.child.kill().await;
+            return Err(LoginError::Expired);
+        }
+        // A stale tab finishing an old login would otherwise complete a session
+        // the user has already restarted.
+        if let Some(s) = session {
+            if s != pending.session {
+                let _ = pending.child.kill().await;
+                return Err(LoginError::Expired);
+            }
+        }
+
+        let line = format!("{}\n", code.trim());
+        if pending.stdin.write_all(line.as_bytes()).await.is_err() {
+            let _ = pending.child.kill().await;
+            return Err(LoginError::Rejected(
+                "the login process had already exited".into(),
+            ));
+        }
+        let _ = pending.stdin.flush().await;
+
+        match tokio::time::timeout(CODE_TIMEOUT, pending.child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(_)) => Err(LoginError::Rejected(tail(&pending.output))),
+            Ok(Err(e)) => Err(LoginError::Rejected(e.to_string())),
+            Err(_) => {
+                let _ = pending.child.kill().await;
+                Err(LoginError::Timeout)
+            }
+        }
+    }
+
+    /// Kill any login in flight for a node. Safe to call when there is none.
+    pub async fn cancel(&self, node: Uuid) {
+        if let Some(mut p) = self.inner.lock().await.remove(&node) {
+            let _ = p.child.kill().await;
+        }
+    }
+
+    /// Drop logins that have outlived their TTL, killing their children.
+    ///
+    /// Called on `begin`, so an abandoned login cannot hold a process forever
+    /// just because nobody came back to it.
+    pub async fn evict_expired(&self) {
+        let mut guard = self.inner.lock().await;
+        let stale: Vec<Uuid> = guard
+            .iter()
+            .filter(|(_, p)| p.started.elapsed() > SESSION_TTL)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(mut p) = guard.remove(&id) {
+                let _ = p.child.kill().await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+}
+
+fn tail(output: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    let text = output.lock().map(|o| o.clone()).unwrap_or_default();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "the CLI rejected it without saying why".to_string()
+    } else {
+        trimmed.rsplit('\n').take(3).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// Pull the authorize URL out of the CLI's greeting.
+///
+/// Matches on `https://` rather than the sentence around it: the wording
+/// ("If the browser didn't open, visit: ") is cosmetic and has no contract
+/// behind it, while a URL on its own line does.
+async fn extract_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let url = line[start..].trim().trim_end_matches(['.', ',']);
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+async fn read_authorize_url<R>(reader: &mut BufReader<R>) -> Result<String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = String::new();
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("reading the login output")?;
+        if n == 0 {
+            bail!(
+                "the login process ended before printing a URL: {}",
+                lines.trim()
+            );
+        }
+        if let Some(url) = extract_url(&line).await {
+            return Ok(url);
+        }
+        lines.push_str(&line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact bytes `claude 2.1.261` prints, captured from a real run.
+    const REAL_GREETING: &str = "Opening browser to sign in…\n\
+        If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=pyIagh&code_challenge_method=S256&state=m9gz12oZ\n\
+        Paste code here if prompted > ";
+
+    #[tokio::test]
+    async fn the_url_is_pulled_out_of_the_real_cli_greeting() {
+        let mut r = BufReader::new(REAL_GREETING.as_bytes());
+        let url = read_authorize_url(&mut r).await.unwrap();
+        assert!(url.starts_with("https://claude.com/cai/oauth/authorize?"));
+        // The whole query string matters: without `state` the callback cannot
+        // be tied back to this attempt.
+        assert!(url.contains("state=m9gz12oZ"), "state must survive: {url}");
+        assert!(url.contains("code_challenge=pyIagh"), "PKCE must survive");
+        // The prose around it must not be dragged in.
+        assert!(!url.contains("visit"), "prose leaked into the url: {url}");
+        assert!(!url.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn a_login_that_dies_without_a_url_is_an_error_not_a_hang() {
+        let mut r = BufReader::new("some unrelated failure\n".as_bytes());
+        let err = read_authorize_url(&mut r).await.unwrap_err().to_string();
+        assert!(err.contains("ended before printing a URL"), "{err}");
+        assert!(
+            err.contains("some unrelated failure"),
+            "the reason must be carried to the operator: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_without_beginning_is_a_clear_error() {
+        let s = LoginSessions::default();
+        let err = s.complete(Uuid::new_v4(), None, "code").await.unwrap_err();
+        assert!(matches!(err, LoginError::NoSession));
+    }
+
+    #[tokio::test]
+    async fn a_second_begin_replaces_the_first_rather_than_leaking_it() {
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("wheel-oauth-{}", std::process::id()));
+
+        // `true` prints no URL, so begin fails — but the important part is
+        // that a failed begin leaves nothing behind to leak.
+        let _ = s.begin(node, "true", &dir).await;
+        assert_eq!(s.len().await, 0, "a failed login must not be retained");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_is_reported_not_panicked() {
+        let s = LoginSessions::default();
+        let dir = std::env::temp_dir().join("wheel-oauth-missing");
+        let err = s
+            .begin(Uuid::new_v4(), "definitely-not-a-real-binary", &dir)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoginError::Spawn(_)), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stub that speaks the CLI's real greeting, then accepts or rejects the
+    /// pasted code. Exercises the whole two-call flow with a live child in
+    /// between, which is the only part of this that can really go wrong.
+    fn stub_cli(name: &str, accept: bool) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-stub-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude-stub");
+        let body = format!(
+            "#!/bin/sh\n\
+             echo 'Opening browser to sign in…'\n\
+             echo 'If the browser didn'\\''t open, visit: https://claude.com/cai/oauth/authorize?code=true&state=abc123'\n\
+             printf 'Paste code here if prompted > '\n\
+             read code\n\
+             if [ \"$code\" = 'good#abc123' ] && [ {accept} -eq 1 ]; then\n\
+               mkdir -p \"$CLAUDE_CONFIG_DIR\"\n\
+               echo '{{}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n\
+               exit 0\n\
+             fi\n\
+             echo 'OAuth token exchange failed: 400' >&2\n\
+             exit 1\n",
+            accept = if accept { 1 } else { 0 }
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+        (path.display().to_string(), dir)
+    }
+
+    #[tokio::test]
+    async fn a_good_code_completes_the_login_and_leaves_credentials() {
+        let (program, dir) = stub_cli("good", true);
+        let creds = dir.join("creds");
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+
+        let (session, url) = s.begin(node, &program, &creds).await.unwrap();
+        assert!(url.starts_with("https://claude.com/cai/oauth/authorize?"));
+        assert_eq!(
+            s.len().await,
+            1,
+            "the child must be kept alive between calls"
+        );
+
+        s.complete(node, Some(session), "good#abc123")
+            .await
+            .unwrap();
+        assert!(
+            creds.join(".credentials.json").exists(),
+            "the CLI must have written credentials into the NODE's own dir"
+        );
+        assert_eq!(s.len().await, 0, "a finished login must not be retained");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_bad_code_is_rejected_with_the_reason_the_cli_gave() {
+        let (program, dir) = stub_cli("bad", false);
+        let creds = dir.join("creds");
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+
+        let (session, _) = s.begin(node, &program, &creds).await.unwrap();
+        let err = s
+            .complete(node, Some(session), "wrong#abc123")
+            .await
+            .unwrap_err();
+        match err {
+            LoginError::Rejected(why) => assert!(
+                why.contains("400"),
+                "the operator needs the CLI's own reason, got: {why}"
+            ),
+            other => panic!("expected a rejection, got {other}"),
+        }
+        // A rejected attempt must not leave a child holding the node hostage.
+        assert_eq!(s.len().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stale browser tab must not finish a login the user already restarted.
+    #[tokio::test]
+    async fn a_code_for_a_superseded_session_is_refused() {
+        let (program, dir) = stub_cli("stale", true);
+        let creds = dir.join("creds");
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+
+        let (first, _) = s.begin(node, &program, &creds).await.unwrap();
+        let (second, _) = s.begin(node, &program, &creds).await.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(s.len().await, 1, "the first login must have been killed");
+
+        let err = s
+            .complete(node, Some(first), "good#abc123")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LoginError::Expired), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cancelling_kills_the_child_and_is_idempotent() {
+        let (program, dir) = stub_cli("cancel", true);
+        let creds = dir.join("creds");
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+
+        s.begin(node, &program, &creds).await.unwrap();
+        s.cancel(node).await;
+        assert_eq!(s.len().await, 0);
+        s.cancel(node).await;
+        assert!(matches!(
+            s.complete(node, None, "good#abc123").await.unwrap_err(),
+            LoginError::NoSession
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

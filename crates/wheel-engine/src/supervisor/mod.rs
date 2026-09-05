@@ -668,6 +668,12 @@ impl Supervisor {
         }
     }
 
+    /// Which harness binary this supervisor drives. The login flow must spawn
+    /// the same one, or an agent could be signed in to a CLI it never runs.
+    pub fn harness_program(&self) -> &str {
+        self.harness.program()
+    }
+
     /// Deliver to an agent, resuming it first if it is parked.
     ///
     /// Every enqueue path goes through here rather than calling `pump_queue`
