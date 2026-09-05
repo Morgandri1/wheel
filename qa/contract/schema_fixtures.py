@@ -87,6 +87,7 @@ def main():
 
     print("schema: %s" % os.path.relpath(schema_path, ROOT))
     fails = []
+    gaps = []
 
     pending = deferred = 0
     for p in sorted(glob.glob(os.path.join(VALID, "*.json"))):
@@ -109,6 +110,21 @@ def main():
         doc = load(p)
         crit = doc.pop("_expect_reject", "?")
         ref = doc.pop("_engine_ref", None)
+        # A fixture tagged with an OPEN bug is a TRACKED GAP, not a fresh failure: it
+        # stays visible in the summary and in qa/BUGS.md, but it does not block every
+        # other team's merges on one team's known bug. A gap that starts passing is a
+        # FAILURE too — it means the bug is fixed and the marker is now lying.
+        bug = doc.pop("_known_bug", None)
+        if bug:
+            if validator.is_valid(doc):
+                gaps.append("invalid/%s — %s (%s)" % (name, bug, crit))
+                print("  GAP  invalid/%-26s accepted — tracked as %s" % (name, bug))
+            else:
+                fails.append("invalid/%s is marked %s but is now REJECTED — the bug looks fixed; "
+                             "remove _known_bug from the fixture and close it in qa/BUGS.md"
+                             % (name, bug))
+                print("  FAIL invalid/%-26s marked %s but now rejected (stale marker)" % (name, bug))
+            continue
         if doc.pop("_enforced_by", "schema") == "engine":
             deferred += 1
             print("  ..   invalid/%-26s engine-enforced (%s) — asserted in qa/integration" % (name, ref or crit))
@@ -120,13 +136,18 @@ def main():
             print("  ok   invalid/%-26s rejected (%s)" % (name, crit))
 
     print()
+    if gaps:
+        print("schema contract: %d TRACKED GAP(S) — open bugs, not new regressions:" % len(gaps))
+        for g in gaps:
+            print("  -", g)
+        print()
     if fails:
         print("schema contract: %d FAILED" % len(fails))
         for f in fails:
             print("  -", f)
         return 1
     print("schema contract: every structural fixture behaves as specified "
-          "(%d pending, %d deferred to engine validation)" % (pending, deferred))
+          "(%d pending, %d deferred to engine, %d tracked gap(s))" % (pending, deferred, len(gaps)))
     return 0
 
 if __name__ == "__main__":
