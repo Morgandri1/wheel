@@ -73,6 +73,14 @@ export const NODE_META: Record<NodeType, NodeMeta> = {
     tint: "var(--t-chest)",
     glyph: "M2 5.5 8 2.5l6 3v7L8 15.5l-6-3z M2 5.5 8 8.5l6-3 M8 8.5v7",
   },
+  tool: {
+    type: "tool",
+    label: "Tool",
+    blurb:
+      "An imported API spec. You decide which fields the agent fills and which come from a vault.",
+    tint: "var(--t-tool)",
+    glyph: "M10.5 2.2a3.6 3.6 0 0 0-4.3 4.6L2.6 10.4a1.5 1.5 0 0 0 2.1 2.1l3.6-3.6a3.6 3.6 0 0 0 4.6-4.3l-2.1 2.1-1.9-.5-.5-1.9z",
+  },
 };
 
 /** Palette order: the two you need for a first board, then the rest by how often they're reached for. */
@@ -85,6 +93,7 @@ export const PALETTE_ORDER: NodeType[] = [
   "mcp",
   "vault",
   "chest",
+  "tool",
 ];
 
 export const WIRE_META: Record<WireType, { label: string; color: string; dash: string }> = {

@@ -128,6 +128,19 @@ export const WIRE_MATRIX: readonly WireRule[] = [
     incoming: "your tools are attached to it at its next start",
     commands: ["(attached to the harness config — no CLI call)"],
   },
+  {
+    from: "agent",
+    to: "tool",
+    type: "read",
+    label: "Call its operations",
+    outgoing: "you can call its operations",
+    incoming: "it can call your operations",
+    commands: [
+      "wheel tool ls <tool>",
+      "wheel tool call <tool> <op> '<json args>'",
+      "(each enabled op is also an MCP tool `<tool>__<op>`)",
+    ],
+  },
 
   // ── ctx ───────────────────────────────────────────────────────────────────
   {
@@ -245,6 +258,16 @@ export const WIRE_MATRIX: readonly WireRule[] = [
     outgoing: "you can read its secrets",
     incoming: "it can read your secrets",
     commands: ["wheel secret get <vault>/<key>"],
+  },
+  // ── tool ──────────────────────────────────────────────────────────────────
+  {
+    from: "tool",
+    to: "vault",
+    type: "read",
+    label: "Resolve vault fills",
+    outgoing: "your vault-mode fills resolve from it at call time",
+    incoming: "its vault-mode fills resolve from you at call time",
+    commands: ['(fills with {mode:"vault"}; values never reach the agent or /v1/board)'],
   },
 ] as const;
 

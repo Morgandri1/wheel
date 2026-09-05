@@ -149,6 +149,12 @@ function NodePlateInner({ data, selected }: NodeProps) {
           <p className="ident truncate text-micro text-ink-dim">
             {node.config.transport === "stdio" ? node.config.command || "no command" : node.config.url || "no url"}
           </p>
+        ) : node.type === "tool" ? (
+          <p className="text-micro text-ink-dim">
+            {node.config.operations.filter((o) => o.enabled).length} of{" "}
+            {node.config.operations.length} operation
+            {node.config.operations.length === 1 ? "" : "s"} enabled
+          </p>
         ) : (
           <p className="text-micro text-ink-dim">Blob store</p>
         )}

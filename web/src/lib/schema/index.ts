@@ -10,6 +10,7 @@ export const NODE_TYPES = [
   "mcp",
   "vault",
   "chest",
+  "tool",
 ] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
 
@@ -100,6 +101,58 @@ export interface VaultConfig {
 
 export type ChestConfig = Record<string, never>;
 
+/** §3d. How one request field is filled. Only `agent` fields are ever shown to an agent. */
+export type Fill =
+  | { mode: "agent" }
+  | { mode: "static"; value: unknown }
+  | { mode: "vault"; ref: string }
+  | { mode: "hidden" };
+
+export type FillMode = Fill["mode"];
+
+export const TOOL_FORMATS = ["openapi", "swagger2", "postman", "insomnia", "manual"] as const;
+export type ToolFormat = (typeof TOOL_FORMATS)[number];
+
+export const PARAM_LOCATIONS = ["path", "query", "header", "cookie"] as const;
+export type ParamLocation = (typeof PARAM_LOCATIONS)[number];
+
+export interface ToolParam {
+  name: string;
+  in: ParamLocation;
+  schema: Record<string, unknown>;
+  required: boolean;
+  fill: Fill;
+}
+
+export interface ToolBody {
+  content_type:
+    | "application/json"
+    | "application/x-www-form-urlencoded"
+    | "multipart/form-data"
+    | "text/plain";
+  schema: Record<string, unknown>;
+  /** Keyed by JSON pointer or dotted path into the body. */
+  fills: Record<string, Fill>;
+}
+
+export interface ToolOperation {
+  id: string;
+  method: HttpMethod | "PATCH" | "HEAD" | "OPTIONS";
+  /** May contain {param} placeholders. */
+  path: string;
+  summary?: string;
+  enabled: boolean;
+  params: ToolParam[];
+  body?: ToolBody;
+}
+
+export interface ToolConfig {
+  kind: "http";
+  source: { format: ToolFormat; raw: string; imported_at: string };
+  base_url: string;
+  operations: ToolOperation[];
+}
+
 export type NodeConfigFor<T extends NodeType> = T extends "agent"
   ? AgentConfig
   : T extends "ctx"
@@ -114,7 +167,9 @@ export type NodeConfigFor<T extends NodeType> = T extends "agent"
             ? McpConfig
             : T extends "vault"
               ? VaultConfig
-              : ChestConfig;
+              : T extends "chest"
+                ? ChestConfig
+                : ToolConfig;
 
 export interface AgentState {
   status: AgentStatus;
@@ -145,6 +200,7 @@ export type ScriptNode = NodeBase<"script">;
 export type McpNode = NodeBase<"mcp">;
 export type VaultNode = NodeBase<"vault">;
 export type ChestNode = NodeBase<"chest">;
+export type ToolNode = NodeBase<"tool">;
 
 export type WheelNode =
   | AgentNode
@@ -154,7 +210,8 @@ export type WheelNode =
   | ScriptNode
   | McpNode
   | VaultNode
-  | ChestNode;
+  | ChestNode
+  | ToolNode;
 
 export const PROJECT_STATUSES = ["stopped", "starting", "running", "error"] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];

@@ -28,6 +28,7 @@
   --t-mcp: #5f4a72;
   --t-vault: #7a6420;
   --t-chest: #3d6a72;
+  --t-tool: #7d4a5e;
 }
 
 [data-theme="dark"] {
@@ -58,4 +59,5 @@
   --t-mcp: #a392b0;
   --t-vault: #bfae86;
   --t-chest: #8fb0b6;
+  --t-tool: #c092a4;
 }
