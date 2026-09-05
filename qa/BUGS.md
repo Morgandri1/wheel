@@ -13,7 +13,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 005 | `make check` (`rust:fmt`) | S3 | API | ~~closed~~ | `main` fails `cargo fmt --check`: 66 diffs across 18 files in wheel-api + wheel-host |
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
-| 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar |
+| 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% (host was 0.00% when filed) |
 
 ---
 
@@ -181,19 +181,24 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
 
-First real numbers from CI (run 33955251384, bar 90%):
+Latest numbers, local `make coverage` (bar 90%, per crate):
 
-| crate | lines | status |
-|---|---|---|
-| `wheel-api` | 29.36% (394/1342) | FAIL |
-| `wheel-core` | 68.34% (669/979) | FAIL |
-| `wheel-engine` | 74.79% (350/468) | EXEMPT — scaffolding (PM ruling); expires when the engine is bootable / `wheel-engine:test` exists |
-| `wheel-host` | **0.00% (0/688)** | FAIL |
+| crate | lines | status | owner |
+|---|---|---|---|
+| `wheel-api` | 35.06% (495/1412) | FAIL | API |
+| `wheel-core` | 69.56% (681/979) | FAIL | SDK |
+| `wheel-host` | 72.21% (491/680) | FAIL | API |
+| `wheel-engine` | 57.02% (1194/2094) | EXEMPT — scaffolding (PM ruling); expires when the engine is bootable / `wheel-engine:test` exists |
 
-`wheel-host` is the one to fix first. It holds every project's engine secret, performs the
-setuid, and is the only process in the stack touching the docker socket — and no test exercises
-a single line of it. The others are under-tested; this one is untested, in the crate where that
-matters most.
+`wheel-host` was at **0.00%** when this was filed and is now at 72.21% — that was the urgent one
+(it holds every project's engine secret, performs the setuid, and is the only process touching the
+docker socket), so the risk has dropped a lot. All three are still below the bar.
+
+**The gate itself was broken until now, and this is worth knowing:** `coverage_gate.py` wrote its
+llvm-cov report to `<repo>/target/`, but `~/.cargo/config.toml` points every worktree at one
+shared target-dir, so that directory does not exist and `llvm-cov` exited with "failed to create
+file". Every "coverage" result before this fix was that error surfacing as a red gate, not a
+measurement. Fixed to use a temp dir. So treat the numbers above as the first trustworthy ones.
 
 `wheel-core` at 68% matters for a specific reason: `validate.rs` is the code that must be
 enforcing the twelve rejections in BUG-001 that the exported schema does not. Untested branches
@@ -303,3 +308,5 @@ artifact Web generates types from and third parties would validate against — n
 Still worth fixing, for a reason the severity change should not obscure: a client that writes a
 config the schema calls valid gets a 400 from the engine. The schema currently promises something
 the product does not accept, which is a worse failure than a schema that is merely strict.
+
+
