@@ -64,6 +64,12 @@ pub enum StartupFailure {
 }
 
 pub trait Harness: Send + Sync {
+    /// The executable to spawn, resolved on PATH.
+    ///
+    /// On the trait rather than hardcoded at the spawn site so a codex node
+    /// cannot be started by running `claude` with codex's arguments.
+    fn program(&self) -> &str;
+
     /// argv for a child. The system prompt is passed by path, never inline.
     fn argv(&self, spec: &SpawnSpec) -> Vec<OsString>;
 

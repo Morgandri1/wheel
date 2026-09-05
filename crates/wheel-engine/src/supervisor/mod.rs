@@ -73,11 +73,22 @@ impl Supervisor {
         db: Arc<Mutex<rusqlite::Connection>>,
         events: Arc<crate::events::Bus>,
     ) -> Self {
+        Self::with_harness(cfg, db, events, Arc::new(ClaudeDriver))
+    }
+
+    /// Build a supervisor driving a specific harness. The seam that lets tests
+    /// exercise real spawn/exit paths against a stub binary.
+    pub fn with_harness(
+        cfg: Arc<Config>,
+        db: Arc<Mutex<rusqlite::Connection>>,
+        events: Arc<crate::events::Bus>,
+        harness: Arc<dyn Harness>,
+    ) -> Self {
         Self {
             cfg,
             db,
             agents: Arc::new(AsyncMutex::new(HashMap::new())),
-            harness: Arc::new(ClaudeDriver),
+            harness,
             events,
         }
     }
@@ -163,7 +174,7 @@ impl Supervisor {
 
         self.set_status(agent, AgentStatus::Starting, None);
 
-        let mut cmd = tokio::process::Command::new("claude");
+        let mut cmd = tokio::process::Command::new(self.harness.program());
         cmd.args(self.harness.argv(&spec))
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
@@ -203,8 +214,12 @@ impl Supervisor {
         });
         drop(guard);
 
-        self.clone().pump_stdout(agent, stdout, slot.clone());
-        self.pump_stderr(agent, stderr);
+        // stderr is logged by its own task; the stdout task waits for it and
+        // is the single owner of "this child has died", so the slot is cleared
+        // and the status settled exactly once, in a defined order.
+        let stderr_done = self.pump_stderr(agent, stderr);
+        self.clone()
+            .pump_stdout(agent, stdout, slot.clone(), stderr_done);
 
         Ok(AgentStatus::Starting)
     }
@@ -280,6 +295,7 @@ impl Supervisor {
         agent: Uuid,
         stdout: tokio::process::ChildStdout,
         slot: Arc<AsyncMutex<Option<Running>>>,
+        stderr_done: tokio::task::JoinHandle<String>,
     ) {
         let db = self.db.clone();
         let harness = self.harness.clone();
@@ -378,12 +394,86 @@ impl Supervisor {
                     }
                 }
             }
+
+            // stdout closed: the child is gone. Reap it.
+            self.reap(agent, slot, stderr_done).await;
         });
     }
 
-    fn pump_stderr(&self, agent: Uuid, stderr: tokio::process::ChildStderr) {
+    /// Settle a child that has exited: clear its slot, reap the process, put
+    /// anything in flight back on the queue, and record why it went away.
+    ///
+    /// Liveness comes from the supervisor that owns the process (§3c#15), so
+    /// this is the ONLY place a dead child is recognised — and it must run,
+    /// because a slot left occupied makes every later `start` a silent no-op
+    /// and lets `pump_queue` write into a stdin nothing is reading.
+    async fn reap(
+        &self,
+        agent: Uuid,
+        slot: Arc<AsyncMutex<Option<Running>>>,
+        stderr_done: tokio::task::JoinHandle<String>,
+    ) {
+        // Wait for stderr so the classification below sees the whole message.
+        // Without this the two tasks race and the reason is a coin flip.
+        let captured = stderr_done.await.unwrap_or_default();
+
+        let mut guard = slot.lock().await;
+        let Some(mut running) = guard.take() else {
+            // `stop()` already took the slot and set the status. Nothing to
+            // settle, and overwriting its Stopped would be a lie.
+            return;
+        };
+        let _ = running.child.wait().await;
+        let in_flight = running.in_flight;
+        drop(guard);
+
+        let (status, detail) = match self.harness.classify_startup_failure(None, &captured) {
+            // Environmental, not poison: the queued message stays queued and
+            // is delivered on the next start once the operator authenticates.
+            // Marking it error would consume the message and lose it.
+            StartupFailure::NeedsAuth => (
+                AgentStatus::NeedsAuth,
+                Some("the harness has no usable credentials".to_string()),
+            ),
+            StartupFailure::Misconfigured(why) if !captured.trim().is_empty() => {
+                (AgentStatus::Error, Some(why))
+            }
+            // Exited with nothing to say. A clean shutdown looks exactly like
+            // this, so it is not reported as an error.
+            StartupFailure::Misconfigured(_) => (AgentStatus::Stopped, None),
+        };
+
+        {
+            let conn = self.db.lock().unwrap();
+            // Anything written to the dying child never ran a turn, so it goes
+            // back on the queue rather than being lost as though it had been
+            // handled.
+            let n = messages::requeue_all_undelivered(
+                &conn,
+                agent,
+                "the harness exited before this message could be processed",
+            )
+            .unwrap_or(0);
+            if n > 0 {
+                tracing::info!(agent = %agent, requeued = n, in_flight = ?in_flight, "returned in-flight messages to the queue");
+            }
+            // A token outliving its process is a credential with no owner.
+            let _ = crate::db::tokens::revoke(&conn, agent);
+            set_status_db(&conn, agent, status, detail);
+            publish_state(&self.events, &conn, agent);
+        }
+    }
+
+    /// Log the child's stderr, and hand the captured text to [`Supervisor::reap`].
+    ///
+    /// Deliberately does NOT decide the agent's status: when this task and the
+    /// stdout task both wrote status, the one that lost the race decided it.
+    fn pump_stderr(
+        &self,
+        agent: Uuid,
+        stderr: tokio::process::ChildStderr,
+    ) -> tokio::task::JoinHandle<String> {
         let db = self.db.clone();
-        let harness = self.harness.clone();
         let bus = self.events.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -395,41 +485,8 @@ impl Supervisor {
                 // stderr is log material, never parsed as JSON.
                 log_line_bus(&bus, &conn, agent, "stderr", &line);
             }
-            // The child's stderr closed: classify why it went away.
-            //
-            // Both branches matter. Matching only Misconfigured here silently
-            // DROPPED needs_auth, so an agent with no credentials sat in
-            // whatever status it happened to hold and the operator was never
-            // told to authenticate.
-            if !captured.is_empty() {
-                let (status, detail) = match harness.classify_startup_failure(None, &captured) {
-                    // Environmental, not poison: the queued message stays
-                    // queued and is delivered on the next start once the
-                    // operator authenticates. Marking it error would consume
-                    // the message and lose it.
-                    StartupFailure::NeedsAuth => (
-                        AgentStatus::NeedsAuth,
-                        Some("the harness has no usable credentials".to_string()),
-                    ),
-                    StartupFailure::Misconfigured(why) => (AgentStatus::Error, Some(why)),
-                };
-                let conn = db.lock().unwrap();
-                // Anything written to the dying child never ran a turn, so it
-                // goes back on the queue rather than being lost as though it
-                // had been handled.
-                let n = messages::requeue_all_undelivered(
-                    &conn,
-                    agent,
-                    "the harness exited before this message could be processed",
-                )
-                .unwrap_or(0);
-                if n > 0 {
-                    tracing::info!(agent = %agent, requeued = n, "returned in-flight messages to the queue");
-                }
-                set_status_db(&conn, agent, status, detail);
-                publish_state(&bus, &conn, agent);
-            }
-        });
+            captured
+        })
     }
 
     fn set_status(&self, agent: Uuid, status: AgentStatus, err: Option<String>) {
@@ -565,6 +622,176 @@ fn publish_message(bus: &crate::events::Bus, conn: &rusqlite::Connection, id: Uu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A harness backed by a shell script, so tests can exercise the real
+    /// spawn/exit path — including what happens after a child dies — without
+    /// a model, a network, or a credential.
+    struct ShimDriver {
+        program: String,
+    }
+
+    impl Harness for ShimDriver {
+        fn program(&self) -> &str {
+            &self.program
+        }
+        fn argv(&self, _spec: &SpawnSpec) -> Vec<std::ffi::OsString> {
+            Vec::new()
+        }
+        fn env(&self, _spec: &SpawnSpec) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            format!("{envelope}\n")
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            HarnessEvent::Unknown { raw: line.into() }
+        }
+        fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(None, stderr)
+        }
+    }
+
+    /// Builds a supervisor whose child is `script`, over an in-memory board
+    /// holding one agent node. Returns the agent's id and its scratch dir.
+    fn shim_supervisor(name: &str, script: &str) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-sup-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("harness.sh");
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let node = wheel_core::Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Agent(wheel_core::AgentConfig {
+                harness: wheel_core::Harness::Claude,
+                system_prompt: "test".into(),
+                ..Default::default()
+            }),
+        );
+        let id = node.id;
+        board::create(&conn, &node).unwrap();
+
+        let cfg = Arc::new(Config {
+            project_id: Uuid::new_v4(),
+            engine_secret: "0123456789abcdef".into(),
+            vault_key: None,
+            data_dir: dir.clone(),
+            listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+            json_logs: false,
+        });
+        let sup = Arc::new(Supervisor::with_harness(
+            cfg,
+            Arc::new(Mutex::new(conn)),
+            Arc::new(crate::events::Bus::new()),
+            Arc::new(ShimDriver {
+                program: program.display().to_string(),
+            }),
+        ));
+        (sup, id, dir)
+    }
+
+    fn status_of(sup: &Supervisor, id: Uuid) -> AgentStatus {
+        let conn = sup.db.lock().unwrap();
+        board::agent_state(&conn, id).unwrap_or_default().status
+    }
+
+    fn runs(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("runs"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Wait for a condition rather than for a duration: a fixed sleep is a
+    /// guess about machine load, and these tests spawn real processes while
+    /// the rest of the suite runs beside them.
+    async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The operator's actual first session: start, discover the agent needs
+    /// credentials, paste them, start again. If the dead child's slot is not
+    /// cleared, that second start returns 200 and spawns NOTHING — the agent
+    /// can never be authenticated, and the API says everything is fine.
+    #[tokio::test]
+    async fn an_agent_can_be_started_again_after_its_child_died() {
+        let (sup, id, dir) = shim_supervisor(
+            "restartable",
+            "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\n\
+             echo 'Invalid API key · Please run /login' >&2\nexit 1\n",
+        );
+        sup.start(id).await.unwrap();
+        until("the agent to report needs_auth", || {
+            status_of(&sup, id) == AgentStatus::NeedsAuth
+        })
+        .await;
+        assert_eq!(runs(&dir), 1);
+
+        // The operator authenticates and starts it again.
+        sup.start(id).await.unwrap();
+        until(
+            "the second start to actually spawn a child, not silently do nothing",
+            || runs(&dir) == 2,
+        )
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that exits with nothing to say has not failed — a clean stop
+    /// looks exactly like this, and reporting it as `error` would light up the
+    /// board every time an agent shut down normally.
+    #[tokio::test]
+    async fn a_silent_exit_is_stopped_not_error() {
+        let (sup, id, dir) = shim_supervisor("silent", "#!/bin/sh\nexit 0\n");
+        sup.start(id).await.unwrap();
+        until("the agent to settle as stopped", || {
+            status_of(&sup, id) == AgentStatus::Stopped
+        })
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §3c#13: a message must never start a process, and concurrent starts
+    /// must collapse into one child.
+    #[tokio::test]
+    async fn concurrent_starts_produce_exactly_one_child() {
+        let (sup, id, dir) = shim_supervisor(
+            "onlyone",
+            "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\nsleep 5\n",
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let s = sup.clone();
+            tasks.push(tokio::spawn(async move { s.start(id).await }));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        until("the one child to start", || runs(&dir) == 1).await;
+        // Give any wrongly-spawned sibling time to show up before concluding.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(runs(&dir), 1, "ten starts must share one process");
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// F008. A child prints whatever it likes on stdout, including a
     /// well-formed `result`. Only an event carrying the session id the
