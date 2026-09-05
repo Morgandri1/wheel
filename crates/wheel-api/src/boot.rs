@@ -39,6 +39,18 @@ pub fn build_orchestrator(cfg: &Config, http: reqwest::Client) -> Arc<dyn Orches
 pub fn http_client(cfg: &Config) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.proxy_timeout_secs))
+        // Never follow a redirect on the proxy path.
+        //
+        // This client speaks to the host, which speaks to tenant engines, from inside a private
+        // network that also holds Postgres. Following a 302 would let an upstream choose our next
+        // destination — `http://postgres.railway.internal:5432`, or the host's own control plane —
+        // with our credentials already attached. Relaying the response instead keeps the decision
+        // with the caller and off our socket.
+        //
+        // It is also what the web app needs: its CSP names exactly one API origin, so a redirect
+        // that reached the browser would be blocked and would surface as a silent timeout rather
+        // than a refusal.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building the http client")
 }
