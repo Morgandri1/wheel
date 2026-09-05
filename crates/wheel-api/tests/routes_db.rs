@@ -35,15 +35,17 @@ struct Seen {
 
 async fn mock_engine() -> (String, Seen) {
     let seen = Seen::default();
-    let app = Router::new().fallback(
-        |State(s): State<Seen>, req: Request<Body>| async move {
+    let app = Router::new()
+        .fallback(|State(s): State<Seen>, req: Request<Body>| async move {
             *s.path.lock().unwrap() = Some(req.uri().path().to_string());
             *s.headers.lock().unwrap() = Some(req.headers().clone());
-            let bytes = axum::body::to_bytes(req.into_body(), 1 << 24).await.unwrap();
+            let bytes = axum::body::to_bytes(req.into_body(), 1 << 24)
+                .await
+                .unwrap();
             *s.body.lock().unwrap() = Some(bytes.to_vec());
             axum::Json(json!({"nodes": []}))
-        },
-    ).with_state(seen.clone());
+        })
+        .with_state(seen.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -89,7 +91,12 @@ fn token(sub: &str) -> String {
     let now = chrono::Utc::now().timestamp();
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
-        &C { sub, iss: ISSUER, exp: now + 3600, nbf: now - 60 },
+        &C {
+            sub,
+            iss: ISSUER,
+            exp: now + 3600,
+            nbf: now - 60,
+        },
         &EncodingKey::from_secret(DEV_SECRET.as_bytes()),
     )
     .unwrap()
@@ -129,7 +136,9 @@ async fn app(engine: String) -> Option<Router> {
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24)
+        .await
+        .unwrap();
     (status, bytes.to_vec())
 }
 
@@ -155,7 +164,9 @@ async fn open_ingress(app: &Router, tok: &str, id: &str) {
         .uri(format!("/v1/projects/{id}"))
         .header("x-auth-token", tok)
         .header("content-type", "application/json")
-        .body(Body::from(json!({"capabilities": {"http": true}}).to_string()))
+        .body(Body::from(
+            json!({"capabilities": {"http": true}}).to_string(),
+        ))
         .unwrap();
     assert_eq!(send(app, req).await.0, StatusCode::OK);
 }
@@ -180,14 +191,28 @@ async fn proxy_strips_the_users_credentials_before_the_hop() {
     let (status, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::OK);
 
-    let h = seen.headers.lock().unwrap().clone().expect("engine saw no request");
-    assert!(h.get("x-auth-token").is_none(), "the session JWT reached the engine");
-    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let h = seen
+        .headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("engine saw no request");
+    assert!(
+        h.get("x-auth-token").is_none(),
+        "the session JWT reached the engine"
+    );
+    let auth = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     assert!(
         !auth.contains(USER_JWT_MARKER),
         "the caller's own Authorization header was relayed downstream"
     );
-    assert_eq!(h.get("x-custom").and_then(|v| v.to_str().ok()), Some("kept"));
+    assert_eq!(
+        h.get("x-custom").and_then(|v| v.to_str().ok()),
+        Some("kept")
+    );
 }
 
 #[tokio::test]
@@ -311,7 +336,10 @@ async fn ingress_cannot_forge_the_wheel_header_namespace() {
         Some("1"),
         "our own marker should be the one that arrives"
     );
-    assert!(h.get("x-wheel-anything").is_none(), "a forged x-wheel-* header survived");
+    assert!(
+        h.get("x-wheel-anything").is_none(),
+        "a forged x-wheel-* header survived"
+    );
 }
 
 #[tokio::test]
