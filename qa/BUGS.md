@@ -19,6 +19,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 011 | `ENG-one-process`, `ENG-park-resume`, `MSG-delivered-means-delivered` | **S1** | SDK | ~~closed~~ | After any failed start, every later start was a silent no-op — and a turn could be written to a dead child's stdin and marked delivered |
 | 012 | `make check` (`web:test`) | ~~S4~~ **S3** | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
 | 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
+| 014 | `API-lifecycle`, `API-project-crud` | S3 | API | **open** | `infra/docker-compose.yml` defaults `ENGINE_IMAGE` to `wheel-engine:stub`, an image nobody builds — every project start 500s on a checked-out stack |
 
 ---
 
@@ -540,3 +541,41 @@ the offending frame printed when log frames arrive and none carries a stream, an
 words that the suite is reading wrong rather than the engine broadcasting wrong. Third time
 this shape has nearly cost SDK an afternoon on my mistake; it is the one class of error where
 my tests are the least trustworthy part of the system.
+
+---
+
+## 014 — compose points at an image nobody builds · S3 · API
+
+`infra/docker-compose.yml:37` — `ENGINE_IMAGE: ${ENGINE_IMAGE:-wheel-engine:stub}`, under a
+comment reading "SDK's real engine owns the wheel-engine:dev tag. **Until their build lands**
+this stack runs...". The build landed. `wheel-engine:dev` and `:test` exist; `:stub` does not
+exist and no target produces it.
+
+**Repro:** bring up `infra/docker-compose.yml` with `ENGINE_IMAGE` unset, create a project,
+`POST /v1/projects/:id/start`.
+**Actual:** API 500 `internal`; host logs `Docker responded with status code 404: No such
+image: wheel-engine:stub`, then `504 {"last_error":"creating project container"}`. Local dev
+cannot start a project at all with the checked-in defaults.
+
+Worked around in `qa/integration/run.sh` (the suite pins `ENGINE_IMAGE=wheel-engine:test`
+rather than inheriting anyone's default), so this is not blocking the gate. The default is
+still wrong for anyone running compose by hand.
+
+**Same shape as 013.** Both are placeholders whose expiry condition is recorded only in a
+prose comment — "until their build lands", "flipped on then" — and prose does not expire.
+013's fix was to make the lint fail on a disabled job with no machine-readable reason and
+re-enabling event. This one wants the same discipline.
+
+---
+
+## The class these three share
+
+014 (`:stub`), 013 (`if: false`), and the `R.check(id, True)` in the vault suite are one
+failure wearing three coats: **a placeholder that reports success**. None of them fails.
+The image 404 surfaced as an API 500 that looked like an API bug; the disabled job rendered
+identically to a passing one; the unconditional check occupied a TESTPLAN ID so the criterion
+read as covered. In every case the honest signal — "this is not real yet" — was written down
+in a comment, where nothing enforces it.
+
+The rule I am applying from here: a placeholder must fail, or carry its expiry somewhere a
+program reads. A comment saying "until X lands" is a note to a person who will not be looking.
