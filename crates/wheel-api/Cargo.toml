@@ -30,9 +30,9 @@ http = "1"
 http-body-util = "0.1"
 bytes = "1"
 hex = "0.4"
+sha2 = "0.10"
 async-trait = "0.1"
 
 [dev-dependencies]
 rsa = { version = "0.9", features = ["pem"] }
-sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }

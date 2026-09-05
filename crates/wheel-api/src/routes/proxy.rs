@@ -78,6 +78,106 @@ fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
     upgrade_ok && connection_ok
 }
 
+/// `ANY /v1/projects/{id}/engine/v1/events` — the events WebSocket.
+///
+/// Registered ahead of the generic engine wildcard because it accepts a second, narrower form of
+/// authentication: a single-use ticket in the query string, for browsers that cannot set headers
+/// on a WebSocket handshake.
+///
+/// Header auth still works and is preferred for non-browser clients. The ticket path is strictly
+/// additional, and it is *not* a weaker door: a ticket can only be minted by an authenticated
+/// owner for one specific project, survives 30 seconds, and is consumed on first use.
+pub async fn engine_events(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+    req: Request,
+) -> ApiResult<Response> {
+    let (mut parts, body) = req.into_parts();
+    let raw_query = parts.uri.query().unwrap_or("").to_string();
+
+    match query_param(&raw_query, "ticket") {
+        Some(ticket) => {
+            // Redemption proves the caller owned this project when the ticket was minted, and
+            // binds it to this project id specifically.
+            crate::routes::ws_ticket::redeem(&state, &ticket, &id).await?;
+        }
+        None => {
+            // No ticket: fall back to the ordinary header-authenticated path, which also proves
+            // ownership. Either way we do not reach the engine without one of the two.
+            ProjectScope::from_request_parts(&mut parts, &state).await?;
+        }
+    }
+
+    let base = state.engine_base_url(&id);
+    // The ticket is deliberately dropped here rather than forwarded: it has already been consumed,
+    // and passing credentials further down the chain is how replay bugs start.
+    let forwarded = strip_query_param(&raw_query, "ticket");
+    let suffix = if forwarded.is_empty() {
+        String::new()
+    } else {
+        format!("?{forwarded}")
+    };
+    let upstream = format!("{base}/v1/events{suffix}");
+
+    let req = Request::from_parts(parts, body);
+    if is_websocket_upgrade(req.headers()) {
+        let (mut parts, _) = req.into_parts();
+        let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &state)
+            .await
+            .map_err(|_| ApiError::BadRequest("malformed websocket upgrade".into()))?;
+        bridge_websocket(state, upgrade, upstream).await
+    } else {
+        forward_http(state, req, upstream).await
+    }
+}
+
+/// Read one parameter out of a raw query string.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| urldecode(v))
+    })
+}
+
+/// Everything except the named parameter, re-joined.
+fn strip_query_param(query: &str, key: &str) -> String {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| pair.split_once('=').map(|(k, _)| k) != Some(key))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(b) => {
+                    out.push(b);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn forward_http(state: AppState, req: Request, upstream: String) -> ApiResult<Response> {
     let method = req.method().clone();
     let headers = hop::sanitize_for_upstream(req.headers(), &[]);
