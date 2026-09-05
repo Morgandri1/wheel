@@ -177,7 +177,11 @@ pub async fn log(
     // outcome: the operator sees a heading with nothing under it and concludes
     // the agent produced no output. A filter that silently does not filter is
     // worse than one that says no.
-    if let Some(stream) = q.stream.as_deref() {
+    // An empty value is treated as no filter, not as an unknown stream: a UI
+    // rendering `?stream=${selected}` sends exactly that for its "all" tab,
+    // and 400-ing the default view would be a rude way to say "no filter".
+    let stream = q.stream.filter(|s| !s.is_empty());
+    if let Some(stream) = stream.as_deref() {
         if serde_json::from_value::<wheel_core::LogStream>(serde_json::Value::String(
             stream.to_string(),
         ))
@@ -203,7 +207,7 @@ pub async fn log(
 
     let rows = stmt
         .query_map(
-            rusqlite::params![id.to_string(), since, q.stream, limit],
+            rusqlite::params![id.to_string(), since, stream, limit],
             |r| {
                 Ok(serde_json::json!({
                     "node_id": id,
