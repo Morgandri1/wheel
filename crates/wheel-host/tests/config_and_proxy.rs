@@ -277,3 +277,65 @@ async fn traversal_in_the_proxy_path_is_refused() {
         "a traversal attempt must never reach the engine"
     );
 }
+
+// ---------------------------------------------------------------- external sandbox
+
+/// The dev-only backend that points at an engine somebody else started.
+///
+/// It isolates nothing, which is why `Config` refuses it outside dev. What it must still get right
+/// is status: reporting `running` for an engine that is not there would make the API tell a user
+/// their project is up when it is not.
+mod external {
+    use super::*;
+    use wheel_host::sandbox::external::ExternalSandbox;
+
+    #[tokio::test]
+    async fn status_is_running_only_when_the_engine_answers_healthz() {
+        let healthy = Router::new().route(
+            "/healthz",
+            get(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, healthy).await.unwrap() });
+
+        let s = ExternalSandbox::new(format!("http://{addr}"));
+        assert_eq!(s.status(&Uuid::new_v4()).await.unwrap(), Status::Running);
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_is_not_there_reads_as_stopped() {
+        let s = ExternalSandbox::new("http://127.0.0.1:1".into());
+        assert_eq!(s.status(&Uuid::new_v4()).await.unwrap(), Status::Stopped);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_calls_are_no_ops_and_engine_base_is_the_configured_url() {
+        // Nothing here owns the engine's existence, so start/stop must succeed without pretending
+        // to have done anything.
+        let s = ExternalSandbox::new("http://127.0.0.1:7000/".into());
+        let id = Uuid::new_v4();
+        let secrets = Secrets {
+            engine_secret: "s".into(),
+            vault_key: "v".into(),
+        };
+        s.provision(&id, &secrets).await.unwrap();
+        s.start(&id, &secrets).await.unwrap();
+        s.restart(&id, &secrets).await.unwrap();
+        s.stop(&id).await.unwrap();
+        s.destroy(&id).await.unwrap();
+        // The trailing slash is trimmed so callers can join paths without doubling it.
+        assert_eq!(s.engine_base(&id), "http://127.0.0.1:7000");
+    }
+
+    #[test]
+    fn secrets_debug_is_redacted() {
+        let s = Secrets {
+            engine_secret: "super-secret-engine-value".into(),
+            vault_key: "super-secret-vault-value".into(),
+        };
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("super-secret-engine-value"));
+        assert!(!rendered.contains("super-secret-vault-value"));
+    }
+}
