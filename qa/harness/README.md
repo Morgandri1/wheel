@@ -82,6 +82,33 @@ One JSON object per line, flushed immediately. Exactly the real event sequence:
 
 **The `result` event is the turn-complete signal** the engine keys `idle` / ephemeral-context-clear off.
 
+### The envelope (SDK-confirmed, 2026-09-05)
+
+The engine writes **exactly one line** of compact JSON to stdin per turn, newline-terminated,
+always the content-block form:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<ENVELOPE>"}]}}
+```
+
+where `<ENVELOPE>` is the JSON-escaped string:
+
+```
+<AgentPrompt id="<message uuid>" from="<from name>" type="<from type>">
+<body>
+</AgentPrompt>
+```
+
+(literal newline after the open tag and before the close tag; `id` is the message uuid — the same
+id as the `messages` row and the `message` WS event). A literal `</AgentPrompt>` occurring inside
+`<body>` is escaped by the engine — see `MSG-envelope-escape` in the TESTPLAN, which is the case
+most likely to be got wrong, since it is the one an agent can trigger by simply *talking about*
+the envelope format.
+
+Spawn argv is likewise SDK-confirmed: `--print --input-format stream-json --output-format
+stream-json --verbose --append-system-prompt <composed> [--model M] [--mcp-config P]
+[--resume S] --permission-mode bypassPermissions`. The fake accepts all of it.
+
 ### The echo property (this is what makes injection testable)
 
 Default reply text is:
@@ -91,10 +118,9 @@ Default reply text is:
 ```
 
 So when QA asserts that ctx injection worked, we assert the agent's *log line* contains the ctx
-markdown — proving the text really reached the child's prompt. Same for the
-`[wheel] message from <from_name> (<from_type>):` framing from §3 of the architecture doc.
-If the engine mangles, drops, double-encodes or reorders anything on the way to stdin, the test
-fails and points straight at the bug.
+markdown — proving the text really reached the child's prompt. Same for the `<AgentPrompt …>`
+envelope above. If the engine mangles, drops, double-encodes or reorders anything on the way to
+stdin, the test fails and points straight at the bug.
 
 ## 5. Test-side steering — `<<FAKE:...>>` directives
 
