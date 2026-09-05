@@ -105,8 +105,14 @@ async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
     // sat broken while `cargo test` stayed green.
     let url = match std::env::var("TEST_DATABASE_URL") {
         Ok(u) => u,
-        Err(_) if std::env::var("CI").is_ok() => {
-            panic!("TEST_DATABASE_URL must be set in CI: these tests cover the tenancy boundary")
+        // Gated on the database being promised, not on being in CI. Keying this off `CI` asserted
+        // that every CI job has Postgres, which was not true and turned main red — the check has to
+        // depend on the thing it actually needs.
+        Err(_) if std::env::var("WHEEL_CI_HAS_DB").as_deref() == Ok("1") => {
+            panic!(
+                "WHEEL_CI_HAS_DB=1 but TEST_DATABASE_URL is unset: these tests are the only \
+                 end-to-end cover for the ownership boundary and must not skip here"
+            )
         }
         Err(_) => {
             eprintln!("skipping {}: TEST_DATABASE_URL not set", module_path!());

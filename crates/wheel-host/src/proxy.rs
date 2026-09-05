@@ -57,11 +57,19 @@ pub async fn ingress(
 
 async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Response {
     if suffix.split('/').any(|seg| seg == "..") {
-        return err(StatusCode::BAD_REQUEST, "bad_request", "Path traversal is not permitted.");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Path traversal is not permitted.",
+        );
     }
 
     let Ok(Some(rec)) = state.store.get(&id).await else {
-        return err(StatusCode::NOT_FOUND, "not_found", "The requested resource does not exist.");
+        return err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "The requested resource does not exist.",
+        );
     };
 
     let base = state.sandbox.engine_base(&id);
@@ -98,7 +106,13 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
 
     let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return err(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", "Request body exceeds the maximum allowed size."),
+        Err(_) => {
+            return err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "Request body exceeds the maximum allowed size.",
+            )
+        }
     };
 
     let resp = match state
@@ -113,7 +127,11 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(project = %id, error = ?e, "engine proxy failed");
-            return err(StatusCode::BAD_GATEWAY, "engine_unreachable", "The project engine is not reachable.");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine is not reachable.",
+            );
         }
     };
 
@@ -137,7 +155,13 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
     }
     builder
         .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "An unexpected error occurred."))
+        .unwrap_or_else(|_| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "An unexpected error occurred.",
+            )
+        })
 }
 
 fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
@@ -208,7 +232,11 @@ async fn bridge_ws(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::warn!(error = ?e, "engine websocket connect failed");
-            return err(StatusCode::BAD_GATEWAY, "engine_unreachable", "The project engine websocket is not reachable.");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine websocket is not reachable.",
+            );
         }
         Err(_elapsed) => {
             // An engine that accepts the socket and then stalls must not pin this task.

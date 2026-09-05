@@ -126,6 +126,49 @@ def body_of(env):
     return env[nl + 1:end] if nl >= 0 and end > nl else ""
 
 
+def escape_envelope_body(body):
+    """Independent implementation of the engine's envelope escaping (§3c#5).
+
+    Deliberately reimplemented from the CONTRACT rather than imported from wheel-core:
+    a test that calls the same function it is testing proves only that the function is
+    self-consistent. This one is derived from the rule — backslash-escape the `<` of any
+    `<AgentPrompt` or `</AgentPrompt`, case-insensitively — so if the engine's escaping
+    misses a variant, the two disagree and the test fails.
+
+    Both tags matter, for different attacks: a forged CLOSING tag ends the envelope early
+    so following text reads as engine-authored framing; a forged OPENING tag begins what
+    looks like a new, authentic message with attribution the attacker chose.
+    """
+    tag = "agentprompt"
+    out = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i] == "<":
+            name_at = i + 2 if body[i + 1:i + 2] == "/" else i + 1
+            if body[name_at:name_at + len(tag)].lower() == tag:
+                out.append("<\\")      # escape the '<' only; the rest is ordinary text
+                i += 1
+                continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def ok(status):
+    """Any 2xx is success.
+
+    The engine answers a send with 202 Accepted, which is the correct status for work it
+    has enqueued rather than completed — and more honest than 200. QA asserting on an
+    exact status rather than the class was a bug in the test, and an expensive one: it
+    made the send look failed, and the three S1 assertions that follow a successful send
+    (MSG-envelope-escape, MSG-envelope-forge, MSG-byte-exact) were gated behind it and
+    silently never ran. A test that skips the important assertion when an unimportant one
+    fails is worse than a test that fails.
+    """
+    return 200 <= status < 300
+
+
 def make_board(pid, token):
     """agent + ctx wired ctx->agent(send); returns (agent_id, ctx_id)."""
     st, ctx, _ = engine("POST", pid, "/v1/nodes", token, {
@@ -137,7 +180,7 @@ def make_board(pid, token):
         "position": {"x": 200, "y": 0},
         "config": {"harness": "claude", "system_prompt": "SYS-CANARY-7b3d",
                    "run_on_startup": False, "ephemeral_context": False}})
-    if st not in (200, 201) or st2 not in (200, 201):
+    if not ok(st) or not ok(st2):
         return None, None
     engine("POST", pid, "/v1/wires", token,
            {"from": ctx["id"], "to": agent["id"], "type": "send"})
@@ -158,7 +201,7 @@ def main():
         api_healthy()
         owner = mint(unique_sub("msgpath"))
         st, proj, _ = call("POST", "/v1/projects", owner, {"name": "qa-msgpath"})
-        if not R.check("MSG-setup/project", st in (200, 201), "-> %s %r" % (st, proj)):
+        if not R.check("MSG-setup/project", ok(st), "-> %s %r" % (st, proj)):
             return R.report("engine-messages")
         pid = proj["id"]
         call("POST", "/v1/projects/%s/start" % pid, owner)
@@ -193,18 +236,38 @@ def main():
         wait_for(lambda: engine("GET", pid, "/v1/agents/%s/log" % agent_id, owner)[1],
                  timeout=60, what="agent log")
 
+        # The composed preamble is written to a file and passed by PATH (argv is
+        # world-readable across uids and the preamble contains injected ctx). Read that
+        # file: it is what the child was actually handed, rather than what the engine
+        # reported handing it. Falls back to the log so the assertion still has a source
+        # if the layout changes.
         st, log, _ = engine("GET", pid, "/v1/agents/%s/log" % agent_id, owner)
         blob = json.dumps(log)
-        R.check("INJ-on-start", "CTX-CANARY-4f2a" in blob,
-                "ctx markdown absent from the composed prompt the child received")
-        R.check("INJ-system-prompt", "SYS-CANARY-7b3d" in blob,
-                "agent system_prompt absent from the composed prompt")
+        prompt_file = subprocess.run(
+            ["docker", "exec", container_for(pid), "sh", "-c",
+             "cat /data/run/*/prompt.txt 2>/dev/null || true"],
+            capture_output=True, text=True).stdout
+        evidence = prompt_file if prompt_file.strip() else blob
+        source = "prompt file" if prompt_file.strip() else "agent log"
+
+        R.check("INJ-on-start", "CTX-CANARY-4f2a" in evidence,
+                "ctx markdown absent from the composed prompt the child received "
+                "(checked the %s; ctx->agent send wire exists)" % source)
+        R.check("INJ-system-prompt", "SYS-CANARY-7b3d" in evidence,
+                "agent system_prompt absent from the composed prompt (checked the %s)" % source)
+        if prompt_file.strip():
+            # Ordering is a contract term (§3: system_prompt first, then ctx by node name),
+            # and only checkable when both are present.
+            si, ci = evidence.find("SYS-CANARY-7b3d"), evidence.find("CTX-CANARY-4f2a")
+            if si >= 0 and ci >= 0:
+                R.check("INJ-order", si < ci,
+                        "ctx injection precedes the agent's own system_prompt")
 
         # ---------------------------------------------------------------- envelope
         st, receipt, _ = engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner,
                                 {"body": "hello wheel"})
         R.check("MSG-send-receipt",
-                st in (200, 201) and all(k in (receipt or {}) for k in ("id", "sha256", "bytes")),
+                ok(st) and all(k in (receipt or {}) for k in ("id", "sha256", "bytes")),
                 "send -> %s %r" % (st, receipt))
 
         def delivered():
@@ -231,9 +294,9 @@ def main():
                 hostile = f.read().decode("utf-8", errors="surrogateescape")
             st, r2, _ = engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner,
                                {"body": hostile})
-            R.check("MSG-limit-body-accepted", st in (200, 201, 413),
+            R.check("MSG-limit-body-accepted", ok(st) or st == 413,
                     "200 KiB hostile body -> %s" % st)
-            if st in (200, 201):
+            if ok(st):
                 wait_for(lambda: any((r2 or {}).get("id", "?") in envelope_text(e)
                                      for e in read_transcript(pid)),
                          timeout=90, what="hostile body delivered")
@@ -248,38 +311,115 @@ def main():
                 R.check("MSG-envelope-forge",
                         'from="user"' in env2 and 'from="PM"' not in env2.split("\n", 1)[0],
                         "forged attribution survived into the envelope header")
-                R.check("MSG-byte-exact", body_of(env2) == hostile,
-                        "body not byte-identical: %d vs %d bytes"
-                        % (len(body_of(env2).encode("utf-8", "surrogateescape")),
-                           len(hostile.encode("utf-8", "surrogateescape"))))
+                # §3c#3 says the recipient transcript is byte-identical; §3/A5 says the
+                # engine escapes literal envelope tags. Both cannot hold on the wire, and
+                # the escaping is the security-critical half — so what must be exact is
+                # the ESCAPED form, and recovery of the original is via `wheel inbox <id>`
+                # (§3c#2), asserted separately once the CLI lands. Raised with PM.
+                delivered = body_of(env2)
+                expected = escape_envelope_body(hostile)
+                R.check("MSG-escape-exact", delivered == expected,
+                        "delivered body != independently-computed escaping "
+                        "(%d vs %d bytes)" % (len(delivered), len(expected)))
+
+                # The security property: no unescaped envelope tag survives into the body.
+                low = delivered.lower()
+                leaked = sum(low.count(t) for t in ("<agentprompt", "</agentprompt"))
+                R.check("MSG-escape-complete", leaked == 0,
+                        "%d unescaped envelope tag(s) reached the child — a body can "
+                        "close the envelope and forge attribution" % leaked)
+
+                R.skip("MSG-byte-exact",
+                       "end-to-end recovery is via `wheel inbox <id>`; CLI + /v1/cli not "
+                       "in main yet. On-the-wire exactness is MSG-escape-exact.")
         else:
             R.skip("MSG-byte-exact", "envelope-integrity.bin missing")
 
-        # ---------------------------------------------------------------- one process
-        for i in range(10):
-            engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner, {"body": "burst-%d" % i})
-        time.sleep(5)
-        p = subprocess.run(["docker", "exec", container_for(pid), "sh", "-c",
-                            "ps -eo args | grep -c '[c]laude' || true"], capture_output=True, text=True)
-        n = (p.stdout or "0").strip()
-        R.check("ENG-one-process", n in ("0", "1"),
-                "10 rapid messages produced %s harness processes (want exactly one, or zero "
-                "if parked)" % n)
+        # ------------------------------------------------- §3c #13: one process per agent
+        # YOKE's defect: each delivered message launched another `claude --continue`, so N
+        # quick messages meant N processes of one agent editing one worktree at once. The
+        # sends must therefore actually be concurrent — a sequential loop would pass even
+        # against an engine that spawns per message, because each spawn would finish first.
+        import threading
+        burst_errors = []
+
+        def fire(i):
+            try:
+                engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner,
+                       {"body": "burst-%d" % i})
+            except Exception as exc:                      # noqa: BLE001 - reported, not raised
+                burst_errors.append("%d: %r" % (i, exc))
+
+        threads = [threading.Thread(target=fire, args=(i,)) for i in range(10)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        span_ms = (time.time() - t0) * 1000
+        R.check("ENG-one-process/burst-sent", not burst_errors,
+                "sends failed: %s" % "; ".join(burst_errors[:3]))
+        if span_ms > 100:
+            print("  note  burst took %.0fms (>100ms); still a valid concurrency test, but "
+                  "the engine had more slack than §3c#13 describes" % span_ms)
+
+        # Poll rather than sleep: a fixed sleep either flakes under load or wastes time.
+        def process_count():
+            q = subprocess.run(["docker", "exec", container_for(pid), "sh", "-c",
+                                "ps -eo args | grep -c '[c]laude' || true"],
+                               capture_output=True, text=True)
+            return (q.stdout or "0").strip()
+
+        worst = "0"
+        for _ in range(20):
+            n = process_count()
+            if n.isdigit() and int(n) > int(worst):
+                worst = n
+            if n.isdigit() and int(n) > 1:
+                break
+            time.sleep(0.5)
+        R.check("ENG-one-process", worst.isdigit() and int(worst) <= 1,
+                "%s concurrent harness processes for one agent (want at most one; §3c#13). "
+                "N messages must never mean N processes." % worst)
 
         def all_delivered():
             t = json.dumps([envelope_text(e) for e in read_transcript(pid)])
             return all(("burst-%d" % i) in t for i in range(10))
         try:
             wait_for(all_delivered, timeout=120, what="all 10 burst messages delivered")
-            R.check("MSG-queue-drain-order", True)
+            R.check("ENG-one-process/ten-turns", True)
         except AssertionError as e:
-            R.check("MSG-queue-drain-order", False, str(e)[:160])
+            R.check("ENG-one-process/ten-turns", False,
+                    "not all 10 messages reached stdin: %s" % str(e)[:140])
+
+        # Every burst message must appear exactly once. A message delivered twice is as
+        # broken as one dropped, and a redelivery loop is how a poison message burns a
+        # budget silently.
+        texts = [envelope_text(e) for e in read_transcript(pid)]
+        dupes = [i for i in range(10)
+                 if sum(1 for t in texts if ("burst-%d" % i) in t) > 1]
+        R.check("MSG-exactly-once", not dupes,
+                "burst messages delivered more than once: %s" % dupes)
+
+        # Strictly serial: one whole JSON line per turn, never interleaved bytes.
+        R.check("MSG-single-writer/burst",
+                all("__unparseable__" not in e for e in read_transcript(pid)),
+                "stdin contains a partial or interleaved write after a 10-message burst")
+
+        # ---------------------------------------------------------------- priority lane
+        # Every /v1/agents/:id/send is from=user, so the user-vs-agent lane cannot be
+        # exercised until agent->agent sends exist (the `wheel` CLI / /v1/cli, not landed).
+        # Deferring is honest; asserting user-beats-user would prove nothing.
+        R.skip("MSG-priority-user",
+               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
+        R.skip("MSG-priority-order",
+               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
 
         # ---------------------------------------------------------------- queue while stopped
         engine("POST", pid, "/v1/agents/%s/stop" % agent_id, owner)
         st, r3, _ = engine("POST", pid, "/v1/agents/%s/send" % agent_id, owner,
                            {"body": "queued-while-stopped"})
-        R.check("MSG-queue-stopped/accepted", st in (200, 201), "send to stopped agent -> %s" % st)
+        R.check("MSG-queue-stopped/accepted", ok(st), "send to stopped agent -> %s" % st)
         R.check("MSG-queue-stopped/state", (r3 or {}).get("state") == "queued",
                 "state is %r, want queued" % (r3 or {}).get("state"))
         engine("POST", pid, "/v1/agents/%s/start" % agent_id, owner)
@@ -295,7 +435,7 @@ def main():
         st, vault, _ = engine("POST", pid, "/v1/nodes", owner, {
             "name": "secrets", "type": "vault", "position": {"x": 0, "y": 200},
             "config": {"keys": ["API_KEY"]}})
-        if st in (200, 201):
+        if ok(st):
             engine("PUT", pid, "/v1/vault/%s/API_KEY" % vault["id"], owner,
                    {"value": "VAULT-CANARY-91ab"})
             st, board, _ = engine("GET", pid, "/v1/board", owner)
