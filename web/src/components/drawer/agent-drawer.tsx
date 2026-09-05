@@ -10,7 +10,7 @@ import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
 import { displayState, senderKind, senderLabel } from "@/lib/message-state";
 import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
 import type { EngineApi } from "@/lib/api";
-import type { LogLine, LogStreamName, Message, WheelNode } from "@/lib/schema";
+import type { Message, WheelNode } from "@/lib/schema";
 
 export function AgentDrawer({
   nodes,
@@ -64,7 +64,7 @@ export function AgentDrawer({
    * the operator's question is "what did the agent actually receive?", and the answer is drowned
    * in stdout when the two are interleaved.
    */
-  const lines = view === "transcript" ? all.filter(isTranscript) : all;
+  const lines = view === "transcript" ? all.filter((l) => l.stream === "transcript") : all;
   const thread = activeTab
     ? messages.filter((m) => m.to === activeTab || (m.from.kind === "node" && m.from.id === activeTab))
     : [];
@@ -291,16 +291,6 @@ function MessageStatePill({
       {d.label}
     </span>
   );
-}
-
-/**
- * docs/schema still types LogStream as stdout|stderr|engine, but the engine emits `transcript`
- * on that field today (SDK confirmed, verified live). Widening here rather than editing the
- * generated file keeps the drift visible and in one place — when the export catches up, this
- * collapses to a plain comparison and the cast is what the compiler will flag.
- */
-function isTranscript(line: LogLine): boolean {
-  return (line.stream as LogStreamName) === "transcript";
 }
 
 const TRANSCRIPT_EMPTY =

@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { AUTH_MODE } from "@/lib/auth";
-import { ClerkTokenBridge } from "@/components/clerk-bridge";
+import { ClerkGate } from "@/components/clerk-bridge";
 import { ToastHost } from "@/components/ui/toast";
 
 export function Providers({ children }: { children: React.ReactNode }) {
@@ -24,11 +24,16 @@ export function Providers({ children }: { children: React.ReactNode }) {
       }),
   );
 
-  return (
-    <QueryClientProvider client={client}>
-      {AUTH_MODE === "clerk" ? <ClerkTokenBridge /> : null}
+  const tree = (
+    <>
       {children}
       <ToastHost />
+    </>
+  );
+
+  return (
+    <QueryClientProvider client={client}>
+      {AUTH_MODE === "clerk" ? <ClerkGate>{tree}</ClerkGate> : tree}
     </QueryClientProvider>
   );
 }

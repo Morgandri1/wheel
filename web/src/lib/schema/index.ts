@@ -142,21 +142,11 @@ export interface Board {
 }
 
 /**
- * Two things the engine does that docs/schema does not yet describe. Raised with SDK; when the
- * export catches up these aliases collapse to re-exports and the conformance test will say so.
- *
- * 1. `transcript` is a LogStream value — the exact bytes written to the child's stdin, carried
- *    on the same log stream so no second subscription is needed (§3c #10).
- * 2. `lagged` is an event frame. It means the socket dropped frames to avoid stalling the
- *    engine's delivery loop, and the connection CONTINUES — it is a resync instruction, not an
- *    error. Treating it as a failure would be the worst possible reading: you would tear down a
- *    healthy socket at the exact moment you were behind.
+ * The engine's own event union. `lagged` means the socket dropped frames rather than let a slow
+ * reader stall the delivery loop: the connection is healthy and what you hold is stale, so it is
+ * a resync instruction, not an error.
  */
-export type LogStreamName = LogStream | "transcript";
+export type EngineFrame = EngineEvent;
 
-export interface LaggedEvent {
-  type: "lagged";
-  hint?: string;
-}
-
-export type EngineFrame = EngineEvent | LaggedEvent;
+/** Log streams, including `transcript` — the exact bytes written to a child's stdin (§3c #10). */
+export type LogStreamName = LogStream;
