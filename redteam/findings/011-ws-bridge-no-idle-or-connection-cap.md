@@ -35,3 +35,11 @@ not a security requirement.
 When the cap + keepalive land: open cap+1 bridges from one project (expect the last refused), and hold
 an established bridge silent past the pong deadline (expect close). PoC will live in
 `redteam/pocs/proxy-ingress/` once the events WS is reachable (real engine or a WS-capable stub).
+
+## Extension (live, 2026-09-05): the authenticated HTTP proxy has NO rate limit either
+Second-pass probe (`redteam/pocs/api-tenancy/t_lifecycle_toctou.py`, check 5): a 60-request burst on
+`GET /v1/projects/:id/engine/v1/board` returned **0 × 429** — only PUBLIC ingress is rate-limited
+(Postgres fixed-window, per API plan), NOT the authenticated proxy. So one authenticated tenant can
+flood the proxy → host → engine unbounded, saturating the shared host — the same shared-host-DoS theme
+as the WS bridge above, over plain HTTP. Recommend a per-project concurrency + rate cap on the authed
+proxy path, not just ingress. Owner: API.
