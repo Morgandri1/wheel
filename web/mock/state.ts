@@ -4,7 +4,7 @@
  * engine — when PROTOCOL.md disagrees, this changes, not the contract.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { isWireAllowed } from "@/lib/wire-matrix";
+import { engineAllowsWire } from "./engine-matrix";
 import { deliveryOrder, senderKind } from "@/lib/message-state";
 import type {
   AgentNode,
@@ -87,10 +87,10 @@ export class EngineRefusal extends Error {
   }
 }
 
-/** §3, enforced server-side too, so the UI's copy of the matrix is never load-bearing. */
+/** §3, enforced from the engine's export — the UI's copy is never load-bearing here. */
 export function assertWireLegal(from: WheelNode, to: WheelNode, type: WireType) {
   if (from.id === to.id) throw new EngineRefusal(400, "a node cannot wire to itself");
-  if (!isWireAllowed(from.type, to.type, type)) {
+  if (!engineAllowsWire(from.type, to.type, type)) {
     throw new EngineRefusal(
       400,
       `no wire allowed from ${from.type} to ${to.type} (type: ${type}) — see the wire matrix`,

@@ -1,11 +1,10 @@
 /**
  * The mock refuses to start if its wire matrix has drifted from the engine's export.
  *
- * QA's point: a mock that enforces a *copy* of the rules can quietly disagree with the engine
- * the moment SDK regenerates, and then everything developed against it is developed against a
- * fiction. The UI's matrix is already pinned to docs/schema/wire-matrix.json by
- * src/lib/wire-matrix.conformance.test.ts; this makes the same guarantee hold at runtime, so
- * you cannot boot a mock that would allow a wire the engine denies, or deny one it allows.
+ * The mock itself enforces straight from the export (see ./engine-matrix), so it cannot disagree
+ * with the engine by construction. This is the belt to that braces: it checks that the UI's copy
+ * in src/lib/wire-matrix.ts also still agrees, and refuses to boot if not — so a developer cannot
+ * spend an afternoon against a board whose popover offers wires the engine would refuse.
  */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
