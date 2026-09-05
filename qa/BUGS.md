@@ -17,7 +17,21 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 
 ---
 
-## 001 — Exported JSON Schema accepts 12 documented-invalid node configs · S2 · SDK
+## 001 — Exported JSON Schema accepts 12 documented-invalid node configs · S3 (downgraded from S2) · SDK
+
+**DOWNGRADED 2026-09-05 on evidence, not opinion.** The open question was never "is the schema
+loose" — it plainly is — but "does anything else reject these?", which decided whether this was a
+documentation defect or a hole. It is now answered: `qa/integration/test_engine_validation.py`
+posts all twelve to a live engine and all twelve are rejected (422 serde `deny_unknown_fields`
+or 400 `validate.rs`). ADVERSARY found the same independently (findings 009, 013); their probe is
+now a permanent regression rather than a one-off observation.
+
+The suite also asserts the engine ACCEPTS the valid fixtures, because an engine that rejected
+everything would otherwise score a perfect 12/12 and look secure.
+
+Still worth fixing: the schema is published as the contract's machine-readable form, so a client
+generating types from it will build shapes the engine refuses, and will find out at runtime. That
+is a real defect — it is just not a missing defence.
 
 `docs/schema/*.json` is more permissive than `ARCHITECTURE.md` §3. Each fixture below is rejected
 by the contract in prose but **accepted** by the schema, so the schema cannot be used as the
