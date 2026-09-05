@@ -64,16 +64,26 @@ pub struct Supervisor {
     db: Arc<Mutex<rusqlite::Connection>>,
     agents: AgentSlots,
     harness: Arc<dyn Harness>,
+    events: Arc<crate::events::Bus>,
 }
 
 impl Supervisor {
-    pub fn new(cfg: Arc<Config>, db: Arc<Mutex<rusqlite::Connection>>) -> Self {
+    pub fn new(
+        cfg: Arc<Config>,
+        db: Arc<Mutex<rusqlite::Connection>>,
+        events: Arc<crate::events::Bus>,
+    ) -> Self {
         Self {
             cfg,
             db,
             agents: Arc::new(AsyncMutex::new(HashMap::new())),
             harness: Arc::new(ClaudeDriver),
+            events,
         }
+    }
+
+    pub fn events(&self) -> &Arc<crate::events::Bus> {
+        &self.events
     }
 
     async fn slot(&self, agent: Uuid) -> Arc<AsyncMutex<Option<Running>>> {
@@ -221,10 +231,12 @@ impl Supervisor {
         running.in_flight = Some(msg.id);
 
         {
+            let bus = &self.events;
             let conn = self.db.lock().unwrap();
             messages::advance(&conn, msg.id, MessageState::Delivered).ok();
+            publish_message(bus, &conn, msg.id);
             // The exact bytes written, for the transcript log stream.
-            log_line(&conn, agent, "transcript", line.trim_end());
+            log_line_bus(bus, &conn, agent, "transcript", line.trim_end());
         }
         self.set_status(agent, AgentStatus::Running, None);
         Ok(())
@@ -238,6 +250,7 @@ impl Supervisor {
     ) {
         let db = self.db.clone();
         let harness = self.harness.clone();
+        let bus = self.events.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -260,7 +273,7 @@ impl Supervisor {
                             continue;
                         }
                         let conn = db.lock().unwrap();
-                        log_line(&conn, agent, "stdout", &text);
+                        log_line_bus(&bus, &conn, agent, "stdout", &text);
                     }
                     HarnessEvent::Result {
                         session_id,
@@ -303,6 +316,7 @@ impl Supervisor {
                                     .ok();
                                 } else {
                                     messages::advance(&conn, mid, MessageState::Consumed).ok();
+                                    publish_message(&bus, &conn, mid);
                                 }
                             }
                             set_status_db(
@@ -327,7 +341,7 @@ impl Supervisor {
                             continue;
                         }
                         let conn = db.lock().unwrap();
-                        log_line(&conn, agent, "stdout", &raw);
+                        log_line_bus(&bus, &conn, agent, "stdout", &raw);
                     }
                 }
             }
@@ -337,6 +351,7 @@ impl Supervisor {
     fn pump_stderr(&self, agent: Uuid, stderr: tokio::process::ChildStderr) {
         let db = self.db.clone();
         let harness = self.harness.clone();
+        let bus = self.events.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             let mut captured = String::new();
@@ -345,7 +360,7 @@ impl Supervisor {
                 captured.push('\n');
                 let conn = db.lock().unwrap();
                 // stderr is log material, never parsed as JSON.
-                log_line(&conn, agent, "stderr", &line);
+                log_line_bus(&bus, &conn, agent, "stderr", &line);
             }
             // The child's stderr closed: classify why it went away. needs_auth
             // is never inferred from an exit code alone.
@@ -363,6 +378,7 @@ impl Supervisor {
     fn set_status(&self, agent: Uuid, status: AgentStatus, err: Option<String>) {
         let conn = self.db.lock().unwrap();
         set_status_db(&conn, agent, status, err);
+        publish_state(&self.events, &conn, agent);
     }
 }
 
@@ -379,6 +395,17 @@ fn session_matches(known: Option<&str>, event: Option<&str>) -> bool {
     match known {
         None => true,
         Some(known) => event == Some(known),
+    }
+}
+
+/// Read the agent's state back out and broadcast it, so subscribers always see
+/// what the database says rather than what the caller intended to write.
+fn publish_state(bus: &crate::events::Bus, conn: &rusqlite::Connection, agent: Uuid) {
+    if let Ok(state) = crate::db::board::agent_state(conn, agent) {
+        bus.publish(wheel_core::Event::NodeState {
+            node_id: agent,
+            state: wheel_core::NodeState::Agent(state),
+        });
     }
 }
 
@@ -408,7 +435,33 @@ fn set_session(conn: &rusqlite::Connection, agent: Uuid, session: &str) {
     );
 }
 
-fn log_line(conn: &rusqlite::Connection, agent: Uuid, stream: &str, text: &str) {
+/// Append a log line and broadcast it. Returns nothing: the broadcast is part
+/// of writing a line, so no call site can persist one and forget to publish it.
+fn log_line_bus(
+    bus: &crate::events::Bus,
+    conn: &rusqlite::Connection,
+    agent: Uuid,
+    stream: &str,
+    text: &str,
+) {
+    let seq = log_line(conn, agent, stream, text);
+    let Ok(stream_parsed) = serde_json::from_value(serde_json::Value::String(stream.to_string()))
+    else {
+        return;
+    };
+    bus.publish(wheel_core::Event::Log {
+        line: wheel_core::LogLine {
+            node_id: agent,
+            seq,
+            stream: stream_parsed,
+            at: wheel_core::Timestamp::now(),
+            text: text.to_string(),
+        },
+    });
+}
+
+/// Persist one log line, returning its per-agent sequence number.
+fn log_line(conn: &rusqlite::Connection, agent: Uuid, stream: &str, text: &str) -> u64 {
     let seq: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM logs WHERE node_id = ?1",
@@ -426,6 +479,15 @@ fn log_line(conn: &rusqlite::Connection, agent: Uuid, stream: &str, text: &str) 
             text
         ],
     );
+    seq as u64
+}
+
+/// Broadcast a message row after a state transition, so the UI can show
+/// queued -> delivered -> consumed as it happens (§3c#4).
+fn publish_message(bus: &crate::events::Bus, conn: &rusqlite::Connection, id: Uuid) {
+    if let Ok(Some(m)) = messages::get(conn, id) {
+        bus.publish(wheel_core::Event::Message { message: m });
+    }
 }
 
 #[cfg(test)]

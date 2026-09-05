@@ -13,6 +13,7 @@ use std::{
 mod api;
 mod config;
 mod db;
+mod events;
 mod harness;
 mod supervisor;
 
@@ -58,10 +59,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let listen = cfg.listen.clone();
     let cfg = Arc::new(cfg);
     let db = Arc::new(Mutex::new(conn));
+    let events = Arc::new(events::Bus::new());
     let state = api::AppState {
-        supervisor: Arc::new(supervisor::Supervisor::new(cfg.clone(), db.clone())),
+        supervisor: Arc::new(supervisor::Supervisor::new(
+            cfg.clone(),
+            db.clone(),
+            events.clone(),
+        )),
         cfg,
         db,
+        events,
     };
     let app = api::router(state);
 

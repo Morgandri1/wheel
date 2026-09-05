@@ -2,7 +2,7 @@
 
 use axum::{extract::State, http::StatusCode, Json};
 use uuid::Uuid;
-use wheel_core::{Node, NodeState, NodeType, NodeWithState, WireSpec};
+use wheel_core::{Event, Node, NodeState, NodeType, NodeWithState, Timestamp, WireSpec};
 
 use axum::extract::Path;
 
@@ -52,6 +52,9 @@ pub async fn create_node(
     };
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     board::create(&conn, &node)?;
+    s.events.publish(Event::BoardChanged {
+        at: Timestamp::now(),
+    });
     Ok((StatusCode::CREATED, Json(node)))
 }
 
@@ -82,6 +85,9 @@ pub async fn patch_node(
     }
 
     board::update(&conn, &node)?;
+    s.events.publish(Event::BoardChanged {
+        at: Timestamp::now(),
+    });
     Ok(Json(node))
 }
 
@@ -91,6 +97,9 @@ pub async fn delete_node(State(s): State<AppState>, Path(id): Path<Uuid>) -> Api
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let existed = board::delete(&conn, id).map_err(|e| ApiError::internal(e.to_string()))?;
     if existed {
+        s.events.publish(Event::BoardChanged {
+            at: Timestamp::now(),
+        });
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(id.to_string()))
@@ -101,6 +110,9 @@ pub async fn delete_node(State(s): State<AppState>, Path(id): Path<Uuid>) -> Api
 pub async fn add_wire(State(s): State<AppState>, Json(w): Json<WireSpec>) -> ApiResult<StatusCode> {
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     board::add_wire(&conn, w.from, w.to, w.wire_type, None)?;
+    s.events.publish(Event::BoardChanged {
+        at: Timestamp::now(),
+    });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -113,6 +125,9 @@ pub async fn remove_wire(
     let existed = board::remove_wire(&conn, w.from, w.to, w.wire_type)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if existed {
+        s.events.publish(Event::BoardChanged {
+            at: Timestamp::now(),
+        });
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("no such wire"))

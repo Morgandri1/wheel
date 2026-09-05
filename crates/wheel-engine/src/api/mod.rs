@@ -26,6 +26,7 @@ use crate::{config::Config, db};
 
 pub mod agent_routes;
 pub mod board_routes;
+pub mod events_route;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,6 +37,9 @@ pub struct AppState {
     /// One writer connection: sqlite serialises writes anyway, and a single
     /// writer keeps the delivery loop's state transitions trivially correct.
     pub db: Arc<Mutex<Connection>>,
+    /// Fan-out for `/v1/events`. Publishing never blocks, so a slow browser
+    /// cannot stall the supervisor.
+    pub events: Arc<crate::events::Bus>,
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
@@ -139,6 +143,7 @@ pub fn router(state: AppState) -> Router {
             "/agents/{id}/inbox/{message_id}",
             get(agent_routes::inbox_one),
         )
+        .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_engine_secret,
