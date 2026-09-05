@@ -445,8 +445,15 @@ def main():
             R.check("SEC-vault-never-read/log", "VAULT-CANARY-91ab" not in json.dumps(log),
                     "vault value present in the agent log")
     finally:
+        # Belt and braces. The API's DELETE is supposed to remove the sandbox, and
+        # API-project-delete-reaps asserts that it does — but teardown must not DEPEND on
+        # the thing it is testing, or a regression there silently leaks a container per
+        # run. Nine leaked before this was added, on a 16 GB host shared by a dozen
+        # agent sessions.
         if VIA_API and pid:
             call("DELETE", "/v1/projects/%s" % pid, owner)
+            subprocess.run(["docker", "rm", "-f", "wheel-p-%s" % pid],
+                           capture_output=True)
         else:
             subprocess.run(["docker", "rm", "-f", DIRECT_NAME], capture_output=True)
 
