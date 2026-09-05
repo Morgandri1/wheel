@@ -53,7 +53,17 @@ export function CtxPanel({
 
       {tab === "write" ? (
         <Field label="Markdown">
-          <div className="border border-rule" data-testid="inspector-ctx-markdown">
+          {/*
+            Monaco is a canvas-and-divs editor, not a form control, so there is no `value` for a
+            test to read off this container — `toHaveValue` here could never have passed. The
+            current text is published as an attribute instead: stable, no phantom hidden input
+            mirroring state, and it says out loud what the container holds.
+          */}
+          <div
+            className="border border-rule"
+            data-testid="inspector-ctx-markdown"
+            data-markdown={markdown}
+          >
             <Monaco
               height="300px"
               defaultLanguage="markdown"
