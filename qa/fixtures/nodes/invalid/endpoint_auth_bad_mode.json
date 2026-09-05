@@ -1,0 +1,22 @@
+{
+  "id": "e1000000-0000-4000-8000-000000000001",
+  "name": "hook-bad",
+  "type": "endpoint",
+  "position": {
+    "x": 1.0,
+    "y": 2.0
+  },
+  "wires": [],
+  "config": {
+    "method": "POST",
+    "path": "/x",
+    "response_mode": "ack",
+    "auth": {
+      "mode": "basic",
+      "vault_ref": "a/b"
+    }
+  },
+  "_expect_reject": "NODE-endpoint-auth",
+  "_enforced_by": "engine",
+  "_engine_ref": "endpoint.auth not in wheel-core yet"
+}

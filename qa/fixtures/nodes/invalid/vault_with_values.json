@@ -1,0 +1,21 @@
+{
+  "id": "805cbaf1-e27a-404a-8e28-e1772aa19550",
+  "name": "v1",
+  "type": "vault",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "keys": [
+      "K"
+    ],
+    "values": {
+      "K": "supersecret"
+    }
+  },
+  "_expect_reject": "NODE-vault-writeonly",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
+}

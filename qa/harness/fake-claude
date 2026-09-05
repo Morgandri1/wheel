@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""fake-claude — deterministic stand-in for the `claude` CLI.
+
+Installed as /usr/local/bin/claude in the `wheel-engine:test` image variant.
+Speaks the SAME stream-json protocol as Claude Code 2.1.x (verified against the
+real binary), but never makes a network call. See qa/harness/README.md for the
+full contract.
+
+Design rules:
+  * Deterministic: same input -> same output, except session_id/uuid/timestamps.
+  * Echoing: the assistant reply CONTAINS the user text it received, so tests can
+    assert that injected ctx markdown / [wheel] message framing reached the prompt.
+  * Steerable from the test side via <<FAKE:...>> directives in the message body
+    and via WHEEL_FAKE_* env vars, so QA never has to rebuild the image.
+"""
+import json, os, sys, time, uuid, re, hashlib, datetime, signal
+
+VERSION = "2.1.261 (Claude Code)"
+SCRIPT_PATH = os.environ.get("WHEEL_FAKE_SCRIPT")  # JSONL of canned turns, one object per turn
+TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")  # optional: append every stdin line here
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def die(msg, code=1):
+    sys.stderr.write("fake-claude: " + msg + "\n")
+    sys.stderr.flush()
+    sys.exit(code)
+
+# ---------------------------------------------------------------- arg parsing
+def parse_args(argv):
+    a = {
+        "print": False, "input_format": "text", "output_format": "text",
+        "verbose": False, "model": None, "system_prompt_append": None, "system_prompt": None,
+        "resume": None, "prompt": None, "mcp_config": None, "cwd": os.getcwd(),
+        "permission_mode": "default",
+    }
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t in ("-p", "--print"):                 a["print"] = True
+        elif t == "--verbose":                     a["verbose"] = True
+        elif t == "--input-format":                i += 1; a["input_format"] = argv[i]
+        elif t == "--output-format":               i += 1; a["output_format"] = argv[i]
+        elif t == "--model":                       i += 1; a["model"] = argv[i]
+        elif t == "--append-system-prompt":        i += 1; a["system_prompt_append"] = argv[i]
+        elif t == "--append-system-prompt-file":   i += 1; a["system_prompt_append"] = _readfile(argv[i])
+        elif t == "--system-prompt":               i += 1; a["system_prompt"] = argv[i]
+        elif t == "--system-prompt-file":          i += 1; a["system_prompt"] = _readfile(argv[i])
+        elif t == "--resume":                      i += 1; a["resume"] = argv[i]
+        elif t == "--permission-mode":             i += 1; a["permission_mode"] = argv[i]
+        elif t in ("--mcp-config", "--mcp-servers"): i += 1; a["mcp_config"] = argv[i]
+        elif t == "--version":                     print(VERSION); sys.exit(0)
+        elif t in ("-h", "--help"):                print("fake-claude: see qa/harness/README.md"); sys.exit(0)
+        elif t.startswith("-"):
+            # Unknown flags are TOLERATED (real CLI has many); record for assertions.
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+        else:
+            a["prompt"] = t
+        i += 1
+    return a
+
+def composed_system_prompt(a):
+    """Everything the engine handed us as system context, concatenated in order."""
+    parts = [p for p in (a.get("system_prompt"), a.get("system_prompt_append")) if p]
+    return "\n".join(parts) if parts else None
+
+def _readfile(p):
+    try:
+        with open(p) as f: return f.read()
+    except OSError: return None
+
+# ---------------------------------------------------------------- auth gate
+ROOT_REFUSAL = ("--dangerously-skip-permissions cannot be used with root/sudo "
+                "privileges for security reasons")
+
+def root_refusal_guard(a):
+    """Reproduce the real CLI's refusal of bypassPermissions when running as root.
+
+    Verified live by SDK: exit 1, EMPTY stdout, that exact stderr. Byte-identical in
+    exit code to an unauthenticated CLI, so a supervisor that infers needs_auth from
+    the exit code alone reports needs_auth forever for what is really a privilege
+    misconfiguration. WHEEL_FAKE_ROOT=1 forces it without needing a root container.
+    """
+    forced = os.environ.get("WHEEL_FAKE_ROOT") == "1"
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if (forced or is_root) and a.get("permission_mode") == "bypassPermissions":
+        die(ROOT_REFUSAL, 1)
+
+def auth_state():
+    """Mirrors the engine's needs_auth flow. WHEEL_FAKE_AUTH=needs_auth|ok."""
+    st = os.environ.get("WHEEL_FAKE_AUTH", "ok")
+    if st == "ok" and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")):
+        # Default fake is authenticated even without creds; opt in to strictness.
+        if os.environ.get("WHEEL_FAKE_STRICT_AUTH"):
+            return "needs_auth"
+    return st
+
+# ---------------------------------------------------------------- directives
+DIRECTIVE = re.compile(r"<<FAKE:([A-Z_]+)(?:=([^>]*))?>>")
+
+def directives(text):
+    return {m.group(1): (m.group(2) if m.group(2) is not None else "") for m in DIRECTIVE.finditer(text or "")}
+
+# ---------------------------------------------------------------- input
+def text_of(msg):
+    """Extract plain text from a stream-json user turn (string or content blocks)."""
+    m = msg.get("message", msg)
+    c = m.get("content", "")
+    if isinstance(c, str):
+        return c
+    out = []
+    for b in c or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            out.append(b.get("text", ""))
+        elif isinstance(b, str):
+            out.append(b)
+    return "\n".join(out)
+
+def main():
+    argv = sys.argv[1:]
+    a = parse_args(argv)
+    session_id = a["resume"] or os.environ.get("WHEEL_FAKE_SESSION_ID") or str(uuid.uuid4())
+    model = a["model"] or "claude-fake-1"
+    stream = a["output_format"] == "stream-json"
+
+    # SDK auth spike: --permission-mode bypassPermissions is REFUSED when the child runs as
+    # root. Exit 1 + EMPTY stdout + this exact stderr — byte-identical to "not logged in".
+    # The engine MUST classify this as `error`, never `needs_auth`, and must never infer
+    # needs_auth from the exit code alone.
+    if os.environ.get("WHEEL_FAKE_ROOT_REFUSAL") == "1" or (
+            a["permission_mode"] == "bypassPermissions" and os.environ.get("WHEEL_FAKE_UID") == "0"):
+        die("--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons", 1)
+
+    root_refusal_guard(a)
+
+    if auth_state() == "needs_auth":
+        # Real CLI exits non-zero with a login prompt on stderr; engine maps -> needs_auth.
+        die("Invalid API key · Please run /login", 1)
+
+    if stream:
+        emit({"type": "system", "subtype": "init", "cwd": a["cwd"], "session_id": session_id,
+              "tools": ["Bash", "Read", "Write", "Edit"], "mcp_servers": _mcp_servers(a),
+              "model": model, "permissionMode": a["permission_mode"], "slash_commands": [],
+              "apiKeySource": "none", "claude_code_version": VERSION, "output_style": "default",
+              "agents": [], "skills": [], "uuid": str(uuid.uuid4()),
+              # Wheel contract: the FIRST event carries the full composed system prompt verbatim,
+              # so tests can assert ctx-node injection + system_prompt actually reached the child.
+              "system_prompt": composed_system_prompt(a),
+              "_fake_system_prompt": composed_system_prompt(a)})
+
+    turn = 0
+    if a["input_format"] == "stream-json":
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            _record(line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                # Real CLI errors on malformed input; engine must surface it.
+                die("Invalid JSON on stdin: " + line[:120], 2)
+            if msg.get("type") not in (None, "user"):
+                continue  # tolerate control frames
+            turn += 1
+            respond(text_of(msg), turn, session_id, model, stream)
+    else:
+        prompt = a["prompt"] if a["prompt"] is not None else sys.stdin.read()
+        _record(prompt)
+        turn = 1
+        respond(prompt, turn, session_id, model, stream)
+
+    sys.exit(0)
+
+def _mcp_servers(a):
+    if not a["mcp_config"]:
+        return []
+    try:
+        cfg = json.loads(a["mcp_config"]) if a["mcp_config"].lstrip().startswith("{") else json.load(open(a["mcp_config"]))
+        return [{"name": k, "status": "connected"} for k in (cfg.get("mcpServers") or cfg).keys()]
+    except Exception:
+        return []
+
+def _record(line):
+    if TRANSCRIPT:
+        try:
+            with open(TRANSCRIPT, "a") as f: f.write(line.rstrip("\n") + "\n")
+        except OSError: pass
+
+# ---------------------------------------------------------------- response
+_SCRIPT = None
+
+def script_turn(turn):
+    """Canned turn `turn` (1-based) from WHEEL_FAKE_SCRIPT, or None.
+
+    Each line is one JSON object: {"reply","is_error","sleep","exit","stderr","events":[raw]}.
+    Running past the end of the script is an ERROR, not a silent fallthrough - a test that
+    sends more turns than it scripted is a broken test and must fail loudly.
+    """
+    global _SCRIPT
+    if not SCRIPT_PATH:
+        return None
+    if _SCRIPT is None:
+        _SCRIPT = []
+        try:
+            with open(SCRIPT_PATH) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#"):
+                        _SCRIPT.append(json.loads(ln))
+        except OSError as e:
+            die("cannot read WHEEL_FAKE_SCRIPT %s: %s" % (SCRIPT_PATH, e), 2)
+        except json.JSONDecodeError as e:
+            die("malformed WHEEL_FAKE_SCRIPT %s: %s" % (SCRIPT_PATH, e), 2)
+    if turn - 1 < len(_SCRIPT):
+        return _SCRIPT[turn - 1]
+    die("WHEEL_FAKE_SCRIPT exhausted: got turn %d, script has %d" % (turn, len(_SCRIPT)), 3)
+
+def respond(user_text, turn, session_id, model, stream):
+    d = directives(user_text)
+    canned = script_turn(turn)
+    if canned:
+        # Canned turns take precedence; directives still work for anything unspecified.
+        for k, flag in (("sleep", "SLEEP"), ("exit", "EXIT"), ("stderr", "STDERR"), ("reply", "REPLY")):
+            if k in canned and canned[k] is not None:
+                d[flag] = str(canned[k])
+        if canned.get("is_error"):
+            d["ERROR"] = str(canned.get("error") or canned.get("reply") or "fake error")
+        for raw in canned.get("events") or []:
+            if stream:
+                emit(raw)
+
+    if "SLEEP" in d:
+        time.sleep(float(d["SLEEP"] or 1))
+    if "EXIT" in d:
+        sys.exit(int(d["EXIT"] or 1))
+    if "CRASH" in d:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if "STDERR" in d:
+        sys.stderr.write((d["STDERR"] or "fake stderr") + "\n"); sys.stderr.flush()
+    if "GARBAGE" in d:
+        # Emit a non-JSON line: the engine MUST NOT die on this (ENG-log-garbage).
+        sys.stdout.write("this is not json\n"); sys.stdout.flush()
+
+    # Deterministic reply that ECHOES what we were given.
+    if "REPLY" in d:
+        reply = d["REPLY"]
+    else:
+        reply = "[fake-claude] turn %d: %s" % (turn, (user_text or "").strip())
+    reply = DIRECTIVE.sub("", reply).strip()
+
+    msg_id = "msg_fake_" + hashlib.sha256(("%s|%d" % (session_id, turn)).encode()).hexdigest()[:16]
+    base_usage = {"input_tokens": max(1, len(user_text or "") // 4), "output_tokens": max(1, len(reply) // 4),
+                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "service_tier": "standard"}
+
+    if stream:
+        if "NOISE" in d:
+            # Unknown/extra event types the real CLI emits. Engine must ignore unknown types.
+            emit({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}, "session_id": session_id})
+            emit({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 42, "session_id": session_id})
+        if "TOOL" in d:
+            tu_id = "toolu_fake_" + hashlib.sha256(reply.encode()).hexdigest()[:12]
+            emit({"type": "assistant", "message": {"model": model, "id": msg_id, "type": "message", "role": "assistant",
+                  "content": [{"type": "tool_use", "id": tu_id, "name": "Bash", "input": {"command": d["TOOL"] or "true"}}],
+                  "stop_reason": None, "usage": base_usage},
+                  "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4()), "timestamp": now_iso()})
+            emit({"type": "user", "message": {"role": "user", "content": [
+                  {"type": "tool_result", "tool_use_id": tu_id, "content": "ok"}]},
+                  "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4()), "timestamp": now_iso()})
+        emit({"type": "assistant", "message": {"model": model, "id": msg_id, "type": "message", "role": "assistant",
+              "content": [{"type": "text", "text": reply}], "stop_reason": None, "stop_sequence": None,
+              "usage": base_usage},
+              "parent_tool_use_id": None, "session_id": session_id, "uuid": str(uuid.uuid4()),
+              "timestamp": now_iso(), "request_id": "req_fake_%d" % turn})
+
+    is_error = "ERROR" in d
+    result = {"type": "result", "subtype": "error_during_execution" if is_error else "success",
+              "is_error": is_error, "result": (d.get("ERROR") or "fake error") if is_error else reply,
+              "session_id": session_id, "num_turns": turn, "duration_ms": 1, "duration_api_ms": 1,
+              "total_cost_usd": 0.0, "usage": base_usage, "permission_denials": [],
+              "uuid": str(uuid.uuid4())}
+    if stream:
+        emit(result)
+    elif os.environ.get("WHEEL_FAKE_OUTPUT", "") == "json":
+        emit(result)
+    else:
+        sys.stdout.write(reply + "\n"); sys.stdout.flush()
+
+def _quiet_broken_pipe():
+    """Engine closing our stdout on stop must not print a Python traceback."""
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        _quiet_broken_pipe(); sys.exit(0)
+    except KeyboardInterrupt:
+        _quiet_broken_pipe(); sys.exit(130)
+    finally:
+        _quiet_broken_pipe()

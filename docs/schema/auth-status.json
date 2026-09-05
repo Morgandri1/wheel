@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AuthStatus",
+  "description": "Whether an agent's harness currently holds usable credentials (`GET /v1/agents/:id/auth`).",
+  "type": "object",
+  "required": [
+    "authenticated"
+  ],
+  "properties": {
+    "account": {
+      "description": "Display-only account identifier (e.g. an email). Never a token.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "authenticated": {
+      "type": "boolean"
+    }
+  }
+}

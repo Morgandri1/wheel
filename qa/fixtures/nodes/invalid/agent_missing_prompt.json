@@ -1,0 +1,17 @@
+{
+  "id": "34195164-6674-4dd6-844c-f25d4763e4e8",
+  "name": "no-prompt",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "harness": "claude",
+    "run_on_startup": false,
+    "ephemeral_context": false
+  },
+  "_expect_reject": "NODE-agent-config",
+  "_enforced_by": "schema"
+}

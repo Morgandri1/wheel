@@ -1,0 +1,34 @@
+{
+  "id": "65188d5c-279c-431a-81bf-e8cb57a39a4b",
+  "name": "findings",
+  "type": "table",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "integer"
+      },
+      {
+        "name": "title",
+        "type": "text"
+      },
+      {
+        "name": "score",
+        "type": "real"
+      },
+      {
+        "name": "raw",
+        "type": "blob"
+      },
+      {
+        "name": "meta",
+        "type": "json"
+      }
+    ]
+  }
+}

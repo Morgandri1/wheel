@@ -1,0 +1,20 @@
+{
+  "id": "88c0ca9f-60b3-45a4-8135-3708929bbad9",
+  "name": "badcol",
+  "type": "table",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "columns": [
+      {
+        "name": "c",
+        "type": "varchar"
+      }
+    ]
+  },
+  "_expect_reject": "NODE-table-columns",
+  "_enforced_by": "schema"
+}

@@ -1,0 +1,22 @@
+{
+  "id": "b0b2c3d4-0000-4000-8000-000000000005",
+  "name": "tool-bad-source-format",
+  "type": "tool",
+  "position": {
+    "x": 12.0,
+    "y": 34.0
+  },
+  "wires": [],
+  "config": {
+    "kind": "http",
+    "source": {
+      "format": "raml",
+      "raw": "{\"openapi\":\"3.0.0\"}",
+      "imported_at": "2026-09-05T00:00:00Z"
+    },
+    "base_url": "https://a.example.com",
+    "operations": []
+  },
+  "_expect_reject": "NODE-tool-config",
+  "_enforced_by": "schema"
+}

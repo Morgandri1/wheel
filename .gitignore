@@ -9,6 +9,10 @@ node_modules/
 *.db-shm
 /data/
 .DS_Store
+qa/.venv/
+qa/.artifacts/
+__pycache__/
+.pytest_cache/
 
 # Test-only RSA key fixture is intentionally committed (see crates/wheel-api/tests/support.rs);
 # it signs nothing real. Everything else key-shaped stays out.

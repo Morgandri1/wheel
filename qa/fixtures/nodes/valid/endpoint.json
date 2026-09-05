@@ -1,0 +1,15 @@
+{
+  "id": "a2aef835-4176-4aaf-8e2b-f2078486ab39",
+  "name": "webhook",
+  "type": "endpoint",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "method": "POST",
+    "path": "/hook",
+    "response_mode": "ack"
+  }
+}

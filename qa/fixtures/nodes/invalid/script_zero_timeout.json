@@ -1,0 +1,18 @@
+{
+  "id": "26fe16c8-fffe-4bee-8c52-a301d552c349",
+  "name": "s2",
+  "type": "script",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "language": "python",
+    "source": "x",
+    "timeout_secs": 0
+  },
+  "_expect_reject": "NODE-script-lang",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_script"
+}

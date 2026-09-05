@@ -1,0 +1,21 @@
+{
+  "id": "78a8716d-0692-4610-8a34-5112cedae6ca",
+  "name": "sneaky",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "harness": "claude",
+    "system_prompt": "x",
+    "run_on_startup": false,
+    "ephemeral_context": false,
+    "status": "running",
+    "session_id": "forged"
+  },
+  "_expect_reject": "NODE-state-not-config",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
+}

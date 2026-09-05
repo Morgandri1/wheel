@@ -1,0 +1,15 @@
+{
+  "id": "fba8a9e0-e4a1-4c52-80f1-32a7ae04f5be",
+  "name": "two words",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x"
+  },
+  "_expect_reject": "NODE-name-charset",
+  "_enforced_by": "schema"
+}

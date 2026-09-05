@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: make check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # Bootstrap first: qa/.venv is gitignored, and without it the schema contract
+      # gate SKIPS. A skipped gate on main is a blind spot — it hid BUG-003.
+      - run: make bootstrap
+      - run: make check
+
+  integration:
+    name: integration (docker + fake harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Skipped until SDK lands the engine image; flipped on then.
+    if: false
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [docker, process]   # M3 adds `process`; matrix is ready for it
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make engine-image-test
+      - run: make test-int
+        env:
+          SANDBOX_BACKEND: ${{ matrix.backend }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ matrix.backend }}
+          path: qa/.artifacts/
+
+  e2e:
+    name: e2e (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: false   # flipped on when Web lands the board UI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: make test-e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: qa/e2e/playwright-report/
+
+  # NOTE: there is deliberately NO job that runs `make test-live`. Live runs hit the
+  # real claude/codex CLIs, cost money and are non-deterministic. Humans only.

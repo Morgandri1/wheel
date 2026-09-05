@@ -1,0 +1,17 @@
+{
+  "id": "755dab06-c787-4d6e-85e5-cda814f92ebf",
+  "name": "extra",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x",
+    "surprise": true
+  },
+  "_expect_reject": "NODE-config-unknown-key",
+  "_enforced_by": "engine",
+  "_engine_ref": "serde deny_unknown_fields (BUG-002)"
+}

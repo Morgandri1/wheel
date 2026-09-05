@@ -1,0 +1,25 @@
+{
+  "id": "a098075a-e12b-40c7-8546-75fcd9b91ef5",
+  "name": "lead",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [
+    {
+      "to": "00000000-0000-4000-8000-000000000001",
+      "type": "send"
+    },
+    {
+      "to": "00000000-0000-4000-8000-000000000002",
+      "type": "read"
+    }
+  ],
+  "config": {
+    "harness": "claude",
+    "system_prompt": "Lead.",
+    "run_on_startup": false,
+    "ephemeral_context": false
+  }
+}

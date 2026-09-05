@@ -1,0 +1,17 @@
+{
+  "id": "2c34d0c9-694a-41e8-8ca9-b16a10808525",
+  "name": "researcher",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "harness": "claude",
+    "model": "claude-sonnet-4-5",
+    "system_prompt": "You research things.",
+    "run_on_startup": true,
+    "ephemeral_context": false
+  }
+}

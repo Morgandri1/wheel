@@ -1,0 +1,13 @@
+{
+  "id": "f6aa5d74-7a0b-4920-8656-b9c92388ef23",
+  "name": "thing",
+  "type": "wormhole",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {},
+  "_expect_reject": "NODE-type-closed",
+  "_enforced_by": "schema"
+}

@@ -1,0 +1,13 @@
+{
+  "id": "709278c0-db4d-4810-880c-f067a375dab1",
+  "name": "edge-pos",
+  "type": "ctx",
+  "position": {
+    "x": -1234.5,
+    "y": 0.25
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x"
+  }
+}

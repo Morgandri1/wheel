@@ -1,0 +1,15 @@
+{
+  "id": "5d49badd-3f2b-4340-87d0-e137fccd5b63",
+  "name": "_bad",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x"
+  },
+  "_expect_reject": "NODE-name-charset",
+  "_enforced_by": "schema"
+}

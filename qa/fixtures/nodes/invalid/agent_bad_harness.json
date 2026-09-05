@@ -1,0 +1,18 @@
+{
+  "id": "4f9d28dc-98e5-4d02-89fd-1a8788ddc7d5",
+  "name": "bad-harness",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "harness": "gpt5",
+    "system_prompt": "x",
+    "run_on_startup": false,
+    "ephemeral_context": false
+  },
+  "_expect_reject": "NODE-agent-config",
+  "_enforced_by": "schema"
+}

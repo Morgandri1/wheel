@@ -1,0 +1,15 @@
+{
+  "id": "94501074-cd53-48d5-8397-1fa176023507",
+  "name": "summarise",
+  "type": "script",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "language": "python",
+    "source": "print('hi')",
+    "timeout_secs": 30
+  }
+}

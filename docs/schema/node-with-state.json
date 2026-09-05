@@ -1,0 +1,840 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NodeWithState",
+  "description": "A node plus its observed state, as returned by `GET /v1/board`.",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/AgentConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/CtxConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "ctx"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/TableConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "table"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/EndpointConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "endpoint"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/ScriptConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "script"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/McpConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "mcp"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/VaultConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "vault"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/ChestConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "chest"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "config",
+        "type"
+      ],
+      "properties": {
+        "config": {
+          "$ref": "#/definitions/ToolConfig"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tool"
+          ]
+        }
+      }
+    }
+  ],
+  "required": [
+    "id",
+    "name",
+    "position"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "name": {
+      "$ref": "#/definitions/NodeName"
+    },
+    "position": {
+      "$ref": "#/definitions/Position"
+    },
+    "state": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/NodeState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "wires": {
+      "description": "OUTGOING wires only.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Wire"
+      }
+    }
+  },
+  "definitions": {
+    "AgentConfig": {
+      "type": "object",
+      "required": [
+        "harness",
+        "system_prompt"
+      ],
+      "properties": {
+        "ephemeral_context": {
+          "description": "Clear the session after every completed turn, re-applying the system prompt and ctx injections, before draining the next queued message.",
+          "default": false,
+          "type": "boolean"
+        },
+        "harness": {
+          "$ref": "#/definitions/Harness"
+        },
+        "model": {
+          "description": "Harness-specific model id. `None` = the CLI's own default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_on_startup": {
+          "description": "Start this agent when the container starts.",
+          "default": false,
+          "type": "boolean"
+        },
+        "system_prompt": {
+          "description": "Appended to the harness's own system prompt, then followed by the markdown of every `ctx` node wired `send` into this agent.",
+          "type": "string"
+        }
+      }
+    },
+    "AgentStatus": {
+      "description": "Lifecycle of an agent node's child process.",
+      "oneOf": [
+        {
+          "description": "No child process. The default, and where a node lands after `stop`.",
+          "type": "string",
+          "enum": [
+            "stopped"
+          ]
+        },
+        {
+          "description": "Child spawned, harness not yet ready to accept a turn.",
+          "type": "string",
+          "enum": [
+            "starting"
+          ]
+        },
+        {
+          "description": "The harness reports it has no usable credentials. Terminal until the operator completes `/v1/agents/:id/auth/*`.",
+          "type": "string",
+          "enum": [
+            "needs_auth"
+          ]
+        },
+        {
+          "description": "Child is mid-turn (a message is being processed).",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "Child is alive and waiting for input.",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "Child exited unexpectedly or the harness reported a fatal error; `last_error` carries the detail.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "ChestConfig": {
+      "description": "Chest has no configuration; its content lives on disk under `/data/chest/<node_id>/` and is indexed in sqlite.",
+      "type": "object"
+    },
+    "Column": {
+      "type": "object",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "description": "Validated with a sqlite-safe charset so it is safe to quote into DDL. Unlike a node name this may be `user`, `system`, ... — the node reserved-name list is about message addressing, not columns.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Ident"
+            }
+          ]
+        },
+        "type": {
+          "$ref": "#/definitions/ColumnType"
+        }
+      }
+    },
+    "ColumnType": {
+      "description": "Column type of a `table` node, mapped onto a sqlite storage class.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "text",
+            "integer",
+            "real",
+            "blob"
+          ]
+        },
+        {
+          "description": "Stored as TEXT; the engine validates it parses as JSON on write.",
+          "type": "string",
+          "enum": [
+            "json"
+          ]
+        }
+      ]
+    },
+    "CtxConfig": {
+      "type": "object",
+      "required": [
+        "markdown"
+      ],
+      "properties": {
+        "markdown": {
+          "type": "string"
+        }
+      }
+    },
+    "EndpointConfig": {
+      "type": "object",
+      "required": [
+        "method",
+        "path",
+        "response_mode"
+      ],
+      "properties": {
+        "method": {
+          "$ref": "#/definitions/HttpMethod"
+        },
+        "path": {
+          "description": "Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`].",
+          "type": "string"
+        },
+        "response_mode": {
+          "$ref": "#/definitions/ResponseMode"
+        }
+      }
+    },
+    "Fill": {
+      "description": "How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.",
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/FillMode"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vault_ref": {
+          "description": "`<vault node name>/<key>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "FillMode": {
+      "description": "How a field is filled when the operation is called (§3d).",
+      "oneOf": [
+        {
+          "description": "The agent supplies it; appears in the operation's input schema.",
+          "type": "string",
+          "enum": [
+            "agent"
+          ]
+        },
+        {
+          "description": "A value the operator typed. Never shown to the agent.",
+          "type": "string",
+          "enum": [
+            "static"
+          ]
+        },
+        {
+          "description": "Resolved at call time from a wired vault. Never shown to the agent and never returned by `/v1/board`.",
+          "type": "string",
+          "enum": [
+            "vault"
+          ]
+        },
+        {
+          "description": "Omitted from the request entirely.",
+          "type": "string",
+          "enum": [
+            "hidden"
+          ]
+        }
+      ]
+    },
+    "Harness": {
+      "description": "Which CLI backs an agent node.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex"
+      ]
+    },
+    "HttpMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE"
+      ]
+    },
+    "Ident": {
+      "description": "A sqlite-safe identifier (table column name).",
+      "type": "string",
+      "maxLength": 63,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9_]{0,62}$"
+    },
+    "McpConfig": {
+      "type": "object",
+      "required": [
+        "transport"
+      ],
+      "properties": {
+        "args": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransport"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "McpTransport": {
+      "type": "string",
+      "enum": [
+        "stdio",
+        "http"
+      ]
+    },
+    "NodeName": {
+      "description": "A node's unique, addressable name. Reserved: user, wheel, system, engine.",
+      "type": "string",
+      "maxLength": 63,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9-_]{0,62}$"
+    },
+    "NodeState": {
+      "description": "`state` as reported next to a node on `GET /v1/board`. Only agent nodes currently carry state; the enum leaves room for others (e.g. table row counts) without a breaking change.",
+      "oneOf": [
+        {
+          "description": "Observed state of an `agent` node.",
+          "type": "object",
+          "required": [
+            "kind",
+            "status"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "agent"
+              ]
+            },
+            "last_activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Timestamp"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "last_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "queued_messages": {
+              "description": "Messages persisted but not yet delivered into the child.",
+              "default": 0,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "session_id": {
+              "description": "The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/definitions/AgentStatus"
+            }
+          }
+        }
+      ]
+    },
+    "ParamLocation": {
+      "description": "Where a parameter goes in the HTTP request.",
+      "type": "string",
+      "enum": [
+        "header",
+        "path",
+        "query",
+        "cookie",
+        "body"
+      ]
+    },
+    "Position": {
+      "description": "Board coordinates. Floats because the canvas pans/zooms continuously.",
+      "type": "object",
+      "required": [
+        "x",
+        "y"
+      ],
+      "properties": {
+        "x": {
+          "type": "number",
+          "format": "double"
+        },
+        "y": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "ResponseMode": {
+      "description": "What an endpoint returns to the HTTP caller.",
+      "oneOf": [
+        {
+          "description": "`202 {\"queued\": true}` as soon as the request is fanned out.",
+          "type": "string",
+          "enum": [
+            "ack"
+          ]
+        },
+        {
+          "description": "Run the wired script synchronously and return its stdout as the body.",
+          "type": "string",
+          "enum": [
+            "script"
+          ]
+        }
+      ]
+    },
+    "ScriptConfig": {
+      "type": "object",
+      "required": [
+        "language",
+        "source"
+      ],
+      "properties": {
+        "language": {
+          "$ref": "#/definitions/ScriptLanguage"
+        },
+        "source": {
+          "type": "string"
+        },
+        "timeout_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ScriptLanguage": {
+      "type": "string",
+      "enum": [
+        "python",
+        "ts",
+        "js"
+      ]
+    },
+    "TableConfig": {
+      "type": "object",
+      "required": [
+        "columns"
+      ],
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Column"
+          }
+        }
+      }
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    },
+    "ToolConfig": {
+      "type": "object",
+      "required": [
+        "base_url"
+      ],
+      "properties": {
+        "base_url": {
+          "description": "Absolute `http(s)` origin every operation is resolved against.",
+          "type": "string"
+        },
+        "operations": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ToolOperation"
+          }
+        },
+        "source_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ToolFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ToolFormat": {
+      "description": "The document format a tool node was imported from.",
+      "type": "string",
+      "enum": [
+        "openapi3",
+        "swagger2",
+        "postman21",
+        "insomnia4"
+      ]
+    },
+    "ToolMethod": {
+      "description": "Methods a tool operation may use. Deliberately a separate enum from [`crate::node::HttpMethod`]: `endpoint` nodes are contractually limited to GET/POST/PUT/DELETE (§3), while imported specs routinely contain PATCH and HEAD. Sharing one enum would silently widen the endpoint contract.",
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS"
+      ]
+    },
+    "ToolOperation": {
+      "description": "One callable operation. Exposed over MCP as `<tool name>__<id>`.",
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "path"
+      ],
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable identifier, unique within the node. Charset is restricted because it is concatenated into an MCP tool name.",
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/definitions/ToolMethod"
+        },
+        "params": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ToolParam"
+          }
+        },
+        "path": {
+          "description": "Path template relative to `base_url`, e.g. `/users/{id}`.",
+          "type": "string"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ToolParam": {
+      "type": "object",
+      "required": [
+        "location",
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fill": {
+          "default": {
+            "mode": "agent"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/Fill"
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/definitions/ParamLocation"
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "schema": {
+          "description": "JSON Schema fragment for this field, used to build the MCP input schema."
+        }
+      }
+    },
+    "VaultConfig": {
+      "description": "Vault config carries only the *key names*. Values are write-only through `PUT /v1/vault/:id/:key`, stored encrypted, and never returned by `GET /v1/board`.",
+      "type": "object",
+      "required": [
+        "keys"
+      ],
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Wire": {
+      "description": "An outgoing wire, as stored on its source node (`Node::wires`).",
+      "type": "object",
+      "required": [
+        "to",
+        "type"
+      ],
+      "properties": {
+        "to": {
+          "description": "Target node id.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "type": {
+          "$ref": "#/definitions/WireType"
+        }
+      }
+    },
+    "WireType": {
+      "description": "What a wire permits. Wires are directional and stored on the *source* node.",
+      "oneOf": [
+        {
+          "description": "Read the target's data (`wheel read`, `table query`, `chest get|ls`, `secret get`, `run <script>`, MCP attachment).",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Mutate the target's data. For `table` and `chest`, write **implies** read — see [`WireType::satisfies`].",
+          "type": "string",
+          "enum": [
+            "write"
+          ]
+        },
+        {
+          "description": "Deliver a message to the target (agent→agent, endpoint→agent, script→agent) or, for `ctx`→`agent`, inject context into its prompt.",
+          "type": "string",
+          "enum": [
+            "send"
+          ]
+        }
+      ]
+    }
+  }
+}

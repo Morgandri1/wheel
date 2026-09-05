@@ -1,0 +1,18 @@
+{
+  "id": "9fc7e98a-2ba0-4e35-87e1-7623666e6834",
+  "name": "m3",
+  "type": "mcp",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "transport": "stdio",
+    "command": "x",
+    "url": "https://e.com"
+  },
+  "_expect_reject": "NODE-mcp-transport",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_config (McpConfig)"
+}

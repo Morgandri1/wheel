@@ -1,0 +1,18 @@
+{
+  "id": "83a54c6c-3111-4469-8bdf-59d9406a8d7d",
+  "name": "e1",
+  "type": "endpoint",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "method": "GET",
+    "path": "hook",
+    "response_mode": "ack"
+  },
+  "_expect_reject": "NODE-endpoint-path",
+  "_enforced_by": "engine",
+  "_engine_ref": "validate_endpoint_path"
+}
