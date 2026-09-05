@@ -76,7 +76,7 @@ wheel/
 - **Engine, CLI, API: Rust** (stable, edition 2021). HTTP: `axum` + `tokio`. sqlite: `rusqlite` (bundled). Docker: `bollard`.
   Postgres (API only): `sqlx`. Errors: `thiserror`/`anyhow`. Serialization: `serde` + `serde_json`. IDs: `uuid` v4. Time: RFC3339 UTC.
 - **Web: Next.js 15 (App Router) + TypeScript + Tailwind + `@xyflow/react`** (board canvas) + TanStack Query + Clerk React.
-- **Auth: Clerk** (hosted; email/password + Google/GitHub/SAML SSO). Web obtains a Clerk session JWT; API verifies it
+- **Auth: pluggable, LOCAL email/password first (operator has no Clerk).** The API owns the auth boundary via an `AuthProvider`: `local` (users table, argon2id, API-issued HS256 session JWTs, `POST /v1/auth/signup|login|logout`, `GET /v1/auth/me`, login rate-limited, `AUTH_MODE=local`) and `jwks` (RS256 against a provider's JWKS + issuer — Clerk, Privy, or any OIDC-style issuer; `AUTH_MODE=jwks`). Same `x-auth-token` contract everywhere; switching providers is configuration. Web's `NEXT_PUBLIC_AUTH_MODE` mirrors it (`local` | `clerk` | `mock` | `dev`).
   against Clerk JWKS (`RS256`), using `sub` as the user id. No home-grown password storage.
 - **Security principle: an agent is untrusted remote code execution inside its sandbox.** Agents run with `--permission-mode bypassPermissions`
   (a headless child would deadlock on prompts), so NOTHING relies on the agent restraining itself: every wire check, secret, and tenant boundary is
