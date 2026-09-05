@@ -23,6 +23,7 @@ through PM unless you have a direct wire. Message format (one per message, first
 - `BLOCKED: <what> — <what you need> — <what you're doing meanwhile>` — never sit idle; pick up unblocked work.
 - `QUESTION: <specific question + your recommended answer>` — always include your recommendation.
 - `DONE: <deliverable>` — with the commit hash and how to verify.
+- **ALWAYS send with `yoke msg <to> --file <path>` (or `--stdin`).** Never pass a composed body as argv: backticks/`$(…)` get shell-substituted and silently corrupt or truncate the message (this has already happened twice). Put the tag on line 1.
 - `BUG: <title> | severity | repro steps | expected vs actual` (QA/ADVERSARY → owner via PM).
 - `PROPOSAL: <change to shared contract>` — PM will accept/reject.
 
@@ -170,7 +171,7 @@ Every command prints a one-line human result (and `--json` for machine output). 
 
 **Inbound message framing** (delivered as a user turn on stdin) mirrors YOKE's `AgentPrompt` envelope so agents can't be spoofed by body text:
 ```
-<AgentPrompt id="<ulid>" from="<from name>" type="<from type>">
+<AgentPrompt id="<message uuid v4 — same id as the messages row and the `message` WS event>" from="<from name>" type="<from type>">
 <body, with any literal `</AgentPrompt>` in the body escaped by the engine>
 </AgentPrompt>
 ```
