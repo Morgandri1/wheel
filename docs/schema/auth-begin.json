@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AuthBegin",
+  "type": "object",
+  "required": [
+    "instructions",
+    "mode",
+    "session"
+  ],
+  "properties": {
+    "instructions": {
+      "description": "Human-readable steps for the UI to render verbatim.",
+      "type": "string"
+    },
+    "mode": {
+      "$ref": "#/definitions/AuthMode"
+    },
+    "session": {
+      "description": "Opaque handle tying `auth/complete` to this `auth/begin`.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "AuthMode": {
+      "description": "How an agent's harness can be authenticated headlessly (`POST /v1/agents/:id/auth/begin`).",
+      "oneOf": [
+        {
+          "description": "User opens `url`, enters `user_code`, engine polls for completion.",
+          "type": "string",
+          "enum": [
+            "device_code"
+          ]
+        },
+        {
+          "description": "User opens `url`, completes OAuth, pastes the resulting code back into `auth/complete`.",
+          "type": "string",
+          "enum": [
+            "paste_code"
+          ]
+        },
+        {
+          "description": "User supplies a provider API key, stored in the node's credential dir.",
+          "type": "string",
+          "enum": [
+            "api_key"
+          ]
+        }
+      ]
+    }
+  }
+}

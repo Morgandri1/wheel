@@ -1,0 +1,18 @@
+[package]
+name = "wheel-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Shared canonical types for Wheel: nodes, wires, messages, events, and the wire matrix. Source of truth for engine, api and web."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+schemars = { version = "0.8", features = ["uuid1"] }
+time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+
+[[bin]]
+name = "export-schema"
+path = "src/bin/export_schema.rs"
