@@ -21,7 +21,8 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
 | 014 | `API-lifecycle`, `API-project-crud` | S3 | API | **open** | `infra/docker-compose.yml` defaults `ENGINE_IMAGE` to `wheel-engine:stub`, an image nobody builds — every project start 500s on a checked-out stack |
 | 015 | `make check` (`rust:clippy`), `BACK-docker-backend` | **S2** | API | **open** | `wheel-host` does not compile on Linux: `RLIMIT_*` cast to `u32` where the target wants `c_int` — the dev stack cannot build |
-| 015 | `make check` (`rust:clippy`) | **S2** | API | **open** | Linux-only clippy break in `wheel-host` rlimits: `as u32` is required on macOS and redundant on glibc, and `-D warnings` makes redundant fatal |
+| 015 | `make check` (`rust:test`), `API-lifecycle` | **S2** | API | ~~closed~~ | `wheel-host` did not compile on Linux: `as_pairs` returned `(u32, _)` where `c_int` was expected |
+| 016 | `make check` (`rust:clippy`, `rust:test`) | **S2** | API | **open** | The fix for 015 is itself a Linux lint error: `as u32` is required on macOS, redundant on glibc, and `-D warnings` makes redundant fatal |
 
 ---
 
@@ -584,35 +585,7 @@ program reads. A comment saying "until X lands" is a note to a person who will n
 
 ---
 
-## 015 — `main` is red on `rust:clippy`, Linux only · S2 · API
-
-`crates/wheel-host/src/sandbox/process.rs`, `Rlimits::as_pairs`: `libc::RLIMIT_NPROC as u32`
-and five siblings. On glibc `RLIMIT_NPROC` is already `u32`, so clippy fires
-`unnecessary_cast` — fatal under `-D warnings`. On macOS the same cast is `c_int -> u32` and
-required. Fix: `as _`, which infers correctly on both and clippy does not flag.
-
-Second failure in a row from the same three lines: 87a99d4 fixed an E0308 on Linux by adding
-the casts, and the casts are themselves a Linux lint error.
-
-**The finding underneath the bug, which is the one worth acting on.** All six of us develop on
-one macOS host, so `make check` locally cannot catch a Linux-only break — by construction, not
-by oversight. Both of these reached `main` with a green local gate, and the first shipped a
-host image with no host binary in it. Our pre-merge gate is macOS-shaped and production is
-Linux, so for anything touching `libc`, `#[cfg]`, or the container images, "green locally"
-carries no information at all.
-
-Proposed to API (their crate pays for it, so their call): either a `cargo check --target
-x86_64-unknown-linux-gnu` step in `make check` that exits 77 where the target is not
-installed, or a Linux `cargo clippy` folded into the `docker-sandbox` job, which already has
-a Linux container and would return the verdict in ~2 minutes instead of at CI time.
-
-This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
-faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
-that means less than the person reading it believes.
-
----
-
-## 015 — `wheel-host` does not compile on Linux · S2 · API
+## 015 — `wheel-host` does not compile on Linux · S2 · API · CLOSED (87a99d4)
 
 **Repro:** `docker compose -f infra/docker-compose.yml up -d --build` on any Linux target
 (CI, or the `host` service's own `debian:bookworm-slim` builder — so this reproduces on a
@@ -650,3 +623,32 @@ argument for a Linux build in the pre-merge gate rather than only in CI.
 
 **Not worked around.** Unlike 013 and 014 there is nothing for QA to pin: the binary does not
 build. The integration gate is red until this lands.
+
+---
+
+## 016 — `main` is red on `rust:clippy`, Linux only · S2 · API
+
+`crates/wheel-host/src/sandbox/process.rs`, `Rlimits::as_pairs`: `libc::RLIMIT_NPROC as u32`
+and five siblings. On glibc `RLIMIT_NPROC` is already `u32`, so clippy fires
+`unnecessary_cast` — fatal under `-D warnings`. On macOS the same cast is `c_int -> u32` and
+required. Fix: `as _`, which infers correctly on both and clippy does not flag.
+
+Second failure in a row from the same three lines, and the direct result of the first:
+BUG-015 was an E0308 on Linux, 87a99d4 fixed it by adding these casts, and the casts are
+themselves a Linux lint error. Two bugs, one root cause — a platform-shaped gate.
+
+**The finding underneath the bug, which is the one worth acting on.** All six of us develop on
+one macOS host, so `make check` locally cannot catch a Linux-only break — by construction, not
+by oversight. Both of these reached `main` with a green local gate, and the first shipped a
+host image with no host binary in it. Our pre-merge gate is macOS-shaped and production is
+Linux, so for anything touching `libc`, `#[cfg]`, or the container images, "green locally"
+carries no information at all.
+
+Proposed to API (their crate pays for it, so their call): either a `cargo check --target
+x86_64-unknown-linux-gnu` step in `make check` that exits 77 where the target is not
+installed, or a Linux `cargo clippy` folded into the `docker-sandbox` job, which already has
+a Linux container and would return the verdict in ~2 minutes instead of at CI time.
+
+This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
+faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
+that means less than the person reading it believes.
