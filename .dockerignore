@@ -1,0 +1,8 @@
+# Build context for docker/Dockerfile.* — only what the binaries need.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!docker/
+crates/**/target/
+**/.DS_Store
