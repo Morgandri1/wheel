@@ -89,6 +89,8 @@ else
   skip "qa:harness-selftest" "python3 not installed"
 fi
 
+step "qa:wire-matrix" python3 qa/tools/gen_wire_matrix.py --check
+
 if ls docs/schema/*.json >/dev/null 2>&1; then
   step "qa:contract-schema" python3 qa/contract/schema_fixtures.py
 else
