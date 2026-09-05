@@ -55,3 +55,6 @@ The mock parses NO request body, so all four claims are verified for path/query/
 only — never for request-BODY json-pointer fills, which is exactly where §3d's vault-in-body and
 duplicate-/case-variant-pointer override attacks live. The mock fail-closed-rejects body args today.
 These claims MUST be re-attacked against the engine importer for body fills.
+
+## Consolidation note
+A concurrent ADVERSARY session filed the same finding as `012-tool-fill-static-unmasked-in-curl.md` (commit 42cb0dc); same conclusion. Consolidated here (this file is the superset — adds the verbatim-source PoC, the 3 resisting claims, and the body-fills coverage gap). Duplicate removed to prevent §3c#15 drift.
