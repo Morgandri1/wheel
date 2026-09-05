@@ -50,3 +50,33 @@ def request(method: str, path: str, *, headers: dict | None = None, body: bytes 
 def result(passed: bool, msg: str) -> int:
     print(("PASS: resisted — " if passed else "FAIL: FINDING — ") + msg)
     return 0 if passed else 1
+
+
+# --- compatibility API used by the campaign probes (req/finish) ---------------
+
+def req(method: str, path: str, *, token: str | None = None, project: str | None = None,
+        headers: dict | None = None, body=None, follow_redirects: bool = False):
+    """Like request(), but sets the tenancy headers and encodes a str body. Returns (status, headers, bytes)."""
+    hdrs = dict(headers or {})
+    if token is not None:
+        hdrs["x-auth-token"] = token
+    if project is not None:
+        hdrs["x-project-id"] = project
+    data = body.encode() if isinstance(body, str) else body
+    return request(method, path, headers=hdrs, body=data, follow_redirects=follow_redirects)
+
+def finish(run):
+    """Run a probe's run(argv)->None|str. None = resisted (PASS); str = the finding (FAIL).
+    Skips cleanly with a clear reason when the stack or its env is not set."""
+    import os as _os
+    if not stack():
+        print("PENDING-STACK: set WHEEL_STACK (+ per-probe WHEEL_TOKEN_A/WHEEL_PROJECT_A etc.) to run")
+        sys.exit(0)
+    try:
+        finding = run(sys.argv[1:])
+    except Exception as e:  # a probe crash is not a PASS
+        print(f"ERROR: probe raised {e!r}")
+        sys.exit(2)
+    if finding is None:
+        sys.exit(result(True, "no leak/SSRF observed"))
+    sys.exit(result(False, finding))
