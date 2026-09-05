@@ -37,3 +37,21 @@ Each is a single-point failure with no schema backstop and no test proving the p
   `config_unknown_key` (mass-assignment surface), `mcp_both`** — then the rest.
 - **Me:** `redteam/pocs/engine-wire/` grows a config-rejection probe posting the 12 fixtures to
   `POST /v1/nodes` and asserting 400 on each. Status flips to CONFIRMED or CLOSED on that result.
+
+## VERIFIED (live, 2026-09-05, docker-backend engine wheel-engine:dev @ :8080 via proxy)
+Ran the 12 engine-enforced BUG-001 fixtures at `POST /v1/projects/:id/engine/v1/nodes`. **All 12
+REJECTED** — the surviving layer HOLDS:
+- 422 (serde `deny_unknown_fields` / unknown variant / missing field): config_unknown_key,
+  state_in_config, vault_with_values, mcp_both, mcp_http_no_url, mcp_stdio_no_command,
+  endpoint_auth_bad_mode, endpoint_auth_bearer_no_ref.
+- 400 (explicit validate.rs): endpoint_no_slash, endpoint_traversal ("must not contain .."),
+  script_zero_timeout, script_timeout_over_max ("must be between …").
+
+**Re-scoping:** the earlier concern ("one untested layer that might fail") is retired — the engine
+layer is now verified to reject every one. The residual is narrower and lower: the *schema* half
+(docs/schema/*.json, Web's type source + any API-side schema check) is still loose (QA BUG-001), so
+defense-in-depth is ASYMMETRIC (strong engine, loose schema), not absent. Fix the schema so a client
+that trusts it can't build a forbidden config, but there is **no runtime bypass** via the engine.
+Severity effectively drops to the schema-strictness issue QA already tracks as BUG-001 (S2). PoC:
+`redteam/pocs/proxy-ingress/live_campaign.py`-style; reproduced inline. Coverage bar (validate.rs 73%)
+is now an assurance gap for SDK, not evidence of a hole.
