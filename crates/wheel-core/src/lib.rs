@@ -25,7 +25,7 @@ pub mod tool;
 pub mod validate;
 pub mod wire;
 
-pub use event::{Event, LogLine, LogStream, WireDenial};
+pub use event::{Event, LogLine, LogStream, WireDenial, LAGGED_HINT};
 pub use host::{
     Capabilities, ErrorBody, ErrorDetail, HostHealth, SandboxBackend, SandboxInfo, SandboxStatus,
     SandboxUpsert,

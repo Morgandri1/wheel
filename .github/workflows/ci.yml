@@ -8,7 +8,13 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main. Merges land every few minutes, and cancel-in-progress
+  # meant each one killed the previous run's verdict — eight consecutive "cancelled"
+  # results and no completed check on main for over half an hour. A cancelled run is
+  # indistinguishable from an untested commit, so main was effectively unverified.
+  # Main runs now queue and each merge gets its own verdict, even if it lags.
+  # Branches and PRs still cancel, where only the latest result is interesting.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always

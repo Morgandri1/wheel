@@ -154,6 +154,23 @@ pub async fn log(
     Path(id): Path<Uuid>,
     Query(q): Query<LogQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // An unknown stream is refused rather than ignored. Passing it through to
+    // SQL would match no rows and return an EMPTY page, which is the worst
+    // outcome: the operator sees a heading with nothing under it and concludes
+    // the agent produced no output. A filter that silently does not filter is
+    // worse than one that says no.
+    if let Some(stream) = q.stream.as_deref() {
+        if serde_json::from_value::<wheel_core::LogStream>(serde_json::Value::String(
+            stream.to_string(),
+        ))
+        .is_err()
+        {
+            return Err(ApiError::invalid(format!(
+                "unknown stream {stream:?}; valid streams are stdout, stderr, engine, transcript"
+            )));
+        }
+    }
+
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).min(10_000) as i64;

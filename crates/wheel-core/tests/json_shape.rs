@@ -437,3 +437,41 @@ fn idle_timeout_defaults_to_300_and_zero_disables_parking() {
     };
     assert_eq!(c.idle_timeout_secs(), 0);
 }
+
+/// Regression: the supervisor writes a `transcript` log stream (§3c#10), but
+/// LogStream had no such variant, so every transcript line failed to parse into
+/// an event and was silently DROPPED from the WebSocket — persisted to the
+/// database, never broadcast. Web caught this; my own end-to-end test missed it
+/// because it only asserted that *a* log event arrived.
+#[test]
+fn every_stream_the_engine_writes_round_trips_as_a_log_stream() {
+    for name in ["stdout", "stderr", "engine", "transcript"] {
+        let parsed: LogStream =
+            serde_json::from_value(json!(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(name));
+    }
+    // ...and an unknown stream is still rejected, so the filter cannot silently
+    // stop filtering.
+    assert!(serde_json::from_value::<LogStream>(json!("bogus")).is_err());
+}
+
+/// The `lagged` frame travels on the events socket, so a client typing the
+/// union from the schema must find it there. Otherwise it lands in the default
+/// branch, and the natural default — tear down and reconnect — is exactly wrong
+/// at the moment the socket is healthy and merely behind.
+#[test]
+fn the_lagged_frame_is_part_of_the_event_union() {
+    let e = Event::Lagged {
+        hint: LAGGED_HINT.to_string(),
+    };
+    let v = serde_json::to_value(&e).unwrap();
+    assert_eq!(v["type"], json!("lagged"));
+    assert_eq!(
+        v["hint"],
+        json!("events were dropped; refetch GET /v1/board")
+    );
+    // Round-trips, so a client can deserialize it with the same union it uses
+    // for every other frame.
+    let back: Event = serde_json::from_value(v).unwrap();
+    assert_eq!(back, e);
+}
