@@ -153,12 +153,15 @@ async function authError(res: Response): Promise<ApiError> {
     /* fall through to our own copy */
   }
   if (res.status === 429) {
+    // API: the login limit is keyed per EMAIL, not per browser — so the person reading this may
+    // be throttled by someone else attacking their account. The copy says what to do and does
+    // not accuse them of anything.
     const after = Number(res.headers.get("retry-after"));
     message =
       message ||
       (Number.isFinite(after) && after > 0
-        ? `Too many attempts. Try again in ${Math.ceil(after)} seconds.`
-        : "Too many attempts. Wait a moment and try again.");
+        ? `Sign-in is paused for this account. Try again in ${Math.ceil(after)} seconds.`
+        : "Sign-in is paused for this account. Try again shortly.");
   }
   if (!message) message = fallbackMessage(res.status);
   return new ApiError(res.status, code, message);

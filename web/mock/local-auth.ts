@@ -78,7 +78,7 @@ export function login(body: { email?: unknown; password?: unknown }) {
 
   if (record && record.until > now) {
     const seconds = Math.ceil((record.until - now) / 1000);
-    throw new EngineRefusal(429, `Too many attempts. Try again in ${seconds} seconds.`, "rate_limited", {
+    throw new EngineRefusal(429, `Sign-in is paused for this account. Try again in ${seconds} seconds.`, "rate_limited", {
       "retry-after": String(seconds),
     });
   }

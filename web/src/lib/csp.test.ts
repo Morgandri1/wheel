@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { buildCsp } from "./csp";
 
 const base = { nonce: "abc123", apiUrl: "https://api.wheel.dev", authMode: "local", dev: false };
-const parse = (policy: string) =>
-  Object.fromEntries(policy.split("; ").map((d) => { const [k, ...v] = d.split(" "); return [k, v]; }));
+const parse = (policy: string): Record<string, string[]> =>
+  Object.fromEntries(policy.split("; ").map((d) => { const [k, ...v] = d.split(" "); return [k!, v]; }));
 
 describe("the production policy", () => {
   const directives = parse(buildCsp(base));
@@ -40,6 +40,15 @@ describe("development", () => {
     expect(directives["connect-src"]).toContain("ws://localhost:*");
   });
 
+  it("drops strict-dynamic so Next's error overlay is readable", () => {
+    // With strict-dynamic, 'self' means nothing and the overlay's un-nonced fallback chunks are
+    // refused — a missing module then renders as a blank page instead of an error.
+    const dev = parse(buildCsp({ ...base, dev: true }));
+    expect(dev["script-src"]).not.toContain("'strict-dynamic'");
+    expect(dev["script-src"]).toContain("'self'");
+    expect(parse(buildCsp(base))["script-src"]).toContain("'strict-dynamic'");
+  });
+
   it("never leaks that relaxation into a production policy", () => {
     expect(buildCsp(base)).not.toContain("localhost");
     expect(buildCsp(base)).not.toContain("unsafe-eval");
@@ -70,7 +79,7 @@ describe("a hostile NEXT_PUBLIC_API_URL", () => {
     expect(policy).not.toContain("also-evil");
     expect(policy).not.toContain("javascript:");
     // Only the parsed origin survives, never the rest of the string.
-    expect(directives["connect-src"]!.every((s) => !s.includes(";"))).toBe(true);
+    expect(directives["connect-src"]!.every((source) => !source.includes(";"))).toBe(true);
   });
 
   it("keeps only the origin when a path or query is attached", () => {
