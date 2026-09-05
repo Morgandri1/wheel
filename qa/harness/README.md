@@ -180,6 +180,24 @@ The fake holds no cross-process state: a new process = a new `session_id` (unles
 `WHEEL_FAKE_SESSION_ID`). So `ephemeral_context: true` is asserted as *"`session_id` in the log
 changed after the turn completed, and the re-applied system prompt + ctx injection reappeared"*.
 
+## 7b. REQUIRED in wheel-engine:test — WHEEL_FAKE_TRANSCRIPT
+
+The test image must spawn every agent child with:
+
+    WHEEL_FAKE_TRANSCRIPT=/data/qa-transcript.jsonl
+
+This is the single hard dependency of `qa/integration/test_engine_messages.py`, which reads
+that file with `docker exec` to assert what the child actually received.
+
+Why it cannot be replaced by reading the engine's log: the engine's account of what it wrote
+to stdin is the thing under test. If the engine double-encodes, reorders, truncates or
+mis-escapes on the way to the child, its own log will faithfully report what it *intended*
+and the test will pass while the agent received something else. MSG-envelope-escape,
+MSG-envelope-forge, MSG-byte-exact and MSG-single-writer are all unprovable without a
+capture taken on the far side of the pipe.
+
+It is one env var, only in the test image, and it costs nothing at runtime.
+
 ## 8. Asks for SDK
 
 1. Build **`wheel-engine:test`** with the two files above, and a `make engine-image-test` target.
