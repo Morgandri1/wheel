@@ -11,6 +11,7 @@ use std::{
 };
 
 mod api;
+mod auth;
 mod caps;
 mod config;
 mod db;

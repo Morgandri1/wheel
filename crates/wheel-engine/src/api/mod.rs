@@ -144,6 +144,14 @@ pub fn router(state: AppState) -> Router {
             "/agents/{id}/inbox/{message_id}",
             get(agent_routes::inbox_one),
         )
+        .route(
+            "/agents/{id}/auth",
+            get(agent_routes::auth_status).delete(agent_routes::auth_clear),
+        )
+        .route(
+            "/agents/{id}/auth/complete",
+            post(agent_routes::auth_complete),
+        )
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
