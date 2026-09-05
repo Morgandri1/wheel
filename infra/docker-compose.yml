@@ -26,10 +26,12 @@ services:
   host:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.host
+      # SDK owns docker/Dockerfile.host (the full image with engine + cli + claude + codex).
+      # Until that lands, this dev image builds just the supervisor so the stack can run.
+      dockerfile: infra/dev/Dockerfile.host.dev
     environment:
       SANDBOX_BACKEND: docker
-      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-change-me}
+      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
       ENGINE_IMAGE: ${ENGINE_IMAGE:-wheel-engine:dev}
       DOCKER_NETWORK: wheel
       BIND_ADDR: 0.0.0.0:7100
@@ -53,16 +55,19 @@ services:
       WHEEL_ENV: dev
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://wheel:wheel@postgres:5432/wheel
-      CLERK_JWKS_URL: ${CLERK_JWKS_URL:?set CLERK_JWKS_URL}
-      CLERK_ISSUER: ${CLERK_ISSUER:?set CLERK_ISSUER}
-      API_MASTER_KEY: ${API_MASTER_KEY:?generate with: openssl rand -base64 32}
+      # Dev defaults: with AUTH_DEV_SECRET set, HS256 tokens are verified locally and the
+      # JWKS endpoint is never contacted. `iss` is still validated, so minted tokens must carry
+      # exactly CLERK_ISSUER.
+      CLERK_JWKS_URL: ${CLERK_JWKS_URL:-http://localhost/unused-jwks}
+      CLERK_ISSUER: ${CLERK_ISSUER:-https://dev.wheel.local}
+      API_MASTER_KEY: ${API_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
       WHEEL_HOST_URL: http://host:7100
-      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-change-me}
+      WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
       PUBLIC_BASE_URL: http://localhost:8080
       CORS_ALLOWED_ORIGINS: http://localhost:3000
       # Local HS256 tokens for testing without Clerk. Only honoured because WHEEL_ENV=dev;
       # the API refuses to boot if this is set with WHEEL_ENV=prod.
-      AUTH_DEV_SECRET: ${AUTH_DEV_SECRET:-}
+      AUTH_DEV_SECRET: ${AUTH_DEV_SECRET:-dev-only-hs256-secret}
       RUST_LOG: info,wheel_api=debug
     ports: ["8080:8080"]
     networks: [wheel]

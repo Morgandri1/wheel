@@ -1,0 +1,21 @@
+# Development image for wheel-host.
+#
+# Temporary: SDK owns docker/Dockerfile.host, which will build the real image (engine + cli +
+# claude + codex + python + node) with wheel-host added on top. Until that exists this builds just
+# the supervisor so the local stack can run. Debug profile on purpose — dev iteration speed matters
+# more here than runtime performance.
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+RUN cargo build -p wheel-host
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/debug/wheel-host /usr/local/bin/wheel-host
+# Runs as root: the supervisor must setuid children to per-project uids (ADVERSARY F007).
+EXPOSE 7100
+ENTRYPOINT ["/usr/local/bin/wheel-host"]
