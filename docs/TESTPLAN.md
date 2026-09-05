@@ -275,6 +275,57 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 
 ---
 
+## 7a. AUTH-local — local email/password provider (§2, `AUTH_MODE=local`)
+
+Auth is pluggable: `local` (users table, argon2id, API-issued HS256 session JWTs) or `jwks`
+(RS256 against a provider's issuer). The `x-auth-token` contract in §7 is unchanged, so every
+`API-auth-*` and `API-auth-owner-404` criterion applies identically under both modes and is
+re-run per mode. This section covers only what the local provider adds.
+
+Password auth is the one area where we now store a secret we can leak. Two things get
+disproportionate weight below: **not telling an unauthenticated caller whether an account
+exists** (`AUTH-local-*-enum*`), and **not letting a token minted for one mode work in
+another** (`AUTH-local-mode-*`) — a token accepted by the wrong verifier is a full tenant
+compromise, and mode-switching is exactly when that happens.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-local-signup` | `POST /v1/auth/signup {email, password}` creates the user and returns a session token that authenticates on `GET /v1/auth/me`. `me` returns `{id, email, created_at}` and **never** a hash, salt, or params. | S2 |
+| `AUTH-local-login` | `POST /v1/auth/login` with correct credentials returns a token equivalent to signup's; `GET /v1/auth/me` agrees on `sub`. | S2 |
+| `AUTH-local-logout` | `POST /v1/auth/logout` succeeds. Whether the issued JWT is revoked server-side or merely dropped client-side is a **contract question, not an implementation detail**: if the token still works after logout, that must be documented in API.md as stateless-until-expiry with the expiry stated. Asserted either way — silence is the failure. | S2 |
+| `AUTH-local-wrong-password` | Wrong password → 401. Body and status are **byte-identical** to `AUTH-local-no-such-user`. | **S1** |
+| `AUTH-local-no-such-user` | Unknown email → 401, byte-identical to the wrong-password response. No "no such account" anywhere, including error codes and headers. | **S1** |
+| `AUTH-local-timing` | Wrong password and unknown email take indistinguishable time — the unknown-email path must still perform argon2id work against a dummy hash. Asserted statistically (≥200 samples per arm, medians within noise), because a skipped KDF is a ~100 ms tell that enumerates every user we have. | **S1** |
+| `AUTH-local-dup-email` | Signup with an existing email fails and creates no second row. Whether it 409s (an enumeration oracle on the signup route, which is conventional and usually accepted) or returns success-without-account is API's call — the test asserts whichever API.md documents, and that the account count is unchanged. | S2 |
+| `AUTH-local-email-normalise` | `Foo@Example.com` and `foo@example.com` are the **same account**. Asserted from both directions: signup A then signup B is a duplicate, and login with either casing works. Without folding, the duplicate check is bypassable and two users own one identity. | **S1** |
+| `AUTH-local-email-invalid` | Non-addresses (`""`, `"a"`, `"a@"`, `"@b"`, a 10 KiB string, a header-injection attempt `a@b\r\nX: y`) are rejected at validation, before any DB write. | S2 |
+| `AUTH-local-pw-policy` | Passwords shorter than 10 characters are rejected at signup **and** at any password change; the boundary is asserted at 9 (reject) and 10 (accept), counted in characters not bytes (a 10-emoji password is 10). | S2 |
+| `AUTH-local-pw-maxlen` | An over-long password is rejected by length **before** hashing (argon2id over a 10 MiB body is a free CPU-exhaustion DoS). Cap documented in API.md; asserted at the boundary. | **S1** |
+| `AUTH-local-pw-bytes` | Passwords survive exactly: unicode, spaces, a trailing newline, and an embedded NUL are either accepted and round-trip to a working login, or rejected — never silently truncated at the NUL (a truncating hash makes `"pw\0anything"` log in). | **S1** |
+| `AUTH-local-hash-alg` | Stored credentials are argon2id with per-user salt and documented params; the DB column holds no plaintext and no unsalted digest. Asserted by reading the row directly in the integration stack. | **S1** |
+| `AUTH-local-no-log` | No password, hash, or session token appears in API logs at any level, on the success path or the failure path — including request-body debug logging and 500 traces. Asserted by grepping captured container logs after driving every auth route. | **S1** |
+| `AUTH-local-ratelimit` | Repeated failed logins for one account are rate-limited (429) per API.md. Per-replica limiting is acceptable in v1 (§5) **if API.md says so** — the test asserts the documented behaviour, and records the multiplier N replicas gives an attacker. | S2 |
+| `AUTH-local-ratelimit-no-lockout` | Rate limiting must not let a third party lock a victim out permanently: it decays, or is keyed so that an attacker cannot hold a known email locked. Whichever API chooses is documented and asserted. | S3 |
+| `AUTH-local-token-alg` | The session JWT is HS256 and the verifier **pins** it: `alg: none`, `alg: RS256` signed with anything, and a token signed with a different secret are all 401. | **S1** |
+| `AUTH-local-token-claims` | Token carries `sub` = the user's id, plus `iss`/`exp`/`nbf`; an expired or not-yet-valid token → 401. `sub` is the identity used for `project.owner_id`, so a token whose `sub` is a *different* user's id must not be mintable by that user. | **S1** |
+| `AUTH-local-token-not-owner` | Signup does not let a caller choose their own `id`/`sub`/`owner_id` — a `{"id": "<victim uuid>"}` field in the signup body is ignored or rejected, never honoured. | **S1** |
+| `AUTH-local-deleted-user` | A token for a deleted user stops working (401/404), and its projects are not reachable by it. | S2 |
+| `AUTH-local-tenancy` | Two locally-registered users are two tenants: `API-auth-owner-404` holds between them, byte-identically. This is §7's ownership suite re-run on real local accounts rather than minted dev tokens. | **S1** |
+| `AUTH-local-mode-jwks-rejects-local` | Under `AUTH_MODE=jwks`, a token issued by the local provider → 401. The HS256/RS256 split must be enforced by the *verifier*, not by the token's own header. | **S1** |
+| `AUTH-local-mode-local-rejects-jwks` | Under `AUTH_MODE=local`, a valid provider (RS256) token → 401. | **S1** |
+| `AUTH-local-mode-local-rejects-dev` | Under `AUTH_MODE=local`, a dev HS256 token minted with `AUTH_DEV_SECRET` → 401. Both are HS256, so this is the one confusion the algorithm check cannot catch — it must be caught by key and issuer. | **S1** |
+| `AUTH-local-mode-routes` | Under `AUTH_MODE=jwks` the `/v1/auth/*` local routes are absent or 404 — a JWKS deployment must not expose a second, weaker way to mint a token for the same tenancy. | **S1** |
+| `AUTH-local-mode-interlock` | `API-dev-interlock-boot` extended: whether `AUTH_DEV_SECRET` is honoured under `AUTH_MODE=local` is an explicit decision, not an accident. Recommendation: the interlock stays as-is (dev secret only when `WHEEL_ENV=dev`) and local mode is orthogonal to it. Asserted against whatever API.md states. | **S1** |
+| `AUTH-local-migration` | The users table migration is idempotent and applies to an empty DB; `email` carries a unique constraint (asserted at the DB level, so a race between two concurrent signups cannot create two rows — the constraint is the guard, not the SELECT-then-INSERT above it). | S2 |
+| `AUTH-local-signup-race` | Two concurrent signups for the same email produce exactly one account; the loser gets the documented duplicate response, not a 500. | S2 |
+
+**Open question for API (recorded, not blocking):** is there a password-change / reset route in
+v1? There is no mail provider until M3 (§3e), so a reset flow has nowhere to send a token.
+If v1 ships without reset, `docs/API.md` should say so explicitly — an undocumented gap here
+reads as an oversight to anyone auditing us later.
+
+---
+
 ## 8. ING — ingress (§2, §5)
 
 | ID | Criterion | Sev |
@@ -394,7 +445,14 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | ID | Criterion |
 |---|---|
 | `E2E-landing` | Landing page renders, no console errors. |
-| `E2E-signin` | Sign-in via Clerk test mode; unauthenticated `/app` redirects. |
+| `E2E-signin` | Sign-in through whatever `NEXT_PUBLIC_AUTH_MODE` is built with; unauthenticated `/app` redirects. |
+| `E2E-local-signup` | (`AUTH_MODE=local`) Sign-up page creates an account and lands on `/app` already authenticated — no second login step. |
+| `E2E-local-login` | Sign-in page authenticates an existing account; the session survives a full page reload. |
+| `E2E-local-logout` | Logout returns to the signed-out state, and `/app` redirects again afterwards — asserted by navigation, not by whether a button changed label. |
+| `E2E-local-bad-password` | A wrong password shows an error **in the UI** and does not navigate. The message must not distinguish wrong-password from unknown-account (`AUTH-local-wrong-password` seen from the browser — the enumeration oracle we most plausibly reintroduce is a helpful error string in the client). |
+| `E2E-local-pw-policy` | A password under the policy is rejected with a message naming the requirement, before any request is sent. |
+| `E2E-local-token-storage` | The session token is not left anywhere a page script can trivially exfiltrate it — assert what Web actually does and that it is deliberate. `localStorage` is acceptable in v1 **if** it is the documented choice. **S1** to leave undocumented. |
+| `E2E-auth-mode-mirror` | The header's `auth-mode` testid reflects the mode the API is actually running (`local` \| `clerk` \| `mock` \| `dev`); a web built for one mode against an API in another fails loudly at sign-in rather than half-working. |
 | `E2E-project-create` | Create a project; it appears and reaches `running`. |
 | `E2E-place-nodes` | Place an `agent` and a `ctx` node on the board; they persist across reload. |
 | `E2E-wire` | Draw `ctx→agent`; an illegal wire is refused **in the UI** with a reason, not just by the API. |

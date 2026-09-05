@@ -11,6 +11,12 @@ never adopted", which is how an E2E suite quietly stops testing anything.
 
 Template ids (`node-${name}`) are checked by their literal prefix, since the suffix is
 data. A prefix no component emits is still a broken selector.
+
+Selectors between DEFERRED-BEGIN and DEFERRED-END name UI a milestone has not built
+yet. They are exempt from the missing check — and inverted: once web/src starts
+rendering one, this gate FAILS, because a deferred selector that works is a test
+somebody owes. That is the same discipline as a tracked known-bug fixture: the marker
+expires by breaking, not by being forgotten.
 """
 import os, re, sys
 
@@ -46,17 +52,32 @@ def main():
         return SKIP
 
     src = open(TESTIDS).read()
-    wanted = {m for m in LITERAL.findall(src)}
+    deferred = set()
+    for block in re.findall(r"DEFERRED-BEGIN(.*?)DEFERRED-END", src, re.S):
+        deferred |= set(LITERAL.findall(block))
+    wanted = {m for m in LITERAL.findall(src)} - deferred
     prefixes = {m for m in TEMPLATE.findall(src) if m}
     have = web_testids()
 
     missing = sorted(t for t in wanted if t not in have)
+    landed = sorted(t for t in deferred if t in have)
     missing_prefix = sorted(p for p in prefixes
                             if not any(h.startswith(p) for h in have))
 
     print("testids referenced by the E2E suite: %d literal, %d templated"
           % (len(wanted), len(prefixes)))
     print("testids present in web/src:          %d" % len(have))
+    if deferred:
+        print("deferred to a later milestone:       %d (%s)"
+              % (len(deferred), ", ".join(sorted(deferred))))
+
+    if landed:
+        print("\n%d DEFERRED selector(s) web/src now renders:" % len(landed))
+        for t in landed:
+            print("  - %s" % t)
+        print("\nThe UI these name has shipped, so the E2E coverage for it is now owed.\n"
+              "Move them out of the DEFERRED block and write the test.")
+        return 1
 
     if missing or missing_prefix:
         print("\n%d selector(s) the E2E suite uses that WEB DOES NOT RENDER:"
