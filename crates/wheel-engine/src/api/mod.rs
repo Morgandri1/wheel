@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{id}/start", post(agent_routes::start))
         .route("/agents/{id}/stop", post(agent_routes::stop))
         .route("/agents/{id}/restart", post(agent_routes::restart))
+        .route("/agents/{id}/clear", post(agent_routes::clear))
         .route("/agents/{id}/send", post(agent_routes::send))
         .route("/agents/{id}/log", get(agent_routes::log))
         .route("/agents/{id}/inbox", get(agent_routes::inbox))

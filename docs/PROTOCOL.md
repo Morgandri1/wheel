@@ -106,6 +106,34 @@ so the two cannot disagree. Self-wires are rejected. Creating a wire that alread
 The supervisor holds a per-agent mutex across spawn, so concurrent starts cannot race into two processes.
 **A message never starts a process** — it enqueues.
 
+**A dead child is reaped, and a start after a failure really starts.** The supervisor owns the process, so it
+is the only thing that decides an agent is no longer running: when the child's pipes close, its slot is
+cleared, anything written to it that never ran a turn goes back to `queued`, its node token is revoked, and the
+status settles (`needs_auth` / `error` / `stopped` — an exit with nothing on stderr is `stopped`, because that
+is also what a clean shutdown looks like). Each spawn carries a run id, so a dying child never settles a slot
+that already holds its replacement. Before this, a slot left occupied made every later `start` a silent
+no-op — `200 OK`, no process — which is exactly the path an operator walks when authenticating for the first
+time.
+
+### `run_on_startup` — parked, not running
+
+An agent configured `run_on_startup` comes up **`parked`** at engine boot: logically on, no process (§2 —
+`run_on_startup` starts them parked). It spawns when something is addressed to it, resuming its session
+transparently. A board of twenty such agents therefore costs zero idle processes, which is the whole point;
+the trade is explicit — **an agent that is never messaged never spawns.** Work queued while the engine was
+down is not stranded by this: boot resumes exactly those parked agents that already have a queued message.
+
+Every enqueue path goes through the supervisor's `deliver`, which resumes a parked agent before pumping, so
+"queued to a parked agent" is never a message that waits forever.
+
+### `ephemeral_context`
+
+When a turn completes on an agent configured `ephemeral_context`, the engine discards the session and starts a
+new one — system prompt and every wired `ctx` node re-injected — and only then drains the next queued message.
+The stored session id is cleared *before* the restart, so the new child does not `--resume` the context that
+was just discarded. `POST /v1/agents/:id/clear` (and `wheel ctx clear`) take the same path on demand; the two
+are the same code, so they cannot drift apart.
+
 `GET .../log` `stream` filter accepts `stdout | stderr | engine | transcript`. `transcript` is the exact bytes
 the engine wrote to the child's stdin (§3c#10), exposed on this same route and as ordinary `log` events so the
 UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per agent and is the resume cursor.
@@ -114,7 +142,7 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 
 | Route | Body → Response | M |
 |---|---|---|
-| `POST /v1/agents/:id/auth/begin` | `{mode?}` → `AuthBegin {mode, url?, user_code?, instructions, session}` | M2 |
+| `POST /v1/agents/:id/auth/begin` | `{mode?}` → `AuthBegin {mode, url?, user_code?, instructions, session}` | **M2, first** |
 | `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code M2 |
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
 | `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |

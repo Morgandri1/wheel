@@ -73,7 +73,7 @@ pub async fn start(
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string()))?;
 
     // Anything queued while the agent was stopped drains now.
-    let _ = s.supervisor.pump_queue(id).await;
+    let _ = s.supervisor.deliver(id).await;
     Ok(Json(status_body(&s, id, status)))
 }
 
@@ -106,7 +106,25 @@ pub async fn restart(
         .start(id)
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string()))?;
-    let _ = s.supervisor.pump_queue(id).await;
+    let _ = s.supervisor.deliver(id).await;
+    Ok(Json(status_body(&s, id, status)))
+}
+
+/// `POST /v1/agents/:id/clear`
+///
+/// Discard the agent's context and rebuild it: a new session with the system
+/// prompt and every wired ctx node re-injected. Backs `wheel ctx clear` and is
+/// the same path `ephemeral_context` takes after a turn.
+pub async fn clear(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_agent(&s, id)?;
+    let status = s
+        .supervisor
+        .clear_context(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string()))?;
     Ok(Json(status_body(&s, id, status)))
 }
 
@@ -140,7 +158,7 @@ pub async fn send(
 
     // Nudge the loop. If the agent is stopped or mid-turn this is a no-op and
     // the message simply waits — it is never dropped and never truncated.
-    let _ = s.supervisor.pump_queue(id).await;
+    let _ = s.supervisor.deliver(id).await;
 
     Ok((StatusCode::ACCEPTED, Json(MessageReceipt::from(&msg))))
 }

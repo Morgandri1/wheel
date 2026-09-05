@@ -40,6 +40,10 @@ pub use prompt::compose_prompt;
 
 /// What the supervisor knows about one running agent.
 struct Running {
+    /// Identifies THIS spawn. A child's reaper must not settle a slot that
+    /// already holds its replacement — which is exactly what happens when an
+    /// ephemeral turn restarts the session the moment the old child dies.
+    run_id: Uuid,
     session_id: Option<String>,
     stdin: ChildStdin,
     child: Child,
@@ -205,7 +209,9 @@ impl Supervisor {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
+        let run_id = Uuid::new_v4();
         *guard = Some(Running {
+            run_id,
             session_id: None,
             stdin,
             child,
@@ -219,7 +225,7 @@ impl Supervisor {
         // and the status settled exactly once, in a defined order.
         let stderr_done = self.pump_stderr(agent, stderr);
         self.clone()
-            .pump_stdout(agent, stdout, slot.clone(), stderr_done);
+            .pump_stdout(agent, stdout, slot.clone(), stderr_done, run_id);
 
         Ok(AgentStatus::Starting)
     }
@@ -296,10 +302,19 @@ impl Supervisor {
         stdout: tokio::process::ChildStdout,
         slot: Arc<AsyncMutex<Option<Running>>>,
         stderr_done: tokio::task::JoinHandle<String>,
+        run_id: Uuid,
     ) {
         let db = self.db.clone();
         let harness = self.harness.clone();
         let bus = self.events.clone();
+        let ephemeral = {
+            let conn = db.lock().unwrap();
+            board::get(&conn, agent)
+                .ok()
+                .flatten()
+                .and_then(|n| n.config.as_agent().map(|a| a.ephemeral_context))
+                .unwrap_or(false)
+        };
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -380,10 +395,17 @@ impl Supervisor {
                             );
                         }
 
-                        // The turn is over, so the next queued message may now
-                        // be written. This is the only place delivery resumes:
-                        // one message per turn, never mid-turn.
-                        let _ = self.pump_queue(agent).await;
+                        // The turn is over. Either the context is discarded
+                        // and rebuilt first, or the next queued message may be
+                        // written now. This is the only place delivery
+                        // resumes: one message per turn, never mid-turn.
+                        if ephemeral {
+                            if let Err(e) = self.clear_context(agent).await {
+                                tracing::warn!(agent = %agent, error = %e, "ephemeral restart failed");
+                            }
+                        } else {
+                            let _ = self.pump_queue(agent).await;
+                        }
                     }
                     HarnessEvent::Unknown { raw } => {
                         if raw.is_empty() {
@@ -396,7 +418,7 @@ impl Supervisor {
             }
 
             // stdout closed: the child is gone. Reap it.
-            self.reap(agent, slot, stderr_done).await;
+            self.reap(agent, slot, stderr_done, run_id).await;
         });
     }
 
@@ -412,15 +434,20 @@ impl Supervisor {
         agent: Uuid,
         slot: Arc<AsyncMutex<Option<Running>>>,
         stderr_done: tokio::task::JoinHandle<String>,
+        run_id: Uuid,
     ) {
         // Wait for stderr so the classification below sees the whole message.
         // Without this the two tasks race and the reason is a coin flip.
         let captured = stderr_done.await.unwrap_or_default();
 
         let mut guard = slot.lock().await;
+        if guard.as_ref().map(|r| r.run_id) != Some(run_id) {
+            // Either `stop()` already took the slot and set the status, or a
+            // replacement child is now living in it. Settling either one would
+            // report this dead process's fate as the live one's.
+            return;
+        }
         let Some(mut running) = guard.take() else {
-            // `stop()` already took the slot and set the status. Nothing to
-            // settle, and overwriting its Stopped would be a lie.
             return;
         };
         let _ = running.child.wait().await;
@@ -489,6 +516,96 @@ impl Supervisor {
         })
     }
 
+    /// Discard an agent's context and rebuild it: a NEW harness session with
+    /// the system prompt and every wired ctx node re-injected, then the queue
+    /// drains again.
+    ///
+    /// This is `ephemeral_context` after a turn and `wheel ctx clear` on
+    /// demand; both want the same thing, so they are the same code path. The
+    /// session id is cleared BEFORE the restart, or the new child would
+    /// `--resume` the context we are throwing away.
+    pub async fn clear_context(self: &Arc<Self>, agent: Uuid) -> Result<AgentStatus> {
+        {
+            let slot = self.slot(agent).await;
+            let mut guard = slot.lock().await;
+            if let Some(mut r) = guard.take() {
+                let _ = r.child.kill().await;
+            }
+        }
+        {
+            let conn = self.db.lock().unwrap();
+            clear_session(&conn, agent);
+        }
+        let status = self.start(agent).await?;
+        let _ = self.pump_queue(agent).await;
+        Ok(status)
+    }
+
+    /// Bring the board up. Agents configured `run_on_startup` come up
+    /// **parked**, not running (§2: `run_on_startup` starts them parked).
+    ///
+    /// Parked means "logically on, no process": the agent costs nothing until
+    /// something addresses it, and [`Supervisor::deliver`] resumes it on the
+    /// first message. Spawning every such agent at boot is what makes a board
+    /// of twenty agents cost twenty idle processes, which is the bill this
+    /// project exists to avoid. An agent that is never messaged therefore
+    /// never spawns — that is the intended trade, not an oversight.
+    pub async fn start_configured_agents(self: &Arc<Self>) {
+        let agents: Vec<Uuid> = {
+            let conn = self.db.lock().unwrap();
+            board::list(&conn)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| {
+                    n.config
+                        .as_agent()
+                        .map(|a| a.run_on_startup)
+                        .unwrap_or(false)
+                })
+                .map(|n| n.id)
+                .collect()
+        };
+        if agents.is_empty() {
+            return;
+        }
+        {
+            let conn = self.db.lock().unwrap();
+            for id in &agents {
+                set_status_db(&conn, *id, AgentStatus::Parked, None);
+                publish_state(&self.events, &conn, *id);
+            }
+        }
+        tracing::info!(count = agents.len(), "agents parked on startup");
+
+        // Anything already queued from a previous run is addressed to them
+        // now, which resumes exactly the agents that have work.
+        for id in agents {
+            let _ = self.deliver(id).await;
+        }
+    }
+
+    /// Deliver to an agent, resuming it first if it is parked.
+    ///
+    /// Every enqueue path goes through here rather than calling `pump_queue`
+    /// directly: a parked agent has no process to write to, and without the
+    /// resume its messages would sit in the queue looking delivered-any-moment
+    /// forever.
+    pub async fn deliver(self: &Arc<Self>, agent: Uuid) -> Result<()> {
+        let (status, waiting) = {
+            let conn = self.db.lock().unwrap();
+            let status = board::agent_state(&conn, agent).unwrap_or_default().status;
+            // Deliberately not `unwrap_or(false)`: a failed lookup would read
+            // as "nothing is waiting" and strand the queue behind a parked
+            // agent, which is indistinguishable from an idle board.
+            let waiting = messages::has_queued(&conn, agent)?;
+            (status, waiting)
+        };
+        if waiting && matches!(status, AgentStatus::Parked) {
+            self.start(agent).await?;
+        }
+        self.pump_queue(agent).await
+    }
+
     fn set_status(&self, agent: Uuid, status: AgentStatus, err: Option<String>) {
         let conn = self.db.lock().unwrap();
         set_status_db(&conn, agent, status, err);
@@ -539,6 +656,15 @@ fn set_status_db(
             wheel_core::Timestamp::now().to_rfc3339(),
             err,
         ],
+    );
+}
+
+/// Forget the resumable session, so the next start is a NEW context rather
+/// than a `--resume` of the one being discarded.
+fn clear_session(conn: &rusqlite::Connection, agent: Uuid) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET session_id = NULL WHERE node_id = ?1",
+        rusqlite::params![agent.to_string()],
     );
 }
 
@@ -644,7 +770,9 @@ mod tests {
             format!("{envelope}\n")
         }
         fn parse_line(&self, line: &str) -> HarnessEvent {
-            HarnessEvent::Unknown { raw: line.into() }
+            // Same wire format as the real driver, so turn handling is
+            // exercised rather than stubbed.
+            ClaudeDriver.parse_line(line)
         }
         fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
             ClaudeDriver.classify_startup_failure(None, stderr)
@@ -654,6 +782,14 @@ mod tests {
     /// Builds a supervisor whose child is `script`, over an in-memory board
     /// holding one agent node. Returns the agent's id and its scratch dir.
     fn shim_supervisor(name: &str, script: &str) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        shim_supervisor_cfg(name, script, |_| {})
+    }
+
+    fn shim_supervisor_cfg(
+        name: &str,
+        script: &str,
+        tweak: impl FnOnce(&mut wheel_core::AgentConfig),
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -670,15 +806,17 @@ mod tests {
         std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
 
         let conn = crate::db::open_memory().unwrap();
+        let mut agent_cfg = wheel_core::AgentConfig {
+            harness: wheel_core::Harness::Claude,
+            system_prompt: "test".into(),
+            ..Default::default()
+        };
+        tweak(&mut agent_cfg);
         let node = wheel_core::Node::new(
             Uuid::new_v4(),
             name.parse().unwrap(),
             wheel_core::Position::default(),
-            wheel_core::NodeConfig::Agent(wheel_core::AgentConfig {
-                harness: wheel_core::Harness::Claude,
-                system_prompt: "test".into(),
-                ..Default::default()
-            }),
+            wheel_core::NodeConfig::Agent(agent_cfg),
         );
         let id = node.id;
         board::create(&conn, &node).unwrap();
@@ -813,5 +951,153 @@ mod tests {
     fn before_init_there_is_nothing_to_compare_so_events_are_accepted() {
         assert!(session_matches(None, Some("s1")));
         assert!(session_matches(None, None));
+    }
+
+    /// A harness that answers every turn, reporting the session it was told to
+    /// resume so a test can see whether the context survived.
+    const ECHO_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+session=$(cat "$dir/session" 2>/dev/null || echo s1)
+resumed=no
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--resume" ]; then resumed=yes; session=$2; fi
+  shift
+done
+echo "$resumed" >> "$dir/resumes"
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+while IFS= read -r line; do
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"$session\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    fn count(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn enqueue(sup: &Supervisor, to: Uuid, body: &str) {
+        let conn = sup.db.lock().unwrap();
+        messages::enqueue(
+            &conn,
+            wheel_core::MessageSender::User,
+            to,
+            body.to_string(),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// `ephemeral_context`: the turn ends, the session is thrown away, and the
+    /// next message runs in a NEW one. If the session id survived, the context
+    /// the operator asked to discard survived with it.
+    #[tokio::test]
+    async fn an_ephemeral_agent_gets_a_new_session_after_every_turn() {
+        let (sup, id, dir) = shim_supervisor_cfg("ephemeral", ECHO_HARNESS, |c| {
+            c.ephemeral_context = true;
+        });
+
+        enqueue(&sup, id, "first");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        // One turn, then the restart: a second child for the same agent.
+        until("the ephemeral restart to spawn a fresh child", || {
+            count(&dir.join("runs")) == 2
+        })
+        .await;
+
+        // ...and it did NOT resume: both children started clean.
+        let resumes = std::fs::read_to_string(dir.join("resumes")).unwrap();
+        assert!(
+            resumes.lines().all(|l| l == "no"),
+            "an ephemeral agent must not --resume the context it just discarded, got: {resumes:?}"
+        );
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The opposite, so the test above is not just proving that restarts
+    /// happen: a normal agent keeps ONE process and one session across turns.
+    #[tokio::test]
+    async fn a_normal_agent_keeps_its_session_across_turns() {
+        let (sup, id, dir) = shim_supervisor("persistent", ECHO_HARNESS);
+
+        enqueue(&sup, id, "first");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+        until("the first turn to complete", || {
+            status_of(&sup, id) == AgentStatus::Idle
+        })
+        .await;
+
+        enqueue(&sup, id, "second");
+        sup.deliver(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            count(&dir.join("runs")),
+            1,
+            "a non-ephemeral agent must keep one process across turns"
+        );
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `run_on_startup` comes up PARKED, not running (§2). A board of twenty
+    /// agents must not cost twenty idle processes at boot.
+    #[tokio::test]
+    async fn run_on_startup_parks_rather_than_spawning() {
+        let (sup, id, dir) = shim_supervisor_cfg("parky", ECHO_HARNESS, |c| {
+            c.run_on_startup = true;
+        });
+
+        sup.start_configured_agents().await;
+        assert_eq!(status_of(&sup, id), AgentStatus::Parked);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            count(&dir.join("runs")),
+            0,
+            "parking must not spawn a process"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ...and a parked agent wakes when something is actually addressed to it.
+    /// Without this the frugality above would just be a way to never run.
+    #[tokio::test]
+    async fn a_parked_agent_resumes_when_a_message_arrives() {
+        let (sup, id, dir) = shim_supervisor_cfg("wakeup", ECHO_HARNESS, |c| {
+            c.run_on_startup = true;
+        });
+        sup.start_configured_agents().await;
+        assert_eq!(status_of(&sup, id), AgentStatus::Parked);
+
+        enqueue(&sup, id, "wake up");
+        sup.deliver(id).await.unwrap();
+        until("the parked agent to spawn on demand", || {
+            count(&dir.join("runs")) == 1
+        })
+        .await;
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Queued work from a previous run is picked up at boot, so a message that
+    /// arrived while the engine was down is not stranded behind a parked agent.
+    #[tokio::test]
+    async fn boot_resumes_a_parked_agent_that_already_has_queued_work() {
+        let (sup, id, dir) = shim_supervisor_cfg("bootwork", ECHO_HARNESS, |c| {
+            c.run_on_startup = true;
+        });
+        enqueue(&sup, id, "left over from last time");
+
+        sup.start_configured_agents().await;
+        until("boot to resume the agent holding queued work", || {
+            count(&dir.join("runs")) == 1
+        })
+        .await;
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

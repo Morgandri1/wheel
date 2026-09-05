@@ -132,6 +132,17 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Message>> {
 /// agents: any normal-lane message older than [`PROMOTE_AFTER_SECS`] jumps the
 /// queue, and the caller passes how many user messages it has delivered in a
 /// row so that after [`USER_LANE_BURST`] one normal-lane message is let through.
+/// Is anything waiting for this agent? Cheaper than fetching the next message
+/// and used to decide whether resuming a parked agent is worth a process.
+pub fn has_queued(conn: &Connection, agent: Uuid) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE to_id = ?1 AND state = 'queued'",
+        rusqlite::params![agent.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 pub fn next_for_delivery(
     conn: &Connection,
     agent: Uuid,
