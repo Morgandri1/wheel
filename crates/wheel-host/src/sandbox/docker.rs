@@ -91,9 +91,17 @@ impl DockerSandbox {
 
         let host_config = bollard::models::HostConfig {
             // Least privilege. A tenant's agents run arbitrary code by design, so the container is
-            // treated as hostile: no capabilities, no privilege escalation via setuid binaries,
-            // and hard caps so one project cannot starve the machine every other tenant shares.
+            // treated as hostile: hard resource caps so one project cannot starve the machine every
+            // other tenant shares, and every capability dropped except the two below.
             cap_drop: Some(vec!["ALL".into()]),
+            // ADVERSARY ruling F007: the engine drops each child to its own per-node uid, which
+            // needs exactly these two and nothing else. Granting CAP_SETUID/CAP_SETGID rather than
+            // running the engine as unconstrained root is the whole point of the finding — the
+            // engine can change a child's uid and can do nothing else privileged.
+            cap_add: Some(vec!["SETUID".into(), "SETGID".into()]),
+            // Compatible with the above: no_new_privs blocks privilege *gain* through execve
+            // (setuid bits, file capabilities); it does not revoke a capability the process
+            // already holds, so per-child setuid still works.
             security_opt: Some(vec!["no-new-privileges".into()]),
             memory: Some(self.cfg.memory_bytes),
             nano_cpus: Some(self.cfg.nano_cpus),
