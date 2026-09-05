@@ -428,6 +428,19 @@ point of failure (v1 accepts this; host reconciles on restart).
   start it, send it a message from the UI, watch it reply in the log, `wheel msg` between two agents works.
   SDK: engine + host (docker backend) + cli + image. API: auth + projects + host client + proxy + WS. Web: board with agent & ctx nodes,
   inspector, start/stop, chat, log. QA: `make check`, smoke test of the slice. ADVERSARY: threat model + first probes.
+- **M1.5 — RAILWAY DEPLOY (OPERATOR TOP PRIORITY, ahead of M2).** Everything runs on Railway + Vercel with the `process`
+  sandbox backend, using the M1 feature set (board, agents, ctx, messaging, events; API-key agent auth).
+  - API: `process` backend in `wheel-host` (uid per project from a fixed range, `/data/projects/<id>` 0700, setuid/setgid + cleared
+    supplementary groups + no_new_privs, rlimits nproc/fsize/nofile, engine on `/run/wheel/<id>/engine.sock`, reconcile on boot);
+    Railway project `wheel` with services `wheel-api` (2 replicas, public domain), `wheel-host` (1 replica, volume at `/data`, no domain),
+    `postgres`; env per `infra/railway/*/railway.toml`; deploy via `railway` CLI (logged in on this host). Locally the process backend is
+    exercised by running the host image itself with `SANDBOX_BACKEND=process` (one container = the Railway service).
+  - SDK: engine `WHEEL_LISTEN=unix://…` mode verified end-to-end (healthz over the socket, control plane, ingress), runs correctly as a
+    dropped uid, honours `WHEEL_DATA_DIR`; then API-key agent auth so hosted agents can actually run.
+  - Web: Vercel project for `web/`, `NEXT_PUBLIC_AUTH_MODE=clerk`, `NEXT_PUBLIC_API_URL` = the API's Railway domain until `api.wheel.dev` DNS exists.
+  - QA: the full integration suite under `SANDBOX_BACKEND=process` (host image, locally and in CI), plus a Railway smoke against the deployed API.
+  - ADVERSARY: F003/F007 live review of the process backend the moment it boots locally; then the deployed stack (private-network reach, secrets in env).
+  - Operator provides: Clerk production keys (JWKS URL, issuer, publishable key), DNS for `wheel.dev`/`api.wheel.dev`, Vercel access.
 - **M2 — All node types + full wire matrix + ingress + vault/chest/table/script/mcp + `tool` (spec import, fills, executor, MCP exposure) + ephemeral context + run_on_startup.**
 - **M3 — Hardening (red-team findings fixed), `process` sandbox backend on Railway, landing page, deploy (Railway ×2 + Vercel), docs.**
 
