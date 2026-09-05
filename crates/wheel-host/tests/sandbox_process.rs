@@ -35,6 +35,11 @@ fn cfg(data_dir: &str, run_dir: &str) -> Config {
         uid_range_start: 20_000,
         uid_stride: 64,
         run_dir: run_dir.into(),
+        rlimit_nproc: 4096,
+        rlimit_address_space_bytes: None,
+        rlimit_fsize_bytes: 8 * 1024 * 1024 * 1024,
+        rlimit_nofile: 16384,
+        rlimit_cpu_secs: None,
         engine_base_url: "unused".into(),
     }
 }
@@ -243,5 +248,46 @@ async fn starting_without_an_engine_binary_fails_rather_than_reporting_running()
         s.status(&id).await.unwrap(),
         Status::Stopped,
         "a project that failed to start must not read as running"
+    );
+}
+
+/// The two limits that silently kill a build.
+///
+/// Agents developing Wheel run cargo and pnpm inside these sandboxes, so this is not a theoretical
+/// concern — it is the workload. Both defaults were wrong before and both failures are the kind
+/// nobody traces back to an rlimit: an allocation error deep inside a dependency, or a SIGKILL
+/// days into a long-lived sandbox.
+#[test]
+fn build_killing_limits_are_off_by_default() {
+    let (data, run) = (scratch(), scratch());
+    let limits = wheel_host::sandbox::process::Rlimits::from(&cfg(&data, &run));
+
+    assert!(
+        limits.address_space.is_none(),
+        "RLIMIT_AS caps virtual address space, not resident memory. rustc reserves far more than \
+         it commits, so any finite value here fails as an allocation error inside a dependency. \
+         Real memory containment belongs to the cgroup."
+    );
+    assert!(
+        limits.cpu.is_none(),
+        "RLIMIT_CPU is cumulative CPU seconds, not a rate: a sandbox building for days would be \
+         SIGKILLed with nothing connecting the death to the cause."
+    );
+
+    // Still bounded where bounding is safe.
+    assert!(
+        limits.nproc >= 2048,
+        "cargo -j needs headroom, got {}",
+        limits.nproc
+    );
+    assert!(
+        limits.nofile >= 8192,
+        "builds open many files, got {}",
+        limits.nofile
+    );
+    assert!(
+        limits.fsize >= 4 * 1024 * 1024 * 1024,
+        "got {}",
+        limits.fsize
     );
 }

@@ -32,6 +32,13 @@ pub struct Config {
     pub uid_stride: u32,
     /// Where per-project engine sockets live. One 0700 directory per project underneath.
     pub run_dir: String,
+    // Per-child rlimits. Defaults are sized so a cargo/pnpm build inside a sandbox completes;
+    // see Rlimits in sandbox/process.rs for why AS and CPU default to unlimited.
+    pub rlimit_nproc: u64,
+    pub rlimit_address_space_bytes: Option<u64>,
+    pub rlimit_fsize_bytes: u64,
+    pub rlimit_nofile: u64,
+    pub rlimit_cpu_secs: Option<u64>,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
 }
@@ -113,6 +120,19 @@ impl Config {
             uid_range_start: parse_or("UID_RANGE_START", 20_000u32)?,
             uid_stride: parse_or("UID_STRIDE", 64u32)?,
             run_dir: var_or("WHEEL_RUN_DIR", "/run/wheel"),
+            rlimit_nproc: parse_or("RLIMIT_NPROC", 4096u64)?,
+            // 0 means unlimited, which is the default: a virtual-address-space cap is what kills
+            // rustc, and the machine's cgroup is what should bound real memory.
+            rlimit_address_space_bytes: match parse_or("RLIMIT_AS_BYTES", 0u64)? {
+                0 => None,
+                n => Some(n),
+            },
+            rlimit_fsize_bytes: parse_or("RLIMIT_FSIZE_BYTES", 8 * 1024 * 1024 * 1024u64)?,
+            rlimit_nofile: parse_or("RLIMIT_NOFILE", 16384u64)?,
+            rlimit_cpu_secs: match parse_or("RLIMIT_CPU_SECS", 0u64)? {
+                0 => None,
+                n => Some(n),
+            },
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }

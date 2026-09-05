@@ -156,76 +156,64 @@ fn drop_privileges(uid: u32, gid: u32, limits: &Rlimits) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Per-child resource ceilings. A tenant runs arbitrary code by design, so these are the only
-/// thing between one project and the machine every other project shares.
+/// Per-child resource ceilings, tuned for sandboxes that compile code.
+///
+/// Agents developing Wheel run `cargo` and `pnpm` inside these sandboxes, and a build is the most
+/// demanding thing that will ever run here. Limits sized for a web service quietly kill it, so the
+/// defaults below deliberately favour "the build completes" over "the ceiling is tight", and every
+/// one is overridable.
+///
+/// Two limits are off by default, for reasons specific to builds:
+///
+/// * **`RLIMIT_AS` (address space).** This is the classic build killer. It caps *virtual* address
+///   space, not resident memory, and rustc reserves far more than it commits — thread stacks,
+///   allocator arenas, mmapped crate metadata. A value that looks generous still fails as an
+///   allocation error deep inside a dependency, which is close to undiagnosable. Real memory
+///   containment belongs to the machine's cgroup, which counts what is actually used.
+/// * **`RLIMIT_CPU`.** It is cumulative CPU seconds for the life of the process, not a rate. A
+///   long-lived engine doing builds for days would eventually be SIGKILLed for no reason anyone
+///   could connect to the cause.
 #[derive(Clone, Copy)]
 pub struct Rlimits {
-    /// Processes/threads — the fork-bomb ceiling.
+    /// Processes/threads — the fork-bomb ceiling. Must still allow `cargo -j N` plus rustc's own
+    /// threads.
     pub nproc: u64,
-    /// Address space, the practical memory cap without cgroups.
-    pub address_space: u64,
-    /// Largest file the tenant may create.
+    /// Address space. `None` leaves it unlimited; see above.
+    pub address_space: Option<u64>,
+    /// Largest single file the tenant may create.
     pub fsize: u64,
-    /// Open file descriptors.
+    /// Open file descriptors. Builds open a lot of them.
     pub nofile: u64,
-    /// CPU seconds; a runaway loop dies rather than occupying a core forever.
-    pub cpu: u64,
+    /// Cumulative CPU seconds. `None` leaves it unlimited; see above.
+    pub cpu: Option<u64>,
 }
-
-/// `setrlimit`'s resource argument is not the same type everywhere: glibc takes
-/// `__rlimit_resource_t` (an enum, u32) while the BSDs take a plain `c_int`. Writing either one
-/// directly compiles on the machine you happen to be using and fails on the other — which is how
-/// a macOS-green build hid a broken Linux target, the platform we actually deploy to.
-#[cfg(all(unix, target_env = "gnu"))]
-type RlimitResource = libc::__rlimit_resource_t;
-#[cfg(all(unix, not(target_env = "gnu")))]
-type RlimitResource = libc::c_int;
 
 impl Rlimits {
     #[cfg(unix)]
-    fn as_pairs(&self) -> [(RlimitResource, libc::rlim_t); 5] {
-        [
-            (
-                libc::RLIMIT_NPROC as RlimitResource,
-                self.nproc as libc::rlim_t,
-            ),
-            (
-                libc::RLIMIT_AS as RlimitResource,
-                self.address_space as libc::rlim_t,
-            ),
-            (
-                libc::RLIMIT_FSIZE as RlimitResource,
-                self.fsize as libc::rlim_t,
-            ),
-            (
-                libc::RLIMIT_NOFILE as RlimitResource,
-                self.nofile as libc::rlim_t,
-            ),
-            (libc::RLIMIT_CPU as RlimitResource, self.cpu as libc::rlim_t),
-        ]
+    fn as_pairs(&self) -> Vec<(libc::c_int, libc::rlim_t)> {
+        let mut v = vec![
+            (libc::RLIMIT_NPROC, self.nproc as libc::rlim_t),
+            (libc::RLIMIT_FSIZE, self.fsize as libc::rlim_t),
+            (libc::RLIMIT_NOFILE, self.nofile as libc::rlim_t),
+        ];
+        if let Some(bytes) = self.address_space {
+            v.push((libc::RLIMIT_AS, bytes as libc::rlim_t));
+        }
+        if let Some(secs) = self.cpu {
+            v.push((libc::RLIMIT_CPU, secs as libc::rlim_t));
+        }
+        v
     }
 }
-
-/// How much virtual address space a project may map, as a multiple of its memory budget.
-///
-/// `RLIMIT_AS` caps *address space*, not resident memory, and that distinction matters: a Rust
-/// runtime reserves far more virtual space than it ever commits — thread stacks, allocator arenas,
-/// and every `mmap` the sqlite and TLS stacks make. Setting this equal to the memory budget looks
-/// tight and correct, and then fails as an allocation error deep inside a dependency, which is
-/// close to undiagnosable in production. The multiplier keeps it a real ceiling on runaway growth
-/// while leaving room for reservations that cost no physical memory.
-const ADDRESS_SPACE_MULTIPLIER: u64 = 8;
 
 impl From<&Config> for Rlimits {
     fn from(cfg: &Config) -> Self {
         Rlimits {
-            nproc: cfg.pids_limit.max(1) as u64,
-            address_space: (cfg.memory_bytes.max(1) as u64)
-                .saturating_mul(ADDRESS_SPACE_MULTIPLIER),
-            fsize: 2 * 1024 * 1024 * 1024,
-            nofile: 4096,
-            // Generous: agents are long-lived, so this is a runaway ceiling, not a scheduler.
-            cpu: 24 * 60 * 60,
+            nproc: cfg.rlimit_nproc,
+            address_space: cfg.rlimit_address_space_bytes,
+            fsize: cfg.rlimit_fsize_bytes,
+            nofile: cfg.rlimit_nofile,
+            cpu: cfg.rlimit_cpu_secs,
         }
     }
 }
