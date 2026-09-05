@@ -183,13 +183,13 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
 
-Latest numbers, local `make coverage` (bar 90%, per crate):
+Latest numbers, CI run 33961539782 (bar 90%, per crate). `wheel-api` has gone 35% -> 89.02%:
 
 | crate | lines | status | owner |
 |---|---|---|---|
-| `wheel-api` | 35.06% (495/1412) | FAIL | API |
+| `wheel-api` | 89.02% (1329/1493) | FAIL — within 1 point of the bar | API |
 | `wheel-core` | 69.56% (681/979) | FAIL | SDK |
-| `wheel-host` | 72.21% (491/680) | FAIL | API |
+| `wheel-host` | 70.69% (521/737) | FAIL | API |
 | `wheel-engine` | 57.02% (1194/2094) | EXEMPT — scaffolding (PM ruling); expires when the engine is bootable / `wheel-engine:test` exists |
 
 `wheel-host` was at **0.00%** when this was filed and is now at 72.21% — that was the urgent one
