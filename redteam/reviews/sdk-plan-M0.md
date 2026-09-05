@@ -25,7 +25,10 @@ and 3 must-verify items.** None block M1 start; all must be settled before the r
    lifecycle state, not a second writer racing a queued message.
 
 ## Endorsements (keep as-is)
-- Open Q1 `script → tool`: **keep DENIED** (least privilege; open only on explicit need).
+- Open Q1 `script → tool`: **CORRECTION** — the contract §3 matrix already lists `script → tool` as
+  `read` ("same as agent"), and QA BUG-004 files SDK's deny as a divergence (26 allowed triples, not 24).
+  My least-privilege preference for deny is a *PROPOSAL for PM*, not grounds to diverge from the contract:
+  implement the contract (allow) unless PM changes it. (Retracts my earlier "keep DENIED".)
 - Open Q2 two method enums (`ToolMethod` vs `HttpMethod`): **keep separate** — sharing widens the
   endpoint GET/POST/PUT/DELETE contract to PATCH/HEAD/OPTIONS. Also validate endpoint config rejects
   non-{GET,POST,PUT,DELETE}.
