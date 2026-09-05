@@ -7,6 +7,102 @@ operation is an authenticated call to the single `wheel-host` machine over priva
 
 ## Authentication
 
+Two providers, selected by `AUTH_MODE`. Both end at the same verified user id, and nothing
+downstream — the ownership check above all — can tell which one ran. Swapping providers is
+configuration, not code.
+
+| `AUTH_MODE` | Token | Verified against |
+|---|---|---|
+| `local` (built in) | HS256, issued by this API | `SESSION_SECRET`, plus a live row in `sessions` |
+| `jwks` | RS256, issued by an external provider | the provider's JWKS |
+
+`AUTH_MODE` must be set explicitly in production — an unset value refuses to boot rather than
+defaulting, because guessing wrong either rejects every real user or accepts tokens from the wrong
+issuer. Under `jwks`, empty `CLERK_JWKS_URL`/`CLERK_ISSUER` also refuse to boot: a placeholder that
+looks like configuration is worse than a missing one, since it starts and then rejects every token
+for a reason nobody can see.
+
+A token minted under one mode is rejected under the other. They are different algorithms verified
+with different keys, so this needs no special case — it falls out of the design.
+
+## Local auth routes (`AUTH_MODE=local`)
+
+All five return `404` when `AUTH_MODE` is not `local`, so switching providers cannot leave a second
+way in.
+
+### `POST /v1/auth/signup`
+```json
+{ "email": "person@example.com", "password": "at least ten chars" }
+```
+`201` →
+```json
+{
+  "token": "<HS256 session JWT>",
+  "expires_at": "2026-09-12T18:40:00+00:00",
+  "user": { "id": "<uuid>", "email": "person@example.com", "created_at": "..." }
+}
+```
+Send `token` as `x-auth-token` on every subsequent request.
+
+- Email is stored `citext`, so `Alice@x.com` and `alice@x.com` are one account. Without that,
+  address casing silently creates a second user who cannot see the first one's projects.
+- Password: 10–1024 **characters**, counted as characters rather than bytes so a ten-character
+  passphrase in a non-Latin script is not wrongly rejected. No composition rules — requiring a digit
+  and a symbol pushes people toward `Password1!`, which is measurably worse than length alone.
+- Hashed with argon2id as a PHC string, so parameters can be raised later without invalidating
+  existing rows.
+- `409` if the email is taken. Rate limited globally per hour.
+
+### `POST /v1/auth/login`
+Same body. `200` with the same shape as signup.
+
+**`401` for every failure** — unknown email, wrong password, malformed input — with one identical
+body. Anything else confirms which addresses are registered.
+
+Unknown emails are verified against a real argon2 hash before failing. Skipping the hash would make
+login measurably faster for addresses that are not registered, turning the endpoint into an
+account-existence oracle that timing alone would reveal.
+
+Rate limited **per email**, 10 attempts per 15 minutes, counted in Postgres so the limit holds
+across replicas rather than multiplying by the replica count. Per-email rather than per-IP because
+the attack an IP limit misses is a password spray from many addresses against one account. Over the
+limit returns `429`, not `401`: pretending the password was wrong would hide the lockout from a
+legitimate user whose account someone else is attacking.
+
+### `POST /v1/auth/logout`
+`204`. Deletes the session row, so the token stops working immediately.
+
+Succeeds even with an expired, already-revoked, or absent token — logging out should never fail.
+
+This is why sessions are rows rather than pure stateless JWTs: a stateless token cannot be revoked
+before it expires, and a "logout" that leaves the token working for seven more days is not a logout.
+
+### `GET /v1/auth/me`
+`200` → `{ "id", "email", "created_at" }`. `401` if the account no longer exists — the signature can
+still verify over a user that has been deleted.
+
+### `POST /v1/auth/password`
+```json
+{ "current_password": "...", "new_password": "..." }
+```
+`204`. Requires the current password even though the caller is already authenticated: that is what
+stops a stolen session token from becoming a permanent takeover, since the attacker still cannot
+lock the owner out.
+
+**Revokes every session, including the caller's own.** If the password was changed because it was
+compromised, leaving existing sessions alive would defeat the point. Clients must log in again.
+
+Email-based password *reset* is M3 — it needs a mail provider, and there is none yet.
+
+### Note on revocation vs. `session_version`
+
+The review asked for a `users.session_version` counter. This implements the same guarantee with a
+`sessions` table instead: logout and password change delete rows, and every request checks the row
+is still live. That is strictly finer-grained — it can revoke one session without ending the others,
+which a global version counter cannot — at the cost of one indexed lookup per request. Flagged
+rather than silently substituted; say the word if you want the counter instead.
+
+
 | Header | Required | Notes |
 |---|---|---|
 | `x-auth-token` | yes | Clerk session JWT (RS256). `Authorization: Bearer <jwt>` is accepted as an alias. |
