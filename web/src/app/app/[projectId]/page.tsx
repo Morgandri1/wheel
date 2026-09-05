@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { use, useCallback, useEffect, useMemo } from "react";
+import { use, useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { engineApi, projects as projectApi } from "@/lib/api";
 import { connectEvents } from "@/lib/events";
@@ -9,6 +9,7 @@ import { useBoardStore } from "@/store/board";
 import { Canvas } from "@/components/board/canvas";
 import { Inspector } from "@/components/inspector";
 import { AgentDrawer } from "@/components/drawer/agent-drawer";
+import { StatusBar } from "@/components/board/status-bar";
 import { Header } from "@/components/header";
 import { Button, Empty, Skeleton } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
@@ -69,6 +70,35 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
   }, [projectId, running, applyEvents, refetchBoard, setConnection]);
 
   const nodes = board.data?.nodes ?? [];
+
+  /** Agents worth stopping: anything holding a process. Parked and stopped already cost nothing. */
+  const parkable = nodes.filter(
+    (n) => n.type === "agent" && ["running", "idle", "starting"].includes(n.state?.status ?? ""),
+  );
+  const [parking, setParking] = useState(false);
+
+  const parkAll = async () => {
+    setParking(true);
+    const results = await Promise.allSettled(parkable.map((n) => api.agent(n.id).stop()));
+    setParking(false);
+    refetchBoard();
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed) toastError(new Error(`${failed} of ${parkable.length} would not stop.`));
+    else toast(`Parked ${parkable.length}. They resume where they stopped.`);
+  };
+
+  /** Board-as-code, §3e: what you drew, as the JSON it already is. */
+  const exportBoard = () => {
+    if (!board.data) return;
+    const blob = new Blob([JSON.stringify(board.data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${board.data.project.name}.board.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const selected = nodes.find((n) => n.id === selectedNodeId) ?? null;
   const conn = CONNECTION_LABEL[connection];
 
@@ -93,6 +123,30 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
               <span className="h-1.5 w-1.5 rounded-full" style={{ background: conn.color }} />
               {conn.text}
             </span>
+          ) : null}
+
+          {running ? (
+            <>
+              <span className="flex-1" />
+              {/* The mockup's top-bar actions. Export is a real thing you can do with what the
+                  board already returns; parking every agent at once is the one bulk action worth
+                  having, because the reason you want it is a bill. */}
+              <Button
+                size="sm"
+                data-testid="btn-export-board"
+                onClick={() => exportBoard()}
+              >
+                Export JSON
+              </Button>
+              <Button
+                size="sm"
+                data-testid="btn-park-all"
+                disabled={parkable.length === 0 || parking}
+                onClick={parkAll}
+              >
+                {parking ? "Parking…" : `Park all${parkable.length ? ` (${parkable.length})` : ""}`}
+              </Button>
+            </>
           ) : null}
         </div>
       </Header>
@@ -163,6 +217,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
               onChanged={refetchBoard}
             />
           </div>
+          <StatusBar nodes={nodes} />
           <AgentDrawer nodes={nodes} api={api} projectId={projectId} />
         </>
       )}

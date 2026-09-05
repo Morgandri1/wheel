@@ -44,11 +44,11 @@
 }
 
 @layer components {
+  /* Modernist draws its edges: 2px, square, no shadow and no inner light. */
   .plate {
     background: var(--panel-1);
-    border: 1px solid var(--rule);
-    border-radius: 2px;
-    box-shadow: inset 0 1px 0 0 var(--plate-highlight);
+    border: 2px solid var(--rule-strong);
+    border-radius: 0;
   }
 
   .hairline {
