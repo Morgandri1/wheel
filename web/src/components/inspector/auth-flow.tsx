@@ -1,145 +1,172 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Button, CopyField, Field, Input } from "@/components/ui";
+import { Button, Field, Input } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
-import type { AuthBegin } from "@/lib/schema";
 import type { EngineApi } from "@/lib/api";
 
 /**
- * Signing an agent in. The harness decides the shape — a device code, a code to paste back,
- * or an API key — so this renders whatever `auth/begin` says and polls until it takes.
+ * Signing an agent in.
+ *
+ * An API key is the live path today (PROTOCOL.md §auth: POST auth/complete {api_key}), so it is
+ * what this panel leads with. OAuth needs `auth/begin` to hold a live child process open for the
+ * device or paste-code exchange; that lands in M2, and its buttons are present-but-disabled with
+ * the reason rather than hidden — an absent control is something people hunt for.
+ *
+ * The key is write-only in the strongest sense available: it is posted and the field is cleared,
+ * it is never read back (no route returns it), and it is never put in a URL, a query key or a
+ * toast. What comes back is whether the agent is authenticated, and optionally which account.
  */
 export function AuthFlow({
   api,
   nodeId,
+  needsAuth,
   onAuthenticated,
 }: {
   api: EngineApi;
   nodeId: string;
+  /** The agent tried to start and had no credentials — the one moment this panel is urgent. */
+  needsAuth: boolean;
   onAuthenticated: () => void;
 }) {
   const agent = api.agent(nodeId);
-  const [begun, setBegun] = useState<AuthBegin | null>(null);
-  const [code, setCode] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  const [replacing, setReplacing] = useState(false);
+  const keyRef = useRef<HTMLInputElement>(null);
 
   const status = useQuery({
     queryKey: ["auth", nodeId],
     queryFn: () => agent.authStatus(),
-    refetchInterval: begun && !busy ? 2500 : false,
+    // Poll only while a submission is settling. The engine writes credentials to disk and probes
+    // the harness, so "authenticated" can land a beat after the request returns.
+    refetchInterval: justSaved ? 2000 : false,
   });
 
+  const authenticated = status.data?.authenticated ?? false;
+
   useEffect(() => {
-    if (status.data?.authenticated) {
-      setBegun(null);
+    if (authenticated && justSaved) {
+      setJustSaved(false);
       onAuthenticated();
     }
-  }, [status.data?.authenticated, onAuthenticated]);
+  }, [authenticated, justSaved, onAuthenticated]);
 
-  if (status.data?.authenticated) {
+  useEffect(() => {
+    if (needsAuth && !authenticated) keyRef.current?.focus();
+  }, [needsAuth, authenticated]);
+
+  const save = async () => {
+    const key = apiKey.trim();
+    if (!key) return;
+    setBusy(true);
+    try {
+      const next = await agent.authComplete({ api_key: key });
+      // Clear immediately: the key has left, and there is no reason for it to sit in a form.
+      setApiKey("");
+      setReplacing(false);
+      setJustSaved(true);
+      if (next.authenticated) {
+        toast("Agent authenticated. Start it to pick up any queued messages.");
+        onAuthenticated();
+      }
+      await status.refetch();
+    } catch (e) {
+      toastError(e, "The engine would not accept that key.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (authenticated && !replacing) {
     return (
-      <div className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2">
+      <div
+        className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
+        data-testid="auth-status"
+        data-authenticated="true"
+      >
         <span className="text-micro text-ink-dim">
-          Signed in{status.data.account ? ` as ${status.data.account}` : ""}
+          Authenticated
+          {status.data?.account ? ` · ${status.data.account}` : " · API key"}
         </span>
-        <span className="h-1.5 w-1.5 rounded-full" style={{ background: "var(--live)" }} />
+        <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
+          Replace
+        </Button>
       </div>
     );
   }
 
-  if (!begun) {
-    return (
-      <Button
-        data-testid="btn-authenticate"
-        onClick={async () => {
-          try {
-            setBusy(true);
-            setBegun(await agent.authBegin());
-          } catch (e) {
-            toastError(e, "Couldn't start sign-in.");
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        {busy ? "Starting…" : "Authenticate"}
-      </Button>
-    );
-  }
-
-  const complete = async (body: { code?: string; api_key?: string }) => {
-    try {
-      setBusy(true);
-      const next = await agent.authComplete(body);
-      if (next.authenticated) {
-        toast("Agent signed in.");
-        setBegun(null);
-        onAuthenticated();
-      }
-    } catch (e) {
-      toastError(e, "That didn't complete sign-in.");
-    } finally {
-      setBusy(false);
-      void status.refetch();
-    }
-  };
-
   return (
     <div className="flex flex-col gap-3 border border-rule p-2.5" data-testid="auth-flow">
-      <p className="text-micro text-ink-dim">{begun.instructions}</p>
-
-      {begun.user_code ? (
-        <Field label="Your code">
-          <CopyField value={begun.user_code} testId="auth-user-code" />
-        </Field>
-      ) : null}
-
-      {begun.url ? (
-        <a
-          href={begun.url}
-          target="_blank"
-          rel="noreferrer"
-          data-testid="auth-link"
-          className="text-micro underline underline-offset-4"
-          style={{ color: "var(--wire-read)" }}
+      {needsAuth && !authenticated ? (
+        <p
+          data-testid="auth-needs-auth-callout"
+          className="text-micro"
+          style={{ color: "var(--danger)" }}
         >
-          Open {new URL(begun.url).host}
-        </a>
+          This agent has no credentials, so it stopped at startup. Anything sent to it is queued
+          and will be delivered once it is authenticated and restarted.
+        </p>
       ) : null}
 
-      {begun.mode === "api_key" ? (
-        <Field label="API key" hint="Stored in the container, never shown again.">
-          <Input
-            data-testid="input-api-key"
-            type="password"
-            mono
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder="sk-…"
-          />
-        </Field>
-      ) : begun.mode === "paste_code" ? (
-        <Field label="Code from the browser">
-          <Input data-testid="input-auth-code" mono value={code} onChange={(e) => setCode(e.target.value)} />
-        </Field>
-      ) : null}
+      <Field
+        label={replacing ? "New API key" : "API key"}
+        hint={
+          replacing
+            ? "Replaces the key already stored for this agent."
+            : "Stored in the agent's own credentials directory. Never shown again, by anything."
+        }
+      >
+        <Input
+          ref={keyRef}
+          type="password"
+          mono
+          autoComplete="off"
+          spellCheck={false}
+          data-testid="input-api-key"
+          placeholder="sk-…"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void save();
+          }}
+        />
+      </Field>
 
       <div className="flex items-center gap-2">
         <Button
           tone="primary"
           size="sm"
           data-testid="btn-auth-complete"
-          disabled={busy || (begun.mode === "api_key" && !apiKey)}
-          onClick={() => complete(begun.mode === "api_key" ? { api_key: apiKey } : { code: code || begun.user_code || undefined })}
+          disabled={!apiKey.trim() || busy}
+          onClick={save}
         >
-          {busy ? "Checking…" : begun.mode === "api_key" ? "Save key" : "I've done it"}
+          {busy ? "Checking…" : "Save key"}
         </Button>
-        <Button size="sm" tone="ghost" onClick={() => setBegun(null)}>
-          Cancel
+        {replacing ? (
+          <Button size="sm" tone="ghost" onClick={() => { setReplacing(false); setApiKey(""); }}>
+            Cancel
+          </Button>
+        ) : null}
+        {justSaved && !authenticated ? (
+          <span className="text-micro text-ink-faint" data-testid="auth-checking">
+            Waiting for the harness to confirm…
+          </span>
+        ) : null}
+      </div>
+
+      <div className="flex items-center gap-2 border-t border-rule pt-2.5">
+        <Button
+          size="sm"
+          disabled
+          data-testid="btn-auth-oauth"
+          title="Signing in with your own Claude or Codex account arrives with the engine's OAuth flow (M2)."
+        >
+          Sign in with your account
         </Button>
+        <span className="text-micro text-ink-faint">M2 — uses your own plan instead of a key</span>
       </div>
     </div>
   );
