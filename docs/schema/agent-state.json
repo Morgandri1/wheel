@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentState",
+  "description": "Observed state of an `agent` node.",
+  "type": "object",
+  "required": [
+    "status"
+  ],
+  "properties": {
+    "last_activity": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "queued_messages": {
+      "description": "Messages persisted but not yet delivered into the child.",
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "session_id": {
+      "description": "The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/AgentStatus"
+    }
+  },
+  "definitions": {
+    "AgentStatus": {
+      "description": "Lifecycle of an agent node's child process.",
+      "oneOf": [
+        {
+          "description": "No child process. The default, and where a node lands after `stop`.",
+          "type": "string",
+          "enum": [
+            "stopped"
+          ]
+        },
+        {
+          "description": "Child spawned, harness not yet ready to accept a turn.",
+          "type": "string",
+          "enum": [
+            "starting"
+          ]
+        },
+        {
+          "description": "The harness reports it has no usable credentials. Terminal until the operator completes `/v1/agents/:id/auth/*`.",
+          "type": "string",
+          "enum": [
+            "needs_auth"
+          ]
+        },
+        {
+          "description": "Child is mid-turn (a message is being processed).",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "Child is alive and waiting for input.",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "Child exited unexpectedly or the harness reported a fatal error; `last_error` carries the detail.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

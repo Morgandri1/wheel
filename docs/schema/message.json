@@ -1,0 +1,202 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Message",
+  "description": "A message row, persisted before any delivery is attempted.",
+  "type": "object",
+  "required": [
+    "body",
+    "bytes",
+    "created_at",
+    "from",
+    "id",
+    "sha256",
+    "state",
+    "to"
+  ],
+  "properties": {
+    "body": {
+      "type": "string"
+    },
+    "bytes": {
+      "description": "Byte length of `body`.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "consumed_at": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "created_at": {
+      "$ref": "#/definitions/Timestamp"
+    },
+    "delivered_at": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "from": {
+      "$ref": "#/definitions/MessageSender"
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "last_error": {
+      "description": "Why this message is still `queued`. Never a reason to truncate it (§3c#11).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reply_to": {
+      "description": "Threading (§3c#9): the message this one replies to.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "sha256": {
+      "description": "Lowercase hex SHA-256 of `body` as sent, so the sender can prove what arrived is what was sent (§3c#3).",
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/definitions/MessageState"
+    },
+    "to": {
+      "description": "Target agent node id.",
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "definitions": {
+    "MessageSender": {
+      "description": "Who sent a message. The `type` rendered into the envelope comes from here and is **engine-generated** — a body can never forge it (§3c#5).",
+      "oneOf": [
+        {
+          "description": "A board node. Only `agent`, `endpoint` and `script` nodes can send; [`MessageSender::sender_type`] is what appears in the envelope.",
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "name",
+            "type"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "node"
+              ]
+            },
+            "name": {
+              "$ref": "#/definitions/NodeName"
+            },
+            "type": {
+              "$ref": "#/definitions/NodeType"
+            }
+          }
+        },
+        {
+          "description": "The operator, via the UI chat box or `POST /v1/agents/:id/send`.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "user"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The engine itself (e.g. a delivery failure notice).",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "system"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "MessageState": {
+      "description": "Delivery state (§3c#4). Strictly forward-moving.",
+      "oneOf": [
+        {
+          "description": "Persisted, not yet written to a child's stdin (agent stopped, or an earlier message is still in flight).",
+          "type": "string",
+          "enum": [
+            "queued"
+          ]
+        },
+        {
+          "description": "Written to the child's stdin.",
+          "type": "string",
+          "enum": [
+            "delivered"
+          ]
+        },
+        {
+          "description": "The harness reported the turn containing it complete.",
+          "type": "string",
+          "enum": [
+            "consumed"
+          ]
+        }
+      ]
+    },
+    "NodeName": {
+      "description": "A node's unique, addressable name. Reserved: user, wheel, system, engine.",
+      "type": "string",
+      "maxLength": 63,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9-_]{0,62}$"
+    },
+    "NodeType": {
+      "description": "The eight node types.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "ctx",
+        "table",
+        "endpoint",
+        "script",
+        "mcp",
+        "vault",
+        "chest",
+        "tool"
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

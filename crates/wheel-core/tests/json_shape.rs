@@ -1,0 +1,345 @@
+//! The canonical JSON in ARCHITECTURE.md §3 is a cross-team contract: Web
+//! generates TypeScript from it and the API forwards it verbatim. These tests
+//! pin the exact wire shape for all 8 node types.
+
+use serde_json::json;
+use uuid::Uuid;
+use wheel_core::*;
+
+fn uid(n: u8) -> Uuid {
+    Uuid::from_bytes([n; 16])
+}
+
+#[test]
+fn agent_node_matches_the_contract_example() {
+    let node = Node {
+        id: uid(1),
+        name: NodeName::new("researcher").unwrap(),
+        position: Position::new(120.0, 340.0),
+        wires: vec![Wire::new(uid(2), WireType::Read)],
+        config: NodeConfig::Agent(AgentConfig {
+            harness: Harness::Claude,
+            model: None,
+            system_prompt: "be brief".into(),
+            run_on_startup: false,
+            ephemeral_context: false,
+        }),
+    };
+    let v = serde_json::to_value(&node).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "id": "01010101-0101-0101-0101-010101010101",
+            "name": "researcher",
+            "position": { "x": 120.0, "y": 340.0 },
+            "wires": [ { "to": "02020202-0202-0202-0202-020202020202", "type": "read" } ],
+            "type": "agent",
+            "config": {
+                "harness": "claude",
+                "system_prompt": "be brief",
+                "run_on_startup": false,
+                "ephemeral_context": false
+            }
+        })
+    );
+    // Round-trips.
+    let back: Node = serde_json::from_value(v).unwrap();
+    assert_eq!(back, node);
+    assert_eq!(back.node_type(), NodeType::Agent);
+}
+
+/// Build one node of every type and assert the `type` tag and `config` payload
+/// land as the flat `"type" + "config"` pair the contract specifies.
+#[test]
+fn every_node_type_round_trips_with_correct_tag() {
+    let cases: Vec<(NodeType, NodeConfig)> = vec![
+        (
+            NodeType::Agent,
+            NodeConfig::Agent(AgentConfig {
+                harness: Harness::Codex,
+                model: Some("gpt-5".into()),
+                system_prompt: "hi".into(),
+                run_on_startup: true,
+                ephemeral_context: true,
+            }),
+        ),
+        (
+            NodeType::Ctx,
+            NodeConfig::Ctx(CtxConfig {
+                markdown: "# notes".into(),
+            }),
+        ),
+        (
+            NodeType::Table,
+            NodeConfig::Table(TableConfig {
+                columns: vec![Column {
+                    name: Ident::new("title").unwrap(),
+                    column_type: ColumnType::Text,
+                }],
+            }),
+        ),
+        (
+            NodeType::Endpoint,
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+            }),
+        ),
+        (
+            NodeType::Script,
+            NodeConfig::Script(ScriptConfig {
+                language: ScriptLanguage::Python,
+                source: "print(1)".into(),
+                timeout_secs: None,
+            }),
+        ),
+        (
+            NodeType::Mcp,
+            NodeConfig::Mcp(McpConfig {
+                transport: McpTransport::Stdio,
+                command: Some("npx".into()),
+                args: Some(vec!["-y".into()]),
+                url: None,
+                env: None,
+            }),
+        ),
+        (
+            NodeType::Vault,
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["OPENAI_API_KEY".into()],
+            }),
+        ),
+        (NodeType::Chest, NodeConfig::Chest(ChestConfig {})),
+        (
+            NodeType::Tool,
+            NodeConfig::Tool(ToolConfig {
+                base_url: "https://api.example.com".into(),
+                source_format: Some(ToolFormat::Openapi3),
+                operations: vec![],
+            }),
+        ),
+    ];
+
+    // Tied to NodeType::ALL, not a literal: adding a node type must break this
+    // test rather than silently skipping coverage of the new one.
+    assert_eq!(
+        cases.len(),
+        NodeType::ALL.len(),
+        "every node type needs a case here"
+    );
+    for t in NodeType::ALL {
+        assert!(
+            cases.iter().any(|(ty, _)| *ty == t),
+            "no case covers node type {t}"
+        );
+    }
+
+    for (expected_type, config) in cases {
+        assert_eq!(config.node_type(), expected_type);
+        let node = Node::new(
+            uid(9),
+            NodeName::new("n1").unwrap(),
+            Position::default(),
+            config,
+        );
+        let v = serde_json::to_value(&node).unwrap();
+        assert_eq!(
+            v["type"],
+            json!(expected_type.as_str()),
+            "tag for {expected_type}"
+        );
+        assert!(
+            v.get("config").is_some(),
+            "config present for {expected_type}"
+        );
+        // The tag must NOT also leak inside config.
+        assert!(
+            v["config"].get("type").is_none() || expected_type == NodeType::Endpoint,
+            "type tag leaked into config for {expected_type}"
+        );
+        let back: Node = serde_json::from_value(v).unwrap();
+        assert_eq!(back, node, "round-trip for {expected_type}");
+    }
+}
+
+#[test]
+fn optional_agent_fields_are_omitted_when_none() {
+    let cfg = NodeConfig::Agent(AgentConfig {
+        harness: Harness::Claude,
+        model: None,
+        system_prompt: String::new(),
+        run_on_startup: false,
+        ephemeral_context: false,
+    });
+    let v = serde_json::to_value(&cfg).unwrap();
+    assert!(
+        v["config"].get("model").is_none(),
+        "null model must be omitted, not null"
+    );
+}
+
+#[test]
+fn a_config_of_the_wrong_type_cannot_be_deserialized() {
+    // type says ctx, config is an agent config -> must fail, not silently pick one.
+    let bad = json!({
+        "id": "01010101-0101-0101-0101-010101010101",
+        "name": "x", "position": {"x":0.0,"y":0.0}, "wires": [],
+        "type": "ctx",
+        "config": { "harness": "claude", "system_prompt": "", "run_on_startup": false, "ephemeral_context": false }
+    });
+    assert!(serde_json::from_value::<Node>(bad).is_err());
+}
+
+#[test]
+fn invalid_names_are_rejected_at_deserialization() {
+    for bad in [
+        "",              // empty
+        "-leading",      // must start alnum
+        "_leading",      // must start alnum
+        "Upper",         // no uppercase
+        "has space",     // no spaces
+        "has.dot",       // charset
+        "has/slash",     // charset — critical: names appear in `wheel read a/b`
+        "user",          // reserved: it is the UI sender label
+        "wheel",         // reserved
+        &"a".repeat(64), // too long (max 63)
+    ] {
+        assert!(
+            NodeName::new(bad).is_err(),
+            "{bad:?} should be rejected as a node name"
+        );
+        let v = json!({
+            "id": "01010101-0101-0101-0101-010101010101",
+            "name": bad, "position": {"x":0.0,"y":0.0}, "wires": [],
+            "type": "chest", "config": {}
+        });
+        assert!(
+            serde_json::from_value::<Node>(v).is_err(),
+            "{bad:?} should be rejected when deserializing a Node"
+        );
+    }
+    // ...and the boundary cases that must be ACCEPTED.
+    for good in ["a", "0", "a-b_c", &"a".repeat(63), "9lives", "x_"] {
+        assert!(
+            NodeName::new(good).is_ok(),
+            "{good:?} should be a legal name"
+        );
+    }
+}
+
+#[test]
+fn table_columns_may_be_called_user_but_not_key() {
+    // `user` is reserved for NODES (message sender label), not columns.
+    assert!(Ident::new("user").is_ok());
+    // `key` is the implicit primary key column.
+    let cfg = NodeConfig::Table(TableConfig {
+        columns: vec![Column {
+            name: Ident::new(TABLE_KEY_COLUMN).unwrap(),
+            column_type: ColumnType::Text,
+        }],
+    });
+    assert!(matches!(
+        validate_config(&cfg),
+        Err(ConfigError::ReservedColumn(_))
+    ));
+    // A column may not contain '-' (it is a bare sqlite identifier).
+    assert!(Ident::new("a-b").is_err());
+}
+
+#[test]
+fn events_use_the_documented_dotted_type_tags() {
+    let e = Event::BoardChanged {
+        at: Timestamp::parse_rfc3339("2026-09-05T00:21:00Z").unwrap(),
+    };
+    let v = serde_json::to_value(&e).unwrap();
+    assert_eq!(v["type"], json!("board.changed"));
+    assert_eq!(v["at"], json!("2026-09-05T00:21:00Z"));
+
+    let e = Event::NodeState {
+        node_id: uid(3),
+        state: NodeState::Agent(AgentState {
+            status: AgentStatus::NeedsAuth,
+            ..Default::default()
+        }),
+    };
+    let v = serde_json::to_value(&e).unwrap();
+    assert_eq!(v["type"], json!("node.state"));
+    assert_eq!(v["state"]["status"], json!("needs_auth"));
+}
+
+#[test]
+fn vault_config_carries_key_names_only_and_validates_them_as_env_names() {
+    let ok = NodeConfig::Vault(VaultConfig {
+        keys: vec!["API_KEY".into(), "A1_B2".into()],
+    });
+    assert!(validate_config(&ok).is_ok());
+    for bad in ["lower", "1LEADING", "HAS-DASH", "HAS SPACE", ""] {
+        let cfg = NodeConfig::Vault(VaultConfig {
+            keys: vec![bad.into()],
+        });
+        assert!(
+            validate_config(&cfg).is_err(),
+            "{bad:?} must be rejected as a vault key"
+        );
+    }
+}
+
+#[test]
+fn endpoint_paths_reject_traversal_and_query_strings() {
+    for bad in ["no-leading-slash", "/a/../b", "/..", "/a?b=1", "/a#f"] {
+        assert!(
+            validate_endpoint_path(bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    for good in ["/", "/hook", "/a/b/c", "/a..b"] {
+        assert!(
+            validate_endpoint_path(good).is_ok(),
+            "{good:?} must be allowed"
+        );
+    }
+}
+
+#[test]
+fn chest_keys_are_normalized_and_traversal_is_refused() {
+    assert_eq!(normalize_chest_key("a//b/./c").unwrap(), "a/b/c");
+    for bad in ["../x", "a/../../b", "/abs", "a\\b", "", ".", "//"] {
+        assert!(
+            normalize_chest_key(bad).is_err(),
+            "{bad:?} must be refused as a chest key"
+        );
+    }
+}
+
+#[test]
+fn listen_addr_parses_both_sandbox_backends() {
+    use std::path::PathBuf;
+    use wheel_core::ListenAddr;
+
+    assert_eq!(
+        ListenAddr::parse("tcp://0.0.0.0:7000").unwrap(),
+        ListenAddr::Tcp("0.0.0.0:7000".into())
+    );
+    assert_eq!(
+        ListenAddr::parse("unix:///run/wheel/abc/engine.sock").unwrap(),
+        ListenAddr::Unix(PathBuf::from("/run/wheel/abc/engine.sock"))
+    );
+    assert_eq!(ListenAddr::default_tcp().to_string(), "tcp://0.0.0.0:7000");
+
+    // Round-trips through Display.
+    for raw in ["tcp://127.0.0.1:1", "unix:///a/b.sock"] {
+        assert_eq!(ListenAddr::parse(raw).unwrap().to_string(), raw);
+    }
+    // Misconfiguration must fail loudly at boot, not bind somewhere useless.
+    for bad in [
+        "7000",
+        "http://x:1",
+        "tcp://",
+        "tcp://hostonly",
+        "tcp://host:99999",
+        "unix://relative/path.sock",
+    ] {
+        assert!(ListenAddr::parse(bad).is_err(), "{bad:?} must be rejected");
+    }
+}

@@ -52,5 +52,5 @@ You own the heart of Wheel: `crates/wheel-core`, `crates/wheel-engine`, `crates/
 
 ## Suggested plan shape
 M1 (day 1): wheel-core + schema export → engine with sqlite, board CRUD, wires, agent start/stop for `claude`, message delivery, injection, `wheel msg`/`read`/`write`/`whoami`/`connections`, events WS, Dockerfile.host. (wheel-host is API's.)
-M2: codex, ephemeral context, table/chest/vault/script/mcp/endpoint/ingress, auth flows.
+M2: codex, ephemeral context, table/chest/vault/script/mcp/endpoint/ingress, auth flows, **tool nodes (§3d)**: `wheel-core` ToolOperation/Fill types; parsers for OpenAPI 3 (`openapiv3` crate), Swagger 2 (convert), Postman v2.1, Insomnia v4 (serde + mappers) with fixture-based tests (petstore + a real Postman export + a real Insomnia export); executor (reqwest, SSRF deny-list with DNS-resolution check, timeouts, size caps, masked curl rendering); `wheel tool ls|call`; MCP tool generation `<tool>__<op>` from agent-fill fields.
 M3: `process` sandbox backend for Railway, hardening from ADVERSARY findings, resource limits (ulimit for scripts & agents), log rotation.

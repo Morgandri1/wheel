@@ -1,0 +1,15 @@
+{
+  "id": "72cf1409-3b16-4cec-8886-c016baf6d5a8",
+  "name": "render",
+  "type": "endpoint",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "method": "GET",
+    "path": "/r",
+    "response_mode": "script"
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxInfo",
+  "description": "`GET /host/v1/projects/:id`",
+  "type": "object",
+  "required": [
+    "id",
+    "status"
+  ],
+  "properties": {
+    "capabilities": {
+      "default": {
+        "http": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/SandboxStatus"
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "Per-project capabilities, toggled by the owner through the API.",
+      "type": "object",
+      "properties": {
+        "http": {
+          "description": "Public ingress at `/p/<project_id>/*` is served only when this is true.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "SandboxStatus": {
+      "description": "Lifecycle of a project's sandbox. Mirrors `Project.status` in §5.",
+      "type": "string",
+      "enum": [
+        "stopped",
+        "starting",
+        "running",
+        "error"
+      ]
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

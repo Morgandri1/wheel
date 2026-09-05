@@ -1,0 +1,14 @@
+{
+  "id": "14943ae5-2b58-4400-86ce-9b71c7922bb9",
+  "name": "mismatch",
+  "type": "agent",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "not an agent config"
+  },
+  "_expect_reject": "NODE-config-tagged"
+}

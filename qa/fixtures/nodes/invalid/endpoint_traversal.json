@@ -1,0 +1,16 @@
+{
+  "id": "6b0b1b07-68c9-477b-8559-e3e9b04eef95",
+  "name": "e2",
+  "type": "endpoint",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "method": "GET",
+    "path": "/../v1/board",
+    "response_mode": "ack"
+  },
+  "_expect_reject": "NODE-endpoint-path"
+}
