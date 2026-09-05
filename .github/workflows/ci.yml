@@ -125,6 +125,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: actions/cache@v4
         with:
           path: |
@@ -133,6 +135,21 @@ jobs:
             target
           key: cargo-docker-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-docker-${{ runner.os }}-
+
+      # FIRST, because it is the fastest way to learn that main is broken on Linux.
+      #
+      # Every agent on this project develops on one macOS host, so a local `make check`
+      # cannot catch a Linux-only break — not by oversight, by construction. Two reached
+      # main in one day: an E0308 in wheel-host's rlimits that shipped a host image with no
+      # host binary in it, and then the clippy error in the fix for it (`as u32` is required
+      # on macOS, redundant on glibc, and `-D warnings` makes redundant fatal). For anything
+      # touching libc, #[cfg] or the images, "green locally" carries no information, and we
+      # were all reading it as though it did.
+      #
+      # This runs here rather than as a new job so it costs no extra runner and reuses this
+      # job's cargo cache: a Linux verdict in ~1 minute instead of at full-CI time.
+      - name: Clippy on Linux (the platform we actually deploy to)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build wheel-engine:dev
         run: make engine-image
