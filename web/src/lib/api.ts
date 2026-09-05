@@ -7,7 +7,7 @@
  * Every project-scoped request carries x-auth-token and x-project-id. The token never appears in
  * a URL, a query string, or a log line.
  */
-import { ApiError, getAuthToken } from "@/lib/auth";
+import { ApiError, getAuthToken, notifyUnauthorized } from "@/lib/auth";
 import type { LogStreamName } from "@/lib/schema";
 import type {
   AuthBegin,
@@ -56,6 +56,9 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     throw new ApiError(0, "offline", "Can't reach the API. Check that it's running.");
   }
 
+  // A 401 is the API telling us the token is dead. Dropping it here — once, centrally — is what
+  // turns "every request fails silently" into "you are signed out", wherever the 401 came from.
+  if (res.status === 401) notifyUnauthorized();
   if (!res.ok) throw await toApiError(res);
   if (opts.expect === "void" || res.status === 204) return undefined as T;
   if (opts.expect === "blob") return (await res.blob()) as T;

@@ -3,7 +3,9 @@
 import Link from "next/link";
 import { AUTH_MODE } from "@/lib/auth";
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui";
+import { signOut, useSession } from "@/lib/local-auth";
 
 /**
  * Spoke endpoints, rounded to three decimals.
@@ -82,6 +84,35 @@ export function Header({ children }: { children?: React.ReactNode }) {
           mock auth
         </span>
       ) : null}
+      <SessionBadge />
     </header>
+  );
+}
+
+/**
+ * Who you are signed in as, and the way out. Local mode only — Clerk brings its own UserButton
+ * and the mock and dev modes have no user to name.
+ */
+function SessionBadge() {
+  const session = useSession();
+  const router = useRouter();
+  if (AUTH_MODE !== "local" || session.status !== "authed") return null;
+  return (
+    <div className="flex items-center gap-2" data-testid="session-badge">
+      <span className="ident max-w-[16rem] truncate text-ink-dim" title={session.user.email}>
+        {session.user.email}
+      </span>
+      <Button
+        size="sm"
+        tone="ghost"
+        data-testid="btn-sign-out"
+        onClick={async () => {
+          await signOut();
+          router.replace("/sign-in");
+        }}
+      >
+        Sign out
+      </Button>
+    </div>
   );
 }

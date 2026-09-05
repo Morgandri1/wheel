@@ -34,11 +34,22 @@ import {
 import { seed } from "./fixtures";
 import { assertMatrixMatchesEngine } from "./assert-matrix";
 import { agentInputSchema, mergeOperations, parseSpec } from "./tools";
+import * as localAuth from "./local-auth";
+
+type Credentials = { email?: unknown; password?: unknown };
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787);
-const ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"];
+// The dev server is usually on 3000; MOCK_ORIGINS lets a second one (a different auth mode, say)
+// be allowed too. A browser cannot tell a CORS refusal from an unreachable server, so an origin
+// missing from this list reads in the UI as "Can't reach the API" — the same trap as an unset
+// CORS_ALLOWED_ORIGINS in production.
+const ORIGINS = (process.env.MOCK_ORIGINS ?? "http://localhost:3000,http://127.0.0.1:3000")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
 
 seed();
+localAuth.seedUser();
 
 // ── plumbing ────────────────────────────────────────────────────────────────
 
@@ -47,12 +58,13 @@ function cors(req: IncomingMessage, res: ServerResponse) {
   res.setHeader("access-control-allow-origin", origin && ORIGINS.includes(origin) ? origin : ORIGINS[0]!);
   res.setHeader("access-control-allow-methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type,x-auth-token,x-project-id");
+  res.setHeader("access-control-expose-headers", "retry-after");
   res.setHeader("access-control-max-age", "600");
 }
 
-function json(res: ServerResponse, status: number, body: unknown) {
+function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, { "content-type": "application/json", ...headers });
   res.end(payload);
 }
 
@@ -81,7 +93,13 @@ async function readJson<T>(req: IncomingMessage): Promise<T> {
 function requireAuth(req: IncomingMessage) {
   const token = req.headers["x-auth-token"];
   if (typeof token !== "string" || token.length === 0) {
-    throw new EngineRefusal(401, "missing x-auth-token");
+    throw new EngineRefusal(401, "missing x-auth-token", "unauthenticated");
+  }
+  // A local-mode token is a real session here, so signing out actually invalidates it and the
+  // client's "any 401 means signed out" path can be exercised. Mock and dev tokens are opaque
+  // strings the mock has no opinion about, and every project belongs to OWNER either way.
+  if (localAuth.isLocalToken(token) && !localAuth.userForToken(token)) {
+    throw new EngineRefusal(401, "that session is no longer valid", "unauthenticated");
   }
   return OWNER;
 }
@@ -455,6 +473,24 @@ async function route(req: IncomingMessage, res: ServerResponse) {
 
   if (path === "/healthz") return json(res, 200, { ok: true, mock: true });
 
+  // Local email/password auth (AUTH_MODE=local). Unauthenticated by definition, except /me.
+  if (path === "/v1/auth/signup" && method === "POST") {
+    return json(res, 201, localAuth.signup(await readJson<Credentials>(req)));
+  }
+  if (path === "/v1/auth/login" && method === "POST") {
+    return json(res, 200, localAuth.login(await readJson<Credentials>(req)));
+  }
+  if (path === "/v1/auth/logout" && method === "POST") {
+    const token = req.headers["x-auth-token"];
+    if (typeof token === "string") localAuth.logout(token);
+    return noContent(res);
+  }
+  if (path === "/v1/auth/me" && method === "GET") {
+    const token = req.headers["x-auth-token"];
+    if (typeof token !== "string" || !token) throw new EngineRefusal(401, "no session", "unauthenticated");
+    return json(res, 200, localAuth.me(token));
+  }
+
   if (path === "/v1/projects" && method === "GET") {
     requireAuth(req);
     return json(res, 200, [...projects.values()].map((r) => r.project));
@@ -548,7 +584,12 @@ const server = createServer((req, res) => {
     return res.end();
   }
   route(req, res).catch((error: unknown) => {
-    if (error instanceof EngineRefusal) return json(res, error.status, { error: error.message });
+    if (error instanceof EngineRefusal) {
+      // docs/API.md: { error: { code, message } }. A bare string here would be parsed away by the
+      // web client and every refusal would read as generic fallback copy.
+      const body = { error: { code: error.code ?? `http_${error.status}`, message: error.message } };
+      return json(res, error.status, body, error.headers ?? {});
+    }
     console.error(error);
     json(res, 500, { error: "mock server blew up — see its console" });
   });
