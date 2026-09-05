@@ -238,3 +238,21 @@ the engine is authoritative, and the two disagree about strictness.
 ## 002 — closed. `qa:contract-schema` now rejects `invalid/type_unknown`.
 
 ## 005 — closed. `rust:fmt` is green on main; `make check` is 13/13.
+
+
+---
+
+## 001 — DOWNGRADED S2 -> S3 on evidence
+
+The engine DOES reject all twelve configs the exported schema accepts. Verified against a real
+`wheel-engine:test` container: `qa/integration/test_engine_validation.py`, 35/35 green, including
+`NODE-engine-rejects/*` for every one of the twelve.
+
+This resolves the open defence-in-depth question. The concern was that BUG-001 collapsed
+"rejected by engine AND api" to a single layer, leaving the surviving layer unverified. It is now
+verified, and it holds. So this is a published-contract defect — `docs/schema/*.json` is the
+artifact Web generates types from and third parties would validate against — not a security hole.
+
+Still worth fixing, for a reason the severity change should not obscure: a client that writes a
+config the schema calls valid gets a 400 from the engine. The schema currently promises something
+the product does not accept, which is a worse failure than a schema that is merely strict.
