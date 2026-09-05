@@ -1,0 +1,14 @@
+{
+  "id": "7cb2e0ad-2ed4-4ac8-873b-90e5b9188507",
+  "name": "reseаrcher",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x"
+  },
+  "_expect_reject": "NODE-name-charset"
+}

@@ -30,6 +30,7 @@ ALLOWED = {
     ("ctx", "agent", "send"):     "INJECTION: ctx markdown prepended to the agent's prompt",
     ("endpoint", "agent", "send"):  "each HTTP hit delivered as a message",
     ("endpoint", "table", "write"): "JSON body inserted as a row",
+    ("endpoint", "vault", "read"):  "resolve the endpoint's auth.vault_ref bearer secret",
     ("endpoint", "script", "send"): "script invoked with the request",
     ("script", "agent", "send"):  "wheel msg from inside the script (token scoped to ITS wires)",
     ("script", "ctx", "read"):    "same as agent",
@@ -52,7 +53,7 @@ NO_OUTGOING = {
     "mcp":   "mcp has no outgoing wires",
 }
 
-TOOL_ONLY = "tool's only outgoing wire is read->vault"
+TOOL_ONLY = "tool's only outgoing wire is read->vault"  # same rule as endpoint
 
 def deny_reason(f, t, w):
     if f == "tool":
@@ -60,7 +61,7 @@ def deny_reason(f, t, w):
     if f in NO_OUTGOING:
         return NO_OUTGOING[f]
     if f == "endpoint":
-        return "endpoint may only send->agent, send->script, write->table"
+        return "endpoint may only send->agent, send->script, write->table, read->vault"
     if w == "send" and t not in ("agent", "script"):
         return "send is only meaningful into agent (and endpoint->script)"
     if f == t == "agent" and w in ("read", "write"):

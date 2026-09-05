@@ -1,0 +1,14 @@
+{
+  "id": "6863202d-988b-408e-844b-ec59e09501b1",
+  "name": "quick",
+  "type": "script",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "language": "ts",
+    "source": "console.log(1)"
+  }
+}

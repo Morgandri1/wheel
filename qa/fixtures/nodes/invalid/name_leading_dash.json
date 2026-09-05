@@ -1,0 +1,14 @@
+{
+  "id": "a5eaded9-3635-4c72-85e4-6674be84b410",
+  "name": "-bad",
+  "type": "ctx",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "markdown": "x"
+  },
+  "_expect_reject": "NODE-name-charset"
+}

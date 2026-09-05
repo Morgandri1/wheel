@@ -1,0 +1,14 @@
+{
+  "id": "53202768-36eb-4459-8406-756b4eb45d97",
+  "name": "remote-mcp",
+  "type": "mcp",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {
+    "transport": "http",
+    "url": "https://mcp.example.com/sse"
+  }
+}

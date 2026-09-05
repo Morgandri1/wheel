@@ -1,0 +1,11 @@
+{
+  "id": "f627e309-26a3-414a-8f61-9c2699686855",
+  "name": "blobs",
+  "type": "chest",
+  "position": {
+    "x": 120.0,
+    "y": 340.0
+  },
+  "wires": [],
+  "config": {}
+}

@@ -18,8 +18,8 @@
     "send"
   ],
   "total": 243,
-  "allow": 25,
-  "deny": 218,
+  "allow": 26,
+  "deny": 217,
   "cells": [
     {
       "id": "WM-agent-agent-read",
@@ -675,7 +675,7 @@
       "to": "agent",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-agent-write",
@@ -683,7 +683,7 @@
       "to": "agent",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-agent-send",
@@ -699,7 +699,7 @@
       "to": "ctx",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-ctx-write",
@@ -707,7 +707,7 @@
       "to": "ctx",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-ctx-send",
@@ -715,7 +715,7 @@
       "to": "ctx",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-table-read",
@@ -723,7 +723,7 @@
       "to": "table",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-table-write",
@@ -739,7 +739,7 @@
       "to": "table",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-endpoint-read",
@@ -747,7 +747,7 @@
       "to": "endpoint",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-endpoint-write",
@@ -755,7 +755,7 @@
       "to": "endpoint",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-endpoint-send",
@@ -763,7 +763,7 @@
       "to": "endpoint",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-script-read",
@@ -771,7 +771,7 @@
       "to": "script",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-script-write",
@@ -779,7 +779,7 @@
       "to": "script",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-script-send",
@@ -795,7 +795,7 @@
       "to": "mcp",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-mcp-write",
@@ -803,7 +803,7 @@
       "to": "mcp",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-mcp-send",
@@ -811,15 +811,15 @@
       "to": "mcp",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-vault-read",
       "from": "endpoint",
       "to": "vault",
       "type": "read",
-      "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "expect": "allow",
+      "why": "resolve the endpoint's auth.vault_ref bearer secret"
     },
     {
       "id": "WM-endpoint-vault-write",
@@ -827,7 +827,7 @@
       "to": "vault",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-vault-send",
@@ -835,7 +835,7 @@
       "to": "vault",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-chest-read",
@@ -843,7 +843,7 @@
       "to": "chest",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-chest-write",
@@ -851,7 +851,7 @@
       "to": "chest",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-chest-send",
@@ -859,7 +859,7 @@
       "to": "chest",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-tool-read",
@@ -867,7 +867,7 @@
       "to": "tool",
       "type": "read",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-tool-write",
@@ -875,7 +875,7 @@
       "to": "tool",
       "type": "write",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-endpoint-tool-send",
@@ -883,7 +883,7 @@
       "to": "tool",
       "type": "send",
       "expect": "deny",
-      "why": "endpoint may only send->agent, send->script, write->table"
+      "why": "endpoint may only send->agent, send->script, write->table, read->vault"
     },
     {
       "id": "WM-script-agent-read",
