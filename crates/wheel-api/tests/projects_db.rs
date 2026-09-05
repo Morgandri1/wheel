@@ -52,7 +52,12 @@ fn token(sub: &str) -> String {
     let now = chrono::Utc::now().timestamp();
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
-        &C { sub, iss: ISSUER, exp: now + 3600, nbf: now - 60 },
+        &C {
+            sub,
+            iss: ISSUER,
+            exp: now + 3600,
+            nbf: now - 60,
+        },
         &EncodingKey::from_secret(DEV_SECRET.as_bytes()),
     )
     .unwrap()
@@ -117,7 +122,9 @@ async fn send(
     };
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, value)
 }
@@ -140,23 +147,54 @@ async fn owner_sees_own_project_and_stranger_gets_404() {
     let alice = token("user_alice");
     let mallory = token("user_mallory");
 
-    let (status, proj) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"alice board"}))).await;
+    let (status, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"alice board"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{proj}");
     let id = proj["id"].as_str().unwrap().to_string();
 
-    let (status, _) = send(&app, "GET", &format!("/v1/projects/{id}"), Some(&alice), None).await;
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "owner cannot read own project");
 
     // The whole ballgame: a *valid* token for the wrong user must not distinguish "yours but
     // forbidden" from "does not exist".
-    let (status, body) = send(&app, "GET", &format!("/v1/projects/{id}"), Some(&mallory), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "cross-tenant read leaked: {body}");
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}"),
+        Some(&mallory),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-tenant read leaked: {body}"
+    );
     assert_eq!(body["error"]["code"], "not_found");
 
     // ...and it must match the response for an id that genuinely does not exist, byte for byte.
     let ghost = uuid::Uuid::new_v4();
-    let (ghost_status, ghost_body) =
-        send(&app, "GET", &format!("/v1/projects/{ghost}"), Some(&mallory), None).await;
+    let (ghost_status, ghost_body) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{ghost}"),
+        Some(&mallory),
+        None,
+    )
+    .await;
     assert_eq!(ghost_status, status);
     assert_eq!(ghost_body, body, "existence oracle: the two 404s differ");
 }
@@ -167,7 +205,14 @@ async fn stranger_cannot_mutate_or_proxy() {
     let alice = token("user_alice");
     let mallory = token("user_mallory");
 
-    let (_, proj) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"a"}))).await;
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"a"})),
+    )
+    .await;
     let id = proj["id"].as_str().unwrap().to_string();
 
     for (method, path) in [
@@ -180,11 +225,22 @@ async fn stranger_cannot_mutate_or_proxy() {
     ] {
         let body = (method == "PATCH").then(|| json!({"name": "stolen"}));
         let (status, _) = send(&app, method, &path, Some(&mallory), body).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path} was reachable by a stranger");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} was reachable by a stranger"
+        );
     }
 
     // Alice's project is untouched.
-    let (_, after) = send(&app, "GET", &format!("/v1/projects/{id}"), Some(&alice), None).await;
+    let (_, after) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}"),
+        Some(&alice),
+        None,
+    )
+    .await;
     assert_eq!(after["name"], "a");
 }
 
@@ -192,7 +248,14 @@ async fn stranger_cannot_mutate_or_proxy() {
 async fn unauthenticated_requests_are_rejected() {
     let (app, _db) = app_or_skip!();
     let alice = token("user_alice");
-    let (_, proj) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"a"}))).await;
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"a"})),
+    )
+    .await;
     let id = proj["id"].as_str().unwrap().to_string();
 
     for path in [
@@ -201,7 +264,11 @@ async fn unauthenticated_requests_are_rejected() {
         format!("/v1/projects/{id}/engine/v1/board"),
     ] {
         let (status, _) = send(&app, "GET", &path, None, None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} served without a token");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} served without a token"
+        );
     }
 }
 
@@ -211,13 +278,36 @@ async fn list_is_scoped_to_the_caller() {
     let alice = token("user_alice");
     let mallory = token("user_mallory");
 
-    send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"alice one"}))).await;
-    send(&app, "POST", "/v1/projects", Some(&mallory), Some(json!({"name":"mallory one"}))).await;
+    send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"alice one"})),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&mallory),
+        Some(json!({"name":"mallory one"})),
+    )
+    .await;
 
     let (status, list) = send(&app, "GET", "/v1/projects", Some(&alice), None).await;
     assert_eq!(status, StatusCode::OK);
-    let names: Vec<&str> = list.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["alice one"], "list leaked another user's projects");
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alice one"],
+        "list leaked another user's projects"
+    );
 }
 
 #[tokio::test]
@@ -225,7 +315,14 @@ async fn malformed_project_id_is_a_400_not_a_500() {
     let (app, _db) = app_or_skip!();
     let alice = token("user_alice");
     for bad in ["not-a-uuid", "../../etc/passwd", "00000000", "%00"] {
-        let (status, _) = send(&app, "GET", &format!("/v1/projects/{bad}"), Some(&alice), None).await;
+        let (status, _) = send(
+            &app,
+            "GET",
+            &format!("/v1/projects/{bad}"),
+            Some(&alice),
+            None,
+        )
+        .await;
         assert!(
             status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
             "id {bad:?} produced {status}"
@@ -238,10 +335,24 @@ async fn project_cap_is_enforced() {
     let (app, _db) = app_or_skip!();
     let alice = token("user_alice");
     for i in 0..3 {
-        let (status, _) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name": format!("p{i}")}))).await;
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/projects",
+            Some(&alice),
+            Some(json!({"name": format!("p{i}")})),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED);
     }
-    let (status, body) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"one too many"}))).await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"one too many"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
@@ -250,7 +361,14 @@ async fn invalid_names_are_rejected() {
     let (app, _db) = app_or_skip!();
     let alice = token("user_alice");
     for bad in ["", "   ", "a\nb", &"x".repeat(65)] {
-        let (status, _) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name": bad}))).await;
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/projects",
+            Some(&alice),
+            Some(json!({"name": bad})),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "accepted name {bad:?}");
     }
 }
@@ -259,7 +377,14 @@ async fn invalid_names_are_rejected() {
 async fn ingress_is_closed_until_opted_in() {
     let (app, _db) = app_or_skip!();
     let alice = token("user_alice");
-    let (_, proj) = send(&app, "POST", "/v1/projects", Some(&alice), Some(json!({"name":"a"}))).await;
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"a"})),
+    )
+    .await;
     let id = proj["id"].as_str().unwrap().to_string();
 
     // Default is closed.
