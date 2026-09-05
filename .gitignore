@@ -25,3 +25,6 @@ __pycache__/
 qa/e2e/node_modules/
 qa/e2e/test-results/
 qa/e2e/playwright-report/
+qa/e2e/node_modules/
+qa/e2e/playwright-report/
+qa/e2e/test-results/
