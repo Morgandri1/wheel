@@ -6,17 +6,25 @@ import { Button, Field, Glyph, Input, Select, Textarea, Toggle } from "@/compone
 import { toast, toastError } from "@/components/ui/toast";
 import { AuthFlow } from "@/components/inspector/auth-flow";
 import { CtxPanel } from "@/components/inspector/ctx-panel";
+import { EndpointPanel } from "@/components/inspector/endpoint-panel";
+import { TablePanel } from "@/components/inspector/table-panel";
 import { useBoardStore } from "@/store/board";
 import type { EngineApi } from "@/lib/api";
-import type { AgentNode, WheelNode } from "@/lib/schema";
+import type { AgentNode, Project, WheelNode } from "@/lib/schema";
 
 export function Inspector({
   node,
+  nodes,
+  project,
   api,
+  projectId,
   onChanged,
 }: {
   node: WheelNode | null;
+  nodes: WheelNode[];
+  project: Project;
   api: EngineApi;
+  projectId: string;
   onChanged: () => void;
 }) {
   if (!node) {
@@ -52,6 +60,16 @@ export function Inspector({
           <AgentPanel node={node} api={api} onChanged={onChanged} />
         ) : node.type === "ctx" ? (
           <CtxPanel node={node} api={api} onChanged={onChanged} />
+        ) : node.type === "endpoint" ? (
+          <EndpointPanel
+            node={node}
+            nodes={nodes}
+            project={project}
+            api={api}
+            onChanged={onChanged}
+          />
+        ) : node.type === "table" ? (
+          <TablePanel node={node} api={api} projectId={projectId} onChanged={onChanged} />
         ) : (
           <p className="text-meta text-ink-dim">
             {meta.blurb} The editor for {meta.label.toLowerCase()} nodes lands next — the node,

@@ -170,7 +170,8 @@ export function engineApi(projectId: string) {
           p,
         ),
       query: (sql: string) =>
-        request<{ rows: Record<string, unknown>[] }>(engine(projectId, `/tables/${nodeId}/query`), {
+        // PROTOCOL.md: a SQL result is {columns, rows}, rows being positional arrays.
+        request<QueryResult>(engine(projectId, `/tables/${nodeId}/query`), {
           ...p,
           method: "POST",
           body: { sql },
@@ -215,6 +216,11 @@ export function engineApi(projectId: string) {
         expect: "void",
       }),
   };
+}
+
+export interface QueryResult {
+  columns: string[];
+  rows: unknown[][];
 }
 
 export type EngineApi = ReturnType<typeof engineApi>;

@@ -150,7 +150,14 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
         <>
           <div className="flex min-h-0 flex-1">
             <Canvas nodes={nodes} api={api} onChanged={refetchBoard} />
-            <Inspector node={selected} api={api} onChanged={refetchBoard} />
+            <Inspector
+              node={selected}
+              nodes={nodes}
+              project={board.data.project}
+              api={api}
+              projectId={projectId}
+              onChanged={refetchBoard}
+            />
           </div>
           <AgentDrawer nodes={nodes} api={api} projectId={projectId} />
         </>
