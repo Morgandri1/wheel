@@ -182,7 +182,7 @@ export function engineApi(projectId: string) {
 
     chest: (nodeId: string) => ({
       ls: (prefix = "") =>
-        request<{ entries: { key: string; size: number }[] }>(
+        request<{ entries: { key: string; bytes: number; modified_at: string }[] }>(
           engine(projectId, `/chests/${nodeId}/ls?prefix=${encodeURIComponent(prefix)}`),
           p,
         ),
