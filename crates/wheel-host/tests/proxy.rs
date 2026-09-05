@@ -109,6 +109,7 @@ async fn harness(engine_base: &str) -> (Router, Uuid) {
         }),
         store,
         http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
     };
     (build_router(state), id)
 }

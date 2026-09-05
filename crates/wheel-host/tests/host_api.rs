@@ -114,6 +114,7 @@ fn harness(sandbox: FakeSandbox) -> (axum::Router, Arc<Mutex<Calls>>, Arc<Store>
         sandbox: Arc::new(sandbox),
         store: store.clone(),
         http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
     };
     (build_router(state), calls, store)
 }

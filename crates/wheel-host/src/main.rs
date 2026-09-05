@@ -31,6 +31,12 @@ async fn main() -> Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(addr = %bind, "listening");
-    axum::serve(listener, app).await?;
+    // With connect info, so the failed-bearer limiter can key on the peer address rather than
+    // throttling every caller together.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
