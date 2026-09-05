@@ -216,9 +216,36 @@ Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_ex
 | `ENG-park-resume` | The next message resumes a parked agent (`parked → starting → running`) with `--resume`, and the **same `session_id`** comes back — proving context was preserved rather than silently reset. | S2 |
 | `ENG-park-no-loss` | A message that arrives while parked is not lost and is delivered exactly once after resume. | **S1** |
 | `ENG-park-ephemeral` | With `ephemeral_context: true`, parking does not resurrect context that was meant to be cleared. | S2 |
+| `ENG-start-after-failure` | An agent that failed to start (`needs_auth`, root refusal, a crash) can be started again after the cause is fixed, and a **new process actually exists**. Asserted by observing the child, never by the status the engine reports about itself — the pre-fix bug returned `200 {"status":"stopped"}` and spawned nothing (BUG-011). Every lifecycle test before this one drove `start` from a clean state, which is why a permanently wedged agent was invisible to the whole suite. | **S1** |
+| `MSG-delivered-means-delivered` | `delivered` means the bytes reached a **live** child's stdin. A message written to a dead child's pipe is not delivered: it stays queued or requeues, and is never marked delivered against a process that no longer exists (BUG-011). | **S1** |
 | `ENG-one-process` | **Exactly one harness process per agent at any time.** 10 messages sent within 100 ms produce ONE process and 10 sequential turns. Start is idempotent: a second start while running is a no-op returning the existing session. | **S1** |
 | `ENG-budget` | `budget.max_turns` / `max_usd` exhaustion → `budget_exhausted`, process stopped, event emitted; no further turns run. | S2 |
 | `ENG-health-not-liveness` | No test (and no engine health check) uses "a process is alive" as a proxy for "the agent is healthy" — `parked` is healthy and processless. | S3 |
+
+---
+
+### 5b. Credential routing into the child (§4, §5b)
+
+An agent's credential is only useful if it reaches the child in the **variable that harness
+actually reads**. Every criterion here is asserted from *outside* the engine, against
+`WHEEL_FAKE_ENV_DUMP` — one record per spawn, written by the fake harness, naming which
+credential variables were set and the sha256 (never the value) of each. The engine's own log
+cannot be the evidence, because the engine is what is under test.
+
+The failure this catches is nasty because it is invisible: a mis-routed credential is rejected
+at request time and surfaces as `needs_auth`, so the operator is told their perfectly valid
+token is wrong.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-cred-oat-var` | An `sk-ant-oat…` setup-token arrives as **CLAUDE_CODE_OAUTH_TOKEN and nothing else**. | S2 |
+| `AUTH-cred-oat-not-as-key` | The same token is **not also** exported as `ANTHROPIC_API_KEY` — belt-and-braces exporting both would be rejected by the API. | S2 |
+| `AUTH-cred-key-var` | An `sk-ant-api…` key arrives as **ANTHROPIC_API_KEY and nothing else**. | S2 |
+| `AUTH-cred-oat-value` / `AUTH-cred-key-value` | The credential that arrives is byte-identical (by sha256) to the one stored — routed to the right variable *and* not mangled on the way. | S2 |
+| `AUTH-cred-no-stale` | Replacing a credential clears the variable the previous one used; a spawn never carries two credentials because an earlier auth left one behind. | **S1** |
+| `AUTH-cred-codex-var` | A codex agent's key arrives as **CODEX_API_KEY**, never `OPENAI_API_KEY` — the latter is reported as present by `codex doctor` and authenticates nothing. | S2 |
+| `AUTH-cred-config-dir` | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are set per node, so two agents never share a credential store. | **S1** |
+| `SEC-no-secret-in-argv` | No credential appears in the child's argv — argv is world-readable across uids (§5b). Asserted from the dump's own record of argv. | **S1** |
 
 ---
 
@@ -442,6 +469,13 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 
 ## 11. E2E — browser (Playwright)
 
+Two Playwright projects, because `NEXT_PUBLIC_AUTH_MODE` is inlined at build time and one
+server can only be built for one mode: `chromium` (:3000, mock auth) and `local-auth` (:3200,
+`AUTH_MODE=local`, its own `.next-local` cache). Both run in `make test-e2e`. The `local-auth`
+specs were written by Web and adopted here rather than run by hand before deploys — AUTH-local
+carries S1 criteria, and an S1 nobody runs is an S1 nobody catches.
+
+
 | ID | Criterion |
 |---|---|
 | `E2E-landing` | Landing page renders, no console errors. |
@@ -449,8 +483,14 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 | `E2E-local-signup` | (`AUTH_MODE=local`) Sign-up page creates an account and lands on `/app` already authenticated — no second login step. |
 | `E2E-local-login` | Sign-in page authenticates an existing account; the session survives a full page reload. |
 | `E2E-local-logout` | Logout returns to the signed-out state, and `/app` redirects again afterwards — asserted by navigation, not by whether a button changed label. |
-| `E2E-local-bad-password` | A wrong password shows an error **in the UI** and does not navigate. The message must not distinguish wrong-password from unknown-account (`AUTH-local-wrong-password` seen from the browser — the enumeration oracle we most plausibly reintroduce is a helpful error string in the client). |
-| `E2E-local-pw-policy` | A password under the policy is rejected with a message naming the requirement, before any request is sent. |
+| `E2E-local-bad-password` | A wrong password shows an error **in the UI**, does not navigate, stores no session, and clears the password field so a retry is not a half-edit of a wrong value. |
+| `E2E-local-no-enumeration` | The wrong-password message and the unknown-account message are the **same string** in the browser. `AUTH-local-wrong-password` seen from the client: the API can stop leaking and the UI reintroduce it on its own with a helpful "no account with that email". Asserted by comparing the two rendered strings, not by matching one expected phrase. |
+| `E2E-local-signin-redirect` | A signed-out visit to `/app` lands on the sign-in screen. |
+| `E2E-local-deep-link` | A deep link's destination survives the round trip through `?next=`. |
+| `E2E-local-session-gate` | A returning user is **never rendered as signed out** on the way back: `loading` (storage unread) is a distinct state from `anon`. Collapsing them bounces every returning user to `/sign-in` for one frame, which arrives as an unreproducible intermittent report. Asserted by watching navigations across a reload, not by reading a label. |
+| `E2E-local-revoked` | A stored token the API no longer accepts signs the user out rather than failing silently on every request. |
+| `E2E-local-ratelimit` | After the documented number of failures the UI says how long to wait (`AUTH-local-ratelimit` from the browser). |
+| `E2E-local-pw-policy` | A password under the policy is rejected with a message naming the requirement, before any request is sent — asserted by **counting requests**, because a message that appears while the request goes out anyway is not client-side validation and the DOM cannot tell the difference. |
 | `E2E-local-token-storage` | The session token is not left anywhere a page script can trivially exfiltrate it — assert what Web actually does and that it is deliberate. `localStorage` is acceptable in v1 **if** it is the documented choice. **S1** to leave undocumented. |
 | `E2E-auth-mode-mirror` | The header's `auth-mode` testid reflects the mode the API is actually running (`local` \| `clerk` \| `mock` \| `dev`); a web built for one mode against an API in another fails loudly at sign-in rather than half-working. |
 | `E2E-project-create` | Create a project; it appears and reaches `running`. |

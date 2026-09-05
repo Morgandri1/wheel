@@ -18,6 +18,7 @@ import json, os, sys, time, uuid, re, hashlib, datetime, signal
 VERSION = "2.1.261 (Claude Code)"
 SCRIPT_PATH = os.environ.get("WHEEL_FAKE_SCRIPT")  # JSONL of canned turns, one object per turn
 TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")  # optional: append every stdin line here
+ENV_DUMP = os.environ.get("WHEEL_FAKE_ENV_DUMP")  # optional: append one JSON record per spawn
 
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -92,6 +93,60 @@ def root_refusal_guard(a):
     if (forced or is_root) and a.get("permission_mode") == "bypassPermissions":
         die(ROOT_REFUSAL, 1)
 
+# ------------------------------------------------------------- credential routing
+# The env vars the engine may use to hand a credential to the child. They are NOT
+# interchangeable: `claude setup-token` mints an sk-ant-oat… token that must arrive as
+# CLAUDE_CODE_OAUTH_TOKEN, and an sk-ant-api… key must arrive as ANTHROPIC_API_KEY.
+# Swapping them fails at request time looking exactly like a bad credential, so the
+# failure surfaces as needs_auth and points at the user rather than at the routing.
+CRED_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN",
+             "CLAUDE_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
+CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN", "IS_SANDBOX")
+
+def credential_class(value):
+    """Name the KIND of credential without ever revealing it."""
+    if value.startswith("sk-ant-oat"):
+        return "oauth_token"
+    if value.startswith("sk-ant-api"):
+        return "api_key"
+    if value.startswith("sk-ant-"):
+        return "anthropic_unknown"
+    if value.startswith("sk-"):
+        return "openai_style"
+    return "opaque"
+
+def env_dump(a):
+    """Append one record describing HOW this spawn was credentialed.
+
+    Values are never written — only their length, sha256 and prefix class — so a test can
+    assert `the sk-ant-oat token arrived as CLAUDE_CODE_OAUTH_TOKEN and nowhere else`
+    without a secret ever reaching disk. One record per spawn (JSONL), because idle parking
+    means an agent is spawned many times and each spawn is a separate routing decision.
+    """
+    if not ENV_DUMP:
+        return
+    creds = {}
+    for name in CRED_VARS:
+        v = os.environ.get(name)
+        if v is None:
+            continue
+        creds[name] = {"bytes": len(v.encode()), "sha256": hashlib.sha256(v.encode()).hexdigest(),
+                       "class": credential_class(v)}
+    rec = {"ts": now_iso(), "pid": os.getpid(), "argv0": os.path.basename(sys.argv[0]),
+           "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+           "permission_mode": a.get("permission_mode"), "resume": a.get("resume"),
+           "credentials": creds,
+           "credential_vars_set": sorted(creds),
+           "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
+           "argv": sys.argv[1:]}
+    try:
+        with open(ENV_DUMP, "a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except OSError as e:
+        # A dump we cannot write must be loud: a silently missing record reads as
+        # "no credential was set", which is the exact wrong answer.
+        die("cannot write WHEEL_FAKE_ENV_DUMP %s: %s" % (ENV_DUMP, e), 2)
+
 def auth_state():
     """Mirrors the engine's needs_auth flow. WHEEL_FAKE_AUTH=needs_auth|ok."""
     st = os.environ.get("WHEEL_FAKE_AUTH", "ok")
@@ -128,6 +183,10 @@ def main():
     session_id = a["resume"] or os.environ.get("WHEEL_FAKE_SESSION_ID") or str(uuid.uuid4())
     model = a["model"] or "claude-fake-1"
     stream = a["output_format"] == "stream-json"
+
+    # Before every exit path: a spawn that dies on the root trap or on needs_auth is
+    # exactly the spawn whose credential routing a test most wants to inspect.
+    env_dump(a)
 
     # SDK auth spike: --permission-mode bypassPermissions is REFUSED when the child runs as
     # root. Exit 1 + EMPTY stdout + this exact stderr — byte-identical to "not logged in".

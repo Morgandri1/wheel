@@ -4,7 +4,7 @@
 The fake harness is test infrastructure: if it lies, every integration test that
 depends on it lies too. So it gets tested like production code.
 """
-import json, os, subprocess, sys, tempfile
+import json, os, hashlib, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLAUDE = os.path.join(HERE, "fake-claude")
@@ -143,24 +143,6 @@ def t_auth():
     p = run(SJ, turn("x"), env={"WHEEL_FAKE_STRICT_AUTH": "1", "ANTHROPIC_API_KEY": "sk-test"})
     check("strict auth with creds => ok", p.returncode == 0)
 
-def t_root_refusal():
-    """Root refusal must be indistinguishable from needs_auth EXCEPT on stderr.
-
-    That is the whole point: the engine cannot use the exit code to tell them apart, so
-    these assertions pin the exact shape the classifier has to work from.
-    """
-    p = run(SJ, turn("x"), env={"WHEEL_FAKE_ROOT_REFUSAL": "1"})
-    check("root refusal exits 1", p.returncode == 1, str(p.returncode))
-    check("root refusal has EMPTY stdout", p.stdout == "", repr(p.stdout[:120]))
-    check("root refusal stderr is the real message",
-          "cannot be used with root/sudo privileges" in p.stderr, p.stderr[:160])
-    a = run(SJ, turn("x"), env={"WHEEL_FAKE_AUTH": "needs_auth"})
-    check("root refusal and needs_auth share exit code + empty stdout (why stderr matters)",
-          a.returncode == p.returncode and a.stdout == p.stdout == "")
-    check("but their stderr differs", a.stderr != p.stderr)
-    p = run(SJ + ["--permission-mode", "bypassPermissions"], turn("x"), env={"WHEEL_FAKE_UID": "0"})
-    check("bypassPermissions as uid 0 refuses", p.returncode == 1 and p.stdout == "")
-
 def t_no_secrets_in_argv():
     """argv is world-readable across uids; prompts/ctx/secrets must never be passed that way."""
     import subprocess as sp
@@ -173,7 +155,23 @@ def t_no_secrets_in_argv():
               ev.get("system_prompt") == "SECRET-CANARY-IN-FILE", repr(ev.get("system_prompt")))
 
 def t_root_refusal():
-    """ENG-root-refusal: reproduce the real CLI's refusal of bypassPermissions as root."""
+    """ENG-root-refusal: the real CLI refuses bypassPermissions as root.
+
+    Root refusal is indistinguishable from needs_auth on exit code AND stdout — stderr is
+    the only signal — so these assertions pin the exact shape the engine's classifier has
+    to work from. Inferring needs_auth from the exit code alone is the bug this forbids.
+    """
+    p = run(SJ, turn("x"), env={"WHEEL_FAKE_ROOT_REFUSAL": "1"})
+    check("root refusal exits 1", p.returncode == 1, str(p.returncode))
+    check("root refusal has EMPTY stdout", p.stdout == "", repr(p.stdout[:120]))
+    check("root refusal stderr is the real message",
+          "cannot be used with root/sudo privileges" in p.stderr, p.stderr[:160])
+    a = run(SJ, turn("x"), env={"WHEEL_FAKE_AUTH": "needs_auth"})
+    check("root refusal and needs_auth share exit code + empty stdout (why stderr matters)",
+          a.returncode == p.returncode and a.stdout == p.stdout == "")
+    check("but their stderr differs", a.stderr != p.stderr)
+    p = run(SJ + ["--permission-mode", "bypassPermissions"], turn("x"), env={"WHEEL_FAKE_UID": "0"})
+    check("bypassPermissions as uid 0 refuses", p.returncode == 1 and p.stdout == "")
     p = run(SJ + ["--permission-mode", "bypassPermissions"], turn("x"), env={"WHEEL_FAKE_ROOT": "1"})
     check("root+bypassPermissions exits 1", p.returncode == 1, str(p.returncode))
     check("root refusal has EMPTY stdout", p.stdout.strip() == "", p.stdout[:120])
@@ -182,6 +180,55 @@ def t_root_refusal():
     check("root refusal is NOT an auth message", "login" not in p.stderr.lower())
     p = run(SJ + ["--permission-mode", "default"], turn("x"), env={"WHEEL_FAKE_ROOT": "1"})
     check("no refusal without bypassPermissions", p.returncode == 0)
+
+def t_env_dump():
+    """WHEEL_FAKE_ENV_DUMP records HOW a spawn was credentialed, without recording the secret.
+
+    SDK's ask: an sk-ant-oat token must arrive as CLAUDE_CODE_OAUTH_TOKEN and an sk-ant-api
+    key as ANTHROPIC_API_KEY; sending one as the other fails at request time looking exactly
+    like a bad credential. Unit tests on the engine side assert what it MEANT to set; this
+    asserts what the child actually RECEIVED.
+    """
+    oat = "sk-ant-oat01-" + "z" * 40
+    with tempfile.TemporaryDirectory() as d:
+        dump = os.path.join(d, "env.jsonl")
+        run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": dump, "CLAUDE_CODE_OAUTH_TOKEN": oat})
+        recs = [json.loads(l) for l in open(dump)]
+        check("one record per spawn", len(recs) == 1, str(len(recs)))
+        r = recs[0]
+        check("the var that was set is named", r["credential_vars_set"] == ["CLAUDE_CODE_OAUTH_TOKEN"],
+              str(r["credential_vars_set"]))
+        check("an oat token is classified as an oauth token",
+              r["credentials"]["CLAUDE_CODE_OAUTH_TOKEN"]["class"] == "oauth_token")
+        check("the secret VALUE never reaches the dump", oat not in open(dump).read())
+        check("but its sha256 does, so a test can prove identity without the value",
+              r["credentials"]["CLAUDE_CODE_OAUTH_TOKEN"]["sha256"] ==
+              hashlib.sha256(oat.encode()).hexdigest())
+
+        run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": dump,
+                                "ANTHROPIC_API_KEY": "sk-ant-api03-" + "y" * 40})
+        recs = [json.loads(l) for l in open(dump)]
+        check("records append across spawns (idle parking respawns)", len(recs) == 2, str(len(recs)))
+        check("an api key is classified as an api key",
+              recs[1]["credentials"]["ANTHROPIC_API_KEY"]["class"] == "api_key")
+
+        # The mis-routing this exists to catch: right secret, wrong variable.
+        run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": dump, "ANTHROPIC_API_KEY": oat})
+        r = [json.loads(l) for l in open(dump)][2]
+        check("a mis-routed oat token is visible as oauth_token in the WRONG var",
+              r["credentials"]["ANTHROPIC_API_KEY"]["class"] == "oauth_token")
+
+    with tempfile.TemporaryDirectory() as d:
+        dump = os.path.join(d, "codex.jsonl")
+        run(["exec", "--json"], "hello\n", binary=CODEX,
+            env={"WHEEL_FAKE_ENV_DUMP": dump, "CODEX_API_KEY": "sk-codex-" + "q" * 20})
+        r = json.loads(open(dump).read().splitlines()[0])
+        check("codex dumps too (§4: it uses CODEX_API_KEY, not OPENAI_API_KEY)",
+              r["credential_vars_set"] == ["CODEX_API_KEY"], str(r["credential_vars_set"]))
+
+    # A dump that cannot be written must be loud: a missing record reads as "no credential".
+    p = run(SJ, turn("x"), env={"WHEEL_FAKE_ENV_DUMP": "/nonexistent-dir-xyz/env.jsonl"})
+    check("an unwritable dump path fails loudly", p.returncode == 2, str(p.returncode))
 
 def t_transcript():
     with tempfile.TemporaryDirectory() as d:
@@ -239,7 +286,28 @@ def t_codex():
     p = run(["exec", "--json", "direct prompt"], "", binary=CODEX)
     check("codex positional prompt", "direct prompt" in p.stdout)
 
+def _assert_no_shadowed_tests():
+    """A second `def t_x` silently deletes the first — globals() keeps one binding per name.
+
+    Five assertions were dead this way before anyone noticed, which is the same failure as a
+    test file that runs zero tests and exits 0. Read the source, not the namespace.
+    """
+    import ast, collections
+    src = ast.parse(open(os.path.abspath(__file__)).read())
+    names = [n.name for n in src.body if isinstance(n, ast.FunctionDef) and n.name.startswith("t_")]
+    dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+    if dupes:
+        print("selftest is broken: duplicate test names shadow each other -> %s" % ", ".join(dupes))
+        return False
+    if len(names) != len([k for k in globals() if k.startswith("t_")]):
+        print("selftest is broken: source defines %d tests, namespace has %d" % (
+            len(names), len([k for k in globals() if k.startswith("t_")])))
+        return False
+    return True
+
 def main():
+    if not _assert_no_shadowed_tests():
+        return 1
     tests = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
     for t in tests:
         print("%s:" % t.__name__[2:])

@@ -9,7 +9,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+# APPENDED, not prepended: these are a fallback for finding cargo/pnpm when they are not
+# on PATH, never an override of the toolchain the caller chose. Prepending them meant a
+# developer who selected node 22 to match CI silently got homebrew's node anyway, and the
+# gate reported a verdict about a runtime nobody asked for.
+export PATH="$PATH:$HOME/.cargo/bin:/opt/homebrew/bin"
 export CARGO_TERM_COLOR=always
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -112,6 +116,16 @@ elif ! have pnpm; then
 else
   if [ ! -d web/node_modules ]; then
     step "web:install" pnpm -C web install --frozen-lockfile
+  fi
+  # CI pins node 22 (.github/workflows/ci.yml). A different major here can make the web
+  # gates disagree with CI for reasons that have nothing to do with the code — node >= 22.4
+  # defines its own experimental `localStorage` global that shadows jsdom's, so every
+  # browser-storage test fails locally and passes in CI. Say so up front rather than let
+  # the next person debug their runtime instead of the product.
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo '')"
+  if [ -n "$node_major" ] && [ "$node_major" != "22" ]; then
+    printf '%s  ! node v%s — CI pins node 22. If a web gate fails here and is green on CI, suspect the runtime first.%s\n' \
+      "$Y" "$node_major" "$Z"
   fi
   for s in lint typecheck test; do
     if web_script "$s"; then step "web:$s" pnpm -C web run "$s"
