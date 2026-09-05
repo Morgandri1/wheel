@@ -71,10 +71,31 @@ if [ "$ENGINE_IMAGE" = "wheel-engine:test" ] && \
   exit 1
 fi
 
-echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
-if ! docker compose -f "$COMPOSE" up -d --build; then
-  echo "compose up failed"
-  exit 1
+api_healthy() {
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "$WHEEL_API_URL/healthz" 2>/dev/null || true)" = "200" ]
+}
+
+# infra/ is API's and they run this same compose project while developing. Racing them
+# produces "removal of container is already in progress" AFTER a 16-minute image build,
+# which is a miserable way to find out. So: reuse a healthy stack, and if we do have to
+# bring one up, retry once — a collision is usually a concurrent run mid-flight, not a
+# broken compose file.
+if api_healthy; then
+  echo "▸ reusing the stack already running at $WHEEL_API_URL"
+  OWN_STACK=0
+else
+  OWN_STACK=1
+  echo "▸ bringing up the stack (SANDBOX_BACKEND=$SANDBOX_BACKEND)"
+  docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1 || true
+  if ! docker compose -f "$COMPOSE" up -d --build; then
+    echo "  compose up failed — retrying once in 20s in case another run was mid-flight"
+    sleep 20
+    docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1 || true
+    if ! docker compose -f "$COMPOSE" up -d --build; then
+      echo "compose up failed"
+      exit 1
+    fi
+  fi
 fi
 
 echo "▸ waiting for the API"

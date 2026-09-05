@@ -411,9 +411,15 @@ def main():
         # exercised until agent->agent sends exist (the `wheel` CLI / /v1/cli, not landed).
         # Deferring is honest; asserting user-beats-user would prove nothing.
         R.skip("MSG-priority-user",
-               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
+               "NOT YET WRITTEN. The blocker is gone — the wheel CLI and /v1/cli are in "
+               "main and agent->agent sends are proven in test_engine_cli.py. This needs a "
+               "priority-lane scenario built on them (queue 3 agent messages, send 1 user "
+               "message, assert order from the stdin transcript).")
         R.skip("MSG-priority-order",
-               "needs agent->agent sends (wheel CLI + /v1/cli, not in main yet)")
+               "NOT YET WRITTEN. The blocker is gone — the wheel CLI and /v1/cli are in "
+               "main and agent->agent sends are proven in test_engine_cli.py. This needs a "
+               "priority-lane scenario built on them (queue 3 agent messages, send 1 user "
+               "message, assert order from the stdin transcript).")
 
         # ---------------------------------------------------------------- queue while stopped
         engine("POST", pid, "/v1/agents/%s/stop" % agent_id, owner)
