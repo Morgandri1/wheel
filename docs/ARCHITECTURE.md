@@ -91,6 +91,13 @@ wheel/
   (e) The engine itself must idle at ~0 CPU: no polling loops — inotify/WS/channels only.
 - **Storage inside the container**: one sqlite file `/data/wheel.db` (nodes, wires, messages, runtime state, Table-node
   data, vault ciphertext, chest index). Chest blobs on disk `/data/chest/<node_id>/`. Scripts on disk `/data/scripts/<node_id>/`.
+- **Isolation boundary = the NODE, not the project (ADVERSARY F007, accepted).** Inside a sandbox every agent/script/MCP child runs under its
+  OWN uid: each project owns a uid range (`base .. base+N`, project gid shared); the engine runs as `base` and keeps only ambient `CAP_SETUID`+`CAP_SETGID`
+  (nothing else) so it can drop each child to `base+1+n`. Per-node creds/config dirs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) are 0700 to that uid; shared
+  §3e workspaces are setgid dirs writable by the project gid. Node tokens are NOT placed in env: the child gets `WHEEL_TOKEN_FILE=<0600 path>` and
+  the CLI/MCP bridge reads it (env is readable via `/proc/<pid>/environ` only by the same uid — belt and braces). Docker backend: engine is container
+  root (cap-dropped to SETUID/SETGID) → trivial. Process backend: host spawns the engine with those two ambient caps. Milestone: M2 (docker), M3 (process).
+  Until M2 the docker backend uses one uid and the contract states "project is the boundary" as a KNOWN GAP in PROTOCOL.md.
 - **One sandbox per project, one `wheel-engine` process per sandbox.** Sandboxes are created by `wheel-host` through a
   `Sandbox` trait with two backends: `docker` (local dev / any VM with a docker daemon: container `wheel-p-<id>`, volume `wheel-p-<id>-data`)
   and `process` (production on Railway, where no docker daemon exists: a dedicated unix uid per project, data dir `/data/projects/<id>` mode 0700,
@@ -287,6 +294,12 @@ The grammar stays yoke's; the implementation follows §3c's hardening.
 | `prompt` (deprecated alias)                               | not carried                                                                                                                                              | —     | — |
 
 Matrix additions from this section: `agent → agent (write)` = manage (start/stop/update/remove/grant-to); grant-created wires carry `granted_by`.
+
+### Harness event integrity (ADVERSARY F008, accepted — Medium)
+Turn-complete and status are inferred ONLY from top-level harness events on the harness's own stdout pipe. SDK must prove with a test that a tool
+run by the agent which prints a well-formed `{"type":"result"}` (or any harness event) line to ITS stdout cannot reach the engine's parser as a
+top-level event (the CLI nests tool output inside JSON strings; the agent-sdk bridge makes this structural). Events must also carry the
+`session_id` the engine started; mismatches are logged and ignored.
 
 ### Message delivery contract
 - Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
