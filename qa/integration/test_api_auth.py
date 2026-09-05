@@ -21,6 +21,21 @@ def main():
     alice = mint(unique_sub("alice"))
     mallory = mint(unique_sub("mallory"))
 
+    # ---------------------------------------------------------------- positive control
+    # EVERY assertion below is "this token is refused", and all of them pass against an API
+    # that refuses every token in existence. When AUTH_MODE=local landed, this suite reported
+    # 7 green and 1 red; the seven were meaningless and the one red was the only signal.
+    # So the control runs FIRST and stops the suite: seven reassuring lines above a failure
+    # is worse output than one line saying auth does not work at all.
+    st, _, _ = call("GET", "/v1/projects", alice)
+    if not R.check("API-auth-accepts-valid", st != 401,
+                   "a VALID dev token was refused (%s) — every negative assertion below "
+                   "would pass vacuously, so they are not run. Check the API's AUTH_MODE: "
+                   "under `local`, dev HS256 tokens are refused BY DESIGN "
+                   "(AUTH-local-mode-local-rejects-dev) and this harness needs a real "
+                   "local account instead." % st):
+        return R.report("api-auth")
+
     # ---------------------------------------------------------------- unauthenticated
     st, _, _ = call("GET", "/v1/projects")
     R.check("API-auth-missing", st == 401, "no token -> %s (want 401)" % st)

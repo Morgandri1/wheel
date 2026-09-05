@@ -229,12 +229,6 @@ def main():
                 sum(1 for r in recs if KEY in (r.get("env_names") or [])) <= 1,
                 "more than one child has %s in its environment by NAME — an absent value is "
                 "not enough, the name alone tells an agent which secrets exist" % KEY)
-        if False:
-            pass
-            else:
-                R.check("SEC-vault-env-scope/%s" % label, not got,
-                        "the unwired agent's log mentions %s" % KEY)
-
         # ---- never in the transcript: the exact bytes written to the child's stdin
         http("POST", "/v1/agents/%s/send" % wired, {"body": "vault probe"})
         time.sleep(4)
