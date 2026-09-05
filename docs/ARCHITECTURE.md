@@ -48,6 +48,7 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+- **Build throughput on the shared dev host**: `~/.cargo/config.toml` sets one shared `target-dir` (`/Users/metatron/wheel-target`) and `jobs = 4` for every worktree — do not override them; `qa/check.sh` serialises cargo gates with `flock /tmp/wheel-cargo.lock`. Run long gates in the background and wait on completion; a foreground cargo killed by load is not a pass.
 - Toolchain (host is macOS, Docker present, **no cargo/node installed yet**): install Rust via
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y` (stable), Node 22 + pnpm via
   `brew install node pnpm` (or fnm). Python 3 is present. Docker Desktop/OrbStack is running.
