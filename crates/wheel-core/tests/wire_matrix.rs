@@ -1,5 +1,5 @@
-//! Exhaustive test of the wire matrix: all 8 x 8 x 3 = 192 cells asserted
-//! individually against ARCHITECTURE.md §3.
+//! Exhaustive test of the wire matrix: all 9 x 9 x 3 = 243 cells asserted
+//! individually against ARCHITECTURE.md §3 (+ §3d for `tool`).
 //!
 //! The expected set below is transcribed from the table *by hand, one line per
 //! documented cell*, deliberately NOT by calling `wire_allowed` — otherwise the
@@ -20,6 +20,7 @@ const EXPECTED_ALLOWED: &[(N, W, N)] = &[
     (N::Agent, W::Write, N::Chest),
     (N::Agent, W::Read, N::Script),
     (N::Agent, W::Read, N::Mcp),
+    (N::Agent, W::Read, N::Tool),
     // ctx →
     (N::Ctx, W::Send, N::Agent),
     // endpoint →
@@ -35,6 +36,9 @@ const EXPECTED_ALLOWED: &[(N, W, N)] = &[
     (N::Script, W::Read, N::Chest),
     (N::Script, W::Write, N::Chest),
     (N::Script, W::Read, N::Vault),
+    // tool → (§3d: a `vault` fill needs its own wire, so the dependency is
+    // visible on the board instead of hidden inside an operation's config)
+    (N::Tool, W::Read, N::Vault),
 ];
 
 fn is_expected(from: N, to: N, ty: W) -> bool {
@@ -58,13 +62,13 @@ fn every_one_of_the_192_cells_matches_the_contract() {
             }
         }
     }
-    assert_eq!(checked, 192, "expected to cover 8*8*3 cells");
+    assert_eq!(checked, 243, "expected to cover 9*9*3 cells");
 }
 
 #[test]
 fn allowed_count_is_exactly_the_documented_set() {
     assert_eq!(allowed_wires().len(), EXPECTED_ALLOWED.len());
-    assert_eq!(EXPECTED_ALLOWED.len(), 22);
+    assert_eq!(EXPECTED_ALLOWED.len(), 24);
 }
 
 #[test]
@@ -95,6 +99,27 @@ fn nothing_may_write_to_a_vault_or_an_agent() {
         assert!(!wire_allowed(from, N::Vault, W::Write));
         assert!(!wire_allowed(from, N::Agent, W::Write));
         assert!(!wire_allowed(from, N::Agent, W::Read));
+    }
+}
+
+#[test]
+fn a_tools_only_outgoing_wire_is_read_to_a_vault() {
+    for to in N::ALL {
+        for ty in W::ALL {
+            let expect = to == N::Vault && ty == W::Read;
+            assert_eq!(wire_allowed(N::Tool, to, ty), expect, "tool --{ty}--> {to}");
+        }
+    }
+    // Only an agent may reach a tool, and only to read it.
+    for from in N::ALL {
+        for ty in W::ALL {
+            let expect = from == N::Agent && ty == W::Read;
+            assert_eq!(
+                wire_allowed(from, N::Tool, ty),
+                expect,
+                "{from} --{ty}--> tool"
+            );
+        }
     }
 }
 

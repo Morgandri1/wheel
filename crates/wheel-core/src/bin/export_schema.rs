@@ -38,6 +38,8 @@ fn main() -> std::io::Result<()> {
     write::<WireSpec>(&dir, "wire-spec")?;
     write::<WireType>(&dir, "wire-type")?;
     write::<Position>(&dir, "position")?;
+    write::<ToolConfig>(&dir, "tool-config")?;
+    write::<ToolOperation>(&dir, "tool-operation")?;
     // Runtime.
     write::<AgentState>(&dir, "agent-state")?;
     write::<NodeState>(&dir, "node-state")?;

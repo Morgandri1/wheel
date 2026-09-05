@@ -52,6 +52,11 @@
       "type": "write"
     },
     {
+      "from": "agent",
+      "to": "tool",
+      "type": "read"
+    },
+    {
       "from": "ctx",
       "to": "agent",
       "type": "send"
@@ -110,6 +115,11 @@
       "from": "script",
       "to": "chest",
       "type": "write"
+    },
+    {
+      "from": "tool",
+      "to": "vault",
+      "type": "read"
     }
   ],
   "node_types": [
@@ -120,7 +130,8 @@
     "script",
     "mcp",
     "vault",
-    "chest"
+    "chest",
+    "tool"
   ],
   "wire_types": [
     "read",

@@ -51,7 +51,7 @@ fn agent_node_matches_the_contract_example() {
 /// Build one node of every type and assert the `type` tag and `config` payload
 /// land as the flat `"type" + "config"` pair the contract specifies.
 #[test]
-fn all_eight_node_types_round_trip_with_correct_tag() {
+fn every_node_type_round_trips_with_correct_tag() {
     let cases: Vec<(NodeType, NodeConfig)> = vec![
         (
             NodeType::Agent,
@@ -111,9 +111,29 @@ fn all_eight_node_types_round_trip_with_correct_tag() {
             }),
         ),
         (NodeType::Chest, NodeConfig::Chest(ChestConfig {})),
+        (
+            NodeType::Tool,
+            NodeConfig::Tool(ToolConfig {
+                base_url: "https://api.example.com".into(),
+                source_format: Some(ToolFormat::Openapi3),
+                operations: vec![],
+            }),
+        ),
     ];
 
-    assert_eq!(cases.len(), 8, "must cover every node type");
+    // Tied to NodeType::ALL, not a literal: adding a node type must break this
+    // test rather than silently skipping coverage of the new one.
+    assert_eq!(
+        cases.len(),
+        NodeType::ALL.len(),
+        "every node type needs a case here"
+    );
+    for t in NodeType::ALL {
+        assert!(
+            cases.iter().any(|(ty, _)| *ty == t),
+            "no case covers node type {t}"
+        );
+    }
 
     for (expected_type, config) in cases {
         assert_eq!(config.node_type(), expected_type);

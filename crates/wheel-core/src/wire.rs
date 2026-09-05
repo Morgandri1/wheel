@@ -130,6 +130,15 @@ pub const fn wire_allowed(from: NodeType, to: NodeType, ty: WireType) -> bool {
         // MCP server attached to the harness config at next start
         (N::Agent, N::Mcp, W::Read) => true,
 
+        // MCP-style tool operations are attached to the agent at next start.
+        (N::Agent, N::Tool, W::Read) => true,
+
+        // --- tool outgoing --------------------------------------------------
+        // A `vault` fill on an operation resolves at call time; the tool node
+        // needs its own wire for it (§3d), so the vault dependency is visible
+        // on the board rather than hidden inside an operation's config.
+        (N::Tool, N::Vault, W::Read) => true,
+
         // --- ctx outgoing ---------------------------------------------------
         // INJECTION: ctx markdown is prepended to the agent's prompt on start
         // and after every context clear. ctx has no other outgoing wires.
@@ -155,7 +164,7 @@ pub const fn wire_allowed(from: NodeType, to: NodeType, ty: WireType) -> bool {
         // --- everything else is denied --------------------------------------
         // In particular: table, vault, chest and mcp have NO outgoing wires;
         // nothing may write to a vault or to an agent; no node may wire to an
-        // endpoint or to an mcp except agent->mcp read.
+        // endpoint; a tool's only outgoing wire is read->vault.
         _ => false,
     }
 }
