@@ -1,0 +1,102 @@
+{
+  "id": "a1b2c3d4-0000-4000-8000-000000000003",
+  "name": "tool-postman",
+  "type": "tool",
+  "position": {
+    "x": 12.0,
+    "y": 34.0
+  },
+  "wires": [],
+  "config": {
+    "kind": "http",
+    "source": {
+      "format": "postman",
+      "raw": "{\"openapi\":\"3.0.0\"}",
+      "imported_at": "2026-09-05T00:00:00Z"
+    },
+    "base_url": "https://api.example.com",
+    "operations": [
+      {
+        "id": "op-postman",
+        "method": "GET",
+        "path": "/v1/charges/{id}",
+        "summary": "Fetch a charge",
+        "enabled": true,
+        "params": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "fill": {
+              "mode": "agent"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "required": false,
+            "fill": {
+              "mode": "static",
+              "value": 10
+            }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "fill": {
+              "mode": "vault",
+              "ref": "secrets/STRIPE_KEY"
+            }
+          },
+          {
+            "name": "X-Trace",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "fill": {
+              "mode": "hidden"
+            }
+          },
+          {
+            "name": "sess",
+            "in": "cookie",
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "fill": {
+              "mode": "agent"
+            }
+          }
+        ],
+        "body": {
+          "content_type": "application/json",
+          "schema": {
+            "type": "object"
+          },
+          "fills": {
+            "/note": {
+              "mode": "agent"
+            },
+            "/apiKey": {
+              "mode": "vault",
+              "ref": "secrets/STRIPE_KEY"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

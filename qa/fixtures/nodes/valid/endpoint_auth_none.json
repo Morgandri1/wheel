@@ -1,0 +1,18 @@
+{
+  "id": "e0000000-0000-4000-8000-000000000001",
+  "name": "hook-open",
+  "type": "endpoint",
+  "position": {
+    "x": 1.0,
+    "y": 2.0
+  },
+  "wires": [],
+  "config": {
+    "method": "POST",
+    "path": "/open",
+    "response_mode": "ack",
+    "auth": {
+      "mode": "none"
+    }
+  }
+}

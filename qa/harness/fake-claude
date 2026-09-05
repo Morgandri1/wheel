@@ -113,6 +113,14 @@ def main():
     model = a["model"] or "claude-fake-1"
     stream = a["output_format"] == "stream-json"
 
+    # SDK auth spike: --permission-mode bypassPermissions is REFUSED when the child runs as
+    # root. Exit 1 + EMPTY stdout + this exact stderr — byte-identical to "not logged in".
+    # The engine MUST classify this as `error`, never `needs_auth`, and must never infer
+    # needs_auth from the exit code alone.
+    if os.environ.get("WHEEL_FAKE_ROOT_REFUSAL") == "1" or (
+            a["permission_mode"] == "bypassPermissions" and os.environ.get("WHEEL_FAKE_UID") == "0"):
+        die("--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons", 1)
+
     if auth_state() == "needs_auth":
         # Real CLI exits non-zero with a login prompt on stderr; engine maps -> needs_auth.
         die("Invalid API key · Please run /login", 1)

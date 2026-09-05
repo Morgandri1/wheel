@@ -143,6 +143,35 @@ def t_auth():
     p = run(SJ, turn("x"), env={"WHEEL_FAKE_STRICT_AUTH": "1", "ANTHROPIC_API_KEY": "sk-test"})
     check("strict auth with creds => ok", p.returncode == 0)
 
+def t_root_refusal():
+    """Root refusal must be indistinguishable from needs_auth EXCEPT on stderr.
+
+    That is the whole point: the engine cannot use the exit code to tell them apart, so
+    these assertions pin the exact shape the classifier has to work from.
+    """
+    p = run(SJ, turn("x"), env={"WHEEL_FAKE_ROOT_REFUSAL": "1"})
+    check("root refusal exits 1", p.returncode == 1, str(p.returncode))
+    check("root refusal has EMPTY stdout", p.stdout == "", repr(p.stdout[:120]))
+    check("root refusal stderr is the real message",
+          "cannot be used with root/sudo privileges" in p.stderr, p.stderr[:160])
+    a = run(SJ, turn("x"), env={"WHEEL_FAKE_AUTH": "needs_auth"})
+    check("root refusal and needs_auth share exit code + empty stdout (why stderr matters)",
+          a.returncode == p.returncode and a.stdout == p.stdout == "")
+    check("but their stderr differs", a.stderr != p.stderr)
+    p = run(SJ + ["--permission-mode", "bypassPermissions"], turn("x"), env={"WHEEL_FAKE_UID": "0"})
+    check("bypassPermissions as uid 0 refuses", p.returncode == 1 and p.stdout == "")
+
+def t_no_secrets_in_argv():
+    """argv is world-readable across uids; prompts/ctx/secrets must never be passed that way."""
+    import subprocess as sp
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sys.txt")
+        open(f, "w").write("SECRET-CANARY-IN-FILE")
+        p = run(SJ + ["--append-system-prompt-file", f], turn("hi"))
+        ev = events(p.stdout)[0]
+        check("system prompt can be supplied by FILE (not argv)",
+              ev.get("system_prompt") == "SECRET-CANARY-IN-FILE", repr(ev.get("system_prompt")))
+
 def t_transcript():
     with tempfile.TemporaryDirectory() as d:
         tp = os.path.join(d, "t.jsonl")
