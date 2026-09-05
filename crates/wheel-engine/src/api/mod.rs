@@ -24,11 +24,15 @@ use wheel_core::{ErrorBody, NodeConfig, NodeName, Position};
 
 use crate::{config::Config, db};
 
+pub mod agent_routes;
 pub mod board_routes;
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
+    /// Owns every agent's child process. The ONLY thing that writes to a
+    /// child's stdin (§3c#12).
+    pub supervisor: Arc<crate::supervisor::Supervisor>,
     /// One writer connection: sqlite serialises writes anyway, and a single
     /// writer keeps the delivery loop's state transitions trivially correct.
     pub db: Arc<Mutex<Connection>>,
@@ -125,6 +129,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/wires", post(board_routes::add_wire))
         .route("/wires", delete(board_routes::remove_wire))
+        .route("/agents/{id}/start", post(agent_routes::start))
+        .route("/agents/{id}/stop", post(agent_routes::stop))
+        .route("/agents/{id}/restart", post(agent_routes::restart))
+        .route("/agents/{id}/send", post(agent_routes::send))
+        .route("/agents/{id}/log", get(agent_routes::log))
+        .route("/agents/{id}/inbox", get(agent_routes::inbox))
+        .route(
+            "/agents/{id}/inbox/{message_id}",
+            get(agent_routes::inbox_one),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_engine_secret,

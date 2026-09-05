@@ -13,6 +13,8 @@ use std::{
 mod api;
 mod config;
 mod db;
+mod harness;
+mod supervisor;
 
 use config::Config;
 use wheel_core::ListenAddr;
@@ -54,9 +56,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(db = %cfg.db_path().display(), "database ready");
 
     let listen = cfg.listen.clone();
+    let cfg = Arc::new(cfg);
+    let db = Arc::new(Mutex::new(conn));
     let state = api::AppState {
-        cfg: Arc::new(cfg),
-        db: Arc::new(Mutex::new(conn)),
+        supervisor: Arc::new(supervisor::Supervisor::new(cfg.clone(), db.clone())),
+        cfg,
+        db,
     };
     let app = api::router(state);
 
