@@ -150,6 +150,11 @@ step "qa:ci-lint"      "$PY" qa/contract/ci_workflow_lint.py
 # detectable statically in under a second, so it is caught here instead.
 step "qa:testid-parity" "$PY" qa/contract/testid_parity.py
 
+# The image must contain the binaries the contract depends on. BUG-010: the `wheel`
+# CLI was silently absent because the Dockerfile built a bin name that does not exist
+# under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.
+step "qa:image-contents" "$PY" qa/contract/image_contents.py
+
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
   step "qa:contract-selftest" "$PY" qa/contract/selftest_schema.py
