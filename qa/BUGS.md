@@ -14,6 +14,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK | **open** | `wheel-host` has 0.00% line coverage; `wheel-api` 29%, `wheel-core` 68% — all below the §0b 90% bar |
+| 008 | `PERF-coverage-90` | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: wheel-api 35.06%, wheel-core 69.56%, wheel-host 72.21% |
 
 ---
 
@@ -303,3 +304,32 @@ artifact Web generates types from and third parties would validate against — n
 Still worth fixing, for a reason the severity change should not obscure: a client that writes a
 config the schema calls valid gets a 400 from the engine. The schema currently promises something
 the product does not accept, which is a worse failure than a schema that is merely strict.
+
+
+---
+
+## 008 — §0b coverage gate: three crates below the 90% bar · S2 · SDK + API
+
+PM turned the §0b gate ON per crate (ruling 2026-09-05). The gate now works and reports:
+
+| crate | lines | status |
+|---|---|---|
+| wheel-api | 35.06% (495/1412) | **FAIL** — API |
+| wheel-core | 69.56% (681/979) | **FAIL** — SDK |
+| wheel-host | 72.21% (491/680) | **FAIL** — API |
+| wheel-engine | 57.02% (1194/2094) | EXEMPT (PM: scaffolding; expires when the engine is bootable / wheel-engine:test exists) |
+
+**Repro:** `make coverage` (or `COVERAGE=1 make check`).
+
+This is a real gate failure, not an advisory number: CI enforces it through `check-strict`.
+
+**QA note on priority, not a ruling:** the number I would chase first regardless of the bar is
+`wheel-core`'s `validate.rs`, because that is the code enforcing BUG-001's twelve documented
+rejections. Untested branches there mean the one remaining layer of the "rejected by engine AND
+api" guarantee has no evidence behind it. Raw percentage is a worse guide than which lines are
+uncovered.
+
+**Also fixed here:** the gate had never actually produced a verdict — it wrote its report to
+`<repo>/target/`, but `~/.cargo/config.toml` points every worktree at one shared target-dir, so
+that directory does not exist and `llvm-cov` failed to create the file. It now uses a temp dir.
+Every earlier "coverage" result was that error, not a measurement.
