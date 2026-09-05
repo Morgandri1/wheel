@@ -66,6 +66,9 @@ skip_absent() { # skip_absent <name> <why> — the area does not exist yet (tole
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+CARGO_LOCK="${WHEEL_CARGO_LOCK:-/tmp/wheel-cargo.lock}"
+cargo_locked() { python3 qa/tools/with_lock.py "$CARGO_LOCK" "$@"; }
+
 # Prefer the QA venv (jsonschema, requests, pytest) when it exists; `make bootstrap` creates it.
 PY=python3
 [ -x qa/.venv/bin/python ] && PY=qa/.venv/bin/python
@@ -81,14 +84,14 @@ elif ! have cargo; then
   skip "rust:clippy" "cargo not installed"
   skip "rust:test"   "cargo not installed"
 else
-  step "rust:fmt"    cargo fmt --all -- --check
-  step "rust:clippy" cargo clippy --workspace --all-targets -- -D warnings
-  step "rust:test"   cargo test --workspace
+  step "rust:fmt"    cargo_locked cargo fmt --all -- --check
+  step "rust:clippy" cargo_locked cargo clippy --workspace --all-targets -- -D warnings
+  step "rust:test"   cargo_locked cargo test --workspace
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
   if [ "$COVERAGE" = "1" ]; then
-    step "rust:coverage" "$PY" qa/tools/coverage_gate.py
+    step "rust:coverage" cargo_locked "$PY" qa/tools/coverage_gate.py
   else
     skip_absent "rust:coverage" "opt-in locally: run 'make coverage' (CI enforces it via check-strict)"
   fi
@@ -148,6 +151,9 @@ else
   skip "qa:contract-selftest" "jsonschema missing — run 'make bootstrap' (creates qa/.venv)"
   skip "qa:contract-schema"   "jsonschema missing — run 'make bootstrap'"
 fi
+
+# E2E is heavy (browser download, two dev servers) so it is not part of `make check`.
+# `make test-e2e` runs it; CI has its own job.
 
 # ----------------------------------------------------------------- summary
 echo
