@@ -2,12 +2,13 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { SafeMarkdown } from "@/components/safe-markdown";
 import { Button, Field } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
 import type { CtxNode } from "@/lib/schema";
+
+import "@/lib/monaco";
 
 const Monaco = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
@@ -89,7 +90,7 @@ export function CtxPanel({
           className="prose-sm max-h-[320px] overflow-y-auto border border-rule p-3 text-meta [&_code]:font-mono [&_h1]:mb-2 [&_h1]:text-lead [&_h1]:font-semibold [&_h2]:mb-1.5 [&_h2]:mt-3 [&_h2]:font-semibold [&_li]:ml-4 [&_li]:list-disc [&_p]:mb-2"
         >
           {markdown.trim() ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
+            <SafeMarkdown>{markdown}</SafeMarkdown>
           ) : (
             <p className="text-ink-faint">Nothing here yet. Whatever you write gets injected verbatim.</p>
           )}

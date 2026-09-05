@@ -8,6 +8,8 @@ import { SCRIPT_LANGUAGES } from "@/lib/schema";
 import type { EngineApi } from "@/lib/api";
 import type { ScriptLanguage, ScriptNode } from "@/lib/schema";
 
+import "@/lib/monaco";
+
 const Monaco = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
   loading: () => <div className="h-[300px] animate-pulse border border-rule bg-[var(--panel-0)]" />,
