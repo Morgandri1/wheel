@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import type { ConnectionStatus } from "@/lib/events";
-import type { EngineEvent, LogLine, Message, NodeType, WireDenial, WireType } from "@/lib/schema";
+import type { EngineFrame, LogLine, Message, NodeType, WireDenial, WireType } from "@/lib/schema";
 
 /** Per-agent log ring. Old lines fall off so a chatty agent can't grow the tab without bound. */
 const LOG_CAP = 2000;
@@ -40,7 +40,7 @@ interface BoardState {
   /** Recent wire denials, newest last — an agent reaching for something it was never wired to. */
   denials: WireDenial[];
   /** Node ids whose runtime state changed in the last batch — consumers re-read the board query. */
-  applyEvents: (events: EngineEvent[]) => { stateChanged: boolean; boardChanged: boolean };
+  applyEvents: (events: EngineFrame[]) => { stateChanged: boolean; boardChanged: boolean; lagged: boolean };
   seedLog: (nodeId: string, lines: LogLine[]) => void;
   reset: () => void;
 }
@@ -86,6 +86,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   applyEvents: (events) => {
     let stateChanged = false;
     let boardChanged = false;
+    let lagged = false;
     const logs = { ...get().logs };
     let messages = get().messages;
     let denials = get().denials;
@@ -109,6 +110,12 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         case "board.changed":
           boardChanged = true;
           break;
+        // The socket dropped frames rather than let a slow reader stall the engine's delivery
+        // loop. The connection is fine; what we hold is stale. Refetch, do not tear down.
+        case "lagged":
+          lagged = true;
+          boardChanged = true;
+          break;
         case "wire.denied":
           // An agent tried to reach a node it has no wire to. Surfacing it is §4's whole point:
           // the person sees the capability that is missing, not a silent no-op in a log.
@@ -120,7 +127,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     if (touchedLogs || messages !== get().messages || denials !== get().denials) {
       set({ logs, messages, denials });
     }
-    return { stateChanged, boardChanged };
+    return { stateChanged, boardChanged, lagged };
   },
 
   reset: () =>

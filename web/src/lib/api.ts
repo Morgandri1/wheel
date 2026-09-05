@@ -8,6 +8,7 @@
  * a URL, a query string, or a log line.
  */
 import { ApiError, getAuthToken } from "@/lib/auth";
+import type { LogStreamName } from "@/lib/schema";
 import type {
   AuthBegin,
   AuthStatus,
@@ -151,11 +152,20 @@ export function engineApi(projectId: string) {
       clear: () => request<void>(engine(projectId, `/agents/${nodeId}/clear`), { ...p, method: "POST" }),
       send: (body: string) =>
         request<Message>(engine(projectId, `/agents/${nodeId}/send`), { ...p, method: "POST", body: { body } }),
-      log: (since?: string) =>
-        request<{ lines: LogLine[] }>(
-          engine(projectId, `/agents/${nodeId}/log${since ? `?since=${encodeURIComponent(since)}` : ""}`),
+      /**
+       * Backfill. `seq` is monotonic per agent and is the resume cursor: the socket has no
+       * replay, so on reconnect you ask for everything after the last seq you saw.
+       */
+      log: (opts: { since?: number; stream?: LogStreamName } = {}) => {
+        const q = new URLSearchParams();
+        if (opts.since !== undefined) q.set("since", String(opts.since));
+        if (opts.stream) q.set("stream", opts.stream);
+        const query = q.toString();
+        return request<{ lines: LogLine[] }>(
+          engine(projectId, `/agents/${nodeId}/log${query ? `?${query}` : ""}`),
           p,
-        ),
+        );
+      },
       authStatus: () => request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth`), p),
       authBegin: () =>
         request<AuthBegin>(engine(projectId, `/agents/${nodeId}/auth/begin`), { ...p, method: "POST" }),

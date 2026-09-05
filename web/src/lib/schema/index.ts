@@ -62,6 +62,7 @@ export type {
 
 import type {
   Event as GeneratedEvent,
+  LogStream,
   NodeType as GeneratedNodeType,
   NodeWithState,
   WireType as GeneratedWireType,
@@ -139,3 +140,23 @@ export interface Board {
   nodes: WheelNode[];
   project: Project;
 }
+
+/**
+ * Two things the engine does that docs/schema does not yet describe. Raised with SDK; when the
+ * export catches up these aliases collapse to re-exports and the conformance test will say so.
+ *
+ * 1. `transcript` is a LogStream value — the exact bytes written to the child's stdin, carried
+ *    on the same log stream so no second subscription is needed (§3c #10).
+ * 2. `lagged` is an event frame. It means the socket dropped frames to avoid stalling the
+ *    engine's delivery loop, and the connection CONTINUES — it is a resync instruction, not an
+ *    error. Treating it as a failure would be the worst possible reading: you would tear down a
+ *    healthy socket at the exact moment you were behind.
+ */
+export type LogStreamName = LogStream | "transcript";
+
+export interface LaggedEvent {
+  type: "lagged";
+  hint?: string;
+}
+
+export type EngineFrame = EngineEvent | LaggedEvent;

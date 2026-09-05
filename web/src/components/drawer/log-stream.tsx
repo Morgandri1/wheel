@@ -6,17 +6,19 @@ import type { LogLine } from "@/lib/schema";
 const ROW = 18;
 const OVERSCAN = 12;
 
-const STREAM_COLOR: Record<LogLine["stream"], string> = {
+const STREAM_COLOR: Record<string, string> = {
   stdout: "var(--ink)",
   stderr: "var(--danger)",
   engine: "var(--ink-faint)",
+  // The transcript is what the agent was handed, not what it said — a distinct voice.
+  transcript: "var(--wire-send)",
 };
 
 /**
  * Windowed log. Rows are a fixed height and never wrap (they scroll sideways instead), so a
  * running agent can emit thousands of lines without the tab paying for them.
  */
-export function LogStream({ lines }: { lines: LogLine[] }) {
+export function LogStream({ lines, empty }: { lines: LogLine[]; empty?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(240);
@@ -43,7 +45,7 @@ export function LogStream({ lines }: { lines: LogLine[] }) {
   if (!lines.length) {
     return (
       <div className="flex h-full items-center px-3 text-micro text-ink-faint" data-testid="log-empty">
-        Nothing yet. Start the agent, or send it a message.
+        {empty ?? "Nothing yet. Start the agent, or send it a message."}
       </div>
     );
   }
@@ -68,7 +70,7 @@ export function LogStream({ lines }: { lines: LogLine[] }) {
                 data-testid="log-line"
                 data-stream={l.stream}
                 className="ident whitespace-pre px-3"
-                style={{ height: ROW, lineHeight: `${ROW}px`, color: STREAM_COLOR[l.stream] }}
+                style={{ height: ROW, lineHeight: `${ROW}px`, color: STREAM_COLOR[l.stream] ?? "var(--ink)" }}
               >
                 {l.text || " "}
               </div>
