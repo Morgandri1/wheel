@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { TicketStore } from "./tickets";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { AgentNode, EngineEvent, ToolOperation, WheelNode, WireType } from "@/lib/schema";
+import type { AgentNode, EngineEvent, ToolOperation, ToolParam, WheelNode, WireType } from "@/lib/schema";
 import {
   EngineRefusal,
   OWNER,
@@ -123,6 +123,12 @@ async function engine(
     const body = await readJson<{ name: string; type: WheelNode["type"]; position: { x: number; y: number }; config: unknown }>(req);
     if (record.nodes.some((n) => n.name === body.name)) {
       throw new EngineRefusal(409, `a node called ${body.name} already exists`);
+    }
+    // The engine requires `config` and answers 422 without it. The mock must be at least as
+    // strict: a lenient mock lets the board work here and 422 against the real engine, which is
+    // exactly how this was missed until the first real-API pass.
+    if (body.config === undefined || body.config === null) {
+      throw new EngineRefusal(422, "missing field `config`");
     }
     const node = makeNode(body.type, body.name, body.position, body.config);
     record.nodes.push(node);
@@ -570,20 +576,32 @@ server.listen(PORT, () => {
   console.log(`wire matrix agrees with the engine's export (${allowedWireCount} allowed triples)`);
 });
 
-/** §3d rule 3: static and vault fills are authoritative, and are masked wherever we render them. */
+/**
+ * §3d rule 1: an operator-pinned field is never shown to the caller — a static value no less
+ * than a vault one. The agent did not supply it, cannot override it, and has no business
+ * learning it; a base_url query key or an API version header pinned as `static` is exactly the
+ * kind of thing that leaks a tenant id or an internal path.
+ *
+ * ADVERSARY F012: the two renderers previously masked `vault` and printed `static` verbatim,
+ * while this comment claimed both were covered. One function decides it now, so the curl and
+ * the URL cannot drift apart again.
+ */
+function renderValue(param: ToolParam, args: Record<string, unknown>): string | null {
+  const mode = param.fill?.mode ?? "agent";
+  if (mode === "hidden") return null;
+  if (mode === "vault" || mode === "static") return MASK;
+  return String(args[param.name] ?? "");
+}
+
+const MASK = "****";
+
 function renderUrl(baseUrl: string, op: ToolOperation, args: Record<string, unknown>): string {
   let path = op.path;
   const query: string[] = [];
 
   for (const param of op.params ?? []) {
-    const mode = param.fill?.mode ?? "agent";
-    if (mode === "hidden") continue;
-    const value =
-      mode === "static"
-        ? (param.fill?.value ?? "")
-        : mode === "vault"
-          ? "<from vault>"
-          : String(args[param.name] ?? "");
+    const value = renderValue(param, args);
+    if (value === null) continue;
     if (param.location === "path") path = path.replace(`{${param.name}}`, encodeURIComponent(value));
     if (param.location === "query" && value) {
       query.push(`${encodeURIComponent(param.name)}=${encodeURIComponent(value)}`);
@@ -597,11 +615,8 @@ function renderCurl(baseUrl: string, op: ToolOperation, args: Record<string, unk
   const parts = [`curl -X ${op.method}`];
   for (const param of op.params ?? []) {
     if (param.location !== "header") continue;
-    const mode = param.fill?.mode ?? "agent";
-    if (mode === "hidden") continue;
-    // Never render a secret, not even into something the person asked to copy.
-    const value =
-      mode === "vault" ? "****" : mode === "static" ? (param.fill?.value ?? "") : String(args[param.name] ?? "");
+    const value = renderValue(param, args);
+    if (value === null) continue;
     parts.push(`-H '${param.name}: ${value}'`);
   }
   parts.push(`'${renderUrl(baseUrl, op, args)}'`);

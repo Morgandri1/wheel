@@ -1,0 +1,499 @@
+/*
+ * The landing page's own look — "Modernist", from the Claude Design project
+ * "Wheel landing page mockups" (wheel-modernist/index.html).
+ *
+ * It is deliberately NOT the board's look. The app is a dark instrument panel you
+ * live inside; the page is a printed poster you read once. Everything here is
+ * scoped under .modernist so the two never contaminate each other: the app's
+ * tokens stay on :root, these live on the wrapper, and the page paints its own
+ * ground rather than inheriting the theme.
+ *
+ * Tokens and component classes are transcribed from the design system's
+ * styles.css — only the parts this page actually uses.
+ */
+
+.modernist {
+  --color-bg: #f3f2f2;
+  --color-surface: #eae9e9;
+  --color-text: #201e1d;
+  --color-accent: #ec3013;
+  --color-accent-600: #dd2b0f;
+  --color-accent-700: #ae1800;
+  --color-divider: color-mix(in srgb, #201e1d 40%, transparent);
+
+  --font-heading: var(--font-archivo), "Archivo", system-ui, sans-serif;
+  --font-heading-weight: 800;
+  --font-body: var(--font-archivo), "Archivo", system-ui, sans-serif;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --radius-md: 0px;
+
+  /* The rhythm: a 28px leading unit (17px body at ~1.65), 14px half-step. */
+  --leading: 28px;
+  --half: 14px;
+  --edge: clamp(20px, 5vw, 72px);
+  --measure: 58ch;
+
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  font-weight: 400;
+  scroll-behavior: smooth;
+  text-wrap: pretty;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modernist { scroll-behavior: auto; }
+}
+
+.modernist h1,
+.modernist h2,
+.modernist h3 {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+.modernist p { margin: 0; }
+.modernist :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.modernist ::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+
+.modernist .wrap { max-width: 1200px; margin: 0 auto; padding: 0 var(--edge); }
+
+/* — navigation — */
+.modernist .nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 2px solid var(--color-divider);
+  padding-inline: max(var(--edge), calc((100% - 1200px) / 2 + var(--edge)));
+}
+.modernist .nav-brand {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 18px;
+  margin-right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.modernist .nav a { color: inherit; text-decoration: none; font-size: 14px; white-space: nowrap; }
+.modernist .nav a:hover { color: var(--color-accent); }
+/* An in-page anchor, so "location" is the truthful value rather than "page". */
+.modernist .nav a[aria-current="location"] { color: var(--color-accent); }
+@media (max-width: 560px) {
+  .modernist .nav a:not(.btn) { display: none; }
+}
+
+/* — buttons — */
+.modernist .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  text-decoration: none;
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 14px;
+  line-height: 1.2;
+  color: var(--color-text);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: var(--space-2) calc(var(--space-3) * 1.2);
+  border-radius: var(--radius-md);
+  transition: background-color 120ms ease;
+}
+.modernist .btn-primary { background: var(--color-accent); color: var(--color-bg); }
+.modernist .btn-primary:hover { background: var(--color-accent-600); }
+.modernist .btn-primary:active { background: var(--color-accent-700); }
+.modernist .btn-ghost { color: var(--color-accent); padding-inline: var(--space-1); }
+.modernist .btn-ghost:hover { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+
+/* — tags — */
+.modernist .tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 3px 10px;
+}
+.modernist .tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent); }
+
+/* — tables — */
+.modernist .table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.modernist .table td { padding: var(--space-2); border-bottom: 1px solid var(--color-divider); }
+
+/* — drawn structure: the 2px rule is the section seam — */
+.modernist .rule2 { height: 2px; border: 0; margin: 0; background: var(--color-divider); }
+
+/* — kicker — */
+.modernist .kicker {
+  display: block;
+  font-size: 13px;
+  line-height: var(--half);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  /* Accent-coloured SMALL text takes the deep step: 6.4:1, where the base
+     accent measures 3.8:1 — a large-text value. */
+  color: var(--color-accent-700);
+  font-feature-settings: "tnum" 1;
+  margin: 0 0 calc(var(--leading) - var(--half));
+}
+
+/* — hero — */
+.modernist .hero { padding: calc(4 * var(--leading)) 0 calc(3 * var(--leading)); }
+.modernist .display {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: clamp(42px, 6.2vw, 84px);
+  /* Ratio-governed ≈1.06 — Archivo 800 sits tight and all-cap-height. */
+  line-height: clamp(44.5px, 6.57vw, 89px);
+  letter-spacing: -0.02em;
+  margin: 0;
+  /* Optical left alignment: the measured Archivo 800 value. */
+  margin-left: -0.058em;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .display .line { display: block; }
+.modernist .hero .sub {
+  font-size: 17px;
+  line-height: var(--leading);
+  max-width: var(--measure);
+  margin: calc(1.5 * var(--leading) - 1cap) 0 0;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .hero .row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--leading); }
+
+/* — the board figure — */
+.modernist .shot { margin: calc(1.5 * var(--leading)) 0; }
+.modernist .shot-frame { margin: 0; border: 2px solid var(--color-divider); }
+.modernist .shot-frame figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--half);
+  padding: var(--half);
+  border-top: 2px solid var(--color-divider);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+
+/* — stat row: red stays a MARK on the light ground; the red FIELD is the close — */
+.modernist .stats { padding: calc(2.5 * var(--leading)) 0; }
+.modernist .stats .grid {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  justify-content: space-between;
+  gap: calc(1.5 * var(--leading)) var(--leading);
+}
+.modernist .stat-num {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: clamp(34px, 3.4vw, 48px);
+  line-height: calc(2 * var(--leading));
+  color: var(--color-accent);
+  margin: 0 0 0 -0.045em;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .stat-label {
+  font-size: 13px;
+  line-height: var(--half);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  /* 70% measures 5.8:1 — at 13px the 4.5:1 bar applies. */
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  margin: var(--half) 0 0;
+}
+
+/* — feature rows: 2px rules ON the seams, red square marks at the numbers — */
+.modernist .features { padding: calc(3 * var(--leading)) 0 calc(2.5 * var(--leading)); }
+.modernist .feature {
+  display: grid;
+  grid-template-columns: minmax(64px, 160px) minmax(0, 420px) minmax(0, 1fr);
+  gap: var(--leading) clamp(24px, 4vw, 72px);
+  align-items: baseline;
+  padding: calc(1.5 * var(--leading)) 0;
+}
+.modernist .feature + .feature { border-top: 2px solid var(--color-divider); }
+.modernist .f-num {
+  position: relative;
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 15px;
+  line-height: var(--leading);
+  color: var(--color-text);
+  font-feature-settings: "tnum" 1;
+  margin: 0;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .f-num::before {
+  content: "";
+  position: absolute;
+  left: -24px;
+  top: calc(0.5cap - 5px);
+  width: 10px;
+  height: 10px;
+  background: var(--color-accent);
+}
+@media (max-width: 1280px) {
+  .modernist .f-num::before { display: none; }
+}
+.modernist .f-title {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 24px;
+  line-height: var(--leading);
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .f-copy {
+  font-size: 15.5px;
+  line-height: var(--leading);
+  margin: 0;
+  color: color-mix(in srgb, var(--color-text) 78%, transparent);
+  max-width: 52ch;
+  text-box: trim-both cap alphabetic;
+}
+
+/* — split sections — */
+.modernist .split {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+  gap: var(--leading) clamp(24px, 5vw, 96px);
+  align-items: center;
+  padding: calc(2 * var(--leading)) 0 calc(3 * var(--leading));
+}
+.modernist .split-title {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 32px;
+  line-height: calc(1.5 * var(--leading));
+  letter-spacing: -0.015em;
+  margin: 0;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .split-copy .note {
+  font-size: 15.5px;
+  line-height: var(--leading);
+  color: color-mix(in srgb, var(--color-text) 78%, transparent);
+  margin: calc(var(--leading) - 1cap) 0 0;
+  max-width: 48ch;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .split-figure { margin: 0; }
+.modernist .split .row { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+
+/* — swarm diagram — */
+.modernist .dg { width: 100%; height: auto; display: block; }
+.modernist .dg .nA { fill: none; stroke: var(--color-accent); stroke-width: 2; }
+.modernist .dg .nA2 { fill: none; stroke: var(--color-text); stroke-width: 2; }
+.modernist .dg .nD { fill: none; stroke: var(--color-divider); stroke-width: 2; }
+.modernist .dg .wire { stroke: var(--color-divider); stroke-width: 2; }
+.modernist .dg text { font: 500 13px var(--font-body); fill: var(--color-text); }
+.modernist .dg .cap {
+  font-size: 10.5px;
+  font-weight: 400;
+  fill: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.modernist .dg .lbl {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  fill: var(--color-accent-700);
+}
+.modernist .dg-key {
+  margin-top: var(--half);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+
+/* — code asides — */
+.modernist .codebox { border: 2px solid var(--color-divider); padding: var(--leading); overflow: auto; }
+.modernist .codebox pre {
+  margin: 0;
+  font: 12.5px/20px var(--font-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--color-text);
+}
+.modernist .jk { color: var(--color-accent-700); }
+.modernist .cli-p { color: var(--color-accent-700); font-weight: 600; }
+.modernist .cli-out { color: color-mix(in srgb, var(--color-text) 60%, transparent); }
+
+/* — the board still, drawn rather than photographed — */
+.modernist .board {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr) 150px;
+  min-height: 300px;
+  font-size: 11px;
+}
+.modernist .board-rail { border-right: 2px solid var(--color-divider); }
+.modernist .board-rail li {
+  list-style: none;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--color-divider);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.modernist .board-rail li:first-child { color: var(--color-text); }
+.modernist .board-canvas {
+  position: relative;
+  background-image: radial-gradient(
+    color-mix(in srgb, var(--color-text) 20%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 16px 16px;
+}
+.modernist .board-inspector { border-left: 2px solid var(--color-divider); padding: 10px; }
+.modernist .board-inspector dt {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  margin-top: 9px;
+}
+.modernist .board-inspector dt:first-child { margin-top: 0; }
+.modernist .board-inspector dd { margin: 2px 0 0; font-size: 11.5px; }
+.modernist .plate {
+  position: absolute;
+  border: 2px solid var(--color-text);
+  background: var(--color-bg);
+  padding: 5px 8px;
+  min-width: 104px;
+}
+.modernist .plate.is-data { border-color: var(--color-divider); }
+.modernist .plate b { display: block; font-weight: 600; font-size: 11.5px; }
+.modernist .plate span {
+  display: block;
+  font-size: 9.5px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.modernist .plate.is-live { border-color: var(--color-accent); }
+.modernist .plate.is-live b::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  background: var(--color-accent);
+  vertical-align: middle;
+}
+
+/* — the run record, set as the record it is — */
+.modernist .record { padding: var(--half) 0; }
+.modernist .record div {
+  display: grid;
+  grid-template-columns: 62px 66px minmax(0, 1fr);
+  gap: 10px;
+  padding: 5px var(--half);
+  font: 11.5px/18px var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-text) 12%, transparent);
+}
+.modernist .record div:last-child { border-bottom: 0; }
+.modernist .record time { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.modernist .record .who { color: var(--color-accent-700); font-weight: 600; }
+.modernist .record .deny { color: var(--color-accent); }
+
+/* — pricing — */
+.modernist .pricing { padding: calc(2.5 * var(--leading)) 0 calc(1.5 * var(--leading)); }
+.modernist .pricing .note {
+  font-size: 15.5px;
+  line-height: var(--leading);
+  color: color-mix(in srgb, var(--color-text) 78%, transparent);
+  max-width: 56ch;
+  margin: calc(var(--leading) - 1cap) 0 0;
+}
+.modernist .byo { display: flex; gap: 8px; margin-top: var(--leading); flex-wrap: wrap; }
+.modernist .meter { max-width: 560px; margin-top: var(--leading); }
+.modernist .meter-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--half);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  margin: 0 0 var(--half);
+}
+.modernist .meter-amt {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 24px;
+  color: var(--color-text);
+  letter-spacing: 0;
+}
+.modernist .meter-track { height: 10px; border: 2px solid var(--color-divider); position: relative; }
+.modernist .meter-fill { position: absolute; inset: 0 auto 0 0; width: 38%; background: var(--color-accent); }
+.modernist .meter-note {
+  font-size: 13px;
+  line-height: 20px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  margin: var(--half) 0 0;
+}
+.modernist .meter-lines { margin-top: var(--half); }
+.modernist .meter-lines td { font-size: 14px; padding: 6px 0; }
+.modernist .meter-lines td + td { color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+.modernist .meter-lines .ml-amt {
+  text-align: right;
+  color: var(--color-text);
+  font-feature-settings: "tnum" 1;
+}
+.modernist .meter-lines tr:last-child td { border-bottom: 0; }
+
+/* — the red poster close: the accent's one field moment — */
+.modernist .close { background: var(--color-accent); color: var(--color-bg); }
+.modernist .close .wrap {
+  padding-top: calc(3 * var(--leading));
+  padding-bottom: calc(3 * var(--leading));
+}
+.modernist .close h2 {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: clamp(34px, 4.2vw, 56px);
+  line-height: clamp(36px, 4.45vw, 59.4px);
+  letter-spacing: -0.015em;
+  margin: 0 0 0 -0.058em;
+  text-box: trim-both cap alphabetic;
+}
+.modernist .close .row { display: flex; gap: var(--space-3); flex-wrap: wrap; margin-top: calc(1.5 * var(--leading)); }
+/* Paper outline on the red field. */
+.modernist .close .btn-ghost { color: var(--color-bg); border: 1px solid var(--color-bg); padding-inline: calc(var(--space-3) * 1.2); }
+.modernist .close .btn-ghost:hover { background: color-mix(in srgb, #f3f2f2 16%, transparent); }
+
+.modernist footer {
+  padding: calc(2 * var(--leading)) 0;
+  font-size: 13px;
+  line-height: var(--leading);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  display: flex;
+  justify-content: space-between;
+  gap: var(--half);
+  flex-wrap: wrap;
+}
+
+/* — responsive collapse — */
+@media (max-width: 980px) {
+  .modernist .board { grid-template-columns: 96px minmax(0, 1fr); }
+  .modernist .board-inspector { display: none; }
+}
+@media (max-width: 880px) {
+  .modernist .feature { grid-template-columns: 1fr; gap: var(--half); }
+  .modernist .f-copy { max-width: var(--measure); }
+}
+@media (max-width: 720px) {
+  .modernist .hero { padding-top: calc(2.5 * var(--leading)); }
+  .modernist .stats .grid { grid-template-columns: repeat(2, 1fr); justify-content: start; }
+  .modernist .split { grid-template-columns: 1fr; }
+  .modernist .split-figure { order: -1; }
+  .modernist .board { grid-template-columns: 1fr; min-height: 260px; }
+  .modernist .board-rail { display: none; }
+}
