@@ -148,11 +148,17 @@ pub fn next_for_delivery(
     agent: Uuid,
     consecutive_user: u32,
 ) -> Result<Option<Message>> {
+    // ORDER BY rowid, not created_at. `created_at` is stored as RFC3339 whose
+    // fractional part has its trailing zeros trimmed, so it is NOT
+    // lexicographically ordered: "…:00.5Z" sorts AFTER "…:00.55Z" because 'Z'
+    // > '5', and a whole-second timestamp sorts after everything else in its
+    // own second. rowid is assigned on insert, so it IS arrival order, which
+    // is what "oldest first" means here anyway.
     let oldest_normal = conn
         .prepare(
             "SELECT * FROM messages
              WHERE to_id = ?1 AND state = 'queued' AND from_kind != 'user'
-             ORDER BY created_at LIMIT 1",
+             ORDER BY rowid LIMIT 1",
         )?
         .query_row(params![agent.to_string()], |r| row_to_message(conn, r))
         .optional()?;
@@ -170,7 +176,7 @@ pub fn next_for_delivery(
         .prepare(
             "SELECT * FROM messages
              WHERE to_id = ?1 AND state = 'queued' AND from_kind = 'user'
-             ORDER BY created_at LIMIT 1",
+             ORDER BY rowid LIMIT 1",
         )?
         .query_row(params![agent.to_string()], |r| row_to_message(conn, r))
         .optional()?;
@@ -295,7 +301,7 @@ pub fn inbox(
         .unwrap_or_else(|| "0000-01-01T00:00:00Z".to_string());
     let mut stmt = conn.prepare(
         "SELECT * FROM messages WHERE to_id = ?1 AND created_at > ?2
-         ORDER BY created_at LIMIT ?3",
+         ORDER BY rowid LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![node.to_string(), since, limit as i64], |r| {
         row_to_message(conn, r)
@@ -521,5 +527,70 @@ mod tests {
         enqueue(&c, MessageSender::User, to, "x".into(), None).unwrap();
         board::delete(&c, to).unwrap();
         assert_eq!(queued_count(&c, to).unwrap(), 0);
+    }
+
+    /// The stored `created_at` is RFC3339 with trailing zeros trimmed, so its
+    /// width varies (20..=27 chars observed). That makes lexicographic order
+    /// disagree with time order: "…00.5Z" sorts AFTER "…00.55Z" because
+    /// 'Z' > '5', and a whole-second stamp sorts after everything in its own
+    /// second. Ordering the queue by that string delivers messages out of
+    /// order — rarely, so it surfaced as an intermittently failing test rather
+    /// than as a bug report.
+    #[test]
+    fn delivery_order_survives_timestamps_that_do_not_sort_as_strings() {
+        let c = mem();
+        let to = agent(&c, "worker");
+        let peer = agent(&c, "peer");
+        let s = sender_for(&c, peer).unwrap().unwrap();
+
+        let first = enqueue(&c, s.clone(), to, "first".into(), None).unwrap();
+        let second = enqueue(&c, s.clone(), to, "second".into(), None).unwrap();
+
+        // Timestamps in arrival order, chosen so the STRINGS sort the other
+        // way round: ".5Z" > ".55Z" lexicographically.
+        for (id, at) in [
+            (first.id, "2026-09-05T19:00:00.5Z"),
+            (second.id, "2026-09-05T19:00:00.55Z"),
+        ] {
+            c.execute(
+                "UPDATE messages SET created_at = ?2 WHERE id = ?1",
+                params![id.to_string(), at],
+            )
+            .unwrap();
+        }
+        assert!(
+            "2026-09-05T19:00:00.5Z" > "2026-09-05T19:00:00.55Z",
+            "this test is pointless unless the strings really do sort backwards"
+        );
+
+        assert_eq!(
+            next_for_delivery(&c, to, 0).unwrap().unwrap().body,
+            "first",
+            "the message that arrived first must be delivered first"
+        );
+    }
+
+    /// The same hazard for a whole-second timestamp, which trims to no
+    /// fractional part at all and so sorts after every message in its second.
+    #[test]
+    fn a_whole_second_timestamp_does_not_jump_the_queue() {
+        let c = mem();
+        let to = agent(&c, "worker");
+        let peer = agent(&c, "peer");
+        let s = sender_for(&c, peer).unwrap().unwrap();
+
+        let first = enqueue(&c, s.clone(), to, "first".into(), None).unwrap();
+        let second = enqueue(&c, s.clone(), to, "second".into(), None).unwrap();
+        for (id, at) in [
+            (first.id, "2026-09-05T19:00:00Z"),
+            (second.id, "2026-09-05T19:00:00.1Z"),
+        ] {
+            c.execute(
+                "UPDATE messages SET created_at = ?2 WHERE id = ?1",
+                params![id.to_string(), at],
+            )
+            .unwrap();
+        }
+        assert_eq!(next_for_delivery(&c, to, 0).unwrap().unwrap().body, "first");
     }
 }
