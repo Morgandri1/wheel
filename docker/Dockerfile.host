@@ -15,10 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# wheel-host is API's crate and may not exist yet; build what is present.
+# All three binaries are required. `wheel-host` was once optional — built with `|| true` and
+# copied with a glob — from when API's crate did not exist yet. That combination meant a
+# wheel-host COMPILE ERROR produced a perfectly good image with no host binary in it, and the
+# failure only surfaced in production as a crash loop. It cost an outage. Build it like the others.
 RUN cargo build --release --bin wheel-engine \
     && cargo build --release --bin wheel \
-    && (cargo build --release --bin wheel-host 2>/dev/null || true)
+    && cargo build --release --bin wheel-host
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -48,11 +51,12 @@ ENV IS_SANDBOX=1
 
 COPY --from=build /src/target/release/wheel-engine /usr/local/bin/wheel-engine
 COPY --from=build /src/target/release/wheel /usr/local/bin/wheel
-COPY --from=build /src/target/release/wheel-hos[t] /usr/local/bin/
+COPY --from=build /src/target/release/wheel-host /usr/local/bin/wheel-host
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && test -x /usr/local/bin/wheel && /usr/local/bin/wheel --help >/dev/null
+    && test -x /usr/local/bin/wheel && /usr/local/bin/wheel --help >/dev/null \
+    && test -x /usr/local/bin/wheel-host && test -x /usr/local/bin/wheel-engine
 
 RUN mkdir -p /data && chown agent:agent /data
 # No `VOLUME ["/data"]`: Railway rejects the directive outright ("docker VOLUME is not supported,
