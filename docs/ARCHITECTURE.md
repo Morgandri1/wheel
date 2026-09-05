@@ -103,8 +103,8 @@ Per-type `config`:
 - `agent`:    `{ harness: "claude" | "codex", model?: string, system_prompt: string, run_on_startup: bool, ephemeral_context: bool }`
 - `ctx`:      `{ markdown: string }`
 - `table`:    `{ columns: [{ name: string, type: "text"|"integer"|"real"|"blob"|"json" }] }` → sqlite table `t_<node.name>` (engine renames on node rename)
-- `endpoint`: `{ method: "GET"|"POST"|"PUT"|"DELETE", path: string /* leading slash, no `..` */, response_mode: "ack" | "script" }`
-- `script`:   `{ language: "python" | "ts" | "js", source: string, timeout_secs?: number /* default 60 */ }`
+- `endpoint`: `{ method: "GET"|"POST"|"PUT"|"DELETE", path: string /* leading slash, no `..` */, response_mode: "ack" | "script", auth: { mode: "none" } | { mode: "bearer", vault_ref: "<vault>/<key>" } /* M2; bearer requires an endpoint→vault read wire; mismatch → 401 with no body */ }`
+- `script`:   `{ language: "python" | "ts" | "js", source: string, timeout_secs?: number /* default 60, max 300 */ }`
 - `mcp`:      `{ transport: "stdio" | "http", command?: string, args?: string[], url?: string, env?: {k: v} }`
 - `vault`:    `{ keys: string[] }` — values are WRITE-ONLY through the API (`PUT /vault/<node>/<key>`), never returned to the UI; stored encrypted at rest with a per-project key.
 - `chest`:    `{}` — blob store; keys are relative paths, no `..`, no absolute paths, max 50 MiB per blob (v1).
@@ -132,12 +132,13 @@ Per-type `config`:
 | script → tool        | same as agent                               | —                                      | —                                                          |
 | tool → vault         | tool may resolve `{mode:"vault"}` fills from that vault at call time | —             | —                                                          |
 | endpoint → agent     | —                                           | —                                      | each HTTP hit is delivered as a message (method, path, headers subset, body) |
+| endpoint → vault     | resolve the endpoint's `auth.vault_ref` bearer secret | —                            | —                                                          |
 | endpoint → table     | —                                           | JSON body inserted as a row            | —                                                          |
 | endpoint → script    | —                                           | —                                      | script invoked with the request; with `response_mode: script` its stdout is the HTTP response body |
 | script → agent       | —                                           | —                                      | `wheel msg` from inside the script (script runs with a token scoped to ITS wires) |
 | script → table/chest/vault/ctx | same as agent                     | same as agent                          | —                                                          |
 
-ctx, table, vault, chest, mcp have no other outgoing wires; tool's only outgoing wire is `read` → vault. Agents may **only** act on nodes they are wired to; the
+ctx, table, vault, chest, mcp have no other outgoing wires; tool's and endpoint's only outgoing `read` wire is → vault. Agents may **only** act on nodes they are wired to; the
 engine checks this on every CLI call using the per-process token — a node's wire set is its capability set.
 
 
@@ -180,7 +181,7 @@ Every command prints a one-line human result (and `--json` for machine output). 
                → notes      read   you can access its data
                ← inbox      send   it can prompt you
    ```
-3. for each ctx→agent (`send`) wire, an injected block: `\n\n# Context: <ctx name>\n<markdown>`.
+3. for each ctx→agent (`send`) wire, an injected block: `\n\n# Context: <ctx name>\n<markdown>` — **ordered by ctx node name** (byte order; stable and board-position-independent).
 
 **Inbound message framing** (delivered as a user turn on stdin) mirrors YOKE's `AgentPrompt` envelope so agents can't be spoofed by body text:
 ```
@@ -237,6 +238,9 @@ Milestone: **M2** (core types + import parsers + executor + CLI + UI); MCP expos
 - Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
 - Delivery into a running agent: engine writes a user turn to the child's stdin using the `<AgentPrompt …>` envelope above.
   Stopped agents queue; queue drains on start. Messages are delivered one at a time; the next is written when the harness reports the turn complete.
+- **Error handling**: a message is consumed exactly once. If the turn that contained it ends in `result.is_error`, the message is marked `consumed` with `error=true` and `last_error`; it is never redelivered (poison messages must not loop). The agent goes to `error`; the next queued message is delivered on the next start/restart.
+- **Priority fairness**: the user lane drains at most **3 consecutive** user messages, then one message from the normal lane is delivered; any normal-lane message older than **60 s** is promoted to the front. (Prevents user chatter from starving agent traffic.)
+- **Read ceilings** (in PROTOCOL.md, enforced client-side): `wheel read <table>` / `query` return at most 10,000 rows per call (paged with `--limit/--offset`); `wheel ls` at most 10,000 keys; script `timeout_secs` ≤ 300.
 - `ephemeral_context: true` → when the agent finishes its turn (harness emits result/idle), engine clears context
   (new session), re-applies system prompt + injected ctx nodes, then continues draining the queue. Agents can also
   request this via `wheel ctx clear`.
