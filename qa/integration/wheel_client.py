@@ -69,7 +69,11 @@ def session_for(sub):
     """
     tok = mint(sub)
     st, _, _ = call("GET", "/v1/projects", tok)
-    if st != 401:
+    # 2xx, not `!= 401`. A stack that is still coming up answers 502/503, and treating that
+    # as "dev tokens are accepted here" hands back a token that starts failing the moment
+    # the API is actually ready — which is how this suite passed locally against a warm
+    # stack and failed in CI against a cold one, reporting it as an auth bug in the API.
+    if 200 <= (st or 0) < 300:
         return tok
     email = "%s@qa.wheel.local" % sub.replace("|", "-")
     password = "qa-integration-password"

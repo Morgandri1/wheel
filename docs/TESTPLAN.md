@@ -64,6 +64,11 @@ is wide open to anything that reaches it directly. Every `deny` case below is as
 
 ---
 
+| `NODE-valid-accepted` | The engine **accepts** every valid fixture. Asserted alongside the rejections: an engine that refused all input would otherwise score a perfect record on the negative cases and read as maximally secure. | S2 |
+| `NODE-engine-enforced-count` | Every config the schema wrongly accepts (BUG-001) is rejected by the live engine, and the count is asserted — so a regression that loosens one of them is red even while the schema stays loose. | S2 |
+
+---
+
 ## 2. WM — wire matrix (§3), exhaustive
 
 All **243** cells (9 node types × 9 × 3 wire types) are enumerated in
@@ -89,6 +94,10 @@ IDs are `WM-<from>-<to>-<type>`, e.g. `WM-agent-ctx-read` (allow),
 | `WM-dup-wire` | Creating an identical wire twice → 409 or idempotent 200, never two rows. |
 | `WM-export-conformance` | `docs/schema/wire-matrix.json` equals the §3 matrix QA derives independently from the prose. A row in the export but not the contract is always a failure (privilege question); a row in the contract but not the export is a missing feature. **QA's copy is derived from the SPEC, never from the export** — deriving from the export would check it against itself and could never detect divergence. This is what found BUG-004. |
 | `WM-cross-project` | A wire whose `to` is a node in ANOTHER project → 404/400, never created. **S1 if it succeeds.** |
+
+---
+
+| `WM-unknown-target` | A wire to a node id that does not exist is refused, with the same shape as a matrix denial — not a 500, and not a distinct error that reveals whether the id exists. | S2 |
 
 ---
 
@@ -134,6 +143,15 @@ The envelope written to the child's stdin is exactly one compact JSON line:
 | `MSG-fairness-aging` | A normal-lane message older than **60 s** is promoted to the front, so user chatter cannot starve agent traffic indefinitely. | S2 |
 | `MSG-priority-lane` | User messages are ordered ahead of queued agent/endpoint/script messages, but are never injected mid-turn (single writer). | S2 |
 
+| `MSG-send-receipt` | `wheel msg` returns `{id, sha256, bytes, state}` (§3c #3); the sha256 is of the body as sent and the id is the envelope id. | S2 |
+| `MSG-byte-count` | The `bytes` in the receipt equals the body's real byte length — not its character count, which differs for every non-ASCII body. | S2 |
+| `MSG-escape-exact` | A body containing a literal `</AgentPrompt>` is escaped by the engine and arrives byte-identical inside the envelope. | **S1** |
+| `MSG-escape-complete` | Every occurrence is escaped, not just the first, and an already-escaped sequence is not double-escaped into a different string. | **S1** |
+| `MSG-exactly-once` | A message is consumed exactly once. A turn ending in `result.is_error` marks it consumed with `error=true` and never redelivers it — poison messages must not loop (§"Message delivery contract"). | **S1** |
+| `MSG-limit-body-accepted` | A body at exactly the 256 KiB limit is accepted and delivered intact; the limit is a boundary, not an approximation. | S2 |
+
+---
+
 ### 3a. Single writer & the user priority lane (§3c #12)
 
 The engine's per-agent delivery loop is the **only** thing that ever writes to a child's stdin.
@@ -171,6 +189,10 @@ bytes the child received — because the engine's own view of what it sent is th
 | `INJ-ephemeral-off` | With `ephemeral_context: false`, session_id is stable across turns. |
 | `INJ-ctx-clear-cli` | `wheel ctx clear` from inside the agent performs the same clear+reapply. |
 | `INJ-run-on-startup` | `run_on_startup: true` starts the agent when the container starts; `false` does not. |
+
+---
+
+| `INJ-order` | Multiple ctx nodes are injected **ordered by ctx node name** (byte order), so the composed prompt is stable and independent of board position (§3, preamble step 3). | S2 |
 
 ---
 
@@ -278,6 +300,14 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 
 ---
 
+| `CLI-msg` | `wheel msg <agent> --file` delivers; sender is derived from the token and never passed. | S2 |
+| `CLI-read` | `wheel read <ctx>` returns the markdown over a `read` wire. | S2 |
+| `CLI-read-not-write` | A `read` wire does not confer write: `wheel write` over a read-only wire is exit 3. `write` implying `read` is the only direction that holds. | **S1** |
+| `CLI-token-file` | The CLI reads its token from `WHEEL_TOKEN_FILE` (0600), never from a command line (§5b: argv is world-readable across uids). | **S1** |
+| `CLI-token-scope` | A node token authorises that node's wires and nothing else; it is refused on the control plane (`/v1/board`), and the engine secret is refused on `/v1/cli`. | **S1** |
+
+---
+
 ## 7. API — public API (§5)
 
 | ID | Criterion | Sev |
@@ -299,6 +329,15 @@ Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can bra
 | `API-alg-confusion` | In prod any non-RS256 `alg` is rejected on sight, including HS256 signed with the RSA **public** key. | **S1** |
 | `API-healthz` | `GET /healthz` needs no auth. | S4 |
 | `API-healthz-dependency` | `/healthz` reflects DEPENDENCY health, not just process liveness: while Postgres is unreachable it must not report `ok`. Observed 2026-09-05 after an OrbStack restart — `/healthz` returned `{"status":"ok"}` for a window in which `POST /v1/projects` returned 500. Not filed as a bug (transient, and not deterministically reproducible), but it matters at N replicas: a load balancer keeps a replica in rotation for exactly as long as its health endpoint lies. Test by pausing the postgres container and asserting `/healthz` degrades. | S3 |
+
+---
+
+| `API-auth-accepts-valid` | A token the API's *current* provider issues is accepted. Runs FIRST and aborts the suite: every other assertion in §7 is "this token is refused", and all of them pass against an API that refuses everything. The negatives are only evidence while this is green. | **S1** |
+| `API-project-create` | `POST /v1/projects` creates a project owned by the caller's `sub`. | S2 |
+| `API-project-list` | `GET /v1/projects` returns the caller's projects and no one else's. | **S1** |
+| `API-project-get-own` | The owner can read their own project. | S2 |
+| `API-tenancy-list` | A second tenant's list never contains the first tenant's projects — asserted with two real accounts, not two minted subs. | **S1** |
+| `API-project-delete-reaps` | `DELETE /v1/projects/:id` stops and destroys the sandbox, not just the row: a deleted project must not leave a running engine holding the tenant's data. | **S1** |
 
 ---
 
@@ -353,6 +392,21 @@ reads as an oversight to anyone auditing us later.
 
 ---
 
+### 7b. AUTH-cred — credential routing to the harness (§4)
+
+An `sk-ant-oat…` setup-token and an `sk-ant-api…` key are **not** interchangeable: each must
+arrive in its own env var, and swapping them fails at request time looking exactly like a bad
+credential — so the operator sees "not logged in" for a credential that is perfectly valid.
+Asserted from the child's side (`WHEEL_FAKE_ENV_DUMP`), never from the engine's own account of
+what it set.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-cred-setup` | A token beginning `sk-ant-oat` reaches the child as `CLAUDE_CODE_OAUTH_TOKEN` and in no other variable. | **S1** |
+| `AUTH-cred-key-spawn` | Any other credential reaches the child as `ANTHROPIC_API_KEY` (codex: `CODEX_API_KEY`, never `OPENAI_API_KEY`, which codex ignores for auth). The value itself never appears in the dump, on argv, or in a log. | **S1** |
+
+---
+
 ## 8. ING — ingress (§2, §5)
 
 | ID | Criterion | Sev |
@@ -372,6 +426,12 @@ reads as an oversight to anyone auditing us later.
 | `ING-auth-bearer-timing` | Bearer comparison is constant-time; no timing oracle. | S2 |
 | `ING-ratelimit` | Documented rate limit is enforced and returns 429. | S3 |
 | `ING-header-filter` | Only the documented header subset is forwarded; `Authorization`/cookies are not leaked into the agent's prompt. | **S1** |
+
+---
+
+| `ING-cap-default-off` | The `http` capability is **off** on a new project: ingress 403s until it is deliberately enabled. Fail-closed is the default, not a setting. | **S1** |
+| `ING-no-enumeration` | `/p/<project_id>/…` for a project that does not exist, and for one whose capability is off, are indistinguishable — no oracle for which project ids are real. | **S1** |
+| `ING-control-plane-unreachable` | The public ingress path cannot reach the engine control plane: `/p/<id>/v1/board`, `/p/<id>/../v1/...` and encoded traversals never proxy to `/v1/*`. | **S1** |
 
 ---
 

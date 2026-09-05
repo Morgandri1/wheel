@@ -24,7 +24,8 @@ def main():
     # AUTH_MODE=local every HS256 dev token is refused by design, so "expired is refused",
     # "wrong issuer is refused" and "wrong key is refused" all pass without testing a single
     # one of those properties.
-    dev_tokens_live = call("GET", "/v1/projects", mint(unique_sub("probe")))[0] != 401
+    _probe = call("GET", "/v1/projects", mint(unique_sub("probe")))[0]
+    dev_tokens_live = 200 <= (_probe or 0) < 300
 
     # ---------------------------------------------------------------- positive control
     # EVERY assertion below is "this token is refused", and all of them pass against an API
