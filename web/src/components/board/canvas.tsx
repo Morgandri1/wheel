@@ -94,7 +94,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   const rfEdges: Edge[] = useMemo(() => {
     const out: Edge[] = [];
     for (const n of nodes) {
-      for (const w of n.wires) {
+      for (const w of n.wires ?? []) {
         const target = byId.get(w.to);
         if (!target) continue;
         out.push({

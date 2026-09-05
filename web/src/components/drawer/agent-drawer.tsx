@@ -7,7 +7,7 @@ import { toastError } from "@/components/ui/toast";
 import { useBoardStore } from "@/store/board";
 import { AGENT_STATUS_META } from "@/lib/node-meta";
 import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
-import { displayState } from "@/lib/message-state";
+import { displayState, senderKind, senderLabel } from "@/lib/message-state";
 import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
 import type { EngineApi } from "@/lib/api";
 import type { Message, WheelNode } from "@/lib/schema";
@@ -59,7 +59,7 @@ export function AgentDrawer({
 
   const lines = activeTab ? (logs[activeTab] ?? []) : [];
   const thread = activeTab
-    ? messages.filter((m) => m.to_node === activeTab || m.from_node === activeTab)
+    ? messages.filter((m) => m.to === activeTab || (m.from.kind === "node" && m.from.id === activeTab))
     : [];
 
   const body = draft.trim();
@@ -165,8 +165,8 @@ export function AgentDrawer({
                       className="mb-2.5 border-l-2 border-rule pl-2.5"
                     >
                       <p className="flex flex-wrap items-center gap-x-1.5 text-micro text-ink-faint">
-                        <span className="ident text-ink-dim">{m.from_name ?? m.from_node}</span>
-                        {m.from_type ? <span>{m.from_type}</span> : null}
+                        <span className="ident text-ink-dim">{senderLabel(m.from)}</span>
+                        <span>{senderKind(m.from)}</span>
                         <span>{new Date(m.created_at).toLocaleTimeString()}</span>
                         <MessageStatePill message={m} messages={thread} agentId={activeTab ?? ""} />
                         <span

@@ -1,6 +1,92 @@
-// HAND-WRITTEN — mirrors docs/ARCHITECTURE.md §3 exactly.
-// Replaced by `pnpm gen:types` once SDK exports docs/schema/*.json.
+/**
+ * The board's vocabulary, re-exported from the engine's own schema export.
+ *
+ * Everything structural comes from ./generated, which `pnpm gen:types` builds from
+ * docs/schema/*.json (itself produced by wheel-core). Nothing here restates a shape the engine
+ * already describes — a second hand-written copy is a divergence waiting to happen, and we have
+ * already been bitten by one.
+ *
+ * What stays hand-written is only what a JSON Schema cannot give TypeScript: runtime value
+ * arrays to iterate and render with, and a few aliases that read better at the call site.
+ */
+export type {
+  AgentConfig,
+  AgentState,
+  AgentStatus,
+  AuthBegin,
+  AuthMode,
+  AuthStatus,
+  Capabilities,
+  ChestConfig,
+  Column,
+  ColumnType,
+  CtxConfig,
+  EndpointConfig,
+  ErrorBody,
+  ErrorDetail,
+  Fill,
+  FillMode,
+  Harness,
+  HostHealth,
+  HttpMethod,
+  LogLine,
+  LogStream,
+  McpConfig,
+  McpTransport,
+  Message,
+  MessageSender,
+  MessageState,
+  Node,
+  NodeConfig,
+  NodeName,
+  NodeState,
+  NodeType,
+  NodeWithState,
+  ParamLocation,
+  Position,
+  ResponseMode,
+  ScriptConfig,
+  ScriptLanguage,
+  TableConfig,
+  Timestamp,
+  ToolConfig,
+  ToolFormat,
+  ToolMethod,
+  ToolOperation,
+  ToolParam,
+  VaultConfig,
+  Wire,
+  WireDenial,
+  WireSpec,
+  WireType,
+} from "./generated";
 
+import type {
+  Event as GeneratedEvent,
+  NodeType as GeneratedNodeType,
+  NodeWithState,
+  WireType as GeneratedWireType,
+} from "./generated";
+
+/** The engine calls it `Event`; on this side it is always the engine's event, never a DOM one. */
+export type EngineEvent = GeneratedEvent;
+
+/** A node as `GET /v1/board` returns it: config plus runtime state. */
+export type WheelNode = NodeWithState;
+
+export type NodeOfType<T extends GeneratedNodeType> = Extract<NodeWithState, { type: T }>;
+
+export type AgentNode = NodeOfType<"agent">;
+export type CtxNode = NodeOfType<"ctx">;
+export type TableNode = NodeOfType<"table">;
+export type EndpointNode = NodeOfType<"endpoint">;
+export type ScriptNode = NodeOfType<"script">;
+export type McpNode = NodeOfType<"mcp">;
+export type VaultNode = NodeOfType<"vault">;
+export type ChestNode = NodeOfType<"chest">;
+export type ToolNode = NodeOfType<"tool">;
+
+/** Iteration order for the palette and for exhaustive tests. Kept in step by the conformance test. */
 export const NODE_TYPES = [
   "agent",
   "ctx",
@@ -11,11 +97,9 @@ export const NODE_TYPES = [
   "vault",
   "chest",
   "tool",
-] as const;
-export type NodeType = (typeof NODE_TYPES)[number];
+] as const satisfies readonly GeneratedNodeType[];
 
-export const WIRE_TYPES = ["read", "write", "send"] as const;
-export type WireType = (typeof WIRE_TYPES)[number];
+export const WIRE_TYPES = ["read", "write", "send"] as const satisfies readonly GeneratedWireType[];
 
 export const AGENT_STATUSES = [
   "stopped",
@@ -25,194 +109,17 @@ export const AGENT_STATUSES = [
   "idle",
   "error",
 ] as const;
-export type AgentStatus = (typeof AGENT_STATUSES)[number];
-
-/** §3: node names are addresses. */
-export const NODE_NAME_RE = /^[a-z0-9][a-z0-9-_]{0,62}$/;
-
-export interface Position {
-  x: number;
-  y: number;
-}
-
-export interface Wire {
-  /** Target node id. Wires stored on a node are OUTGOING only. */
-  to: string;
-  type: WireType;
-}
-
-export type Harness = "claude" | "codex";
-
-export interface AgentConfig {
-  harness: Harness;
-  model?: string;
-  system_prompt: string;
-  run_on_startup: boolean;
-  ephemeral_context: boolean;
-}
-
-export interface CtxConfig {
-  markdown: string;
-}
 
 export const COLUMN_TYPES = ["text", "integer", "real", "blob", "json"] as const;
-export type ColumnType = (typeof COLUMN_TYPES)[number];
-
-export interface TableColumn {
-  name: string;
-  type: ColumnType;
-}
-
-export interface TableConfig {
-  columns: TableColumn[];
-}
-
 export const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE"] as const;
-export type HttpMethod = (typeof HTTP_METHODS)[number];
-
-export interface EndpointConfig {
-  method: HttpMethod;
-  /** Leading slash, no `..`. */
-  path: string;
-  response_mode: "ack" | "script";
-}
-
 export const SCRIPT_LANGUAGES = ["python", "ts", "js"] as const;
-export type ScriptLanguage = (typeof SCRIPT_LANGUAGES)[number];
-
-export interface ScriptConfig {
-  language: ScriptLanguage;
-  source: string;
-  timeout_secs?: number;
-}
-
-export interface McpConfig {
-  transport: "stdio" | "http";
-  command?: string;
-  args?: string[];
-  url?: string;
-  env?: Record<string, string>;
-}
-
-/** Values are write-only; the API never returns them and this client has no getter. */
-export interface VaultConfig {
-  keys: string[];
-}
-
-export type ChestConfig = Record<string, never>;
-
-/** §3d. How one request field is filled. Only `agent` fields are ever shown to an agent. */
-export type Fill =
-  | { mode: "agent" }
-  | { mode: "static"; value: unknown }
-  | { mode: "vault"; ref: string }
-  | { mode: "hidden" };
-
-export type FillMode = Fill["mode"];
-
 export const TOOL_FORMATS = ["openapi", "swagger2", "postman", "insomnia", "manual"] as const;
-export type ToolFormat = (typeof TOOL_FORMATS)[number];
-
 export const PARAM_LOCATIONS = ["path", "query", "header", "cookie"] as const;
-export type ParamLocation = (typeof PARAM_LOCATIONS)[number];
 
-export interface ToolParam {
-  name: string;
-  in: ParamLocation;
-  schema: Record<string, unknown>;
-  required: boolean;
-  fill: Fill;
-}
+/** §3: a node's name is the address other agents send to. */
+export const NODE_NAME_RE = /^[a-z0-9][a-z0-9-_]{0,62}$/;
 
-export interface ToolBody {
-  content_type:
-    | "application/json"
-    | "application/x-www-form-urlencoded"
-    | "multipart/form-data"
-    | "text/plain";
-  schema: Record<string, unknown>;
-  /** Keyed by JSON pointer or dotted path into the body. */
-  fills: Record<string, Fill>;
-}
-
-export interface ToolOperation {
-  id: string;
-  method: HttpMethod | "PATCH" | "HEAD" | "OPTIONS";
-  /** May contain {param} placeholders. */
-  path: string;
-  summary?: string;
-  enabled: boolean;
-  params: ToolParam[];
-  body?: ToolBody;
-}
-
-export interface ToolConfig {
-  kind: "http";
-  source: { format: ToolFormat; raw: string; imported_at: string };
-  base_url: string;
-  operations: ToolOperation[];
-}
-
-export type NodeConfigFor<T extends NodeType> = T extends "agent"
-  ? AgentConfig
-  : T extends "ctx"
-    ? CtxConfig
-    : T extends "table"
-      ? TableConfig
-      : T extends "endpoint"
-        ? EndpointConfig
-        : T extends "script"
-          ? ScriptConfig
-          : T extends "mcp"
-            ? McpConfig
-            : T extends "vault"
-              ? VaultConfig
-              : T extends "chest"
-                ? ChestConfig
-                : ToolConfig;
-
-export interface AgentState {
-  status: AgentStatus;
-  session_id?: string | null;
-  last_activity?: string | null;
-  last_error?: string | null;
-}
-
-interface NodeBase<T extends NodeType> {
-  id: string;
-  name: string;
-  type: T;
-  position: Position;
-  wires: Wire[];
-  config: NodeConfigFor<T>;
-  /**
-   * Runtime state, reported alongside config by GET /v1/board.
-   * ASSUMPTION (see docs/plans/web.md §6 Q1): nested, null for non-agent types.
-   */
-  state?: AgentState | null;
-}
-
-export type AgentNode = NodeBase<"agent">;
-export type CtxNode = NodeBase<"ctx">;
-export type TableNode = NodeBase<"table">;
-export type EndpointNode = NodeBase<"endpoint">;
-export type ScriptNode = NodeBase<"script">;
-export type McpNode = NodeBase<"mcp">;
-export type VaultNode = NodeBase<"vault">;
-export type ChestNode = NodeBase<"chest">;
-export type ToolNode = NodeBase<"tool">;
-
-export type WheelNode =
-  | AgentNode
-  | CtxNode
-  | TableNode
-  | EndpointNode
-  | ScriptNode
-  | McpNode
-  | VaultNode
-  | ChestNode
-  | ToolNode;
-
+/** Web-side only: the API's project record (§5), which is not part of the engine's schema. */
 export const PROJECT_STATUSES = ["stopped", "starting", "running", "error"] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
@@ -224,7 +131,6 @@ export interface Project {
   status: ProjectStatus;
   created_at: string;
   updated_at: string;
-  /** Proposed to PM (§6 Q6); falls back to NEXT_PUBLIC_API_URL when absent. */
   ingress_base_url?: string;
 }
 
@@ -232,57 +138,3 @@ export interface Board {
   nodes: WheelNode[];
   project: Project;
 }
-
-/** §3c: delivery is observable. `consumed` = the harness reported the turn complete. */
-export const MESSAGE_STATES = ["queued", "delivered", "consumed"] as const;
-export type MessageState = (typeof MESSAGE_STATES)[number];
-
-/** Mirrors the engine's `messages` row (§3c "Message delivery contract"). */
-export interface Message {
-  id: string;
-  from_node: string;
-  to_node: string;
-  body: string;
-  /** sha256 of the body as sent, so a mangled delivery is visible rather than guessed at. */
-  sha256: string;
-  bytes: number;
-  reply_to?: string | null;
-  state: MessageState;
-  created_at: string;
-  delivered_at?: string | null;
-  consumed_at?: string | null;
-  /** Set when delivery could not proceed; the message stays queued and is never truncated. */
-  last_error?: string | null;
-  /** Denormalised by the engine for display. */
-  from_name?: string;
-  from_type?: NodeType | "user" | "system";
-}
-
-export type LogStream = "stdout" | "stderr" | "system";
-
-export interface LogLine {
-  node_id: string;
-  cursor: string;
-  stream: LogStream;
-  line: string;
-  ts: string;
-}
-
-export interface AuthBeginResponse {
-  mode: "device_code" | "paste_code" | "api_key";
-  url?: string;
-  user_code?: string;
-  instructions: string;
-}
-
-export interface AuthStatus {
-  authenticated: boolean;
-  account?: string;
-}
-
-/** §4 WebSocket frames. ASSUMPTION (§6 Q2) until PROTOCOL.md lands. */
-export type EngineEvent =
-  | { type: "node.state"; project_id: string; ts: string; node_id: string; state: AgentState }
-  | { type: "message"; project_id: string; ts: string; message: Message }
-  | { type: "log"; project_id: string; ts: string } & LogLine
-  | { type: "board.changed"; project_id: string; ts: string };

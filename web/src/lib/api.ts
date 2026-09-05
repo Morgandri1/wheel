@@ -9,7 +9,7 @@
  */
 import { ApiError, getAuthToken } from "@/lib/auth";
 import type {
-  AuthBeginResponse,
+  AuthBegin,
   AuthStatus,
   Board,
   LogLine,
@@ -156,7 +156,7 @@ export function engineApi(projectId: string) {
         ),
       authStatus: () => request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth`), p),
       authBegin: () =>
-        request<AuthBeginResponse>(engine(projectId, `/agents/${nodeId}/auth/begin`), { ...p, method: "POST" }),
+        request<AuthBegin>(engine(projectId, `/agents/${nodeId}/auth/begin`), { ...p, method: "POST" }),
       authComplete: (body: { code?: string; api_key?: string }) =>
         request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth/complete`), { ...p, method: "POST", body }),
     }),

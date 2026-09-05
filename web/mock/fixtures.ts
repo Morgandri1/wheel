@@ -48,11 +48,11 @@ export function seed(): ProjectRecord {
 
   record.nodes.push(houseStyle, researcher, writer, findings, inbound);
 
-  houseStyle.wires.push({ to: researcher.id, type: "send" }); // injection
-  researcher.wires.push({ to: writer.id, type: "send" });
-  researcher.wires.push({ to: findings.id, type: "write" });
-  researcher.wires.push({ to: houseStyle.id, type: "read" });
-  inbound.wires.push({ to: researcher.id, type: "send" });
+  houseStyle.wires!.push({ to: researcher.id, type: "send" }); // injection
+  researcher.wires!.push({ to: writer.id, type: "send" });
+  researcher.wires!.push({ to: findings.id, type: "write" });
+  researcher.wires!.push({ to: houseStyle.id, type: "read" });
+  inbound.wires!.push({ to: researcher.id, type: "send" });
 
   const rows = new Map<string, Record<string, unknown>>([
     ["orbital-decay", { key: "orbital-decay", claim: "Decay is faster than the 2019 model predicts.", source: "celestrak", confidence: 0.72 }],

@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import type { ConnectionStatus } from "@/lib/events";
-import type { EngineEvent, LogLine, Message, NodeType, WireType } from "@/lib/schema";
+import type { EngineEvent, LogLine, Message, NodeType, WireDenial, WireType } from "@/lib/schema";
 
 /** Per-agent log ring. Old lines fall off so a chatty agent can't grow the tab without bound. */
 const LOG_CAP = 2000;
@@ -37,6 +37,8 @@ interface BoardState {
 
   logs: Record<string, LogLine[]>;
   messages: Message[];
+  /** Recent wire denials, newest last — an agent reaching for something it was never wired to. */
+  denials: WireDenial[];
   /** Node ids whose runtime state changed in the last batch — consumers re-read the board query. */
   applyEvents: (events: EngineEvent[]) => { stateChanged: boolean; boardChanged: boolean };
   seedLog: (nodeId: string, lines: LogLine[]) => void;
@@ -76,6 +78,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   logs: {},
   messages: [],
+  denials: [],
 
   seedLog: (nodeId, lines) =>
     set((s) => ({ logs: { ...s.logs, [nodeId]: lines.slice(-LOG_CAP) } })),
@@ -85,20 +88,15 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     let boardChanged = false;
     const logs = { ...get().logs };
     let messages = get().messages;
+    let denials = get().denials;
     let touchedLogs = false;
 
     for (const e of events) {
       switch (e.type) {
         case "log": {
-          const prev = logs[e.node_id] ?? [];
-          const next = prev.concat({
-            node_id: e.node_id,
-            cursor: e.cursor,
-            stream: e.stream,
-            line: e.line,
-            ts: e.ts,
-          });
-          logs[e.node_id] = next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
+          const prev = logs[e.line.node_id] ?? [];
+          const next = prev.concat(e.line);
+          logs[e.line.node_id] = next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
           touchedLogs = true;
           break;
         }
@@ -111,10 +109,17 @@ export const useBoardStore = create<BoardState>((set, get) => ({
         case "board.changed":
           boardChanged = true;
           break;
+        case "wire.denied":
+          // An agent tried to reach a node it has no wire to. Surfacing it is §4's whole point:
+          // the person sees the capability that is missing, not a silent no-op in a log.
+          denials = denials.concat(e.denial).slice(-50);
+          break;
       }
     }
 
-    if (touchedLogs || messages !== get().messages) set({ logs, messages });
+    if (touchedLogs || messages !== get().messages || denials !== get().denials) {
+      set({ logs, messages, denials });
+    }
     return { stateChanged, boardChanged };
   },
 
@@ -127,6 +132,7 @@ export const useBoardStore = create<BoardState>((set, get) => ({
       pendingWire: null,
       logs: {},
       messages: [],
+      denials: [],
       connection: "connecting",
     }),
 }));

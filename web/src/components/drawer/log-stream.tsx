@@ -9,7 +9,7 @@ const OVERSCAN = 12;
 const STREAM_COLOR: Record<LogLine["stream"], string> = {
   stdout: "var(--ink)",
   stderr: "var(--danger)",
-  system: "var(--ink-faint)",
+  engine: "var(--ink-faint)",
 };
 
 /**
@@ -64,13 +64,13 @@ export function LogStream({ lines }: { lines: LogLine[] }) {
           <div style={{ transform: `translateY(${start * ROW}px)` }}>
             {visible.map((l) => (
               <div
-                key={l.cursor}
+                key={l.seq}
                 data-testid="log-line"
                 data-stream={l.stream}
                 className="ident whitespace-pre px-3"
                 style={{ height: ROW, lineHeight: `${ROW}px`, color: STREAM_COLOR[l.stream] }}
               >
-                {l.line || " "}
+                {l.text || " "}
               </div>
             ))}
           </div>

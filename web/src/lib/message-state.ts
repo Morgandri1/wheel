@@ -6,7 +6,7 @@
  * not enough — the person needs to know whether theirs is the one going in next, or sitting behind
  * someone else's. This module derives that from the message rows we already have.
  */
-import type { Message, MessageState } from "@/lib/schema";
+import type { Message, MessageSender, MessageState } from "@/lib/schema";
 
 export interface MessageDisplayState {
   state: MessageState | "blocked";
@@ -21,7 +21,7 @@ export interface MessageDisplayState {
 /** Priority lane first (§3c #12), then oldest first — the order the engine will deliver in. */
 export function deliveryOrder(messages: readonly Message[], agentId: string): Message[] {
   return messages
-    .filter((m) => m.to_node === agentId && m.state === "queued" && !m.last_error)
+    .filter((m) => m.to === agentId && m.state === "queued" && !m.last_error)
     .sort((a, b) => {
       const lane = laneRank(a) - laneRank(b);
       if (lane !== 0) return lane;
@@ -30,7 +30,17 @@ export function deliveryOrder(messages: readonly Message[], agentId: string): Me
 }
 
 function laneRank(m: Message): number {
-  return m.from_type === "user" ? 0 : 1;
+  return m.from.kind === "user" ? 0 : 1;
+}
+
+/** How a sender is named in the message list. Node senders are addresses, so they read as such. */
+export function senderLabel(from: MessageSender): string {
+  return from.kind === "node" ? from.name : from.kind === "user" ? "you" : "engine";
+}
+
+/** The word after the name: the node type, or the sender kind when there is no node behind it. */
+export function senderKind(from: MessageSender): string {
+  return from.kind === "node" ? from.type : from.kind;
 }
 
 /** The message the engine will write to stdin next, or null when the queue is empty. */

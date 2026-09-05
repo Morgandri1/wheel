@@ -167,9 +167,9 @@ function NodePlateInner({ data, selected }: NodeProps) {
           </p>
         ) : node.type === "tool" ? (
           <p className="text-micro text-ink-dim">
-            {node.config.operations.filter((o) => o.enabled).length} of{" "}
-            {node.config.operations.length} operation
-            {node.config.operations.length === 1 ? "" : "s"} enabled
+            {(node.config.operations ?? []).filter((o) => o.enabled).length} of{" "}
+            {(node.config.operations ?? []).length} operation
+            {(node.config.operations ?? []).length === 1 ? "" : "s"} enabled
           </p>
         ) : (
           <p className="text-micro text-ink-dim">Blob store</p>

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, CopyField, Field, Input } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
-import type { AuthBeginResponse } from "@/lib/schema";
+import type { AuthBegin } from "@/lib/schema";
 import type { EngineApi } from "@/lib/api";
 
 /**
@@ -21,7 +21,7 @@ export function AuthFlow({
   onAuthenticated: () => void;
 }) {
   const agent = api.agent(nodeId);
-  const [begun, setBegun] = useState<AuthBeginResponse | null>(null);
+  const [begun, setBegun] = useState<AuthBegin | null>(null);
   const [code, setCode] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
@@ -133,7 +133,7 @@ export function AuthFlow({
           size="sm"
           data-testid="btn-auth-complete"
           disabled={busy || (begun.mode === "api_key" && !apiKey)}
-          onClick={() => complete(begun.mode === "api_key" ? { api_key: apiKey } : { code: code || begun.user_code })}
+          onClick={() => complete(begun.mode === "api_key" ? { api_key: apiKey } : { code: code || begun.user_code || undefined })}
         >
           {busy ? "Checking…" : begun.mode === "api_key" ? "Save key" : "I've done it"}
         </Button>

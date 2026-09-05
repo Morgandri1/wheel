@@ -155,7 +155,7 @@ async function engine(
 
     if (method === "DELETE") {
       record.nodes = record.nodes.filter((n) => n.id !== node.id);
-      for (const other of record.nodes) other.wires = other.wires.filter((w) => w.to !== node.id);
+      for (const other of record.nodes) other.wires = other.wires!.filter((w) => w.to !== node.id);
       record.tables.delete(node.id);
       record.chests.delete(node.id);
       boardChanged(record);
@@ -172,12 +172,12 @@ async function engine(
 
     if (method === "POST") {
       assertWireLegal(from, to, body.type);
-      if (from.wires.some((w) => w.to === to.id && w.type === body.type)) {
+      if (from.wires!.some((w) => w.to === to.id && w.type === body.type)) {
         throw new EngineRefusal(409, "that wire already exists");
       }
-      from.wires.push({ to: to.id, type: body.type });
+      from.wires!.push({ to: to.id, type: body.type });
     } else {
-      from.wires = from.wires.filter((w) => !(w.to === to.id && w.type === body.type));
+      from.wires! = from.wires!.filter((w) => !(w.to === to.id && w.type === body.type));
     }
     boardChanged(record);
     noContent(res);
@@ -198,7 +198,7 @@ async function engine(
       } else if (action === "clear") clearContext(record, node);
       else if (action === "send") {
         const body = await readJson<{ body: string }>(req);
-        const message = deliver(record, node, "user", "user", body.body);
+        const message = deliver(record, node, "user", body.body);
         json(res, 202, message);
         return true;
       }
@@ -208,13 +208,13 @@ async function engine(
 
     if (method === "GET" && action === "log") {
       const since = url.searchParams.get("since");
-      const lines = since ? record.log.filter((l) => l.node_id === node.id && l.cursor > since) : record.log.filter((l) => l.node_id === node.id);
+      const lines = since ? record.log.filter((l) => l.node_id === node.id && l.seq > Number(since)) : record.log.filter((l) => l.node_id === node.id);
       json(res, 200, { lines });
       return true;
     }
 
     if (method === "GET" && action === "messages") {
-      const messages = record.messages.filter((m) => m.to_node === node.name || m.from_node === node.name);
+      const messages = record.messages.filter((m) => m.to === node.name || m.from.kind === "node" && m.from.id === node.name);
       json(res, 200, { messages });
       return true;
     }
@@ -242,7 +242,7 @@ async function engine(
       const body = await readJson<{ code?: string; api_key?: string }>(req);
       if (!body.code && !body.api_key) throw new EngineRefusal(400, "no code or api key supplied");
       record.authenticated.add(node.id);
-      appendLog(record, node.id, "system", "credentials accepted");
+      appendLog(record, node.id, "engine", "credentials accepted");
       if (node.state?.status === "needs_auth") startAgent(record, node);
       json(res, 200, { authenticated: true, account: "you@example.com" });
       return true;
@@ -429,10 +429,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     const endpoint = record.nodes.find((n) => n.type === "endpoint" && n.config.path === hitPath);
     if (!endpoint) throw new EngineRefusal(404, "no endpoint node for that path");
     const body = (await readBody(req)).toString("utf8");
-    for (const wire of endpoint.wires) {
+    for (const wire of endpoint.wires ?? []) {
       const target = findNode(record, wire.to);
       if (target?.type === "agent") {
-        deliver(record, target, endpoint.name, "endpoint", JSON.stringify({ method, path: hitPath, body }));
+        deliver(record, target, endpoint.name, JSON.stringify({ method, path: hitPath, body }));
       }
     }
     return json(res, 202, { accepted: true, id: randomUUID() });

@@ -191,14 +191,14 @@ function AgentPanel({
 
       <div className="flex flex-col gap-3 border-t border-rule pt-4">
         <Toggle
-          checked={node.config.run_on_startup}
+          checked={node.config.run_on_startup ?? false}
           onChange={(v) => patchConfig({ run_on_startup: v })}
           label="Start with the project"
           hint="Comes up automatically whenever the container starts."
           testId="inspector-agent-run-on-startup"
         />
         <Toggle
-          checked={node.config.ephemeral_context}
+          checked={node.config.ephemeral_context ?? false}
           onChange={(v) => patchConfig({ ephemeral_context: v })}
           label="Clear context after each turn"
           hint="Fresh session every message: system prompt and injected context are re-applied."

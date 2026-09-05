@@ -25,7 +25,7 @@ export function agentWireLines(nodes: readonly WheelNode[], agent: AgentNode): W
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const out: WireLine[] = [];
 
-  for (const wire of agent.wires) {
+  for (const wire of (agent.wires ?? [])) {
     const target = byId.get(wire.to);
     if (!target) continue;
     const rule = wireRule(agent.type, target.type, wire.type);
@@ -42,7 +42,7 @@ export function agentWireLines(nodes: readonly WheelNode[], agent: AgentNode): W
   const incoming: WireLine[] = [];
   for (const node of nodes) {
     if (node.id === agent.id) continue;
-    for (const wire of node.wires) {
+    for (const wire of (node.wires ?? [])) {
       if (wire.to !== agent.id) continue;
       const rule = wireRule(node.type, agent.type, wire.type);
       incoming.push({
@@ -63,7 +63,7 @@ export function agentWireLines(nodes: readonly WheelNode[], agent: AgentNode): W
 export function injectedContexts(nodes: readonly WheelNode[], agent: AgentNode): CtxNode[] {
   return nodes.filter(
     (n): n is CtxNode =>
-      n.type === "ctx" && n.wires.some((w) => w.to === agent.id && w.type === "send"),
+      n.type === "ctx" && (n.wires ?? []).some((w) => w.to === agent.id && w.type === "send"),
   );
 }
 
