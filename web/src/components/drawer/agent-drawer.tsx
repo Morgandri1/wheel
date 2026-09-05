@@ -215,6 +215,19 @@ export function AgentDrawer({
               }}
               className="max-h-24 min-h-[32px] flex-1 resize-none rounded-control border border-rule bg-[var(--panel-0)] px-2.5 py-1.5 text-meta text-ink placeholder:text-ink-faint focus:border-[var(--wire-read)] focus:outline-none"
             />
+            {/*
+              §3c #12: interrupting is a deliberate, separate act — it cancels the turn the agent
+              is in the middle of. It is never what Send does. The button is present but inert
+              until the engine exposes POST /v1/agents/:id/interrupt in M2, so the shape of the
+              interaction is visible now and cannot be confused with sending.
+            */}
+            <Button
+              data-testid="chat-interrupt"
+              disabled
+              title="Interrupting a running turn arrives with the engine's interrupt route (M2)."
+            >
+              Interrupt
+            </Button>
             <Button
               tone="primary"
               data-testid="chat-send"
@@ -224,6 +237,9 @@ export function AgentDrawer({
               {sending ? "Queueing…" : "Send"}
             </Button>
             </div>
+            <p className="mt-1 text-micro text-ink-faint">
+              Your message waits for the turn in flight to finish — it is never spliced into one.
+            </p>
           </div>
         </>
       ) : null}
