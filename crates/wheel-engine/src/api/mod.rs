@@ -28,6 +28,7 @@ pub mod agent_routes;
 pub mod board_routes;
 pub mod cli_routes;
 pub mod events_route;
+pub mod vault_routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -83,6 +84,9 @@ impl From<db::board::BoardError> for ApiError {
             // A denied wire is a policy answer, not a malformed request, so it
             // is 403 rather than 400 — and it is surfaced, never silent.
             B::Wire(w) => ApiError::new(StatusCode::FORBIDDEN, "wire_denied", w.to_string()),
+            // 409: the request is well-formed and the wire is legal; the
+            // BOARD is the thing that cannot accept it.
+            B::Ambiguous(m) => ApiError::new(StatusCode::CONFLICT, "ambiguous_credential", m),
             B::Config(c) => ApiError::invalid(c.to_string()),
         }
     }
@@ -157,6 +161,11 @@ pub fn router(state: AppState) -> Router {
             post(agent_routes::auth_complete),
         )
         .route("/agents/{id}/auth/begin", post(agent_routes::auth_begin))
+        .route("/vault/{id}", get(vault_routes::list_keys))
+        .route(
+            "/vault/{id}/{key}",
+            axum::routing::put(vault_routes::put_value).delete(vault_routes::delete_value),
+        )
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -173,6 +182,8 @@ pub fn router(state: AppState) -> Router {
         .route("/ls", get(cli_routes::ls))
         .route("/list", get(cli_routes::list))
         .route("/read", get(cli_routes::read))
+        .route("/secret", get(cli_routes::secret_get))
+        .route("/secret/keys", get(cli_routes::secret_keys))
         .route("/write", post(cli_routes::write))
         .route("/msg", post(cli_routes::msg))
         .route("/inbox", get(cli_routes::inbox));

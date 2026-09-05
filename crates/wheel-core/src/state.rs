@@ -151,6 +151,10 @@ pub struct AuthStatus {
     pub authenticated: bool,
     /// Which kind of credential is stored, or `null` when there is none.
     pub mode: Option<CredentialKind>,
+    /// For `mode: "env"`, the name of the vault node supplying it. Never the
+    /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Display-only account identifier (e.g. an email). Never a token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
@@ -173,6 +177,11 @@ pub enum CredentialKind {
     /// The harness's own login credentials on disk, written by its OAuth flow.
     /// Carried by the node's config dir, not by an environment variable.
     OauthSession,
+    /// Supplied by a wired `vault` node and exported into the child's
+    /// environment at spawn. This is how one project runs several accounts of
+    /// the same provider: one vault per account, and an agent uses the vault
+    /// it has a read wire to.
+    Env,
 }
 
 impl CredentialKind {
@@ -181,8 +190,25 @@ impl CredentialKind {
             CredentialKind::ApiKey => "api_key",
             CredentialKind::OauthToken => "oauth_token",
             CredentialKind::OauthSession => "oauth_session",
+            CredentialKind::Env => "env",
         }
     }
+}
+
+/// Environment variables that authenticate a harness.
+///
+/// A vault key with one of these names is a credential, which is why two
+/// wired vaults defining the same one is refused rather than resolved: the
+/// engine would have to pick an account on the user's behalf, and whichever
+/// it picked would be right half the time and silent about it.
+pub const CREDENTIAL_KEYS: [&str; 3] = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CODEX_API_KEY",
+];
+
+pub fn is_credential_key(key: &str) -> bool {
+    CREDENTIAL_KEYS.contains(&key)
 }
 
 /// How an agent's harness can be authenticated headlessly

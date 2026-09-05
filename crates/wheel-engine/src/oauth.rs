@@ -231,8 +231,16 @@ impl LoginSessions {
     }
 }
 
+/// The CLI's stdin prompt, which carries no newline and therefore ends up
+/// glued to the front of whatever it says next.
+const PASTE_PROMPT: &str = "Paste code here if prompted >";
+
 fn tail(output: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
     let text = output.lock().map(|o| o.clone()).unwrap_or_default();
+    // Without this the operator is told "that code was not accepted: Paste
+    // code here if prompted > Login failed: ..." — the prompt is furniture,
+    // and the reason is the part they need.
+    let text = text.replace(PASTE_PROMPT, " ");
     let trimmed = text.trim();
     if trimmed.is_empty() {
         "the CLI rejected it without saying why".to_string()
@@ -308,6 +316,20 @@ mod tests {
             err.contains("some unrelated failure"),
             "the reason must be carried to the operator: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_reason_does_not_carry_the_cli_prompt_as_furniture() {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(
+            "Paste code here if prompted > Login failed: Request failed with status code 400\n"
+                .to_string(),
+        ));
+        let reason = tail(&out);
+        assert!(
+            reason.starts_with("Login failed"),
+            "the reason must lead with the reason: {reason}"
+        );
+        assert!(!reason.contains("Paste code here"));
     }
 
     #[tokio::test]
