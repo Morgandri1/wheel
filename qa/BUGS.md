@@ -9,6 +9,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 |---|----------|-----|-------|--------|-------|
 | 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | **S2** | SDK | **open** | Exported JSON Schema accepts 12 configs the contract forbids |
 | 002 | `NODE-type-closed` | S3 | SDK | **open** | `node-config` union falls through to the `script` branch for an unknown type instead of failing |
+| 003 | `NODE-tool-config` | **S2** | SDK | **open** | `ToolConfig` diverges from §3d: no `kind`, and `source{format,raw,imported_at}` flattened to `source_format` |
 
 ---
 
@@ -71,3 +72,34 @@ checked against its own branch.
 ## Closed
 
 *(none yet)*
+
+
+---
+
+## 003 — `ToolConfig` diverges from the §3d contract · S2 · SDK
+
+`crates/wheel-core`'s `ToolConfig` (as exported to `docs/schema/tool-config.json`) does not match
+`ARCHITECTURE.md` §3d. This is not a schema-strictness issue like 001 — two contract fields are
+absent from the type altogether.
+
+**Repro:** `make check` (gate `qa:contract-schema`), or
+`qa/.venv/bin/python qa/contract/schema_fixtures.py`. Fails on
+`invalid/tool_bad_kind` and `invalid/tool_bad_source_format`, both ACCEPTED.
+
+| Contract §3d | Implemented | Consequence |
+|---|---|---|
+| `kind: "http"` (and `"email"` per §3e) | **field absent** | A tool node can't declare what kind it is. §3e's email tool node has nowhere to live, and `tool_bad_kind` (`kind: "grpc"`) is accepted because the key is simply ignored. |
+| `source: { format, raw, imported_at }` | flat `source_format` (nullable); `raw` and `imported_at` absent | **§3d rule (5) becomes unimplementable**: "re-import diffs operations by `method+path`, keeps existing fills". You cannot diff against the previous spec if the previous spec was never stored. `imported_at` is also how the UI shows staleness. |
+
+Both invalid fixtures are accepted only because the schema has no `additionalProperties: false` —
+the unknown `kind` / `source` keys are silently dropped. So a client that writes the contract's
+shape gets a 200 and loses the data, which is worse than a 400.
+
+**Expected:** `kind: "http" | "email"` required, and `source` as the nested object §3d specifies,
+retaining `raw` so re-import can diff.
+
+**Note on how this stayed hidden:** `make check` reported green on `main` because the
+`qa:contract-schema` gate SKIPS when `jsonschema` isn't installed, and `qa/.venv` is gitignored.
+The gate was correct to skip rather than fail, but a skipped gate on `main` is a blind spot — so
+CI now runs `make bootstrap` first, and `make check-strict` (CHECK_STRICT=1) treats any skip as a
+failure. Fixed as part of this report.

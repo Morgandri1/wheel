@@ -19,8 +19,9 @@ SKIP = 77   # exit code meaning "gate could not run"; qa/check.sh reports it as 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 # WHEEL_SCHEMA_DIR lets the selftest point this at a scratch schema. Unset in normal runs.
 SCHEMA_DIR = os.environ.get("WHEEL_SCHEMA_DIR") or os.path.join(ROOT, "docs", "schema")
-VALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "valid")
-INVALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "invalid")
+FIXTURES = os.environ.get("WHEEL_FIXTURES_DIR") or os.path.join(ROOT, "qa", "fixtures", "nodes")
+VALID = os.path.join(FIXTURES, "valid")
+INVALID = os.path.join(FIXTURES, "invalid")
 
 def load(p):
     with open(p) as f:
@@ -47,7 +48,7 @@ def find_node_schema():
 
 def main():
     try:
-        from jsonschema import Draft202012Validator
+        from jsonschema import validators as _jsv
     except ImportError:
         print("jsonschema not installed — run `make bootstrap` (creates qa/.venv)")
         return SKIP
@@ -66,6 +67,9 @@ def main():
         return 1
 
     schema = load(schema_path)
+    # docs/schema/*.json declare draft-07; validating them as 2020-12 silently
+    # changes how $ref and some keywords behave. Use the declared dialect.
+    Vcls = _jsv.validator_for(schema)
     store = {}
     for f in files:  # let $refs across the exported schemas resolve
         try:
@@ -77,9 +81,9 @@ def main():
     try:
         from jsonschema import RefResolver
         resolver = RefResolver.from_schema(schema, store=store)
-        validator = Draft202012Validator(schema, resolver=resolver)
+        validator = Vcls(schema, resolver=resolver)
     except Exception:
-        validator = Draft202012Validator(schema)
+        validator = Vcls(schema)
 
     print("schema: %s" % os.path.relpath(schema_path, ROOT))
     fails = []

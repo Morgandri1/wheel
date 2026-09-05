@@ -45,7 +45,9 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
-      # Same entrypoint devs run locally — CI and local must never diverge.
+      # Bootstrap first: qa/.venv is gitignored, and without it the schema contract
+      # gate SKIPS. A skipped gate on main is a blind spot — it hid BUG-003.
+      - run: make bootstrap
       - run: make check
 
   integration:
