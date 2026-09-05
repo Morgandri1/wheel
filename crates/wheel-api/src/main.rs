@@ -70,6 +70,9 @@ async fn main() -> Result<()> {
                 if let Err(e) = wheel_api::http::ratelimit::sweep(&db).await {
                     tracing::warn!(error = ?e, "rate limit sweep failed");
                 }
+                if let Err(e) = wheel_api::routes::ws_ticket::sweep(&db).await {
+                    tracing::warn!(error = ?e, "ws ticket sweep failed");
+                }
             }
         }
     });

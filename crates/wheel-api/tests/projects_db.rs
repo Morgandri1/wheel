@@ -78,24 +78,66 @@ fn token(sub: &str) -> String {
 ///
 /// Tests that use this must run serially (`--test-threads=1`), since they share one database and
 /// each one truncates it.
+/// Prepare the schema exactly once per test binary, however many tests ask for it.
+///
+/// This used to drop and re-migrate on every call. Tests run in parallel, so that meant one test
+/// truncating the world while another was mid-request — the suite failed a different assertion on
+/// roughly every other run. A flaky security suite is worse than no suite, because people learn to
+/// read red as noise.
+///
+/// Isolation now comes from each test using a unique subject (see `user()`) rather than from
+/// destroying shared state, so concurrent tests simply cannot see each other's rows.
+///
+/// Reset the schema exactly once per test binary, not once per `app()` call.
+///
+/// Doing it per call was a real bug, not just waste. Tests run in parallel, so one test's
+/// `DROP TABLE ... CASCADE` deleted the tables out from under another test that was mid-request.
+/// The result was an intermittent failure in whichever test happened to be running — usually
+/// `stranger_cannot_mutate_or_proxy` — which reads as a flaky *security* check. Nothing is more
+/// corrosive than a boundary test that cries wolf, so the destructive reset is serialised here and
+/// per-test isolation comes from unique subjects instead.
+static SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static POOL: tokio::sync::OnceCell<sqlx::PgPool> = tokio::sync::OnceCell::const_new();
+
 async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .expect("connect to TEST_DATABASE_URL");
 
-    // Drop the migration ledger along with the tables. Dropping only the tables would leave
-    // `_sqlx_migrations` claiming 0001 was already applied, so the migration is skipped and the
-    // tables never come back — every subsequent query then fails on a missing relation.
-    sqlx::query(
-        "DROP TABLE IF EXISTS ingress_rate_limits, project_secrets, projects, _sqlx_migrations CASCADE",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+    // One pool for the whole binary, not one per test.
+    //
+    // Every test used to build its own pool of up to 5 connections. Run in parallel that is a
+    // demand for 5 x (number of tests) connections against a database other suites are also using,
+    // which exhausted the server and failed every test with PoolTimedOut — a failure that looks
+    // like a total boundary collapse but is purely a fixture problem.
+    let db = POOL
+        .get_or_init(|| async {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect(&url)
+                .await
+                .expect("connect to TEST_DATABASE_URL")
+        })
+        .await
+        .clone();
+
+    {
+        let db = db.clone();
+        SCHEMA
+            .get_or_init(|| async move {
+                // The migration ledger is dropped alongside the tables: dropping only the tables
+                // would leave `_sqlx_migrations` claiming the migrations were applied, so they
+                // would be skipped and the tables would never come back.
+                sqlx::query(
+                    "DROP TABLE IF EXISTS ws_tickets, ingress_rate_limits, project_secrets, \
+                     projects, _sqlx_migrations CASCADE",
+                )
+                .execute(&db)
+                .await
+                .unwrap();
+                sqlx::migrate!("./migrations").run(&db).await.unwrap();
+            })
+            .await;
+    }
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {
@@ -406,4 +448,189 @@ async fn ingress_is_closed_until_opted_in() {
     let ghost = uuid::Uuid::new_v4();
     let (status, _) = send(&app, "GET", &format!("/p/{ghost}/hello"), None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// --- WebSocket tickets ---------------------------------------------------------------------
+//
+// The ticket is the one credential we deliberately allow into a URL, so its guarantees carry more
+// weight than usual: it must be usable exactly once, expire quickly, and be useless against any
+// project other than the one it was minted for.
+
+#[tokio::test]
+async fn ws_ticket_is_single_use() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+
+    let (status, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"ws single use"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/ws-ticket"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "minting a ticket for my own project should succeed"
+    );
+    let ticket = body["ticket"].as_str().unwrap().to_string();
+    assert_eq!(body["expires_in"], 30);
+
+    // First redemption wins.
+    let first = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}/engine/v1/events?ticket={ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(
+        first.0,
+        StatusCode::UNAUTHORIZED,
+        "a fresh ticket must authenticate; got {:?}",
+        first
+    );
+
+    // Second must not. It fails as 401 rather than reaching the engine at all.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}/engine/v1/events?ticket={ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a ticket was accepted twice"
+    );
+}
+
+#[tokio::test]
+async fn ws_ticket_does_not_open_another_project() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+
+    let mut ids = Vec::new();
+    for name in ["ws project a", "ws project b"] {
+        let (status, proj) = send(
+            &app,
+            "POST",
+            "/v1/projects",
+            Some(&alice),
+            Some(json!({"name": name})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        ids.push(proj["id"].as_str().unwrap().to_string());
+    }
+
+    let (_, body) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{}/ws-ticket", ids[0]),
+        Some(&alice),
+        None,
+    )
+    .await;
+    let ticket = body["ticket"].as_str().unwrap().to_string();
+
+    // Same owner, different project: still refused. Ownership is not the only binding.
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/projects/{}/engine/v1/events?ticket={ticket}", ids[1]),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a ticket opened a different project's socket"
+    );
+}
+
+#[tokio::test]
+async fn ws_ticket_cannot_be_minted_for_someone_elses_project() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+    let mallory = token(&user("mallory"));
+
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"alice ws"})),
+    )
+    .await;
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/ws-ticket"),
+        Some(&mallory),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger minted a ticket for someone else's project"
+    );
+}
+
+#[tokio::test]
+async fn garbage_and_missing_tickets_are_refused() {
+    let Some((app, _db)) = app().await else {
+        return;
+    };
+    let alice = token(&user("alice"));
+    let (_, proj) = send(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&alice),
+        Some(json!({"name":"ws garbage"})),
+    )
+    .await;
+    let id = proj["id"].as_str().unwrap().to_string();
+
+    for q in ["?ticket=not-a-real-ticket", "?ticket=", ""] {
+        let (status, _) = send(
+            &app,
+            "GET",
+            &format!("/v1/projects/{id}/engine/v1/events{q}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated events access via {q:?}"
+        );
+    }
 }
