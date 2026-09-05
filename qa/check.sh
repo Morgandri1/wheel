@@ -142,6 +142,9 @@ step "qa:wire-conformance" "$PY" qa/contract/wire_matrix_conformance.py
 # WHEEL_ENGINE_URL is set, for 404-vs-405).
 step "qa:route-parity" "$PY" qa/contract/route_parity.py
 
+# A broken workflow file means CI never runs, which reads as "no red" not "no verdict".
+step "qa:ci-lint"      "$PY" qa/contract/ci_workflow_lint.py
+
 # Every data-testid the E2E suite selects must exist in web/src. Playwright can
 # only report this by launching a browser and failing 30s in; the same drift is
 # detectable statically in under a second, so it is caught here instead.
