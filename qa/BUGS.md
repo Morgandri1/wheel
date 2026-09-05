@@ -14,7 +14,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 004 | `WM-export-conformance`, `WM-endpoint-vault-read`, `WM-script-tool-read` | S3 | SDK | ~~closed~~ | `wire_allowed` was missing two contract rows: `endpoint→vault (read)` and `script→tool (read)` |
 | 007 | `E2E-landing` | S3 | Web | **open** | Landing page hydration mismatch: `WheelMark` trig coordinates differ between Node and browser V8 |
 | 006 | `PERF-check-budget`, §0b | **S2** | SDK + API | **open** | §0b 90%-per-crate gate: 4 crates below the bar (latest main: wheel-api 89.02%, wheel-cli 0.00%, wheel-core 70.51%, wheel-host 68.33%) |
-| 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | **open** | `transcript` log lines are persisted but never emitted over the events WebSocket |
+| 009 | `ENG-log-stream-parity`, `COMMS-observability` | **S2** | SDK | ~~closed~~ | `transcript` log lines are persisted but never emitted over the events WebSocket |
 | 010 | `ENG-image-contents`, `CLI-*` | **S1** | SDK | ~~closed~~ | The `wheel` CLI is absent from the engine image — agents have no interface to the board |
 | 011 | `ENG-one-process`, `ENG-park-resume`, `MSG-delivered-means-delivered` | **S1** | SDK | ~~closed~~ | After any failed start, every later start was a silent no-op — and a turn could be written to a dead child's stdin and marked delivered |
 | 012 | `make check` (`web:test`) | S4 | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
@@ -509,3 +509,28 @@ the job list, which is what makes this worse than an ordinary red.
 output is not a gate; if it were worth printing it was worth failing on. That is the same
 lesson as exit 77 (a gate that cannot run must not look like a gate that passed) arriving from
 a direction I had not covered: a gate that *reports* a problem without failing on it.
+
+---
+
+## 009 — CLOSED 2026-09-05 · verified by an automatic gate, not by a claim
+
+`qa/integration/test_engine_events.py` opens `/v1/events`, starts an agent, sends a message,
+and asserts the set of log streams the WS broadcasts is a superset of the set the database
+recorded over the same window. `transcript` is asserted by name as well, because that is the
+stream this bug was about. 9/9 green against `wheel-engine:test`.
+
+**The set comparison is the point.** SDK's own note on this bug: their e2e "asserted that *a*
+log event arrived rather than WHICH streams did", so a missing stream could not fail it. A
+presence check cannot fail while anything at all arrives. The set version needs no list of
+stream names to maintain: a new stream is covered the day it is added, and a stream that stops
+being broadcast is red the same day.
+
+**And it nearly produced a false report.** My first run said `recorded ['stdout','transcript']
+but broadcast only []` — a clean S2 against SDK for a bug they had already fixed. The real
+frame is `{type:"log", line:{stream, text, …}}` and I was reading `stream` from the top level,
+so every frame yielded nothing. An empty set from a parse error is byte-identical to an empty
+set from a missing feature. The suite now separates them: `ENG-events-log-readable` fails with
+the offending frame printed when log frames arrive and none carries a stream, and says in
+words that the suite is reading wrong rather than the engine broadcasting wrong. Third time
+this shape has nearly cost SDK an afternoon on my mistake; it is the one class of error where
+my tests are the least trustworthy part of the system.

@@ -467,6 +467,25 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 
 ---
 
+### 10a. ENG-events — the events WebSocket (§4)
+
+The rule for this whole section: assert **which**, never **that**. A criterion that passes
+while anything at all arrives cannot detect the thing going missing, which is how BUG-009
+survived an e2e that was watching it.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ENG-events-connect` | `/v1/events` accepts an authenticated WS handshake and stays open across a start and a message. | S2 |
+| `ENG-log-stream-nonempty` | The engine recorded at least one log row in the window. Asserted BEFORE the parity comparison: two empty sets are equal, and that is how every parity test dies quietly. | S2 |
+| `ENG-events-log-readable` | If `log` frames arrive and none yields a `stream`, the SUITE is wrong, not the engine — fails naming that, with the frame printed. Distinguishes a reader bug from a missing feature, which are otherwise the same empty set. | S2 |
+| `ENG-log-stream-parity` | The set of log streams broadcast over the WS ⊇ the set the database recorded for the same agent over the same window. Needs no maintained list of stream names. | **S2** |
+| `COMMS-observability/transcript` | `transcript` specifically is broadcast, not only persisted (BUG-009 by name, so a regression of *this* bug is caught even if the recording side breaks the same way). | **S2** |
+| `ENG-events-node-state` | A start produces `node.state` frames carrying `status`. | S2 |
+| `ENG-events-message` | A delivered message produces a `message` frame. | S2 |
+| `ENG-events-one-session` | Every frame that names a `session_id` names the same one — §"Harness event integrity" makes a mismatch a security property. | **S1** |
+
+---
+
 ## 11. E2E — browser (Playwright)
 
 Two Playwright projects, because `NEXT_PUBLIC_AUTH_MODE` is inlined at build time and one
