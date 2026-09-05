@@ -439,6 +439,18 @@ One ID per row of the §3c table, so we can prove each YOKE lesson was actually 
 
 ---
 
+## 13b. Known failure signatures
+
+Diagnoses that cost someone hours once. Recorded so the next person recognises them in minutes
+rather than re-deriving them.
+
+| Signature | Cause | Fix |
+|---|---|---|
+| `Tokio context is being shutdown`, then sqlx pool timeouts, and the failing test MOVES between runs | A `static` pool binds to whichever `#[tokio::test]` runtime created it first and dies with that runtime. The next test inherits a dead pool. The wandering failure is the tell — a real bug stays put. | One small pool per test. Never share a pool across `#[tokio::test]` runtimes. (API, 2026-09-05) |
+| A DB suite is green in CI but coverage is implausibly low | Tests that self-skip when `TEST_DATABASE_URL` is unset. Correct on a dev box, invisible in CI — the suite reports success having run a fraction of itself. | Provide the service in CI, and make `check-strict` fail a gate that COULD NOT RUN while tolerating one that is not applicable. |
+| A test suite "passes" but the important assertions never executed | An early assertion gated the later ones (e.g. asserting an exact status code before the assertions that follow a successful call). | Assert the status *class*, and be suspicious when a pass count drops without a failure appearing. Cost QA the three S1 envelope assertions on the first engine run. |
+| Playwright fails everything at `browserType.launch: spawn Unknown system error -88`; `cargo` dies with exit 137 | Host memory exhaustion, not a product fault. An OOM-killed build is indistinguishable from a real red until the exit code is read. | Run heavy gates in CI; check `vm_stat` before blaming the code. |
+
 ## 14. Traceability
 
 - Wire matrix cells: `qa/fixtures/wire_matrix.json` (generated; `make check` fails on drift).
