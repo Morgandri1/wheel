@@ -22,6 +22,9 @@ horizontally-scaled gateway** (Railway, N replicas) in front of the single `whee
 4. **Host client** — on create: generate engine secret + vault key (store encrypted), `PUT /host/v1/projects/:id {engine_secret, vault_key, capabilities}`,
    then `POST …/start`. start/stop/restart/delete map 1:1 to host API calls (§4b); `status` comes from `GET /host/v1/projects/:id` on read, cached ≤5s.
    Host unreachable → project `status: "error"` with a clear error body, never a 500 stack trace. Retries with jittered backoff for idempotent calls only.
+4b. **`wheel-host`** (you own it — §4b): `Sandbox` trait with `docker` (bollard; M1) and `process` (Railway; M3: uid per project e.g. 20000+n, `/data/projects/<id>` 0700, setuid/setgid + supplementary groups cleared + no_new_privs, rlimits nproc/fsize/nofile, engine on `/run/wheel/<id>/engine.sock`) backends;
+   host API on `:7100` bearer `WHEEL_HOST_SECRET`; sqlite `/data/host.db`; reconcile on boot (restart projects that were running); proxy HTTP + WS to per-project engines using SDK's engine spawn contract (§4b). Docker backend hardening as before: no published ports, `--cap-drop ALL`, `no-new-privileges`, mem/cpu/pids limits, `unless-stopped`.
+   Get ADVERSARY to review the process backend design before you build it (via PM).
 5. **Engine proxy** `ANY /v1/projects/:id/engine/*` → `WHEEL_HOST_URL/host/v1/projects/:id/engine/*` adding `Authorization: Bearer <host secret>`; strip client hop-by-hop headers;
    stream bodies; **WebSocket upgrade** for `/engine/v1/events` (bridge both directions). Never expose the host secret to the client. 30s timeout except WS/log streams.
 6. **Public ingress** `ANY /p/:project_id/*` → `WHEEL_HOST_URL/host/v1/projects/:id/ingress/*` — no auth; only if `capabilities.http == true` (else 403); strip `x-auth-token`/`x-project-id`

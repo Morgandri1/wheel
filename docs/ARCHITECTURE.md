@@ -2,8 +2,9 @@
 
 You are one agent on a five-agent team building **Wheel**: a per-project, per-user Docker container that runs
 continuously in the cloud with Claude Code / Codex instances as child processes. Agents talk to each other over
-"wires" and access other nodes on a visual board. This document is the single source of truth for cross-team
-contracts. If you need to change anything here, message PM first (`yoke msg PM "PROPOSAL: ..."`). Do not
+"wires" and access other nodes on a visual board. **Wheel is YOKE v2.** The engine running this very team (YOKE: wires, node-as-keyspace memory, `msg`, injected `# Context:` blocks, `<AgentPrompt>` envelopes) is the reference
+implementation of the pattern; Wheel keeps the pattern, adds the board/UI/multi-tenant cloud runtime, and fixes every rough edge we hit using YOKE (§3c). When in doubt about an agent-facing behaviour, ask "what does yoke do?" — then "what annoyed us about it?".
+This document is the single source of truth for cross-team contracts. If you need to change anything here, message PM first (`yoke msg PM "PROPOSAL: ..."`). Do not
 silently diverge.
 
 ## 0. Team, ownership, and how we communicate
@@ -11,8 +12,8 @@ silently diverge.
 | Agent (yoke name) | Role                    | Owns (paths in the monorepo)                                         |
 |-------------------|-------------------------|----------------------------------------------------------------------|
 | PM                | Project manager (me)    | docs/ARCHITECTURE.md, docs/plans/, final decisions                   |
-| SDK/Engine        | Engine + SDK dev (Rust) | crates/wheel-core, crates/wheel-engine, crates/wheel-host, crates/wheel-cli, docker/, docs/PROTOCOL.md |
-| API               | API dev (Rust)          | crates/wheel-api, docs/API.md, infra/ (compose, Railway config, deploy) |
+| SDK/Engine        | Engine + SDK dev (Rust) | crates/wheel-core, crates/wheel-engine, crates/wheel-cli, docker/Dockerfile.host (image), docs/PROTOCOL.md |
+| API               | API dev (Rust)          | crates/wheel-api, **crates/wheel-host** (sandbox supervisor), docker/Dockerfile.api, docs/API.md, infra/ (compose, Railway config, deploy) |
 | Web               | Web dev (TypeScript)    | web/ (Next.js, Vercel config), web/src/lib/schema (generated types)  |
 | QA                | QA engineer             | qa/, Makefile `check` targets, CI config, docs/TESTPLAN.md           |
 | ADVERSARY         | Red team                | redteam/ (threat model, findings, PoCs)                              |
@@ -230,7 +231,7 @@ POST   /v1/cli/*                          → used by the `wheel` binary; bearer
 SDK documents exact request/response bodies in `docs/PROTOCOL.md` and exports JSON Schema for `wheel-core` types into
 `docs/schema/*.json` (`cargo run -p wheel-core --bin export-schema`). Web generates TS types from that.
 
-## 4b. Host API (`wheel-host`, on the engine machine, private network only, bearer `WHEEL_HOST_SECRET`) — SDK owns, API consumes
+## 4b. Host API (`wheel-host`, on the engine machine, private network only, bearer `WHEEL_HOST_SECRET`) — API owns; SDK owns the engine spawn contract below
 
 ```
 GET    /host/v1/healthz                                    → { ok, sandbox_backend: "docker"|"process", projects_running: n }
@@ -243,6 +244,14 @@ ANY    /host/v1/projects/:id/ingress/*                     → proxy to that pro
 ```
 The host is the ONLY process that holds engine secrets at runtime (the API stores them encrypted in Postgres and hands them to the host on `PUT`).
 The host persists its sandbox table in `/data/host.db` (sqlite) and reconciles running processes/containers on boot (restart projects that were running).
+
+**Engine spawn contract (SDK provides, host consumes — both backends):** the host launches `wheel-engine` with env
+`WHEEL_PROJECT_ID`, `WHEEL_ENGINE_SECRET`, `WHEEL_VAULT_KEY` (base64), `WHEEL_DATA_DIR` (default `/data`), `WHEEL_LISTEN`
+(`tcp://0.0.0.0:7000` in docker mode; `unix:///run/wheel/<id>/engine.sock` in process mode), `WHEEL_LOG=json`. The engine must be
+healthy (`GET /healthz` → 200) within 10s of start, exit non-zero with a one-line reason on misconfiguration, and shut down cleanly on SIGTERM
+(stop children, flush sqlite) within 15s. In process mode the engine runs as the project uid the host has already dropped to (the host does the
+setuid, not the engine). `docker/Dockerfile.host` is one image: SDK owns it and installs engine+cli+claude+codex+python+node; API adds the `wheel-host`
+binary and entrypoint (`wheel-host` by default; `wheel-engine` when `WHEEL_ROLE=engine`, which is what the docker backend uses).
 
 ## 5. Public API (api.wheel.dev, stateless, horizontally scaled) — API owns
 
