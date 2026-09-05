@@ -30,7 +30,13 @@ def main():
 
     out = os.path.join(ROOT, "target", "qa-coverage.json")
     r = subprocess.run(
-        ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out],
+        ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
+         # PM-approved, requested by API, owned here rather than in their crates so the
+         # team that benefits is not the team that widens it. Scoped to main.rs and
+         # nothing wider: those files are pure wiring (config load, pool, router assembly,
+         # serve). If logic lands in one, the fix is to move the logic into a covered
+         # module — NOT to widen this regex.
+         "--ignore-filename-regex", r"(^|/)main\.rs$"],
         cwd=ROOT, capture_output=True, text=True)
     if r.returncode in (137, -9):
         # SIGKILL: the instrumented build was OOM-killed, not a coverage failure.
