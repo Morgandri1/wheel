@@ -183,6 +183,16 @@ export const WIRE_MATRIX: readonly WireRule[] = [
     commands: ['(with response_mode "script", the script\'s stdout is the HTTP response body)'],
   },
 
+  {
+    from: "endpoint",
+    to: "vault",
+    type: "read",
+    label: "Resolve its bearer secret",
+    outgoing: "your bearer auth resolves from it on every hit",
+    incoming: "its bearer auth resolves from you on every hit",
+    commands: ['(auth.vault_ref; a mismatch answers 401 with no body)'],
+  },
+
   // ── script ────────────────────────────────────────────────────────────────
   {
     from: "script",
@@ -259,6 +269,16 @@ export const WIRE_MATRIX: readonly WireRule[] = [
     incoming: "it can read your secrets",
     commands: ["wheel secret get <vault>/<key>"],
   },
+  {
+    from: "script",
+    to: "tool",
+    type: "read",
+    label: "Call its operations",
+    outgoing: "you can call its operations",
+    incoming: "it can call your operations",
+    commands: ["wheel tool ls <tool>", "wheel tool call <tool> <op> '<json args>'"],
+  },
+
   // ── tool ──────────────────────────────────────────────────────────────────
   {
     from: "tool",

@@ -13,13 +13,25 @@ export type Timestamp = string;
  * Lifecycle of an agent node's child process.
  */
 
-export type AgentStatus = "stopped" | "starting" | "needs_auth" | "running" | "idle" | "error";
+export type AgentStatus =
+  | "stopped"
+  | "starting"
+  | "needs_auth"
+  | "running"
+  | "idle"
+  | "parked"
+  | "budget_exhausted"
+  | "error";
 
 /**
  * Observed state of an `agent` node.
  */
 
 export interface AgentState {
+  /**
+   * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
+   */
+  hosted_on?: string | null;
   last_activity?: Timestamp | null;
   last_error?: string | null;
   /**
@@ -30,7 +42,20 @@ export interface AgentState {
    * The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.
    */
   session_id?: string | null;
+  /**
+   * Observed spend, from the harness's usage events. Drives `budget`.
+   */
+  spend?: Spend | null;
   status: AgentStatus;
+}
+
+/**
+ * Accumulated cost for an agent's current lifetime.
+ */
+
+export interface Spend {
+  turns?: number;
+  usd?: number;
 }
 
 /**
@@ -75,6 +100,21 @@ export interface Capabilities {
    */
   http?: boolean;
 }
+
+/**
+ * How an endpoint authenticates inbound public requests (§3, M2).
+ *
+ * Internally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.
+ */
+
+export type EndpointAuth =
+  | {
+      mode: "none";
+    }
+  | {
+      mode: "bearer";
+      vault_ref: string;
+    };
 
 /**
  * The uniform error body used by both the host and the engine.
@@ -124,6 +164,10 @@ export type Event =
  */
 
 export type NodeState = {
+  /**
+   * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
+   */
+  hosted_on?: string | null;
   kind: "agent";
   last_activity?: Timestamp | null;
   last_error?: string | null;
@@ -135,6 +179,10 @@ export type NodeState = {
    * The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.
    */
   session_id?: string | null;
+  /**
+   * Observed spend, from the harness's usage events. Drives `budget`.
+   */
+  spend?: Spend | null;
   status: AgentStatus;
 };
 
@@ -194,6 +242,10 @@ export type LogStream = ("stdout" | "stderr") | "engine";
  */
 
 export type WireType = "read" | "write" | "send";
+
+/**
+ * Accumulated cost for an agent's current lifetime.
+ */
 
 /**
  * A message row, persisted before any delivery is attempted.
@@ -368,6 +420,12 @@ export type Ident = string;
 
 export type ColumnType = ("text" | "integer" | "real" | "blob") | "json";
 
+/**
+ * How an endpoint authenticates inbound public requests (§3, M2).
+ *
+ * Internally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.
+ */
+
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 /**
@@ -378,7 +436,34 @@ export type ResponseMode = "ack" | "script";
 
 export type ScriptLanguage = "python" | "ts" | "js";
 
-export type McpTransport = "stdio" | "http";
+/**
+ * MCP server config, tagged by transport.
+ *
+ * Modelled as an enum rather than a struct of optionals so that "stdio requires command", "http requires url" and "never both" are *structural* — they hold in the exported JSON Schema and in the Rust type, not only in a runtime check the API might forget to call. The JSON shape is unchanged: `{"transport":"stdio","command":...}`.
+ */
+
+export type McpConfig =
+  | {
+      args?: string[] | null;
+      command: string;
+      env?: {
+        [k: string]: string;
+      } | null;
+      transport: "stdio";
+    }
+  | {
+      env?: {
+        [k: string]: string;
+      } | null;
+      transport: "http";
+      url: string;
+    };
+
+/**
+ * What kind of tool a `tool` node is (§3d / §3e).
+ */
+
+export type ToolKind = "http" | "email";
 
 /**
  * Methods a tool operation may use. Deliberately a separate enum from [`crate::node::HttpMethod`]: `endpoint` nodes are contractually limited to GET/POST/PUT/DELETE (§3), while imported specs routinely contain PATCH and HEAD. Sharing one enum would silently widen the endpoint contract.
@@ -402,14 +487,26 @@ export type ParamLocation = "header" | "path" | "query" | "cookie" | "body";
  * The document format a tool node was imported from.
  */
 
-export type ToolFormat = "openapi3" | "swagger2" | "postman21" | "insomnia4";
+export type ToolFormat = ("openapi" | "swagger2" | "postman" | "insomnia") | "manual";
+
+/**
+ * RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z
+ */
 
 export interface AgentConfig {
+  /**
+   * Spend ceiling. On reach, the engine stops the agent with `status: budget_exhausted`.
+   */
+  budget?: Budget | null;
   /**
    * Clear the session after every completed turn, re-applying the system prompt and ctx injections, before draining the next queued message.
    */
   ephemeral_context?: boolean;
   harness: Harness;
+  /**
+   * Stop the process after this long idle and resume the session on the next message (§3c#14 idle parking). `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.
+   */
+  idle_timeout_secs?: number | null;
   /**
    * Harness-specific model id. `None` = the CLI's own default.
    */
@@ -422,6 +519,15 @@ export interface AgentConfig {
    * Appended to the harness's own system prompt, then followed by the markdown of every `ctx` node wired `send` into this agent.
    */
   system_prompt: string;
+}
+
+/**
+ * Per-agent spend ceiling (§3e). Either field may be set independently.
+ */
+
+export interface Budget {
+  max_turns?: number | null;
+  max_usd?: number | null;
 }
 
 export interface CtxConfig {
@@ -441,9 +547,10 @@ export interface Column {
 }
 
 export interface EndpointConfig {
+  auth?: EndpointAuth;
   method: HttpMethod;
   /**
-   * Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`].
+   * Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`], and constrained in the exported schema so the static gate catches it too.
    */
   path: string;
   response_mode: ResponseMode;
@@ -453,16 +560,6 @@ export interface ScriptConfig {
   language: ScriptLanguage;
   source: string;
   timeout_secs?: number | null;
-}
-
-export interface McpConfig {
-  args?: string[] | null;
-  command?: string | null;
-  env?: {
-    [k: string]: string;
-  } | null;
-  transport: McpTransport;
-  url?: string | null;
 }
 
 /**
@@ -484,8 +581,9 @@ export interface ToolConfig {
    * Absolute `http(s)` origin every operation is resolved against.
    */
   base_url: string;
+  kind: ToolKind;
   operations?: ToolOperation[];
-  source_format?: ToolFormat | null;
+  source: ToolSource;
 }
 
 /**
@@ -535,6 +633,21 @@ export interface Fill {
 }
 
 /**
+ * Where a tool node's operations came from.
+ *
+ * `raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.
+ */
+
+export interface ToolSource {
+  format: ToolFormat;
+  imported_at: Timestamp;
+  /**
+   * The document as imported. Empty for `manual`.
+   */
+  raw?: string;
+}
+
+/**
  * `state` as reported next to a node on `GET /v1/board`. Only agent nodes currently carry state; the enum leaves room for others (e.g. table row counts) without a breaking change.
  */
 
@@ -547,11 +660,17 @@ export interface Fill {
  */
 
 /**
+ * Accumulated cost for an agent's current lifetime.
+ */
+
+/**
  * The eight node types.
  */
 
 /**
- * A node plus its observed state, as returned by `GET /v1/board`.
+ * A node plus its observed state: `GET /v1/board` returns `{ ...node, state }`.
+ *
+ * `state` is always present and is **null for non-agent node types** — not omitted.
  */
 
 export type NodeWithState = {
@@ -635,7 +754,23 @@ export type NodeWithState = {
  */
 
 /**
+ * How an endpoint authenticates inbound public requests (§3, M2).
+ *
+ * Internally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.
+ */
+
+/**
  * What an endpoint returns to the HTTP caller.
+ */
+
+/**
+ * MCP server config, tagged by transport.
+ *
+ * Modelled as an enum rather than a struct of optionals so that "stdio requires command", "http requires url" and "never both" are *structural* — they hold in the exported JSON Schema and in the Rust type, not only in a runtime check the API might forget to call. The JSON shape is unchanged: `{"transport":"stdio","command":...}`.
+ */
+
+/**
+ * What kind of tool a `tool` node is (§3d / §3e).
  */
 
 /**
@@ -664,6 +799,10 @@ export interface Position {
 }
 
 /**
+ * Accumulated cost for an agent's current lifetime.
+ */
+
+/**
  * An outgoing wire, as stored on its source node (`Node::wires`).
  */
 
@@ -674,6 +813,10 @@ export interface Wire {
   to: string;
   type: WireType;
 }
+
+/**
+ * Per-agent spend ceiling (§3e). Either field may be set independently.
+ */
 
 /**
  * Vault config carries only the *key names*. Values are write-only through `PUT /v1/vault/:id/:key`, stored encrypted, and never returned by `GET /v1/board`.
@@ -689,6 +832,12 @@ export interface Wire {
 
 /**
  * How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.
+ */
+
+/**
+ * Where a tool node's operations came from.
+ *
+ * `raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.
  */
 
 /**
@@ -765,7 +914,23 @@ export type Node = {
  */
 
 /**
+ * How an endpoint authenticates inbound public requests (§3, M2).
+ *
+ * Internally tagged so the two shapes are structurally distinct: `bearer` cannot exist without a `vault_ref`, and `none` cannot carry one.
+ */
+
+/**
  * What an endpoint returns to the HTTP caller.
+ */
+
+/**
+ * MCP server config, tagged by transport.
+ *
+ * Modelled as an enum rather than a struct of optionals so that "stdio requires command", "http requires url" and "never both" are *structural* — they hold in the exported JSON Schema and in the Rust type, not only in a runtime check the API might forget to call. The JSON shape is unchanged: `{"transport":"stdio","command":...}`.
+ */
+
+/**
+ * What kind of tool a `tool` node is (§3d / §3e).
  */
 
 /**
@@ -785,11 +950,19 @@ export type Node = {
  */
 
 /**
+ * RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z
+ */
+
+/**
  * Board coordinates. Floats because the canvas pans/zooms continuously.
  */
 
 /**
  * An outgoing wire, as stored on its source node (`Node::wires`).
+ */
+
+/**
+ * Per-agent spend ceiling (§3e). Either field may be set independently.
  */
 
 /**
@@ -806,6 +979,12 @@ export type Node = {
 
 /**
  * How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.
+ */
+
+/**
+ * Where a tool node's operations came from.
+ *
+ * `raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.
  */
 
 /**
@@ -859,6 +1038,10 @@ export interface SandboxUpsert {
  */
 
 /**
+ * What kind of tool a `tool` node is (§3d / §3e).
+ */
+
+/**
  * Methods a tool operation may use. Deliberately a separate enum from [`crate::node::HttpMethod`]: `endpoint` nodes are contractually limited to GET/POST/PUT/DELETE (§3), while imported specs routinely contain PATCH and HEAD. Sharing one enum would silently widen the endpoint contract.
  */
 
@@ -875,11 +1058,21 @@ export interface SandboxUpsert {
  */
 
 /**
+ * RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z
+ */
+
+/**
  * One callable operation. Exposed over MCP as `<tool name>__<id>`.
  */
 
 /**
  * How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.
+ */
+
+/**
+ * Where a tool node's operations came from.
+ *
+ * `raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.
  */
 
 /**
@@ -900,6 +1093,20 @@ export interface SandboxUpsert {
 
 /**
  * How one field is filled. `value`/`vault_ref` are meaningful only for their corresponding mode; [`crate::validate::validate_config`] enforces that.
+ */
+
+/**
+ * The document format a tool node was imported from.
+ */
+
+/**
+ * RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z
+ */
+
+/**
+ * Where a tool node's operations came from.
+ *
+ * `raw` is retained deliberately: §3d rule 5 requires re-import to diff operations by `method+path` and keep existing fills, and you cannot diff against a previous spec that was never stored.
  */
 
 /**

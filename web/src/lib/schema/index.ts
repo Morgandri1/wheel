@@ -32,7 +32,6 @@ export type {
   LogLine,
   LogStream,
   McpConfig,
-  McpTransport,
   Message,
   MessageSender,
   MessageState,
@@ -107,6 +106,8 @@ export const AGENT_STATUSES = [
   "needs_auth",
   "running",
   "idle",
+  "parked",
+  "budget_exhausted",
   "error",
 ] as const;
 

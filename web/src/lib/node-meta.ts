@@ -108,5 +108,8 @@ export const AGENT_STATUS_META: Record<AgentStatus, { label: string; color: stri
   needs_auth: { label: "Needs sign-in", color: "var(--danger)", pulse: false },
   running: { label: "Running", color: "var(--live)", pulse: true },
   idle: { label: "Idle", color: "var(--live)", pulse: false },
+  // §3c #14: the process is stopped but the session is kept, so the next message resumes it.
+  parked: { label: "Parked", color: "var(--ink-faint)", pulse: false },
+  budget_exhausted: { label: "Out of budget", color: "var(--wire-write)", pulse: false },
   error: { label: "Error", color: "var(--danger)", pulse: false },
 };
