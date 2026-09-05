@@ -172,3 +172,22 @@ docker compose -f infra/docker-compose.yml up --build
 
 The docker socket is mounted into the **host** service only. Anything that can reach the socket can
 trivially escape to the machine, so the internet-facing API must never see it.
+
+With `WHEEL_ENV=dev` and `AUTH_DEV_SECRET` set, HS256 tokens are accepted and the JWKS endpoint is
+never contacted. `iss` is still validated, so a minted token must carry exactly `CLERK_ISSUER`.
+
+### End-to-end check
+
+`infra/dev/e2e.py` mints a dev token and walks the whole chain: create project → start sandbox →
+read the board back through the authenticated proxy. It also asserts the boundary holds — no token
+is `401`, another user's project is `404` (never `403`, which would confirm existence), and ingress
+on a project that has not opted in is `403`.
+
+```bash
+python3 infra/dev/e2e.py
+```
+
+Until SDK's engine lands, `infra/dev/Dockerfile.engine.stub` provides a stub that implements just
+enough to prove the chain: an unauthenticated `/healthz` for the host's readiness probe and a
+bearer-gated `/v1/board`. `infra/dev/Dockerfile.host.dev` likewise builds only the supervisor and
+is replaced by SDK's `docker/Dockerfile.host` when that exists.

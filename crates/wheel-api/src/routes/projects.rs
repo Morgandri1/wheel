@@ -82,14 +82,19 @@ pub async fn create(
     .await?;
     tx.commit().await?;
 
-    // Provision outside the transaction: docker is not transactional, and holding a pg transaction
-    // open across a container create would pin a connection for seconds.
+    // Provision outside the transaction: sandbox creation is not transactional, and holding a pg
+    // transaction open across it would pin a connection for seconds.
+    let mut project: Project = row.into();
     if let Err(e) = state.orch.provision(&id, &secrets).await {
         tracing::error!(project_id = %id, error = ?e, "provisioning failed after row insert");
         set_status(&state, &id, ProjectStatus::Error).await?;
+        // Report what we just persisted. Returning the pre-update row would tell the caller
+        // "stopped" while the database says "error", and the UI would offer a Start button for a
+        // project that has no sandbox to start.
+        project.status = ProjectStatus::Error;
     }
 
-    Ok((axum::http::StatusCode::CREATED, Json(row.into())))
+    Ok((axum::http::StatusCode::CREATED, Json(project)))
 }
 
 pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<Project>>> {

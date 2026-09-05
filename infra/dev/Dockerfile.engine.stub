@@ -1,0 +1,5 @@
+# Stub engine, for proving the API -> host -> engine chain before SDK's real engine lands.
+FROM python:3.12-slim
+COPY infra/dev/stub_engine.py /stub_engine.py
+EXPOSE 7000
+CMD ["python", "/stub_engine.py"]
