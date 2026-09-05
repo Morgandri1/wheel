@@ -31,7 +31,9 @@ pub async fn ingress(
     req: Request,
 ) -> ApiResult<Response> {
     if rest.split('/').any(|seg| seg == "..") {
-        return Err(ApiError::BadRequest("path traversal is not permitted".into()));
+        return Err(ApiError::BadRequest(
+            "path traversal is not permitted".into(),
+        ));
     }
 
     // Unknown project → 404. This lookup deliberately has no owner predicate: ingress is public by
@@ -50,7 +52,11 @@ pub async fn ingress(
     state.ingress_limiter.check(&state.db, &project_id).await?;
 
     let base = state.ingress_base_url(&project_id);
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let upstream = format!("{base}/{rest}{query}");
 
     let method = req.method().clone();

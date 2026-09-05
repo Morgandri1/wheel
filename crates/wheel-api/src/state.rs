@@ -49,5 +49,4 @@ impl AppState {
             None => self.cfg.host_ingress_url(project_id),
         }
     }
-
 }

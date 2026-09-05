@@ -4,8 +4,8 @@
 //! It is better to fail loudly on startup than to serve traffic with a development authentication
 //! bypass quietly enabled in production.
 
-use anyhow::{anyhow, bail, Context, Result};
 use crate::crypto::Secret;
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +61,12 @@ fn var_or(key: &str, default: &str) -> String {
 
 fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
     match std::env::var(key) {
-        Ok(v) => v
-            .parse::<T>()
-            .map_err(|_| anyhow!("environment variable {key} is not a valid {}", std::any::type_name::<T>())),
+        Ok(v) => v.parse::<T>().map_err(|_| {
+            anyhow!(
+                "environment variable {key} is not a valid {}",
+                std::any::type_name::<T>()
+            )
+        }),
         Err(_) => Ok(default),
     }
 }
@@ -84,7 +87,9 @@ impl Config {
         // complete authentication bypass by design, for local testing. If it is present while we
         // are not explicitly in dev, that is either a misconfiguration or an attack, and the only
         // safe response is to not start.
-        let dev_secret = std::env::var("AUTH_DEV_SECRET").ok().filter(|s| !s.is_empty());
+        let dev_secret = std::env::var("AUTH_DEV_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
         let dev_secret = match (env, dev_secret) {
             (Env::Prod, Some(_)) => bail!(
                 "AUTH_DEV_SECRET is set but WHEEL_ENV is not \"dev\". This would enable HS256 \
@@ -106,9 +111,8 @@ impl Config {
                 .decode(raw.trim())
                 .context("API_MASTER_KEY must be valid base64")?;
             let len = bytes.len();
-            <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                anyhow!("API_MASTER_KEY must decode to exactly 32 bytes, got {len}")
-            })?
+            <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| anyhow!("API_MASTER_KEY must decode to exactly 32 bytes, got {len}"))?
         };
 
         let clerk_azp = var_or("CLERK_AZP", "")
@@ -169,7 +173,10 @@ impl std::fmt::Debug for Config {
             .field("host_url", &self.host_url)
             .field("host_secret", &"<redacted>")
             .field("master_key", &"<redacted>")
-            .field("dev_secret", &self.dev_secret.as_ref().map(|_| "<redacted>"))
+            .field(
+                "dev_secret",
+                &self.dev_secret.as_ref().map(|_| "<redacted>"),
+            )
             .field("database_url", &"<redacted>")
             .field("max_projects_per_user", &self.max_projects_per_user)
             .field("ingress_rate_per_min", &self.ingress_rate_per_min)

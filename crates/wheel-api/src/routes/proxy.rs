@@ -28,11 +28,17 @@ pub async fn engine_proxy(
 ) -> ApiResult<Response> {
     // Reject traversal outright rather than relying on the upstream to normalise it.
     if rest.split('/').any(|seg| seg == "..") {
-        return Err(ApiError::BadRequest("path traversal is not permitted".into()));
+        return Err(ApiError::BadRequest(
+            "path traversal is not permitted".into(),
+        ));
     }
 
     let base = state.engine_base_url(&scope.project.id);
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let upstream = format!("{base}/{rest}{query}");
 
     // axum 0.8 will not extract `Option<WebSocketUpgrade>` (that needs `OptionalFromRequestParts`,
@@ -124,7 +130,10 @@ async fn bridge_websocket(
 
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&ws_url)
-        .header("Authorization", format!("Bearer {}", state.cfg.host_secret.expose()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", state.cfg.host_secret.expose()),
+        )
         // Handshake headers required by RFC 6455; tungstenite does not add these for a raw request.
         .header("Host", host_of(&ws_url).unwrap_or_default())
         .header("Connection", "Upgrade")
@@ -137,10 +146,12 @@ async fn bridge_websocket(
         .body(())
         .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("building ws request")))?;
 
-    let (upstream, _resp) = tokio_tungstenite::connect_async(request).await.map_err(|e| {
-        tracing::warn!(error = ?e, "engine websocket connect failed");
-        ApiError::BadGateway("engine websocket unreachable")
-    })?;
+    let (upstream, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "engine websocket connect failed");
+            ApiError::BadGateway("engine websocket unreachable")
+        })?;
 
     Ok(upgrade.on_upgrade(move |client| pump(client, upstream)))
 }
