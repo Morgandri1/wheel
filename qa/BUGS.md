@@ -20,6 +20,7 @@ A bug is closed only when its TESTPLAN ID goes green — not when someone says i
 | 012 | `make check` (`web:test`) | ~~S4~~ **S3** | Web | **open** | 30 local-auth vitest cases fail on node ≥ 22.4: Node's own experimental `localStorage` global shadows jsdom's |
 | 013 | all `qa/integration/*` IDs | **S2** | QA | ~~closed~~ | QA's own integration suite was `if: false` in CI and had never run there — 127 assertions passed only on one laptop |
 | 014 | `API-lifecycle`, `API-project-crud` | S3 | API | **open** | `infra/docker-compose.yml` defaults `ENGINE_IMAGE` to `wheel-engine:stub`, an image nobody builds — every project start 500s on a checked-out stack |
+| 015 | `make check` (`rust:clippy`), `BACK-docker-backend` | **S2** | API | **open** | `wheel-host` does not compile on Linux: `RLIMIT_*` cast to `u32` where the target wants `c_int` — the dev stack cannot build |
 | 015 | `make check` (`rust:clippy`) | **S2** | API | **open** | Linux-only clippy break in `wheel-host` rlimits: `as u32` is required on macOS and redundant on glibc, and `-D warnings` makes redundant fatal |
 
 ---
@@ -608,3 +609,44 @@ a Linux container and would return the verdict in ~2 minutes instead of at CI ti
 This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
 faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
 that means less than the person reading it believes.
+
+---
+
+## 015 — `wheel-host` does not compile on Linux · S2 · API
+
+**Repro:** `docker compose -f infra/docker-compose.yml up -d --build` on any Linux target
+(CI, or the `host` service's own `debian:bookworm-slim` builder — so this reproduces on a
+mac too, inside the container).
+
+```
+crates/wheel-host/src/sandbox/process.rs:205
+  expected `Vec<(i32, u64)>`, found `Vec<(u32, u64)>`
+  = note: expected struct `Vec<(i32, _)>`
+             found struct `Vec<(u32, _)>`
+error: could not compile `wheel-host` (lib) due to 2 previous errors
+target host: failed to solve: "cargo build -p wheel-host" exit code: 101
+```
+
+On the CI runner the same code compiles but `-D warnings` rejects it as
+`clippy::unnecessary_cast`, so `make check` is red there and the build is hard-broken in the
+compose builder. Two symptoms, one cause.
+
+**Cause.** `RlimitDefaults::as_pairs` returns `Vec<(u32, libc::rlim_t)>` and casts each
+`libc::RLIMIT_*` with `as u32`. On glibc/Linux those constants are already `__rlimit_resource_t`
+(a `u32`), so the cast is redundant; where the signature is expected to be `c_int` it is the
+wrong type outright.
+
+**The fix is already written in the file — it just is not the code.** Immediately above,
+`process.rs:165` defines `RlimitResource` (`__rlimit_resource_t` on glibc/Linux, `c_int`
+elsewhere) with a doc comment explaining this exact failure, and `as_pairs`'s own comment says
+"The call site casts with `as _` so both targets are satisfied." The call site casts with
+`as u32`. So the comment documents a fix that was not applied, and the alias that exists to
+prevent this is unused at the one place it was written for.
+
+**Why S2, not S3.** It blocks the whole local stack (`make dev`, `make test-int`) and holds
+`make check` red on `main` for everyone, on top of BUG-006. Worth noting that this is the
+second time this file has broken this way — its own comment records the first — which is an
+argument for a Linux build in the pre-merge gate rather than only in CI.
+
+**Not worked around.** Unlike 013 and 014 there is nothing for QA to pin: the binary does not
+build. The integration gate is red until this lands.
