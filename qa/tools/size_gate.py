@@ -20,13 +20,45 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUDGET = os.path.join(ROOT, "qa", "size-budget.json")
-# What is actually deployed: the engine and cli ship inside the sandbox image, the host and
-# api are the Railway services. Test-only binaries are not a running cost.
-SHIPPED = ["wheel-engine", "wheel-cli", "wheel-host", "wheel-api"]
+# What is shipped is DISCOVERED from cargo metadata, never hand-listed. The hand-written
+# list this replaces named "wheel-cli" and "wheel-api" -- neither of which is a binary
+# (wheel-cli builds `wheel`; wheel-api is a library) -- and omitted `wheeld`, the daemon
+# Railway actually runs. It therefore measured two of the four things that ship and said
+# nothing about the omission, because a name that produces no file just fell out of the
+# loop. Discovery plus MISSING-IS-A-FAILURE is what stops that being silent.
+#
+# Only `export-schema` is excluded: it is a codegen tool run at build time, not a
+# deliverable, so its size is nobody's running cost.
+NOT_SHIPPED = {"export-schema"}
 SKIP = 77
 # Percent a binary may grow before the gate objects. Release size moves a little with
 # toolchain patches, and a gate that fires on 200 bytes gets ignored.
 TOLERANCE = 0.02
+
+
+def target_dir(env):
+    """Where cargo will actually put the binaries: env wins, then the shared config."""
+    if env.get("CARGO_TARGET_DIR"):
+        return env["CARGO_TARGET_DIR"]
+    p = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                       capture_output=True, text=True, cwd=ROOT, env=env)
+    if p.returncode == 0:
+        return json.loads(p.stdout)["target_directory"]
+    return os.path.join(ROOT, "target")
+
+
+def shipped_binaries(root=ROOT):
+    """Bin target names for every workspace member, minus the build-time-only ones."""
+    p = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                       capture_output=True, text=True, cwd=root)
+    if p.returncode != 0:
+        return None
+    names = set()
+    for pkg in json.loads(p.stdout)["packages"]:
+        for tgt in pkg.get("targets", []):
+            if "bin" in tgt.get("kind", []) and tgt["name"] not in NOT_SHIPPED:
+                names.add(tgt["name"])
+    return sorted(names)
 
 
 def verdict(measured, budget):
@@ -62,26 +94,52 @@ def main():
         print("cargo not installed — run `make bootstrap`")
         return SKIP
 
-    # A private target dir: the shared one is written by six worktrees at once, and a
-    # measurement taken from a directory someone else is linking into is not a measurement.
-    env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(ROOT, "target-size"))
-    build = subprocess.run(["cargo", "build", "--release", "--workspace"],
+    # The shared target dir, held under the cargo lock for the build AND the measurement.
+    # A private dir would guarantee nobody else is linking, but it also means a second
+    # multi-gigabyte copy of every dependency on a laptop that PM has just cleaned 79 GB
+    # off. The lock buys the same guarantee for the cost of waiting our turn -- and this
+    # gate exists because disk and compute are the P1, so it should not be the thing that
+    # eats them. WHEEL_SIZE_TARGET_DIR overrides it in CI, where the disk is disposable.
+    env = dict(os.environ)
+    if os.environ.get("WHEEL_SIZE_TARGET_DIR"):
+        env["CARGO_TARGET_DIR"] = os.environ["WHEEL_SIZE_TARGET_DIR"]
+    lock = [sys.executable, os.path.join(ROOT, "qa", "tools", "with_lock.py"),
+            "/tmp/wheel-cargo.lock"]
+    build = subprocess.run(lock + ["cargo", "build", "--release", "--workspace"],
                            cwd=ROOT, env=env, capture_output=True, text=True)
+    if build.returncode == 75:
+        print("another worktree held the cargo lock longer than we waited — not measured")
+        return 75
     if build.returncode != 0:
         print("release build failed, so there is nothing to measure:\n%s"
               % build.stderr[-800:])
         return SKIP
 
-    outdir = os.path.join(env["CARGO_TARGET_DIR"], "release")
-    measured = {}
-    for name in SHIPPED:
+    expected = shipped_binaries()
+    if expected is None:
+        print("could not read cargo metadata, so the list of shipped binaries is unknown")
+        return SKIP
+    if not expected:
+        print("cargo metadata reports no bin targets — that is not a workspace we ship, "
+              "and an empty measurement is not a pass")
+        return SKIP
+
+    outdir = os.path.join(target_dir(env), "release")
+    measured, missing = {}, []
+    for name in expected:
         path = os.path.join(outdir, name)
         if os.path.exists(path):
             measured[name] = os.path.getsize(path)
-    if not measured:
-        print("no shipped binaries found in %s — nothing measured, and an empty "
-              "measurement is not a pass" % outdir)
-        return SKIP
+        else:
+            missing.append(name)
+    if missing:
+        # The build returned 0, so metadata promised a binary the build did not produce.
+        # Skipping it would measure a subset and call it the total.
+        print("binary size: FAILED")
+        print("  - DEP-binary-size: cargo metadata declares %s but the release build "
+              "produced no such file in %s. Measuring what is left would report a subset "
+              "as the total." % (", ".join(missing), outdir))
+        return 1
 
     budget = {}
     if os.path.exists(BUDGET):

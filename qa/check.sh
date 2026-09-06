@@ -117,8 +117,25 @@ elif ! have pnpm; then
   skip "web:typecheck" "pnpm not installed"
   skip "web:test"      "pnpm not installed"
 else
-  if [ ! -d web/node_modules ]; then
-    step "web:install" pnpm -C web install --frozen-lockfile
+  # ALWAYS install, never "install if the directory is missing". Existence is not
+  # freshness: a dependency added to package.json after a worktree's first install stays
+  # invisible to that worktree forever, and the error it produces is a TYPE error in
+  # somebody's diff. Web lost time to exactly that (@types/jsdom, declared in
+  # package.json, absent from main's older node_modules) and main read as red for a
+  # reason no code change could fix. `--frozen-lockfile` is a ~1s no-op when the tree is
+  # current, it is what CI runs, and running the same command as CI is the point.
+  #
+  # A FAILED INSTALL IS "COULD NOT RUN", NOT "THE CODE IS WRONG". That distinction is the
+  # whole bug being fixed here: an environment problem wearing a code failure's clothes.
+  # So a bad install skips the web gates loudly instead of reporting three red Xs against
+  # a diff that never touched them.
+  if pnpm -C web install --frozen-lockfile >/tmp/wheel-web-install.$$.log 2>&1; then
+    rm -f /tmp/wheel-web-install.$$.log
+  else
+    web_install_err="$(tail -3 /tmp/wheel-web-install.$$.log | tr '\n' ' ')"
+    rm -f /tmp/wheel-web-install.$$.log
+    skip "web:install" "pnpm install --frozen-lockfile failed, so the web gates would be judging stale dependencies: ${web_install_err}"
+    WEB_DEPS_STALE=1
   fi
   # CI pins node 22 (.github/workflows/ci.yml). A different major here can make the web
   # gates disagree with CI for reasons that have nothing to do with the code — node >= 22.4
@@ -131,7 +148,9 @@ else
       "$Y" "$node_major" "$Z"
   fi
   for s in lint typecheck test; do
-    if web_script "$s"; then step "web:$s" pnpm -C web run "$s"
+    if [ -n "${WEB_DEPS_STALE:-}" ]; then
+      skip "web:$s" "dependencies could not be installed — a verdict here would describe node_modules, not the code"
+    elif web_script "$s"; then step "web:$s" pnpm -C web run "$s"
     else skip "web:$s" "no '$s' script in web/package.json"; fi
   done
   if web_script "coverage"; then step "web:coverage" pnpm -C web run coverage
@@ -219,12 +238,34 @@ step "qa:deps-budget" "$PY" qa/tools/deps_gate.py
 # decides here, and a ratchet pointing the wrong way is silently green forever.
 step "qa:size-ratchet" "$PY" qa/contract/size_ratchet.py
 
-if docker image inspect wheel-engine:dev >/dev/null 2>&1 || \
-   docker image inspect wheel-engine:test >/dev/null 2>&1; then
-  step "qa:image-contents" "$PY" qa/contract/image_contents.py
-else
-  skip_absent "qa:image-contents" "no engine image here; runs in the CI job that builds one (ci_workflow_lint asserts it does)"
-fi
+# THE SAME CLASS AS web:install ABOVE, which is why it is worth stating twice: asking
+# whether an image EXISTS answers "has anyone ever built one here", and the question is
+# "does the image match the code under test". A tag is a mutable pointer that six agents
+# on this host all push to, and on 2026-09-06 a six-hour-old wheel-engine:test made a
+# whole afternoon of suites describe a pre-fix engine -- including ones that informed a
+# deploy decision. So freshness is asserted, and a stale image SKIPS: a verdict about the
+# wrong build is not a pass, and it is not the code's failure either.
+image_state="$("$PY" - <<'PYFRESH' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.path.join("qa", "integration"))
+from wheel_client import image_freshness
+import subprocess
+for tag in ("wheel-engine:test", "wheel-engine:dev"):
+    if subprocess.run(["docker", "image", "inspect", tag],
+                      capture_output=True).returncode != 0:
+        continue
+    fresh, why = image_freshness(tag)
+    print(("FRESH " if fresh else "STALE ") + (why or tag))
+    break
+else:
+    print("ABSENT no engine image built here")
+PYFRESH
+)"
+case "$image_state" in
+  FRESH*)  step "qa:image-contents" "$PY" qa/contract/image_contents.py ;;
+  STALE*)  skip "qa:image-contents" "${image_state#STALE }" ;;
+  *)       skip_absent "qa:image-contents" "no engine image here; runs in the CI job that builds one (ci_workflow_lint asserts it does)" ;;
+esac
 
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.
