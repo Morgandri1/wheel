@@ -29,6 +29,34 @@ SKIP = 77
 TOLERANCE = 0.02
 
 
+def verdict(measured, budget):
+    """(failures, notes, budget, changed) — the ratchet, as a pure function.
+
+    Separated so it can be exercised without a fat-LTO release build. The measurement half
+    needs minutes and gigabytes; the DECISION half is where a ratchet gets its direction
+    wrong, and a gate whose logic has never run is not a gate. Same reason `staleness` is
+    split out of the image-freshness check.
+    """
+    failures, notes, changed = [], [], False
+    budget = dict(budget)
+    for name, size in sorted(measured.items()):
+        ceiling = budget.get(name)
+        if ceiling is None:
+            budget[name] = size
+            changed = True
+            notes.append("seeding %s at %.2f MiB" % (name, size / 1048576))
+        elif size > ceiling * (1 + TOLERANCE):
+            failures.append("DEP-binary-size: %s is %.2f MiB, ceiling %.2f MiB (+%.1f%%)"
+                            % (name, size / 1048576, ceiling / 1048576,
+                               100.0 * (size - ceiling) / ceiling))
+        elif size < ceiling:
+            budget[name] = size
+            changed = True
+            notes.append("%s improved %.2f -> %.2f MiB; ceiling lowered"
+                         % (name, ceiling / 1048576, size / 1048576))
+    return failures, notes, budget, changed
+
+
 def main():
     if subprocess.run(["which", "cargo"], capture_output=True).returncode != 0:
         print("cargo not installed — run `make bootstrap`")
@@ -60,22 +88,7 @@ def main():
         with open(BUDGET) as fh:
             budget = json.load(fh)
 
-    failures, notes, changed = [], [], False
-    for name, size in sorted(measured.items()):
-        ceiling = budget.get(name)
-        if ceiling is None:
-            budget[name] = size
-            changed = True
-            notes.append("seeding %s at %.2f MiB" % (name, size / 1048576))
-        elif size > ceiling * (1 + TOLERANCE):
-            failures.append("DEP-binary-size: %s is %.2f MiB, ceiling %.2f MiB (+%.1f%%)"
-                            % (name, size / 1048576, ceiling / 1048576,
-                               100.0 * (size - ceiling) / ceiling))
-        elif size < ceiling:
-            budget[name] = size
-            changed = True
-            notes.append("%s improved %.2f -> %.2f MiB; ceiling lowered"
-                         % (name, ceiling / 1048576, size / 1048576))
+    failures, notes, budget, changed = verdict(measured, budget)
 
     if changed and "--check-only" not in sys.argv:
         with open(BUDGET, "w") as fh:
