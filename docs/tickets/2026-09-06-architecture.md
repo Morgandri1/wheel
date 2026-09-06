@@ -61,3 +61,32 @@ Two of today's wrong turns were resource claims taken from a control plane rathe
 container, and one test read an unwritable directory as a full disk. Wanted: a standing check that
 reports real `df`, real memory and the real toolchain paths from inside a running sandbox, so the
 first answer to "is it full?" is measured rather than quoted.
+
+## A8 — Agents share one checkout, not one each · **S2** · SDK/Engine
+
+Operator: "in a large number of workflows, only a single repository and/or monorepo will be open,
+meaning one clone per agent is… bloated." Measured today: a checkout plus its build tree cost 1.9 GB
+per agent, and three agents filled a 4.6 GB volume. Six agents on one repo is six copies of the same
+bytes, six fetches, and six chances for one of them to hold a stale tree.
+
+Wanted: a node type (or a workspace node's shared mode) that materialises ONE checkout per project,
+mounted into every agent wired to it. Writes need a policy — a shared working tree with six agents
+editing it is a merge conflict machine, so the likely shape is one shared clone plus a cheap
+per-agent worktree over it (`git worktree`), which shares the object store and costs kilobytes per
+agent rather than gigabytes.
+
+## A9 — There is no clone mechanism, and that is why the token leaked · **S1** · SDK/Engine
+
+QA established it and it changes A8 and the token fix both: **the engine contains no git code**, and
+`workspaces` materialisation is unimplemented. Legs 1-3 of the operator's goal work today because
+agents IMPROVISE — each one runs `git clone https://<token>@github.com/...` in its own way, which is
+exactly how a live GitHub PAT ended up in plaintext in a `.git/config` on the volume.
+
+So the fix is not a repair. Wanted: the engine materialises a workspace, and supplies credentials
+through a helper reading the child's environment (or a per-invocation `http.extraheader`) — never in
+the remote URL, never in argv. QA's `WOW-token-not-on-disk` gate already exists and passes against a
+correct implementation, proven by planting a credential in the production shape and requiring the
+detector to catch it. It is waiting for the mechanism.
+
+Until this lands, every agent that clones is one improvisation away from writing the operator's
+credential to disk, and the loop that makes Wheel self-developing is the thing doing it.

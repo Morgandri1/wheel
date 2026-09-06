@@ -84,6 +84,12 @@ pub enum MessageState {
     Delivered,
     /// The harness reported the turn containing it complete.
     Consumed,
+    /// The body could not be encoded for delivery, so it was set aside rather
+    /// than retried forever. A stored message that kills the encoder is
+    /// replayed at every start, which turns one bad body into a board that
+    /// never comes up (ADVERSARY 035); quarantine is what makes that
+    /// impossible independently of whether the encoder has a bug today.
+    Undeliverable,
 }
 
 impl MessageState {
@@ -92,6 +98,7 @@ impl MessageState {
             MessageState::Queued => "queued",
             MessageState::Delivered => "delivered",
             MessageState::Consumed => "consumed",
+            MessageState::Undeliverable => "undeliverable",
         }
     }
 
@@ -102,6 +109,11 @@ impl MessageState {
             (self, next),
             (MessageState::Queued, MessageState::Delivered)
                 | (MessageState::Delivered, MessageState::Consumed)
+                // A message may be set aside from either lane, and never
+                // leaves: quarantine is terminal by design, so a body that
+                // cannot be encoded cannot come back on the next start.
+                | (MessageState::Queued, MessageState::Undeliverable)
+                | (MessageState::Delivered, MessageState::Undeliverable)
         )
     }
 }
