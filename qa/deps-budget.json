@@ -1,0 +1,74 @@
+{
+  "forbidden": {
+    "wheel-cli": [
+      "sqlx",
+      "reqwest"
+    ],
+    "wheel-engine": [
+      "sqlx"
+    ],
+    "wheeld": [
+      "sqlx"
+    ]
+  },
+  "known_debt": {
+    "wheeld:sqlx": "PM A10: wheeld runs the same store on SQLite and still compiles sqlx (444 lines of dependency tree). Owner API. Delete this entry when it is feature-gated -- the gate then enforces the ban and fails if it ever comes back."
+  },
+  "platforms": {
+    "aarch64-apple-darwin": {
+      "crates": {
+        "wheel-api": 246,
+        "wheel-cli": 63,
+        "wheel-core": 29,
+        "wheel-engine": 194,
+        "wheel-host": 206,
+        "wheel-sqlite": 32,
+        "wheeld": 281
+      },
+      "duplicates": [
+        "bitflags",
+        "getrandom",
+        "hashbrown",
+        "hashlink",
+        "indexmap",
+        "rand",
+        "rand_chacha",
+        "rand_core",
+        "schemars",
+        "syn",
+        "tokio-tungstenite",
+        "tungstenite",
+        "webpki-roots"
+      ],
+      "total": 284
+    },
+    "x86_64-unknown-linux-gnu": {
+      "crates": {
+        "wheel-api": 246,
+        "wheel-cli": 63,
+        "wheel-core": 29,
+        "wheel-engine": 195,
+        "wheel-host": 206,
+        "wheel-sqlite": 32,
+        "wheeld": 281
+      },
+      "duplicates": [
+        "bitflags",
+        "cpufeatures",
+        "getrandom",
+        "hashbrown",
+        "hashlink",
+        "indexmap",
+        "rand",
+        "rand_chacha",
+        "rand_core",
+        "schemars",
+        "syn",
+        "tokio-tungstenite",
+        "tungstenite",
+        "webpki-roots"
+      ],
+      "total": 284
+    }
+  }
+}
