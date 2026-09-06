@@ -48,14 +48,22 @@ test("agent api-key auth: needs_auth -> authenticate -> authenticated, key never
     // Anthropic account is the native path (contract §2 — "API keys are a hidden advanced
     // fallback"), so the key field lives behind "Other ways to sign in". This spec tests the
     // fallback, so it navigates to it the way a person would. The assertions below are unchanged.
-    // Open the disclosure only if it is closed. A bare click toggles, so if the panel ever
-    // starts open by default this would CLOSE it and the failure would read as "the API-key
-    // field does not exist" — which is what sent this spec into a timeout the first time.
-    // Navigating to a state should be idempotent, not a flip.
-    const field = page.getByTestId("input-api-key");
-    if (!(await field.isVisible().catch(() => false))) {
-      await page.getByTestId("btn-auth-other-ways").click();
+    // Open the disclosure only if it is closed, and ask the COMPONENT whether it is —
+    // aria-expanded is the state it owns and publishes, so this reads the same fact the
+    // panel acts on. Web pointed that out; my first version inferred the state from
+    // whether the field happened to be visible, which is a guess about a consequence.
+    //
+    // Idempotent, not a toggle: a bare click would CLOSE an already-open panel, and the
+    // failure would read as "the API-key field does not exist" — the same disguise that
+    // sent this spec into a timeout the first time.
+    const disclosure = page.getByTestId("btn-auth-other-ways");
+    await expect(disclosure).toHaveAttribute("aria-controls", /.+/);
+    if ((await disclosure.getAttribute("aria-expanded")) !== "true") {
+      await disclosure.click();
     }
+    await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+
+    const field = page.getByTestId("input-api-key");
     await expect(field).toBeVisible();
 
     await expect(field).toHaveAttribute("type", "password");
