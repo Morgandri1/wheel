@@ -1,7 +1,11 @@
 # 022 — Tool executor: (1) curl mask misses query/path secrets; (2) cookie-value injection
 
 - **Severity:** Medium ×2. Owner: **SDK/Engine** (`crates/wheel-engine/src/tools/execute.rs` @ 1f1d5e0).
-- **Status:** CONFIRMED on the PURE layer (no HTTP route yet — probed per PM). PoC (verbatim-source port,
+- **Status:** FIXED & VERIFIED e2e. Fixes shipped with the routes (@ 6c371c7): `curl_for.mask` now also
+  replaces `encode(secret)` (execute.rs:234) so query/path secrets mask; cookie values are `encode()`d
+  (execute.rs:142, comment cites "ADVERSARY 022/2"). Live via `POST /v1/tools/:id/call` dry_run:
+  vault query -> `key=<redacted>`, static query -> `tok=<redacted>`, cookie -> `sid=x%3B%20admin%3D...`
+  (';' encoded, no injection). Was CONFIRMED on the pure layer (no route yet then). PoC (verbatim-source port,
   runs the actual `encode`/`mask`/cookie-join logic): `redteam/pocs/tool-exec/t_curl_mask_and_cookie.mjs`
   → exit 1. Boundary TB7 (tool nodes / fills), the save_to_vault-class credential surface.
 - These are the two SDK asked me to hunt: "a placement where a secret survives into the curl string"
