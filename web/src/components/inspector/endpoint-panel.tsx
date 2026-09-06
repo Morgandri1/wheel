@@ -9,7 +9,14 @@ import { HTTP_METHODS } from "@/lib/schema";
 import { probeEndpoint, probeVerdict, type Probe } from "@/lib/endpoint-probe";
 import { projects } from "@/lib/api";
 import type { EngineApi } from "@/lib/api";
-import type { EndpointNode, HttpMethod, Project, ResponseMode, WheelNode } from "@/lib/schema";
+import type {
+  EndpointAuth,
+  EndpointNode,
+  HttpMethod,
+  Project,
+  ResponseMode,
+  WheelNode,
+} from "@/lib/schema";
 
 /**
  * An endpoint is the one node the outside world can touch, so the panel leads with the URL and
@@ -32,6 +39,11 @@ export function EndpointPanel({
   const [method, setMethod] = useState<HttpMethod>(node.config.method);
   const [path, setPath] = useState(node.config.path);
   const [responseMode, setResponseMode] = useState<ResponseMode>(node.config.response_mode);
+  const initialAuth = node.config.auth ?? { mode: "none" };
+  const [authMode, setAuthMode] = useState<EndpointAuth["mode"]>(initialAuth.mode);
+  const [vaultRef, setVaultRef] = useState(
+    initialAuth.mode === "bearer" ? initialAuth.vault_ref : "",
+  );
   const [saving, setSaving] = useState(false);
   const [enabling, setEnabling] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -42,16 +54,34 @@ export function EndpointPanel({
     setMethod(node.config.method);
     setPath(node.config.path);
     setResponseMode(node.config.response_mode);
+    const auth = node.config.auth ?? { mode: "none" };
+    setAuthMode(auth.mode);
+    setVaultRef(auth.mode === "bearer" ? auth.vault_ref : "");
     // A measurement belongs to the URL it was taken against. Keeping it across a node switch, or
     // across an edit to the path, would show a reading of somewhere else.
     setProbe(null);
-  }, [node.id, node.config.method, node.config.path, node.config.response_mode]);
+  }, [node.id, node.config.method, node.config.path, node.config.response_mode, node.config.auth]);
+
+  /** §3: only a vault this endpoint holds a `read` wire to can supply the bearer secret. */
+  const wiredVaults = useMemo(() => {
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    return (node.wires ?? [])
+      .filter((w) => w.type === "read")
+      .map((w) => byId.get(w.to))
+      .filter((n): n is Extract<WheelNode, { type: "vault" }> => n?.type === "vault");
+  }, [node.wires, nodes]);
 
   const pathError = validateEndpointPath(path);
+  const savedAuth = node.config.auth ?? { mode: "none" };
+  const authDirty =
+    authMode !== savedAuth.mode ||
+    (authMode === "bearer" && vaultRef !== (savedAuth.mode === "bearer" ? savedAuth.vault_ref : ""));
+  const authError = authMode === "bearer" && !vaultRef.trim();
   const dirty =
     method !== node.config.method ||
     path !== node.config.path ||
-    responseMode !== node.config.response_mode;
+    responseMode !== node.config.response_mode ||
+    authDirty;
 
   // `??` is wrong here: the API sends ingress_base_url as an EMPTY STRING until the project has
   // started, and an empty string is not null. That produced a "public URL" of just the path —
@@ -94,8 +124,10 @@ export function EndpointPanel({
   const save = async () => {
     setSaving(true);
     try {
+      const auth: EndpointAuth =
+        authMode === "bearer" ? { mode: "bearer", vault_ref: vaultRef.trim() } : { mode: "none" };
       await api.patchNode(node.id, {
-        config: { ...node.config, method, path, response_mode: responseMode },
+        config: { ...node.config, method, path, response_mode: responseMode, auth },
       });
       onChanged();
       toast("Saved.");
@@ -222,12 +254,63 @@ export function EndpointPanel({
         </Select>
       </Field>
 
+      <Field
+        label="Auth"
+        hint={
+          authMode === "bearer"
+            ? "Every hit must send `Authorization: Bearer <secret>`. A mismatch answers 401 with no body."
+            : "Anyone with the URL can hit it — no bearer check."
+        }
+      >
+        <Select
+          data-testid="inspector-endpoint-auth-mode"
+          value={authMode}
+          onChange={(e) => {
+            const next = e.target.value as EndpointAuth["mode"];
+            setAuthMode(next);
+            if (next === "none") setVaultRef("");
+          }}
+        >
+          <option value="none">No auth</option>
+          <option value="bearer" disabled={wiredVaults.length === 0}>
+            Bearer token
+          </option>
+        </Select>
+      </Field>
+
+      {authMode === "bearer" && wiredVaults.length ? (
+        <Field label="Vault key" hint="Resolved from the vault on every hit. Never shown to the caller.">
+          <Input
+            data-testid="inspector-endpoint-auth-vault-ref"
+            mono
+            list="endpoint-auth-vaults"
+            placeholder={`${wiredVaults[0]!.name}/key-name`}
+            value={vaultRef}
+            onChange={(e) => setVaultRef(e.target.value)}
+          />
+          <datalist id="endpoint-auth-vaults">
+            {wiredVaults.flatMap((v) =>
+              (v.config.keys ?? []).map((k) => (
+                <option key={`${v.name}/${k}`} value={`${v.name}/${k}`} />
+              )),
+            )}
+          </datalist>
+        </Field>
+      ) : null}
+
+      {authMode === "bearer" && !wiredVaults.length ? (
+        <p className="text-micro text-ink-faint" data-testid="endpoint-auth-no-vault">
+          No vault is wired for read, so bearer auth cannot resolve a secret. Wire this endpoint to
+          a vault first.
+        </p>
+      ) : null}
+
       <div className="flex justify-end">
         <Button
           tone="primary"
           size="sm"
           data-testid="btn-endpoint-save"
-          disabled={!dirty || Boolean(pathError) || saving}
+          disabled={!dirty || Boolean(pathError) || authError || saving}
           onClick={save}
         >
           {saving ? "Saving…" : "Save"}
