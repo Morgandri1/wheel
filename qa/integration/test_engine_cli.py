@@ -343,12 +343,13 @@ def main():
         # Positive control, first. Every assertion below is "the message was informative",
         # and all of them hold vacuously if nothing failed — which is exactly what a suite
         # reports when the commands it chose all happen to succeed.
-        if not R.check("CLI-error-has-a-cause/something-failed", bool(failed_at_all),
+        if not R.control("CLI-error-has-a-cause/something-failed", bool(failed_at_all),
                        "none of the five commands failed, so there were no error messages "
                        "to judge — this check proved nothing about error text"):
             return R.report("wheel CLI")
 
-        R.check("CLI-error-has-a-cause", not bare,
+        R.gated("CLI-error-has-a-cause", "CLI-error-has-a-cause/something-failed",
+                not bare,
                 "these failed with nothing a caller could act on: %s. Every CLI failure "
                 "must carry the engine's code and message; an internal error must still "
                 "name its request id so the cause is findable in the log." % bare)
