@@ -340,6 +340,23 @@ deployed.
 | `DEPLOY-healthz-is-ours` | The 200 carries our health body. A parked page, an edge cache or another service on the domain answers 200 just as happily, so status alone proves only that something on the internet replied. | S2 |
 | `DEPLOY-healthz-host` | The same for `wheel-host`. It has no public domain by design (§5b), so this needs an API-proxied liveness route; **skipped by name** until API adds one — the host holds every project's engine secret, and "never checked" must not read as "fine". | S2 |
 
+### 5b. MCP — the board as tools a model can call (§3c #1)
+
+Driven the way Claude drives it: `wheel mcp-serve` as a child process speaking
+line-delimited JSON-RPC 2.0 on stdin/stdout — not the HTTP route underneath. The framing is
+part of what can break, and a model is the only consumer.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCP-initialize` | `initialize` returns a protocol version. |
+| `MCP-tools-list` | `tools/list` returns tools. |
+| `MCP-advertised-has-handler` | **Every advertised tool resolves to a handler** — no `-32602 unknown tool`. SDK shipped `run` and `ctx_clear` advertised with nothing behind them; a tool that resolves to nothing teaches a model the board is unreliable and it stops trying things that would have worked. Advertising is a promise. A wire denial or bad argument is fine here: the claim is the tool EXISTS, not that the call succeeds. | **S2** |
+| `MCP-unknown-tool-is-refused` | **Positive control.** A made-up tool name *is* refused with `-32602`. Without it, a server that answered every name would make the check above pass vacuously. | S2 |
+| `MCP-tools-live-wires` | A wire added AFTER `mcp-serve` started appears in the next `tools/list`, same process, no restart — otherwise a model must be restarted to notice a node it was just granted. Must run BEFORE any destructive check: the call-everything sweep invokes `ctx_clear`, which rotates the session, and this then fails with "expired token" while reading like an engine bug. | S2 |
+| `MCP-token-not-in-argv` | The node token never appears in any process command line; argv is world-readable across uids (§5b). | **S1** |
+| `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens rotate on agent start, and a client holding the previous one is refused — otherwise a stopped agent's credential outlives the agent. | **S1** |
+| `WM-table-name-hyphen` | A table node named with `-` is REFUSED, the message names the fix, and nothing is silently renamed to `table_1`. PM ruling: §3 permits `-` in node names, a table node's name becomes `t_<name>`, and a node whose address is not what the user typed is unaddressable by the agent that was told about it. | S2 |
+
 ---
 
 ## 6. CLI — the `wheel` binary (§3c)
