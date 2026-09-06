@@ -360,14 +360,22 @@ def main():
                   "whether the vault token works. Output: %s" % denied[-300:])
 
         pout = turn(agent, push_cmd % ("", branch), wait=180)
+        # "git push exited 0" and "the ref is on GitHub" are different claims, and PM was
+        # explicit that only one of them is the operator's goal. Ask the REMOTE.
+        lsr = turn(agent, "cd /data/wow && git ls-remote origin %s 2>&1 | tail -2" % branch,
+                   wait=120)
+        on_remote = branch in lsr
+
         if pout == TURN_TIMEOUT or "engine unreachable" in pout:
             R.skip("WOW-commit-push", "the push turn did not finish — no verdict")
         else:
-            R.gated("WOW-commit-push", "WOW-push-needs-the-token", "RC=0" in pout,
+            R.gated("WOW-commit-push", "WOW-push-needs-the-token",
+                    "RC=0" in pout and on_remote,
                     "an agent in the sandbox could not push to %s with its vault token. "
                     "This is the third leg of the operator's goal and it is already "
                     "happening in production, so a failure here is a gap in the gate, not "
-                    "in the capability: %s" % (REPO, pout[-400:]))
+                    "in the capability. push -> %s; the remote's own view of the branch "
+                    "-> %r" % (REPO, pout[-300:], lsr[-160:]))
 
         # PM's S1, applied after the WRITE as well: pushing must not leave a credential
         # behind either, and a push is where git is most tempted to persist one.
