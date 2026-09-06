@@ -170,9 +170,21 @@ export function engineApi(projectId: string) {
         );
       },
       authStatus: () => request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth`), p),
-      authBegin: () =>
-        request<AuthBegin>(engine(projectId, `/agents/${nodeId}/auth/begin`), { ...p, method: "POST" }),
-      authComplete: (body: { code?: string; api_key?: string }) =>
+      authBegin: (body?: { mode?: "paste_code" | "device_code" | "api_key" }) =>
+        request<AuthBegin>(engine(projectId, `/agents/${nodeId}/auth/begin`), {
+          ...p,
+          method: "POST",
+          body: body ?? {},
+        }),
+      authComplete: (body: {
+        code?: string;
+        api_key?: string;
+        setup_token?: string;
+        /** Ties a paste-code submission to the `auth/begin` that issued it. */
+        session?: string;
+        /** Name of a vault to also store this credential in, so peers wired to it inherit it. */
+        save_to_vault?: string;
+      }) =>
         request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth/complete`), { ...p, method: "POST", body }),
     }),
 

@@ -2,9 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Button, Field, Input } from "@/components/ui";
+import { Button, Field, Input, Select } from "@/components/ui";
+import { OauthPanel } from "@/components/inspector/oauth-panel";
+import { vaultShareNote } from "@/lib/auth-session";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
+import type { AuthStatus } from "@/lib/schema";
 
 /**
  * Signing an agent in.
@@ -55,6 +58,8 @@ export function AuthFlow({
   needsAuth,
   vaults = [],
   onAuthenticated,
+  nextNeedsAuth = null,
+  onSelectAgent,
 }: {
   api: EngineApi;
   nodeId: string;
@@ -63,12 +68,23 @@ export function AuthFlow({
   /** Names of vaults this agent has a read wire to, for the `env` mode hint. */
   vaults?: string[];
   onAuthenticated: () => void;
+  /**
+   * The next agent on this board still waiting for credentials. One login per agent is the
+   * durable arrangement, so a board of agents means repeating this — the least we can do is
+   * hand over the next one instead of making someone hunt for it on the canvas.
+   */
+  nextNeedsAuth?: { id: string; name: string } | null;
+  onSelectAgent?: (id: string) => void;
 }) {
   const agent = api.agent(nodeId);
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [replacing, setReplacing] = useState(false);
+  const [setupToken, setSetupToken] = useState("");
+  const [vault, setVault] = useState("");
+  const [shareNote, setShareNote] = useState<string | null>(null);
+  const [showOther, setShowOther] = useState(false);
   const keyRef = useRef<HTMLInputElement>(null);
 
   const status = useQuery({
@@ -92,16 +108,21 @@ export function AuthFlow({
     if (needsAuth && !authenticated) keyRef.current?.focus();
   }, [needsAuth, authenticated]);
 
-  const save = async () => {
-    const key = apiKey.trim();
-    if (!key) return;
+  const saveCredential = async (body: { api_key?: string; setup_token?: string }) => {
     setBusy(true);
     try {
-      const next = await agent.authComplete({ api_key: key });
-      // Clear immediately: the key has left, and there is no reason for it to sit in a form.
+      const next = (await agent.authComplete({
+        ...body,
+        ...(vault ? { save_to_vault: vault } : {}),
+      })) as AuthStatus & {
+        saved_to_vault?: { expires_at?: string | null; warning?: string | null } | null;
+      };
+      // Clear immediately: the credential has left, and there is no reason for it to sit in a form.
       setApiKey("");
+      setSetupToken("");
       setReplacing(false);
       setJustSaved(true);
+      setShareNote(vault ? vaultShareNote(next.saved_to_vault ?? {}) : null);
       if (next.authenticated) {
         toast("Credentials saved. Anything queued for this agent will be delivered.");
         onAuthenticated();
@@ -115,38 +136,72 @@ export function AuthFlow({
     }
   };
 
+  const save = async () => {
+    const key = apiKey.trim();
+    if (key) await saveCredential({ api_key: key });
+  };
+
+  const saveSetupToken = async () => {
+    const token = setupToken.trim();
+    if (token) await saveCredential({ setup_token: token });
+  };
+
   const authData = status.data as (typeof status.data & { source?: string | null }) | undefined;
   const mode = authData?.mode as string | null | undefined;
   const source = authData?.source;
   const fromVault = mode === "env";
 
+  const nextAgentHop =
+    nextNeedsAuth && onSelectAgent ? (
+      <div className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2">
+        <span className="text-micro text-ink-dim">
+          {nextNeedsAuth.name} is still waiting for credentials.
+        </span>
+        <Button
+          size="sm"
+          data-testid="btn-auth-next-agent"
+          onClick={() => onSelectAgent(nextNeedsAuth.id)}
+        >
+          Sign in {nextNeedsAuth.name}
+        </Button>
+      </div>
+    ) : null;
+
   if (authenticated && !replacing) {
     return (
-      <div
-        className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
-        data-testid="auth-status"
-        data-authenticated="true"
-        data-mode={mode ?? ""}
-        data-source={source ?? ""}
-      >
-        {/* SDK: `authenticated: true` means a credential is STORED, not that it works — only the
-            harness's own probe can say that. "Connected" here would be a lie an expired token
-            tells, and the support round-trip lands on us. */}
-        <span className="text-micro text-ink-dim">
-          {credentialLabel(mode, source, vaults)}
-          {status.data?.account ? ` · ${status.data.account}` : ""}
-        </span>
-        {fromVault ? (
-          // Nothing to replace here: the value lives in the vault node and is edited there.
-          // Offering "Replace" would invite someone to shadow their own vault by hand.
-          <span className="text-micro text-ink-faint" data-testid="auth-from-vault">
-            edit it in the vault
+      <div className="flex flex-col gap-2">
+        <div
+          className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
+          data-testid="auth-status"
+          data-authenticated="true"
+          data-mode={mode ?? ""}
+          data-source={source ?? ""}
+        >
+          {/* SDK: `authenticated: true` means a credential is STORED, not that it works — only the
+              harness's own probe can say that. "Connected" here would be a lie an expired token
+              tells, and the support round-trip lands on us. */}
+          <span className="text-micro text-ink-dim">
+            {credentialLabel(mode, source, vaults)}
+            {status.data?.account ? ` · ${status.data.account}` : ""}
           </span>
-        ) : (
-          <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
-            Replace
-          </Button>
-        )}
+          {fromVault ? (
+            // Nothing to replace here: the value lives in the vault node and is edited there.
+            // Offering "Replace" would invite someone to shadow their own vault by hand.
+            <span className="text-micro text-ink-faint" data-testid="auth-from-vault">
+              edit it in the vault
+            </span>
+          ) : (
+            <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
+              Replace
+            </Button>
+          )}
+        </div>
+        {shareNote ? (
+          <p className="text-micro text-ink-faint" data-testid="auth-vault-note">
+            {shareNote}
+          </p>
+        ) : null}
+        {nextAgentHop}
       </div>
     );
   }
@@ -164,63 +219,132 @@ export function AuthFlow({
         </p>
       ) : null}
 
-      <Field
-        label={replacing ? "New key or token" : "API key or setup-token"}
-        hint={
-          replacing
-            ? "Replaces the credential already stored for this agent."
-            : "An sk-ant- API key, or the token from `claude setup-token`. Stored in the agent's own credentials directory and never shown again, by anything."
-        }
-      >
-        <Input
-          ref={keyRef}
-          type="password"
-          mono
-          autoComplete="off"
-          spellCheck={false}
-          data-testid="input-api-key"
-          placeholder="sk-ant-… or a setup-token"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void save();
-          }}
-        />
-      </Field>
+      {/* The native path first: it needs no CLI, which is the whole reason it exists. */}
+      <OauthPanel
+        api={api}
+        nodeId={nodeId}
+        vaults={vaults}
+        onAuthenticated={() => {
+          setJustSaved(true);
+          onAuthenticated();
+          void status.refetch();
+        }}
+        onShareNote={setShareNote}
+      />
 
-      <div className="flex items-center gap-2">
-        <Button
-          tone="primary"
-          size="sm"
-          data-testid="btn-auth-complete"
-          disabled={!apiKey.trim() || busy}
-          onClick={save}
+      <div className="border-t border-rule pt-2.5">
+        <button
+          type="button"
+          className="text-micro text-ink-faint underline"
+          data-testid="btn-auth-other-ways"
+          onClick={() => setShowOther((v) => !v)}
         >
-          {busy ? "Saving…" : "Save credential"}
-        </Button>
-        {replacing ? (
-          <Button size="sm" tone="ghost" onClick={() => { setReplacing(false); setApiKey(""); }}>
-            Cancel
+          {showOther ? "Hide other ways to sign in" : "Other ways to sign in"}
+        </button>
+      </div>
+
+      {showOther || replacing ? (
+        <div className="flex flex-col gap-3" data-testid="auth-other-ways">
+          <Field
+            label="Setup token"
+            hint="From `claude setup-token` on a machine that has the CLI. Starts with sk-ant-oat."
+          >
+            <Input
+              type="password"
+              mono
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="input-setup-token"
+              placeholder="sk-ant-oat…"
+              value={setupToken}
+              onChange={(e) => setSetupToken(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveSetupToken();
+              }}
+            />
+          </Field>
+          <Button
+            size="sm"
+            data-testid="btn-auth-save-setup-token"
+            disabled={!setupToken.trim() || busy}
+            onClick={saveSetupToken}
+          >
+            {busy ? "Saving…" : "Save setup token"}
           </Button>
-        ) : null}
-        {justSaved && !authenticated ? (
-          <span className="text-micro text-ink-faint" data-testid="auth-checking">
-            Saving…
-          </span>
-        ) : null}
-      </div>
 
-      <div className="flex items-center gap-2 border-t border-rule pt-2.5">
-        <Button
-          size="sm"
-          disabled
-          data-testid="btn-auth-oauth"
-          title="Signing in with your own Claude or Codex account arrives with the engine's OAuth flow (M2)."
-        >
-          Sign in with your account
-        </Button>
-        <span className="text-micro text-ink-faint">M2 — uses your own plan instead of a key</span>
-      </div>
+          <Field
+            label={replacing ? "New API key" : "API key"}
+            hint={
+              replacing
+                ? "Replaces the credential already stored for this agent."
+                : "An sk-ant- API key. Billed per token rather than against your plan — the account sign-in above is usually what you want."
+            }
+          >
+            <Input
+              ref={keyRef}
+              type="password"
+              mono
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="input-api-key"
+              placeholder="sk-ant-…"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void save();
+              }}
+            />
+          </Field>
+
+          {vaults.length ? (
+            <Field
+              label="Also save to a vault"
+              hint="Every agent wired to that vault inherits the credential."
+            >
+              <Select
+                data-testid="select-auth-vault-other"
+                value={vault}
+                onChange={(e) => setVault(e.target.value)}
+              >
+                <option value="">Just this agent</option>
+                {vaults.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          ) : null}
+
+          <div className="flex items-center gap-2">
+            <Button
+              tone="primary"
+              size="sm"
+              data-testid="btn-auth-complete"
+              disabled={!apiKey.trim() || busy}
+              onClick={save}
+            >
+              {busy ? "Saving…" : "Save credential"}
+            </Button>
+            {replacing ? (
+              <Button size="sm" tone="ghost" onClick={() => { setReplacing(false); setApiKey(""); }}>
+                Cancel
+              </Button>
+            ) : null}
+            {justSaved && !authenticated ? (
+              <span className="text-micro text-ink-faint" data-testid="auth-checking">
+                Saving…
+              </span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {shareNote ? (
+        <p className="text-micro text-ink-faint" data-testid="auth-vault-note">
+          {shareNote}
+        </p>
+      ) : null}
     </div>
   );
 }

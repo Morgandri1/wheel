@@ -34,6 +34,8 @@ export interface ProjectRecord {
   messages: Message[];
   log: LogLine[];
   authenticated: Set<string>;
+  /** Which KIND of credential each agent holds, so GET /auth stops guessing "api_key". */
+  authModes: Map<string, string>;
   tables: Map<string, Map<string, Record<string, unknown>>>;
   chests: Map<string, Map<string, Buffer>>;
   vaults: Map<string, Set<string>>;
@@ -120,6 +122,7 @@ export function createProject(name: string): ProjectRecord {
     messages: [],
     log: [],
     authenticated: new Set(),
+    authModes: new Map(),
     tables: new Map(),
     chests: new Map(),
     vaults: new Map(),

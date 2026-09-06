@@ -121,6 +121,19 @@ function AgentPanel({
     [node.wires, nodes],
   );
   const openTab = useBoardStore((s) => s.openTab);
+  const select = useBoardStore((s) => s.select);
+  /**
+   * The next agent on this board still waiting for credentials. One login per agent is the
+   * durable arrangement, so signing in a board means repeating this; handing over the next one
+   * beats making someone find it on the canvas.
+   */
+  const nextNeedsAuth = useMemo(() => {
+    const next = nodes.find(
+      (n) => n.type === "agent" && n.id !== node.id && n.state?.status === "needs_auth",
+    );
+    return next ? { id: next.id, name: next.name } : null;
+  }, [nodes, node.id]);
+
   const [prompt, setPrompt] = useState(node.config.system_prompt);
   const [model, setModel] = useState(node.config.model ?? "");
   const [saving, setSaving] = useState(false);
@@ -189,6 +202,8 @@ function AgentPanel({
         needsAuth={status === "needs_auth"}
         vaults={wiredVaults}
         onAuthenticated={onChanged}
+        nextNeedsAuth={nextNeedsAuth}
+        onSelectAgent={select}
       />
 
       <Field label="Harness">
