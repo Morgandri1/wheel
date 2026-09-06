@@ -26,13 +26,26 @@ def have(image, binary):
 
 
 def main():
-    image = os.environ.get("WHEEL_IMAGE", "wheel-engine:test")
+    # Prefer whichever image is actually here. The CI job that builds an image builds
+    # `wheel-engine:dev` (`make engine-image`); only the integration job builds `:test`.
+    # Hardcoding :test made this gate exit 77 in the job I had just moved it to, and `-e`
+    # turned that skip into a red job -- the gate relocation broke the job it moved to,
+    # which is a tidier version of the mistake the relocation guard exists to prevent.
+    image = os.environ.get("WHEEL_IMAGE")
+    if not image:
+        for candidate in ("wheel-engine:dev", "wheel-engine:test"):
+            if subprocess.run(["docker", "image", "inspect", candidate],
+                              capture_output=True).returncode == 0:
+                image = candidate
+                break
+        else:
+            image = "wheel-engine:test"
     if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
         print("docker not running")
         return SKIP
     if subprocess.run(["docker", "image", "inspect", image],
                       capture_output=True).returncode != 0:
-        print("%s not built (make engine-image-test)" % image)
+        print("no engine image present (tried wheel-engine:dev and :test) — build one with `make engine-image` or `make engine-image-test`")
         return SKIP
 
     fails = []

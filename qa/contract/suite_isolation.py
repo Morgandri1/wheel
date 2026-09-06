@@ -20,6 +20,44 @@ PORT_RE = re.compile(r'os\.environ\.get\(\s*"([A-Z0-9_]+)"\s*,\s*"(\d+)"\s*\)')
 NAME_RE = re.compile(r'^NAME\s*=\s*"([^"]+)"', re.M)
 
 
+def check_imports(suite_dir):
+    """Names used from wheel_client must be imported -- checked by AST, not by grep.
+
+    I appended ", free_port" to an import line and it landed inside the trailing
+    `# noqa` comment, so the module used a name it had never imported and died at import
+    time in CI. My own verification was `grep "import.*free_port"`, which matched the
+    comment and reported all clear. A grep sees text; only a parser sees an import.
+    """
+    import ast, os
+    watched = {"free_port", "configure_fakes", "pin_image", "run_suite", "Results"}
+    bad = []
+    for name in sorted(os.listdir(suite_dir)):
+        if not name.startswith("test_") or not name.endswith(".py"):
+            continue
+        path = os.path.join(suite_dir, name)
+        try:
+            tree = ast.parse(open(path).read())
+        except SyntaxError as e:
+            bad.append("%s does not parse: %s" % (name, e))
+            continue
+        imported = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                imported.update(a.asname or a.name for a in n.names)
+            elif isinstance(n, ast.Import):
+                imported.update((a.asname or a.name).split(".")[0] for a in n.names)
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        assigned = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                    for t in n.targets if isinstance(t, ast.Name)}
+        funcs = {n.name for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for w in sorted(watched & used):
+            if w not in imported and w not in assigned and w not in funcs:
+                bad.append("%s uses %s() without importing it — it will die at import time"
+                           % (name, w))
+    return bad
+
+
 def check_free_port(suite_dir):
     """A fixed port makes a leftover container indistinguishable from a broken engine.
 
@@ -76,6 +114,7 @@ def main():
                             % (name, ", ".join(sorted(set(files)))))
 
     problems.extend(check_free_port(INTEGRATION))
+    problems.extend(check_imports(INTEGRATION))
 
     if problems:
         print("suite isolation violated:")
