@@ -29,7 +29,7 @@ use axum::{
     Json, Router,
 };
 use uuid::Uuid;
-use wheel_core::{HttpMethod, MessageSender, NodeConfig, NodeType, WireType};
+use wheel_core::{ErrorBody, HttpMethod, MessageSender, NodeConfig, NodeType, WireType};
 
 use super::AppState;
 use crate::db::board;
@@ -109,7 +109,13 @@ async fn handle(
         "DELETE" => HttpMethod::Delete,
         // A verb no endpoint can be configured for is indistinguishable from
         // a path that does not exist, and says less.
-        _ => return (StatusCode::NOT_FOUND, Json(err("no_such_endpoint"))).into_response(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(err("no_such_endpoint", "no endpoint answers this path")),
+            )
+                .into_response()
+        }
     };
     let matched = {
         let conn = match state.db.lock() {
@@ -126,12 +132,19 @@ async fn handle(
             return (
                 StatusCode::METHOD_NOT_ALLOWED,
                 [("allow", allowed.as_str().to_string())],
-                Json(err("method_not_allowed")),
+                Json(err(
+                    "method_not_allowed",
+                    "this path does not accept this method",
+                )),
             )
                 .into_response();
         }
         Matched::None => {
-            return (StatusCode::NOT_FOUND, Json(err("no_such_endpoint"))).into_response()
+            return (
+                StatusCode::NOT_FOUND,
+                Json(err("no_such_endpoint", "no endpoint answers this path")),
+            )
+                .into_response()
         }
     };
 
@@ -166,8 +179,14 @@ async fn handle(
     deliver(&state, &matched, &method, path, &headers, &raw)
 }
 
-fn err(code: &str) -> serde_json::Value {
-    serde_json::json!({ "code": code })
+/// The same `{"error":{"code","message"}}` envelope every other engine route
+/// uses (`api/mod.rs`'s `ApiError`) — this module builds its own responses
+/// rather than going through `ApiError` (ingress needs a bare `Response` for
+/// the deliver path, and `Allow`/rate-limit headers besides), but a bare
+/// `{"code":...}` here would still be a second, disagreeing error contract on
+/// the same engine.
+fn err(code: &str, message: &str) -> ErrorBody {
+    ErrorBody::new(code, message)
 }
 
 pub struct MatchedEndpoint {
@@ -425,6 +444,27 @@ mod tests {
             code.contains("messages::enqueue"),
             "ingress must deliver through messages::enqueue, the only path that \
              reaches Message::envelope"
+        );
+    }
+
+    /// Web caught this live: `err()` built a bare `{"code":...}` body, which
+    /// disagrees with every other engine route's `{"error":{"code",
+    /// "message"}}` envelope (`api/mod.rs`'s `ApiError`/`ErrorBody`) --
+    /// including `crates/wheel-api/tests/ingress_honesty.rs`'s own mock of the
+    /// wrapped shape. One error contract for the whole engine, ingress
+    /// included.
+    #[test]
+    fn ingress_errors_use_the_same_envelope_as_every_other_engine_route() {
+        let body = err("no_such_endpoint", "no endpoint answers this path");
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["error"]["code"], "no_such_endpoint");
+        assert_eq!(v["error"]["message"], "no endpoint answers this path");
+        // Not a second, bare `code` sitting beside `error` -- exactly one
+        // top-level key, matching ApiError's own IntoResponse.
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "unexpected top-level shape: {v}"
         );
     }
 
