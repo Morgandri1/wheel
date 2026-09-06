@@ -23,6 +23,7 @@ import { CommandPalette } from "@/components/board/command-palette";
 import { NODE_META } from "@/lib/node-meta";
 import { canConnect, explainDenial, isInjection } from "@/lib/wire-matrix";
 import { clampPosition, suggestName } from "@/lib/validate";
+import { dropOverride, settleOverrides, storedPosition } from "@/lib/drag-overrides";
 import { newNodeInput } from "@/lib/node-defaults";
 import { useBoardStore } from "@/store/board";
 import { toast, toastError } from "@/components/ui/toast";
@@ -55,6 +56,10 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   /** Positions being dragged right now; they win over the server's copy until drag ends. */
   const [dragged, setDragged] = useState<Record<string, Position>>({});
   const [measured, setMeasured] = useState<Record<string, { width: number; height: number }>>({});
+
+  useEffect(() => {
+    setDragged((prev) => settleOverrides(prev, nodes));
+  }, [nodes]);
   const [confirmDelete, setConfirmDelete] = useState<WheelNode | null>(null);
   const [pendingTool, setPendingTool] = useState<{ position: Position } | null>(null);
   const [toolUrl, setToolUrl] = useState("");
@@ -147,17 +152,14 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
 
   const onNodeDragStop = useCallback(
     async (_: unknown, node: RFNode) => {
-      const position = clampPosition(node.position);
+      const sent = clampPosition(node.position);
       try {
-        await api.patchNode(node.id, { position });
+        const saved = await api.patchNode(node.id, { position: sent });
+        setDragged((prev) => ({ ...prev, [node.id]: storedPosition(saved, sent) }));
       } catch (e) {
         toastError(e, "Couldn't save that position.");
+        setDragged((prev) => dropOverride(prev, node.id));
       } finally {
-        setDragged((prev) => {
-          const next = { ...prev };
-          delete next[node.id];
-          return next;
-        });
         onChanged();
       }
     },

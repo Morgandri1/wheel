@@ -26,5 +26,12 @@
       ]
     }
   ],
-  "ignoreCommand": "git diff HEAD^ HEAD -- package.json | grep -q '^+.*\"version\"' && exit 1 || exit 0"
+  "ignoreCommand": "git diff HEAD^ HEAD -- package.json | grep -q '^+.*\"version\"' && exit 1 || exit 0",
+  "git": {
+    "deploymentEnabled": {
+      "**": false,
+      "*": false,
+      "main": true
+    }
+  }
 }
