@@ -34,6 +34,8 @@ R = Results()
 PORT = free_port(int(os.environ.get("WHEEL_SHM_PORT", "17433")))
 BASE = "http://127.0.0.1:%d" % PORT
 NAME = "qa-engine-shm-%s" % uuid.uuid4().hex[:8]
+NAME2 = "qa-engine-shm2-%s" % uuid.uuid4().hex[:8]
+PORT2 = free_port(int(os.environ.get("WHEEL_SHM2_PORT", "17434")))
 VOL = "qa-shmvol-%s" % uuid.uuid4().hex[:8]
 SECRET = "qa-shm-secret-at-least-16ch"
 
@@ -189,8 +191,59 @@ def main():
                     % (value, ((said.stdout + said.stderr)[-220:])))
             sh("docker", "rm", "-f", name2)
             sh("docker", "volume", "rm", vol2)
+        # ---- the same property on a HEALTHY volume, which runs today -----------------
+        #
+        # ENG-concurrent-readers above can only be observed once the engine starts, so
+        # BUG-022 leaves it skipped indefinitely. The property it guards — that the engine
+        # never leaves its database exclusively locked — does not depend on a hostile
+        # volume, and PM flagged it directly: a transient EXCLUSIVE that is not given back
+        # trades a crash loop for an engine no second connection can read.
+        #
+        # Measured for the record: a connection holding locking_mode=EXCLUSIVE blocks a
+        # second one from BOTH reading and writing ("database is locked"). So this is a real
+        # discriminator, not a formality.
+        sh("docker", "rm", "-f", NAME2)
+        key2 = sh("openssl", "rand", "-base64", "32").stdout.strip()
+        ok2 = sh("docker", "run", "-d", "--name", NAME2,
+                 "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+                 "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
+                 "-e", "WHEEL_VAULT_KEY=" + key2,
+                 "-e", "WHEEL_ROLE=engine",
+                 "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+                 "-p", "%d:7000" % PORT2, "wheel-engine:test").returncode == 0
+        healthy = False
+        if ok2:
+            for _ in range(60):
+                # curl, not wget: the image has curl and no wget, so the wget version
+                # spun for the full 30s and then failed its own control. The control
+                # caught it — "the engine did not start on a NORMAL volume" — which is
+                # the right failure, but the cause was my probe, not the engine.
+                probe = sh("docker", "exec", NAME2, "sh", "-c",
+                           "curl -sf http://127.0.0.1:7000/healthz 2>/dev/null || true")
+                if "ok" in probe.stdout:
+                    healthy = True
+                    break
+                time.sleep(0.5)
+
+        if not R.control("ENG-second-connection/engine-up", healthy,
+                         "the engine did not start on a NORMAL volume, so a second-connection "
+                         "result would say nothing about locking"):
+            return R.report("engine-shm")
+
+        second = sh("docker", "exec", NAME2, "python3", "-c",
+                    "import sqlite3;c=sqlite3.connect('/data/wheel.db',timeout=5);"
+                    "c.execute('SELECT count(*) FROM nodes').fetchone();"
+                    "c.execute('CREATE TABLE IF NOT EXISTS qa_probe(a)');"
+                    "c.execute('INSERT INTO qa_probe VALUES (1)');c.commit();print('second-ok')")
+        R.gated("ENG-second-connection-not-locked-out", "ENG-second-connection/engine-up",
+                "second-ok" in second.stdout,
+                "a second connection to the running engine's database could not read AND "
+                "write: %s. An exclusive lock that was never given back trades a crash loop "
+                "for an engine nothing else can open — and the query path opens this file a "
+                "second time." % (second.stderr or second.stdout)[:200])
     finally:
         sh("docker", "rm", "-f", NAME)
+        sh("docker", "rm", "-f", NAME2)
         sh("docker", "volume", "rm", VOL)
 
     return R.report("engine-shm")
