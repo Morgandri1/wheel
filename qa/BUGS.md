@@ -904,7 +904,33 @@ the implementation just lands one level too high.
 implementation not matching its own stated intent, which is the kind that survives review
 because the reasoning next to it reads correctly.
 
-## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK
+## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK · CLOSED 2026-09-06
+
+**Closed on `1163cc9`** (`try_mode` in `crates/wheel-sqlite/src/lib.rs` now calls `mode_holds`,
+which proves the mode with `BEGIN IMMEDIATE; COMMIT;` before the fast path is allowed to
+return — not a read-back). `set_journal_mode`'s fast path (line 67) and its two escalations
+all route through the same `mode_holds`, so the engine's `allow_exclusive=false` call gets the
+identical proof the host's `true` path always had; the asymmetry this bug reported is gone.
+
+**Verified independently, not from the fix landing.** I could not rebuild `wheel-engine:test`
+to re-run the docker fixture (`qa/fixtures/wal_blocked_shm.py`, `qa:ENG-starts-without-shm`) —
+this sandbox has no `docker` binary at all, not just a stale image. Instead I reproduced
+BUG-022's exact scenario at the crate level, the same way SDK did from their own sandbox: a
+real directory sitting at `<db>-shm` (so sqlite can never map shared memory), opened through
+`wheel_sqlite::open_configured(path, false)` — the engine's own call shape, non-exclusive —
+against current `origin/main` (`1aa77ac`). Result: falls back to `truncate`, and a real
+`CREATE TABLE`/`INSERT` write succeeds. That is BUG-022's own reproduction recipe, run to the
+same conclusion by a method independent of SDK's.
+
+**What is still owed:** `qa/integration/test_engine_shm.py` / `ENG-starts-without-shm` itself
+has not gone green under my hand — it needs a rebuilt `wheel-engine:test` image and a docker
+daemon, neither available here. SDK's incoming crate-level unit test (no docker) will cover
+the same failure mode as permanent regression coverage; this crate-level check is not a
+replacement for eventually confirming the docker fixture on a host that has docker, and
+whoever next has docker access should do that pass before treating the image-level gate as
+proven rather than "consistent with the fix" from two independent crate-level checks.
+
+---
 
 `ENG-starts-without-shm` is RED against an image built from current main, i.e. **after** the fix
 that recovered production. The engine dies on a shm-less volume with:

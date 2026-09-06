@@ -163,7 +163,13 @@ def main():
     # version put it under the temp dir that gets rmtree'd at the end, which made every
     # `make coverage` a full instrumented rebuild -- on a six-agent host that is minutes of
     # load average 50, and a gate nobody can afford to run is a gate nobody runs.
-    cov_target = os.path.join(ROOT, "target-cov")
+    #
+    # WHEEL_COV_TARGET_DIR overrides the location. Some sandboxes put the repo itself on a
+    # small shared volume (a few GB shared by every agent, alongside wheel.db/host.db) where
+    # an instrumented workspace build can fill it -- this cost the whole board its disk once.
+    # Unset, the default is unchanged: ROOT/target-cov, next to the repo, for the laptop case
+    # this was designed for.
+    cov_target = os.environ.get("WHEEL_COV_TARGET_DIR") or os.path.join(ROOT, "target-cov")
     env = dict(os.environ, CARGO_TARGET_DIR=cov_target)
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
