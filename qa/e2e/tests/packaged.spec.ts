@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { T } from "../testids";
+import { expectHydrated } from "../hydration";
 
 /**
  * E2E-pkg-* — the artifact users actually install (`npx wheel-web`), not the one we develop
@@ -110,6 +111,9 @@ test("E2E-pkg-hydrates: the packaged board is interactive, not merely rendered",
     .getByTestId(T.authForm)
     .or(page.getByTestId(T.projectNew))
     .or(page.getByTestId(T.projectNewEmpty));
-  await expect(signIn.first()).toBeVisible({ timeout: 20_000 });
-  await expect(signIn.first()).toBeEnabled();
+  // Was toBeVisible + toBeEnabled. Both pass on server-rendered HTML with the bundle
+  // missing — I wrote the comment about "renders is not works" and then asserted exactly
+  // that. A packaged build is the likeliest place for a bundle to be absent, so this is
+  // the spec that could least afford it.
+  await expectHydrated(signIn.first(), "the packaged board's entry control");
 });

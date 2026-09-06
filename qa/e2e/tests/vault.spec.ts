@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { T } from "../testids";
+import { expectHydrated } from "../hydration";
 import { addNode, createProject, deleteProject, putSecret, startProject } from "../api";
 
 /**
@@ -44,7 +45,10 @@ test("E2E-vault-masked: a written vault value never comes back to the browser", 
 
     await startProject(project.id);
     await page.goto(`/app/${project.id}`);
-    await expect(page.getByTestId(T.board)).toBeVisible();
+    // This spec goes on to click a node and type a secret into the inspector. Both need a
+    // live board, not a rendered one, so assert the stronger thing here where it is cheap
+    // rather than discover it as a mystified click timeout twenty lines down.
+    await expectHydrated(page.getByTestId(T.board), "the board canvas");
     await page.getByTestId(T.node("secrets")).click();
 
     // The key NAME is expected to be visible; the value must not be, anywhere.
