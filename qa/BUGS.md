@@ -761,3 +761,34 @@ artifact for the one run anybody would ever read it for contained 70 bytes of
 
 Two owners of teardown, and the one that ran first was the one that did not know about the
 evidence. `main()` no longer tears down; `run_suite()` owns it, capture then remove.
+
+## 019 — `wheeld` does not compile on main: the one binary we ship · **S1** · API
+
+`cargo build -p wheeld` on `origin/main` (verified at b15e9c7, after rebasing — my first
+observation was on a worktree that was behind, so I withheld the report until I had re-run it
+on current main):
+
+```
+error[E0063]: missing field `ready` in initializer of `HostState`
+   --> crates/wheeld/src/lib.rs:121:8
+121 |     Ok(wheel_host::HostState {
+    |        ^^^^^^^^^^^^^^^^^^^^^ missing `ready`
+error: could not compile `wheeld` (lib) due to 1 previous error
+```
+
+`wheel_host::HostState` gained a `ready` field (`d8da69d`, "host: cover the parts that were
+only ever exercised in production") and `wheeld`, which constructs one, was not updated.
+
+**Why S1 rather than S2.** `wheeld` is M1.7's entire promise: one executable, nothing
+installed. A workspace that does not build means the artifact a new user downloads does not
+exist. It is also `members = ["crates/*"]`, so this breaks `cargo test --workspace` for
+everybody, not just whoever runs the daemon.
+
+**How QA saw it and CI did not (yet):** the wheeld smoke tried to build the binary it smokes
+and skipped by name with the compiler error, which is the behaviour I want — it did not pass,
+and it did not pretend the daemon was fine. The CI run I diagnosed from (34020280822) predates
+the break; run 34027530976 on b15e9c7 is the first that should catch it.
+
+**Fix:** set `ready` in `crates/wheeld/src/lib.rs:121`, or give `HostState` a constructor so a
+new field cannot break a second call site silently — the second is the reason this happened.
+
