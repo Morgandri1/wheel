@@ -37,12 +37,32 @@ const node = {
   state: null,
 } as unknown as EndpointNode;
 
-function renderPanel(http: boolean) {
-  const api = { patchNode: vi.fn() } as unknown as EngineApi;
+const vaultNode = {
+  id: "v1",
+  name: "secrets",
+  type: "vault",
+  position: { x: 0, y: 0 },
+  wires: [],
+  config: { keys: ["api-token"] },
+  state: null,
+} as unknown as import("@/lib/schema").WheelNode;
+
+function renderPanel(
+  http: boolean,
+  overrides: { node?: EndpointNode; nodes?: import("@/lib/schema").WheelNode[]; api?: EngineApi } = {},
+) {
+  const activeNode = overrides.node ?? node;
+  const api = overrides.api ?? ({ patchNode: vi.fn() } as unknown as EngineApi);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <EndpointPanel node={node} nodes={[node]} project={project(http)} api={api} onChanged={() => {}} />
+      <EndpointPanel
+        node={activeNode}
+        nodes={overrides.nodes ?? [activeNode]}
+        project={project(http)}
+        api={api}
+        onChanged={() => {}}
+      />
     </QueryClientProvider>,
   );
 }
@@ -129,5 +149,95 @@ describe("testing the public URL", () => {
   it("shows no reading at all until one has been taken", () => {
     renderPanel(true);
     expect(screen.queryByTestId("endpoint-probe")).toBeNull();
+  });
+});
+
+/**
+ * §3d/§3: bearer auth resolves from a vault the endpoint holds a `read` wire to. The picker
+ * must not let anyone type an unreachable vault name — it only offers what is actually wired.
+ */
+describe("bearer auth", () => {
+  it("disables the bearer option until a vault is wired", () => {
+    renderPanel(true);
+    const bearerOption = screen.getByRole("option", { name: "Bearer token" }) as HTMLOptionElement;
+    expect(bearerOption.disabled).toBe(true);
+  });
+
+  it("lets bearer be picked once a vault is wired, and offers its keys", () => {
+    const wired = { ...node, wires: [{ to: "v1", type: "read" }] } as unknown as EndpointNode;
+    renderPanel(true, { node: wired, nodes: [wired, vaultNode] });
+    const bearerOption = screen.getByRole("option", { name: "Bearer token" }) as HTMLOptionElement;
+    expect(bearerOption.disabled).toBe(false);
+
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-mode"), {
+      target: { value: "bearer" },
+    });
+    expect(screen.getByTestId("inspector-endpoint-auth-vault-ref")).toBeDefined();
+  });
+
+  it("blocks save until a vault key is entered", () => {
+    const wired = { ...node, wires: [{ to: "v1", type: "read" }] } as unknown as EndpointNode;
+    renderPanel(true, { node: wired, nodes: [wired, vaultNode] });
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-mode"), {
+      target: { value: "bearer" },
+    });
+    expect((screen.getByTestId("btn-endpoint-save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("saves the vault_ref alongside the rest of the config", async () => {
+    const wired = { ...node, wires: [{ to: "v1", type: "read" }] } as unknown as EndpointNode;
+    const patchNode = vi.fn().mockResolvedValue({});
+    renderPanel(true, {
+      node: wired,
+      nodes: [wired, vaultNode],
+      api: { patchNode } as unknown as EngineApi,
+    });
+
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-mode"), {
+      target: { value: "bearer" },
+    });
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-vault-ref"), {
+      target: { value: "secrets/api-token" },
+    });
+    fireEvent.click(screen.getByTestId("btn-endpoint-save"));
+
+    await waitFor(() =>
+      expect(patchNode).toHaveBeenCalledWith(
+        "n1",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            auth: { mode: "bearer", vault_ref: "secrets/api-token" },
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("warns when bearer is already configured but its vault got unwired", () => {
+    const brokenAuth = {
+      ...node,
+      config: { ...node.config, auth: { mode: "bearer", vault_ref: "secrets/api-token" } },
+    } as unknown as EndpointNode;
+    renderPanel(true, { node: brokenAuth, nodes: [brokenAuth] });
+    expect(screen.getByTestId("endpoint-auth-no-vault")).toBeDefined();
+    // The field that would let someone fix it is not shown either — there is nothing to pick from.
+    expect(screen.queryByTestId("inspector-endpoint-auth-vault-ref")).toBeNull();
+  });
+
+  it("going back to the saved mode leaves nothing dirty to save", () => {
+    const wired = { ...node, wires: [{ to: "v1", type: "read" }] } as unknown as EndpointNode;
+    renderPanel(true, { node: wired, nodes: [wired, vaultNode] });
+
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-mode"), {
+      target: { value: "bearer" },
+    });
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-vault-ref"), {
+      target: { value: "secrets/api-token" },
+    });
+    fireEvent.change(screen.getByTestId("inspector-endpoint-auth-mode"), {
+      target: { value: "none" },
+    });
+
+    expect((screen.getByTestId("btn-endpoint-save") as HTMLButtonElement).disabled).toBe(true);
   });
 });
