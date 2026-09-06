@@ -29,7 +29,7 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results, pin_image  # noqa: E402, free_port
+from wheel_client import Results, pin_image, free_port  # noqa: E402
 
 R = Results()
 SKIP = 77

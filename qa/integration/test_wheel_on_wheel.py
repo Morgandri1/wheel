@@ -250,7 +250,11 @@ def main():
         # it is separable — but only ever by SKIPPING it, never by assuming it.
         R.skip("WOW-cargo-test", "WHEEL_WOW_SKIP_BUILD=1")
     elif not vanished and "CLONE_OK" in out:
-        build = ("cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
+        # `set -o pipefail`, because `cargo test | tail` reports TAIL's exit status. The
+        # first real run of this leg came back "exit=0" while cargo had not run at all
+        # (rustup had no default toolchain), so my own probe called a failed build a
+        # successful command and only the captured stdout gave it away.
+        build = ("set -o pipefail; cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
         out = turn(agent, build, wait=1800)
         if out == TURN_TIMEOUT:
             # A cold `cargo test` inside a fresh sandbox builds every dependency from

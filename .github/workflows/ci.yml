@@ -226,8 +226,13 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
+      # No explicit Playwright install: `pnpm -C web exec playwright` looks for it in web/,
+      # where it does not live — it is a dependency of qa/e2e — so this job died with
+      # `Command "playwright" not found` before running anything. qa/e2e/run.sh already
+      # installs qa/e2e's node_modules and chromium, which is why the e2e job needs no such
+      # step either. `make test-pkg` calls it. I added a step the working job does not have,
+      # to solve a problem it does not have.
       - run: pnpm -C web install --frozen-lockfile
-      - run: pnpm -C web exec playwright install --with-deps chromium
       - run: make test-pkg
 
       - name: Upload the report on failure
