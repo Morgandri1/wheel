@@ -22,7 +22,7 @@
       "serviceId": "c359eaf4-d766-485b-9c1e-8e5e368382f4",
       "dockerfilePath": "docker/Dockerfile.host",
       "numReplicas": 1,
-      "healthcheckPath": "/healthz",
+      "healthcheckPath": null,
       "healthcheckTimeout": 300,
       "restartPolicyType": "ON_FAILURE",
       "restartPolicyMaxRetries": 10,
