@@ -597,7 +597,29 @@ impl Supervisor {
         };
         let Some(msg) = next else { return Ok(()) };
 
-        let line = self.harness.encode_turn(&msg.envelope());
+        // Encoding is the one step that reads a body we did not write. An em
+        // dash in a stored message once panicked the escaper here, and because
+        // the message is replayed at every start, that took a whole board down
+        // through repeated reboots (ADVERSARY 035). The escaper is fixed; this
+        // makes the CLASS impossible: a body that cannot be encoded is set
+        // aside with its reason, and the agent goes on to the next message.
+        let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.harness.encode_turn(&msg.envelope())
+        }));
+        let line = match encoded {
+            Ok(line) => line,
+            Err(_) => {
+                let reason = "the body could not be encoded for delivery and was set aside";
+                tracing::error!(
+                    message_id = %msg.id,
+                    agent = %agent,
+                    "quarantined a message whose body panicked the encoder"
+                );
+                let conn = self.db.lock().unwrap();
+                messages::quarantine(&conn, msg.id, reason).ok();
+                return Ok(());
+            }
+        };
         if let Err(e) = running.stdin.write_all(line.as_bytes()).await {
             // Never truncate and never drop: the message stays queued with a
             // visible reason (§3c#11).

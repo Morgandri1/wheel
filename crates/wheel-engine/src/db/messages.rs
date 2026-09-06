@@ -225,6 +225,12 @@ pub fn advance(conn: &Connection, id: Uuid, to: MessageState) -> Result<(), Stat
         MessageState::Delivered => "delivered_at",
         MessageState::Consumed => "consumed_at",
         MessageState::Queued => unreachable!("can_advance_to never permits a move back to queued"),
+        // Quarantine has no timestamp column of its own: `quarantine()` writes
+        // the state and the reason together, and this path is not how a message
+        // gets there.
+        MessageState::Undeliverable => {
+            unreachable!("a message is set aside by quarantine(), which records the reason")
+        }
     };
     conn.execute(
         &format!("UPDATE messages SET state = ?2, {column} = ?3 WHERE id = ?1"),
@@ -278,6 +284,19 @@ pub fn requeue_all_undelivered(conn: &Connection, node: Uuid, reason: &str) -> R
          WHERE to_id = ?1 AND state = 'delivered'",
         params![node.to_string(), reason],
     )?)
+}
+
+/// Set a message aside permanently, with the reason visible on the row.
+///
+/// The delivery loop calls this when a body cannot be encoded. `next_for_delivery`
+/// only ever selects `state = 'queued'`, so a quarantined message is skipped by
+/// construction rather than by a second filter someone could forget to add.
+pub fn quarantine(conn: &Connection, id: Uuid, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET state = 'undeliverable', last_error = ?2 WHERE id = ?1",
+        params![id.to_string(), reason],
+    )?;
+    Ok(())
 }
 
 pub fn set_last_error(conn: &Connection, id: Uuid, err: &str) -> Result<()> {
@@ -592,5 +611,66 @@ mod tests {
             .unwrap();
         }
         assert_eq!(next_for_delivery(&c, to, 0).unwrap().unwrap().body, "first");
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    /// A message set aside is never selected again. Without this the delivery
+    /// loop re-reads the same body at every start, which is how one stored
+    /// message kept a board down through repeated reboots.
+    #[test]
+    fn a_quarantined_message_is_never_offered_for_delivery_again() {
+        let conn = crate::db::open_memory().unwrap();
+        let agent = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+        let m = insert(
+            &conn,
+            &wheel_core::Message::new(peer, agent, wheel_core::FromKind::Agent, "body".into()),
+        )
+        .unwrap();
+
+        assert!(
+            next_for_delivery(&conn, agent, 0).unwrap().is_some(),
+            "premise: the message is deliverable before it is set aside"
+        );
+
+        quarantine(&conn, m.id, "the body could not be encoded").unwrap();
+
+        assert!(
+            next_for_delivery(&conn, agent, 0).unwrap().is_none(),
+            "a quarantined message must not come back: replaying it is what took the board down"
+        );
+    }
+
+    /// The reason lives on the row, because an operator needs to know WHICH
+    /// message was dropped, not merely that one was.
+    #[test]
+    fn quarantine_records_why_on_the_message() {
+        let conn = crate::db::open_memory().unwrap();
+        let agent = Uuid::new_v4();
+        let m = insert(
+            &conn,
+            &wheel_core::Message::new(
+                Uuid::new_v4(),
+                agent,
+                wheel_core::FromKind::Agent,
+                "body".into(),
+            ),
+        )
+        .unwrap();
+        quarantine(&conn, m.id, "the body could not be encoded").unwrap();
+
+        let (state, err): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_error FROM messages WHERE id = ?1",
+                params![m.id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "undeliverable");
+        assert_eq!(err.as_deref(), Some("the body could not be encoded"));
     }
 }
