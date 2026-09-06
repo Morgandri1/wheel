@@ -308,6 +308,11 @@ run by the agent which prints a well-formed `{"type":"result"}` (or any harness 
 top-level event (the CLI nests tool output inside JSON strings; the agent-sdk bridge makes this structural). Events must also carry the
 `session_id` the engine started; mismatches are logged and ignored.
 
+### Credential-distribution rule (binding; two S1-class bugs found on this path in one day)
+`save_to_vault` — anything that takes a credential from one node and hands it to many — is the most dangerous surface in Wheel. No change
+to that path (routes, key derivation, expiry, the credential lookup, the vault export) merges without ADVERSARY's review recorded in
+`redteam/reviews/`, and every change ships with a mutation-checked test that an agent-planted credential cannot be promoted.
+
 ### Message delivery contract
 - Messages persist in sqlite (`messages`: id, from_node, to_node, body, sha256, bytes, reply_to, state, created_at, delivered_at, consumed_at, last_error).
 - Delivery into a running agent: engine writes a user turn to the child's stdin using the `<AgentPrompt …>` envelope above.
