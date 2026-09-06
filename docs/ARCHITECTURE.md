@@ -42,6 +42,11 @@ ownership area. Ship small, commit often, keep main green.
 
 - Monorepo at `/Users/metatron/wheel` (git, branch `main`), origin `https://github.com/Morgandri1/wheel.git`. Never rewrite history on `main`.
   Agents merge to `main` locally as before; **PM pushes `main` to origin** after merges (you may `git push origin main` yourself after a merge — fast-forward only, never force). Never edit files in the main worktree; the three `M` files someone leaves there break other people's merges.
+- **ONE WORKTREE PER SESSION (binding; observed collisions ×3 — §3c #13 evidence).** YOKE may run several sessions of one agent at once. Before editing,
+  a session checks `git -C /Users/metatron/wheel-wt/<role> status --short`; if the tree is dirty or another session of your agent is live, do NOT touch it —
+  create your own: `git -C /Users/metatron/wheel worktree add /Users/metatron/wheel-wt/<role>-$$ <role>/main -b <role>/s$$`, work there, merge to `<role>/main`
+  then `main` when green, and `git worktree remove` it. Never `git reset --hard`, `stash`, or commit files you did not write. Test containers, ports and
+  image tags are per-run (name them with your pid) — never a shared mutable name.
 - Each agent works in its own **git worktree** so we don't fight over one index:
   `git -C /Users/metatron/wheel worktree add /Users/metatron/wheel-wt/<role> -b <role>/main` (role = sdk | api | web | qa | redteam).
 - Integrate frequently: rebase your branch on `main`, run `make check` (QA owns it; until it exists run your own
