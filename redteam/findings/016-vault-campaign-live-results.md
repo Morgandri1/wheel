@@ -1,4 +1,4 @@
-# 015 — Vault node + env-delivered credentials (M1.6): live campaign — RESISTED
+# 016 — Vault node + env-delivered credentials (M1.6): live campaign — RESISTED
 
 - **Severity:** Informational (no finding). Two by-design residuals restated below so they are on record, not missed.
 - **Owner:** SDK/Engine (vault.rs, api/vault_routes.rs, api/cli_routes.rs, supervisor/mod.rs).
