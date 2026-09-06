@@ -42,6 +42,9 @@ pub struct Config {
     /// How long a process left over from a previous engine gets to exit on SIGTERM before it is
     /// killed. Short on purpose: this runs on the start path, once per project, on host boot.
     pub reap_grace_secs: u64,
+    /// Megabytes that must be free before a project may start. Not what a build needs — what one
+    /// engine needs to open its database and take a message without corrupting it.
+    pub disk_floor_mb: u64,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
 }
@@ -145,6 +148,7 @@ impl Config {
                 n => Some(n),
             },
             reap_grace_secs: parse_or("REAP_GRACE_SECS", 5u64)?,
+            disk_floor_mb: parse_or("DISK_FLOOR_MB", 256u64)?,
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }
@@ -174,6 +178,7 @@ impl Config {
             rlimit_nofile: 16384,
             rlimit_cpu_secs: None,
             reap_grace_secs: 5,
+            disk_floor_mb: 1,
             engine_base_url: "http://127.0.0.1:7000".into(),
         }
     }

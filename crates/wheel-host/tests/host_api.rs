@@ -127,6 +127,7 @@ fn test_config() -> Config {
         rlimit_nofile: 16384,
         rlimit_cpu_secs: None,
         reap_grace_secs: 1,
+        disk_floor_mb: 1,
         engine_base_url: "http://127.0.0.1:1".into(),
     }
 }
@@ -956,4 +957,75 @@ async fn starting_up_is_not_visible_to_an_unauthenticated_caller() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A full volume must refuse the start, not spawn a sandbox that will corrupt its own database.
+///
+/// This is the ninety-minute outage in one test. `/data` hit 100%, sqlite reported it as "disk I/O
+/// error ... trying to resize an existing shared-memory segment" while growing a WAL index, and two
+/// of us spent the afternoon on journal modes because the number nobody had was `df`. A refusal
+/// that names the disk would have ended it in a minute.
+#[tokio::test]
+async fn a_full_volume_refuses_the_start_and_says_it_is_the_disk() {
+    let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
+    let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
+    let sandbox = FakeSandbox::new();
+    let calls = sandbox.calls.clone();
+    let state = HostState {
+        // A floor no machine can meet is how a full disk is simulated without filling one.
+        cfg: Config {
+            disk_floor_mb: u64::MAX / (1024 * 1024),
+            ..test_config()
+        },
+        sandbox: Arc::new(sandbox),
+        store,
+        http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: wheel_host::Readiness::serving_from_start(),
+    };
+    let app = build_router(state);
+
+    let id = Uuid::new_v4();
+    let (status, _) = call(
+        &app,
+        "PUT",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        Some(serde_json::json!({"engine_secret": "s", "vault_key": "dg=="})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/host/v1/projects/{id}/start"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    let reason = body["last_error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("the volume is full"),
+        "the refusal has to name the disk, not a symptom: {reason}"
+    );
+    assert!(
+        calls.lock().unwrap().started.is_empty(),
+        "a sandbox was started onto a volume with no room in it"
+    );
+}
+
+/// healthz carries the number that was missing, so the next person does not have to ssh for it.
+#[tokio::test]
+async fn healthz_reports_how_full_the_volume_is() {
+    let (app, _calls, _store) = harness(FakeSandbox::new());
+    let (status, body) = call(&app, "GET", "/host/v1/healthz", Some(SECRET), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["disk_free_mb"].as_u64().is_some(),
+        "no free-space figure on healthz: {body}"
+    );
+    let used = body["disk_used_percent"].as_u64().expect("used percent");
+    assert!(used <= 100, "{used}% used");
 }

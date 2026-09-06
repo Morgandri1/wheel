@@ -109,3 +109,25 @@ destroyed through the host before the row is dropped, so nothing is left running
 record of it.
 
 Predicates are covered by `infra/tests/prune-probe-projects.test.sh`.
+
+## The volume
+
+`wheel-host` mounts a 5 GB Railway volume at `/data`. **Railway's dashboard figure for it is not
+reliable** — on 6 Sep it read 127 MB while `df -h /data` inside the container read 4.5 G of 4.6 G,
+100 % used. Check it the honest way:
+
+```bash
+railway ssh --service wheel-host "df -h /data && du -sh /data/projects/*/* | sort -h | tail"
+```
+
+A full volume is not a quiet failure. sqlite reports it as `disk I/O error ... trying to resize an
+existing shared-memory segment` while growing a WAL index, which reads like a filesystem
+incompatibility and is not one: it is ENOSPC. That cost ninety minutes of downtime and two wrong
+fixes. So the host now measures it itself — free space is logged at boot, reported on
+`GET /host/v1/healthz` as `disk_free_mb` / `disk_used_percent`, and a project start below
+`DISK_FLOOR_MB` (default 256) is refused with `507` and a message that names the disk.
+
+What filled it was per-agent Rust toolchains: each agent node had its own `.rustup` (1.1–1.5 GB)
+inside its private credentials directory, and one had cloned the repo into that directory and built
+it there (a 1.9 GB `target/`). ARCHITECTURE M1.6 wants `CARGO_HOME`/`RUSTUP_HOME` **per project**;
+the engine's spawn environment is SDK's.
