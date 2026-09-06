@@ -82,6 +82,13 @@ other than what it looked like.**
 10. **Fixed ports let a leftover container impersonate a broken engine.** All suites use
     `free_port()`; `suite_isolation` enforces it.
 
+11. **A gate that checks one direction is blind in the other, and mine was.**
+    `id_traceability` verified every asserted ID exists in the plan and never checked that a
+    plan ID is UNIQUE. Ten were defined twice; three of those disagreed on severity
+    (`ING-ratelimit` was S3 in one row and S2 in the other). A suite asserting such an ID
+    passes the gate while testing only one of the two meanings. Same blindness ADVERSARY
+    found in `route_parity`, in my own file, two days apart.
+
 ## CONTRACT (rules I think are wrong, or worth stating)
 
 - **No exemption without a machine-checkable expiry.** PM ruled this and it works: the
