@@ -93,12 +93,7 @@ impl LoginSessions {
         self.cancel(node).await;
 
         std::fs::create_dir_all(config_dir).ok();
-        let mut cmd = tokio::process::Command::new(program);
-        // Same hygiene as an agent child (ADVERSARY F015): this is the same
-        // harness binary, and the engine's own secrets have no business in
-        // the environment of anything it spawns.
-        cmd.env_clear();
-        crate::supervisor::inherit_platform_env(&mut cmd);
+        let mut cmd = crate::supervisor::child_command(program);
         cmd.args(["auth", "login", "--claudeai"])
             // The node's own config dir, so this login belongs to this agent
             // and not to every agent in the sandbox.

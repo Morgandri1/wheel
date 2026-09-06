@@ -90,7 +90,26 @@ const INHERITED_ENV: &[&str] = &[
 /// `PATH`. Matches what the host uses for the engine.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-pub(crate) fn inherit_platform_env(cmd: &mut tokio::process::Command) {
+/// The ONLY way this engine starts a child process.
+///
+/// F015 was a single missing `env_clear` at a single spawn site. The fix is
+/// two lines, which is exactly why it must not live in each caller's
+/// discipline: scripts and MCP servers arrive in M2, and a third spawn site
+/// that forgot them would hand the engine's secrets to untrusted code again
+/// with nothing to catch it. Building the clear into the constructor means a
+/// child that skips it cannot be built.
+///
+/// A process can always read its own `/proc/self/environ`, so anything
+/// inherited here is readable by untrusted code whatever uid it runs as.
+/// Enforced by `every_child_process_is_started_through_child_command`.
+pub(crate) fn child_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.env_clear();
+    inherit_platform_env(&mut cmd);
+    cmd
+}
+
+fn inherit_platform_env(cmd: &mut tokio::process::Command) {
     for key in INHERITED_ENV {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
@@ -270,26 +289,13 @@ impl Supervisor {
 
         self.set_status(agent, AgentStatus::Starting, None);
 
-        let mut cmd = tokio::process::Command::new(self.harness.program());
+        let mut cmd = child_command(self.harness.program());
         cmd.args(self.harness.argv(&spec))
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // The child starts from an EMPTY environment and is given back only
-        // what it needs (ADVERSARY F015). A process can always read its own
-        // /proc/self/environ, so anything inherited here is readable by
-        // untrusted code no matter which uid it runs as: the engine's own
-        // WHEEL_ENGINE_SECRET and WHEEL_VAULT_KEY were both inherited, which
-        // handed an agent the control-plane bearer and the key to every vault
-        // in the project -- including vaults it had no wire to.
-        //
-        // An allowlist rather than a deny-list, so a variable added to the
-        // engine's environment later is dropped by default rather than leaked
-        // until somebody remembers to name it.
-        cmd.env_clear();
-        inherit_platform_env(&mut cmd);
         for (k, v) in self.harness.env(&spec) {
             cmd.env(k, v);
         }
@@ -1183,6 +1189,57 @@ mod tests {
 
     /// A harness that answers every turn, reporting the session it was told to
     /// resume so a test can see whether the context survived.
+    /// F015 is fixed at a choke-point, not at each call site, and this is what
+    /// keeps it that way. Scripts and MCP servers land in M2; a spawn added
+    /// then that reaches for `Command::new` directly would inherit the
+    /// engine's secrets again and no runtime test would notice, because the
+    /// leaking child would be one nobody had written a test for yet.
+    #[test]
+    fn every_child_process_is_started_through_child_command() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        assert!(!files.is_empty(), "found no sources to scan");
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            // Production code only. A test may build a Command however it
+            // likes -- it is not what runs in a sandbox.
+            let prod = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            let mut current_fn = String::new();
+            for (n, line) in prod.lines().enumerate() {
+                if let Some(rest) = line.trim_start().strip_prefix("fn ") {
+                    current_fn = rest.split('(').next().unwrap_or_default().to_string();
+                } else if let Some(rest) = line.trim_start().strip_prefix("pub(crate) fn ") {
+                    current_fn = rest.split('(').next().unwrap_or_default().to_string();
+                }
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains("Command::new") && current_fn != "child_command" {
+                    offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these spawn a child without env_clear -- use supervisor::child_command:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// A harness that records the environment it was actually given.
     const ENV_DUMP_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
