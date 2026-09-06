@@ -23,8 +23,51 @@ EXEMPT = {
                      "expires when the engine is bootable / wheel-engine:test exists"),
 }
 
+def db_gated_crates():
+    """Crates whose test suite is partly gated behind a Postgres instance we do not have.
+
+    `crates/wheel-api/tests/*_db.rs` self-skip when TEST_DATABASE_URL is unset, printing
+    "skipping ... TEST_DATABASE_URL not set" and passing. Coverage is then measured with a
+    large part of the suite absent, and the number that comes out is not a verdict on the
+    crate -- it is a verdict on this machine. Measured locally, wheel-api reads 33.38%
+    against 89.02% in CI, where the database exists.
+
+    Reporting that as FAIL would send its owner after a 57-point gap that is not there. So
+    the crate is reported INCONCLUSIVE and the run does not fail on it. CI sets
+    TEST_DATABASE_URL (and WHEEL_CI_HAS_DB=1, which turns the skip into a hard error), so
+    the bar is still enforced exactly where the measurement is complete.
+    """
+    if os.environ.get("TEST_DATABASE_URL"):
+        return set()
+    out = set()
+    crates_dir = os.path.join(ROOT, "crates")
+    for crate in os.listdir(crates_dir) if os.path.isdir(crates_dir) else []:
+        tests = os.path.join(crates_dir, crate, "tests")
+        if not os.path.isdir(tests):
+            continue
+        for f in os.listdir(tests):
+            if not f.endswith(".rs"):
+                continue
+            try:
+                with open(os.path.join(tests, f)) as fh:
+                    if "TEST_DATABASE_URL" in fh.read():
+                        out.add(crate)
+                        break
+            except OSError:
+                pass
+    return out
+
+
 def main():
-    if subprocess.run(["cargo", "llvm-cov", "--version"], capture_output=True).returncode != 0:
+    try:
+        probe = subprocess.run(["cargo", "llvm-cov", "--version"], capture_output=True)
+    except FileNotFoundError:
+        # No cargo at all. A gate that cannot run says so; it does not raise, because a
+        # traceback exits non-zero and reads as "the code is bad" rather than "I could not
+        # look at the code".
+        print("cargo is not on PATH — run 'make bootstrap' (or source ~/.cargo/env)")
+        return SKIP
+    if probe.returncode != 0:
         print("cargo-llvm-cov not installed — run 'make bootstrap'")
         return SKIP
 
@@ -108,13 +151,20 @@ def main():
     if foreign:
         print("note: ignored %d instrumented file(s) from other worktrees" % foreign)
 
-    fails, exempted = [], []
+    fails, exempted, inconclusive = [], [], []
+    needs_db = db_gated_crates()
     print("per-crate line coverage (bar: %.0f%%)" % MIN)
     for crate in sorted(per):
         covered, total = per[crate]
         pct = (100.0 * covered / total) if total else 100.0
         ex = EXEMPT.get(crate)
-        if ex and pct < MIN:
+        if crate in needs_db:
+            inconclusive.append(
+                "%s reads %.2f%% here, but its *_db.rs suites skipped (TEST_DATABASE_URL "
+                "unset) — this number describes this machine, not the crate" % (crate, pct))
+            print("  ????   %-14s %6.2f%%  (%d/%d)  db tests did not run" %
+                  (crate, pct, covered, total))
+        elif ex and pct < MIN:
             exempted.append("%s at %.2f%% — %s (%s)" % (crate, pct, ex[0], ex[1]))
             print("  EXEMPT %-14s %6.2f%%  (%d/%d)" % (crate, pct, covered, total))
         elif ex and pct >= MIN:
@@ -131,6 +181,12 @@ def main():
         print("\n%d exempt crate(s):" % len(exempted))
         for e in exempted:
             print("  -", e)
+    if inconclusive:
+        print("\n%d crate(s) NOT MEASURED here:" % len(inconclusive))
+        for i in inconclusive:
+            print("  -", i)
+        print("  Start Postgres and set TEST_DATABASE_URL to measure them locally; CI "
+              "always does.")
     if fails:
         print("\ncoverage gate: %d FAILED" % len(fails))
         for f in fails:

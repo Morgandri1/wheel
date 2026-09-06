@@ -180,70 +180,73 @@ def main():
         print(err)
         return SKIP
 
-    try:
-        vault, _ = node("ghsecrets", "vault", {"keys": ["GH_TOKEN"]})
-        agent, st = node("builder", "agent",
-                         {"harness": "claude", "system_prompt": "You build Wheel.",
-                          "run_on_startup": False, "ephemeral_context": False}, x=200)
-        if not R.check("WOW/setup", agent and vault, "node creation -> %s" % st):
-            return R.report("wheel-on-wheel")
+    vault, _ = node("ghsecrets", "vault", {"keys": ["GH_TOKEN"]})
+    agent, st = node("builder", "agent",
+                     {"harness": "claude", "system_prompt": "You build Wheel.",
+                      "run_on_startup": False, "ephemeral_context": False}, x=200)
+    if not R.check("WOW/setup", agent and vault, "node creation -> %s" % st):
+        return R.report("wheel-on-wheel")
 
-        # The credential reaches the agent the way the product intends: a vault node, a
-        # read wire, exported at spawn. No token is passed on a command line anywhere.
-        http("POST", "/v1/wires", {"from": agent, "to": vault, "type": "read"})
-        st, _ = http("PUT", "/v1/vault/%s/GH_TOKEN" % vault, {"value": token})
-        if not R.check("WOW-vault-token", 200 <= st < 300, "vault write answered %s" % st):
-            return R.report("wheel-on-wheel")
+    # The credential reaches the agent the way the product intends: a vault node, a
+    # read wire, exported at spawn. No token is passed on a command line anywhere.
+    http("POST", "/v1/wires", {"from": agent, "to": vault, "type": "read"})
+    st, _ = http("PUT", "/v1/vault/%s/GH_TOKEN" % vault, {"value": token})
+    if not R.check("WOW-vault-token", 200 <= st < 300, "vault write answered %s" % st):
+        return R.report("wheel-on-wheel")
 
-        http("POST", "/v1/agents/%s/start" % agent)
-        time.sleep(3)
+    http("POST", "/v1/agents/%s/start" % agent)
+    time.sleep(3)
 
-        # `git clone` reads GH_TOKEN out of the environment via the credential helper, so
-        # the secret is never in argv (argv is world-readable across uids — contract §5b).
-        clone = ("set -e; cd /data; rm -rf wow; "
-                 "git config --global credential.helper "
-                 "'!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f'; "
-                 "git clone --depth 1 %s wow 2>&1 | tail -3; "
-                 "test -f wow/Cargo.toml && echo CLONE_OK" % REPO)
-        out = turn(agent, clone, wait=180)
-        vanished = "engine unreachable" in out
-        if vanished:
-            # The engine died; that says nothing about whether an agent can clone.
-            R.skip("WOW-clone", "the engine went away mid-run — %s" % engine_postmortem())
-        else:
-            R.check("WOW-clone", "CLONE_OK" in out,
-                    "the agent could not clone with its vault token: %s" % out[-400:])
+    # `git clone` reads GH_TOKEN out of the environment via the credential helper, so
+    # the secret is never in argv (argv is world-readable across uids — contract §5b).
+    clone = ("set -e; cd /data; rm -rf wow; "
+             "git config --global credential.helper "
+             "'!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f'; "
+             "git clone --depth 1 %s wow 2>&1 | tail -3; "
+             "test -f wow/Cargo.toml && echo CLONE_OK" % REPO)
+    out = turn(agent, clone, wait=180)
+    vanished = "engine unreachable" in out
+    if vanished:
+        # The engine died; that says nothing about whether an agent can clone.
+        R.skip("WOW-clone", "the engine went away mid-run — %s" % engine_postmortem())
+    else:
+        R.check("WOW-clone", "CLONE_OK" in out,
+                "the agent could not clone with its vault token: %s" % out[-400:])
 
-        if os.environ.get("WHEEL_WOW_SKIP_BUILD") == "1":
-            # The clone leg proves the interesting half (a vault secret reaching an agent
-            # and authenticating a real remote); `cargo test` proves the sandbox is a build
-            # environment. On a host with six agents resident the build gets OOM-killed, so
-            # it is separable — but only ever by SKIPPING it, never by assuming it.
-            R.skip("WOW-cargo-test", "WHEEL_WOW_SKIP_BUILD=1")
-        elif not vanished and "CLONE_OK" in out:
-            build = ("cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
-            out = turn(agent, build, wait=1800)
-            R.check("WOW-cargo-test", "test result: ok" in out,
-                    "cargo test -p wheel-core did not pass inside the sandbox: %s"
-                    % out[-600:])
-        else:
-            R.skip("WOW-cargo-test", "nothing was cloned, so there is nothing to build")
+    if os.environ.get("WHEEL_WOW_SKIP_BUILD") == "1":
+        # The clone leg proves the interesting half (a vault secret reaching an agent
+        # and authenticating a real remote); `cargo test` proves the sandbox is a build
+        # environment. On a host with six agents resident the build gets OOM-killed, so
+        # it is separable — but only ever by SKIPPING it, never by assuming it.
+        R.skip("WOW-cargo-test", "WHEEL_WOW_SKIP_BUILD=1")
+    elif not vanished and "CLONE_OK" in out:
+        build = ("cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
+        out = turn(agent, build, wait=1800)
+        R.check("WOW-cargo-test", "test result: ok" in out,
+                "cargo test -p wheel-core did not pass inside the sandbox: %s"
+                % out[-600:])
+    else:
+        R.skip("WOW-cargo-test", "nothing was cloned, so there is nothing to build")
 
-        # The token travelled through the engine; it must not have been written down.
-        #
-        # Gated on the log being READABLE. An unreachable engine returns an error body with
-        # no token in it, and "the token is not in this error message" is not the claim.
-        # This assertion reported green against a dead engine on its first run, which is
-        # the exact shape of vacuous pass this suite exists to avoid.
-        st, log = http("GET", "/v1/agents/%s/log" % agent)
-        if st == 0:
-            R.skip("WOW-no-token-in-log", "the agent log could not be read, so its absence "
-                                          "from the log proves nothing")
-        else:
-            R.check("WOW-no-token-in-log", token not in json.dumps(log),
-                    "the GitHub token is in the agent log")
-    finally:
-        sh("docker", "rm", "-f", NAME)
+    # The token travelled through the engine; it must not have been written down.
+    #
+    # Gated on the log being READABLE. An unreachable engine returns an error body with
+    # no token in it, and "the token is not in this error message" is not the claim.
+    # This assertion reported green against a dead engine on its first run, which is
+    # the exact shape of vacuous pass this suite exists to avoid.
+    st, log = http("GET", "/v1/agents/%s/log" % agent)
+    if st == 0:
+        R.skip("WOW-no-token-in-log", "the agent log could not be read, so its absence "
+                                      "from the log proves nothing")
+    else:
+        R.check("WOW-no-token-in-log", token not in json.dumps(log),
+                "the GitHub token is in the agent log")
+    # Teardown is run_suite()'s, not this function's.
+    #
+    # run_suite saves the engine's own log before removing the container, which only
+    # works if nothing removed it first. With a teardown here too, the failure artifact
+    # was written after the container was already gone: the one run anybody would ever
+    # want to read it for produced 70 bytes of "No such container".
 
     return R.report("wheel-on-wheel")
 
