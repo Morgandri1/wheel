@@ -105,3 +105,22 @@ text steering the PM agent within its broad wire set). Pre-ship requirements (ve
    into the agent that can write plans and message everyone.
 I will run the full endpoint/ingress live campaign (SSRF is N/A for inbound, but auth-bypass, poison-body →
 sink, size/rate/replay, and the R4 injection blast-radius) against this path the moment the ingress code lands.
+
+## Link 6 — RESOLVED: ingress landed, VERIFIED reached-and-safe. The chain is CLOSED.
+`crates/wheel-engine/src/api/ingress.rs` is on main. I ran the campaign (source + tests). Verdict:
+- **Link 6 is REACHED-AND-SAFE, not reasoned.** Ingress delivers ONLY through `messages::enqueue` →
+  `Message::envelope` → the FIXED escaper (034), never formatting an envelope or calling the escaper itself.
+  A source-grep regression test (`ingress_delivers_only_through_the_one_envelope_sink`) FAILS if a future edit
+  hand-rolls delivery beside the sink. So the ingress body IS routed through the single sink (link 6 confirmed
+  reached) and the 034 fix defuses the panic (confirmed safe). **The internet → permanently-dead-board chain is
+  closed at the sink for ingress too** — links 1-4 fixed (034 escaper + `catch_unwind` quarantine), link 5 was
+  never a link, link 6 reaches the fixed sink.
+- Attribution correct (`type=endpoint` by construction, never `user`); secret constant-time-compared and
+  redacted from the delivered body; forged `x-wheel-*` stripped at the API edge; body capped while reading;
+  reject-before-waking-a-child ordering.
+- **One residual, availability only:** no per-caller rate limit (the trusted client-IP header is never set) →
+  **finding 039** (Medium). It cannot re-open the dead-board chain; it lets one abuser starve the legitimate
+  Telegram→PM provider. Fix is in 039.
+- Pre-ship reqs from the link-6 note still stand for the Telegram→PM consumer: Bearer not `None`, and dedup on
+  Telegram `update_id` (ingress is provider-agnostic and does not parse Telegram, so replay protection is the
+  consumer's job).
