@@ -84,6 +84,7 @@ impl StartupTail {
     }
 }
 
+pub mod git_creds;
 mod prompt;
 pub use prompt::compose_prompt;
 
@@ -431,6 +432,21 @@ impl Supervisor {
         // The agent's own working copy (§3e), not the data root. See
         // `Config::workspace_dir` for what this does and does not fix.
         let workspace = self.cfg.workspace_dir(node.name.as_str());
+
+        // Finding 036: a live GitHub PAT was found in `.git/config` on the
+        // production volume, because an agent cloned with the token in the
+        // remote URL. Clones made before this ran keep that token for ever, so
+        // repairing them is part of starting, not a migration someone
+        // remembers to run.
+        match git_creds::sanitise_remotes(&workspace) {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!(
+                node = %node.name,
+                remotes = n,
+                "removed credentials from git remote URLs in this workspace; rotate those tokens"
+            ),
+            Err(e) => tracing::warn!(node = %node.name, error = %e, "could not check git remotes"),
+        }
         std::fs::create_dir_all(&workspace).with_context(|| {
             format!(
                 "creating the workspace for {} at {}",
@@ -498,6 +514,19 @@ impl Supervisor {
             self.cfg.listen.client_url(),
         );
         cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
+
+        // Git authenticates from the ENVIRONMENT, so an agent never needs to
+        // put a token in a remote URL — where it is written to disk — or on a
+        // command line, where `/proc` publishes it to every other uid.
+        match git_creds::write_askpass(&run_dir) {
+            Ok(askpass) => {
+                cmd.env("GIT_ASKPASS", &askpass);
+                // Without this, git falls back to prompting on a tty that is
+                // not there and the agent sees a hang rather than an error.
+                cmd.env("GIT_TERMINAL_PROMPT", "0");
+            }
+            Err(e) => tracing::warn!(error = %e, "no git askpass helper for this child"),
+        }
 
         // A private crate cache per project. The toolchain in the image is
         // shared and immutable; what a tenant FETCHES is not, and a shared
