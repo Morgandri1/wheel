@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
+mod mcp;
 mod transport;
 
 use transport::{Engine, Reply};
@@ -187,6 +188,12 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
                 json_out,
                 render_rows,
             )
+        }
+
+        "mcp-serve" => {
+            let stdin = std::io::stdin();
+            mcp::serve(&engine, stdin.lock(), std::io::stdout())?;
+            Ok(0)
         }
 
         "tool" => {
@@ -545,7 +552,7 @@ fn render_inbox(v: &serde_json::Value) {
 /// Percent-encode a query value. Node names are `[a-z0-9_-]` so this is only
 /// load-bearing for chest paths and message ids, but encoding everything is
 /// cheaper than remembering which callers need it.
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

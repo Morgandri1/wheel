@@ -19,6 +19,7 @@ pub mod config;
 pub mod db;
 pub mod events;
 pub mod harness;
+pub mod mcp;
 pub mod oauth;
 pub mod peercred;
 pub mod supervisor;
@@ -34,7 +35,10 @@ use wheel_core::ListenAddr;
 /// The caller owns the runtime, so an embedder can host this alongside other
 /// work rather than being handed a process.
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {
-    init_tracing(cfg.json_logs);
+    // Logging belongs to whoever owns the PROCESS, not to each engine in it.
+    // `wheeld` runs several of these together; if serve() installed a global
+    // subscriber, the second engine would panic on a logging detail. The
+    // binary wrapper installs one; an embedder uses whatever it already has.
     tracing::info!(project = %cfg.project_id, listen = %cfg.listen, "starting");
 
     // Said at boot, every boot, at warn level. If someone ever has to work out
@@ -147,12 +151,43 @@ async fn shutdown_signal() {
     }
 }
 
-pub fn init_tracing(json: bool) {
+/// Install a global tracing subscriber, if there is not one already.
+///
+/// Returns whether THIS call installed it. Uses `try_init` rather than `init`
+/// because a global subscriber can only be set once per process: `wheeld` runs
+/// several engines in one process, and the second one panicking on a logging
+/// detail is not an acceptable way to find that out.
+///
+/// A library caller should generally not call this at all — logging belongs to
+/// whoever owns the process. [`serve`] deliberately does not.
+pub fn init_tracing(json: bool) -> bool {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if json {
-        fmt().with_env_filter(filter).json().init();
+        fmt().with_env_filter(filter).json().try_init().is_ok()
     } else {
-        fmt().with_env_filter(filter).init();
+        fmt().with_env_filter(filter).try_init().is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A global subscriber can only be set once per process. `wheeld` runs
+    /// several engines together, so a second call must be a no-op rather than
+    /// a panic — the failure mode this replaced was the SECOND engine dying on
+    /// a logging detail, which is a miserable thing to debug.
+    #[test]
+    fn installing_tracing_twice_is_not_a_panic() {
+        let first = super::init_tracing(false);
+        let second = super::init_tracing(false);
+        // Whether THIS test installed it depends on what else ran first, so
+        // the assertion is that the two calls disagree at most about who won —
+        // never that either of them panicked.
+        assert!(
+            !(first && second),
+            "only one call may claim to have installed it"
+        );
+        // And a third, for the same reason.
+        super::init_tracing(true);
     }
 }

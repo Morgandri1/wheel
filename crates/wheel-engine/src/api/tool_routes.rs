@@ -19,6 +19,9 @@ use crate::{
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ImportBody {
+    /// Accept that this re-import drops fills an operator pinned.
+    #[serde(default)]
+    pub allow_unpin: bool,
     /// Omitted means "work it out": every format announces itself.
     #[serde(default)]
     pub format: Option<wheel_core::ToolFormat>,
@@ -66,7 +69,36 @@ pub async fn reimport(
     let got =
         import::import(&body.raw, body.format).map_err(|e| ApiError::invalid(e.to_string()))?;
 
-    let (merged, added, removed) = merge_operations(&cfg.operations, got.operations);
+    let m = merge_operations(&cfg.operations, got.operations);
+
+    // PM: never demote a pinned fill to `agent` without an explicit reset. A
+    // pin is the confinement for a credential the agent must never see, and a
+    // routine spec refresh is not consent to remove one.
+    if !m.unpinned.is_empty() && !body.allow_unpin {
+        let detail: Vec<String> = m
+            .unpinned
+            .iter()
+            .map(|u| format!("{}.{} ({})", u.op, u.param, u.was))
+            .collect();
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "would_unpin",
+            format!(
+                "this spec no longer has {}, so {} pinned to the board would become \
+                 agent-fillable. Re-pin on the new field names, or resend with allow_unpin \
+                 to accept that.",
+                detail.join(", "),
+                if m.unpinned.len() == 1 {
+                    "a field"
+                } else {
+                    "fields"
+                }
+            ),
+        ));
+    }
+
+    let (merged, added, removed) = (m.operations, m.added, m.removed);
+    let unpinned = m.unpinned;
 
     let base_url = if got.base_url.is_empty() {
         cfg.base_url.clone()
@@ -98,6 +130,7 @@ pub async fn reimport(
         "operations": updated.operations,
         "added": added,
         "removed": removed,
+        "unpinned": unpinned,
     })))
 }
 
@@ -114,21 +147,35 @@ pub async fn reimport(
 pub fn merge_operations(
     existing: &[wheel_core::ToolOperation],
     fresh: Vec<wheel_core::ToolOperation>,
-) -> (Vec<wheel_core::ToolOperation>, Vec<String>, Vec<String>) {
+) -> Merged {
     let mut merged = Vec::new();
     let mut added = Vec::new();
+    let mut unpinned = Vec::new();
+
     for mut op in fresh {
-        match existing
-            .iter()
-            .find(|old| old.method == op.method && old.path == op.path)
-        {
+        match existing.iter().find(|old| same_operation(old, &op)) {
             Some(old) => {
                 // Identity and configuration survive; shape follows the spec.
                 op.id = old.id.clone();
                 op.enabled = old.enabled;
                 for p in op.params.iter_mut() {
-                    if let Some(prev) = old.params.iter().find(|q| q.name == p.name) {
+                    if let Some(prev) = old.params.iter().find(|q| same_param(q, p)) {
                         p.fill = prev.fill.clone();
+                    }
+                }
+                // A pin the fresh spec has nowhere to put. ADVERSARY 024: a
+                // RENAMED parameter has no counterpart, so it silently kept
+                // the fresh default of `agent` and the operator's vault pin
+                // vanished — with no add/remove signal, because the operation
+                // itself still matched. That is a credential slot handed to
+                // the agent by a routine spec refresh.
+                for prev in old.params.iter().filter(|q| is_pinned(&q.fill)) {
+                    if !op.params.iter().any(|p| same_param(prev, p)) {
+                        unpinned.push(Unpinned {
+                            op: old.id.clone(),
+                            param: prev.name.clone(),
+                            was: fill_mode_name(&prev.fill).into(),
+                        });
                     }
                 }
             }
@@ -136,16 +183,91 @@ pub fn merge_operations(
         }
         merged.push(op);
     }
-    let removed = existing
-        .iter()
-        .filter(|old| {
-            !merged
-                .iter()
-                .any(|n| n.method == old.method && n.path == old.path)
-        })
-        .map(|o| o.id.clone())
-        .collect();
-    (merged, added, removed)
+
+    let mut removed = Vec::new();
+    for old in existing {
+        if merged.iter().any(|n| same_operation(old, n)) {
+            continue;
+        }
+        removed.push(old.id.clone());
+        // A vanished operation takes its pins with it. It IS reported as
+        // removed, but the pin is the part that matters.
+        for prev in old.params.iter().filter(|q| is_pinned(&q.fill)) {
+            unpinned.push(Unpinned {
+                op: old.id.clone(),
+                param: prev.name.clone(),
+                was: fill_mode_name(&prev.fill).into(),
+            });
+        }
+    }
+
+    Merged {
+        operations: merged,
+        added,
+        removed,
+        unpinned,
+    }
+}
+
+/// A fill an operator deliberately took away from the agent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Unpinned {
+    pub op: String,
+    pub param: String,
+    /// `vault` or `static`.
+    pub was: String,
+}
+
+#[derive(Debug)]
+pub struct Merged {
+    pub operations: Vec<wheel_core::ToolOperation>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub unpinned: Vec<Unpinned>,
+}
+
+fn is_pinned(f: &wheel_core::Fill) -> bool {
+    matches!(
+        f.mode,
+        wheel_core::FillMode::Vault | wheel_core::FillMode::Static
+    )
+}
+
+fn fill_mode_name(f: &wheel_core::Fill) -> &'static str {
+    match f.mode {
+        wheel_core::FillMode::Vault => "vault",
+        wheel_core::FillMode::Static => "static",
+        wheel_core::FillMode::Hidden => "hidden",
+        wheel_core::FillMode::Agent => "agent",
+    }
+}
+
+/// Two operations are the same one if they address the same thing.
+///
+/// Method and path are compared case-insensitively with a trailing slash
+/// ignored (ADVERSARY 024, the weaker variant): an upstream that normalises
+/// `/pets` to `/pets/` is a cosmetic change, and treating it as a different
+/// operation would reset every fill on the board and report it as an
+/// add/remove churn nobody can read.
+fn same_operation(a: &wheel_core::ToolOperation, b: &wheel_core::ToolOperation) -> bool {
+    a.method == b.method && normalise(&a.path) == normalise(&b.path)
+}
+
+fn normalise(path: &str) -> String {
+    let p = path.trim_end_matches('/').to_ascii_lowercase();
+    if p.is_empty() {
+        "/".into()
+    } else {
+        p
+    }
+}
+
+/// Two params are the same field if they are in the same place with the same
+/// name. Location is part of the key because `id` in the path and `id` in the
+/// query are different fields, and matching on name alone would copy one
+/// field's pin onto the other.
+fn same_param(a: &wheel_core::ToolParam, b: &wheel_core::ToolParam) -> bool {
+    a.location == b.location && a.name.eq_ignore_ascii_case(&b.name)
 }
 
 /// `GET /v1/tools/:id/ops` — exactly what an agent would see.
@@ -394,10 +516,16 @@ mod tests {
             ],
         )];
 
-        let (merged, added, removed) = merge_operations(&existing, fresh);
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
-        assert_eq!(merged.len(), 1);
+        let m = merge_operations(&existing, fresh);
+        assert!(m.added.is_empty());
+        assert!(m.removed.is_empty());
+        assert!(
+            m.unpinned.is_empty(),
+            "nothing was renamed: {:?}",
+            m.unpinned
+        );
+        assert_eq!(m.operations.len(), 1);
+        let merged = m.operations;
 
         let o = &merged[0];
         // The id an agent addresses does not change under it.
@@ -413,14 +541,110 @@ mod tests {
         assert_eq!(find("limit").fill.mode, FillMode::Agent);
     }
 
+    /// ADVERSARY 024, their exact PoC. My earlier test covered an OP-ID
+    /// rename with unchanged param names — not a PARAM rename, which is the
+    /// case that actually loses the pin. Upstream renames `Authorization` to
+    /// `authorization`, the operation still matches on method+path, so
+    /// nothing appears in added/removed and the credential slot quietly
+    /// becomes agent-fillable.
+    #[test]
+    fn a_renamed_parameter_cannot_silently_lose_its_pin() {
+        let existing = vec![op(
+            "getData",
+            "/data",
+            vec![param("Authorization", vault("prod-keys/API_KEY"))],
+        )];
+        // A case-only rename is the same header by HTTP's rules, so it keeps
+        // the pin rather than being reported.
+        let m = merge_operations(
+            &existing,
+            vec![op(
+                "getData",
+                "/data",
+                vec![param("authorization", Fill::agent())],
+            )],
+        );
+        assert!(
+            m.unpinned.is_empty(),
+            "a case-only header rename is the same field: {:?}",
+            m.unpinned
+        );
+        assert_eq!(m.operations[0].params[0].fill.mode, FillMode::Vault);
+
+        // A genuine rename has nowhere to put the pin, and MUST be reported
+        // rather than defaulting the replacement to agent in silence.
+        let m = merge_operations(
+            &existing,
+            vec![op(
+                "getData",
+                "/data",
+                vec![param("Auth-Token", Fill::agent())],
+            )],
+        );
+        assert_eq!(m.added, Vec::<String>::new(), "the op still matches");
+        assert_eq!(m.removed, Vec::<String>::new());
+        assert_eq!(m.unpinned.len(), 1, "the pin loss must be reported");
+        assert_eq!(m.unpinned[0].op, "getData");
+        assert_eq!(m.unpinned[0].param, "Authorization");
+        assert_eq!(m.unpinned[0].was, "vault");
+    }
+
+    /// Same name, different place, is a different field — copying one pin
+    /// onto the other would put a credential somewhere nobody put it.
+    #[test]
+    fn a_pin_does_not_move_between_locations_that_share_a_name() {
+        let mut in_header = param("id", vault("creds/KEY"));
+        in_header.location = ParamLocation::Header;
+        let mut in_query = param("id", Fill::agent());
+        in_query.location = ParamLocation::Query;
+
+        let m = merge_operations(
+            &[op("x", "/x", vec![in_header])],
+            vec![op("x", "/x", vec![in_query])],
+        );
+        assert_eq!(m.operations[0].params[0].fill.mode, FillMode::Agent);
+        assert_eq!(m.unpinned.len(), 1, "the header pin has nowhere to go");
+    }
+
+    /// The weaker variant they noted: an upstream that normalises `/pets` to
+    /// `/pets/` is a cosmetic change. Treating it as a different operation
+    /// would reset every fill on the board and report churn nobody can read.
+    #[test]
+    fn a_cosmetic_path_change_does_not_churn_every_fill() {
+        let existing = vec![op(
+            "listPets",
+            "/pets",
+            vec![param("Authorization", vault("creds/KEY"))],
+        )];
+        for cosmetic in ["/pets/", "/Pets", "/PETS/"] {
+            let m = merge_operations(
+                &existing,
+                vec![op(
+                    "listPets",
+                    cosmetic,
+                    vec![param("Authorization", Fill::agent())],
+                )],
+            );
+            assert!(m.added.is_empty(), "{cosmetic} read as a new operation");
+            assert!(m.removed.is_empty(), "{cosmetic}");
+            assert!(m.unpinned.is_empty(), "{cosmetic} lost the pin");
+            assert_eq!(m.operations[0].params[0].fill.mode, FillMode::Vault);
+        }
+        // ...but a genuinely different path is genuinely different.
+        let m = merge_operations(&existing, vec![op("listPets", "/animals", vec![])]);
+        assert_eq!(m.added, vec!["listPets"]);
+        assert_eq!(m.removed, vec!["listPets"]);
+        assert_eq!(m.unpinned.len(), 1, "the vanished op took a pin with it");
+    }
+
     /// A disabled operation stays disabled: re-enabling one an operator turned
     /// off is the same class of mistake as un-pinning a fill.
     #[test]
     fn a_reimport_does_not_re_enable_an_operation_that_was_turned_off() {
         let mut off = op("dangerous", "/wipe", vec![]);
         off.enabled = false;
-        let (merged, _, _) = merge_operations(&[off], vec![op("dangerous", "/wipe", vec![])]);
-        assert!(!merged[0].enabled);
+        let m = merge_operations(&[off], vec![op("dangerous", "/wipe", vec![])]);
+        assert!(!m.operations[0].enabled);
     }
 
     #[test]
@@ -428,13 +652,13 @@ mod tests {
         let existing = vec![op("stays", "/a", vec![]), op("goes", "/b", vec![])];
         let fresh = vec![op("stays", "/a", vec![]), op("arrives", "/c", vec![])];
 
-        let (merged, added, removed) = merge_operations(&existing, fresh);
-        assert_eq!(added, vec!["arrives"]);
-        assert_eq!(removed, vec!["goes"]);
+        let m = merge_operations(&existing, fresh);
+        assert_eq!(m.added, vec!["arrives"]);
+        assert_eq!(m.removed, vec!["goes"]);
         // The removed one is NOT silently carried forward, and not silently
         // dropped either — it is named so the operator decides.
-        assert_eq!(merged.len(), 2);
-        assert!(merged.iter().all(|o| o.id != "goes"));
+        assert_eq!(m.operations.len(), 2);
+        assert!(m.operations.iter().all(|o| o.id != "goes"));
     }
 
     /// A field the spec no longer has cannot keep a fill: there is nothing to
@@ -447,16 +671,21 @@ mod tests {
             "/x",
             vec![param("Authorization", vault("creds/KEY"))],
         )];
-        // Spec drops it...
-        let (merged, _, _) = merge_operations(&existing, vec![op("x", "/x", vec![])]);
-        assert!(merged[0].params.is_empty());
+        // Spec drops it: the params are gone AND the loss of the pin is
+        // reported rather than silently accepted.
+        let m = merge_operations(&existing, vec![op("x", "/x", vec![])]);
+        assert!(m.operations[0].params.is_empty());
+        assert_eq!(m.unpinned.len(), 1);
+        assert_eq!(m.unpinned[0].param, "Authorization");
+        assert_eq!(m.unpinned[0].was, "vault");
         // ...and brings it back: the operator's pin applies again rather than
         // the field arriving as an agent field.
-        let (merged, _, _) = merge_operations(
+        let m = merge_operations(
             &existing,
             vec![op("x", "/x", vec![param("Authorization", Fill::agent())])],
         );
-        assert_eq!(merged[0].params[0].fill.mode, FillMode::Vault);
+        assert_eq!(m.operations[0].params[0].fill.mode, FillMode::Vault);
+        assert!(m.unpinned.is_empty());
     }
 
     /// §3d rule 1: an agent sees ONLY agent-mode fields. This projection is

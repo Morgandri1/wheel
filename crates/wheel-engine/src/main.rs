@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         }
     };
 
+    let json_logs = cfg.json_logs;
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
@@ -26,6 +27,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // The binary owns the process, so the binary owns the logging.
+    wheel_engine::init_tracing(json_logs);
 
     match runtime.block_on(wheel_engine::serve(cfg)) {
         Ok(()) => ExitCode::SUCCESS,
