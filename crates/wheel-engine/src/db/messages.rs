@@ -347,16 +347,16 @@ pub fn node_sender(id: Uuid, name: NodeName, node_type: NodeType) -> MessageSend
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::board;
     use wheel_core::{AgentConfig, Node, NodeConfig, Position};
 
-    fn mem() -> Connection {
+    pub(crate) fn mem() -> Connection {
         crate::db::open_memory().unwrap()
     }
 
-    fn agent(conn: &Connection, name: &str) -> Uuid {
+    pub(crate) fn agent(conn: &Connection, name: &str) -> Uuid {
         let n = Node::new(
             Uuid::new_v4(),
             NodeName::new(name).unwrap(),
@@ -616,32 +616,28 @@ mod tests {
 
 #[cfg(test)]
 mod quarantine_tests {
+    use super::tests::*;
     use super::*;
 
     /// A message set aside is never selected again. Without this the delivery
     /// loop re-reads the same body at every start, which is how one stored
-    /// message kept a board down through repeated reboots.
+    /// message kept a board down through repeated reboots (ADVERSARY 035).
     #[test]
     fn a_quarantined_message_is_never_offered_for_delivery_again() {
-        let conn = crate::db::open_memory().unwrap();
-        let agent = Uuid::new_v4();
-        let peer = Uuid::new_v4();
-        let m = insert(
-            &conn,
-            &wheel_core::Message::new(peer, agent, wheel_core::FromKind::Agent, "body".into()),
-        )
-        .unwrap();
+        let c = mem();
+        let to = agent(&c, "worker");
+        let m = enqueue(&c, MessageSender::User, to, "body".into(), None).unwrap();
 
         assert!(
-            next_for_delivery(&conn, agent, 0).unwrap().is_some(),
+            next_for_delivery(&c, to, 0).unwrap().is_some(),
             "premise: the message is deliverable before it is set aside"
         );
 
-        quarantine(&conn, m.id, "the body could not be encoded").unwrap();
+        quarantine(&c, m.id, "the body could not be encoded").unwrap();
 
         assert!(
-            next_for_delivery(&conn, agent, 0).unwrap().is_none(),
-            "a quarantined message must not come back: replaying it is what took the board down"
+            next_for_delivery(&c, to, 0).unwrap().is_none(),
+            "a quarantined message must not come back: replaying it is what took a board down"
         );
     }
 
@@ -649,21 +645,12 @@ mod quarantine_tests {
     /// message was dropped, not merely that one was.
     #[test]
     fn quarantine_records_why_on_the_message() {
-        let conn = crate::db::open_memory().unwrap();
-        let agent = Uuid::new_v4();
-        let m = insert(
-            &conn,
-            &wheel_core::Message::new(
-                Uuid::new_v4(),
-                agent,
-                wheel_core::FromKind::Agent,
-                "body".into(),
-            ),
-        )
-        .unwrap();
-        quarantine(&conn, m.id, "the body could not be encoded").unwrap();
+        let c = mem();
+        let to = agent(&c, "worker");
+        let m = enqueue(&c, MessageSender::User, to, "body".into(), None).unwrap();
+        quarantine(&c, m.id, "the body could not be encoded").unwrap();
 
-        let (state, err): (String, Option<String>) = conn
+        let (state, err): (String, Option<String>) = c
             .query_row(
                 "SELECT state, last_error FROM messages WHERE id = ?1",
                 params![m.id.to_string()],
