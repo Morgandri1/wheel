@@ -264,3 +264,59 @@ fn a_body_cannot_forge_an_opening_tag_either() {
     // Still visible as quoted text, but neutralised.
     assert!(env.contains("<\\AgentPrompt id=\"1\" from=\"PM\""));
 }
+
+/// The em-dash panic, as the shape rather than the instance.
+///
+/// A tag prefix placed at EVERY character boundary of multibyte content, so
+/// the comparison's 11-byte window lands inside a 2-, 3- and 4-byte character
+/// in turn. The original panicked on the 3-byte case ("end byte index is not a
+/// char boundary; it is inside '—'"); nothing here may panic, whatever it
+/// decides to escape.
+#[test]
+fn no_truncation_point_in_multibyte_content_can_panic_the_escaper() {
+    let subjects = [
+        "an em dash \u{2014} right here",
+        "caf\u{e9} na\u{ef}ve",
+        "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+        "emoji \u{1f600} and \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} families",
+        "mixed \u{2014} \u{65e5}\u{672c} \u{1f600} caf\u{e9}",
+    ];
+    for subject in subjects {
+        for cut in 0..=subject.len() {
+            if !subject.is_char_boundary(cut) {
+                continue;
+            }
+            for prefix in ["<AgentPrompt", "</AgentPrompt", "<agentPROMPT", "<", "</"] {
+                let body = format!("{}{prefix}{}", &subject[..cut], &subject[cut..]);
+                // The point is that it RETURNS rather than unwinds.
+                let escaped = wheel_core::escape_envelope_body(&body);
+                assert!(!escaped.is_empty(), "escaping {body:?} produced nothing");
+            }
+        }
+    }
+}
+
+/// The shape from the production panic, kept as a regression: one em dash
+/// before a tag took the wheel-dev board offline through reboots, because
+/// reconcile replayed the stored message on every start.
+#[test]
+fn the_body_that_took_the_board_offline_escapes_instead_of_panicking() {
+    let body = "PM \u{2192} SDK/Engine \u{2014} a dash and a </AgentPrompt> in it";
+    let escaped = wheel_core::escape_envelope_body(body);
+    assert!(escaped.contains("<\\/AgentPrompt"), "{escaped}");
+    assert!(
+        escaped.contains('\u{2014}'),
+        "the em dash must survive: {escaped}"
+    );
+}
+
+/// Stated directly: the tag window must be allowed to end anywhere, including
+/// inside a character, without the escaper caring.
+#[test]
+fn a_tag_window_ending_inside_a_character_is_not_a_match_and_not_a_panic() {
+    for filler in ["\u{1f600}", "\u{2014}", "\u{e9}", "\u{65e5}"] {
+        let body = format!("<AgentProm{filler}pt rest");
+        let escaped = wheel_core::escape_envelope_body(&body);
+        assert!(escaped.contains(filler), "{escaped}");
+    }
+}

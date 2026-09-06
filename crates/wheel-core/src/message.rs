@@ -181,32 +181,51 @@ impl From<&Message> for MessageReceipt {
 /// form, and `wheel inbox <id>` returns the original body from sqlite (§3c#2),
 /// so nothing is lost.
 pub fn escape_envelope_body(body: &str) -> String {
-    const TAG: &str = "agentprompt";
+    // The comparison is on BYTES, and the string is never sliced by a byte
+    // offset we computed.
+    //
+    // It used to be `body[name_at..name_at + TAG.len()]`, and slicing a `str`
+    // at an index that is not a character boundary PANICS. `name_at` was
+    // always a boundary -- it follows `<` and an optional `/`, both ASCII --
+    // so the bug hid until the byte 11 further on landed mid-character. An em
+    // dash did it: PM writes them in most messages, one was stored on the
+    // wheel-dev board, and every engine start replayed it and died. A whole
+    // project stayed offline through reboots because of one character in one
+    // message.
+    //
+    // The wider rule this is written to obey: message content must never be
+    // able to kill an engine. A body that is awkward, malformed or hostile is
+    // a bad message, not a dead board -- whatever this cannot interpret it
+    // emits as ordinary text.
+    const TAG: &[u8] = b"agentprompt";
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
-    while i < body.len() {
+    while i < bytes.len() {
         if bytes[i] == b'<' {
             // Optional '/' immediately after '<', then the tag name.
             let after = i + 1;
-            let name_at = if after < body.len() && bytes[after] == b'/' {
+            let name_at = if bytes.get(after) == Some(&b'/') {
                 after + 1
             } else {
                 after
             };
-            if body.len() >= name_at + TAG.len()
-                && body[name_at..name_at + TAG.len()].eq_ignore_ascii_case(TAG)
-            {
+            let matches_tag = body.len() >= name_at + TAG.len()
+                && body[name_at..name_at + TAG.len()].eq_ignore_ascii_case("agentprompt");
+            if matches_tag {
                 // Consume only the '<'; the rest is emitted as ordinary text.
                 out.push_str("<\\");
                 i += 1;
                 continue;
             }
         }
-        let c = body[i..]
-            .chars()
-            .next()
-            .expect("index is on a char boundary");
+        // `i` is on a character boundary: every step advances by a whole
+        // character, and the only other move is over `<`, which is one byte.
+        // `get` rather than an index anyway -- an invariant worth stating is
+        // not worth panicking over if it is ever broken by a later edit.
+        let Some(c) = body.get(i..).and_then(|rest| rest.chars().next()) else {
+            break;
+        };
         out.push(c);
         i += c.len_utf8();
     }
