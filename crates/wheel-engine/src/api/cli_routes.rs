@@ -413,7 +413,13 @@ fn table_config(node: &wheel_core::Node) -> ApiResult<&wheel_core::TableConfig> 
 fn storage_err(e: anyhow::Error) -> ApiError {
     // These carry the agent's own mistake -- an unknown column, a value of the
     // wrong type -- so they are the caller's to fix, not a 500.
-    ApiError::invalid(e.to_string())
+    //
+    // `{e}` prints only the outermost `.with_context(...)` layer (e.g.
+    // "writing t_reports/x"), which is a caption with no subject: every
+    // sqlite failure in `tables.rs` is wrapped that way, so the actual cause
+    // -- "no such table: t_reports" -- never reached the caller. `{e:#}`
+    // walks the whole chain.
+    ApiError::invalid(format!("{e:#}"))
 }
 
 /// `POST /v1/cli/rm` — delete a table row (needs `write`).
@@ -715,4 +721,31 @@ pub async fn ctx_clear(
         "cleared": true,
         "status": status.as_str(),
     })))
+}
+
+#[cfg(test)]
+mod storage_err_tests {
+    use super::storage_err;
+
+    /// PM, live on the wheel-dev board: a table node whose backing table went
+    /// missing answered `wheel write` with `{"message":"writing t_reports/x"}`
+    /// -- a caption with no subject. Every `tables.rs` function wraps its
+    /// sqlite call in `.with_context(|| "verb noun")`, and `anyhow::Error`'s
+    /// `{}` (what `.to_string()` used) prints ONLY that outermost layer, so
+    /// the actual cause never reached the caller. `storage_err` must render
+    /// the whole chain (`{:#}`), not just the caption.
+    #[test]
+    fn the_message_names_the_cause_the_context_was_wrapping() {
+        let err =
+            anyhow::anyhow!("no such table: t_reports").context("writing t_reports/2026-09-06-sdk");
+        let rendered = format!("{:?}", storage_err(err));
+        assert!(
+            rendered.contains("writing t_reports/2026-09-06-sdk"),
+            "must keep the caption: {rendered}"
+        );
+        assert!(
+            rendered.contains("no such table: t_reports"),
+            "must also name the cause, not just the caption: {rendered}"
+        );
+    }
 }
