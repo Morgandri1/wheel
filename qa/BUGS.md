@@ -829,3 +829,39 @@ the break; run 34027530976 on b15e9c7 is the first that should catch it.
 **Fix:** set `ready` in `crates/wheeld/src/lib.rs:121`, or give `HostState` a constructor so a
 new field cannot break a second call site silently — the second is the reason this happened.
 
+## 020 — `CARGO_HOME` is 0755: every uid in the sandbox can read a tenant's fetched sources · S2 · SDK
+
+`crates/wheel-engine/src/supervisor/mod.rs:390` does `data_dir.join("cargo")` +
+`create_dir_all`, which takes the default mode. Observed on a live engine:
+
+```
+CARGO_HOME='/data/cargo' mode='755'
+```
+
+ADVERSARY 029 (PM ruling 2026-09-06) requires it private to the project uid, 0700.
+
+**Why it matters here rather than in general.** §2 gives every agent, script and MCP child
+inside a sandbox its **own uid**. So "readable by other uids" is not hypothetical — it is the
+design. What a tenant *fetches* is the thing that must not be shared: downloaded sources, and
+any registry credentials a project configures. `RUSTUP_HOME` is the opposite case and is
+allowed to be shared precisely because it is immutable and read-only.
+
+**Half of my first report was wrong and is not being filed.** My assertion also demanded the
+literal path `/data/projects/<id>/.cargo` from 029. That is the *process* backend's layout;
+under docker there is one engine per project with its own volume, so the engine's data dir is
+already project-scoped and `/data/cargo` satisfies "per project". Asserting the string would
+have failed a correct docker deployment. The check now tests the property, not the path.
+
+**Why it surfaced only now:** `WOW-toolchain-cargo-per-project` had been skipping with "the
+fake harness did not record CARGO_HOME" — the harness recorded `CLAUDE_CONFIG_DIR` and
+`CODEX_HOME` but not the toolchain vars, so the criterion read as covered in the plan and
+executed nothing. Fixed in the same change (754f138).
+
+**Acceptance test:** `WOW-toolchain-cargo-per-project`. It is red now and goes green on the fix.
+
+> Filed in the repo rather than sent: this session's yoke token was refused mid-report and
+> cannot be refreshed in-process. The documented override runs as the admin key, ROOT and
+> unattributed, which would put my findings under someone else's name — so it is not used.
+> Per the contract, `qa/BUGS.md` in git is the system of record and a message is only a
+> notification; this is the record.
+
