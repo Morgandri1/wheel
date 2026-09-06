@@ -599,3 +599,79 @@ pub const CLI_LOG_STREAMS: [LogStream; 4] = [
     LogStream::Engine,
     LogStream::Transcript,
 ];
+
+// --- tool nodes (§3d) -------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ToolCallBody {
+    pub node: String,
+    pub op: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default)]
+    pub curl: bool,
+}
+
+/// `GET /v1/cli/tool?node=<tool>` — the operations I may call, and the fields
+/// I must fill.
+///
+/// `read` is the wire: a tool call is the agent using a capability the board
+/// granted it, and the tool's own credentials are never part of what it sees.
+pub async fn tool_ls(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<NodeQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = me
+        .require(&conn, &q.node, WireType::Read)
+        .map_err(|d| deny(&s, Some(&me), d))?;
+    let cfg = match &node.config {
+        wheel_core::NodeConfig::Tool(c) => c.clone(),
+        other => {
+            return Err(ApiError::invalid(format!(
+                "{} is {} {} node, not a tool",
+                node.name,
+                other.node_type().article(),
+                other.node_type()
+            )))
+        }
+    };
+    drop(conn);
+    Ok(Json(serde_json::json!({
+        "tool": node.name,
+        "operations": crate::api::tool_routes::agent_view(node.name.as_ref(), &cfg),
+    })))
+}
+
+/// `POST /v1/cli/tool` — call an operation.
+pub async fn tool_call(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ToolCallBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let (node, cfg) = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let node = me
+            .require(&conn, &body.node, WireType::Read)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+        let cfg = match &node.config {
+            wheel_core::NodeConfig::Tool(c) => c.clone(),
+            other => {
+                return Err(ApiError::invalid(format!(
+                    "{} is {} {} node, not a tool",
+                    node.name,
+                    other.node_type().article(),
+                    other.node_type()
+                )))
+            }
+        };
+        (node, cfg)
+    };
+
+    crate::api::tool_routes::run_operation(&s, &node, &cfg, &body.op, &body.args, body.curl)
+        .await
+        .map(Json)
+}

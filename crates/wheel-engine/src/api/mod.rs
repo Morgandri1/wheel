@@ -29,6 +29,7 @@ pub mod board_routes;
 pub mod cli_routes;
 pub mod events_route;
 mod table_routes;
+pub mod tool_routes;
 pub mod vault_routes;
 
 #[derive(Clone)]
@@ -180,6 +181,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/tables/{id}/rows", get(table_routes::rows))
         .route("/tables/{id}/query", post(table_routes::query))
+        .route("/tools/import", post(tool_routes::preview))
+        .route("/tools/{id}/import", post(tool_routes::reimport))
+        .route("/tools/{id}/ops", get(tool_routes::ops))
+        .route("/tools/{id}/call", post(tool_routes::call))
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

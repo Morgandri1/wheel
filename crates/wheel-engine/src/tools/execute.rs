@@ -134,7 +134,12 @@ pub fn build_request(
             }
             ParamLocation::Query => query.push((p.name.clone(), value)),
             ParamLocation::Header => headers.push((p.name.clone(), value)),
-            ParamLocation::Cookie => cookies.push((p.name.clone(), value)),
+            // Encoded like path and query (ADVERSARY 022/2). A cookie value
+            // is data, and `x; admin=true; role=root` is two more cookies the
+            // caller never granted. `;` is legal in a header value, so
+            // reqwest does not reject it the way it rejects CRLF — this is
+            // the only thing standing between an agent and a forged session.
+            ParamLocation::Cookie => cookies.push((p.name.clone(), encode(&value))),
             ParamLocation::Body => {
                 body.insert(
                     p.name.clone(),
@@ -213,11 +218,22 @@ fn encode(s: &str) -> String {
 /// the point of the masking is that they can paste it somewhere without
 /// handing over a credential the agent was never allowed to see.
 pub fn curl_for(p: &Prepared) -> String {
+    // Both spellings (ADVERSARY 022/1). A secret in a query or path fill is
+    // stored PERCENT-ENCODED in the url, so searching for the raw string
+    // missed it entirely whenever the value contained anything outside the
+    // unreserved set -- which every base64 credential does. The header
+    // placement was masked and the query placement was not, which is the
+    // worst kind of gap: it looks like it works.
     let mask = |s: &str| -> String {
         let mut out = s.to_string();
         for secret in &p.secrets {
-            if !secret.is_empty() {
-                out = out.replace(secret.as_str(), "<redacted>");
+            if secret.is_empty() {
+                continue;
+            }
+            out = out.replace(secret.as_str(), "<redacted>");
+            let encoded = encode(secret);
+            if encoded != *secret {
+                out = out.replace(&encoded, "<redacted>");
             }
         }
         out
@@ -746,6 +762,114 @@ mod tests {
         .unwrap();
         let curl = curl_for(&prepared);
         assert!(!curl.contains("sk-SUPER-SECRET"), "{curl}");
+        assert!(curl.contains("<redacted>"), "{curl}");
+    }
+
+    /// ADVERSARY 022/1. A secret is stored PERCENT-ENCODED in the url, so a
+    /// mask that searched for the raw string missed every credential
+    /// containing a character outside the unreserved set — which is every
+    /// base64 credential. The header placement was masked and the query
+    /// placement was not, which is the worst kind of gap: it looks like it
+    /// works.
+    #[test]
+    fn a_secret_is_masked_in_the_url_even_though_it_is_encoded_there() {
+        let raw = "sk/live+abc==";
+        let creds = HashMap::from([("creds/API_KEY".to_string(), raw.to_string())]);
+
+        // Query placement.
+        let o = ToolOperation {
+            path: "/search".into(),
+            params: vec![p("key", ParamLocation::Query, vault("creds/API_KEY"))],
+            ..op(vec![])
+        };
+        let curl = curl_for(
+            &build_request(&cfg(vec![o.clone()]), &o, &serde_json::json!({}), &creds).unwrap(),
+        );
+        assert!(!curl.contains(raw), "raw secret in curl: {curl}");
+        assert!(
+            !curl.contains("sk%2Flive%2Babc%3D%3D"),
+            "ENCODED secret survived in the url: {curl}"
+        );
+        assert!(curl.contains("<redacted>"), "{curl}");
+
+        // Path placement, same encoding, same requirement.
+        let o = ToolOperation {
+            path: "/keys/{key}".into(),
+            params: vec![p("key", ParamLocation::Path, vault("creds/API_KEY"))],
+            ..op(vec![])
+        };
+        let curl = curl_for(
+            &build_request(&cfg(vec![o.clone()]), &o, &serde_json::json!({}), &creds).unwrap(),
+        );
+        assert!(!curl.contains(raw), "{curl}");
+        assert!(!curl.contains("sk%2Flive%2Babc%3D%3D"), "{curl}");
+
+        // And a header, which already worked — so the fix did not trade one
+        // placement for another.
+        let o = ToolOperation {
+            path: "/x".into(),
+            params: vec![p(
+                "Authorization",
+                ParamLocation::Header,
+                vault("creds/API_KEY"),
+            )],
+            ..op(vec![])
+        };
+        let curl = curl_for(
+            &build_request(&cfg(vec![o.clone()]), &o, &serde_json::json!({}), &creds).unwrap(),
+        );
+        assert!(!curl.contains(raw), "{curl}");
+    }
+
+    /// ADVERSARY 022/2. `;` is legal in a header value, so reqwest does not
+    /// reject it the way it rejects CRLF — encoding is the only thing between
+    /// an agent and a forged session cookie.
+    #[test]
+    fn a_cookie_value_cannot_inject_more_cookies() {
+        let o = ToolOperation {
+            path: "/x".into(),
+            params: vec![p("sid", ParamLocation::Cookie, Fill::agent())],
+            ..op(vec![])
+        };
+        let got = build_request(
+            &cfg(vec![o.clone()]),
+            &o,
+            &serde_json::json!({"sid": "x; admin=true; role=root"}),
+            &secrets(),
+        )
+        .unwrap();
+
+        let (_, value) = &got.cookies[0];
+        assert!(!value.contains(';'), "cookie separator survived: {value}");
+        assert!(!value.contains(' '), "{value}");
+        assert!(
+            !value.contains('='),
+            "an `=` would still split a pair: {value}"
+        );
+
+        // ...and it is still gone once the jar is joined for the wire.
+        let curl = curl_for(&got);
+        assert!(
+            !curl.contains("admin=true"),
+            "injected cookie in curl: {curl}"
+        );
+        assert!(!curl.contains("role=root"), "{curl}");
+    }
+
+    /// A vault-filled cookie must be masked too, in its encoded form.
+    #[test]
+    fn a_secret_cookie_is_masked_in_the_curl() {
+        let creds = HashMap::from([("creds/API_KEY".to_string(), "sk/live+abc==".to_string())]);
+        let o = ToolOperation {
+            path: "/x".into(),
+            params: vec![p("session", ParamLocation::Cookie, vault("creds/API_KEY"))],
+            ..op(vec![])
+        };
+        let curl = curl_for(
+            &build_request(&cfg(vec![o.clone()]), &o, &serde_json::json!({}), &creds).unwrap(),
+        );
+        assert!(!curl.contains("sk/live+abc=="), "{curl}");
+        assert!(!curl.contains("sk%2Flive%2Babc%3D%3D"), "{curl}");
         assert!(curl.contains("<redacted>"), "{curl}");
     }
 

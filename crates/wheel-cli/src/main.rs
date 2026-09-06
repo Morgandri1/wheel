@@ -26,6 +26,8 @@ wheel — talk to your Wheel board
   wheel write <node>[/<row>] <value>|--file <path>|--stdin
   wheel rm    <node>/<row>          delete a table row or chest blob
   wheel query <table> \"<SELECT ...>\"  read-only SQL, scoped to that one table
+  wheel tool ls   <tool>            operations I can call, and the fields to fill
+  wheel tool call <tool> <op> '<json>' [--curl]   invoke one; --curl prints it instead
   wheel msg   <agent> <text>|--file <path>|--stdin
   wheel inbox [<message-id>]        re-read what I was sent
 
@@ -185,6 +187,56 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
                 json_out,
                 render_rows,
             )
+        }
+
+        "tool" => {
+            let sub = rest.first().map(String::as_str).unwrap_or("");
+            match sub {
+                "ls" | "list" => {
+                    let node = rest.get(1).ok_or_else(|| usage("tool ls needs <tool>"))?;
+                    show(
+                        engine.get(&format!("/v1/cli/tool?node={}", urlencode(node)))?,
+                        json_out,
+                        render_tool_ops,
+                    )
+                }
+                "call" => {
+                    let node = rest
+                        .get(1)
+                        .ok_or_else(|| usage("tool call needs <tool> <op>"))?;
+                    let op = rest
+                        .get(2)
+                        .ok_or_else(|| usage("tool call needs <tool> <op>"))?;
+                    // Args are optional: an operation may have no agent fields.
+                    let rest_args = &rest[3..];
+                    let curl = rest_args.iter().any(|a| a == "--curl");
+                    let literal: Vec<String> = rest_args
+                        .iter()
+                        .filter(|a| *a != "--curl")
+                        .cloned()
+                        .collect();
+                    let args: serde_json::Value = if literal.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        let raw = read_value(&literal)?;
+                        serde_json::from_str(&raw).map_err(|e| {
+                            usage(&format!("tool call arguments must be a JSON object: {e}"))
+                        })?
+                    };
+                    show(
+                        engine.post(
+                            "/v1/cli/tool",
+                            serde_json::json!({"node": node, "op": op, "args": args, "curl": curl}),
+                        )?,
+                        json_out,
+                        render_tool_call,
+                    )
+                }
+                _ => {
+                    eprintln!("wheel: tool needs `ls <tool>` or `call <tool> <op> '<json>'`\n");
+                    Ok(1)
+                }
+            }
         }
 
         "inbox" => {
@@ -396,6 +448,65 @@ fn render_rows(v: &serde_json::Value) {
     }
 }
 
+/// One line per operation, then the fields the agent must fill. An agent
+/// reading this needs to know what to send, not what the operator configured.
+fn render_tool_ops(v: &serde_json::Value) {
+    let Some(ops) = v["operations"].as_array() else {
+        println!("{v}");
+        return;
+    };
+    if ops.is_empty() {
+        println!("no operations enabled on this tool");
+        return;
+    }
+    for o in ops {
+        println!(
+            "  {:24}  {} {}{}",
+            o["id"].as_str().unwrap_or("?"),
+            o["method"].as_str().unwrap_or("?"),
+            o["path"].as_str().unwrap_or("?"),
+            o["summary"]
+                .as_str()
+                .map(|s| format!("  — {s}"))
+                .unwrap_or_default(),
+        );
+        let required: Vec<&str> = o["input_schema"]["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        if let Some(props) = o["input_schema"]["properties"].as_object() {
+            for (name, schema) in props {
+                println!(
+                    "      {name}: {}{}",
+                    schema["type"].as_str().unwrap_or("string"),
+                    if required.contains(&name.as_str()) {
+                        " (required)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+}
+
+/// A call prints the body, because that is what the agent asked for. The
+/// status goes to stderr so `wheel tool call ... | jq` still works.
+fn render_tool_call(v: &serde_json::Value) {
+    if let Some(curl) = v["curl"].as_str() {
+        println!("{curl}");
+        return;
+    }
+    match &v["body"] {
+        serde_json::Value::Null => println!("{v}"),
+        serde_json::Value::String(s) => println!("{s}"),
+        body => println!("{body}"),
+    }
+    if let Some(status) = v["status"].as_u64() {
+        eprintln!("{status} · {} bytes · {}ms", v["bytes"], v["duration_ms"]);
+    }
+}
+
 fn render_ok(v: &serde_json::Value) {
     println!("ok — wrote {}", v["node"].as_str().unwrap_or("?"));
 }
@@ -504,7 +615,7 @@ mod tests {
             serde_json::json!({"wires": [{"to": {}}]}),
         ];
         type Renderer = fn(&serde_json::Value);
-        let renderers: [(&str, Renderer); 10] = [
+        let renderers: [(&str, Renderer); 12] = [
             ("whoami", render_whoami),
             ("connections", render_connections),
             ("list", render_list),
@@ -513,6 +624,8 @@ mod tests {
             ("ok", render_ok),
             ("receipt", render_receipt),
             ("inbox", render_inbox),
+            ("tool_ops", render_tool_ops),
+            ("tool_call", render_tool_call),
             ("secret", render_secret),
             ("keys", render_keys),
         ];
@@ -581,6 +694,8 @@ mod tests {
             ("ok", render_ok),
             ("receipt", render_receipt),
             ("inbox", render_inbox),
+            ("tool_ops", render_tool_ops),
+            ("tool_call", render_tool_call),
             ("secret", render_secret),
             ("keys", render_keys),
         ];
@@ -637,6 +752,18 @@ mod tests {
         }));
         render_secret(&serde_json::json!({ "value": "s3cret" }));
         render_keys(&serde_json::json!({ "keys": ["K1"] }));
+        render_tool_ops(&serde_json::json!({
+            "operations": [{"id": "listPets", "method": "GET", "path": "/pets",
+                            "summary": "List all pets",
+                            "input_schema": {"type": "object",
+                                             "properties": {"limit": {"type": "integer"}},
+                                             "required": ["limit"]}}]
+        }));
+        render_tool_ops(&serde_json::json!({ "operations": [] }));
+        render_tool_call(&serde_json::json!({
+            "status": 200, "body": {"ok": true}, "bytes": 11, "duration_ms": 5
+        }));
+        render_tool_call(&serde_json::json!({ "curl": "curl -X GET 'https://x'" }));
     }
 
     /// The grammar-to-route mapping is a documented contract (PROTOCOL.md) and
@@ -669,6 +796,16 @@ mod tests {
                 "/v1/cli/ls?node=table&prefix=2026-",
             ),
             (vec!["rm", "notes/r1"], "POST", "/v1/cli/rm"),
+            (
+                vec!["tool", "ls", "petstore"],
+                "GET",
+                "/v1/cli/tool?node=petstore",
+            ),
+            (
+                vec!["tool", "call", "petstore", "listPets", "{}"],
+                "POST",
+                "/v1/cli/tool",
+            ),
             (vec!["query", "notes", "SELECT 1"], "POST", "/v1/cli/query"),
             (vec!["inbox"], "GET", "/v1/cli/inbox"),
             (
@@ -739,6 +876,10 @@ mod tests {
             vec!["secret", "list"],
             vec!["rm"],
             vec!["query"],
+            vec!["tool"],
+            vec!["tool", "ls"],
+            vec!["tool", "call"],
+            vec!["tool", "call", "petstore"],
             vec!["not-a-command"],
         ] {
             let args: Vec<String> = bad.iter().map(|a| a.to_string()).collect();
