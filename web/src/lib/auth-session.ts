@@ -78,3 +78,38 @@ export function vaultShareNote(
   }
   return "Shared through the vault. This is a short-lived token, not a permanent login.";
 }
+
+/**
+ * When a stored credential stops working, said before it does rather than after.
+ *
+ * `null`/absent means durable OR unknown, and the engine deliberately will not guess between
+ * them — so neither does this. Saying nothing is the only honest option: inventing "expires
+ * soon" for a durable key is a false alarm, and inventing "durable" for a session token is the
+ * failure this field exists to prevent.
+ *
+ * A credential shared into a vault expires for every agent reading that vault at the same moment,
+ * which is why this is worth surfacing rather than leaving to a support round-trip.
+ */
+export function expiryMessage(
+  expiresAt: string | null | undefined,
+  now: number,
+): { text: string; urgent: boolean } | null {
+  if (!expiresAt) return null;
+  const when = new Date(expiresAt);
+  const at = when.getTime();
+  if (Number.isNaN(at)) return null;
+
+  const msLeft = at - now;
+  if (msLeft <= 0) return { text: "These credentials have expired — sign in again.", urgent: true };
+
+  const hours = msLeft / 3_600_000;
+  if (hours < 1) {
+    const minutes = Math.max(1, Math.round(msLeft / 60_000));
+    return { text: `Expires in ${minutes} minute${minutes === 1 ? "" : "s"} — sign in again soon.`, urgent: true };
+  }
+  if (hours < 24) {
+    const whole = Math.round(hours);
+    return { text: `Expires in ${whole} hour${whole === 1 ? "" : "s"}.`, urgent: whole <= 6 };
+  }
+  return { text: `Expires ${when.toLocaleString()}.`, urgent: false };
+}

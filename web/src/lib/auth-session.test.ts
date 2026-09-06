@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "@/lib/auth";
-import { countdown, completeFailure, expiryFrom, vaultShareNote } from "@/lib/auth-session";
+import { countdown, completeFailure, expiryFrom, expiryMessage, vaultShareNote } from "@/lib/auth-session";
 
 const T0 = 1_700_000_000_000;
 
@@ -91,5 +91,45 @@ describe("vaultShareNote", () => {
   it("says nothing when nothing was shared", () => {
     expect(vaultShareNote(null)).toBeNull();
     expect(vaultShareNote(undefined)).toBeNull();
+  });
+});
+
+describe("expiryMessage", () => {
+  const iso = (ms: number) => new Date(T0 + ms).toISOString();
+
+  // The engine will not guess between "durable" and "unknown", so neither may we: inventing
+  // "expires soon" for an API key is a false alarm, and inventing "durable" for a session token
+  // is the exact failure this field exists to prevent.
+  it.each([null, undefined, "", "not a date"])("says nothing for %o", (value) => {
+    expect(expiryMessage(value as string | null | undefined, T0)).toBeNull();
+  });
+
+  it("is urgent and past tense once it has lapsed", () => {
+    const m = expiryMessage(iso(-1000), T0)!;
+    expect(m.urgent).toBe(true);
+    expect(m.text).toMatch(/have expired/i);
+  });
+
+  it("counts minutes inside the last hour, and calls it urgent", () => {
+    const m = expiryMessage(iso(20 * 60_000), T0)!;
+    expect(m.text).toMatch(/20 minutes/);
+    expect(m.urgent).toBe(true);
+  });
+
+  it("counts hours within a day", () => {
+    expect(expiryMessage(iso(5 * 3_600_000), T0)!.text).toMatch(/5 hours/);
+    expect(expiryMessage(iso(1 * 3_600_000), T0)!.text).toMatch(/1 hour\b/);
+  });
+
+  // Six hours is the line: enough warning to act, not so much that it cries wolf all day.
+  it("is urgent at six hours and calm at seven", () => {
+    expect(expiryMessage(iso(6 * 3_600_000), T0)!.urgent).toBe(true);
+    expect(expiryMessage(iso(7 * 3_600_000), T0)!.urgent).toBe(false);
+  });
+
+  it("gives a date beyond a day, without alarm", () => {
+    const m = expiryMessage(iso(50 * 3_600_000), T0)!;
+    expect(m.urgent).toBe(false);
+    expect(m.text).toMatch(/^Expires /);
   });
 });

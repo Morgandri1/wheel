@@ -79,12 +79,16 @@ export interface AuthBegin {
 }
 
 /**
+ * RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z
+ */
+
+/**
  * What kind of credential an agent node holds.
  *
  * Distinct from [`AuthMode`], which is how a credential is *obtained*. The difference matters because the kind decides which environment variable carries it to the child, and the two Anthropic credentials are not interchangeable in that envelope.
  */
 
-export type CredentialKind = "api_key" | "oauth_token" | "oauth_session";
+export type CredentialKind = "api_key" | "oauth_token" | "oauth_session" | "env";
 
 /**
  * Whether an agent's harness currently holds usable credentials (`GET /v1/agents/:id/auth`).
@@ -100,9 +104,19 @@ export interface AuthStatus {
    */
   authenticated: boolean;
   /**
+   * When the stored credential stops working, if it is the kind that does.
+   *
+   * `None` means durable OR unknown -- those are not the same thing, and the engine will not guess. A session credential copied into a vault expires for every agent reading that vault at once, so the UI needs this to say "re-login by ..." before it lapses rather than after.
+   */
+  expires_at?: Timestamp | null;
+  /**
    * Which kind of credential is stored, or `null` when there is none.
    */
   mode?: CredentialKind | null;
+  /**
+   * For `mode: "env"`, the name of the vault node supplying it. Never the value.
+   */
+  source?: string | null;
 }
 
 /**
