@@ -304,6 +304,7 @@ mod tests {
 
     // Constructing a pool needs a runtime even when lazy, so this is async rather than a plain
     // `#[test]`.
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn pick_returns_the_statement_for_the_backend_in_use() {
         let sqlite = Db::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());

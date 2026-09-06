@@ -8,6 +8,9 @@
 //! such route, and only that becomes a 501. A 404 that carries anything is an answer — the
 //! engine's `no_such_endpoint`, or an endpoint script's own 404 — and passes through untouched.
 
+// Exercises the SQLite backend, so it exists only in a build that has one.
+#![cfg(feature = "sqlite")]
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};

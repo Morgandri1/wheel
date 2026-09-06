@@ -9,6 +9,9 @@
 //! What is NOT shared, and why the store still branches: Postgres time arithmetic (`now()`,
 //! `make_interval`, `interval '5 minutes'`) has no SQLite equivalent, and `citext`/`jsonb` are
 //! column types rather than expressions.
+// Exercises the SQLite backend, so it exists only in a build that has one.
+#![cfg(feature = "sqlite")]
+
 use sqlx::sqlite::SqlitePoolOptions;
 use uuid::Uuid;
 
