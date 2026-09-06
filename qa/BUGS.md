@@ -1062,7 +1062,6 @@ about my build; the lesson that was actually needed is this one — the gate has
 "broken" from "could not tell", in that direction too. A gate that cries wolf gets ignored
 exactly when it is right.
 
-
 ## 026 — "Position is an integer cell" is ruled but not implemented · S2 · SDK · OPEN
 
 **TESTPLAN:** `POS-is-an-integer/*`, `POS-rounds-and-clamps/*`, `POS-move-clamps` — 17 red on
@@ -1086,3 +1085,34 @@ one, so the two views disagree by construction for any value outside the bounds.
 
 The gate deliberately asserts **agreement** (write response == later board refetch) rather than
 the arithmetic, so it will go green on any implementation that is internally consistent.
+
+---
+
+## 029 — `wheel-on-wheel`'s own `GITHUB_TOKEN` cannot push, masking real signal on nearly every PR · S3 · QA (mine) · CLOSED, PR #18 (89ceb67)
+
+**Filed as 026, renumbered to 029** — collided with `main`'s real 026 (Position-integer-cell,
+SDK). Skipping straight to 029 rather than 027: `qa/sandbox-environment-fixes` (PR #11) already
+claims 027 and 028 for two unrelated entries filed earlier and still unmerged at the time this
+one rebased; using 029 avoids a third collision whichever of the two PRs lands first.
+
+PM traced the `wheel-on-wheel` red X on nearly every open PR (#3, #4, #8, #9, #10, #11, #12,
+#13, #14, #15, #16 — checked directly) to the repo's `default_workflow_permissions = "read"`
+(`gh api repos/Morgandri1/wheel/actions/permissions/workflow`). `ci.yml`'s `wheel-on-wheel`
+job hands its own `GITHUB_TOKEN` to the agent as `WHEEL_WOW_GH_TOKEN`; read-only means the
+clone leg works and the push leg always 403s — `"Permission to Morgandri1/wheel.git denied
+to github-actions[bot]"`. Not an engine or capability bug: the test's own failure text
+already says so (`WOW-commit-push` gated on `WOW-push-needs-the-token`, "a gap in the gate,
+not in the capability").
+
+**Why S3 rather than higher:** nothing about the product is broken — an agent given a real,
+writable token pushes fine (§3e workspace commits work in production). The cost is entirely
+to CI legibility: a red `wheel-on-wheel` on a PR reads as "this PR broke something" when it
+is unrelated to every PR it appeared on, including at least one (PR #12) that had a real bug
+mixed in underneath it.
+
+**Fix:** job-level `permissions: contents: write` on `wheel-on-wheel` alone (PR #18), not a
+repo-wide default change — every other job keeps read-only. Minimal blast radius for a token
+this job's own disposable test branch needs and nothing else does.
+
+**Status:** merged (`89ceb67`). Filed as its own entry per PM's ask, so it does not get
+re-litigated as a fresh mystery the next time someone hits it.
