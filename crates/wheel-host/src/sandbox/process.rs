@@ -43,6 +43,53 @@ impl ProcessSandbox {
         }
     }
 
+    /// Kill anything still running under this project's uids before its engine starts.
+    ///
+    /// An engine that is SIGKILLed — or that exits without reaping — leaves its harness children
+    /// reparented to init and running. The supervisor that owned them is gone, so nothing stops
+    /// them and nothing knows they exist; the next start would give that agent node a second
+    /// process, which is exactly what §3c #13 forbids, and the orphan burns a Claude process on a
+    /// shared host until someone notices.
+    ///
+    /// This is narrow on purpose. It runs only here, immediately before spawning the engine, at
+    /// which point nothing of ours is supposed to be alive at these uids; it only ever touches the
+    /// project's own allocated range, which is unique to it and never recycled; and `sweep_range`
+    /// refuses uid 0 outright. The real fix belongs in the engine's shutdown path — this is the
+    /// backstop for when that path does not get to run.
+    async fn reap_leftovers(&self, id: &Uuid, uid_base: u32) {
+        let range = uid_base..uid_base.saturating_add(self.cfg.uid_stride);
+        let leftovers = leftover_pids(Path::new("/proc"), &range);
+        if leftovers.is_empty() {
+            return;
+        }
+
+        // SIGTERM first, always. One of these may be a live engine we simply lost the handle to
+        // (the host restarted; children are spawned with kill_on_drop(false) precisely so a host
+        // crash does not take every tenant down with it). That engine is owed its documented
+        // shutdown: flush sqlite, stop its own children. SIGKILL here would skip all of it and
+        // strand the very children we are trying not to leave behind.
+        for pid in &leftovers {
+            tracing::warn!(project = %id, pid, "asking a process left by a previous engine to exit");
+            unsafe { libc::kill(*pid, libc::SIGTERM) };
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(self.cfg.reap_grace_secs);
+        while Instant::now() < deadline {
+            if leftover_pids(Path::new("/proc"), &range).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Whatever is still there ignored SIGTERM or was never going to handle it. It cannot be
+        // supervised — we hold no handle to it — so leaving it would mean a second process for
+        // this project's nodes the moment the new engine starts.
+        for pid in leftover_pids(Path::new("/proc"), &range) {
+            tracing::warn!(project = %id, pid, "killing a process that outlived its engine");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+
     /// The complete environment of an engine child. `env_clear` plus this list is the whole of it:
     /// the engine inherits nothing from the host process, so a secret the host holds for some other
     /// project can never reach it.
@@ -294,6 +341,7 @@ impl Sandbox for ProcessSandbox {
         let uid = self.uid_for(id).await?;
         let gid = uid;
         self.provision(id, secrets).await?;
+        self.reap_leftovers(id, uid).await;
 
         let socket = self.socket_path(id);
         // A stale socket from an unclean shutdown would make bind fail.
@@ -430,6 +478,50 @@ pub(crate) async fn healthz_over_socket(socket: &std::path::Path) -> bool {
     }
 }
 
+/// Pids under `proc_root` whose real uid falls inside `range`.
+///
+/// Split out from the killing so the selection rule is testable without privileges and without a
+/// real /proc: this is the function that decides what dies, so it is the one that must be pinned.
+/// uid 0 is never in range — a project uid range starting at 0 would mean root, and killing root
+/// processes is never what we want, whatever the config says.
+fn leftover_pids(proc_root: &Path, range: &std::ops::Range<u32>) -> Vec<i32> {
+    if range.is_empty() || range.start == 0 {
+        return Vec::new();
+    }
+    let me = std::process::id() as i32;
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if pid == me || pid <= 1 {
+            continue;
+        }
+        if let Some(uid) = real_uid(&entry.path().join("status")) {
+            if range.contains(&uid) {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// The real uid from a `/proc/<pid>/status` file — field 1 of the `Uid:` line (real, not effective:
+/// a process that dropped privileges is still the project's to clean up).
+fn real_uid(status: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(status).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +639,94 @@ mod tests {
                 "WHEEL_VAULT_KEY",
             ]
         );
+    }
+
+    /// A fake /proc: one directory per pid, each with a `status` file shaped like the real one.
+    fn fake_proc(entries: &[(&str, &str)]) -> PathBuf {
+        let root = tempdir();
+        for (name, status) in entries {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("status"), status).unwrap();
+        }
+        root
+    }
+
+    fn status_for(uid: u32) -> String {
+        format!("Name:\tclaude\nState:\tS (sleeping)\nPPid:\t1\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    }
+
+    #[test]
+    fn only_processes_inside_the_projects_own_uid_range_are_selected() {
+        let proc = fake_proc(&[
+            ("100", &status_for(20_000)),
+            ("101", &status_for(20_063)),
+            ("102", &status_for(20_064)),
+            ("103", &status_for(19_999)),
+            ("104", &status_for(0)),
+        ]);
+        let mut pids = leftover_pids(&proc, &(20_000..20_064));
+        pids.sort_unstable();
+        assert_eq!(
+            pids,
+            vec![100, 101],
+            "the range is half-open and excludes root"
+        );
+    }
+
+    /// A project uid range that reached 0 would mean "kill root's processes". Whatever the config
+    /// says, that is never the intent, so the rule refuses before it reads anything.
+    #[test]
+    fn a_range_that_would_include_root_selects_nothing() {
+        let proc = fake_proc(&[("100", &status_for(0)), ("101", &status_for(1))]);
+        assert!(leftover_pids(&proc, &(0..64)).is_empty());
+    }
+
+    #[test]
+    fn an_empty_range_selects_nothing() {
+        let proc = fake_proc(&[("100", &status_for(20_000))]);
+        assert!(leftover_pids(&proc, &(20_000..20_000)).is_empty());
+    }
+
+    #[test]
+    fn init_and_the_host_itself_are_never_selected() {
+        let me = std::process::id();
+        let proc = fake_proc(&[
+            ("1", &status_for(20_000)),
+            (&me.to_string(), &status_for(20_000)),
+            ("4242", &status_for(20_000)),
+        ]);
+        assert_eq!(leftover_pids(&proc, &(20_000..20_064)), vec![4242]);
+    }
+
+    #[test]
+    fn unreadable_and_malformed_entries_are_skipped_rather_than_guessed() {
+        let proc = fake_proc(&[
+            ("100", "Name:\tx\nPPid:\t1\n"),
+            ("101", "Uid:\tnot-a-number\n"),
+            ("102", ""),
+            ("kthreadd", &status_for(20_000)),
+            ("103", &status_for(20_001)),
+        ]);
+        assert_eq!(leftover_pids(&proc, &(20_000..20_064)), vec![103]);
+    }
+
+    #[test]
+    fn a_proc_that_cannot_be_read_is_not_an_error() {
+        assert!(leftover_pids(Path::new("/nonexistent-proc"), &(20_000..20_064)).is_empty());
+    }
+
+    /// The real uid, not the effective one: a child that dropped privileges further is still the
+    /// project's to clean up.
+    #[test]
+    fn the_real_uid_is_what_counts() {
+        let root = tempdir();
+        std::fs::write(
+            root.join("status"),
+            "Name:\tx\nUid:\t20005\t20009\t20009\t20009\n",
+        )
+        .unwrap();
+        assert_eq!(real_uid(&root.join("status")), Some(20_005));
     }
 
     /// Readiness has to mean the engine answered, not merely that a process exists. Reporting a
