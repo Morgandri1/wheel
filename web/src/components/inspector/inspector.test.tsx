@@ -116,6 +116,24 @@ describe("the endpoint panel, specifically", () => {
     expect(screen.getByTestId("endpoint-http-off")).toBeDefined();
   });
 
+  // The API sends ingress_base_url as "" until the project starts. `??` does not catch an empty
+  // string, so the public URL rendered as bare "/hook" — which looks and copies like a URL and
+  // goes nowhere.
+  it("never shows a bare path as the public URL before the project has started", () => {
+    renderInspector(node("endpoint"), { ...project, ingress_base_url: "" });
+    const shown = screen.getByTestId("inspector-endpoint-url").textContent ?? "";
+    expect(shown).not.toBe("/hook");
+    expect(shown).toMatch(/^https?:\/\/|\/p\//);
+    expect(shown).toContain("/hook");
+  });
+
+  it("prefers the API's ingress URL once it has one", () => {
+    renderInspector(node("endpoint"));
+    expect(screen.getByTestId("inspector-endpoint-url").textContent).toBe(
+      "https://api.example.test/p/p1/hook",
+    );
+  });
+
   it("says the URL is off when http is disabled", () => {
     renderInspector(node("endpoint"));
     expect(screen.getByTestId("endpoint-http-off")).toBeDefined();

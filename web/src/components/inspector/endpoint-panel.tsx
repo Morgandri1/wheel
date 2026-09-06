@@ -43,7 +43,10 @@ export function EndpointPanel({
     path !== node.config.path ||
     responseMode !== node.config.response_mode;
 
-  const base = project.ingress_base_url ?? `${process.env.NEXT_PUBLIC_API_URL ?? ""}/p/${project.id}`;
+  // `??` is wrong here: the API sends ingress_base_url as an EMPTY STRING until the project has
+  // started, and an empty string is not null. That produced a "public URL" of just the path —
+  // "/hook" — which looks like a URL, copies like a URL, and goes nowhere.
+  const base = project.ingress_base_url || `${process.env.NEXT_PUBLIC_API_URL ?? ""}/p/${project.id}`;
   const url = `${base.replace(/\/$/, "")}${node.config.path}`;
 
   /** What this endpoint actually does with a hit depends entirely on where its wires go. */
