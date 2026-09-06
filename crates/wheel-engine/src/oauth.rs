@@ -17,7 +17,7 @@
 
 use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin},
@@ -146,47 +146,47 @@ impl LoginSessions {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
+        // Pump BOTH streams from the start, and look for the URL in whatever
+        // arrives. The URL was read from stdout only, which assumed something
+        // about a CLI this engine does not own: an interactive prompt
+        // routinely goes to stderr, and if it does, `begin` waits the full
+        // timeout and answers 504 -- an operator staring at a gateway error
+        // for a sign-in that was working fine on the other side of the pipe.
         let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let mut pumps = Vec::new();
-        {
+        for stream in [
+            Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            Box::new(stderr) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        ] {
             let output = output.clone();
             pumps.push(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    if let Ok(mut o) = output.lock() {
-                        o.push_str(&l);
-                        o.push('\n');
+                // read_line rather than lines(): the prompt the CLI writes
+                // before waiting for input carries no newline, so a
+                // line-oriented reader never yields it -- and it is the thing
+                // that tells us the CLI is ready for a code.
+                let mut reader = BufReader::new(stream);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(mut o) = output.lock() {
+                                o.push_str(&String::from_utf8_lossy(&buf));
+                            }
+                        }
                     }
                 }
             }));
         }
 
-        // Read stdout until the URL appears, then keep draining in the
-        // background — a child whose pipe fills up would block forever.
-        let mut reader = BufReader::new(stdout);
-        let url = match tokio::time::timeout(URL_TIMEOUT, read_authorize_url(&mut reader)).await {
-            Ok(Ok(url)) => url,
-            Ok(Err(e)) => {
+        let url = match wait_for_url(&output, &mut child).await {
+            Ok(url) => url,
+            Err(e) => {
                 let _ = child.kill().await;
-                return Err(LoginError::Spawn(e.to_string()));
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                return Err(LoginError::Timeout);
+                return Err(e);
             }
         };
-        {
-            let output = output.clone();
-            pumps.push(tokio::spawn(async move {
-                let mut lines = reader.lines();
-                while let Ok(Some(l)) = lines.next_line().await {
-                    if let Ok(mut o) = output.lock() {
-                        o.push_str(&l);
-                        o.push('\n');
-                    }
-                }
-            }));
-        }
 
         let session = Uuid::new_v4();
         self.inner.lock().await.insert(
@@ -427,33 +427,49 @@ fn clean(text: &str) -> String {
 /// Matches on `https://` rather than the sentence around it: the wording
 /// ("If the browser didn't open, visit: ") is cosmetic and has no contract
 /// behind it, while a URL on its own line does.
-async fn extract_url(line: &str) -> Option<String> {
-    let start = line.find("https://")?;
-    let url = line[start..].trim().trim_end_matches(['.', ',']);
+/// Pull the authorize URL out of whatever the CLI has said so far.
+///
+/// Matches on `https://` rather than the sentence around it: the wording
+/// ("If the browser didn't open, visit: ") is cosmetic and has no contract
+/// behind it, while a URL does.
+fn extract_url(text: &str) -> Option<String> {
+    let start = text.find("https://")?;
+    let rest = &text[start..];
+    // Stop at the first whitespace: the URL may be followed by more output
+    // on the same read, and a trailing prompt must not become part of it.
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',']);
     (!url.is_empty()).then(|| url.to_string())
 }
 
-async fn read_authorize_url<R>(reader: &mut BufReader<R>) -> Result<String>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = String::new();
+/// Watch everything the child says until an authorize URL appears.
+///
+/// Polls the shared buffer rather than owning a pipe, so it does not care
+/// which stream the CLI chose — and notices if the child gives up first,
+/// which is a different failure from "it is taking a while" and deserves the
+/// child's own words rather than a timeout.
+async fn wait_for_url(
+    output: &std::sync::Arc<std::sync::Mutex<String>>,
+    child: &mut Child,
+) -> Result<String, LoginError> {
+    let deadline = Instant::now() + URL_TIMEOUT;
     loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("reading the login output")?;
-        if n == 0 {
-            bail!(
-                "the login process ended before printing a URL: {}",
-                lines.trim()
-            );
-        }
-        if let Some(url) = extract_url(&line).await {
+        let text = output.lock().map(|o| o.clone()).unwrap_or_default();
+        if let Some(url) = extract_url(&text) {
             return Ok(url);
         }
-        lines.push_str(&line);
+        if let Ok(Some(_)) = child.try_wait() {
+            // It exited without ever offering a URL. Whatever it printed is
+            // the reason, and it is far more useful than "timed out".
+            let said = clean(&text);
+            return Err(LoginError::Spawn(format!(
+                "the login process ended before printing a URL: {said}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(LoginError::Timeout);
+        }
+        tokio::time::sleep(VERDICT_POLL).await;
     }
 }
 
@@ -466,29 +482,124 @@ mod tests {
         If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=pyIagh&code_challenge_method=S256&state=m9gz12oZ\n\
         Paste code here if prompted > ";
 
-    #[tokio::test]
-    async fn the_url_is_pulled_out_of_the_real_cli_greeting() {
-        let mut r = BufReader::new(REAL_GREETING.as_bytes());
-        let url = read_authorize_url(&mut r).await.unwrap();
+    #[test]
+    fn the_url_is_pulled_out_of_the_real_cli_greeting() {
+        let url = extract_url(REAL_GREETING).unwrap();
         assert!(url.starts_with("https://claude.com/cai/oauth/authorize?"));
         // The whole query string matters: without `state` the callback cannot
         // be tied back to this attempt.
         assert!(url.contains("state=m9gz12oZ"), "state must survive: {url}");
         assert!(url.contains("code_challenge=pyIagh"), "PKCE must survive");
-        // The prose around it must not be dragged in.
+        // The prose around it must not be dragged in, and neither must the
+        // prompt that follows it on the next line.
         assert!(!url.contains("visit"), "prose leaked into the url: {url}");
+        assert!(
+            !url.contains("Paste"),
+            "the prompt leaked into the url: {url}"
+        );
         assert!(!url.contains('\n'));
     }
 
+    #[test]
+    fn nothing_that_is_not_a_url_is_mistaken_for_one() {
+        assert!(extract_url("").is_none());
+        assert!(extract_url("Opening browser to sign in…").is_none());
+        assert!(extract_url("some unrelated failure").is_none());
+    }
+
+    /// The bug this was: the URL was read from stdout ONLY. An interactive
+    /// CLI routinely prompts on stderr, and if it does, `begin` waits the
+    /// full 30s and answers 504 — which the operator sees as a broken
+    /// service for a sign-in that was working fine on the other side of the
+    /// pipe. Whichever stream it chooses, we must find it.
     #[tokio::test]
-    async fn a_login_that_dies_without_a_url_is_an_error_not_a_hang() {
-        let mut r = BufReader::new("some unrelated failure\n".as_bytes());
-        let err = read_authorize_url(&mut r).await.unwrap_err().to_string();
-        assert!(err.contains("ended before printing a URL"), "{err}");
+    async fn the_url_is_found_even_when_the_cli_prints_it_to_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-stderr-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-stub");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo 'Opening browser to sign in…' >&2\n\
+             echo 'visit: https://claude.com/cai/oauth/authorize?state=onstderr' >&2\n\
+             printf 'Paste code here if prompted > ' >&2\n\
+             read code\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let s = LoginSessions::default();
+        let started = Instant::now();
+        let (_, url) = s
+            .begin(
+                Uuid::new_v4(),
+                &program.display().to_string(),
+                &dir.join("creds"),
+            )
+            .await
+            .unwrap();
+
+        assert!(url.contains("state=onstderr"), "{url}");
+        // The property is "we did not wait out the URL timeout", not a
+        // statement about speed: this host runs six agents and a cargo build
+        // holds it for seconds at a time. A tight bound here fails for load
+        // and teaches everyone to ignore the result.
         assert!(
-            err.contains("some unrelated failure"),
-            "the reason must be carried to the operator: {err}"
+            started.elapsed() < URL_TIMEOUT,
+            "the URL was on stderr and we waited the whole timeout for it: {:?}",
+            started.elapsed()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that dies without offering a URL must report ITS reason, not
+    /// a timeout — those send an operator to completely different places.
+    #[tokio::test]
+    async fn a_login_that_dies_without_a_url_reports_what_it_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-dies-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-stub");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho 'some unrelated failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let s = LoginSessions::default();
+        let started = Instant::now();
+        let err = s
+            .begin(
+                Uuid::new_v4(),
+                &program.display().to_string(),
+                &dir.join("creds"),
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("ended before printing a URL"), "{msg}");
+        assert!(
+            msg.contains("some unrelated failure"),
+            "the reason must be carried to the operator: {msg}"
+        );
+        assert!(
+            started.elapsed() < URL_TIMEOUT,
+            "an exit must not wait out the URL timeout: {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

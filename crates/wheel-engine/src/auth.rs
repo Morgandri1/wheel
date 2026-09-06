@@ -579,6 +579,52 @@ mod vault_handoff_tests {
         }
     }
 
+    /// PM ruling: an explicit `vault_key` is a CONFIRMATION, not an
+    /// instruction. This pins the pairs it must accept and reject, so the
+    /// route's check cannot drift from the routing it is confirming.
+    #[test]
+    fn an_explicit_vault_key_is_only_valid_when_it_matches_the_credential() {
+        let agrees = |token: &str, harness: Harness, requested: &str| {
+            let kind = classify_token(token, harness);
+            requested.eq_ignore_ascii_case(token_env(kind, harness))
+        };
+
+        // Accepted: the caller named the key the credential actually is.
+        assert!(agrees(
+            "sk-ant-oat01-x",
+            Harness::Claude,
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        ));
+        assert!(agrees(
+            "sk-ant-api03-x",
+            Harness::Claude,
+            "ANTHROPIC_API_KEY"
+        ));
+        assert!(agrees("sk-x", Harness::Codex, "CODEX_API_KEY"));
+        // Case is not the caller's problem; env names are conventionally
+        // uppercase and rejecting on case alone would be a puzzle, not a check.
+        assert!(agrees(
+            "sk-ant-api03-x",
+            Harness::Claude,
+            "anthropic_api_key"
+        ));
+
+        // Refused: this is exactly the 018 mistake, stated by the caller.
+        assert!(!agrees(
+            "sk-ant-api03-x",
+            Harness::Claude,
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        ));
+        assert!(!agrees(
+            "sk-ant-oat01-x",
+            Harness::Claude,
+            "ANTHROPIC_API_KEY"
+        ));
+        assert!(!agrees("sk-ant-api03-x", Harness::Claude, "CODEX_API_KEY"));
+        assert!(!agrees("sk-x", Harness::Codex, "ANTHROPIC_API_KEY"));
+        assert!(!agrees("sk-ant-oat01-x", Harness::Claude, "SOMETHING_ELSE"));
+    }
+
     /// The shape `claude auth login` is expected to leave behind.
     #[test]
     fn the_token_is_found_in_the_stores_normal_shape() {

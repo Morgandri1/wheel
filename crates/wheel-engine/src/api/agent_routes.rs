@@ -303,6 +303,16 @@ pub struct AuthComplete {
     /// credential fields.
     #[serde(default)]
     pub save_to_vault: Option<String>,
+    /// The vault key to store the credential under.
+    ///
+    /// Optional, and only ever a CONFIRMATION: the engine derives the right
+    /// name from the credential itself, and a caller that disagrees is
+    /// refused rather than obeyed. Letting a caller name the key would let
+    /// them file an `ANTHROPIC_API_KEY` as `CLAUDE_CODE_OAUTH_TOKEN`, which
+    /// every peer agent would then import under a variable the harness does
+    /// not read (ADVERSARY 018).
+    #[serde(default)]
+    pub vault_key: Option<String>,
 }
 
 /// `POST /v1/agents/:id/auth/complete`
@@ -319,11 +329,27 @@ pub async fn auth_complete(
     // Paste-code OAuth: the code goes to the child that `auth/begin` left
     // waiting, and the CLI writes its own credentials into the node's dir.
     if let Some(code) = body.code {
-        return finish_paste_code(&s, id, body.session, &code, body.save_to_vault.as_deref()).await;
+        return finish_paste_code(
+            &s,
+            id,
+            body.session,
+            &code,
+            body.save_to_vault.as_deref(),
+            body.vault_key.as_deref(),
+        )
+        .await;
     }
 
     if let Some(token) = body.setup_token {
-        return finish_setup_token(&s, id, harness, &token, body.save_to_vault.as_deref()).await;
+        return finish_setup_token(
+            &s,
+            id,
+            harness,
+            &token,
+            body.save_to_vault.as_deref(),
+            body.vault_key.as_deref(),
+        )
+        .await;
     }
 
     let Some(key) = body.api_key else {
@@ -351,7 +377,14 @@ pub async fn auth_complete(
                 token: key.trim().to_string(),
                 expires_at: None,
             };
-            Some(save_credential_to_vault(&s, id, harness, vault, &found)?)
+            Some(save_credential_to_vault(
+                &s,
+                id,
+                harness,
+                vault,
+                &found,
+                body.vault_key.as_deref(),
+            )?)
         }
         None => None,
     };
@@ -386,6 +419,7 @@ async fn finish_setup_token(
     harness: wheel_core::Harness,
     token: &str,
     save_to_vault: Option<&str>,
+    vault_key: Option<&str>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = token.trim();
     if harness != wheel_core::Harness::Claude {
@@ -412,7 +446,9 @@ async fn finish_setup_token(
                 token: token.to_string(),
                 expires_at: None,
             };
-            Some(save_credential_to_vault(s, id, harness, vault, &found)?)
+            Some(save_credential_to_vault(
+                s, id, harness, vault, &found, vault_key,
+            )?)
         }
         None => None,
     };
@@ -529,6 +565,7 @@ async fn finish_paste_code(
     session: Option<Uuid>,
     code: &str,
     save_to_vault: Option<&str>,
+    vault_key: Option<&str>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if code.trim().is_empty() {
         return Err(ApiError::invalid("the code is empty"));
@@ -556,7 +593,9 @@ async fn finish_paste_code(
             let found = crate::auth::oauth_token_from_store(&config_dir).map_err(|e| {
                 ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
             })?;
-            Some(save_credential_to_vault(s, id, harness, vault, &found)?)
+            Some(save_credential_to_vault(
+                s, id, harness, vault, &found, vault_key,
+            )?)
         }
         None => None,
     };
@@ -590,6 +629,7 @@ fn save_credential_to_vault(
     harness: wheel_core::Harness,
     vault_name: &str,
     found: &crate::auth::StoredOauth,
+    requested_key: Option<&str>,
 ) -> ApiResult<serde_json::Value> {
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let vault = board::get_by_name(&conn, vault_name)
@@ -629,6 +669,19 @@ fn save_credential_to_vault(
     // child's environment, so the vault and the spawn cannot disagree.
     let kind = crate::auth::classify_token(&found.token, harness);
     let key = crate::auth::token_env(kind, harness);
+
+    // An explicit key is a confirmation, never an instruction. Disagreeing
+    // with the credential is the exact mistake 018 described, so it is a 400
+    // that names both -- silently correcting it would hide a caller bug, and
+    // obeying it would recreate the leak.
+    if let Some(requested) = requested_key {
+        if !requested.eq_ignore_ascii_case(key) {
+            return Err(ApiError::invalid(format!(
+                "this credential is a {} and must be stored as {key}, not {requested:?}",
+                kind.as_str()
+            )));
+        }
+    }
 
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
