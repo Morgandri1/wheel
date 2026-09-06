@@ -150,6 +150,16 @@ def main():
         R.check("VAL-table-name-atomic", "bad-table" not in names,
                 "a table node survived a failed table creation: %s" % names)
 
+        # No SILENT RENAME (PM ruling 2026-09-06). Refusing and then quietly creating
+        # `bad_table` would satisfy the check above while giving the user a node at an
+        # address they did not choose and cannot predict — and every peer's wires,
+        # preamble and `wheel read` would use the name the user never typed. A refusal
+        # has to refuse.
+        renamed = [n for n in names if n and n.replace("_", "-") == "bad-table"]
+        R.check("VAL-table-name-no-silent-rename", not renamed,
+                "the engine refused `bad-table` and then created %s anyway — the user gets "
+                "a node at an address they never chose" % renamed)
+
         # The SAME name is fine for a type that is not backed by a sqlite table — the
         # narrowing is table-specific, not a general retreat from §3's name rule.
         # A DIFFERENT name: reusing "bad-table" made this assert uniqueness, not naming.

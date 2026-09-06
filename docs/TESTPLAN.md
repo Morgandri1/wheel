@@ -767,6 +767,27 @@ be seconds.
 
 ---
 
+## 11b-ii. MCP — the built-in MCP server (§3c #1)
+
+`wheel mcp-serve` is the PRIMARY agent interface, ahead of the shell, so a fault here is the
+surface an untrusted model uses to reach the board. Driven through the real binary over real
+stdin/stdout: a unit test of the dispatcher cannot see either failure that actually happened
+— a tool advertised with no handler behind it, and a handler registered by an edit that
+matched nothing.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCP-tools-list` | `tools/list` returns a parseable tool set over JSON-RPC 2.0. | S2 |
+| `MCP-every-tool-has-handler` | Every ADVERTISED tool resolves to a real handler. Calling each must produce a denial or an argument error — never "unknown tool". A model does not experience a missing handler as a routing error; it concludes the board is unreliable and stops trying things that would have worked. | **S1** |
+| `MCP-tools-current-without-restart` | The list reflects CURRENT wires: a wire added while an agent runs is usable without a restart, because the list is fetched live from the engine. | S2 |
+| `MCP-tools-list-follows-wires` | Adding a wire never SHRINKS the tool set (asserted as a set difference, so a list that merely changed size cannot pass for the right change). | S2 |
+| `MCP-read-wired` / `MCP-read-unwired-denied` | The wire is the capability through MCP exactly as through the CLI: a wired ctx reads, an unwired one does not. | **S1** |
+| `MCP-read-unwired-denied/meaningful` | **Gates the line above.** The denial only counts if the WIRED read succeeded in the same run — the first version of this suite sent the wrong argument name, so the content was absent because the call was malformed, not because a wire was enforced. A denial assertion that passes against a broken request proves nothing. | **S1** |
+| `MCP-denial-is-explained` | A denial says it was a wire denial, so a model can tell "not allowed" from "not there" and stop retrying. | S2 |
+| `MCP-token-not-in-argv` | The node token reaches the server as a FILE path; no token appears in any command line (§5b: argv is world-readable across uids). | **S1** |
+| `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens change across stop/start, and a rotated token no longer works. Without the first, the second is untestable and rotation is theatre. | **S1** |
+| `VAL-table-name-no-silent-rename` | A table node named with `-` is REFUSED, and the engine does not then create `bad_table` instead. A silent rename would satisfy the atomicity check while handing the user a node at an address they never chose — and every peer's wires, preamble and `wheel read` would use it. | S2 |
+
 ## 11c. ING — endpoint ingress fan-out (§3, SDK session 2 item 1)
 
 Written before the feature, so it lands against a red suite rather than being described by
