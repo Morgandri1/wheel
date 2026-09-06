@@ -45,8 +45,15 @@ def main():
     allowed = pinned.get("allowed") or {}
     expected = set(allowed)
 
+    # Entries ruled in but not yet built. Reported, not failed -- and SELF-EXPIRING: once the
+    # engine actually has one, the marker must go or this gate fails. A pending note that
+    # outlives its change is how a pinned list starts describing something that is not there.
+    pending = pinned.get("pending") or {}
+    landed = sorted(k for k in pending if k in actual)
+    awaited = sorted(k for k in pending if k not in actual)
+
     added = sorted(actual - expected)
-    removed = sorted(expected - actual)
+    removed = sorted(expected - actual - set(pending))
     unexplained = sorted(k for k, v in allowed.items() if not str(v).strip())
 
     print("inherited-env allowlist: %d entr%s in the engine, %d pinned"
@@ -68,6 +75,14 @@ def main():
         fails.append(
             "pinned with an empty reason: %s — a name with no reason is how an allowlist "
             "grows one convenience at a time." % ", ".join(unexplained))
+
+    if awaited:
+        print("  pending (ruled in, not yet in the engine): %s" % ", ".join(awaited))
+    if landed:
+        fails.append(
+            "%s is now IN the engine but still marked pending — the ruling landed, so remove "
+            "it from `pending` and leave it in `allowed`. A pending note that outlives its "
+            "change is how a pinned list starts lying." % ", ".join(landed))
 
     if fails:
         print()

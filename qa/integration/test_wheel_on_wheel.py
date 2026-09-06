@@ -271,6 +271,62 @@ def main():
     else:
         R.skip("WOW-cargo-test", "nothing was cloned, so there is nothing to build")
 
+    # ---- ADVERSARY 029 / PM ruling: WHERE the toolchain vars point, not just that they exist.
+    #
+    # Membership in the F015 allowlist is not safety. RUSTUP_HOME may be inherited ONLY because
+    # it points at an immutable, read-only toolchain outside the data dir: a toolchain a child
+    # can WRITE is a toolchain a child can replace, and every later project then builds with
+    # whatever it left there. CARGO_HOME is the opposite case and must never be inherited —
+    # what a tenant FETCHES is not immutable, and a shared one puts one project's downloaded
+    # sources, and any registry credentials it configures, where the next project can read them.
+    #
+    # qa/contract/env_allowlist.py pins the RULING; this asserts the RUNNING system obeys it.
+    dump = sh("docker", "exec", NAME, "sh", "-c",
+              "cat /data/wheel-fake-env.jsonl 2>/dev/null || true").stdout
+    recs = [json.loads(l) for l in dump.splitlines() if l.strip()]
+    env_of = {}
+    for r in recs:
+        env_of.update(r.get("config") or {})
+    child_names = set()
+    for r in recs:
+        child_names.update(r.get("env_names") or [])
+
+    if not recs:
+        for tid in ("WOW-toolchain-rustup-readonly", "WOW-toolchain-cargo-per-project"):
+            R.skip(tid, "no child spawned, so there is no environment to inspect")
+    else:
+        rustup = env_of.get("RUSTUP_HOME")
+        if rustup is None and "RUSTUP_HOME" not in child_names:
+            R.skip("WOW-toolchain-rustup-readonly",
+                   "RUSTUP_HOME not yet inherited (ADVERSARY 029, SDK lands it after ingress)")
+        else:
+            probe = sh("docker", "exec", NAME, "sh", "-c",
+                       "d=%s; [ -d \"$d\" ] && stat -c '%%a %%u' \"$d\" || echo missing"
+                       % (rustup or "/opt/rust/rustup"))
+            info = probe.stdout.strip()
+            mode = info.split()[0] if info and info != "missing" else ""
+            R.check("WOW-toolchain-rustup-readonly",
+                    (rustup or "").startswith("/opt/") and not (rustup or "").startswith("/data")
+                    and bool(mode) and mode[-2:] in ("55", "44", "05", "00", "50", "40"),
+                    "RUSTUP_HOME=%r stat=%r — it must sit in the image's read-only toolchain "
+                    "dir, never under /data or a project dir, and never be writable by the "
+                    "child uids" % (rustup, info))
+
+        cargo = env_of.get("CARGO_HOME")
+        if cargo is None:
+            R.skip("WOW-toolchain-cargo-per-project",
+                   "the fake harness did not record CARGO_HOME for this spawn")
+        else:
+            probe = sh("docker", "exec", NAME, "sh", "-c",
+                       "[ -d \"%s\" ] && stat -c '%%a' \"%s\" || echo missing" % (cargo, cargo))
+            mode = probe.stdout.strip()
+            R.check("WOW-toolchain-cargo-per-project",
+                    cargo.startswith("/data/projects/") and mode == "700",
+                    "CARGO_HOME=%r mode=%r — it must be per project under /data/projects/<id>, "
+                    "0700 and owned by the project uid. Inherited or shared means one tenant's "
+                    "fetched sources and registry credentials are readable by the next."
+                    % (cargo, mode))
+
     # The token travelled through the engine; it must not have been written down.
     #
     # Gated on the log being READABLE. An unreachable engine returns an error body with
