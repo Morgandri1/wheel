@@ -2,6 +2,7 @@
 
 use crate::auth::jwks::JwksCache;
 use crate::config::Config;
+use crate::db::Db;
 use crate::http::ratelimit::RateLimiter;
 use crate::orchestrator::Orchestrator;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ pub struct AppState(Arc<Inner>);
 
 pub struct Inner {
     pub cfg: Config,
-    pub db: sqlx::PgPool,
+    pub db: Db,
     pub jwks: JwksCache,
     pub http: reqwest::Client,
     pub orch: Arc<dyn Orchestrator>,

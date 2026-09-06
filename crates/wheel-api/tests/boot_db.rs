@@ -37,11 +37,16 @@ async fn migrations_run_against_an_empty_database() {
         "ws_tickets",
         "ingress_rate_limits",
     ] {
+        // information_schema is Postgres's, and this suite only runs against Postgres; the SQLite
+        // schema is covered by tests/sqlite_store.rs, which applies it for real.
+        let wheel_api::db::Db::Pg(pool) = &db else {
+            panic!("this suite runs against postgres");
+        };
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
         )
         .bind(table)
-        .fetch_one(&db)
+        .fetch_one(pool)
         .await
         .unwrap();
         assert!(exists, "{table} should exist after migrations");
@@ -84,23 +89,22 @@ async fn maintenance_reclaims_expired_rows() {
         .expect("db");
 
     let stale_project = uuid::Uuid::new_v4();
-    sqlx::query(
+    wheel_api::db_execute!(
+        &db,
         "INSERT INTO ingress_rate_limits (project_id, window_start, hits) \
          VALUES ($1, now() - interval '3 hours', 1)",
+        stale_project
     )
-    .bind(stale_project)
-    .execute(&db)
-    .await
     .unwrap();
 
     wheel_api::boot::run_maintenance_once(&db).await;
 
-    let left: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1")
-            .bind(stale_project)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let left: i64 = wheel_api::db_scalar!(
+        &db,
+        "SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1",
+        stale_project
+    )
+    .unwrap();
     assert_eq!(
         left, 0,
         "the sweep should have reclaimed a 3-hour-old window"

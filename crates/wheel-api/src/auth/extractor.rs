@@ -147,14 +147,13 @@ fn parse_uuid(s: &str) -> Result<Uuid, ApiError> {
 /// the same code path returning the same `NotFound`, so the two can never drift into an
 /// enumeration oracle where timing or status distinguishes them.
 async fn load_owned(state: &AppState, id: &Uuid, owner_id: &str) -> Result<Project, ApiError> {
-    let row: Option<ProjectRow> = sqlx::query_as::<_, ProjectRow>(
+    let row: Option<ProjectRow> = crate::db_fetch_optional!(
+        &state.db,
         "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
          FROM projects WHERE id = $1 AND owner_id = $2",
-    )
-    .bind(id)
-    .bind(owner_id)
-    .fetch_optional(&state.db)
-    .await?;
+        id,
+        owner_id
+    )?;
 
     row.map(Project::from).ok_or(ApiError::NotFound)
 }
@@ -165,12 +164,11 @@ pub async fn load_unauthenticated_for_ingress(
     state: &AppState,
     id: &Uuid,
 ) -> Result<Project, ApiError> {
-    let row: Option<ProjectRow> = sqlx::query_as::<_, ProjectRow>(
+    let row: Option<ProjectRow> = crate::db_fetch_optional!(
+        &state.db,
         "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
          FROM projects WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
+        id
+    )?;
     row.map(Project::from).ok_or(ApiError::NotFound)
 }

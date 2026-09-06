@@ -8,7 +8,7 @@
 use uuid::Uuid;
 use wheel_api::http::ratelimit::{sweep, RateLimiter};
 
-async fn db() -> Option<sqlx::PgPool> {
+async fn db() -> Option<wheel_api::db::Db> {
     let url = match std::env::var("TEST_DATABASE_URL") {
         Ok(u) => u,
         Err(_) if std::env::var("WHEEL_CI_HAS_DB").as_deref() == Ok("1") => {
@@ -19,15 +19,9 @@ async fn db() -> Option<sqlx::PgPool> {
             return None;
         }
     };
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
+    let pool = wheel_api::db::Db::connect(&url)
         .await
-        .expect("connect");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrate");
+        .expect("connect and migrate");
     Some(pool)
 }
 
@@ -110,31 +104,30 @@ async fn sweep_drops_closed_windows_and_spares_the_current_one() {
 
     // A row from well outside the retention horizon.
     let stale = Uuid::new_v4();
-    sqlx::query(
+    wheel_api::db_execute!(
+        &db,
         "INSERT INTO ingress_rate_limits (project_id, window_start, hits) \
          VALUES ($1, now() - interval '2 hours', 99)",
+        stale
     )
-    .bind(stale)
-    .execute(&db)
-    .await
     .expect("insert stale row");
 
     sweep(&db).await.expect("sweep");
 
-    let stale_left: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1")
-            .bind(stale)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let stale_left: i64 = wheel_api::db_scalar!(
+        &db,
+        "SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1",
+        stale
+    )
+    .unwrap();
     assert_eq!(stale_left, 0, "closed windows must be reclaimed");
 
-    let current_left: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1")
-            .bind(id)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let current_left: i64 = wheel_api::db_scalar!(
+        &db,
+        "SELECT count(*) FROM ingress_rate_limits WHERE project_id = $1",
+        id
+    )
+    .unwrap();
     assert_eq!(
         current_left, 1,
         "sweeping must not reset the window a caller is currently being counted against"

@@ -89,6 +89,19 @@ impl Db {
     }
 }
 
+/// Did this error come from a UNIQUE constraint?
+///
+/// The two backends report it with different codes — Postgres `23505`, SQLite `2067`/`1555` — and
+/// the distinction matters at exactly one place: a duplicate email is a conflict the caller caused,
+/// not a server fault, and reporting it as a 500 would tell a user their signup broke when in fact
+/// the address is taken.
+pub fn is_unique_violation(e: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = e else {
+        return false;
+    };
+    matches!(db.code().as_deref(), Some("23505" | "2067" | "1555"))
+}
+
 /// The filesystem path inside a `sqlite:` URL, or `None` if this is not one.
 ///
 /// Accepts the spellings people actually write — `sqlite:x.db`, `sqlite://x.db`,

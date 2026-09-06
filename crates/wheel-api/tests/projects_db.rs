@@ -99,7 +99,7 @@ fn token(sub: &str) -> String {
 /// `stranger_cannot_mutate_or_proxy` — which reads as a flaky *security* check. Nothing is more
 /// corrosive than a boundary test that cries wolf, so the destructive reset is serialised here and
 /// per-test isolation comes from unique subjects instead.
-async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
+async fn app() -> Option<(axum::Router, wheel_api::db::Db)> {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     // Skipping is a convenience for a laptop without a database, never for CI. These tests are the
@@ -131,20 +131,9 @@ async fn app() -> Option<(axum::Router, sqlx::PgPool)> {
     // sees "A Tokio 1.x context was found, but it is being shutdown" followed by pool timeouts.
     // That failure is intermittent and reads like a boundary bug, which is the worst kind of
     // fixture defect. Two connections per test keeps the total well inside the server's limit.
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(&url)
+    let db = wheel_api::db::Db::connect(&url)
         .await
-        .expect("connect to TEST_DATABASE_URL");
-
-    // Idempotent, so it is safe to run per test. Tests isolate from each other by using a unique
-    // subject per test (see `user()`) rather than by truncating shared tables, so no test needs a
-    // clean slate and none can pull the schema out from under another.
-    sqlx::migrate!("./migrations")
-        .run(&db)
-        .await
-        .expect("run migrations");
+        .expect("connect and migrate");
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {

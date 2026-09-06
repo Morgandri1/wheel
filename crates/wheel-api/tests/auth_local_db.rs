@@ -42,7 +42,7 @@ fn cfg(db_url: &str, mode: AuthMode) -> Config {
     }
 }
 
-async fn app_with(mode: AuthMode) -> Option<(Router, sqlx::PgPool)> {
+async fn app_with(mode: AuthMode) -> Option<(Router, wheel_api::db::Db)> {
     let url = match std::env::var("TEST_DATABASE_URL") {
         Ok(u) => u,
         Err(_) if std::env::var("WHEEL_CI_HAS_DB").as_deref() == Ok("1") => {
@@ -53,12 +53,9 @@ async fn app_with(mode: AuthMode) -> Option<(Router, sqlx::PgPool)> {
             return None;
         }
     };
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
+    let db = wheel_api::db::Db::connect(&url)
         .await
-        .expect("connect");
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        .expect("connect and migrate");
 
     let state = AppState::new(Inner {
         jwks: wheel_api::auth::jwks::JwksCache::new(
@@ -76,7 +73,7 @@ async fn app_with(mode: AuthMode) -> Option<(Router, sqlx::PgPool)> {
     Some((wheel_api::build_router(state, &[]), db))
 }
 
-async fn app() -> Option<(Router, sqlx::PgPool)> {
+async fn app() -> Option<(Router, wheel_api::db::Db)> {
     app_with(AuthMode::Local).await
 }
 

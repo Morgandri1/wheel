@@ -5,6 +5,7 @@
 //! changes configuration rather than code: both paths end at the same `VerifiedUser`, and the
 //! ownership extractor never learns which one produced it.
 
+use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -125,25 +126,24 @@ fn dummy_hash() -> &'static str {
     "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$5s4/dGvBGnJvVOtY0Xh3TfCJyaS3rSU0aVEEeC0dxKQ"
 }
 
-pub async fn create_user(db: &sqlx::PgPool, email: &str, password: &str) -> ApiResult<User> {
+pub async fn create_user(db: &Db, email: &str, password: &str) -> ApiResult<User> {
     let email = validate_email(email).map_err(ApiError::BadRequest)?;
     validate_password(password).map_err(ApiError::BadRequest)?;
     let hash = hash_password(password)?;
     let id = Uuid::new_v4();
 
-    let row = sqlx::query_as::<_, UserRow>(
+    let row: Result<UserRow, _> = crate::db_fetch_one!(
+        db,
         "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) \
          RETURNING id, email, password_hash, created_at",
-    )
-    .bind(id)
-    .bind(&email)
-    .bind(&hash)
-    .fetch_one(db)
-    .await
-    .map_err(|e| match &e {
-        // 23505 = unique_violation. Reported as a conflict rather than a 500, but see the note in
-        // the signup handler about what we tell the caller.
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
+        id,
+        &email,
+        &hash
+    );
+    let row = row.map_err(|e| match &e {
+        // A conflict the caller caused rather than a 500 — but see the note in the signup handler
+        // about what we actually tell them.
+        _ if crate::db::is_unique_violation(&e) => {
             ApiError::Conflict("an account with that email already exists".into())
         }
         _ => ApiError::from(e),
@@ -160,15 +160,14 @@ pub async fn create_user(db: &sqlx::PgPool, email: &str, password: &str) -> ApiR
 ///
 /// Returns `None` for every failure — unknown email, wrong password, malformed input — and takes
 /// the same work in each case, so the caller cannot distinguish them and neither can an attacker.
-pub async fn authenticate(db: &sqlx::PgPool, email: &str, password: &str) -> Option<User> {
+pub async fn authenticate(db: &Db, email: &str, password: &str) -> Option<User> {
     let email = validate_email(email).ok();
     let row: Option<UserRow> = match &email {
-        Some(e) => sqlx::query_as::<_, UserRow>(
+        Some(e) => crate::db_fetch_optional!(
+            db,
             "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
+            e
         )
-        .bind(e)
-        .fetch_optional(db)
-        .await
         .ok()
         .flatten(),
         None => None,
@@ -189,13 +188,12 @@ pub async fn authenticate(db: &sqlx::PgPool, email: &str, password: &str) -> Opt
     }
 }
 
-pub async fn find_user(db: &sqlx::PgPool, id: &Uuid) -> ApiResult<Option<User>> {
-    let row: Option<UserRow> = sqlx::query_as::<_, UserRow>(
+pub async fn find_user(db: &Db, id: &Uuid) -> ApiResult<Option<User>> {
+    let row: Option<UserRow> = crate::db_fetch_optional!(
+        db,
         "SELECT id, email, password_hash, created_at FROM users WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
+        id
+    )?;
     Ok(row.map(|r| User {
         id: r.id,
         email: r.email,
@@ -203,20 +201,14 @@ pub async fn find_user(db: &sqlx::PgPool, id: &Uuid) -> ApiResult<Option<User>> 
     }))
 }
 
-pub async fn change_password(
-    db: &sqlx::PgPool,
-    user_id: &Uuid,
-    current: &str,
-    new: &str,
-) -> ApiResult<()> {
+pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) -> ApiResult<()> {
     validate_password(new).map_err(ApiError::BadRequest)?;
 
-    let row: UserRow = sqlx::query_as::<_, UserRow>(
+    let row: UserRow = crate::db_fetch_one!(
+        db,
         "SELECT id, email, password_hash, created_at FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_one(db)
-    .await?;
+        user_id
+    )?;
 
     // Proving the current password is what stops a stolen session token from becoming a permanent
     // takeover: an attacker with the token still cannot lock the owner out.
@@ -225,19 +217,43 @@ pub async fn change_password(
     }
 
     let hash = hash_password(new)?;
-    let mut tx = db.begin().await?;
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-        .bind(user_id)
-        .bind(&hash)
-        .execute(&mut *tx)
-        .await?;
-    // Every other session dies with the old password. If the password was changed because it was
-    // compromised, leaving old sessions alive would defeat the point of changing it.
-    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+
+    // Both statements or neither. Every other session dies with the old password — if it was
+    // changed because it was compromised, leaving the old sessions alive defeats the point — and a
+    // new password whose revocation did not commit would be exactly that failure, silently.
+    //
+    // Written out per backend rather than through the dispatch macros because a transaction is a
+    // connection, not a pool, and sqlx types it per database.
+    const SET_PASSWORD: &str = "UPDATE users SET password_hash = $2 WHERE id = $1";
+    const REVOKE_SESSIONS: &str = "DELETE FROM sessions WHERE user_id = $1";
+    match db {
+        Db::Pg(pool) => {
+            let mut tx = pool.begin().await?;
+            sqlx::query(SET_PASSWORD)
+                .bind(user_id)
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(REVOKE_SESSIONS)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Db::Sqlite(pool) => {
+            let mut tx = pool.begin().await?;
+            sqlx::query(SET_PASSWORD)
+                .bind(user_id)
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(REVOKE_SESSIONS)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+    }
     Ok(())
 }
 
@@ -249,7 +265,7 @@ pub struct IssuedSession {
 }
 
 pub async fn issue_session(
-    db: &sqlx::PgPool,
+    db: &Db,
     user_id: &Uuid,
     secret: &str,
     issuer: &str,
@@ -258,12 +274,13 @@ pub async fn issue_session(
     let now = Utc::now();
     let expires_at = now + Duration::days(SESSION_TTL_DAYS);
 
-    sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)")
-        .bind(sid)
-        .bind(user_id)
-        .bind(expires_at)
-        .execute(db)
-        .await?;
+    crate::db_execute!(
+        db,
+        "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)",
+        sid,
+        user_id,
+        expires_at
+    )?;
 
     let claims = SessionClaims {
         sub: user_id.to_string(),
@@ -287,7 +304,7 @@ pub async fn issue_session(
 /// Signature and claims are checked first, then the session row: a stateless JWT alone cannot be
 /// logged out, and "log out" that leaves the token working is not a logout.
 pub async fn verify_session(
-    db: &sqlx::PgPool,
+    db: &Db,
     token: &str,
     secret: &str,
     issuer: &str,
@@ -309,11 +326,13 @@ pub async fn verify_session(
     let sid = Uuid::parse_str(&data.claims.sid)
         .map_err(|_| ApiError::Unauthorized("session id is not a uuid"))?;
 
-    let live: Option<Uuid> =
-        sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1 AND expires_at > now()")
-            .bind(sid)
-            .fetch_optional(db)
-            .await?;
+    // Expiry is judged by the database clock on both backends, so replicas cannot disagree about
+    // whether a session is still alive.
+    const PG: &str = "SELECT user_id FROM sessions WHERE id = $1 AND expires_at > now()";
+    const SQLITE: &str = "SELECT user_id FROM sessions \
+         WHERE id = $1 AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+    let live: Option<(Uuid,)> = crate::db_fetch_optional!(db, db.pick(PG, SQLITE), sid)?;
+    let live = live.map(|r| r.0);
 
     match live {
         Some(user_id) if user_id.to_string() == data.claims.sub => Ok(data.claims.sub),
@@ -322,12 +341,7 @@ pub async fn verify_session(
     }
 }
 
-pub async fn revoke_session(
-    db: &sqlx::PgPool,
-    token: &str,
-    secret: &str,
-    issuer: &str,
-) -> ApiResult<()> {
+pub async fn revoke_session(db: &Db, token: &str, secret: &str, issuer: &str) -> ApiResult<()> {
     let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     v.set_issuer(&[issuer]);
     // Accept an expired token here: logging out of an already-expired session should succeed
@@ -342,21 +356,18 @@ pub async fn revoke_session(
         &v,
     ) {
         if let Ok(sid) = Uuid::parse_str(&data.claims.sid) {
-            sqlx::query("DELETE FROM sessions WHERE id = $1")
-                .bind(sid)
-                .execute(db)
-                .await?;
+            crate::db_execute!(db, "DELETE FROM sessions WHERE id = $1", sid)?;
         }
     }
     Ok(())
 }
 
 /// Delete sessions that have already expired. Idempotent, safe in every replica.
-pub async fn sweep(db: &sqlx::PgPool) -> anyhow::Result<u64> {
-    let r = sqlx::query("DELETE FROM sessions WHERE expires_at < now()")
-        .execute(db)
-        .await?;
-    Ok(r.rows_affected())
+pub async fn sweep(db: &Db) -> anyhow::Result<u64> {
+    const PG: &str = "DELETE FROM sessions WHERE expires_at < now()";
+    const SQLITE: &str =
+        "DELETE FROM sessions WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+    Ok(crate::db_execute!(db, db.pick(PG, SQLITE))?)
 }
 
 #[cfg(test)]

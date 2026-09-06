@@ -6,6 +6,7 @@
 
 use crate::auth::{AuthUser, ProjectScope};
 use crate::crypto;
+use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{validate_project_name, Capabilities, Project, ProjectRow, ProjectStatus};
 use crate::orchestrator::EngineSecrets;
@@ -37,10 +38,11 @@ pub async fn create(
     validate_project_name(&name).map_err(ApiError::BadRequest)?;
 
     // Per-user quota. Checked before we do any work that costs money or disk.
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE owner_id = $1")
-        .bind(user.id())
-        .fetch_one(&state.db)
-        .await?;
+    let count: i64 = crate::db_scalar!(
+        &state.db,
+        "SELECT count(*) FROM projects WHERE owner_id = $1",
+        user.id()
+    )?;
     if count >= state.cfg.max_projects_per_user {
         return Err(ApiError::Conflict(format!(
             "project limit reached ({} per user)",
@@ -58,29 +60,55 @@ pub async fn create(
 
     // Row and secrets are written atomically: a project without secrets could never start, and a
     // secret row without a project would be an orphan holding key material.
-    let mut tx = state.db.begin().await?;
-    let row: ProjectRow = sqlx::query_as::<_, ProjectRow>(
-        "INSERT INTO projects (id, owner_id, name, capabilities, status) \
+    //
+    // Spelled out per backend rather than through the dispatch macros because a transaction is a
+    // connection, not a pool, and sqlx types it per database.
+    const INSERT_PROJECT: &str = "INSERT INTO projects (id, owner_id, name, capabilities, status) \
          VALUES ($1, $2, $3, $4, 'stopped') \
-         RETURNING id, owner_id, name, capabilities, status, created_at, updated_at",
-    )
-    .bind(id)
-    .bind(user.id())
-    .bind(&name)
-    .bind(serde_json::to_value(Capabilities::default()).expect("capabilities serialise"))
-    .fetch_one(&mut *tx)
-    .await?;
-
-    sqlx::query(
+         RETURNING id, owner_id, name, capabilities, status, created_at, updated_at";
+    const INSERT_SECRETS: &str =
         "INSERT INTO project_secrets (project_id, engine_secret_enc, vault_key_enc) \
-         VALUES ($1, $2, $3)",
-    )
-    .bind(id)
-    .bind(&engine_enc)
-    .bind(&vault_enc)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
+         VALUES ($1, $2, $3)";
+    let caps = serde_json::to_value(Capabilities::default()).expect("capabilities serialise");
+
+    let row: ProjectRow = match &state.db {
+        Db::Pg(pool) => {
+            let mut tx = pool.begin().await?;
+            let row = sqlx::query_as::<_, ProjectRow>(INSERT_PROJECT)
+                .bind(id)
+                .bind(user.id())
+                .bind(&name)
+                .bind(&caps)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query(INSERT_SECRETS)
+                .bind(id)
+                .bind(&engine_enc)
+                .bind(&vault_enc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            row
+        }
+        Db::Sqlite(pool) => {
+            let mut tx = pool.begin().await?;
+            let row = sqlx::query_as::<_, ProjectRow>(INSERT_PROJECT)
+                .bind(id)
+                .bind(user.id())
+                .bind(&name)
+                .bind(&caps)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query(INSERT_SECRETS)
+                .bind(id)
+                .bind(&engine_enc)
+                .bind(&vault_enc)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            row
+        }
+    };
 
     // Provision outside the transaction: sandbox creation is not transactional, and holding a pg
     // transaction open across it would pin a connection for seconds.
@@ -98,13 +126,12 @@ pub async fn create(
 }
 
 pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<Project>>> {
-    let rows: Vec<ProjectRow> = sqlx::query_as::<_, ProjectRow>(
+    let rows: Vec<ProjectRow> = crate::db_fetch_all!(
+        &state.db,
         "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
          FROM projects WHERE owner_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(user.id())
-    .fetch_all(&state.db)
-    .await?;
+        user.id()
+    )?;
     Ok(Json(
         rows.into_iter()
             .map(|r| Project::from(r).with_ingress_base(&state.cfg.public_base_url))
@@ -141,20 +168,26 @@ pub async fn update(
         .map(|c| serde_json::to_value(c).expect("capabilities serialise"));
 
     // COALESCE keeps this a single statement while leaving omitted fields untouched.
-    let row: ProjectRow = sqlx::query_as::<_, ProjectRow>(
-        "UPDATE projects SET \
+    const PG: &str = "UPDATE projects SET \
            name = COALESCE($3, name), \
            capabilities = COALESCE($4, capabilities), \
            updated_at = now() \
          WHERE id = $1 AND owner_id = $2 \
-         RETURNING id, owner_id, name, capabilities, status, created_at, updated_at",
-    )
-    .bind(scope.project.id)
-    .bind(scope.user.id())
-    .bind(body.name.as_ref().map(|n| n.trim()))
-    .bind(caps)
-    .fetch_one(&state.db)
-    .await?;
+         RETURNING id, owner_id, name, capabilities, status, created_at, updated_at";
+    const SQLITE: &str = "UPDATE projects SET \
+           name = COALESCE($3, name), \
+           capabilities = COALESCE($4, capabilities), \
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = $1 AND owner_id = $2 \
+         RETURNING id, owner_id, name, capabilities, status, created_at, updated_at";
+    let row: ProjectRow = crate::db_fetch_one!(
+        &state.db,
+        state.db.pick(PG, SQLITE),
+        scope.project.id,
+        scope.user.id(),
+        body.name.as_ref().map(|n| n.trim()),
+        caps
+    )?;
     Ok(Json(
         Project::from(row).with_ingress_base(&state.cfg.public_base_url),
     ))
@@ -172,22 +205,22 @@ pub async fn destroy(
         .await
         .map_err(ApiError::Internal)?;
 
-    sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_id = $2")
-        .bind(scope.project.id)
-        .bind(scope.user.id())
-        .execute(&state.db)
-        .await?;
+    crate::db_execute!(
+        &state.db,
+        "DELETE FROM projects WHERE id = $1 AND owner_id = $2",
+        scope.project.id,
+        scope.user.id()
+    )?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Decrypt this project's engine secrets, in the encoding the engine spawn contract requires.
 async fn load_secrets(state: &AppState, id: &Uuid) -> ApiResult<EngineSecrets> {
-    let row: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+    let row: (Vec<u8>, Vec<u8>) = crate::db_fetch_one!(
+        &state.db,
         "SELECT engine_secret_enc, vault_key_enc FROM project_secrets WHERE project_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await?;
+        id
+    )?;
     let engine_secret = crypto::open(&state.cfg.master_key, &row.0).map_err(ApiError::Internal)?;
     let vault_key = crypto::open(&state.cfg.master_key, &row.1).map_err(ApiError::Internal)?;
     let vault_key = crypto::canonical_vault_key(&vault_key).map_err(ApiError::Internal)?;
@@ -284,23 +317,21 @@ pub async fn restart(
 }
 
 async fn set_status(state: &AppState, id: &Uuid, status: ProjectStatus) -> ApiResult<()> {
-    sqlx::query("UPDATE projects SET status = $2, updated_at = now() WHERE id = $1")
-        .bind(id)
-        .bind(status.as_str())
-        .execute(&state.db)
-        .await?;
+    const PG: &str = "UPDATE projects SET status = $2, updated_at = now() WHERE id = $1";
+    const SQLITE: &str =
+        "UPDATE projects SET status = $2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = $1";
+    crate::db_execute!(&state.db, state.db.pick(PG, SQLITE), id, status.as_str())?;
     Ok(())
 }
 
 async fn reload(state: &AppState, scope: &ProjectScope) -> ApiResult<Json<Project>> {
-    let row: ProjectRow = sqlx::query_as::<_, ProjectRow>(
+    let row: ProjectRow = crate::db_fetch_one!(
+        &state.db,
         "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
          FROM projects WHERE id = $1 AND owner_id = $2",
-    )
-    .bind(scope.project.id)
-    .bind(scope.user.id())
-    .fetch_one(&state.db)
-    .await?;
+        scope.project.id,
+        scope.user.id()
+    )?;
     Ok(Json(
         Project::from(row).with_ingress_base(&state.cfg.public_base_url),
     ))

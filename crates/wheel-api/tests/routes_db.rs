@@ -118,12 +118,9 @@ async fn app(engine: String) -> Option<Router> {
             return None;
         }
     };
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
+    let db = wheel_api::db::Db::connect(&url)
         .await
-        .expect("connect to TEST_DATABASE_URL");
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        .expect("connect and migrate");
 
     let state = AppState::new(Inner {
         jwks: wheel_api::auth::jwks::JwksCache::new(
