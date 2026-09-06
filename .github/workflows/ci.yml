@@ -198,6 +198,34 @@ jobs:
           name: integration-logs-${{ matrix.backend }}
           path: qa/.artifacts/
 
+  wheel-on-wheel:
+    name: wheel-on-wheel (agent clones and builds Wheel)
+    runs-on: ubuntu-latest
+    # The build leg compiles wheel-core inside the sandbox. On the shared dev host, with
+    # six agents resident, it is OOM-killed before it finishes -- so it runs HERE, on a
+    # runner with the machine to itself, and stays WHEEL_WOW_SKIP_BUILD=1 locally
+    # (PM ruling 2026-09-06). The clone leg is the cheap half and runs in both places.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make bootstrap
+      - run: make engine-image-test
+      - name: Agent clones and builds Wheel inside its own sandbox
+        run: python3 qa/integration/test_wheel_on_wheel.py
+        env:
+          WHEEL_WOW: "1"
+          # The suite's own preflight skips by name when this is absent, so a fork without
+          # the secret reports "no GitHub token" rather than a spurious red.
+          WHEEL_WOW_GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload the engine's log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-on-wheel-logs
+          path: qa/artifacts/
+
   e2e:
     name: e2e (playwright)
     runs-on: ubuntu-latest
