@@ -44,7 +44,20 @@ test("agent api-key auth: needs_auth -> authenticate -> authenticated, key never
     // here and then do nothing when they try.
     await expectHydrated(page.getByTestId("auth-needs-auth-callout"), "the needs_auth callout");
 
+    // The API key is deliberately NOT the first thing offered any more: signing in with an
+    // Anthropic account is the native path (contract §2 — "API keys are a hidden advanced
+    // fallback"), so the key field lives behind "Other ways to sign in". This spec tests the
+    // fallback, so it navigates to it the way a person would. The assertions below are unchanged.
+    // Open the disclosure only if it is closed. A bare click toggles, so if the panel ever
+    // starts open by default this would CLOSE it and the failure would read as "the API-key
+    // field does not exist" — which is what sent this spec into a timeout the first time.
+    // Navigating to a state should be idempotent, not a flip.
     const field = page.getByTestId("input-api-key");
+    if (!(await field.isVisible().catch(() => false))) {
+      await page.getByTestId("btn-auth-other-ways").click();
+    }
+    await expect(field).toBeVisible();
+
     await expect(field).toHaveAttribute("type", "password");
     await field.fill(KEY);
     await page.getByTestId("btn-auth-complete").click();

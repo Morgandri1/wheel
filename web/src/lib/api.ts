@@ -254,7 +254,20 @@ export function engineApi(projectId: string) {
 
       /** Exactly what an agent would see: enabled ops, agent-mode fields only. */
       ops: (nodeId: string) =>
-        request<{ operations: { id: string; description?: string; input_schema: unknown }[] }>(
+        // `name` is the MCP tool name the engine actually exposes. Taking it from here rather
+        // than rebuilding it as `<tool>__<op>` is the point of this endpoint: the UI's "what can
+        // the agent do" and the agent's own view are meant to be incapable of drifting, and a
+        // name the UI computes can quietly stop matching the one agents call.
+        request<{
+          tool?: string;
+          operations: {
+            id: string;
+            name?: string;
+            summary?: string;
+            description?: string;
+            input_schema: unknown;
+          }[];
+        }>(
           engine(projectId, `/tools/${nodeId}/ops`),
           p,
         ),

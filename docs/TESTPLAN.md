@@ -340,6 +340,23 @@ deployed.
 | `DEPLOY-healthz-is-ours` | The 200 carries our health body. A parked page, an edge cache or another service on the domain answers 200 just as happily, so status alone proves only that something on the internet replied. | S2 |
 | `DEPLOY-healthz-host` | The same for `wheel-host`. It has no public domain by design (§5b), so this needs an API-proxied liveness route; **skipped by name** until API adds one — the host holds every project's engine secret, and "never checked" must not read as "fine". | S2 |
 
+### 5b. MCP — the board as tools a model can call (§3c #1)
+
+Driven the way Claude drives it: `wheel mcp-serve` as a child process speaking
+line-delimited JSON-RPC 2.0 on stdin/stdout — not the HTTP route underneath. The framing is
+part of what can break, and a model is the only consumer.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCP-initialize` | `initialize` returns a protocol version. |
+| `MCP-tools-list` | `tools/list` returns tools. |
+| `MCP-advertised-has-handler` | **Every advertised tool resolves to a handler** — no `-32602 unknown tool`. SDK shipped `run` and `ctx_clear` advertised with nothing behind them; a tool that resolves to nothing teaches a model the board is unreliable and it stops trying things that would have worked. Advertising is a promise. A wire denial or bad argument is fine here: the claim is the tool EXISTS, not that the call succeeds. | **S2** |
+| `MCP-unknown-tool-is-refused` | **Positive control.** A made-up tool name *is* refused with `-32602`. Without it, a server that answered every name would make the check above pass vacuously. | S2 |
+| `MCP-tools-live-wires` | A wire added AFTER `mcp-serve` started appears in the next `tools/list`, same process, no restart — otherwise a model must be restarted to notice a node it was just granted. Must run BEFORE any destructive check: the call-everything sweep invokes `ctx_clear`, which rotates the session, and this then fails with "expired token" while reading like an engine bug. | S2 |
+| `MCP-token-not-in-argv` | The node token never appears in any process command line; argv is world-readable across uids (§5b). | **S1** |
+| `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens rotate on agent start, and a client holding the previous one is refused — otherwise a stopped agent's credential outlives the agent. | **S1** |
+| `WM-table-name-hyphen` | A table node named with `-` is REFUSED, the message names the fix, and nothing is silently renamed to `table_1`. PM ruling: §3 permits `-` in node names, a table node's name becomes `t_<name>`, and a node whose address is not what the user typed is unaddressable by the agent that was told about it. | S2 |
+
 ---
 
 ## 6. CLI — the `wheel` binary (§3c)
@@ -749,6 +766,80 @@ be seconds.
 | `WOW-no-token-in-log` | The git token appears in no log line, no transcript, no event, and no `git remote -v` output the agent can print. Cloning with a token in the URL is the ordinary way to do this and it writes the secret into `.git/config`. | **S1** |
 
 ---
+
+## 11b-ii. MCP — the built-in MCP server (§3c #1)
+
+`wheel mcp-serve` is the PRIMARY agent interface, ahead of the shell, so a fault here is the
+surface an untrusted model uses to reach the board. Driven through the real binary over real
+stdin/stdout: a unit test of the dispatcher cannot see either failure that actually happened
+— a tool advertised with no handler behind it, and a handler registered by an edit that
+matched nothing.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCP-tools-list` | `tools/list` returns a parseable tool set over JSON-RPC 2.0. | S2 |
+| `MCP-every-tool-has-handler` | Every ADVERTISED tool resolves to a real handler. Calling each must produce a denial or an argument error — never "unknown tool". A model does not experience a missing handler as a routing error; it concludes the board is unreliable and stops trying things that would have worked. | **S1** |
+| `MCP-tools-current-without-restart` | The list reflects CURRENT wires: a wire added while an agent runs is usable without a restart, because the list is fetched live from the engine. | S2 |
+| `MCP-tools-list-follows-wires` | Adding a wire never SHRINKS the tool set (asserted as a set difference, so a list that merely changed size cannot pass for the right change). | S2 |
+| `MCP-read-wired` / `MCP-read-unwired-denied` | The wire is the capability through MCP exactly as through the CLI: a wired ctx reads, an unwired one does not. | **S1** |
+| `MCP-read-unwired-denied/meaningful` | **Gates the line above.** The denial only counts if the WIRED read succeeded in the same run — the first version of this suite sent the wrong argument name, so the content was absent because the call was malformed, not because a wire was enforced. A denial assertion that passes against a broken request proves nothing. | **S1** |
+| `MCP-denial-is-explained` | A denial says it was a wire denial, so a model can tell "not allowed" from "not there" and stop retrying. | S2 |
+| `MCP-token-not-in-argv` | The node token reaches the server as a FILE path; no token appears in any command line (§5b: argv is world-readable across uids). | **S1** |
+| `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens change across stop/start, and a rotated token no longer works. Without the first, the second is untestable and rotation is theatre. | **S1** |
+| `VAL-table-name-no-silent-rename` | A table node named with `-` is REFUSED, and the engine does not then create `bad_table` instead. A silent rename would satisfy the atomicity check while handing the user a node at an address they never chose — and every peer's wires, preamble and `wheel read` would use it. | S2 |
+
+## 11c. ING — endpoint ingress fan-out (§3, SDK session 2 item 1)
+
+Written before the feature, so it lands against a red suite rather than being described by
+whatever it happens to do. Ingress is the only path where a **stranger** reaches the board:
+everything else requires a node token or the engine secret.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ING-agent-envelope` | A hit on an `endpoint→agent (send)` wire arrives as `<AgentPrompt from="<endpoint>" type="endpoint">` carrying `{method, path, headers, body}`. `type` is `endpoint`, never `user` — an agent that cannot tell a stranger's request from its operator's instruction has no basis for caution. | **S1** |
+| `ING-headers-subset` | Only the documented header subset is forwarded. `Authorization`, `Cookie` and the bearer the endpoint itself consumed must NOT reach the agent: the agent is untrusted code and the credential is not its business. | **S1** |
+| `ING-body-cap` | A body over 5 MiB is refused at the boundary with no partial delivery — never truncated into an agent's context, where a half-body reads as a whole one. | S2 |
+| `ING-table-insert` | `endpoint→table (write)` inserts the JSON body as a row; a body that does not match the columns is refused, not silently coerced. | S2 |
+| `ING-script-response` | `endpoint→script` with `response_mode: script` returns the script's **stdout** as the HTTP body. With `response_mode: ack` the stdout is NOT returned, so a script cannot leak into a response the operator did not ask for. | S2 |
+| `ING-auth-bearer` | `auth.mode: bearer` resolves via the endpoint's `vault_ref`. A mismatch is **401 with an empty body** — no hint, no length difference, nothing an attacker can measure. | **S1** |
+| `ING-auth-requires-wire` | A `bearer` endpoint with no `endpoint→vault (read)` wire fails CLOSED (refuses every request), never open. | **S1** |
+| `ING-capability-off` | With project capability `http: false`, `/p/<id>/*` is **403 at the API** and the request never reaches the engine — asserted by the engine seeing no request, not merely by the status code. | **S1** |
+| `ING-ratelimit` | The documented rate limit is enforced and the limiter cannot be reset by a spoofed `X-Forwarded-For` (R4, same shape as the auth limiter). | S2 |
+| `ING-no-such-endpoint` | A path with no endpoint node is 404 and does not disclose which project ids or endpoint names exist. | S2 |
+
+## 11d. SCR — script nodes (§3, SDK session 2 item 2)
+
+A script is code the operator wrote running next to code an agent wrote. The interesting
+question is not "does it run" but "what can it reach".
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `SCR-token-scope` | A script's `WHEEL_TOKEN` obeys **the script's own wires**, not its caller's. An agent with wide wires invoking a narrow script must not lend it that reach — otherwise `wheel run` is a confused deputy and every script is a privilege-escalation gadget. | **S1** |
+| `SCR-token-file` | The script receives `WHEEL_TOKEN_FILE`, not a token on the command line (§5b: argv is world-readable across uids). | **S1** |
+| `SCR-timeout` | `timeout_secs` is enforced, capped at 300, and a killed script reports a timeout — distinguishable from a script that exited non-zero. | S2 |
+| `SCR-output-cap` | Output over 1 MiB is capped, and the caller is told it was capped rather than handed a silently shortened result. | S2 |
+| `SCR-unprivileged` | The script runs as the node's uid, not the engine's, and cannot read another node's config dir. | **S1** |
+| `SCR-no-wire-denied` | `wheel run <script>` without an `agent→script (read)` wire is exit 3. | **S1** |
+| `SCR-mcp-run-real` | The MCP `run` tool is advertised **only when a script node exists and is wired**. SDK removed `run` rather than stub it for exactly this reason: a tool that resolves to 404 teaches a model the board is unreliable, and it stops trying things that would have worked. | S2 |
+
+## 11e. CHEST — blob store (§3, SDK session 2 item 3)
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `CHEST-traversal` | `..`, absolute paths, and encoded variants (`%2e%2e`, `..%2f`, backslashes) are refused. Asserted by the file NOT existing outside the chest dir, never only by the status code. | **S1** |
+| `CHEST-symlink-escape` | A symlink inside the chest pointing outside it does not let a read or write escape — the check must be on the resolved path, not the requested one. | **S1** |
+| `CHEST-size-cap` | A blob over 50 MiB is refused, and the partial upload does not remain on disk. | S2 |
+| `CHEST-write-implies-read` | A `write` wire can read; a `read` wire cannot write (exit 3). | S2 |
+| `CHEST-ls-scope` | `wheel ls <chest> [prefix]` lists only that chest, and a prefix cannot escape it. | S2 |
+
+## 11f. MCPNODE — MCP nodes attached at agent start (§3, SDK session 2 item 4)
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCPNODE-config-from-wires` | The generated harness config contains exactly the mcp nodes the agent has a `read` wire to — asserted as a SET, so an extra server is a failure and not just a missing one. | **S1** |
+| `MCPNODE-ssrf` | `mcp.url` is subject to the §3d SSRF policy: loopback, RFC1918, link-local, `*.internal` and `*.railway.internal` are refused, including via redirect and via a DNS name that resolves to them. | **S1** |
+| `MCPNODE-no-secret-in-config` | Vault-sourced values in `mcp.env` do not appear in any world-readable file, and the config file is 0600 to the node's uid. | **S1** |
+| `MCPNODE-unwired-absent` | An mcp node that exists but is not wired to this agent does not appear in its config. | S2 |
 
 ## 12. BACK / PERF — backends and scale
 

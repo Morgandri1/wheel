@@ -381,10 +381,12 @@ function AgentView({ node, api, projectId }: { node: ToolNode; api: EngineApi; p
         <ul className="flex flex-col gap-2">
           {ops.data.operations.map((op) => (
             <li key={op.id} className="border border-rule p-2" data-testid={`tool-agent-op-${op.id}`}>
-              <p className="ident text-micro text-ink">
-                {node.name}__{op.id}
-              </p>
-              {op.description ? <p className="text-micro text-ink-dim">{op.description}</p> : null}
+              {/* The engine's own name, not one assembled here — see api.ts. The fallback covers
+                  an engine too old to send it and is not the expected path. */}
+              <p className="ident text-micro text-ink">{op.name ?? `${node.name}__${op.id}`}</p>
+              {op.description ?? op.summary ? (
+                <p className="text-micro text-ink-dim">{op.description ?? op.summary}</p>
+              ) : null}
               <pre className="ident mt-1 overflow-x-auto text-micro text-ink-faint">
                 {JSON.stringify(op.input_schema, null, 2)}
               </pre>

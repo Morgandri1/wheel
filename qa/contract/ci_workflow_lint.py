@@ -17,6 +17,30 @@ CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 # did not, and 127 assertions ran only on one laptop while CI reported green.
 DISABLED_OK = {}
 
+def check_relocated_gates(doc):
+    """Gates that `make check` cannot run must still run SOMEWHERE, provably.
+
+    qa:image-contents needs an engine image; `make check` builds none, so it is marked not
+    applicable there and runs in the CI job that does build one. That is a reasonable trade
+    and a dangerous one: "moved to another job" and "silently stopped running" look exactly
+    alike from a green summary. This asserts the destination still exists -- the same job
+    must both build the image and invoke the gate.
+    """
+    fails = []
+    for name, job in (doc.get("jobs") or {}).items():
+        steps = job.get("steps") or []
+        runs = " \n".join(str(st.get("run") or "") for st in steps if isinstance(st, dict))
+        if "engine-image" in runs and "image_contents.py" in runs:
+            return []          # found a job that builds the image and checks it
+    fails.append(
+        "no CI job both runs `make engine-image` AND invokes qa/contract/image_contents.py. "
+        "That gate is marked NOT APPLICABLE in `make check` because nothing builds an image "
+        "there, on the promise that CI runs it — this is the check that the promise is kept. "
+        "Either restore the step, or make the gate strict in `make check` again.")
+    return fails
+
+
+
 def main():
     try:
         import yaml
@@ -62,6 +86,8 @@ def main():
                 "job '%s' is disabled with `if: false` and has no entry in DISABLED_OK — a "
                 "disabled job reports the same green as a passing one. If it must stay off, "
                 "add it below with the reason and the event that turns it back on." % n)
+
+    fails.extend(check_relocated_gates(d))
 
     print("ci.yml: %d job(s) — %s" % (len(jobs), ", ".join(sorted(jobs))))
     print("cancel-in-progress: %s" % (cip or "(unset)"))

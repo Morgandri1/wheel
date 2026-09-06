@@ -55,13 +55,20 @@ describe("validateEndpointPath", () => {
   });
 });
 
+/**
+ * These two cases were BACKWARDS until 2026-09-06, and the fix was to the validator, not to the
+ * tests: wheel-core's `Ident` (crates/wheel-core/src/name.rs) requires the first character to be
+ * a lowercase letter OR A DIGIT, then `[a-z0-9_]`. So `_private` is refused by the engine and was
+ * accepted here, and `9leading` is accepted by the engine and was refused here — a disagreement in
+ * both directions at once, each producing a pointless round trip.
+ */
 describe("validateColumnName", () => {
-  it("accepts sqlite-safe identifiers", () => {
-    for (const n of ["claim", "_private", "col_9", "a"]) expect(validateColumnName(n), n).toBeNull();
+  it("accepts sqlite-safe identifiers, including a leading digit", () => {
+    for (const n of ["claim", "9leading", "col_9", "a"]) expect(validateColumnName(n), n).toBeNull();
   });
 
   it("refuses what could not be quoted into DDL safely", () => {
-    for (const n of ["9leading", "Capital", "has space", "has-dash", "", "a".repeat(64)]) {
+    for (const n of ["_private", "Capital", "has space", "has-dash", "", "a".repeat(64)]) {
       expect(validateColumnName(n), n).toMatch(/lowercase/);
     }
   });
@@ -96,5 +103,58 @@ describe("suggestName", () => {
     const suggestion = suggestName("agent", taken);
     expect(taken).not.toContain(suggestion);
     expect(validateNodeName(suggestion)).toBeNull();
+  });
+});
+
+describe("table node names must already be sqlite identifiers", () => {
+  // A table node IS its table (t_<name>), and `-` is subtraction in SQL.
+  it("refuses a hyphen, in the engine's own words", () => {
+    const err = validateNodeName("my-notes", [], "table");
+    expect(err).toMatch(/cannot contain/i);
+    expect(err).toMatch(/_/);
+  });
+
+  it("accepts underscores and digits", () => {
+    expect(validateNodeName("my_notes", [], "table")).toBeNull();
+    expect(validateNodeName("notes2", [], "table")).toBeNull();
+  });
+
+  // Deliberately NOT stricter than the engine: `t_9lives` is a valid identifier, so refusing a
+  // leading digit here would be the UI inventing a rule the server does not have.
+  it("allows a leading digit, because the t_ prefix makes it an identifier", () => {
+    expect(validateNodeName("9lives", [], "table")).toBeNull();
+  });
+
+  it("leaves every other node type free to use hyphens", () => {
+    for (const type of ["agent", "ctx", "endpoint", "script", "vault", "chest", "mcp", "tool"] as const) {
+      expect(validateNodeName("my-notes", [], type)).toBeNull();
+    }
+    expect(validateNodeName("my-notes")).toBeNull();
+  });
+});
+
+describe("suggested names are names the engine will accept", () => {
+  // `table-2` cannot be created, so suggesting it made the board look broken.
+  it("separates a table suggestion with an underscore", () => {
+    expect(suggestName("table", ["table"])).toBe("table_2");
+    expect(validateNodeName(suggestName("table", ["table"]), [], "table")).toBeNull();
+  });
+
+  it("keeps hyphens for every other type", () => {
+    expect(suggestName("agent", ["agent"])).toBe("agent-2");
+  });
+});
+
+describe("column names match wheel-core's Ident", () => {
+  it("accepts a leading digit, which the engine accepts", () => {
+    expect(validateColumnName("2nd_place")).toBeNull();
+  });
+
+  it("refuses a leading underscore, which the engine refuses", () => {
+    expect(validateColumnName("_hidden")).not.toBeNull();
+  });
+
+  it("refuses a hyphen", () => {
+    expect(validateColumnName("first-name")).not.toBeNull();
   });
 });
