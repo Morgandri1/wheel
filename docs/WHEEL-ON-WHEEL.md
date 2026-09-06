@@ -48,8 +48,9 @@ host's problem (§5b).
 ## Bringing it up
 
 ```bash
-export WHEEL_API=https://wheel-api-production.up.railway.app
-export WHEEL_EMAIL=you@example.com WHEEL_PASSWORD='…'        # an account created via the web app or signup route
-infra/bootstrap-board.sh                                        # idempotent: creates project + nodes + wires, prints the project id
+export WHEEL_API=http://localhost:8080                           # default target is LOCAL; production needs WHEEL_ALLOW_REMOTE=1
+export WHEEL_EMAIL=you@example.com WHEEL_PASSWORD='…'          # an account created via the web app or signup route
+infra/bootstrap-board.sh                                        # idempotent create-or-reuse: never deletes anything
+# production, deliberately: WHEEL_ALLOW_REMOTE=1 WHEEL_API=https://wheel-api-production.up.railway.app infra/bootstrap-board.sh
 # then in the web app: open the project → vault "secrets" → set GITHUB_TOKEN and CLAUDE_CODE_OAUTH_TOKEN → start the project
 ```
