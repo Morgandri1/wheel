@@ -42,6 +42,16 @@ export type SessionState =
   | { status: "anon"; user: null }
   | { status: "authed"; user: SessionUser };
 
+/**
+ * The persisted session's key and shape: `{ token, user: { id, email } }`.
+ *
+ * QA's E2E suite fakes this shape in `qa/e2e/session.ts` to skip the sign-in form, and
+ * `E2E-local-session-shape` signs in for real and compares the keys and types of what actually
+ * lands here against that fake. So changing the shape — adding a field, nesting the user,
+ * renaming the token — turns that test red ON PURPOSE. Update the fake; do not route around it.
+ * A seeded session that has drifted from what the app writes is a mock nobody compares against
+ * the real thing, which is the failure mode the whole arrangement exists to prevent.
+ */
 const STORAGE_KEY = "wheel.session";
 /** The API is the authority on this; the client check exists so the round trip is not the teacher. */
 export const MIN_PASSWORD_LENGTH = 10;
