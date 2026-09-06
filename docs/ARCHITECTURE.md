@@ -74,6 +74,28 @@ correct-URL hit is the baseline, and no create-time obstacle may require otherwi
 | `scheme` | For `shared_secret`: `raw` · `bearer` · `basic`. For `hmac`: `github` · `stripe` · `slack` · `hmac_sha256`, computed over the RAW body before any parsing. |
 | `ip_allow` | Optional CIDR list, additive to the above, never a substitute for it. |
 
+**Accepted from ADVERSARY 031, all of it, and binding on the implementation:**
+
+- **Replay.** A shared secret does not bind a request, so every hit is replayable. For `stripe` and `slack`
+  the HMAC MUST be computed over the provider's timestamped base string AND the timestamp rejected outside a
+  ±5 minute window; `github` and `hmac_sha256` carry no timestamp and are replayable by design. An
+  endpoint→agent that MUTATES must therefore be idempotent, or dedupe on the provider's delivery id.
+- **Size before signature.** The raw body must be capped while streaming, BEFORE it is buffered to compute an
+  HMAC — otherwise an unsigned 100 MB body is a memory DoS that costs the sender nothing. The cap is ≤ the
+  256 KiB message-body limit, because the body becomes a delivered message.
+- **Rate-limit key** is (project, trusted client IP), never a raw `X-Forwarded-For`: the platform lets a
+  client prepend one. `ip_allow` narrows the caller set; it never replaces the limit.
+- **Constant time** covers the HMAC comparison as well as the shared-secret comparison.
+- **The endpoint's real capability is its agent's wire set.** `mode:none` wired `send` to an agent that can
+  `wheel write`, `wheel msg` a peer or `wheel secret get` is an open internet→agent prompt-injection channel,
+  and the envelope prevents forged attribution but says nothing about content. This is the operator's choice
+  to make and must NOT be blocked at create — but the UI marks such an agent internet-exposed, the preamble
+  marks a `type=endpoint` body UNTRUSTED EXTERNAL INPUT, and the docs steer ingress at a minimal-wire agent.
+- **No oracle.** A failed hit is a bare 401 with no body that never distinguishes wrong-secret from
+  no-such-path, and no ingress response or error carries the endpoint node's name.
+- **Rotation** is an atomic swap of the vault value, with a distinct `secret_key` per endpoint so rotating
+  one cannot silently break another.
+
 Rules that hold whatever `auth` says: comparisons are constant-time; a failure is a bare 401 that
 never says which part was wrong and never wakes the agent; the presented credential never reaches
 the delivered message, the transcript or the log; rate limit and body-size cap are enforced BEFORE
