@@ -22,6 +22,11 @@ import { defineConfig, devices } from "@playwright/test";
  * a flake here is a bug in the test or the app and should be fixed, not re-rolled.
  */
 const LOCAL_AUTH = /local-auth\.spec\.ts/;
+// packaged.spec.ts runs under its own config (packaged.config.ts) with its own servers.
+// It is ignored here so a normal run does not try to load the packaged board off a dev
+// server that was never built for it.
+const PACKAGED = /packaged\.spec\.ts/;
+
 const WEB_URL = process.env.WHEEL_WEB_URL ?? "http://localhost:3000";
 const LOCAL_URL = process.env.WHEEL_LOCAL_WEB_URL ?? "http://localhost:3200";
 const LOCAL_API = process.env.WHEEL_LOCAL_API_URL ?? "http://localhost:8788";
@@ -45,7 +50,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: LOCAL_AUTH,
+      testIgnore: [LOCAL_AUTH, PACKAGED],
       use: { ...devices["Desktop Chrome"] },
     },
     {

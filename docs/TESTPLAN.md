@@ -650,6 +650,20 @@ carries S1 criteria, and an S1 nobody runs is an S1 nobody catches.
 | `E2E-oauth-begin` | The paste-code panel renders the engine's `url`, `user_code` and `instructions` **verbatim**; the link is `target=_blank` with `rel=noopener`; the code box starts empty. A panel that rebuilds or normalises the URL sends the user to a login that does not match the session, and the failure looks like the user mistyping. A pre-filled code would be the panel guessing at the one step where guessing is indistinguishable from a phishing prompt. |
 | `E2E-oauth-complete` | The code the user typed is submitted **byte-exact**, together with the `session` from the `auth/begin` that issued it. Dropping `session` is what lets a stale code from an earlier attempt succeed. |
 | `E2E-oauth-expiry` | When the sign-in window closes, the input is disabled and the hint says to start again. An expired sign-in cannot be retyped out of; a live box invites the user to paste a valid code, be told it is wrong, and blame themselves. |
+
+### 11a. The packaged artifact (`npx wheel-web`)
+
+Everything else in §11 tests `next dev`. Users install a prebuilt standalone bundle, and the
+two differ precisely where it does not show until someone installs it. Opt-in (`WHEEL_PKG=1`,
+`make test-pkg`) because it needs a real `next build`; its own CI job for the same reason the
+wheel-on-wheel build leg has one. Web identified this gap and asked for the coverage.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `E2E-pkg-runtime-api` | `--api <url>` is honoured at RUN time. The package is started against a mock on **:8789** while its build-time default is **:8787**, and every `/v1/` request must go to the former. `NEXT_PUBLIC_*` values are frozen when the bundle compiles, so the natural implementation of this flag is one that does nothing at all and reviews perfectly; a package whose single option silently does nothing is worse than one with no option. Asserted as WHICH origin, not THAT some call happened. | **S1** |
+| `E2E-pkg-csp-agrees` | The CSP the packaged server sends names the same API it was pointed at. A policy computed for a different origin blocks every call in the browser and surfaces as a CSP violation rather than a failed fetch — so it reads as a network fault and gets debugged in the wrong place. | S2 |
+| `E2E-pkg-assets` | No 404s and no console errors: the package ships the assets it references. `next dev` serves from source and will happily find a file the packer never copied, so this is invisible to every other test, and it degrades quietly — the board renders and one panel is simply dead. | S2 |
+| `E2E-pkg-hydrates` | The packaged board is **interactive**, not merely rendered. A bundle that ships but never hydrates serves perfect HTML and responds to nothing; proving it needs a control whose enabled state only exists once React is live. | S2 |
 | `E2E-signin` | Sign-in through whatever `NEXT_PUBLIC_AUTH_MODE` is built with; unauthenticated `/app` redirects. |
 | `E2E-local-signup` | (`AUTH_MODE=local`) Sign-up page creates an account and lands on `/app` already authenticated — no second login step. |
 | `E2E-local-login` | Sign-in page authenticates an existing account; the session survives a full page reload. |
