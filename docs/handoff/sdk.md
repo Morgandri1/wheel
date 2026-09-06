@@ -10,17 +10,22 @@ wire enforcement, vault AES-256-GCM, table nodes, tool nodes end to end, built-i
 
 Findings closed: F015 (children inherited the engine's env — now `env_clear` + a 9-entry
 allowlist, structurally enforced by `child_command`), 018, 021–027. Last verified push before
-this handoff: `d206b95`. 258 engine tests, clippy clean.
+this handoff: **`9476350`** on `origin/main`. 262 engine tests, clippy clean.
+
+Landed after `d206b95`, all on `origin/main`:
+`7a76a5d` per-project crate cache (QA BUG-021 / ADVERSARY 029) ·
+`32a1ff9` a table node's sqlite table follows it through every change of shape ·
+`0692797` table storage re-established on boot (W1).
 
 ## IN FLIGHT (this branch — read the commits, they carry the reasoning)
 
-1. **CARGO_HOME** (QA BUG-021 / ADVERSARY 029) — done. `data_dir/.cargo`, mode SET to 0700 each
+1. **CARGO_HOME** (QA BUG-021 / ADVERSARY 029) — done, `7a76a5d`. `data_dir/.cargo`, mode SET to 0700 each
    start then verified; refuses to start a child it cannot make private. The gate asserts the
    VALUE the child got and the MODE, not that the variable exists.
-2. **Table orphan** — done. Changing a table node's config to another type orphaned `t_<name>`;
+2. **Table orphan** — done, `32a1ff9`. Changing a table node's config to another type orphaned `t_<name>`;
    the next table node with that name inherited its rows AND columns. `board::update` now carries
    the table through every transition; `board::delete` propagates a failed drop instead of `.ok()`.
-3. **W1, table nodes lose their table across a restore** — done. Engine boot calls
+3. **W1, table nodes lose their table across a restore** — done, `0692797`. Engine boot calls
    `board::ensure_tables`, which runs `tables::ensure` for every table node.
    **`tables::create` is destructive** (it claims the name); **`tables::ensure` is the safe
    one**. W1's fix must call `ensure`. See TRAPS.
@@ -66,7 +71,10 @@ one asserted row survival that mine did not, and I took that assertion.
    `find_ambiguity`. Declared overlap becomes a create-time WARNING, not a 409. Today an operator
    who declared `CLAUDE_CODE_OAUTH_TOKEN` and left it empty gets a false 409 when wiring the
    second vault that actually holds the token — which is the multi-account setup we shipped for.
-   Gates: QA `1b56a3d`.
+   Gates: QA `1b56a3d`. ADVERSARY confirms their `run_declared_empty.sh` §5 is the acceptance
+   test and is **currently RED**: a declared-but-empty `CLAUDE_CODE_OAUTH_TOKEN` in vault A still
+   409-blocks wiring vault B that holds the real value. `find_ambiguity` must treat a
+   declared-but-unfilled key as non-blocking, the way presence already became stored-based.
 5. **Child reaping** — was session 2's in-flight work (`signal_group`, `cmd.process_group(0)`,
    `GRACE`), uncommitted in `wheel-wt/sdk`, which **does not compile** (borrow error at lib.rs:92).
    Salvage or rewrite; do not assume it is a starting point.
