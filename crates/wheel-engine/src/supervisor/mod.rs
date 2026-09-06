@@ -246,6 +246,48 @@ impl Supervisor {
             .ok_or(self.vault_key_error.unwrap_or(NO_VAULT_KEY))
     }
 
+    /// The project's private crate cache, created 0700 and checked.
+    ///
+    /// QA's BUG-021 against 029: the comment beside this said the right thing
+    /// and the code landed one level too high. `create_dir_all` uses the
+    /// default mode, so the directory came out 0755 — readable by every OTHER
+    /// uid in the sandbox, and §2 gives each agent, script and MCP child its
+    /// own uid precisely so they are not each other's. What sits in there is
+    /// downloaded sources and, the moment a tenant configures a private
+    /// registry, `credentials.toml` with a token.
+    ///
+    /// The mode is SET rather than left to the umask, and then verified: a
+    /// directory that already existed keeps whatever mode it was made with,
+    /// so creating it correctly is not the same as finding it correct.
+    fn cargo_home(&self) -> Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `.cargo` under the project's own data dir. On the process backend
+        // that dir IS /data/projects/<id>; on docker it is the project's own
+        // volume. Either way it is per-project, which is the property that
+        // matters -- the previous name `cargo` also sat next to whatever else
+        // shares a host data dir.
+        let dir = self.cfg.data_dir.join(".cargo");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating the crate cache at {}", dir.display()))?;
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700))
+            .with_context(|| format!("restricting {} to this project", dir.display()))?;
+
+        // Belt: refuse to start rather than hand a child a cache another uid
+        // can read. A registry token in a world-readable directory is worth
+        // failing loudly over.
+        let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o077;
+        anyhow::ensure!(
+            mode == 0,
+            "the crate cache at {} is readable or writable by other uids (mode {:o}); \
+             it holds fetched sources and any registry credentials, so a child is not \
+             started with it",
+            dir.display(),
+            std::fs::metadata(&dir)?.permissions().mode() & 0o777
+        );
+        Ok(dir)
+    }
+
     /// Why this agent cannot start on the credential it holds, if that is
     /// already known.
     ///
@@ -387,8 +429,7 @@ impl Supervisor {
         // CARGO_HOME would put one project's downloaded sources -- and its
         // registry credentials, if it ever configures any -- where the next
         // project can read them.
-        let cargo_home = self.cfg.data_dir.join("cargo");
-        std::fs::create_dir_all(&cargo_home).ok();
+        let cargo_home = self.cargo_home()?;
         cmd.env("CARGO_HOME", &cargo_home);
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
@@ -1451,6 +1492,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// QA's BUG-021 / 029. The gate asserts the VALUE and the MODE, not that
+    /// the variable is present — which is exactly why they caught this and a
+    /// membership check would not have.
+    #[tokio::test]
+    async fn the_crate_cache_is_per_project_and_private_to_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, _id, dir) = shim_supervisor("cargo-home", ECHO_HARNESS);
+
+        let cargo_home = sup.cargo_home().unwrap();
+
+        // Under the project's OWN data dir. On the process backend that dir is
+        // /data/projects/<id>, so this is 029's path; the old `data_dir/cargo`
+        // sat beside whatever else shared a host data dir.
+        assert!(
+            cargo_home.starts_with(&dir),
+            "the cache must live under this project's data dir: {}",
+            cargo_home.display()
+        );
+        assert_eq!(cargo_home.file_name().unwrap(), ".cargo");
+
+        // 0700. `create_dir_all` alone gives 0755, and every other uid in the
+        // sandbox could then read fetched sources and any credentials.toml.
+        let mode = std::fs::metadata(&cargo_home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the crate cache is mode {mode:o}; it holds registry credentials"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that already exists keeps the mode it was made with, so
+    /// creating it correctly is not the same as finding it correct: the mode
+    /// is SET on every start, not left to whatever made the directory. It is
+    /// repaired rather than refused because the cache is ours to fix and a
+    /// board that will not start is the worse failure -- but if we cannot
+    /// make it private (another uid owns it), `set_permissions` fails and the
+    /// agent does not start with it.
+    #[tokio::test]
+    async fn a_loosened_crate_cache_is_tightened_before_the_child_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, id, dir) = shim_supervisor("cargo-loose", ENV_DUMP_HARNESS);
+
+        let cargo_home = sup.cargo_home().unwrap();
+        std::fs::write(cargo_home.join("credentials.toml"), "token = \"secret\"").unwrap();
+        std::fs::set_permissions(&cargo_home, PermissionsExt::from_mode(0o755)).unwrap();
+
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+
+        let mode = std::fs::metadata(&cargo_home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the loosened cache was left at {mode:o}");
+        assert!(
+            cargo_home.join("credentials.toml").exists(),
+            "tightening the cache must not discard what is in it"
+        );
+
+        // The gate asserts the VALUE the child was given, not that the name
+        // is present: pointing every project at one shared cache would set
+        // the variable just as well.
+        let env = std::fs::read_to_string(&dumped).unwrap();
+        assert!(
+            env.lines()
+                .any(|l| l == format!("CARGO_HOME={}", cargo_home.display())),
+            "the child was not given this project's own cache:\n{env}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A harness that records the environment it was actually given.
