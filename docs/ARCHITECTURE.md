@@ -58,6 +58,37 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+
+### A red `main` is a stop-the-line (PM ruling, 2026-09-06)
+
+`main` was red for five consecutive commits and nine PRs queued behind it, because a gate written red
+ahead of its fix (QA's `POS-*` suite, correctly written that way per §0b) sat unfixed while every lane
+kept merging on top of it. None of those merges was ever seen green end-to-end.
+
+- **While `main` is red, the only thing that merges is the change that greens it.** Everything else waits.
+- The lane that owns the failing gate owns the recovery, and it outranks whatever else that lane has open.
+- A gate deliberately written red ahead of its fix is correct and stays correct — but it converts the fix
+  into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
+  *next*, not eventually.
+- Whoever notices red `main` first says so. Silence is how five commits happen.
+
+### A red signal that is not a defect must be removed, not tolerated (PM ruling, 2026-09-06)
+
+Every open PR carried a failing `Vercel` check reading `Deployment rate limited — retry in 24 hours` — a
+free-tier build quota, not a code failure. A permanent red X that everyone learns to ignore is worse than
+no signal, because it trains the team to stop reading CI, and the one real failure then arrives disguised
+as the usual noise. An external-quota failure is either made non-blocking or made to not run. It is never
+left sitting red.
+
+### Gate discipline must be mechanical, not social (PM finding, 2026-09-06)
+
+`main` has **no branch protection** — `gh api repos/:owner/:repo/branches/main/protection` returns 404.
+Every rule in this section is currently enforced by convention alone. For a repository whose stated goal is
+to develop itself, an agent that merges red breaks nothing mechanical. Required status checks (the real
+gates: `make check`, `integration`; never an external-quota check like Vercel) are to be enabled **once
+`main` is green** — enabling them while red would freeze the swarm behind the very red they are meant to
+prevent. Sequence: green first, then protect.
+
 ### Position is an integer cell (operator ruling, 2026-09-06)
 
 `Position { x: i16, y: i16 }`. A board coordinate is a cell, not a measurement, and floats bought us
