@@ -36,6 +36,9 @@ const URL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the CLI to accept or reject a pasted code.
 const CODE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long to wait for the child's own output after it has exited.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Pending {
     session: Uuid,
     url: String,
@@ -44,6 +47,9 @@ struct Pending {
     stdin: ChildStdin,
     /// Everything the child has said, for diagnosing a rejected code.
     output: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The tasks draining the child's pipes. They finish when the pipes close,
+    /// which is what makes `output` complete rather than merely current.
+    pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -113,9 +119,10 @@ impl LoginSessions {
         let stderr = child.stderr.take().expect("stderr piped");
 
         let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut pumps = Vec::new();
         {
             let output = output.clone();
-            tokio::spawn(async move {
+            pumps.push(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(l)) = lines.next_line().await {
                     if let Ok(mut o) = output.lock() {
@@ -123,7 +130,7 @@ impl LoginSessions {
                         o.push('\n');
                     }
                 }
-            });
+            }));
         }
 
         // Read stdout until the URL appears, then keep draining in the
@@ -142,7 +149,7 @@ impl LoginSessions {
         };
         {
             let output = output.clone();
-            tokio::spawn(async move {
+            pumps.push(tokio::spawn(async move {
                 let mut lines = reader.lines();
                 while let Ok(Some(l)) = lines.next_line().await {
                     if let Ok(mut o) = output.lock() {
@@ -150,7 +157,7 @@ impl LoginSessions {
                         o.push('\n');
                     }
                 }
-            });
+            }));
         }
 
         let session = Uuid::new_v4();
@@ -163,6 +170,7 @@ impl LoginSessions {
                 child,
                 stdin,
                 output,
+                pumps,
             },
         );
         self.arm_expiry(node, session);
@@ -196,16 +204,21 @@ impl LoginSessions {
 
         let line = format!("{}\n", code.trim());
         if pending.stdin.write_all(line.as_bytes()).await.is_err() {
+            // The child is already gone, which means it has already said why.
+            // Reporting "the login process had already exited" would replace
+            // the CLI's own reason with a description of our plumbing.
             let _ = pending.child.kill().await;
-            return Err(LoginError::Rejected(
-                "the login process had already exited".into(),
-            ));
+            drain(pending.pumps).await;
+            return Err(LoginError::Rejected(tail(&pending.output)));
         }
         let _ = pending.stdin.flush().await;
 
         match tokio::time::timeout(CODE_TIMEOUT, pending.child.wait()).await {
             Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(Ok(_)) => Err(LoginError::Rejected(tail(&pending.output))),
+            Ok(Ok(_)) => {
+                drain(pending.pumps).await;
+                Err(LoginError::Rejected(tail(&pending.output)))
+            }
             Ok(Err(e)) => Err(LoginError::Rejected(e.to_string())),
             Err(_) => {
                 let _ = pending.child.kill().await;
@@ -274,6 +287,27 @@ impl LoginSessions {
     async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }
+}
+
+/// Wait for the pipe readers to finish before reporting what the child said.
+///
+/// `wait()` returns when the process exits, which is NOT when its output has
+/// been read: the pumps are separate tasks, and the last line can still be in
+/// flight. Without this the rejection reason is whatever happened to have
+/// arrived -- often nothing, so the operator is told "the CLI rejected it
+/// without saying why" while the CLI's actual reason is a few microseconds
+/// behind. It won the race on macOS and lost it on Linux CI, which is the
+/// clearest possible sign it was a race and not a platform difference.
+///
+/// The pipes are already closed by the exit, so these finish immediately; the
+/// timeout is only so a wedged reader cannot hold the login open.
+async fn drain(pumps: Vec<tokio::task::JoinHandle<()>>) {
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        for p in pumps {
+            let _ = p.await;
+        }
+    })
+    .await;
 }
 
 /// The CLI's stdin prompt, which carries no newline and therefore ends up
@@ -488,6 +522,55 @@ mod tests {
         }
         // A rejected attempt must not leave a child holding the node hostage.
         assert_eq!(s.len().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression CI caught. A child that writes its reason and exits
+    /// immediately loses a race with the task reading its pipe, so the
+    /// operator was told "the CLI rejected it without saying why" while the
+    /// real reason sat unread. This stub writes enough that the pump cannot
+    /// possibly have finished by the time `wait()` returns.
+    #[tokio::test]
+    async fn the_reason_survives_a_child_that_exits_the_instant_it_speaks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-race-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-stub");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo 'Opening browser to sign in…'\n\
+             echo 'visit: https://claude.com/cai/oauth/authorize?state=abc123'\n\
+             printf 'Paste code here if prompted > '\n\
+             read code\n\
+             i=0\n\
+             while [ $i -lt 200 ]; do echo \"noise line $i\" >&2; i=$((i+1)); done\n\
+             echo 'OAuth token exchange failed: 400 invalid_grant' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+        let (session, _) = s
+            .begin(node, &program.display().to_string(), &dir.join("creds"))
+            .await
+            .unwrap();
+
+        match s.complete(node, Some(session), "wrong").await.unwrap_err() {
+            LoginError::Rejected(why) => {
+                assert!(
+                    why.contains("400") && why.contains("invalid_grant"),
+                    "the CLI's own last words must reach the operator, got: {why}"
+                );
+            }
+            other => panic!("expected a rejection, got {other}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
