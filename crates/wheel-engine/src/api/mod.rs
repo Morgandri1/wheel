@@ -28,6 +28,7 @@ pub mod agent_routes;
 pub mod board_routes;
 pub mod cli_routes;
 pub mod events_route;
+mod table_routes;
 pub mod vault_routes;
 
 #[derive(Clone)]
@@ -95,6 +96,10 @@ impl From<db::board::BoardError> for ApiError {
             // BOARD is the thing that cannot accept it.
             B::Ambiguous(m) => ApiError::new(StatusCode::CONFLICT, "ambiguous_credential", m),
             B::Config(c) => ApiError::invalid(c.to_string()),
+            // Almost always a name that cannot become a sqlite identifier,
+            // and the message says which character and what to use instead --
+            // so it is the caller's to fix, not an internal fault.
+            B::Storage(m) => ApiError::invalid(m),
         }
     }
 }
@@ -173,6 +178,8 @@ pub fn router(state: AppState) -> Router {
             "/vault/{id}/{key}",
             axum::routing::put(vault_routes::put_value).delete(vault_routes::delete_value),
         )
+        .route("/tables/{id}/rows", get(table_routes::rows))
+        .route("/tables/{id}/query", post(table_routes::query))
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -193,7 +200,9 @@ pub fn router(state: AppState) -> Router {
         .route("/secret/keys", get(cli_routes::secret_keys))
         .route("/write", post(cli_routes::write))
         .route("/msg", post(cli_routes::msg))
-        .route("/inbox", get(cli_routes::inbox));
+        .route("/inbox", get(cli_routes::inbox))
+        .route("/rm", post(cli_routes::rm))
+        .route("/query", post(cli_routes::query));
 
     Router::new()
         .route("/healthz", get(healthz))

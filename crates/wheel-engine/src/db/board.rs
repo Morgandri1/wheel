@@ -4,6 +4,8 @@
 //! calls — so the two cannot disagree about what a legal board is.
 
 use anyhow::Result;
+
+use super::tables;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use wheel_core::{
@@ -25,6 +27,9 @@ pub enum BoardError {
     Wire(#[from] wheel_core::WireError),
     #[error(transparent)]
     Config(#[from] wheel_core::ConfigError),
+    /// A table node's storage could not follow it. Its own message says why.
+    #[error("{0}")]
+    Storage(String),
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -99,6 +104,20 @@ pub fn create(conn: &Connection, node: &Node) -> Result<(), BoardError> {
             params![node.id.to_string()],
         )
         .ok();
+    }
+    // A table node IS its table. Doing this here rather than in the route
+    // means no caller can create one without its storage -- and a name that
+    // cannot become a sqlite identifier fails the whole creation instead of
+    // leaving a node on the board that silently has nowhere to put rows.
+    if let NodeConfig::Table(cfg) = &node.config {
+        if let Err(e) = tables::create(conn, &node.name, cfg) {
+            conn.execute(
+                "DELETE FROM nodes WHERE id = ?1",
+                params![node.id.to_string()],
+            )
+            .ok();
+            return Err(BoardError::Storage(e.to_string()));
+        }
     }
     Ok(())
 }
@@ -176,6 +195,14 @@ pub fn wires_to(conn: &Connection, to: Uuid) -> Result<Vec<(Uuid, WireType)>> {
 }
 
 pub fn delete(conn: &Connection, id: Uuid) -> Result<bool> {
+    // The user's rows are not covered by the schema's cascades: `t_<name>` is
+    // a table of its own, so deleting the node has to take it too or the data
+    // outlives the thing that addressed it.
+    if let Some(node) = get(conn, id)? {
+        if let NodeConfig::Table(_) = &node.config {
+            tables::drop(conn, &node.name).ok();
+        }
+    }
     // Wires, agent_state, messages, tokens and logs all cascade via the schema.
     let n = conn.execute("DELETE FROM nodes WHERE id = ?1", params![id.to_string()])?;
     Ok(n > 0)
@@ -234,6 +261,17 @@ pub fn add_wire(
 /// a node can never change what kind of thing it is.
 pub fn update(conn: &Connection, node: &Node) -> Result<(), BoardError> {
     validate_config(&node.config)?;
+
+    // `t_<name>` is derived from the node name, so a rename that did not carry
+    // the table would leave every row unreachable from the new address.
+    if let NodeConfig::Table(_) = &node.config {
+        let previous = get(conn, node.id).ok().flatten().map(|n| n.name);
+        if let Some(old_name) = previous.filter(|p| p != &node.name) {
+            tables::rename(conn, &old_name, &node.name)
+                .map_err(|e| BoardError::Storage(e.to_string()))?;
+        }
+    }
+
     let (ty, cfg) = split_config(&node.config);
     conn.execute(
         "UPDATE nodes SET name=?2, type=?3, config=?4, x=?5, y=?6, updated_at=?7 WHERE id=?1",

@@ -3,7 +3,7 @@
 //! One writer connection behind a mutex — sqlite serialises writes anyway, and
 //! a single writer makes the delivery loop's state transitions trivially
 //! correct. User SQL never touches this connection: table nodes get a separate
-//! read-only connection with an authorizer (M2).
+//! read-only connection with an authorizer (`tables::query`).
 
 use std::path::Path;
 
@@ -12,6 +12,7 @@ use rusqlite::Connection;
 
 pub mod board;
 pub mod messages;
+pub mod tables;
 pub mod tokens;
 
 /// Open (creating if needed) and migrate the project database.

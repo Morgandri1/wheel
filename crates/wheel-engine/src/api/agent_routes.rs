@@ -291,6 +291,11 @@ pub struct AuthComplete {
     /// browser tab completing a login the user has already restarted.
     #[serde(default)]
     pub session: Option<Uuid>,
+    /// Name of a vault node to also store the resulting credential in, so the
+    /// other agents wired to that vault authenticate without their own login.
+    /// The agent must have a read wire to it.
+    #[serde(default)]
+    pub save_to_vault: Option<String>,
 }
 
 /// `POST /v1/agents/:id/auth/complete`
@@ -307,7 +312,7 @@ pub async fn auth_complete(
     // Paste-code OAuth: the code goes to the child that `auth/begin` left
     // waiting, and the CLI writes its own credentials into the node's dir.
     if let Some(code) = body.code {
-        return finish_paste_code(&s, id, body.session, &code).await;
+        return finish_paste_code(&s, id, body.session, &code, body.save_to_vault.as_deref()).await;
     }
 
     let Some(key) = body.api_key else {
@@ -419,6 +424,7 @@ async fn finish_paste_code(
     id: Uuid,
     session: Option<Uuid>,
     code: &str,
+    save_to_vault: Option<&str>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if code.trim().is_empty() {
         return Err(ApiError::invalid("the code is empty"));
@@ -441,6 +447,11 @@ async fn finish_paste_code(
         ));
     }
 
+    let vaulted = match save_to_vault {
+        Some(vault) => Some(save_credential_to_vault(s, id, &config_dir, vault)?),
+        None => None,
+    };
+
     let was_blocked = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
         let st = board::agent_state(&conn, id).unwrap_or_default();
@@ -457,12 +468,77 @@ async fn finish_paste_code(
         at: wheel_core::Timestamp::now(),
     });
 
-    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+    let mut body = serde_json::json!(wheel_core::AuthStatus {
         authenticated: true,
         mode: Some(wheel_core::CredentialKind::OauthSession),
         source: None,
         account: None,
-    })))
+    });
+    if let Some(v) = vaulted {
+        body["vault"] = v;
+    }
+    Ok(Json(body))
+}
+
+/// Copy the credential this login just produced into a vault, so the other
+/// agents wired to that vault do not each need their own browser round-trip.
+///
+/// Reports the expiry rather than hiding it. A subscription login stores a
+/// SESSION token that the CLI refreshes in place; copying it into a vault
+/// gives five other agents a credential that works now and stops working
+/// later, with nothing to explain why. `claude setup-token` is the durable
+/// answer, and the response says so when what we found is not that.
+fn save_credential_to_vault(
+    s: &AppState,
+    agent: Uuid,
+    config_dir: &std::path::Path,
+    vault_name: &str,
+) -> ApiResult<serde_json::Value> {
+    let found = crate::auth::oauth_token_from_store(config_dir)
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string()))?;
+
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let vault = board::get_by_name(&conn, vault_name)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("no node named {vault_name:?}")))?;
+    if vault.node_type() != wheel_core::NodeType::Vault {
+        return Err(ApiError::invalid(format!("{vault_name} is not a vault")));
+    }
+
+    // The wire is the capability here as everywhere else: an agent may only
+    // put its credential in a vault it can actually read, or it would be
+    // writing into a keyspace it has no relationship with.
+    let me = board::get(&conn, agent)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(agent.to_string()))?;
+    if !me.has_wire(
+        vault.id,
+        wheel_core::WireType::Read,
+        wheel_core::NodeType::Vault,
+    ) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wire_denied",
+            format!(
+                "no wire from {} to {vault_name} (need: read) -- wire the agent to the vault first",
+                me.name
+            ),
+        ));
+    }
+
+    const KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+    crate::api::vault_routes::store_in_vault(s, &conn, vault.id, KEY, &found.token)?;
+
+    let mut out = serde_json::json!({ "name": vault_name, "key": KEY, "stored": true });
+    if let Some(exp) = found.expires_at {
+        out["expires_at"] = serde_json::json!(exp);
+    }
+    if !found.is_long_lived() {
+        out["warning"] = serde_json::json!(
+            "this is a session credential and will expire; for a durable one, run              `claude setup-token` and submit that token as api_key instead"
+        );
+    }
+    Ok(out)
 }
 
 fn login_error(e: crate::oauth::LoginError) -> ApiError {

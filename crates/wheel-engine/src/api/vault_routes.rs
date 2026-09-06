@@ -43,72 +43,83 @@ pub async fn put_value(
         return Err(ApiError::invalid("an empty value is not a secret"));
     }
 
-    let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
-
     {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let node = board::get(&conn, id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
-        let mut cfg = match node.config.clone() {
-            wheel_core::NodeConfig::Vault(v) => v,
-            _ => return Err(ApiError::invalid("not a vault node")),
-        };
-
-        // Adding a key can create an ambiguity that did not exist when the
-        // wires were made, so every agent already reading this vault is
-        // re-checked before the write, not after.
-        if !cfg.keys.contains(&key) {
-            for agent in crate::vault::agents_reading(&conn, id)
-                .map_err(|e| ApiError::internal(e.to_string()))?
-            {
-                if crate::vault::supplies_key(&conn, agent, &key, id)
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-                    .is_some()
-                {
-                    let a = crate::vault::supplies_key(&conn, agent, &key, id)
-                        .map_err(|e| ApiError::internal(e.to_string()))?
-                        .unwrap_or_default();
-                    let what = if wheel_core::is_credential_key(&key) {
-                        "credential"
-                    } else {
-                        "vault key"
-                    };
-                    return Err(ApiError::new(
-                        StatusCode::CONFLICT,
-                        "ambiguous_credential",
-                        format!(
-                            "ambiguous {what} {key}: {} already supplies it to {}",
-                            a,
-                            board::get(&conn, agent)
-                                .ok()
-                                .flatten()
-                                .map(|n| n.name.to_string())
-                                .unwrap_or_else(|| agent.to_string())
-                        ),
-                    ));
-                }
-            }
-        }
-
-        crate::vault::put(&conn, vk, id, &key, &body.value)
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-
-        // Keep the declared key list in step with what is stored, so the UI
-        // and the ambiguity checks see the same vault.
-        if !cfg.keys.contains(&key) {
-            cfg.keys.push(key.clone());
-            cfg.keys.sort();
-            let mut updated = node.clone();
-            updated.config = wheel_core::NodeConfig::Vault(cfg);
-            board::update(&conn, &updated).map_err(ApiError::from)?;
-        }
+        store_in_vault(&s, &conn, id, &key, &body.value)?;
     }
 
     s.events.publish(wheel_core::Event::BoardChanged {
         at: wheel_core::Timestamp::now(),
     });
     Ok(Json(serde_json::json!({ "key": key, "stored": true })))
+}
+
+/// Store one value in a vault: the ambiguity check, the encrypted write, and
+/// the declared-key bookkeeping that go with it.
+///
+/// Shared by `PUT /v1/vault/:id/:key` and by the paste-code login's
+/// `save_to_vault`, so a credential written by either route is written the
+/// same way rather than by two implementations that can drift.
+pub(crate) fn store_in_vault(
+    s: &AppState,
+    conn: &rusqlite::Connection,
+    vault: Uuid,
+    key: &str,
+    value: &str,
+) -> ApiResult<()> {
+    let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
+
+    let node = board::get(conn, vault)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(vault.to_string()))?;
+    let mut cfg = match node.config.clone() {
+        wheel_core::NodeConfig::Vault(v) => v,
+        _ => return Err(ApiError::invalid("not a vault node")),
+    };
+
+    // Adding a key can create an ambiguity that did not exist when the wires
+    // were made, so every agent already reading this vault is re-checked
+    // before the write, not after.
+    let known = cfg.keys.iter().any(|k| k == key);
+    if !known {
+        for agent in crate::vault::agents_reading(conn, vault)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+        {
+            if let Some(other) = crate::vault::supplies_key(conn, agent, key, vault)
+                .map_err(|e| ApiError::internal(e.to_string()))?
+            {
+                let what = if wheel_core::is_credential_key(key) {
+                    "credential"
+                } else {
+                    "vault key"
+                };
+                let agent_name = board::get(conn, agent)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.name.to_string())
+                    .unwrap_or_else(|| agent.to_string());
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "ambiguous_credential",
+                    format!("ambiguous {what} {key}: {other} already supplies it to {agent_name}"),
+                ));
+            }
+        }
+    }
+
+    crate::vault::put(conn, vk, vault, key, value)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Keep the declared key list in step with what is stored, so the UI and
+    // the ambiguity checks see the same vault.
+    if !known {
+        cfg.keys.push(key.to_string());
+        cfg.keys.sort();
+        let mut updated = node.clone();
+        updated.config = wheel_core::NodeConfig::Vault(cfg);
+        board::update(conn, &updated).map_err(ApiError::from)?;
+    }
+    Ok(())
 }
 
 /// `DELETE /v1/vault/:id/:key`

@@ -373,6 +373,56 @@ mod tests {
         )
     }
 
+    /// The board is what the UI renders and what every agent can read. A
+    /// vault's KEY NAMES belong there; its values never do -- and this is the
+    /// path a paste-code login now writes through, so it is worth asserting
+    /// rather than assuming.
+    #[test]
+    fn a_vaulted_credential_is_never_on_the_board() {
+        const SECRET: &str = "sk-ant-oat01-this-must-never-appear";
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        board::create(&c, &v).unwrap();
+        put(&c, &key(), v.id, "CLAUDE_CODE_OAUTH_TOKEN", SECRET).unwrap();
+
+        // Whatever the board hands out, in any shape, must not contain it.
+        let one = serde_json::to_string(&board::get(&c, v.id).unwrap().unwrap()).unwrap();
+        let all = serde_json::to_string(&board::list(&c).unwrap()).unwrap();
+        for rendered in [&one, &all] {
+            assert!(
+                !rendered.contains(SECRET),
+                "a vault value reached the board: {rendered}"
+            );
+        }
+
+        // The KEY NAME is retrievable, because the operator has to see what a
+        // vault holds to reason about it. `list_keys` reads what is STORED;
+        // the node's declared list is the route's bookkeeping, and the
+        // ambiguity checks use the union of the two so a key present in only
+        // one of them is still treated as supplied.
+        assert_eq!(list_keys(&c, v.id).unwrap(), ["CLAUDE_CODE_OAUTH_TOKEN"]);
+        assert_eq!(offered_keys(&c, v.id).unwrap(), ["CLAUDE_CODE_OAUTH_TOKEN"]);
+
+        // And the value is retrievable only through the vault itself.
+        assert_eq!(
+            get(&c, &key(), v.id, "CLAUDE_CODE_OAUTH_TOKEN")
+                .unwrap()
+                .unwrap(),
+            SECRET
+        );
+    }
+
+    /// If a child echoes a vaulted credential, it must not survive into a log
+    /// line or a transcript that the operator or another agent can read.
+    #[test]
+    fn a_vaulted_credential_is_redacted_out_of_anything_a_child_echoes() {
+        const SECRET: &str = "sk-ant-oat01-this-must-never-appear";
+        let line = format!("running with token {SECRET} now");
+        let cleaned = redact(&line, &[SECRET.to_string()]);
+        assert!(!cleaned.contains(SECRET), "{cleaned}");
+        assert!(cleaned.contains("running with token"), "{cleaned}");
+    }
+
     #[test]
     fn a_value_round_trips_and_is_not_stored_in_the_clear() {
         let c = crate::db::open_memory().unwrap();
