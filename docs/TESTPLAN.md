@@ -767,6 +767,59 @@ be seconds.
 
 ---
 
+## 11c. ING — endpoint ingress fan-out (§3, SDK session 2 item 1)
+
+Written before the feature, so it lands against a red suite rather than being described by
+whatever it happens to do. Ingress is the only path where a **stranger** reaches the board:
+everything else requires a node token or the engine secret.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ING-agent-envelope` | A hit on an `endpoint→agent (send)` wire arrives as `<AgentPrompt from="<endpoint>" type="endpoint">` carrying `{method, path, headers, body}`. `type` is `endpoint`, never `user` — an agent that cannot tell a stranger's request from its operator's instruction has no basis for caution. | **S1** |
+| `ING-headers-subset` | Only the documented header subset is forwarded. `Authorization`, `Cookie` and the bearer the endpoint itself consumed must NOT reach the agent: the agent is untrusted code and the credential is not its business. | **S1** |
+| `ING-body-cap` | A body over 5 MiB is refused at the boundary with no partial delivery — never truncated into an agent's context, where a half-body reads as a whole one. | S2 |
+| `ING-table-insert` | `endpoint→table (write)` inserts the JSON body as a row; a body that does not match the columns is refused, not silently coerced. | S2 |
+| `ING-script-response` | `endpoint→script` with `response_mode: script` returns the script's **stdout** as the HTTP body. With `response_mode: ack` the stdout is NOT returned, so a script cannot leak into a response the operator did not ask for. | S2 |
+| `ING-auth-bearer` | `auth.mode: bearer` resolves via the endpoint's `vault_ref`. A mismatch is **401 with an empty body** — no hint, no length difference, nothing an attacker can measure. | **S1** |
+| `ING-auth-requires-wire` | A `bearer` endpoint with no `endpoint→vault (read)` wire fails CLOSED (refuses every request), never open. | **S1** |
+| `ING-capability-off` | With project capability `http: false`, `/p/<id>/*` is **403 at the API** and the request never reaches the engine — asserted by the engine seeing no request, not merely by the status code. | **S1** |
+| `ING-ratelimit` | The documented rate limit is enforced and the limiter cannot be reset by a spoofed `X-Forwarded-For` (R4, same shape as the auth limiter). | S2 |
+| `ING-no-such-endpoint` | A path with no endpoint node is 404 and does not disclose which project ids or endpoint names exist. | S2 |
+
+## 11d. SCR — script nodes (§3, SDK session 2 item 2)
+
+A script is code the operator wrote running next to code an agent wrote. The interesting
+question is not "does it run" but "what can it reach".
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `SCR-token-scope` | A script's `WHEEL_TOKEN` obeys **the script's own wires**, not its caller's. An agent with wide wires invoking a narrow script must not lend it that reach — otherwise `wheel run` is a confused deputy and every script is a privilege-escalation gadget. | **S1** |
+| `SCR-token-file` | The script receives `WHEEL_TOKEN_FILE`, not a token on the command line (§5b: argv is world-readable across uids). | **S1** |
+| `SCR-timeout` | `timeout_secs` is enforced, capped at 300, and a killed script reports a timeout — distinguishable from a script that exited non-zero. | S2 |
+| `SCR-output-cap` | Output over 1 MiB is capped, and the caller is told it was capped rather than handed a silently shortened result. | S2 |
+| `SCR-unprivileged` | The script runs as the node's uid, not the engine's, and cannot read another node's config dir. | **S1** |
+| `SCR-no-wire-denied` | `wheel run <script>` without an `agent→script (read)` wire is exit 3. | **S1** |
+| `SCR-mcp-run-real` | The MCP `run` tool is advertised **only when a script node exists and is wired**. SDK removed `run` rather than stub it for exactly this reason: a tool that resolves to 404 teaches a model the board is unreliable, and it stops trying things that would have worked. | S2 |
+
+## 11e. CHEST — blob store (§3, SDK session 2 item 3)
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `CHEST-traversal` | `..`, absolute paths, and encoded variants (`%2e%2e`, `..%2f`, backslashes) are refused. Asserted by the file NOT existing outside the chest dir, never only by the status code. | **S1** |
+| `CHEST-symlink-escape` | A symlink inside the chest pointing outside it does not let a read or write escape — the check must be on the resolved path, not the requested one. | **S1** |
+| `CHEST-size-cap` | A blob over 50 MiB is refused, and the partial upload does not remain on disk. | S2 |
+| `CHEST-write-implies-read` | A `write` wire can read; a `read` wire cannot write (exit 3). | S2 |
+| `CHEST-ls-scope` | `wheel ls <chest> [prefix]` lists only that chest, and a prefix cannot escape it. | S2 |
+
+## 11f. MCPNODE — MCP nodes attached at agent start (§3, SDK session 2 item 4)
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `MCPNODE-config-from-wires` | The generated harness config contains exactly the mcp nodes the agent has a `read` wire to — asserted as a SET, so an extra server is a failure and not just a missing one. | **S1** |
+| `MCPNODE-ssrf` | `mcp.url` is subject to the §3d SSRF policy: loopback, RFC1918, link-local, `*.internal` and `*.railway.internal` are refused, including via redirect and via a DNS name that resolves to them. | **S1** |
+| `MCPNODE-no-secret-in-config` | Vault-sourced values in `mcp.env` do not appear in any world-readable file, and the config file is 0600 to the node's uid. | **S1** |
+| `MCPNODE-unwired-absent` | An mcp node that exists but is not wired to this agent does not appear in its config. | S2 |
+
 ## 12. BACK / PERF — backends and scale
 
 | ID | Criterion |

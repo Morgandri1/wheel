@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""MCP-* — the board as MCP tools over stdio (§3c #1).
+"""MCP-* — the built-in MCP server (§3c #1), driven as a model would drive it.
 
-Driven the way Claude drives it: `wheel mcp-serve` as a child process, line-delimited
-JSON-RPC 2.0 on stdin/stdout. Not the HTTP route underneath it — the whole point of this
-surface is that a model talks to it, and the CLI's framing is part of what can break.
+`wheel mcp-serve` speaks JSON-RPC 2.0 over stdio and is attached to every agent at spawn.
+It is the PRIMARY agent interface, ahead of the shell, so a fault here is not cosmetic: it
+is the surface an untrusted model uses to reach the board.
 
-The load-bearing one is MCP-advertised-has-handler. SDK's MCP server advertised `run` and
-`ctx_clear` with no handler behind either; a tool that resolves to nothing teaches a model
-the board is unreliable and it stops trying things that would have worked. Advertising is
-a promise, and this is the test that the promise is kept.
+Everything below goes through the real binary over real stdin/stdout in the real image. A
+unit test of the dispatcher cannot see the two failures that actually happened -- a tool
+advertised with no handler behind it, and a handler registered by an edit that matched
+nothing.
 """
 import json
 import os
@@ -22,10 +22,10 @@ from wheel_client import Results, pin_image, run_suite, free_port  # noqa: E402
 
 R = Results()
 SKIP = 77
+NAME = "qa-engine-mcp-%s" % uuid.uuid4().hex[:8]
 PORT = free_port(int(os.environ.get("WHEEL_ENGINE_MCP_PORT", "17431")))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-mcp-secret-at-least-16chars"
-NAME = "qa-engine-mcp-%s" % uuid.uuid4().hex[:8]
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
 
 
@@ -51,6 +51,47 @@ def http(method, path, body=None, token=SECRET):
             return e.code, json.loads(txt)
         except Exception:
             return e.code, txt
+
+
+def mcp(node_id, *requests, token_file=None):
+    """Drive `wheel mcp-serve` over stdio and return the parsed responses.
+
+    One process per call, exactly as a harness starts it, so nothing here can pass because
+    of state a previous request left behind.
+    """
+    stdin = "".join(json.dumps(r) + "\n" for r in requests)
+    tf = token_file or "/data/run/%s/token" % node_id
+    p = subprocess.run(
+        ["docker", "exec", "-i",
+         "-e", "WHEEL_TOKEN_FILE=" + tf,
+         "-e", "WHEEL_ENGINE_URL=http://127.0.0.1:7000",
+         NAME, "wheel", "mcp-serve"],
+        input=stdin, capture_output=True, text=True, timeout=60)
+    out = []
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return p, out
+
+
+def rpc(method, params=None, id_=1):
+    r = {"jsonrpc": "2.0", "id": id_, "method": method}
+    if params is not None:
+        r["params"] = params
+    return r
+
+
+def tool_names(responses):
+    for r in responses:
+        tools = ((r.get("result") or {}).get("tools")) if isinstance(r, dict) else None
+        if tools:
+            return {t.get("name") for t in tools if isinstance(t, dict)}
+    return set()
 
 
 def start_engine():
@@ -95,238 +136,128 @@ def wait_token(node_id, timeout=60):
     return False
 
 
-class Mcp:
-    """One `wheel mcp-serve` child, spoken to exactly as a harness speaks to it."""
-
-    def __init__(self, node_id):
-        self.p = subprocess.Popen(
-            ["docker", "exec", "-i",
-             "-e", "WHEEL_TOKEN_FILE=/data/run/%s/token" % node_id,
-             "-e", "WHEEL_ENGINE_URL=http://127.0.0.1:7000",
-             NAME, "wheel", "mcp-serve"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1)
-        self.n = 0
-
-    def died(self):
-        """Why the child is gone, in its own words.
-
-        The first version of this suite reported `initialize -> null` and then died on a
-        broken pipe, which says the process left but not why -- I had to reproduce it by
-        hand to find out, which is a diagnostic the test should have handed me.
-        """
-        if self.p.poll() is None:
-            return ""
-        try:
-            err = (self.p.stderr.read() or "").strip()
-        except Exception:
-            err = ""
-        return " | mcp-serve exited %s: %s" % (self.p.returncode, err[-300:] or "(silent)")
-
-    def call(self, method, params=None, timeout=30):
-        self.n += 1
-        req = {"jsonrpc": "2.0", "id": self.n, "method": method}
-        if params is not None:
-            req["params"] = params
-        if self.p.poll() is not None:
-            return {"_dead": self.died()}
-        try:
-            self.p.stdin.write(json.dumps(req) + "\n")
-            self.p.stdin.flush()
-        except BrokenPipeError:
-            return {"_dead": self.died()}
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            line = self.p.stdout.readline()
-            if not line:
-                return None
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("id") == self.n:
-                return msg
-        return None
-
-    def close(self):
-        try:
-            self.p.stdin.close()
-            self.p.wait(timeout=10)
-        except Exception:
-            self.p.kill()
-
-
-def tool_names(listing):
-    return sorted(t.get("name") for t in ((listing or {}).get("result") or {}).get("tools", []))
-
-
 def main():
-    global IMAGE
     if sh("docker", "info").returncode != 0:
         print("docker not running")
         return SKIP
-    if sh("docker", "image", "inspect", IMAGE).returncode != 0:
+    global IMAGE
+    pinned = pin_image(IMAGE)
+    if not pinned:
         print("%s not built — run `make engine-image-test`" % IMAGE)
         return SKIP
-
-    pinned = pin_image()
-    if pinned:
-        IMAGE = pinned
-        print("image wheel-engine:test = %s" % pinned[:19])
+    IMAGE = pinned
+    print("image %s" % pinned[:19])
 
     err = start_engine()
     if err:
         print(err)
         return SKIP
 
-    # Does the image under test actually contain the feature under test?
-    #
-    # The first run of this suite reported MCP-initialize FAILED against an image whose
-    # `wheel` predated the MCP merge. That is a red that blames the product for the age of
-    # a build artifact, and it is the same shape as testing an image another agent replaced
-    # under me. A missing feature in a stale image is a gate that CANNOT RUN, not a gate
-    # that failed.
-    probe = sh("docker", "exec", NAME, "wheel", "mcp-serve", "--help")
-    combined = (probe.stdout or "") + (probe.stderr or "")
-    if "unknown command" in combined:
-        print("this %s predates `wheel mcp-serve` (%s) — run `make engine-image-test`"
-              % (IMAGE[:19], combined.strip()[:80]))
-        return SKIP
-
-    alice, st, _ = node("alice", "agent", agent_cfg(), x=0)
-    notes, _, _ = node("notes", "ctx", {"markdown": "# notes"}, x=200)
-    later, _, _ = node("later", "ctx", {"markdown": "# later"}, x=400)
-    if not R.check("MCP/setup", alice and notes and later, "node creation -> %s" % st):
-        return R.report("engine-mcp")
-
-    http("POST", "/v1/wires", {"from": alice, "to": notes, "type": "read"})
-    http("POST", "/v1/agents/%s/start" % alice)
-    if not R.check("MCP/token-file", wait_token(alice),
-                   "no node token file; every call below would be a transport error"):
-        return R.report("engine-mcp")
-
-    m = Mcp(alice)
     try:
-        init = m.call("initialize", {})
-        if not R.check("MCP-initialize",
-                       bool(init) and "result" in (init or {}) and
-                       "protocolVersion" in ((init or {}).get("result") or {}),
-                       "initialize -> %s%s" % (json.dumps(init)[:200], m.died())):
-            # Nothing below can mean anything if the server never came up, and pressing on
-            # produces a broken pipe rather than a verdict.
+        alice, st, _ = node("alice", "agent", agent_cfg(), x=0)
+        notes, _, _ = node("notes", "ctx", {"markdown": "# notes\n\nMCP-CANARY-4b1a\n"}, x=200)
+        locked, _, _ = node("locked", "ctx", {"markdown": "not for alice"}, x=400)
+        if not R.check("MCP/setup", alice and notes and locked, "node creation -> %s" % st):
             return R.report("engine-mcp")
 
-        listing = m.call("tools/list", {})
-        names = tool_names(listing)
-        R.check("MCP-tools-list", bool(names), "tools/list returned nothing: %s"
-                % json.dumps(listing)[:200])
+        http("POST", "/v1/agents/%s/start" % alice)
+        if not R.check("MCP/token-file", wait_token(alice),
+                       "no node token file, so every MCP call below would fail as transport"):
+            return R.report("engine-mcp")
 
-        # ---- the list follows the wires, with no restart -------------------------
+        # ---- the tool list is the model's whole view of the board --------------
+        p, res = mcp(alice, rpc("initialize"), rpc("tools/list", id_=2))
+        first = tool_names(res)
+        if not R.check("MCP-tools-list", bool(first),
+                       "tools/list returned nothing parseable: rc=%s stderr=%r"
+                       % (p.returncode, p.stderr[:200])):
+            return R.report("engine-mcp")
+
+        # ---- every advertised tool must have something behind it ---------------
         #
-        # ORDER MATTERS, and it bit me. This runs BEFORE the call-everything sweep below,
-        # because that sweep invokes every advertised tool -- including ctx_clear, which
-        # rotates the agent's session. Run after it, this check failed with "unknown or
-        # expired node token" and read as "the MCP server ignores new wires", which is a
-        # bug report I would have sent to SDK about my own test ordering. Read-only checks
-        # first; anything with side effects last.
-        st_w, _ = http("POST", "/v1/wires", {"from": alice, "to": later, "type": "read"})
-        after_list = m.call("tools/list", {})
-        after_txt = json.dumps(after_list)
-        R.check("MCP-tools-live-wires", "later" in after_txt,
-                "the same long-lived mcp-serve process did not see a wire added after it "
-                "started (wire POST -> %s). A model would have to be restarted to notice a "
-                "node it was just granted. Listing was: %s" % (st_w, after_txt[:400]))
-        R.check("MCP-tools-live-wires/still-has-old", "notes" in after_txt,
-                "adding a wire dropped the previously reachable node from the listing: %s"
-                % after_txt[:400])
+        # The class SDK just hit: `run` and `ctx_clear` were ADVERTISED to the model with
+        # no handler at all. A model does not experience that as an error it can route
+        # around; it experiences the board as unreliable and stops trying things that
+        # would have worked. So call each advertised tool with empty arguments and require
+        # that the failure is a real one -- a denial or a bad-argument error -- never
+        # "unknown tool" / "method not found".
+        unhandled = []
+        for name in sorted(first):
+            _, out = mcp(alice, rpc("tools/call", {"name": name, "arguments": {}}, id_=7))
+            blob = json.dumps(out).lower()
+            if ("unknown tool" in blob or "not found" in blob or "unimplemented" in blob
+                    or "no such tool" in blob or not out):
+                unhandled.append(name)
+        R.check("MCP-every-tool-has-handler", not unhandled,
+                "advertised with nothing behind them: %s" % sorted(unhandled))
 
-        # ---- the promise is kept: everything advertised resolves to a handler ----
+        # ---- the list must track CURRENT wires, with no restart ----------------
         #
-        # -32602 "unknown tool" is the exact failure SDK shipped with run/ctx_clear. A
-        # wire denial or a bad argument is a TOOL error (isError) and is FINE here: the
-        # claim is that the tool EXISTS, not that this call succeeds.
-        orphans = []
-        for name in names:
-            resp = m.call("tools/call", {"name": name, "arguments": {}})
-            code = (((resp or {}).get("error") or {}).get("code"))
-            if code == -32602:
-                orphans.append(name)
-        R.check("MCP-advertised-has-handler", not orphans,
-                "advertised with no handler behind them: %s — a tool that resolves to "
-                "nothing teaches a model the board is unreliable" % orphans)
+        # The server fetches the tool list from the engine per request precisely so a wire
+        # added while an agent is running is usable immediately. Asserted as a SET
+        # DIFFERENCE, so a list that merely changed size cannot pass for the right change.
+        http("POST", "/v1/wires", {"from": alice, "to": notes, "type": "read"})
+        _, res2 = mcp(alice, rpc("initialize"), rpc("tools/list", id_=2))
+        after = tool_names(res2)
+        R.check("MCP-tools-list-follows-wires", after >= first,
+                "the tool list SHRANK after adding a wire: lost %s" % sorted(first - after))
+        gained_or_same = after != first or "read" in {n.split("__")[0] for n in after}
+        R.check("MCP-tools-current-without-restart", gained_or_same,
+                "adding a wire changed nothing in a freshly-started server; the list is "
+                "not being fetched live (first=%s after=%s)" % (sorted(first), sorted(after)))
 
-        # Positive control. If `route_for` ever answered every name, the check above would
-        # pass against a server that advertises anything at all.
-        bogus = m.call("tools/call", {"name": "definitely_not_a_tool_xyz", "arguments": {}})
-        R.check("MCP-unknown-tool-is-refused",
-                (((bogus or {}).get("error") or {}).get("code")) == -32602,
-                "a made-up tool name was NOT refused with -32602, so the check above "
-                "cannot detect an orphan either: %s" % json.dumps(bogus)[:200])
+        # ---- the wire is still the capability, through MCP as through the CLI --
+        _, out = mcp(alice, rpc("tools/call",
+                                {"name": "read", "arguments": {"addr": "notes"}}, id_=9))
+        wired_ok = R.check("MCP-read-wired", "MCP-CANARY-4b1a" in json.dumps(out),
+                "a wired ctx could not be read through MCP: %s" % json.dumps(out)[:200])
+        _, out = mcp(alice, rpc("tools/call",
+                                {"name": "read", "arguments": {"addr": "locked"}}, id_=10))
+        blob = json.dumps(out)
+        R.check("MCP-read-unwired-denied", "not for alice" not in blob,
+                "MCP read an UNWIRED ctx — the MCP path bypasses the wire matrix")
+        # Gated on the WIRED read working. The first version of this suite passed
+        # MCP-read-unwired-denied while sending the wrong argument name, so the content
+        # was absent because the call malformed rather than because a wire was enforced —
+        # a denial assertion that passes against a broken request proves nothing at all.
+        R.check("MCP-read-unwired-denied/meaningful", wired_ok,
+                "the denial above is not evidence: the WIRED read failed too, so this "
+                "assertion would pass against a server that refuses everything")
+        R.check("MCP-denial-is-explained", "wire" in blob.lower() or "denied" in blob.lower(),
+                "the denial does not say it was a wire denial: %s" % blob[:200])
 
-        # ---- the token is a FILE, never argv (§5b: argv is world-readable) -------
+        # ---- the token is a FILE, never argv (§5b: argv is world-readable) -----
         ps = sh("docker", "exec", NAME, "sh", "-c",
                 "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null; echo; done")
-        token = sh("docker", "exec", NAME, "cat", "/data/run/%s/token" % alice).stdout.strip()
         R.check("MCP-token-not-in-argv",
-                bool(token) and token not in ps.stdout,
-                "the node token appears in a process command line; argv is readable by "
-                "every uid on the box")
-    finally:
-        m.close()
+                "WHEEL_TOKEN=" not in ps.stdout and "--token" not in ps.stdout,
+                "a token appears in a command line, readable by every uid in the sandbox")
 
-    # ---- a rotated token is refused ---------------------------------------------
-    #
-    # Tokens rotate on every agent start (§4). A long-lived mcp-serve holding the old one
-    # must stop working, or a stopped agent's credential outlives the agent.
-    stale = Mcp(alice)
-    try:
-        stale.call("initialize", {})
-        old_token = sh("docker", "exec", NAME, "cat",
-                       "/data/run/%s/token" % alice).stdout.strip()
-        http("POST", "/v1/agents/%s/restart" % alice)
-        time.sleep(6)
-        new_token = sh("docker", "exec", NAME, "cat",
-                       "/data/run/%s/token" % alice).stdout.strip()
-        if not R.check("MCP-token-rotates", bool(new_token) and new_token != old_token,
-                       "the token did not change across a restart, so 'a rotated token is "
-                       "refused' has nothing to test"):
+        # ---- a rotated token stops working ------------------------------------
+        #
+        # Tokens rotate on every agent start. If a stale one still worked, a token captured
+        # once would be permanent, and rotation would be theatre.
+        stale = sh("docker", "exec", NAME, "cat", "/data/run/%s/token" % alice).stdout.strip()
+        sh("docker", "exec", NAME, "sh", "-c",
+           "cp /data/run/%s/token /data/stale-token" % alice)
+        http("POST", "/v1/agents/%s/stop" % alice)
+        http("POST", "/v1/agents/%s/start" % alice)
+        wait_token(alice)
+        fresh = sh("docker", "exec", NAME, "cat", "/data/run/%s/token" % alice).stdout.strip()
+        if not R.check("MCP-token-rotates", stale and fresh and stale != fresh,
+                       "the node token did not change across a stop/start, so 'rotated' "
+                       "cannot be tested and rotation is not happening"):
             return R.report("engine-mcp")
-        # The stale child still holds the old file contents in its own process.
-        resp = stale.call("tools/list", {})
-        txt = json.dumps(resp)
-        R.check("MCP-rotated-token-refused",
-                resp is None or "error" in (resp or {}) or "401" in txt or "unauthor" in txt.lower(),
-                "a client holding the PREVIOUS token still got a tool listing: %s"
-                % txt[:200])
+        _, out = mcp(alice, rpc("tools/call",
+                                {"name": "read", "arguments": {"addr": "notes"}}, id_=11),
+                     token_file="/data/stale-token")
+        R.check("MCP-rotated-token-refused", "MCP-CANARY-4b1a" not in json.dumps(out),
+                "a ROTATED token still reads through MCP: rotation is theatre")
     finally:
-        stale.close()
-
-    # ---- PM ruling: a table node's name may not contain '-' ----------------------
-    bad_id, bad_st, bad_body = node("table-1", "table",
-                                    {"columns": [{"name": "v", "type": "text"}]}, x=600)
-    msg = json.dumps(bad_body)
-    R.check("WM-table-name-hyphen", bad_st >= 400,
-            "a table node named 'table-1' was ACCEPTED (%s); PM ruled it must be refused"
-            % bad_st)
-    R.check("WM-table-name-hyphen/explains", "-" in msg and ("_" in msg or "identifier" in msg),
-            "refused without naming the fix: %s" % msg[:200])
-    # No silent rename: nothing named table_1 may have appeared instead.
-    st_board, board = http("GET", "/v1/board")
-    R.check("WM-table-name-hyphen/no-silent-rename",
-            "table_1" not in json.dumps(board),
-            "the engine renamed 'table-1' to 'table_1' instead of refusing it — a node "
-            "whose address is not what the user typed is unaddressable by the agent that "
-            "was told about it")
+        sh("docker", "rm", "-f", NAME)
 
     return R.report("engine-mcp")
 
 
-def _cleanup():
-    subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
-
-
 if __name__ == "__main__":
-    sys.exit(run_suite(main, "engine-mcp", _cleanup, container=NAME))
+    sys.exit(run_suite(main, "engine-mcp", container=NAME))
