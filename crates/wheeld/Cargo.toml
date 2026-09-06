@@ -1,0 +1,29 @@
+[package]
+name = "wheeld"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wheeld"
+path = "src/main.rs"
+
+[lib]
+name = "wheeld"
+path = "src/lib.rs"
+
+[dependencies]
+wheel-api = { path = "../wheel-api" }
+wheel-host = { path = "../wheel-host" }
+wheel-engine = { path = "../wheel-engine" }
+wheel-core = { path = "../wheel-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+rand = "0.8"
+axum = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
