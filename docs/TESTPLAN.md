@@ -956,3 +956,15 @@ that laptop.
 | `WHEELD-engine-reachable` | The per-project engine answers `GET /v1/board` **through the API**, in one process. This is the claim that distinguishes wheeld from "an API that starts": a green API does not imply a reachable engine. | **S1** |
 | `WHEELD-sigterm` | SIGTERM (not kill) stops it within 20s. A daemon a person runs in a terminal has to stop when they press ctrl-c, and must not leave the store wedged for the next start. | S2 |
 
+---
+
+## 13. API-cors — the preflight must describe the router
+
+Owned by API; recorded here so the criterion is traceable and so the invariant survives the
+person who found it.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `API-cors-covers-every-served-method` | Every method the router actually serves is allowed by the CORS preflight. A static allow-list drifts the moment a route is added, and the symptom is an unreadable preflight failure in a browser rather than an error anyone can act on. API's fix mirrors methods and headers FROM the router, leaving the origin allowlist as the only boundary, so a method we do not serve is a 405 with a body instead. Mutation-checked by restoring a static `[GET, POST]`, which failed naming `HEAD /healthz`. | S2 |
+| `INFRA-prune-deny-list` | The probe-project pruner's predicates: the deny list wins, a lookalike domain is not a probe domain, and nothing young is ever a candidate. 36 assertions, plain bash, no deps — wired into `make check` because the subject is a DELETION tool that runs against production data. | **S1** |
+
