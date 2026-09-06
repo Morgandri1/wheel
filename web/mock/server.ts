@@ -134,7 +134,12 @@ async function engine(
   const project = record.project;
 
   if (method === "GET" && path === "/v1/board") {
-    json(res, 200, { nodes: record.nodes, project });
+    // The engine knows the project's ID and nothing else — name, capabilities and ingress URL all
+    // live in the API's Postgres, which the engine never sees. This mock used to return the whole
+    // project here, which is why an endpoint panel reading `project.capabilities.http` off the
+    // board worked locally and blanked the board in production. A mock that is more generous than
+    // the thing it stands in for hides exactly the bugs it exists to catch.
+    json(res, 200, { nodes: record.nodes, project: { id: project.id } });
     return true;
   }
 

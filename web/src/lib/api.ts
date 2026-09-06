@@ -83,6 +83,10 @@ function defaultMessage(status: number): string {
   if (status === 403) return "That isn't allowed on this project.";
   if (status === 404) return "That's gone, or was never yours.";
   if (status === 409) return "That conflicts with something already there.";
+  // 503 is how the engine reports its own misconfiguration (e.g. started without a vault key).
+  // Retrying never fixes that, so this must not suggest it. Used only when the server sends no
+  // message of its own; its words always win.
+  if (status === 503) return "The engine is not able to serve this right now. This usually needs a fix, not a retry.";
   if (status >= 500) return "The API failed. Try again in a moment.";
   return "That request was rejected.";
 }

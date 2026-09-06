@@ -71,7 +71,10 @@ export function EndpointPanel({
 
   return (
     <>
-      {!project.capabilities.http ? (
+      {/* Optional-chained on purpose: an older API, or any project shape that omits it, must not
+          be able to blank the board. Absent capabilities read as "off", which is the safe claim —
+          telling someone a URL is live when it is not costs more than the reverse. */}
+      {!project.capabilities?.http ? (
         <p
           data-testid="endpoint-http-off"
           className="border border-[color-mix(in_srgb,var(--wire-write)_50%,transparent)] px-2.5 py-2 text-micro"

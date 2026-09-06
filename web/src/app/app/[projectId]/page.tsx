@@ -94,7 +94,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${board.data.project.name}.board.json`;
+    a.download = `${project.data?.name ?? projectId}.board.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -211,7 +211,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
             <Inspector
               node={selected}
               nodes={nodes}
-              project={board.data.project}
+              project={project.data}
               api={api}
               projectId={projectId}
               onChanged={refetchBoard}
