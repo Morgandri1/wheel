@@ -27,6 +27,12 @@ pub trait Orchestrator: Send + Sync {
     async fn destroy(&self, project_id: &Uuid) -> Result<()>;
     /// Observed status, from the runtime rather than from our database.
     async fn status(&self, project_id: &Uuid) -> Result<ProjectStatus>;
+
+    /// Is the sandbox host reachable and serving?
+    ///
+    /// Liveness of the host itself rather than of any project, for a deploy gate: the host has no
+    /// public domain, so nothing outside this API can ask it directly.
+    async fn host_alive(&self) -> Result<()>;
 }
 
 pub mod host;
@@ -36,6 +42,9 @@ pub struct NoopOrchestrator;
 
 #[async_trait]
 impl Orchestrator for NoopOrchestrator {
+    async fn host_alive(&self) -> Result<()> {
+        Ok(())
+    }
     async fn provision(&self, _: &Uuid, _: &EngineSecrets) -> Result<()> {
         Ok(())
     }

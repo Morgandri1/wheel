@@ -150,6 +150,24 @@ Every error, on every route:
 ### `GET /healthz`
 Unauthenticated. `200 {"status":"ok"}`.
 
+### `GET /v1/host/healthz`
+
+Liveness of the sandbox host, as seen from the API. Unauthenticated, like `/healthz`.
+
+```
+200 {"ok": true}      the host is serving
+503 {"ok": false}     it is not
+```
+
+It exists because `GET /healthz` answering 200 does not mean the product works: during one outage
+the API stayed perfectly healthy while the host was stopped, and every project create hung until
+the platform edge gave up. The host has no public domain, so nothing outside the API can ask it
+directly.
+
+Liveness only — no backend name, no project counts, no upstream error text. The answer is cached for
+one second: the route is unauthenticated, and without that a flood here becomes a flood against the
+one machine every tenant's sandbox runs on.
+
 ### `POST /v1/projects`
 ```bash
 curl -X POST https://api.wheel.dev/v1/projects \

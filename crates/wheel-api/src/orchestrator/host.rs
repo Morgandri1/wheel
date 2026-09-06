@@ -91,6 +91,24 @@ fn fastrand_ms(max: u64) -> u64 {
 
 #[async_trait]
 impl Orchestrator for HostClient {
+    async fn host_alive(&self) -> Result<()> {
+        // The host's unauthenticated liveness route, not the bearer-gated `/host/v1/healthz`: this
+        // asks only "is the process serving", and the bearer is still sent because everything else
+        // on that port requires it and a probe that behaves differently is a probe of a different
+        // thing.
+        let r = self
+            .req(reqwest::Method::GET, format!("{}/healthz", self.base))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .context("host: liveness request failed")?;
+        if r.status().is_success() {
+            Ok(())
+        } else {
+            bail!("host answered {} to a liveness probe", r.status())
+        }
+    }
+
     async fn provision(&self, project_id: &Uuid, secrets: &EngineSecrets) -> Result<()> {
         // PUT is idempotent by contract, so it is safe to retry.
         self.with_retry(3, || async {
