@@ -320,12 +320,27 @@ def main():
             probe = sh("docker", "exec", NAME, "sh", "-c",
                        "[ -d \"%s\" ] && stat -c '%%a' \"%s\" || echo missing" % (cargo, cargo))
             mode = probe.stdout.strip()
-            R.check("WOW-toolchain-cargo-per-project",
-                    cargo.startswith("/data/projects/") and mode == "700",
-                    "CARGO_HOME=%r mode=%r — it must be per project under /data/projects/<id>, "
-                    "0700 and owned by the project uid. Inherited or shared means one tenant's "
-                    "fetched sources and registry credentials are readable by the next."
-                    % (cargo, mode))
+            # Two separate claims, and only one of them is backend-independent.
+            #
+            # PER-PROJECT: 029 words it as "/data/projects/<id>/.cargo", which is the PROCESS
+            # backend's layout. Under docker there is one engine per project with its own
+            # volume, so the engine's own data dir is already project-scoped and /data/cargo
+            # satisfies the requirement. Asserting the literal path would fail a correct
+            # docker deployment, so what is checked is that it sits under the engine's data
+            # dir rather than somewhere shared between engines.
+            #
+            # NOT GROUP/OTHER-ACCESSIBLE: this one holds everywhere and is the part that
+            # matters, because §2 puts every agent, script and MCP child under its OWN uid
+            # inside the sandbox. A 0755 cache is readable by every one of them, and what a
+            # tenant fetches — sources, and any registry credentials it configures — is
+            # exactly what must not be.
+            under_data = cargo.startswith("/data")
+            private = mode.endswith("00") and len(mode) == 3
+            R.check("WOW-toolchain-cargo-per-project", under_data and private,
+                    "CARGO_HOME=%r mode=%r — it must live under the project's own data dir "
+                    "and be private to the project uid (0700). 755 is readable by every other "
+                    "uid in the sandbox, and §2 gives each agent, script and MCP child its "
+                    "own." % (cargo, mode))
 
     # The token travelled through the engine; it must not have been written down.
     #
