@@ -98,6 +98,7 @@ fn cfg() -> Config {
         rlimit_nofile: 16384,
         rlimit_cpu_secs: None,
         reap_grace_secs: 1,
+        disk_floor_mb: 1,
         engine_base_url: "http://127.0.0.1:1".into(),
     }
 }

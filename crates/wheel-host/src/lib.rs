@@ -10,6 +10,7 @@
 
 pub mod auth_limit;
 pub mod config;
+pub mod disk;
 pub mod proxy;
 pub mod sandbox;
 pub mod store;
@@ -233,6 +234,16 @@ pub async fn liveness() -> Json<serde_json::Value> {
 }
 
 pub async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> {
+    // Free space is on the health check because the day it mattered, nobody had it: a full volume
+    // presented as a sqlite error about shared memory, and the platform's dashboard disagreed with
+    // `df` by a factor of thirty. Whoever looks here next gets the number that was missing.
+    let (disk_free_mb, disk_used_percent) = match disk::space(&state.cfg.data_dir) {
+        Ok(s) => (Some(s.free_mb()), Some(s.used_percent())),
+        Err(e) => {
+            tracing::warn!(error = %format_args!("{e:#}"), "could not measure free space");
+            (None, None)
+        }
+    };
     Json(json!({
         "ok": true,
         "sandbox_backend": match state.cfg.backend {
@@ -240,6 +251,8 @@ pub async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> 
             Backend::Process => "process",
             Backend::External => "external",
         },
+        "disk_free_mb": disk_free_mb,
+        "disk_used_percent": disk_used_percent,
     }))
 }
 
@@ -302,6 +315,17 @@ pub async fn start(State(state): State<HostState>, Path(id): Path<Uuid>) -> Resp
     }) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response();
     };
+
+    // Before anything is spawned: a sandbox started onto a full volume corrupts its own database on
+    // the first write, and reports it as an error about shared memory. Refusing names the disk.
+    if let Err(e) = disk::check_room(&state.cfg.data_dir, state.cfg.disk_floor_mb) {
+        tracing::error!(project = %id, error = %format_args!("{e:#}"), "refusing to start");
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(json!({"status": "error", "last_error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
 
     let secrets = Secrets {
         engine_secret: rec.engine_secret,
@@ -403,6 +427,19 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     // view; only liveness answers early, which is all the checker asks.
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(addr = %bind, "listening");
+
+    // One line, at boot, because the day the volume filled nobody had this number: the platform's
+    // dashboard said 127 MB of 5 GB while `df` said 100%, and the failure arrived disguised as a
+    // sqlite error about shared memory.
+    match disk::space(&state.cfg.data_dir) {
+        Ok(s) => tracing::info!(
+            volume = %state.cfg.data_dir,
+            free_mb = s.free_mb(),
+            used_percent = s.used_percent(),
+            "volume"
+        ),
+        Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "could not measure free space"),
+    }
 
     let reconciling = state.clone();
     tokio::spawn(async move {
