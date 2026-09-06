@@ -9,6 +9,7 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    setupFiles: ["./test/setup.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text-summary", "lcov"],
@@ -20,6 +21,7 @@ export default defineConfig({
         "src/lib/wire-matrix.ts",
         "src/lib/limits.ts",
         "src/lib/local-auth.ts",
+        "src/lib/auth-session.ts",
         "src/lib/csp.ts",
         "src/lib/events.ts",
         "src/lib/message-state.ts",

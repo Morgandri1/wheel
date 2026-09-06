@@ -265,25 +265,86 @@ async function engine(
     const step = authMatch[3];
 
     if (method === "POST" && step === "begin") {
+      const body = await readJson<{ mode?: string }>(req).catch(() => ({}) as { mode?: string });
       const claude = node.config.harness === "claude";
+      const mode = body.mode ?? (claude ? "paste_code" : "device_code");
+      // The session handle is what makes a pasted code belong to THIS begin. The engine expires
+      // it; modelled here so the UI's 409 path can be exercised without waiting 15 minutes.
+      const session = `sess-${Math.random().toString(36).slice(2, 10)}`;
+      const ttl = Number(process.env.MOCK_AUTH_TTL_SECS ?? 900);
+      authSessions.set(session, { nodeId: node.id, expiresAt: Date.now() + ttl * 1000 });
       json(res, 200, {
-        mode: claude ? "device_code" : "api_key",
-        url: claude ? "https://claude.ai/device" : undefined,
-        user_code: claude ? "WHEL-0R81" : undefined,
-        instructions: claude
-          ? "Open the link, enter the code, then come back and confirm."
-          : "Paste an API key for this harness. It is stored in the project, never shown again.",
+        mode,
+        session,
+        expires_in: ttl,
+        url: "https://claude.ai/oauth/authorize?code=true&client_id=wheel-mock",
+        user_code: mode === "device_code" ? "WHEL-0R81" : undefined,
+        instructions:
+          mode === "paste_code"
+            ? "Open the link, approve the sign-in, then copy the code it shows you and paste it below."
+            : "Open the link and enter the code shown here.",
       });
       return true;
     }
 
     if (method === "POST" && step === "complete") {
-      const body = await readJson<{ code?: string; api_key?: string }>(req);
-      if (!body.code && !body.api_key) throw new EngineRefusal(400, "no code or api key supplied");
+      const body = await readJson<{
+        code?: string;
+        api_key?: string;
+        setup_token?: string;
+        session?: string;
+        save_to_vault?: string;
+      }>(req);
+
+      if (!body.code && !body.api_key && !body.setup_token) {
+        throw new EngineRefusal(400, "no code, setup token or api key supplied");
+      }
+
+      if (body.code) {
+        const found = body.session ? authSessions.get(body.session) : undefined;
+        if (!found || found.nodeId !== node.id) {
+          throw new EngineRefusal(409, "that sign-in session is no longer open", "session_expired");
+        }
+        if (found.expiresAt <= Date.now()) {
+          authSessions.delete(body.session!);
+          throw new EngineRefusal(409, "that sign-in session has expired", "session_expired");
+        }
+        if (body.code.trim().length < 6) {
+          throw new EngineRefusal(400, "that code is too short — copy the whole thing");
+        }
+        authSessions.delete(body.session!);
+      }
+
       if (body.api_key && body.api_key.trim().length < 8) {
         throw new EngineRefusal(400, "that key is too short to be real");
       }
+      if (body.setup_token && !body.setup_token.trim().startsWith("sk-ant-oat")) {
+        throw new EngineRefusal(400, "a setup token starts with sk-ant-oat");
+      }
+
+      let savedToVault: { name: string; expires_at: string; warning: string } | undefined;
+      if (body.save_to_vault) {
+        const vaultNode = record.nodes.find(
+          (n) => n.type === "vault" && n.name === body.save_to_vault,
+        );
+        if (!vaultNode) throw new EngineRefusal(400, `no vault called ${body.save_to_vault}`);
+        const keys = record.vaults.get(vaultNode.id) ?? new Set<string>();
+        keys.add(body.code ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY");
+        record.vaults.set(vaultNode.id, keys);
+        const expiresAt = new Date(Date.now() + 8 * 3600 * 1000).toISOString();
+        savedToVault = {
+          name: vaultNode.name,
+          expires_at: expiresAt,
+          // A paste-code login is a short-lived access token. Saying so is the whole point.
+          warning: body.code
+            ? "This is a short-lived access token: agents wired to this vault will lose it when it expires. One sign-in per agent is the durable arrangement."
+            : "Stored for every agent wired to this vault.",
+        };
+        boardChanged(record);
+      }
+
       record.authenticated.add(node.id);
+      record.authModes.set(node.id, body.code ? "oauth_session" : body.setup_token ? "oauth_token" : "api_key");
       appendLog(record, node.id, "engine", "credentials accepted");
       // Authenticating does NOT start a process. Queued messages are preserved and delivered
       // after the agent is restarted, so the mock leaves it stopped and the UI has to say so —
@@ -291,7 +352,12 @@ async function engine(
       if (node.state?.status === "needs_auth") {
         setAgentState(record, node, { status: "stopped" });
       }
-      json(res, 200, { authenticated: true, account: "you@example.com" });
+      json(res, 200, {
+        authenticated: true,
+        account: "you@example.com",
+        mode: record.authModes.get(node.id),
+        ...(savedToVault ? { saved_to_vault: savedToVault } : {}),
+      });
       return true;
     }
 
@@ -306,7 +372,7 @@ async function engine(
       const authed = record.authenticated.has(node.id);
       json(res, 200, {
         authenticated: authed,
-        mode: authed ? "api_key" : null,
+        mode: authed ? (record.authModes.get(node.id) ?? "api_key") : null,
         account: authed ? "you@example.com" : undefined,
       });
       return true;
@@ -519,6 +585,14 @@ function credentialVaultFor(record: ProjectRecord, agent: WheelNode): WheelNode 
 }
 
 // ── public API routes (§5) ──────────────────────────────────────────────────
+
+/**
+ * Open paste-code sign-ins, keyed by the handle returned from auth/begin.
+ *
+ * Process-wide rather than per-project because a session handle is unique on its own; the node id
+ * is stored so a code minted for one agent cannot be redeemed against another.
+ */
+const authSessions = new Map<string, { nodeId: string; expiresAt: number }>();
 
 async function route(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
