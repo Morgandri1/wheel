@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { projects as api } from "@/lib/api";
 import type { Project, ProjectStatus } from "@/lib/schema";
 import { Header } from "@/components/header";
@@ -26,6 +26,15 @@ export default function ProjectsPage() {
   });
 
   const [creating, setCreating] = useState(false);
+  /**
+   * Creating a project is the first call that has to reach the sandbox host, so it is the first
+   * one that can hang when the host is unavailable. API confirmed the shape: provisioning retries
+   * eat ~33s and the caller then gets an edge 502, not our error envelope. A button that says
+   * "Creating…" for half a minute reads as a frozen app, so after ten seconds we say what is
+   * actually happening. This is a message, not a timeout — the request is still in flight and may
+   * still succeed.
+   */
+  const [slowCreate, setSlowCreate] = useState(false);
   const [name, setName] = useState("");
   const [pendingDelete, setPendingDelete] = useState<Project | null>(null);
   const [confirmName, setConfirmName] = useState("");
@@ -34,6 +43,7 @@ export default function ProjectsPage() {
 
   const create = useMutation({
     mutationFn: (n: string) => api.create(n),
+    onMutate: () => setSlowCreate(false),
     onSuccess: (p) => {
       setCreating(false);
       setName("");
@@ -41,7 +51,14 @@ export default function ProjectsPage() {
       toast(`Created ${p.name}.`);
     },
     onError: (e) => toastError(e, "Couldn't create that project."),
+    onSettled: () => setSlowCreate(false),
   });
+
+  useEffect(() => {
+    if (!create.isPending) return;
+    const t = setTimeout(() => setSlowCreate(true), 10_000);
+    return () => clearTimeout(t);
+  }, [create.isPending]);
 
   const remove = useMutation({
     mutationFn: (id: string) => api.remove(id),
@@ -202,6 +219,12 @@ export default function ProjectsPage() {
               placeholder="field-notes"
             />
           </Field>
+          {slowCreate ? (
+            <p className="text-micro text-ink-faint" data-testid="create-taking-long">
+              This is taking longer than usual. The project service may be starting up — the
+              request is still going, and nothing has been created twice.
+            </p>
+          ) : null}
           <div className="flex justify-end gap-2">
             <Button type="button" tone="ghost" onClick={() => setCreating(false)}>
               Cancel
