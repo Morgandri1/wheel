@@ -252,3 +252,85 @@ fn base_url_must_be_absolute_http_and_publicly_routable() {
         );
     }
 }
+
+/// ADVERSARY 026: IPv4 addresses embedded in IPv6 forms.
+mod embedded_ipv4_forms {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use wheel_core::{embedded_ipv4, ip_is_denied};
+
+    /// Every one of these is `169.254.169.254` — the cloud metadata endpoint,
+    /// the single most valuable SSRF target on a hosted machine — wearing a
+    /// different spelling. A deny-list that reads the spelling rather than the
+    /// destination is one an attacker picks the spelling to defeat.
+    #[test]
+    fn the_metadata_endpoint_is_denied_in_every_ipv6_disguise() {
+        for spelling in [
+            "::ffff:169.254.169.254",   // IPv4-mapped
+            "::169.254.169.254",        // IPv4-compatible (deprecated)
+            "2002:a9fe:a9fe::",         // 6to4
+            "64:ff9b::169.254.169.254", // NAT64 well-known prefix
+            "2001:0:a9fe:a9fe::",       // Teredo, server field
+        ] {
+            let ip: IpAddr = spelling.parse().unwrap();
+            assert!(
+                ip_is_denied(ip),
+                "{spelling} is 169.254.169.254 in disguise"
+            );
+        }
+    }
+
+    #[test]
+    fn private_ranges_are_denied_through_every_form_too() {
+        for spelling in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+            "::ffff:192.168.1.1",
+            "::10.0.0.5",
+            "2002:0a00:0005::",   // 6to4 wrapping 10.0.0.5
+            "2002:7f00:0001::",   // 6to4 wrapping 127.0.0.1
+            "64:ff9b::10.0.0.5",  // NAT64 wrapping 10.0.0.5
+            "2001:0:0a00:0005::", // Teredo server 10.0.0.5
+        ] {
+            let ip: IpAddr = spelling.parse().unwrap();
+            assert!(ip_is_denied(ip), "{spelling} must be denied");
+        }
+    }
+
+    /// Teredo hides the CLIENT address by XOR with all-ones, so a deny-list
+    /// reading the bits as written misses it entirely.
+    #[test]
+    fn a_teredo_client_address_is_deobfuscated_before_being_judged() {
+        let v6 = Ipv6Addr::new(0x2001, 0, 0x0102, 0x0304, 0, 0, !0x0a00, !0x0005);
+        assert!(
+            embedded_ipv4(v6).contains(&Ipv4Addr::new(10, 0, 0, 5)),
+            "the obfuscated client address was not recovered: {:?}",
+            embedded_ipv4(v6)
+        );
+        assert!(ip_is_denied(IpAddr::V6(v6)));
+    }
+
+    /// The rule must not swallow ordinary public IPv6, or every AAAA answer
+    /// becomes unreachable and the whole feature stops working.
+    #[test]
+    fn ordinary_public_ipv6_is_still_reachable() {
+        for spelling in [
+            "2606:4700:4700::1111",     // public resolver
+            "2a00:1450:4009:81f::200e", // public host
+            "::ffff:1.1.1.1",           // a mapped PUBLIC v4 is fine
+            "2002:0101:0101::",         // 6to4 wrapping 1.1.1.1
+            "64:ff9b::1.1.1.1",         // NAT64 wrapping 1.1.1.1
+        ] {
+            let ip: IpAddr = spelling.parse().unwrap();
+            assert!(!ip_is_denied(ip), "{spelling} should be reachable");
+        }
+    }
+
+    /// `::` and `::1` are their own rules, not embedded-IPv4 ones — the
+    /// extractor must not claim them and must not miss them either.
+    #[test]
+    fn the_unspecified_and_loopback_addresses_are_still_denied() {
+        assert!(ip_is_denied("::".parse().unwrap()));
+        assert!(ip_is_denied("::1".parse().unwrap()));
+        assert!(embedded_ipv4("::".parse().unwrap()).is_empty());
+    }
+}

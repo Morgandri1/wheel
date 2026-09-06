@@ -51,8 +51,8 @@ pub use state::{
 };
 pub use timestamp::Timestamp;
 pub use tool::{
-    host_is_denied, ip_is_denied, Fill, FillMode, ParamLocation, ToolConfig, ToolFormat, ToolKind,
-    ToolMethod, ToolOperation, ToolParam, ToolSource,
+    embedded_ipv4, host_is_denied, ip_is_denied, Fill, FillMode, ParamLocation, ToolConfig,
+    ToolFormat, ToolKind, ToolMethod, ToolOperation, ToolParam, ToolSource,
 };
 pub use validate::{
     normalize_chest_key, url_host, validate_config, validate_endpoint_path, ConfigError,

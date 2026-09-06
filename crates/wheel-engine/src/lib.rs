@@ -44,6 +44,19 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // Said at boot, every boot, at warn level. If someone ever has to work out
     // why a tenant read another tenant's data, this line is what they will
     // find -- and if it is absent, the answer is not "shared uid".
+    // Named at boot, every boot. This is a hole in the SSRF policy that exists
+    // for tests and red-team probes; if anyone ever has to work out how a tool
+    // call reached a local address, this line is the answer, and its absence
+    // rules the explanation out.
+    if !cfg.tool_allow_hosts.is_empty() {
+        tracing::warn!(
+            targets = %cfg.tool_allow_hosts.join(","),
+            "{} is set: tool calls may reach these exact host:port targets despite the SSRF policy. \
+             This must never be set in production.",
+            crate::config::ENV_TOOL_ALLOW_HOST
+        );
+    }
+
     let isolation = wheel_core::UidIsolation::from_env();
     if isolation.is_shared() {
         tracing::warn!(

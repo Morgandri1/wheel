@@ -1124,6 +1124,7 @@ mod tests {
             data_dir: dir.clone(),
             listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
             json_logs: false,
+            tool_allow_hosts: Vec::new(),
         });
         let sup = Arc::new(Supervisor::with_harness(
             cfg,

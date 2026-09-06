@@ -952,6 +952,37 @@ purpose. JSON documents are unaffected.
 
 ### SSRF policy on every call (§3d rule 4)
 
+**IPv4 hidden inside IPv6 is judged as the IPv4 it is** (ADVERSARY 026). `169.254.169.254` reached through
+6to4 is the same request to the same metadata service; only the spelling differs, and a deny-list that reads
+the spelling rather than the destination is one an attacker picks the spelling to defeat. Extracted and
+checked for: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), **6to4** (`2002::/16`), **NAT64**
+(`64:ff9b::/96`) and **Teredo** (`2001::/32`, both the server field and the client field, which is obfuscated
+by XOR with all-ones and must be recovered before it is judged). Ordinary public IPv6 is unaffected.
+
+### `WHEEL_TOOL_ALLOW_HOST` — a hole for tests, never for production
+
+Testing the redirect loop, the response cap and the timeout needs a real server, and the SSRF policy
+correctly refuses every address one can be started on. So the engine reads an allowlist:
+
+```
+WHEEL_TOOL_ALLOW_HOST=127.0.0.1:8080[,127.0.0.1:9090]
+```
+
+- **Exact `host:port` matches only.** No wildcards, no CIDR, no bare hosts — a bare host would permit every
+  port on it, and a wildcard would be a range wearing an allowlist's clothes. A malformed entry is a boot
+  error.
+- **Consulted after the address is resolved and pinned**, so it permits ONE literal target: with
+  `127.0.0.1:8080` allowed, `127.0.0.2:8080` and `127.0.0.1:9090` are still refused, and the metadata
+  endpoint is never reachable through it.
+- **The engine REFUSES TO BOOT when it is set with `WHEEL_ENV=prod`** (non-zero exit, one-line reason naming
+  the targets). It is a hole in the SSRF policy; in production that is a refusal to start rather than a
+  warning nobody reads.
+- When set outside production it is logged at **warn** on every boot, naming the targets. If anyone ever has
+  to work out how a tool call reached a local address, that line is the answer — and its absence rules the
+  explanation out.
+- An empty or whitespace-only value reads as unset, so clearing it does not require deleting it.
+
+
 `base_url` is checked at config time; every CALL re-checks, because a redirect is a destination nobody
 named. Literal and suffix denials first (no DNS), then the host is resolved ONCE and the connection pinned
 to the validated address — a name that answers differently a moment later cannot become a different
