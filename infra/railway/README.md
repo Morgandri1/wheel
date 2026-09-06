@@ -97,6 +97,21 @@ do not each keep an engine resident on the single host, which costs memory and s
 person's project creation (0.71 s with fourteen engines up, 0.49 s with one).
 
 ```bash
+./infra/prune-probe-projects.railway.sh            # list candidates, delete nothing
+./infra/prune-probe-projects.railway.sh --apply    # delete them
+```
+
+Postgres and `wheel-host` are both private — `postgres.railway.internal` and
+`wheel-host.railway.internal:7100` resolve only inside the project's network — and no container
+there has both a database client and an HTTP client. The wrapper therefore runs the reviewed
+script locally, unchanged, and executes only its two I/O seams inside the containers that can reach
+what they talk to, naming `$DATABASE_URL` and `$WHEEL_HOST_SECRET` rather than carrying their
+values. Adding `psql` and `curl` to the internet-facing API image to save that hop would hand
+anyone who gets execution there exactly the two tools they would want.
+
+Against a reachable database and host, the script runs on its own:
+
+```bash
 DATABASE_URL=… ./infra/prune-probe-projects.sh              # list candidates, delete nothing
 DATABASE_URL=… WHEEL_HOST_URL=… WHEEL_HOST_SECRET=… \
   ./infra/prune-probe-projects.sh --apply
