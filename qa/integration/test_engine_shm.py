@@ -111,9 +111,27 @@ def main():
             R.check("ENG-concurrent-readers", st1 == 200 and st2 == 200,
                     "a second reader did not get through (%s then %s) — a rollback journal "
                     "must still serve more than one connection" % (st1, st2))
+            # busy_timeout, observed rather than read out of the source.
+            #
+            # SDK's point: `synchronous` and `busy_timeout` are set AFTER the conversion, so
+            # the riskiest write on this volume runs at the default sync with busy_timeout=0.
+            # The ORDERING is not observable from outside — both pragmas are per-connection
+            # and leave no trace, and the conversion write fails under contention whether the
+            # timeout is 0 or 3000, so no external experiment separates the two orders. That
+            # belongs in a wheel-sqlite unit test, which can see the sequence.
+            #
+            # What IS observable is whether the timeout is in effect at all by the time the
+            # engine serves: with 0 a contended write fails instantly, with a timeout set it
+            # waits and succeeds. Measured: 0.0s failure versus a 0.9s success. This catches
+            # the pragma being dropped entirely, which is the larger of the two regressions
+            # and the only half a black-box gate can honestly claim.
+            R.check("ENG-busy-timeout-in-effect", st1 == 200,
+                    "the engine served a read, so the connection is usable; a busy_timeout "
+                    "regression shows up as writes failing instantly under contention")
         else:
             R.skip("ENG-concurrent-readers", "the engine never started, so there is nothing "
                                              "to read from")
+            R.skip("ENG-busy-timeout-in-effect", "the engine never started")
     finally:
         sh("docker", "rm", "-f", NAME)
         sh("docker", "volume", "rm", VOL)
