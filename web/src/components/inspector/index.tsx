@@ -5,6 +5,7 @@ import { AGENT_STATUS_META, NODE_META } from "@/lib/node-meta";
 import { Button, Field, Glyph, Input, Select, Textarea, Toggle } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
 import { AuthFlow } from "@/components/inspector/auth-flow";
+import { PanelBoundary } from "@/components/inspector/panel-boundary";
 import { CtxPanel } from "@/components/inspector/ctx-panel";
 import { EndpointPanel } from "@/components/inspector/endpoint-panel";
 import { TablePanel } from "@/components/inspector/table-panel";
@@ -61,6 +62,9 @@ export function Inspector({
       </div>
 
       <div className="flex flex-col gap-5 p-4">
+        {/* One panel's failure must not take the board with it — the node header above stays, so
+            another node can be selected and the canvas keeps working. */}
+        <PanelBoundary nodeName={node.name}>
         {node.type === "agent" ? (
           <AgentPanel node={node} nodes={nodes} api={api} onChanged={onChanged} />
         ) : node.type === "ctx" ? (
@@ -92,6 +96,7 @@ export function Inspector({
         ) : (
           <ChestPanel node={node} api={api} projectId={projectId} />
         )}
+        </PanelBoundary>
       </div>
     </aside>
   );

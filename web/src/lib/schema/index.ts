@@ -138,7 +138,17 @@ export interface Project {
 
 export interface Board {
   nodes: WheelNode[];
-  project: Project;
+  /**
+   * The engine identifies the project and nothing more — it does not know the project's name,
+   * capabilities or ingress URL, all of which live in the API's Postgres.
+   *
+   * This was typed as a full `Project`, which is why passing it into a panel that reads
+   * `capabilities.http` compiled cleanly and then threw on the real engine, taking the board down
+   * with it. A type that promises fields the server never sends removes the compiler from the
+   * only place it could have helped. Anything needing the real project takes it from
+   * `GET /v1/projects/:id`.
+   */
+  project: { id: string };
 }
 
 /**
