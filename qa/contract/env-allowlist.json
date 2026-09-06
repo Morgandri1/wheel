@@ -10,7 +10,7 @@
     "SSL_CERT_FILE": "CA bundle \u2014 without it a private-CA container looks like a network fault",
     "SSL_CERT_DIR": "CA bundle, as above",
     "NODE_EXTRA_CA_CERTS": "CA bundle for node-based harnesses, as above",
-    "RUSTUP_HOME": "where the immutable shared toolchain lives; machine configuration, not a secret and not project-scoped. ADVERSARY 029 admits it ONLY under the image's read-only toolchain dir."
+    "RUSTUP_HOME": "where the immutable shared toolchain lives; machine configuration, not a secret and not project-scoped. ADVERSARY 029 admits it ONLY under the image's read-only toolchain dir \u2014 see `constraints`, which WOW-toolchain-rustup-readonly asserts at runtime. Landed by SDK 2026-09-06; the pending marker expired by breaking, as intended."
   },
   "constraints": {
     "RUSTUP_HOME": {
@@ -35,8 +35,5 @@
       "why": "What a tenant FETCHES is not immutable. A shared CARGO_HOME puts one project's downloaded sources \u2014 and any registry credentials it configures \u2014 where the next project can read them. Set per project at spawn, never inherited."
     }
   },
-  "checked_by": "qa/integration/test_wheel_on_wheel.py (WOW-toolchain-*), per PM: the WOW leg is the acceptance test",
-  "pending": {
-    "RUSTUP_HOME": "ADVERSARY 029 / PM ruling 2026-09-06: SDK adds this after ingress. Pinned ahead of the change so the review is on record BEFORE the code, not after. Expires by breaking: once the engine has it, this marker must go or the gate fails \u2014 a pending note that outlives its change is how a list starts lying."
-  }
+  "checked_by": "qa/integration/test_wheel_on_wheel.py (WOW-toolchain-*), per PM: the WOW leg is the acceptance test"
 }
