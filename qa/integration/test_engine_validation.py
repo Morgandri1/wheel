@@ -81,6 +81,35 @@ def payload(doc):
             if not k.startswith("_") and k != "id"}
 
 
+def wheel(node_id, *argv):
+    """Run `wheel ...` in the container with that node's real token file.
+
+    Table row writes have no engine-secret route (`PUT /v1/tables/:id/rows/:row` has never
+    existed and never will by design -- §4 only exposes GET rows / POST query on that realm;
+    a write is always CLI/node-token gated through `POST /v1/cli/write`, i.e. `wheel write`).
+    This file's own `http()` helper only ever sends the engine secret, so the two PUTs this
+    replaces were silently 404ing and every "before"/"after" row assertion below them had
+    been running against an empty, re-ensured table rather than real data (ADVERSARY, via PM).
+    Matches test_engine_cli.py's own `wheel()`: the real binary, the real token file, not a
+    reimplementation of the CLI's auth call.
+    """
+    return subprocess.run(
+        ["docker", "exec", "-e", "WHEEL_TOKEN_FILE=/data/run/%s/token" % node_id,
+         "-e", "WHEEL_ENGINE_URL=http://127.0.0.1:7000", NAME, "wheel"] + list(argv),
+        capture_output=True, text=True)
+
+
+def wait_token(node_id, timeout=60):
+    """The supervisor writes the token file when the agent starts."""
+    for _ in range(int(timeout * 2)):
+        p = subprocess.run(["docker", "exec", NAME, "test", "-s",
+                            "/data/run/%s/token" % node_id], capture_output=True)
+        if p.returncode == 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def main():
     if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
         print("docker not running")
@@ -194,7 +223,32 @@ def main():
                        "could not create the table node: %s %s" % (st, str(tbl)[:120])):
             return R.report("engine-validation")
 
-        http("PUT", "/v1/tables/%s/rows/r1" % tid, {"title": "before", "count": 1})
+        # Row writes are CLI/node-token gated (§4: the engine-secret realm exposes only
+        # GET rows / POST query, never a write) -- an agent wired write->reports, not the
+        # engine secret used everywhere else in this file.
+        st, writer = http("POST", "/v1/nodes",
+                          {"name": "reports-writer", "type": "agent",
+                           "position": {"x": 0, "y": 0},
+                           "config": {"harness": "claude", "system_prompt": "writer",
+                                      "run_on_startup": False, "ephemeral_context": False}})
+        wid = (writer or {}).get("id")
+        if not R.check("TBL-restore/writer-setup", 200 <= st < 300 and wid,
+                       "could not create the writer agent: %s %s" % (st, str(writer)[:120])):
+            return R.report("engine-validation")
+        st, _ = http("POST", "/v1/wires", {"from": wid, "to": tid, "type": "write"})
+        if not R.check("TBL-restore/writer-wired", 200 <= st < 300,
+                       "could not wire the writer agent to reports (write): %s" % st):
+            return R.report("engine-validation")
+        http("POST", "/v1/agents/%s/start" % wid)
+        if not R.check("TBL-restore/writer-token", wait_token(wid),
+                       "the writer agent never got a token file — cannot write a real row"):
+            return R.report("engine-validation")
+
+        p = wheel(wid, "write", "reports/r1", json.dumps({"title": "before", "count": 1}))
+        R.check("TBL-restore/setup-row", p.returncode == 0,
+                "the setup write itself failed (exit %d: %s) — every assertion below it "
+                "would have been proving something about an empty table"
+                % (p.returncode, (p.stderr or p.stdout).strip()[:160]))
 
         drop = subprocess.run(
             ["docker", "exec", NAME, "python3", "-c",
@@ -213,13 +267,14 @@ def main():
                 % (st, str(rows)[:160]))
 
         # Re-created EMPTY, and with the configured columns — a table rebuilt without its
-        # columns is a different bug wearing the fix's clothes.
+        # columns is a different bug wearing the fix's clothes. Same wire, same token: a
+        # re-ensured table is still the same NODE, so nothing about the writer changes.
         if st == 200:
-            st2, _ = http("PUT", "/v1/tables/%s/rows/r2" % tid,
-                          {"title": "after", "count": 2})
-            R.check("WOW-table-survives-restart/columns", 200 <= st2 < 300,
+            p2 = wheel(wid, "write", "reports/r2", json.dumps({"title": "after", "count": 2}))
+            R.check("WOW-table-survives-restart/columns", p2.returncode == 0,
                     "the table came back but would not accept its own configured columns "
-                    "(%s) — it was recreated from something other than the node config" % st2)
+                    "(exit %d: %s) — it was recreated from something other than the node "
+                    "config" % (p2.returncode, (p2.stderr or p2.stdout).strip()[:160]))
     finally:
         subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
 
