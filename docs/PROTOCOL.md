@@ -823,9 +823,27 @@ by name and gets its pin back.
 ```jsonc
 { "operations": [ ... ],        // the merged set, as above
   "added":   ["createPet"],     // ids present in the spec and not in the node
-  "removed": ["deletePet"] }    // ids in the node that the spec no longer has —
+  "removed": ["deletePet"],     // ids in the node that the spec no longer has —
                                 // REPORTED, not deleted: the operator decides
+  "unpinned": [] }              // pins this import would drop (see below)
 ```
+
+Operations are matched with method and path compared **case-insensitively, ignoring a trailing slash**, and
+params by **location + name** (case-insensitively). `id` in the path and `id` in the query are different
+fields; an upstream normalising `/pets` to `/pets/` is not a new operation.
+
+**A re-import that would drop a pin is REFUSED.** A renamed parameter has nowhere to put the operator's
+`vault`/`static` fill, so the replacement would default to `agent` — turning a credential slot the agent
+must never see into one it controls, with no add/remove signal because the operation itself still matched.
+
+```jsonc
+{ "error": { "code": "would_unpin", "message":
+  "this spec no longer has getData.Authorization (vault), so a field pinned to the board would become
+   agent-fillable. Re-pin on the new field names, or resend with allow_unpin to accept that." } }
+```
+
+`allow_unpin: true` proceeds, and the response's `unpinned` lists every dropped pin as
+`{ "op", "param", "was": "vault"|"static" }`.
 
 ### `GET /v1/tools/:id/ops` — exactly what an agent sees
 

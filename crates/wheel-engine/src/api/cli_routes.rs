@@ -675,3 +675,19 @@ pub async fn tool_call(
         .await
         .map(Json)
 }
+
+/// `GET /v1/cli/mcp/tools` — the MCP tool list for the calling node.
+///
+/// Built here rather than in the CLI so the list reflects the caller's CURRENT
+/// wires: a tool node wired after the agent started still appears, and one
+/// unwired disappears, without restarting the child.
+pub async fn mcp_tools(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    Ok(Json(serde_json::json!({
+        "tools": crate::mcp::tools_for(&conn, &me),
+    })))
+}
