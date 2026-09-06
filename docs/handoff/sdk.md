@@ -10,12 +10,13 @@ wire enforcement, vault AES-256-GCM, table nodes, tool nodes end to end, built-i
 
 Findings closed: F015 (children inherited the engine's env — now `env_clear` + a 9-entry
 allowlist, structurally enforced by `child_command`), 018, 021–027. Last verified push before
-this handoff: **`9476350`** on `origin/main`. 262 engine tests, clippy clean.
+this handoff: **`c0c5e4a`** on `origin/main`. 264 engine tests, clippy clean.
 
 Landed after `d206b95`, all on `origin/main`:
 `7a76a5d` per-project crate cache (QA BUG-021 / ADVERSARY 029) ·
 `32a1ff9` a table node's sqlite table follows it through every change of shape ·
-`0692797` table storage re-established on boot (W1).
+`0692797` table storage re-established on boot (W1) ·
+`0c2d18f` the crate cache must be this project's own directory, not a symlink into a shared one.
 
 ## IN FLIGHT — all of this is merged and pushed (read the commits, they carry the reasoning)
 
