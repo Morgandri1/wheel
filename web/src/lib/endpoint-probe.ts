@@ -43,16 +43,32 @@ export function errorCode(body: string): string | null {
 /**
  * What a status actually tells you. Deliberately short of a verdict it cannot support.
  *
- * The case that matters is a bare 404. Endpoint ingress does not exist engine-side yet, so today
- * EVERY board 404s — and the operator who hit that on `/tg` could not tell "not built" from
- * "I typed the path wrong". A 404 with no code is evidence about the engine, not about the path,
- * and saying so is the whole point of this button.
+ * The distinction that matters is between a 404 nobody wrote and a 404 the engine WROTE. API
+ * turns a bodiless 404 into `501 ingress_unavailable`, because that is an engine with no
+ * `/ingress/*` route at all; a 404 carrying a body passed through their proxy untouched and is a
+ * real answer about this path. Treating both as "ingress is not built yet" would, the moment
+ * ingress lands, tell someone their correct-looking path is fine when it is the thing that is
+ * wrong — the same misreading this button exists to end, pointed the other way.
  */
-export function probeVerdict(status: number, code: string | null = null): string {
+export function probeVerdict({
+  status,
+  code = null,
+  body = "",
+}: {
+  status: number;
+  code?: string | null;
+  body?: string;
+}): string {
   if (code === "ingress_unavailable") return "This project's engine does not serve endpoints yet.";
+  if (code === "no_such_endpoint") {
+    return "The engine is serving ingress but has no endpoint at this path — check the path above.";
+  }
   if (status === 403) return "Reached the API, which refused it — public HTTP is off for this project.";
   if (status === 404) {
-    return "Reached the API, which served nothing here. Endpoint ingress is not built yet, so a bare 404 is expected on every board today — it does not mean your path is wrong.";
+    // This branch retires itself: once API's honesty fix lands, a bodiless 404 arrives as a 501.
+    return body.trim()
+      ? "Something answered 404, with a body. That is a real answer about this path, not a missing feature — read it below."
+      : "Reached the API, which served nothing here and said nothing about why. Endpoint ingress is not built yet, so a bodiless 404 is expected on every board today — it does not mean your path is wrong.";
   }
   if (status === 405) return "Reached the ingress; this path does not accept GET.";
   if (status === 501) return "Reached the API; ingress is not implemented yet.";

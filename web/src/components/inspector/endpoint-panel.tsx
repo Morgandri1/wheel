@@ -157,7 +157,7 @@ export function EndpointPanel({
                 <span className="text-micro text-ink-faint">{probe.statusText}</span>
               </div>
               <p className="text-micro text-ink-dim" data-testid="endpoint-probe-verdict">
-                {probeVerdict(probe.status, probe.code)}
+                {probeVerdict({ status: probe.status, code: probe.code, body: probe.body })}
               </p>
               {probe.body ? (
                 <pre
