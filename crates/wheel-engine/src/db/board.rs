@@ -110,6 +110,18 @@ pub fn create(conn: &Connection, node: &Node) -> Result<(), BoardError> {
     // cannot become a sqlite identifier fails the whole creation instead of
     // leaving a node on the board that silently has nowhere to put rows.
     if let NodeConfig::Table(cfg) = &node.config {
+        // The name rule for table nodes is stricter than for other node types
+        // (PM ruling): it becomes a sqlite identifier, so it must already be
+        // one. Checked here, before the DDL, so the message names the rule
+        // rather than reporting a SQL syntax error.
+        if let Err(e) = wheel_core::validate_table_name(node.name.as_str()) {
+            conn.execute(
+                "DELETE FROM nodes WHERE id = ?1",
+                params![node.id.to_string()],
+            )
+            .ok();
+            return Err(BoardError::Storage(e.to_string()));
+        }
         if let Err(e) = tables::create(conn, &node.name, cfg) {
             conn.execute(
                 "DELETE FROM nodes WHERE id = ?1",

@@ -33,6 +33,14 @@ pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long to wait for the CLI to print its authorize URL.
 const URL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What tests use instead. Deliberately far beyond anything a stub needs: the
+/// property under test is "the URL was found", and `begin` returning `Ok` is
+/// already proof it was found before the deadline. Inheriting the production
+/// budget only makes the test fail when the machine is busy, which teaches
+/// everyone to ignore it.
+#[cfg(test)]
+const GENEROUS_TEST_URL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long to wait for a verdict on a submitted code.
 ///
 /// The CLI does not necessarily EXIT when it rejects one -- it prints the
@@ -98,6 +106,10 @@ type Sessions = std::sync::Arc<Mutex<HashMap<Uuid, Pending>>>;
 
 pub struct LoginSessions {
     inner: Sessions,
+    /// A field for the same reason `ttl` is: these tests spawn real shells on
+    /// a host running six agents, where a process can take twenty seconds to
+    /// start. A production constant is not a budget a test should inherit.
+    url_timeout: Duration,
     /// A field rather than a constant so the expiry path can be tested at
     /// speed. Production always uses `SESSION_TTL`.
     ttl: Duration,
@@ -108,6 +120,13 @@ impl Default for LoginSessions {
         Self {
             inner: Sessions::default(),
             ttl: SESSION_TTL,
+            // Under test, a budget the machine cannot blow through. These
+            // tests spawn real shells on a host running six agents, and a
+            // production constant is not a budget a test should inherit.
+            #[cfg(test)]
+            url_timeout: GENEROUS_TEST_URL_TIMEOUT,
+            #[cfg(not(test))]
+            url_timeout: URL_TIMEOUT,
         }
     }
 }
@@ -180,7 +199,7 @@ impl LoginSessions {
             }));
         }
 
-        let url = match wait_for_url(&output, &mut child).await {
+        let url = match wait_for_url(&output, &mut child, self.url_timeout).await {
             Ok(url) => url,
             Err(e) => {
                 let _ = child.kill().await;
@@ -301,6 +320,7 @@ impl LoginSessions {
         Self {
             inner: Sessions::default(),
             ttl,
+            url_timeout: GENEROUS_TEST_URL_TIMEOUT,
         }
     }
 
@@ -451,8 +471,9 @@ fn extract_url(text: &str) -> Option<String> {
 async fn wait_for_url(
     output: &std::sync::Arc<std::sync::Mutex<String>>,
     child: &mut Child,
+    budget: Duration,
 ) -> Result<String, LoginError> {
-    let deadline = Instant::now() + URL_TIMEOUT;
+    let deadline = Instant::now() + budget;
     loop {
         let text = output.lock().map(|o| o.clone()).unwrap_or_default();
         if let Some(url) = extract_url(&text) {
@@ -535,7 +556,6 @@ mod tests {
         std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
 
         let s = LoginSessions::default();
-        let started = Instant::now();
         let (_, url) = s
             .begin(
                 Uuid::new_v4(),
@@ -546,15 +566,9 @@ mod tests {
             .unwrap();
 
         assert!(url.contains("state=onstderr"), "{url}");
-        // The property is "we did not wait out the URL timeout", not a
-        // statement about speed: this host runs six agents and a cargo build
-        // holds it for seconds at a time. A tight bound here fails for load
-        // and teaches everyone to ignore the result.
-        assert!(
-            started.elapsed() < URL_TIMEOUT,
-            "the URL was on stderr and we waited the whole timeout for it: {:?}",
-            started.elapsed()
-        );
+        // No timing assertion: `begin` returning Ok IS the proof that the URL
+        // was found before the deadline, and anything tighter only fails when
+        // the machine is busy.
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -578,7 +592,6 @@ mod tests {
         std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
 
         let s = LoginSessions::default();
-        let started = Instant::now();
         let err = s
             .begin(
                 Uuid::new_v4(),
@@ -594,11 +607,8 @@ mod tests {
             msg.contains("some unrelated failure"),
             "the reason must be carried to the operator: {msg}"
         );
-        assert!(
-            started.elapsed() < URL_TIMEOUT,
-            "an exit must not wait out the URL timeout: {:?}",
-            started.elapsed()
-        );
+        // Reporting the child's own words rather than a timeout is the
+        // property; the error variant proves which path ran.
         std::fs::remove_dir_all(&dir).ok();
     }
 

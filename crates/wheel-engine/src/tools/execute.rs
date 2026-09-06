@@ -280,16 +280,39 @@ fn shell_quote(s: &str) -> String {
 /// never named, and the most useful thing an attacker can do with an allowed
 /// host is have it point them somewhere else.
 pub async fn send(p: &Prepared) -> Result<Outcome> {
+    send_inner(p, Reach::PublicOnly, CALL_TIMEOUT).await
+}
+
+/// Which destinations a send may reach.
+///
+/// `Loopback` exists ONLY so the redirect, cap and timeout behaviour can be
+/// tested against a real server — every one of those was reasoned about rather
+/// than demonstrated, which is how the two worst bugs today got in.
+///
+/// It permits LOOPBACK and nothing else: every other denial still applies, so
+/// a test can reach a server on 127.0.0.1 and still watch a redirect to the
+/// metadata endpoint be refused. A blanket allowance would have made that test
+/// prove nothing. It is not reachable from production code either — [`send`]
+/// is the only public entry point and always passes `PublicOnly`, and a test
+/// asserts that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reach {
+    PublicOnly,
+    #[cfg(test)]
+    Loopback,
+}
+
+async fn send_inner(p: &Prepared, reach: Reach, timeout: Duration) -> Result<Outcome> {
     let started = std::time::Instant::now();
     let mut url = p.url.clone();
     let mut hops = 0usize;
 
     loop {
-        let (host, addr) = resolve_and_check(&url).await?;
+        let (host, addr) = resolve_for(&url, reach).await?;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(CALL_TIMEOUT)
+            .timeout(timeout)
             .resolve(&host, addr)
             .build()
             .context("building the http client")?;
@@ -378,6 +401,10 @@ async fn finish(
 /// looked up exactly once and the address that was checked is the address that
 /// is used.
 async fn resolve_and_check(url: &str) -> Result<(String, std::net::SocketAddr)> {
+    resolve_for(url, Reach::PublicOnly).await
+}
+
+async fn resolve_for(url: &str, reach: Reach) -> Result<(String, std::net::SocketAddr)> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("bad url {url:?}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -389,7 +416,7 @@ async fn resolve_and_check(url: &str) -> Result<(String, std::net::SocketAddr)> 
         .to_string();
     // Cheap literal and suffix checks first: they need no DNS and they catch
     // the obvious attempts before we ask the resolver anything.
-    if wheel_core::host_is_denied(&host) {
+    if !host_permitted(reach, &host) {
         bail!("{host} is not a reachable destination: private, loopback or internal");
     }
     let port = parsed
@@ -403,13 +430,12 @@ async fn resolve_and_check(url: &str) -> Result<(String, std::net::SocketAddr)> 
     if addrs.is_empty() {
         bail!("{host} does not resolve");
     }
-    // EVERY answer must be public, not just the one we pick: a name that
-    // resolves to both a public and a private address is a rebinding attempt
-    // wearing a disguise, and picking the public one would be luck.
-    for a in &addrs {
-        if wheel_core::ip_is_denied(a.ip()) {
-            bail!("{host} resolves to {}, which is not reachable", a.ip());
-        }
+    if let Some(bad) = addrs
+        .iter()
+        .map(|a| a.ip())
+        .find(|ip| !ip_permitted(reach, *ip))
+    {
+        bail!("{host} resolves to {bad}, which is not reachable");
     }
     Ok((host, addrs[0]))
 }
@@ -422,6 +448,46 @@ fn join_redirect(from: &str, location: &str) -> Result<String> {
         .join(location)
         .with_context(|| format!("bad redirect target {location:?}"))?;
     Ok(next.to_string())
+}
+
+/// The first address in a DNS answer that is not a public destination.
+///
+/// EVERY answer is checked, not just the one that would be used: a name
+/// resolving to both a public and a private address is a rebinding attempt
+/// wearing a disguise, and picking the public one would be luck rather than a
+/// decision.
+fn first_denied(addrs: &[std::net::SocketAddr]) -> Option<IpAddr> {
+    addrs
+        .iter()
+        .map(|a| a.ip())
+        .find(|ip| wheel_core::ip_is_denied(*ip))
+}
+
+fn host_permitted(reach: Reach, host: &str) -> bool {
+    if !wheel_core::host_is_denied(host) {
+        return true;
+    }
+    match reach {
+        Reach::PublicOnly => false,
+        // Loopback only. `169.254.169.254` is denied here exactly as it is in
+        // production, which is what makes the per-hop redirect test real.
+        #[cfg(test)]
+        Reach::Loopback => host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(host == "localhost"),
+    }
+}
+
+fn ip_permitted(reach: Reach, ip: IpAddr) -> bool {
+    if !wheel_core::ip_is_denied(ip) {
+        return true;
+    }
+    match reach {
+        Reach::PublicOnly => false,
+        #[cfg(test)]
+        Reach::Loopback => ip.is_loopback(),
+    }
 }
 
 /// Public for tests and for the SSRF check on `mcp.url`.
@@ -978,6 +1044,359 @@ mod tests {
         assert_eq!(
             join_redirect("https://a.example/x", "http://127.0.0.1/").unwrap(),
             "http://127.0.0.1/"
+        );
+    }
+}
+
+/// `send()` had no coverage at all: the redirect loop, the per-hop SSRF
+/// re-check, the streamed cap and the timeout were reasoned about rather than
+/// demonstrated. Both of today's worst bugs were in exactly that category, so
+/// these run against a real server on a real socket.
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// What one request to the fake server looked like.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        head: String,
+        body: String,
+    }
+
+    /// Serve a scripted sequence of responses, recording every request.
+    ///
+    /// Real sockets rather than a mocked client, because the things under test
+    /// -- redirect following, connection pinning, a streamed size cap -- live
+    /// between the client and the wire, which a mock replaces.
+    async fn fake_server(responses: Vec<String>) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let want: usize = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= end + 4 + want {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                let (head, body) = match text.split_once("\r\n\r\n") {
+                    Some((h, b)) => (h.to_string(), b.to_string()),
+                    None => (text.clone(), String::new()),
+                };
+                log.lock().unwrap().push(Seen { head, body });
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (port, seen)
+    }
+
+    fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    fn prepared(port: u16, path: &str) -> Prepared {
+        Prepared {
+            method: "POST".into(),
+            url: format!("http://127.0.0.1:{port}{path}"),
+            headers: vec![("Authorization".into(), "Bearer secret-token".into())],
+            cookies: vec![],
+            body: Some(serde_json::json!({"text": "hi"})),
+            secrets: vec!["secret-token".into()],
+        }
+    }
+
+    async fn send_local(p: &Prepared) -> Result<Outcome> {
+        send_inner(p, Reach::Loopback, Duration::from_secs(5)).await
+    }
+
+    /// The control: without this the refusals below prove nothing.
+    #[tokio::test]
+    async fn a_call_reaches_the_server_and_returns_what_it_said() {
+        let (port, seen) = fake_server(vec![json_response("200 OK", r#"{"ok":true}"#)]).await;
+        let got = send_local(&prepared(port, "/send")).await.unwrap();
+
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body["ok"], true);
+        assert_eq!(got.bytes, r#"{"ok":true}"#.len());
+        assert!(got.headers.contains_key("content-type"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].head.starts_with("POST /send HTTP/1.1"),
+            "{}",
+            seen[0].head
+        );
+        assert!(seen[0].head.contains("Bearer secret-token"));
+        assert_eq!(seen[0].body, r#"{"text":"hi"}"#);
+    }
+
+    /// A redirect is a destination the caller never named. The body — and the
+    /// credentials in it — must not follow one.
+    #[tokio::test]
+    async fn a_body_is_not_replayed_to_a_redirect_target() {
+        let (port, seen) = fake_server(vec![
+            redirect_to("/second"),
+            json_response("200 OK", r#"{"ok":true}"#),
+        ])
+        .await;
+        let got = send_local(&prepared(port, "/first")).await.unwrap();
+        assert_eq!(got.status, 200);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the redirect must have been followed");
+        assert_eq!(
+            seen[0].body, r#"{"text":"hi"}"#,
+            "first hop carries the body"
+        );
+        assert_eq!(seen[1].body, "", "the body must NOT follow the redirect");
+    }
+
+    #[tokio::test]
+    async fn a_relative_redirect_is_resolved_against_where_it_came_from() {
+        let (port, seen) = fake_server(vec![
+            redirect_to("/moved/here"),
+            json_response("200 OK", "{}"),
+        ])
+        .await;
+        send_local(&prepared(port, "/a/b")).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[1].head.starts_with("POST /moved/here"),
+            "{}",
+            seen[1].head
+        );
+    }
+
+    /// The whole point of following redirects by hand: the target is
+    /// re-validated. An allowed host pointing at loopback is the most useful
+    /// thing an attacker can do with a permitted destination.
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused_at_the_hop() {
+        let (port, seen) = fake_server(vec![
+            redirect_to("http://169.254.169.254/latest/meta-data/"),
+            json_response("200 OK", "{}"),
+        ])
+        .await;
+        // The seam permits LOOPBACK only, so the first hop is reachable and
+        // the metadata address is refused exactly as it would be in
+        // production. That is what makes this a test of the per-hop check
+        // rather than of the first one.
+        let err = send_local(&prepared(port, "/start"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a reachable destination"),
+            "the redirect target must be refused: {err}"
+        );
+        assert!(err.contains("169.254.169.254"), "name the target: {err}");
+
+        // The first hop DID happen — this is a second-hop refusal, not the
+        // first request being blocked.
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the first hop should have been made and the second refused"
+        );
+    }
+
+    /// A redirect chain that leaves the permitted set at ANY hop is refused
+    /// there, not merely at the first.
+    #[tokio::test]
+    async fn a_later_hop_is_checked_as_strictly_as_the_first() {
+        let (port, seen) = fake_server(vec![
+            redirect_to("/second"),
+            redirect_to("http://10.0.0.5/internal"),
+            json_response("200 OK", "{}"),
+        ])
+        .await;
+        let err = send_local(&prepared(port, "/first"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a reachable destination"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "refused on the third hop");
+    }
+
+    /// The same, through the PRODUCTION entry point, which is the one that
+    /// matters: the first hop is refused before any request is made.
+    #[tokio::test]
+    async fn the_production_path_refuses_a_private_destination() {
+        let (port, seen) = fake_server(vec![json_response("200 OK", "{}")]).await;
+        let err = send(&prepared(port, "/x")).await.unwrap_err().to_string();
+        assert!(err.contains("not a reachable destination"), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the request must not be made at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_stops_at_the_limit() {
+        let hops = MAX_REDIRECTS + 2;
+        let (port, seen) = fake_server((0..hops).map(|_| redirect_to("/again")).collect()).await;
+        let err = send_local(&prepared(port, "/start"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too many redirects"), "{err}");
+        assert!(
+            seen.lock().unwrap().len() <= MAX_REDIRECTS + 1,
+            "followed more hops than the limit allows"
+        );
+    }
+
+    /// A redirect with no Location has nowhere to go, and IS the answer.
+    #[tokio::test]
+    async fn a_redirect_without_a_location_is_returned_as_it_stands() {
+        let (port, _) = fake_server(vec![
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ])
+        .await;
+        let got = send_local(&prepared(port, "/x")).await.unwrap();
+        assert_eq!(got.status, 302);
+    }
+
+    /// The cap is a STREAMED one: it must stop reading rather than accept a
+    /// body and measure it afterwards.
+    #[tokio::test]
+    async fn an_oversized_response_is_refused_rather_than_buffered() {
+        let big = "a".repeat(MAX_RESPONSE_BYTES + 4096);
+        let (port, _) = fake_server(vec![json_response("200 OK", &big)]).await;
+        let err = send_local(&prepared(port, "/big"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeded"), "{err}");
+        assert!(err.contains("MiB"), "the operator needs the number: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_response_just_under_the_cap_is_returned() {
+        let body = format!("\"{}\"", "a".repeat(64 * 1024));
+        let (port, _) = fake_server(vec![json_response("200 OK", &body)]).await;
+        let got = send_local(&prepared(port, "/ok")).await.unwrap();
+        assert_eq!(got.status, 200);
+        assert_eq!(got.bytes, body.len());
+    }
+
+    /// A server that accepts the connection and never answers must not hold
+    /// the call open: an agent waiting forever is an agent that never reports.
+    #[tokio::test]
+    async fn a_server_that_never_answers_hits_the_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept and hold, saying nothing.
+            let _held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let err = send_inner(
+            &prepared(port, "/silent"),
+            Reach::Loopback,
+            Duration::from_millis(400),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout did not bound the call: {:?}",
+            started.elapsed()
+        );
+        let _ = err;
+    }
+
+    /// Non-JSON is returned as text rather than being an error: plenty of APIs
+    /// answer with plain text, and an agent should see it.
+    #[tokio::test]
+    async fn a_non_json_body_comes_back_as_text() {
+        let (port, _) = fake_server(vec![json_response("200 OK", "not json at all")]).await;
+        let got = send_local(&prepared(port, "/text")).await.unwrap();
+        assert_eq!(
+            got.body,
+            serde_json::Value::String("not json at all".into())
+        );
+    }
+
+    /// EVERY address in a DNS answer is checked, not just the one that would be
+    /// used. A name resolving to both a public and a private address is a
+    /// rebinding attempt in a disguise.
+    #[test]
+    fn a_mixed_dns_answer_is_refused_on_the_private_one() {
+        use std::net::SocketAddr;
+        let public: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let private: SocketAddr = "10.0.0.5:443".parse().unwrap();
+        let metadata: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let v6_local: SocketAddr = "[::1]:443".parse().unwrap();
+
+        assert!(first_denied(&[public]).is_none());
+        assert!(first_denied(&[public, public]).is_none());
+        // The private one is found wherever it sits in the answer.
+        assert_eq!(first_denied(&[private, public]), Some(private.ip()));
+        assert_eq!(first_denied(&[public, private]), Some(private.ip()));
+        assert_eq!(
+            first_denied(&[public, public, metadata]),
+            Some(metadata.ip())
+        );
+        assert_eq!(first_denied(&[public, v6_local]), Some(v6_local.ip()));
+        assert!(first_denied(&[]).is_none());
+    }
+
+    /// The test-only escape hatch must be unreachable from production. `send`
+    /// is the only public entry point and it always asks for PublicOnly.
+    #[test]
+    fn the_loopback_reach_is_not_reachable_from_production_code() {
+        let src = include_str!("execute.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains("Reach::Loopback"),
+            "production code can reach the test-only loopback allowance"
+        );
+        assert_eq!(
+            production
+                .matches("send_inner(p, Reach::PublicOnly")
+                .count(),
+            1,
+            "send() must be the only production caller of send_inner"
         );
     }
 }
