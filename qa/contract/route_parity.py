@@ -96,7 +96,17 @@ def rust_handlers():
             # Signature runs to the closing paren of the parameter list.
             tail = src[m.end():m.end() + 600]
             sig = tail.split(") ->")[0] if ") ->" in tail else tail
-            if EXTRACTOR.search(sig):
+            # An extractor makes it a handler. So does taking NOTHING at all:
+            # `pub async fn f() -> ApiResult<_>` is a real handler shape (SDK asked for
+            # this widening after the first version could not have seen one).
+            #
+            # A helper is what is left: parameters, but none of them extractors --
+            # run_operation(&AppState, &Node, ...) is shared by the operator route and the
+            # CLI path and is not itself routed. Widening to "any pub async fn" would flag
+            # it, and a gate with one standing false positive is one people learn to scroll
+            # past, which costs more than the shape it would catch.
+            no_params = sig.strip().startswith(")") or not sig.strip().strip("(").strip()
+            if EXTRACTOR.search(sig) or no_params:
                 out.setdefault(module, set()).add(m.group(1))
     return out
 
