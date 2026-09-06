@@ -172,6 +172,29 @@ def turn(agent, command, wait=180):
     return TURN_TIMEOUT
 
 
+def credential_scan(root, token):
+    """What a credential looks like on disk under `root`, measured from OUTSIDE the agent.
+
+    Three separate questions, because they fail independently and PM asked for all three:
+    the literal token anywhere in the tree, a credential embedded in a remote URL, and
+    what `git remote -v` actually prints. Run by `docker exec`, not by the agent: an agent
+    asked to search for its own leaked secret is the wrong witness.
+    """
+    literal = sh("docker", "exec", NAME, "sh", "-c",
+                 "grep -rlF -- '%s' %s 2>/dev/null | head -5" % (token, root)).stdout.strip()
+    cfg = sh("docker", "exec", NAME, "sh", "-c",
+             "cat %s/.git/config 2>/dev/null" % root).stdout
+    remotes = sh("docker", "exec", NAME, "sh", "-c",
+                 "cd %s 2>/dev/null && git remote -v" % root).stdout
+    # `https://user:secret@host` in any of them. Matches the shape, not one token, so a
+    # DIFFERENT credential than the one we planted is still caught.
+    embedded = re.findall(r"https://[^/\s]*:[^/@\s]+@", cfg + remotes)
+    return {"literal_files": literal, "config": cfg, "remotes": remotes,
+            "embedded": embedded,
+            "clean": not literal and not embedded and token not in cfg + remotes}
+
+
+
 def main():
     if os.environ.get("WHEEL_WOW") != "1":
         print("wheel-on-wheel is opt-in: set WHEEL_WOW=1 (it clones and compiles; minutes, "
@@ -190,7 +213,9 @@ def main():
         # The whole point of the test is that a real agent can do real work in the sandbox.
         # Without the toolchain there is nothing to measure, and a green here would mean
         # only that we successfully did nothing.
-        for tid in ("WOW-clone", "WOW-vault-token", "WOW-cargo-test", "WOW-no-token-in-log"):
+        for tid in ("WOW-clone", "WOW-vault-token", "WOW-cargo-test", "WOW-no-token-in-log",
+                    "WOW-token-not-on-disk", "WOW-commit", "WOW-commit-push",
+                    "WOW-token-not-on-disk-after-push"):
             R.skip(tid, "sandbox image lacks %s — needs SDK's toolchain image" % ", ".join(absent))
         return R.report("wheel-on-wheel")
 
@@ -198,7 +223,9 @@ def main():
 
     token = os.environ.get("WHEEL_WOW_GH_TOKEN") or sh("gh", "auth", "token").stdout.strip()
     if not token:
-        for tid in ("WOW-vault-token", "WOW-clone", "WOW-cargo-test", "WOW-no-token-in-log"):
+        for tid in ("WOW-vault-token", "WOW-clone", "WOW-cargo-test", "WOW-no-token-in-log",
+                    "WOW-token-not-on-disk", "WOW-commit", "WOW-commit-push",
+                    "WOW-token-not-on-disk-after-push"):
             R.skip(tid, "no GitHub token: set WHEEL_WOW_GH_TOKEN or run `gh auth login`")
         return R.report("wheel-on-wheel")
 
@@ -242,6 +269,114 @@ def main():
     else:
         R.check("WOW-clone", "CLONE_OK" in out,
                 "the agent could not clone with its vault token: %s" % out[-400:])
+
+    # ---- PM 15:55 (S1): a live GitHub PAT was found in plaintext in .git/config -------
+    #
+    # Found by the cloud adversary on the production volume and verified by PM. The clone
+    # put the vault token in the REMOTE URL, so it landed in `.git/config`, which is
+    # world-readable to every uid in the sandbox that can reach the workspace, survives the
+    # process, and gets copied wherever the workspace is copied. The token in this suite
+    # reaches git through a credential helper reading the environment instead, so this leg
+    # is what proves that difference is real rather than intended.
+    #
+    # The control first: a detector that reports "no credential on disk" is only evidence
+    # if it would have said otherwise. So a credential is PLANTED in a scratch repo, in
+    # exactly the shape the production exposure had, and the same detector must flag it.
+    # Without this, a typo in the grep, a wrong path or an empty token all read as green —
+    # and "we looked and found nothing" is the single easiest false green to ship.
+    planted = "ghp_" + "P1anted" * 5
+    sh("docker", "exec", NAME, "sh", "-c",
+       "rm -rf /data/detector && mkdir -p /data/detector && cd /data/detector && "
+       "git init -q . && git remote add origin "
+       "https://x-access-token:%s@github.com/example/repo.git" % planted)
+    caught = credential_scan("/data/detector", planted)
+    R.control("WOW/credential-detector-works", not caught["clean"] and bool(caught["embedded"]),
+              "the detector did NOT flag a credential deliberately written into "
+              ".git/config, so it cannot be trusted to report the absence of one. "
+              "config=%r remotes=%r" % (caught["config"][-200:], caught["remotes"][-120:]))
+    sh("docker", "exec", NAME, "sh", "-c", "rm -rf /data/detector")
+
+    if "CLONE_OK" not in out:
+        R.skip("WOW-token-not-on-disk", "nothing was cloned, so there is no workspace to "
+                                        "search — an absence here would mean only that")
+    else:
+        found = credential_scan("/data/wow", token)
+        R.gated("WOW-token-not-on-disk", "WOW/credential-detector-works", found["clean"],
+                "the GitHub token is on disk in the workspace after clone. Files "
+                "containing it: %s. Credentialed remote URLs: %s. This is a live PAT "
+                "readable by every process that can reach the workspace, and it outlives "
+                "the agent that used it: `git remote -v` -> %r"
+                % (found["literal_files"] or "none", found["embedded"] or "none",
+                   found["remotes"][-160:]))
+
+    # ---- PM 15:48: the third leg — commit & push -------------------------------------
+    #
+    # Clone proves a vault token authenticates a READ. The operator's goal is Wheel
+    # developing itself, which needs a WRITE, and until now nobody had ever run one: seven
+    # PRs were opened by cloud agents today on a capability with no gate under it.
+    #
+    # Pushes go to a throwaway branch named for the run, never main and never a role
+    # branch, and it is deleted in the same run whatever the outcome.
+    #
+    # THE CONTROL IS THE TEST. A push that succeeds because the RUNNER is logged in, or
+    # because a credential is cached in the image, proves nothing about the sandbox — and
+    # that is the exact shape that produced three false greens today. So the same push is
+    # attempted FIRST with the token removed from the environment, and it must FAIL. If it
+    # succeeds, some other credential is doing the work and the real result is worthless.
+    branch = "wow/%s" % uuid.uuid4().hex[:12]
+    if "CLONE_OK" not in out:
+        for tid in ("WOW-commit", "WOW-commit-push", "WOW-push-needs-the-token"):
+            R.skip(tid, "nothing was cloned, so there is no workspace to commit in")
+    else:
+        # A tracked file, not creds/ (that is A3), and content that is obviously test
+        # residue if a branch ever escapes deletion.
+        edit = ("set -e; cd /data/wow; "
+                "git config user.email 'qa@wheel.test'; git config user.name 'Wheel QA'; "
+                "echo 'wheel-on-wheel probe %s' >> README.md; "
+                "git add README.md; "
+                "git commit -q -m 'qa: wheel-on-wheel push probe (%s)' && echo COMMIT_OK; "
+                "git rev-parse --short HEAD" % (branch, branch))
+        cout = turn(agent, edit, wait=120)
+        if cout == TURN_TIMEOUT or "engine unreachable" in cout:
+            R.skip("WOW-commit", "the commit turn did not finish — %s" % cout[:120])
+        else:
+            R.check("WOW-commit", "COMMIT_OK" in cout,
+                    "the agent could not commit in its own workspace. Git identity is the "
+                    "usual cause and it must fail legibly, not silently: %s" % cout[-400:])
+
+        # Control: the same push, with the token taken out of the environment.
+        denied = turn(agent, "cd /data/wow && env -u GH_TOKEN git push origin HEAD:%s "
+                             "2>&1 | tail -3; echo RC=$?" % branch, wait=120)
+        pushed_without_token = "RC=0" in denied and "reject" not in denied.lower()
+        R.control("WOW-push-needs-the-token", not pushed_without_token,
+                  "a push SUCCEEDED with the vault token removed. Some other credential is "
+                  "authenticating — a cached helper, an ambient git config, or a token "
+                  "baked into the image — so a green push leg would say nothing about "
+                  "whether the vault token works. Output: %s" % denied[-300:])
+
+        pout = turn(agent, "cd /data/wow && git push origin HEAD:%s 2>&1 | tail -3; "
+                           "echo RC=$?" % branch, wait=180)
+        if pout == TURN_TIMEOUT or "engine unreachable" in pout:
+            R.skip("WOW-commit-push", "the push turn did not finish — no verdict")
+        else:
+            R.gated("WOW-commit-push", "WOW-push-needs-the-token", "RC=0" in pout,
+                    "an agent in the sandbox could not push to %s with its vault token. "
+                    "This is the third leg of the operator's goal and it is already "
+                    "happening in production, so a failure here is a gap in the gate, not "
+                    "in the capability: %s" % (REPO, pout[-400:]))
+
+        # PM's S1, applied after the WRITE as well: pushing must not leave a credential
+        # behind either, and a push is where git is most tempted to persist one.
+        after_push = credential_scan("/data/wow", token)
+        R.gated("WOW-token-not-on-disk-after-push", "WOW/credential-detector-works",
+                after_push["clean"],
+                "the GitHub token is on disk after the push (it was not after the clone, "
+                "so the push wrote it): files=%s remotes=%r"
+                % (after_push["literal_files"] or "none", after_push["remotes"][-160:]))
+
+        # Clean up whatever we managed to create, on every path out.
+        turn(agent, "cd /data/wow && git push origin --delete %s 2>&1 | tail -2" % branch,
+             wait=120)
 
     if os.environ.get("WHEEL_WOW_SKIP_BUILD") == "1":
         # The clone leg proves the interesting half (a vault secret reaching an agent
