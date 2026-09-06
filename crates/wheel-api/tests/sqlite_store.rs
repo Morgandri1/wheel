@@ -175,3 +175,60 @@ async fn ingress_is_disabled_by_default() {
             .unwrap();
     assert_eq!(caps["http"], serde_json::json!(false));
 }
+
+/// The dispatch macros, exercised on the backend a local install uses.
+///
+/// They are the reason one query string can serve both, so a mistake here would be a mistake in
+/// every query rather than in one.
+#[tokio::test]
+async fn the_dispatch_macros_work_against_a_real_backend() {
+    use wheel_api::{db_execute, db_fetch_all, db_fetch_one, db_fetch_optional, db_scalar};
+
+    let db = Db::connect(&temp_db()).await.unwrap();
+    let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+    for (id, name) in [(a, "alpha"), (b, "beta")] {
+        let affected = db_execute!(
+            &db,
+            "INSERT INTO projects (id, owner_id, name) VALUES ($1,$2,$3)",
+            id,
+            "user_1",
+            name
+        )
+        .expect("insert");
+        assert_eq!(affected, 1);
+    }
+
+    let one: (String,) = db_fetch_one!(&db, "SELECT name FROM projects WHERE id = $1", a).unwrap();
+    assert_eq!(one.0, "alpha");
+
+    let missing: Option<(String,)> = db_fetch_optional!(
+        &db,
+        "SELECT name FROM projects WHERE id = $1",
+        uuid::Uuid::new_v4()
+    )
+    .unwrap();
+    assert!(
+        missing.is_none(),
+        "a missing row must be None, not an error"
+    );
+
+    let all: Vec<(String,)> =
+        db_fetch_all!(&db, "SELECT name FROM projects ORDER BY name").unwrap();
+    assert_eq!(
+        all.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+
+    let count: i64 = db_scalar!(
+        &db,
+        "SELECT count(*) FROM projects WHERE owner_id = $1",
+        "user_1"
+    )
+    .unwrap();
+    assert_eq!(count, 2);
+
+    // An error has to arrive as an error, not a panic inside the macro.
+    let broken: Result<(String,), _> = db_fetch_one!(&db, "SELECT nope FROM projects");
+    assert!(broken.is_err());
+}
