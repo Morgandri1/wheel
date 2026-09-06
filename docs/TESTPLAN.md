@@ -269,6 +269,28 @@ token is wrong.
 | `AUTH-cred-config-dir` | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are set per node, so two agents never share a credential store. | **S1** |
 | `SEC-no-secret-in-argv` | No credential appears in the child's argv — argv is world-readable across uids (§5b). Asserted from the dump's own record of argv. | **S1** |
 
+### 7b-ii. A declared key is not a credential (ADVERSARY 028)
+
+Production `wheel-dev` showed six agents reporting `authenticated: true, mode: env,
+source: secrets` against a vault that had **no value stored for any key**. Declaring a key
+name in `vault.config.keys` is a statement of intent; only a `PUT` puts a secret in it. The
+engine was reading the declaration and answering as though it had read a credential, so every
+agent started with a blank token in its environment and failed at the provider — which
+surfaces as "your perfectly valid token is wrong", the single most expensive wrong answer in
+this system.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-declared-key-not-credential` | A vault DECLARING `CLAUDE_CODE_OAUTH_TOKEN` with no value PUT ⇒ `GET /v1/agents/:id/auth` says `authenticated: false`, and start lands in `needs_auth` — never `starting` with an empty variable. | **S1** |
+| `AUTH-declared-key-not-credential/positive` | **Positive control, and the reason the one above means anything:** `PUT` a value ⇒ `authenticated: true, mode: env`; `DELETE` it ⇒ `false` again. Without this pair an engine that reported `false` for everything would satisfy the criterion above perfectly. | **S1** |
+
+### 11d. WEB — the auth panel tells the truth while it is still loading
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `WEB-auth-panel-no-flash` | With a DELAYED `/auth` response the sign-in form is never mounted and then unmounted. A panel that renders sign-in before it knows, and retracts it a moment later, teaches the operator that the UI guesses — and the guess is about whether their agent is authenticated. Asserted across the pending window, not after it settles. | S2 |
+| `WEB-auth-signin-reachable-in-env-mode` | In `mode: env` a sign-in disclosure still EXISTS and opens the OAuth panel, with `save_to_vault` preselected to the vault the credential came from. An agent credentialed from a vault must still be re-authenticable without hunting: env mode is where a token expires and nobody can replace it. | S2 |
+
 ### 7b-i. The child's environment is the engine's, minus everything (ADVERSARY F015)
 
 The engine holds `WHEEL_ENGINE_SECRET` (authority over the whole board) and `WHEEL_VAULT_KEY`
