@@ -55,6 +55,7 @@ pub struct AppState {
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
+#[derive(Debug)]
 pub struct ApiError(StatusCode, &'static str, String);
 
 impl ApiError {
