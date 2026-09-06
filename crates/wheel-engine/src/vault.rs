@@ -542,6 +542,62 @@ mod tests {
             .is_none());
     }
 
+    /// ADVERSARY 021. The spawn gate reads the VAULT's expiry, per agent — so
+    /// one expiring credential in a vault read by N agents stops all N at
+    /// once, not just the one that authenticated. This pins the blast radius
+    /// the refusal exists to prevent.
+    #[test]
+    fn one_expiry_on_a_shared_vault_reaches_every_reader() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("team", &[]);
+        board::create(&c, &v).unwrap();
+
+        let agents: Vec<_> = ["alice", "bob", "carol"]
+            .iter()
+            .map(|n| {
+                let a = node(n, NodeConfig::Agent(AgentConfig::default()));
+                board::create(&c, &a).unwrap();
+                board::add_wire(&c, a.id, v.id, wheel_core::WireType::Read, None).unwrap();
+                a
+            })
+            .collect();
+
+        let past = wheel_core::Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap();
+        put_with_expiry(
+            &c,
+            &key(),
+            v.id,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "tok",
+            Some(past),
+        )
+        .unwrap();
+
+        // Every reader sees the same lapsed credential, not just the one that
+        // put it there.
+        for a in &agents {
+            let (name, _k, exp) = credential_detail(&c, a.id, wheel_core::Harness::Claude)
+                .unwrap()
+                .unwrap();
+            assert_eq!(name, "team");
+            assert_eq!(exp, Some(past), "{} must see the vault's expiry", a.name);
+        }
+
+        // ...and the readers are exactly who a refusal must name.
+        let mut readers: Vec<String> = agents_reading(&c, v.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|id| {
+                board::get(&c, id)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.name.to_string())
+            })
+            .collect();
+        readers.sort();
+        assert_eq!(readers, ["alice", "bob", "carol"]);
+    }
+
     /// If a child echoes a vaulted credential, it must not survive into a log
     /// line or a transcript that the operator or another agent can read.
     #[test]
