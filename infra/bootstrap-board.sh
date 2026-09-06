@@ -32,15 +32,20 @@ CONTRACT=$(node contract ctx 0 0 "$(md "$ROOT/docs/ARCHITECTURE.md")")
 WORKFLOW=$(node workflow ctx 0 200 "$(python3 -c 'import json,re;t=open("docs/WHEEL-ON-WHEEL.md").read();print(json.dumps({"markdown":t[t.index("## Working rules"):t.index("## Sizing")]}))')")
 SECRETS=$(node secrets vault 0 400 '{"keys":["GITHUB_TOKEN","CLAUDE_CODE_OAUTH_TOKEN"]}')
 REPORTS=$(node reports table 0 600 '{"columns":[{"name":"ts","type":"text"},{"name":"author","type":"text"},{"name":"kind","type":"text"},{"name":"body","type":"json"}]}')
-declare -A AG
+AG_FILE="$(mktemp)"; trap 'rm -f "$AG_FILE"' EXIT
+agent_id() { awk -v r="$1" '$1==r {print $2}' "$AG_FILE"; }
 y=0; for role in pm sdk api web qa adversary; do
   brief="$ROOT/docs/plans/$role.brief.md"; eph=0; [ "$role" = pm ] && eph=1
-  AG[$role]=$(node "$role" agent 500 "$y" "$(prompt "$brief" "You are the $role agent developing Wheel on Wheel. Follow the contract and workflow contexts." "$eph")"); y=$((y+150))
+  id=$(node "$role" agent 500 "$y" "$(prompt "$brief" "You are the $role agent developing Wheel on Wheel. Follow the contract and workflow contexts." "$eph")")
+  echo "$role $id" >> "$AG_FILE"; y=$((y+150))
 done
-for role in "${!AG[@]}"; do
-  wire "$CONTRACT" "${AG[$role]}" send; wire "$WORKFLOW" "${AG[$role]}" send
-  wire "${AG[$role]}" "$SECRETS" read; wire "${AG[$role]}" "$REPORTS" write
-  [ "$role" != pm ] && { wire "${AG[pm]}" "${AG[$role]}" send; wire "${AG[$role]}" "${AG[pm]}" send; }
+PM_ID=$(agent_id pm)
+for role in pm sdk api web qa adversary; do
+  id=$(agent_id "$role")
+  wire "$CONTRACT" "$id" send; wire "$WORKFLOW" "$id" send
+  wire "$id" "$SECRETS" read; wire "$id" "$REPORTS" write
+  [ "$role" != pm ] && { wire "$PM_ID" "$id" send; wire "$id" "$PM_ID" send; }
 done
-wire "${AG[sdk]}" "${AG[api]}" send; wire "${AG[api]}" "${AG[sdk]}" send; wire "${AG[sdk]}" "${AG[web]}" send; wire "${AG[web]}" "${AG[sdk]}" send
+wire "$(agent_id sdk)" "$(agent_id api)" send; wire "$(agent_id api)" "$(agent_id sdk)" send
+wire "$(agent_id sdk)" "$(agent_id web)" send; wire "$(agent_id web)" "$(agent_id sdk)" send
 echo "project $PID ready — set the vault secrets in the web app, then start the agents (run_on_startup starts them on the next project start)."
