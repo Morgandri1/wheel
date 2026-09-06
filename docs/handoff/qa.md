@@ -68,6 +68,28 @@ docker build -f docker/Dockerfile.test --build-arg BASE=wheel-engine:mutant-qa \
 WHEEL_PANIC_IMAGE=wheel-engine:mutant-test python3 qa/integration/test_engine_panics.py
 ```
 
+**An absence is not evidence, and neither is a probe that could never have arrived.**
+`free_port(0)` returned literally `0`: binding to port 0 SUCCEEDS -- the kernel assigns one
+-- so the helper reported 0 as bindable and handed it back. Four override gates then failed
+identically against a perfectly healthy engine, and the report I had drafted said the fix
+was still broken on `main`, to the operator whose own override had caused the outage. What
+caught it was the shape: four identical failures, and the engine's own log line
+`"message":"database ready"` sitting inside my failure text. Fixed in `free_port`, but the
+general form recurs -- when several gates fail the same way at once, suspect the harness
+first, and read your own failure text before sending it.
+
+**A red merge gate must mean the code is broken.** `make check` reported `rust:test FAILED`
+on `main` with no failing test, no panic and no compiler error -- six worktrees share one
+`target-dir`, and a bare `cargo` call outside `check.sh`'s lock rewrites artifacts under a
+run in progress. `cargo test --workspace` was green. `qa/tools/cargo_test_gate.py` now
+classifies an evidence-free cargo failure as INCONCLUSIVE (exit 75). The doctrine already
+said "could not check" must never read as "passed"; it has to hold in the other direction
+too, because a gate that cries wolf is ignored exactly when it is right.
+
+**`qa/BUGS.md` numbers 017-020 were each issued twice**, by concurrent sessions of me
+merging from separate worktrees -- they collide in meaning, never in a diff, so git will not
+warn you. Cite bug titles, not numbers. Next free number is 026.
+
 **`wheel-engine:test` is a mutable tag on a shared host and it goes stale.** It was six
 hours old on 2026-09-06, so every suite anyone ran that afternoon tested a pre-fix engine.
 `pin_image()` resolves it to an immutable ID and suites print which. If a result surprises
