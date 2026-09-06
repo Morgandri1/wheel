@@ -3173,6 +3173,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "rand 0.8.8",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
