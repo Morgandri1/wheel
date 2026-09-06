@@ -320,3 +320,36 @@ fn a_tag_window_ending_inside_a_character_is_not_a_match_and_not_a_panic() {
         assert!(escaped.contains(filler), "{escaped}");
     }
 }
+
+/// API's minimal repro, which panicked against origin/main: `<`, then exactly
+/// eleven bytes, then a character that straddles the offset the tag comparison
+/// reads to.
+///
+/// My own multibyte test stayed green through BOTH the broken and the fixed
+/// version, because it never put a multi-byte character at that precise
+/// offset. A test that exercises the right alphabet is not the same as a test
+/// that exercises the right position.
+#[test]
+fn a_multibyte_char_eleven_bytes_after_a_less_than() {
+    let _ = wheel_core::escape_envelope_body("< 123456789\u{2014} x");
+}
+
+/// The poison-pill property (ADVERSARY 034), which is the reason this was an
+/// outage rather than a bad turn: the offending body is ON DISK, so the engine
+/// panicked during START, before it could serve — and therefore before anyone
+/// could consume or delete the row. Every boot replayed it.
+///
+/// So the property is not "this body escapes correctly", it is "a stored body
+/// cannot stop the engine coming up". Every offset, so no single character
+/// position can be the one that gets through.
+#[test]
+fn no_stored_body_can_stop_the_engine_from_starting() {
+    for offset in 0..64 {
+        for tail in ["\u{2014}", "\u{1f600}", "\u{65e5}", "\u{e9}"] {
+            let body = format!("<{}{tail} trailing text", " ".repeat(offset));
+            let _ = wheel_core::escape_envelope_body(&body);
+            let framed = format!("</{}{tail}", "x".repeat(offset));
+            let _ = wheel_core::escape_envelope_body(&framed);
+        }
+    }
+}

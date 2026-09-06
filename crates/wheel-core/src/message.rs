@@ -210,8 +210,17 @@ pub fn escape_envelope_body(body: &str) -> String {
             } else {
                 after
             };
-            let matches_tag = body.len() >= name_at + TAG.len()
-                && body[name_at..name_at + TAG.len()].eq_ignore_ascii_case("agentprompt");
+            // Byte slicing, not `&str` slicing. `body.len() >= name_at + TAG.len()`
+            // proves the index is IN RANGE; it proves nothing about it being on
+            // a CHARACTER boundary, and that is what panicked -- one '<' with a
+            // multi-byte character straddling the offset eleven bytes later took
+            // the wheel-dev board down for hours. A byte slice cannot land
+            // mid-character, so the whole class goes away, and it is what the
+            // comment above this function already claimed: matching is on the
+            // decoded BYTES.
+            let matches_tag = bytes
+                .get(name_at..name_at + TAG.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(TAG));
             if matches_tag {
                 // Consume only the '<'; the rest is emitted as ordinary text.
                 out.push_str("<\\");
