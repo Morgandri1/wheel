@@ -104,6 +104,17 @@ the agent is woken, because on a public URL they are the only cost control; and 
 delivers, so a board can be secured after it works.
 
 - **Web releases (operator, Vercel rate limit)**: Vercel builds ONLY when `web/package.json` `version` changes (`ignoreCommand` in `web/vercel.json`). Merging `web/main` to `main` is unchanged; a deploy is a deliberate release: Web bumps the minor version once per bundle of finished work (a feature, or a batch of fixes that together read as a minor version), never per commit. Hotfix = patch bump. No other agent bumps that version.
+- **Measure the machine, never the dashboard (outage 2026-09-06, 80 minutes)**: the platform's volume
+  metric read 127 MB while `df` inside the container read 4.5G of 4.6G with **zero available**. PM quoted the
+  dashboard to rule out disk space, and the whole team then spent an afternoon fixing sqlite. `xShmMap
+  "cannot resize an existing shared-memory segment"` **is ENOSPC**. Before accepting any resource explanation,
+  measure from inside the running container; a control-plane number about a data-plane fact is a claim, not
+  evidence. The host must surface free space in its healthcheck and refuse to start a project below a floor,
+  so the first line anyone reads is the true one.
+- **A config override on a recovery path must be proven reachable, or not exist**: `WHEEL_SQLITE_JOURNAL`
+  was added mid-incident as a lever and silently collapsed both branches of the recovery negotiation onto one
+  target, so the branch that worked was never tried. It shipped without a test that a forced value can be
+  reached under the hostile condition. A knob on a path nobody has exercised is a way to disable the fix.
 - **Build throughput on the shared dev host**: `~/.cargo/config.toml` sets one shared `target-dir` (`/Users/metatron/wheel-target`) and `jobs = 4` for every worktree — do not override them; `qa/check.sh` serialises cargo gates with `flock /tmp/wheel-cargo.lock`. Run long gates in the background and wait on completion; a foreground cargo killed by load is not a pass. **Exception (QA, BUG-019 withdrawn 91b9e21): the shared target-dir links one worktree's rlibs against another's source when they sit on different commits, so any build whose result you REPORT — a gate, a smoke, a verification run, a coverage measurement — uses a private `CARGO_TARGET_DIR` and always rebuilds; only exploratory `cargo check`/`cargo test` while editing may use the shared dir.** A failure seen only under the shared dir is not a bug until it reproduces in a private one.
 - Toolchain (host is macOS, Docker present, **no cargo/node installed yet**): install Rust via
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y` (stable), Node 22 + pnpm via
