@@ -54,10 +54,104 @@ pub fn import(raw: &str, format: Option<ToolFormat>) -> Result<Imported> {
 /// JSON or YAML. Real OpenAPI documents are usually YAML, and refusing them
 /// would exclude most of the specs anyone actually has.
 fn parse_document(raw: &str) -> Result<Value> {
+    if raw.len() > MAX_DOCUMENT_BYTES {
+        bail!(
+            "this document is {} MiB; the limit is {} MiB",
+            raw.len() / (1024 * 1024),
+            MAX_DOCUMENT_BYTES / (1024 * 1024)
+        );
+    }
     if let Ok(v) = serde_json::from_str::<Value>(raw) {
         return Ok(v);
     }
+    // Only YAML can do this, and only with anchors, so the check sits on this
+    // path rather than in front of both.
+    if let Some(token) = yaml_anchor_or_alias(raw) {
+        bail!(
+            "this YAML uses an anchor or alias ({token}), which this importer does not accept: \
+             a few hundred bytes of them expand to billions of nodes. Expand them, or convert \
+             the document to JSON."
+        );
+    }
     serde_yaml::from_str::<Value>(raw).context("this is neither valid JSON nor valid YAML")
+}
+
+/// The largest document this will parse.
+///
+/// A spec describes an API; it is not a payload. Note this does NOT defend
+/// against alias expansion — a billion-laughs document is a few hundred bytes
+/// — which is why the anchor check exists separately.
+pub const MAX_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Find a YAML anchor (`&name`) or alias (`*name`) outside quotes and comments.
+///
+/// `serde_yaml` (libyaml) expands aliases with no limit and exposes no option
+/// to bound it, so refusing the construct is the only defence that does not
+/// depend on a parser setting that does not exist. Anchors are vanishingly
+/// rare in real API specs — `$ref` is the idiomatic mechanism, and that one is
+/// already depth-bounded.
+///
+/// A token counts only when it STARTS one: preceded by a structural character
+/// or start of line, and followed by a word character. `R&D` and `a * b` are
+/// text, not syntax.
+fn yaml_anchor_or_alias(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let line = strip_yaml_comment(line);
+        let bytes = line.as_bytes();
+        let mut in_single = false;
+        let mut in_double = false;
+        for (i, c) in line.char_indices() {
+            match c {
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '&' | '*' if !in_single && !in_double => {
+                    let before_ok = i == 0
+                        || matches!(
+                            bytes[i - 1],
+                            b' ' | b'\t' | b'[' | b'{' | b',' | b'-' | b':'
+                        );
+                    let after_ok = line[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|n| n.is_alphanumeric() || n == '_');
+                    if before_ok && after_ok {
+                        return Some(
+                            line[i..]
+                                .chars()
+                                .take_while(|n| {
+                                    n.is_alphanumeric()
+                                        || *n == '_'
+                                        || *n == '-'
+                                        || *n == '&'
+                                        || *n == '*'
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Drop a trailing `# comment`, which is not part of the document.
+fn strip_yaml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double && (i == 0 || bytes[i - 1].is_ascii_whitespace()) => {
+                return &line[..i];
+            }
+            _ => {}
+        }
+    }
+    line
 }
 
 fn detect(doc: &Value) -> Result<ToolFormat> {
@@ -1136,6 +1230,92 @@ mod tests {
         assert_eq!(import(SWAGGER2, None).unwrap().format, ToolFormat::Swagger2);
         assert_eq!(import(POSTMAN, None).unwrap().format, ToolFormat::Postman);
         assert_eq!(import(INSOMNIA, None).unwrap().format, ToolFormat::Insomnia);
+    }
+
+    /// ADVERSARY 023. A billion-laughs document is a few HUNDRED bytes and
+    /// expands to ~10^9 nodes, so the size cap protects nothing here — the
+    /// anchor refusal is the whole defence. libyaml exposes no expansion
+    /// limit to set.
+    #[test]
+    fn a_yaml_bomb_is_refused_before_it_is_expanded() {
+        let bomb = "a0: &a0 \"lol\"\n\
+                    a1: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]\n\
+                    a2: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]\n\
+                    a3: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]\n\
+                    openapi: \"3.0.0\"\n\
+                    top: *a3\n";
+        assert!(bomb.len() < 400, "the point is that it is tiny");
+
+        let started = std::time::Instant::now();
+        let err = import(bomb, None).unwrap_err().to_string();
+        assert!(err.contains("anchor or alias"), "{err}");
+        assert!(
+            err.contains("JSON"),
+            "the error must say the way out: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "it must be refused rather than expanded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An anchor without aliases is still the construct we refuse — a
+    /// document that has one can grow the other in a later revision, and the
+    /// refusal is about the mechanism, not about this instance being large.
+    #[test]
+    fn an_anchor_alone_is_refused_too() {
+        let doc = "openapi: \"3.0.0\"\ndefaults: &d\n  x: 1\n";
+        assert!(import(doc, None)
+            .unwrap_err()
+            .to_string()
+            .contains("anchor or alias"));
+    }
+
+    /// The refusal must not fire on text that merely contains `&` or `*`,
+    /// or every spec with an ampersand in a description would be rejected.
+    #[test]
+    fn ordinary_text_containing_ampersands_and_stars_still_imports() {
+        let doc = "openapi: \"3.0.0\"\n\
+                   info:\n  title: R&D API\n  description: \"Tom & Jerry, a * b, 3 & 4\"\n\
+                   servers:\n  - url: https://x.example\n\
+                   paths:\n  /ping:\n    get:\n      operationId: ping\n      summary: a & b\n";
+        let got = import(doc, None).unwrap();
+        assert_eq!(got.operations.len(), 1);
+    }
+
+    /// A `#` inside a quoted string is not a comment, so the scanner must not
+    /// truncate the line and miss an anchor after it.
+    #[test]
+    fn an_anchor_after_a_quoted_hash_is_still_found() {
+        let doc = "openapi: \"3.0.0\"\ntitle: \"a # b\"\ndefaults: &d\n  x: 1\n";
+        assert!(import(doc, None)
+            .unwrap_err()
+            .to_string()
+            .contains("anchor or alias"));
+        // ...and a real comment mentioning an anchor is only a comment.
+        let doc = "openapi: \"3.0.0\"\n\
+                   servers:\n  - url: https://x.example   # use &default here\n\
+                   paths:\n  /ping:\n    get:\n      operationId: ping\n";
+        assert!(import(doc, None).is_ok());
+    }
+
+    #[test]
+    fn an_oversized_document_is_refused_without_being_parsed() {
+        let huge = format!(
+            "{{\"openapi\":\"3.0.0\",\"x\":\"{}\"}}",
+            "a".repeat(MAX_DOCUMENT_BYTES + 1)
+        );
+        let err = import(&huge, None).unwrap_err().to_string();
+        assert!(err.contains("the limit is"), "{err}");
+    }
+
+    /// JSON is unaffected by all of this: it has no anchors, and a legitimate
+    /// large-ish spec must still import.
+    #[test]
+    fn a_normal_json_spec_is_not_caught_by_the_yaml_defences() {
+        assert!(import(PETSTORE, None).is_ok());
+        assert!(import(POSTMAN, None).is_ok());
     }
 
     #[test]

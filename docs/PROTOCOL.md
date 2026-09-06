@@ -750,3 +750,162 @@ one user is a convenience; two projects as one user is a tenancy boundary that
 does not exist while claiming to. `wheel_core::UidIsolation::from_env()` is the
 single reader of that variable, so the host and the engine cannot disagree about
 which mode they are in.
+
+## Tool nodes (§3d)
+
+The engine is the ONLY parser. Web sends the raw document and renders what comes back, so a spec cannot
+import differently in the preview than in the node.
+
+### `POST /v1/tools/import` — preview, creates nothing
+
+Request `{ "raw": "<document>", "format"?: "openapi"|"swagger2"|"postman"|"insomnia" }`. `format` is
+optional; every format announces itself and detection is preferred.
+
+```jsonc
+{ "format": "openapi",
+  "base_url": "https://api.petstore.example/v1",
+  "operations": [ {
+      "id": "listPets",              // charset-safe, unique in the node; becomes half an MCP tool name
+      "method": "GET",
+      "path": "/pets/{petId}",       // Postman's `:petId` is normalised to this shape
+      "summary": "List all pets",
+      "enabled": true,
+      "params": [ {
+          "name": "limit",
+          "location": "query",       // header | path | query | cookie | body
+          "required": false,
+          "description": "how many",
+          "schema": { "type": "integer" },
+          "fill": { "mode": "agent" }   // ALWAYS agent on import; see Fills
+      } ] } ] }
+```
+
+Errors: `400 invalid` — `"could not tell what kind of document this is…"`, `"this is neither valid JSON
+nor valid YAML"`, `"no operations found in this document"`. A document with one unusable operation out of
+forty imports the other thirty-nine rather than failing.
+
+### Body fields are FLAT NAMES, not JSON pointers
+
+**This deviates from the wording in ARCHITECTURE.md §3** (`fills: { "<json-pointer or dotted path>": Fill }`)
+and Web should build against what is here, which is what the engine and `wheel-core` actually do.
+
+A JSON request body contributes one param per **top-level property**, with `location: "body"` and `name`
+set to that property name. There are no pointers, no dotted paths, and no `body` object in the config:
+
+```jsonc
+// requestBody schema { "properties": { "name": {...}, "address": { "type": "object", ... } } }
+"params": [
+  { "name": "name",    "location": "body", "schema": { "type": "string" }, "fill": {"mode":"agent"} },
+  { "name": "address", "location": "body", "schema": { "type": "object" }, "fill": {"mode":"agent"} }
+]
+```
+
+**Nested objects are kept whole.** `address` is one field whose value is an object; it does not become
+`/address/city` and `/address/street`. An agent filling one object is clearer than filling three strings,
+and the schema stays honest about the shape the API wants. A body that is not an object (an array, a
+string) becomes a single field named `body`.
+
+**Cookie values are percent-encoded**, like path and query values. `;` is legal in a header value so
+nothing downstream rejects it, and an unencoded cookie value of `x; admin=true` would be two more cookies
+the caller never granted.
+
+In `args` they are therefore addressed by plain name, and a body field keeps the caller's own JSON type —
+`{"address": {"city": "Berlin"}}` is sent as an object, not as a string. Header, path, query and cookie
+values are always sent as text.
+
+### `POST /v1/tools/:id/import` — re-import into an existing node
+
+Diffs by `method` + `path`. **Fills survive, and so does `enabled` and the operation's `id`.** Re-importing
+must never hand a field back to the agent that an operator pinned to a vault, or a routine spec refresh
+silently becomes "the agent can now set the API key". A field that disappears and later returns is matched
+by name and gets its pin back.
+
+```jsonc
+{ "operations": [ ... ],        // the merged set, as above
+  "added":   ["createPet"],     // ids present in the spec and not in the node
+  "removed": ["deletePet"] }    // ids in the node that the spec no longer has —
+                                // REPORTED, not deleted: the operator decides
+```
+
+### `GET /v1/tools/:id/ops` — exactly what an agent sees
+
+The same projection the CLI and (later) the MCP input schema are built from, so the UI's "what can the
+agent do" and the agent's own view cannot drift. Disabled operations are absent. **Only `agent`-mode
+fields appear**, and no `fill` block is included at all — a static value or a vault ref is not shown here,
+because this is the agent's view.
+
+```jsonc
+{ "tool": "petstore",
+  "operations": [ {
+      "id": "listPets",
+      "name": "petstore__listPets",     // the MCP tool name
+      "method": "GET",
+      "path": "/pets",
+      "summary": "List all pets",
+      "input_schema": {                  // JSON Schema of the agent's fields only
+        "type": "object",
+        "properties": { "limit": { "type": "integer", "description": "how many" } },
+        "required": []
+      } } ] }
+```
+
+### `POST /v1/tools/:id/call`
+
+Request `{ "op": "listPets", "args": { ... }, "dry_run"?: false }`.
+
+```jsonc
+{ "status": 200, "headers": { "content-type": "application/json" },
+  "body": { ... },              // parsed JSON, or a string when it is not JSON
+  "duration_ms": 143, "bytes": 2048 }
+```
+
+`dry_run: true` sends nothing and returns the equivalent command instead, with **every static and vault
+value masked** — in headers, cookies, body and the URL, in both its raw and percent-encoded spellings (a
+secret placed in a query or path fill is stored encoded, so masking only the raw form missed every base64
+credential):
+
+```jsonc
+{ "curl": "curl -X POST -H 'Authorization: <redacted>' -d '{\"text\":\"hi\"}' 'https://api.example.com/messages/g'" }
+```
+
+The agent's `/v1/cli` equivalents are `GET /v1/cli/tool?node=<tool>` and
+`POST /v1/cli/tool {node, op, args, curl?}`, both gated on a `read` wire to the tool node.
+
+### Refusals
+
+| Situation | Code | HTTP | Message |
+|---|---|---|---|
+| Argument names a `static`/`vault`/`hidden` field | `invalid` | 400 | `"Authorization" is set by the board (a vault), not by the caller` |
+| Argument names no field at all | `invalid` | 400 | `"admin" is not a field of operation listPets` |
+| A required agent field is missing | `invalid` | 400 | `field "room" is required` |
+| A `{placeholder}` left unfilled | `invalid` | 400 | `path parameter "room" was not supplied` |
+| Operation is disabled | `invalid` | 400 | `operation deletePet is disabled` |
+| No such operation | `not_found` | 404 | `no operation "nope" on petstore` |
+| A `vault` fill whose vault the tool has no wire to | `wire_denied` | 403 | `no wire from petstore to creds (need: read) — wire the tool to the vault` |
+| A `vault` fill naming a missing key | `not_found` | 404 | `creds has no key "API_KEY"` |
+| Engine started without `WHEEL_VAULT_KEY` | `config` | 503 | names the variable |
+| The upstream call failed, was denied by SSRF policy, timed out, or exceeded 5 MiB | `tool_error` | 502 | the reason |
+
+There is no "ambiguous pointer" refusal, because there are no pointers — a duplicate body property is
+impossible in JSON Schema, and two params with the same name are prevented at config validation
+(`duplicate tool operation id` / a param list is per-operation).
+
+**A field the board owns is REFUSED when an agent names it, never ignored.** Ignoring it would let an
+agent believe it had set an authorization header the operator actually controls.
+
+### Import limits
+
+`raw` is capped at **2 MiB**. Separately, **YAML anchors and aliases are refused** (`400 invalid`, naming
+the token): libyaml expands them with no limit and exposes no option to bound it, and a few hundred bytes
+of aliases expand to ~10^9 nodes. `$ref` is the idiomatic mechanism and is depth-bounded instead. The size
+cap is not the defence here — a billion-laughs document is tiny — so the two limits are separate on
+purpose. JSON documents are unaffected.
+
+### SSRF policy on every call (§3d rule 4)
+
+`base_url` is checked at config time; every CALL re-checks, because a redirect is a destination nobody
+named. Literal and suffix denials first (no DNS), then the host is resolved ONCE and the connection pinned
+to the validated address — a name that answers differently a moment later cannot become a different
+destination. **Every** resolved address must be public, not just the one chosen. Redirects are followed
+manually, re-checked per hop, max 3, and the body is sent on the FIRST HOP ONLY so credentials do not
+follow a redirect off-origin. 30s timeout, 5 MiB response ceiling.
