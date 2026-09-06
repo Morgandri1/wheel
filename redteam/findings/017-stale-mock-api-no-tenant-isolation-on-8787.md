@@ -1,12 +1,18 @@
 # 017 — Running dev API on :8787 is a STALE MOCK build with ZERO tenant isolation (all owner_id='user_mock')
 
-- **Severity:** High **as a dev-stack hazard / investigation lead**; **NOT a product vuln in current source.**
+- **Severity:** RESOLVED — was flagged High as a dev-stack hazard / vault-verify investigation lead; confirmed
+  **NOT a product vuln** (`:8787` is Web's intentional mock; prod + HEAD both enforce owner==caller).
 - **Owner:** API (dev/deploy hygiene). Current source is CORRECT — see below.
-- **Status:** CONFIRMED (2026-09-05). The API answering on `127.0.0.1:8787` stamps `owner_id='user_mock'`
-  on every project regardless of the authenticated caller, so any account can delete/patch/start/stop any
-  project. `user_mock` does **not exist anywhere in `crates/wheel-api/src` at HEAD** → the binary is stale
-  (pre-local-auth). PoCs: `redteam/pocs/api-tenancy/t_cross_account_local_auth.py` (+ the guarded
-  `t_cross_account_mutation.py`).
+- **Status:** CLOSED / NOT-A-PRODUCT-BUG (2026-09-05). `:8787` is **Web's MOCK server** (`user_mock` is its
+  documented, never-deployed behaviour — PM confirmed; Web will label its banner "MOCK — no tenancy").
+  **Production confirmed clean by PM** (real uuid owner_id, cross-account GET → 404). **HEAD verified GREEN
+  by me**: fresh HEAD API on `:8080` (`AUTH_MODE=local`), two distinct signups — A's project `owner_id` =
+  A's real uuid (not a constant); B's GET/DELETE/PATCH/STOP/START/RESTART of A's project ALL → 404; A's
+  project intact. Also: the HEAD local-auth issues a real HS256 JWT (iss=PUBLIC_BASE_URL) and REJECTS the
+  dev-secret token (401) — R2 dev-token-rejection already works. API also added a boot guard
+  (`1b62b28`, "refuse a stub identity provider in production"). PoCs:
+  `redteam/pocs/api-tenancy/t_cross_account_local_auth.py` (GREEN vs :8080), guarded
+  `t_cross_account_mutation.py` (catches the mock identity-collapse).
 - **Boundary:** TB1 (browser/API tenancy).
 
 ## What I observed (live, :8787)
