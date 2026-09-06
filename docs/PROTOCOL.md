@@ -197,7 +197,7 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 | Route | Body → Response | M |
 |---|---|---|
 | `POST /v1/agents/:id/auth/begin` | → `AuthBegin {mode, url, instructions, session}` (claude only) | **M1** |
-| `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code **M2** |
+| `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{setup_token?}` \| `{code?}`, each with optional `save_to_vault` → `AuthStatus` | api_key **M1** · code/setup_token **M2** |
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
 | `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |
 
@@ -237,6 +237,24 @@ discover that.
 
 `codex` signs in by device code, which is a poll rather than a submit; `auth/begin` on a codex node returns
 `400` saying so rather than a paste-code envelope nothing can satisfy.
+
+#### `setup_token` — the credential to prefer for a shared board
+
+`auth/complete {setup_token}` takes a long-lived token from `claude setup-token`. It is a separate field
+from `api_key` rather than a second spelling of it, because it **asserts durability**: a credential that
+is not a `sk-ant-oat…` setup-token is refused here with a message pointing at `api_key` instead. The whole
+reason to reach for this field is the promise that the credential will not expire underneath a board of
+agents, and silently accepting a session token would break that promise where nobody would see it.
+
+Stored as `CLAUDE_CODE_OAUTH_TOKEN`; `mode` comes back as `"oauth_token"`. Claude only — a codex node
+takes `api_key` (`CODEX_API_KEY`).
+
+**Operator flow for a board of N agents:** run `claude setup-token` once, then
+`POST auth/complete {setup_token, save_to_vault: "<vault>"}` against any one agent that has a read wire to
+that vault. Every agent wired to it authenticates with `mode: "env"` on its next start. No expiry, no
+refresh, one text box.
+
+`save_to_vault` works with all three credential fields.
 
 #### Handing the credential to the rest of the board (`save_to_vault`)
 

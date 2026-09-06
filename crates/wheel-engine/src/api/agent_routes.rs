@@ -291,9 +291,16 @@ pub struct AuthComplete {
     /// browser tab completing a login the user has already restarted.
     #[serde(default)]
     pub session: Option<Uuid>,
+    /// A long-lived token from `claude setup-token`. Distinct from `api_key`
+    /// only in that it ASSERTS durability: a short-lived credential submitted
+    /// here is refused rather than quietly vaulted for five other agents to
+    /// depend on.
+    #[serde(default)]
+    pub setup_token: Option<String>,
     /// Name of a vault node to also store the resulting credential in, so the
     /// other agents wired to that vault authenticate without their own login.
-    /// The agent must have a read wire to it.
+    /// The agent must have a read wire to it. Works with any of the three
+    /// credential fields.
     #[serde(default)]
     pub save_to_vault: Option<String>,
 }
@@ -315,11 +322,16 @@ pub async fn auth_complete(
         return finish_paste_code(&s, id, body.session, &code, body.save_to_vault.as_deref()).await;
     }
 
+    if let Some(token) = body.setup_token {
+        return finish_setup_token(&s, id, harness, &token, body.save_to_vault.as_deref()).await;
+    }
+
     let Some(key) = body.api_key else {
         // Be explicit rather than silently succeeding with no credential: a
         // 200 here would leave the agent unauthenticated but looking fine.
         return Err(ApiError::invalid(
-            "supply either api_key (a provider key or a `claude setup-token`) or code (paste-code OAuth)",
+            "supply one of: setup_token (from `claude setup-token`), api_key (a provider key), \
+             or code (paste-code OAuth)",
         ));
     };
 
@@ -331,12 +343,97 @@ pub async fn auth_complete(
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
 
-    // An agent that stalled on needs_auth was already started by someone who
-    // wanted it running, so saving a credential resumes it rather than leaving
-    // a stuck queue for the operator to poke. `parked` is the honest status
-    // for that: logically on, no process — and `deliver` below spawns one only
-    // if a message is actually waiting, so an agent with an empty queue costs
-    // nothing while it sits authenticated.
+    // A provider key is shareable too -- one key across a board is a normal
+    // thing to want -- so save_to_vault applies here as well.
+    let vaulted = match body.save_to_vault.as_deref() {
+        Some(vault) => {
+            let found = crate::auth::StoredOauth {
+                token: key.trim().to_string(),
+                expires_at: None,
+            };
+            Some(save_credential_to_vault(&s, id, vault, &found)?)
+        }
+        None => None,
+    };
+
+    resume_if_blocked(&s, id).await?;
+
+    let mut out = serde_json::json!(wheel_core::AuthStatus {
+        authenticated: true,
+        mode: Some(kind),
+        source: None,
+        account: None,
+    });
+    if let Some(v) = vaulted {
+        out["vault"] = v;
+    }
+    Ok(Json(out))
+}
+
+/// `auth/complete {setup_token}` — the durable credential.
+///
+/// `claude setup-token` mints a long-lived token specifically so it can be
+/// handed to other machines, which makes it the right thing to put in a vault
+/// that a board of agents reads. This route exists as its own field rather
+/// than as another `api_key` so it can REFUSE a short-lived credential: the
+/// whole reason to use it is the promise that it will not expire underneath
+/// five other agents, and accepting a session token here would break that
+/// promise silently.
+async fn finish_setup_token(
+    s: &AppState,
+    id: Uuid,
+    harness: wheel_core::Harness,
+    token: &str,
+    save_to_vault: Option<&str>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let token = token.trim();
+    if harness != wheel_core::Harness::Claude {
+        return Err(ApiError::invalid(
+            "setup_token is a claude credential; a codex node takes api_key",
+        ));
+    }
+    let kind = crate::auth::classify_token(token, harness);
+    if kind != wheel_core::CredentialKind::OauthToken {
+        return Err(ApiError::invalid(
+            "that is not a `claude setup-token` credential (expected one starting `sk-ant-oat`);              submit a provider key as api_key instead",
+        ));
+    }
+
+    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    crate::auth::store_token(&config_dir, token, harness)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+
+    let vaulted = match save_to_vault {
+        Some(vault) => {
+            // No expiry: that is the point of this credential, and it is what
+            // makes the response carry no warning.
+            let found = crate::auth::StoredOauth {
+                token: token.to_string(),
+                expires_at: None,
+            };
+            Some(save_credential_to_vault(s, id, vault, &found)?)
+        }
+        None => None,
+    };
+
+    resume_if_blocked(s, id).await?;
+
+    let mut body = serde_json::json!(wheel_core::AuthStatus {
+        authenticated: true,
+        mode: Some(wheel_core::CredentialKind::OauthToken),
+        source: None,
+        account: None,
+    });
+    if let Some(v) = vaulted {
+        body["vault"] = v;
+    }
+    Ok(Json(body))
+}
+
+/// An agent that stalled on `needs_auth` was already started by someone who
+/// wanted it running, so saving a credential resumes it rather than leaving a
+/// stuck queue for the operator to poke.
+async fn resume_if_blocked(s: &AppState, id: Uuid) -> ApiResult<()> {
     let was_blocked = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
         let st = board::agent_state(&conn, id).unwrap_or_default();
@@ -352,13 +449,7 @@ pub async fn auth_complete(
     s.events.publish(wheel_core::Event::BoardChanged {
         at: wheel_core::Timestamp::now(),
     });
-
-    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
-        authenticated: true,
-        mode: Some(kind),
-        source: None,
-        account: None,
-    })))
+    Ok(())
 }
 
 /// The harness an agent node is configured for, or a 404/400 that says why not.
@@ -448,25 +539,16 @@ async fn finish_paste_code(
     }
 
     let vaulted = match save_to_vault {
-        Some(vault) => Some(save_credential_to_vault(s, id, &config_dir, vault)?),
+        Some(vault) => {
+            let found = crate::auth::oauth_token_from_store(&config_dir).map_err(|e| {
+                ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
+            })?;
+            Some(save_credential_to_vault(s, id, vault, &found)?)
+        }
         None => None,
     };
 
-    let was_blocked = {
-        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let st = board::agent_state(&conn, id).unwrap_or_default();
-        let blocked = st.status == wheel_core::AgentStatus::NeedsAuth;
-        if blocked {
-            board::set_status(&conn, id, wheel_core::AgentStatus::Parked, None);
-        }
-        blocked
-    };
-    if was_blocked {
-        let _ = s.supervisor.deliver(id).await;
-    }
-    s.events.publish(wheel_core::Event::BoardChanged {
-        at: wheel_core::Timestamp::now(),
-    });
+    resume_if_blocked(s, id).await?;
 
     let mut body = serde_json::json!(wheel_core::AuthStatus {
         authenticated: true,
@@ -491,12 +573,9 @@ async fn finish_paste_code(
 fn save_credential_to_vault(
     s: &AppState,
     agent: Uuid,
-    config_dir: &std::path::Path,
     vault_name: &str,
+    found: &crate::auth::StoredOauth,
 ) -> ApiResult<serde_json::Value> {
-    let found = crate::auth::oauth_token_from_store(config_dir)
-        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string()))?;
-
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let vault = board::get_by_name(&conn, vault_name)
         .map_err(|e| ApiError::internal(e.to_string()))?
