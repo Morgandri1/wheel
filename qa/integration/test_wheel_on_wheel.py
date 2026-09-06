@@ -18,7 +18,7 @@ inside a container does not belong in a gate developers run before every merge.
 """
 import base64, json, os, subprocess, sys, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results, free_port
+from wheel_client import Results, run_suite, free_port
 
 SKIP = 77
 R = Results()
@@ -102,6 +102,23 @@ def start_engine():
             pass
         time.sleep(0.5)
     return "engine never became healthy"
+
+
+def engine_postmortem():
+    """Why the engine went away — asked while the container still exists.
+
+    "Connection refused" has at least three causes here and they need different actions:
+    the kernel OOM-killed it (this host runs six agents and a cargo build is not small),
+    another session removed it, or it crashed. Guessing produced a bug report against the
+    wrong person once already; the container knows, so ask it before cleanup does.
+    """
+    p = sh("docker", "inspect", "-f",
+           "status={{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}", NAME)
+    if p.returncode != 0:
+        return "the container no longer exists — something outside this suite removed it"
+    logs = sh("docker", "logs", "--tail", "5", NAME)
+    return "%s; last log: %s" % (p.stdout.strip(),
+                                 (logs.stdout + logs.stderr).strip()[-300:] or "(none)")
 
 
 def turn(agent, command, wait=180):
@@ -189,10 +206,21 @@ def main():
                  "git clone --depth 1 %s wow 2>&1 | tail -3; "
                  "test -f wow/Cargo.toml && echo CLONE_OK" % REPO)
         out = turn(agent, clone, wait=180)
-        R.check("WOW-clone", "CLONE_OK" in out,
-                "the agent could not clone with its vault token: %s" % out[-400:])
+        vanished = "engine unreachable" in out
+        if vanished:
+            # The engine died; that says nothing about whether an agent can clone.
+            R.skip("WOW-clone", "the engine went away mid-run — %s" % engine_postmortem())
+        else:
+            R.check("WOW-clone", "CLONE_OK" in out,
+                    "the agent could not clone with its vault token: %s" % out[-400:])
 
-        if "CLONE_OK" in out:
+        if os.environ.get("WHEEL_WOW_SKIP_BUILD") == "1":
+            # The clone leg proves the interesting half (a vault secret reaching an agent
+            # and authenticating a real remote); `cargo test` proves the sandbox is a build
+            # environment. On a host with six agents resident the build gets OOM-killed, so
+            # it is separable — but only ever by SKIPPING it, never by assuming it.
+            R.skip("WOW-cargo-test", "WHEEL_WOW_SKIP_BUILD=1")
+        elif not vanished and "CLONE_OK" in out:
             build = ("cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
             out = turn(agent, build, wait=1800)
             R.check("WOW-cargo-test", "test result: ok" in out,
@@ -202,14 +230,27 @@ def main():
             R.skip("WOW-cargo-test", "nothing was cloned, so there is nothing to build")
 
         # The token travelled through the engine; it must not have been written down.
+        #
+        # Gated on the log being READABLE. An unreachable engine returns an error body with
+        # no token in it, and "the token is not in this error message" is not the claim.
+        # This assertion reported green against a dead engine on its first run, which is
+        # the exact shape of vacuous pass this suite exists to avoid.
         st, log = http("GET", "/v1/agents/%s/log" % agent)
-        R.check("WOW-no-token-in-log", token not in json.dumps(log),
-                "the GitHub token is in the agent log")
+        if st == 0:
+            R.skip("WOW-no-token-in-log", "the agent log could not be read, so its absence "
+                                          "from the log proves nothing")
+        else:
+            R.check("WOW-no-token-in-log", token not in json.dumps(log),
+                    "the GitHub token is in the agent log")
     finally:
         sh("docker", "rm", "-f", NAME)
 
     return R.report("wheel-on-wheel")
 
 
+def _cleanup():
+    subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_suite(main, "wheel-on-wheel", _cleanup))

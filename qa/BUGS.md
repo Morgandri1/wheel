@@ -190,6 +190,15 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
 
+> **2026-09-06 — THE NUMBERS BELOW ARE SUSPECT AND ARE BEING RE-MEASURED.**
+> `make coverage` ran `cargo llvm-cov` against the shared `target-dir` that every worktree
+> uses, and summed per-crate lines with a filter that accepted any path containing
+> `/crates/` — so one crate's coverage was totalled across six checkouts of it. `validate.rs`
+> read 0% while it was actually 97%, which dragged `wheel-core` to 4.85%. Fixed in
+> `qa/tools/coverage_gate.py` (private `CARGO_TARGET_DIR`, files scoped to this worktree, and
+> an empty result is a SKIP rather than 0%). CI was never affected — one checkout, one target
+> dir. Re-publishing the table after a clean local run.
+
 Latest numbers, CI run 33961539782 (bar 90%, per crate). `wheel-api` has gone 35% -> 89.02%:
 
 | crate | lines | status | owner |
@@ -701,3 +710,36 @@ Fixed in two layers: `qa/contract/suite_isolation.py` (in `make check`) forbids 
 ports, shared port env vars and shared container names across suites; and long-running suites
 take a per-run container name plus `wheel_client.free_port()`, which falls back to an
 OS-assigned port when the default is busy. Verified by running two engines side by side.
+
+## 017 — Suites can test an image another agent replaced mid-run · S2 · QA (mine) · CLOSED
+
+Six agents share one docker daemon, and at least SDK and I both build `wheel-engine:test`.
+A tag is a mutable pointer: a suite that runs `docker run wheel-engine:test` twenty times over
+four minutes can test containers from more than one build, and cannot tell.
+
+This produced a nearly-sent **false S1 against SDK**. `test_engine_child_env.py` reported F015
+unfixed and had `/proc/<pid>/environ` output showing `WHEEL_ENGINE_SECRET` and `WHEEL_VAULT_KEY`
+in a live agent child. The fix was already on `main` and working; the image had been rebuilt
+under me between my build and my assertions. The evidence was real and the conclusion was wrong,
+which is the worst combination a bug report can have.
+
+**Fixed:** `pin_image()` in `qa/integration/wheel_client.py` resolves the tag to its immutable
+image ID once at startup; every container in the run comes from the ID, and the report prints it,
+so a result names the build it describes.
+
+**Worth copying:** anyone testing against a shared tag on this host has the same hazard.
+
+## 018 — A skipped positive control silently un-guarded its assertions · S2 · QA (mine) · CLOSED
+
+`SEC-child-env/sentinel-works` proves the digest search can find a secret that IS present, so
+that "no secret found" means something. It skipped (my vault key was 31 bytes, so nothing could
+be stored) — and `SEC-child-env-no-secret-under-any-name` then reported **green**, against a
+child that at that moment held both engine secrets.
+
+The absence assertions did not know their control had not run. A control that does not gate its
+dependents is decoration.
+
+**Fixed:** the control returns a boolean; its dependents report `skip` with the reason when it is
+unproven, never `pass`. Same class as the vault at-rest scan reading `wheel.db` while the engine
+writes WAL: the canary was "absent" because it was in `wheel.db-wal`, and only the control
+(the key NAME was missing from the same scan) caught it.
