@@ -1,5 +1,39 @@
 # SDK / Engine — handoff
 
+## UPDATE (session C, 2026-09-06, PM kickoff after wheel-dev stand-down)
+
+Picked the highest-priority still-open item PM/ADVERSARY flagged (`docs/handoff/adversary.md`
+UNVERIFIED #3 / this doc's old NEXT #4): **028 face 5, the declared-key-ambiguity 409.** Done,
+`aa8be54` on branch `sdk/028-face5-declared-overlap-warning`, PR #4, not yet merged by PM.
+
+- `find_ambiguity` was judging presence on `offered_keys` (declared ∪ stored), so a vault that
+  only *declared* a credential with no value stored still 409-blocked wiring a second vault that
+  actually held it (`redteam/pocs/vault/run_declared_empty.sh` §5, RED). Split it: `find_ambiguity`
+  is now stored-only (`list_keys`) and is the ONLY thing that blocks — a wire, or an agent's env
+  at spawn. A new `find_declared_overlap` (declared-only) is non-blocking and comes back as
+  `POST /v1/wires`'s `{"warning": "..."}` on the same 200 instead of a 409.
+- The old test that encoded the now-overruled behaviour
+  (`a_declared_key_is_still_enough_to_be_ambiguous`) is replaced; two other pre-existing tests
+  (`two_vaults_offering_the_same_credential_are_ambiguous`,
+  `env_for_agent_refuses_rather_than_choosing_a_winner`) relied on declared-only ambiguity and
+  needed real stored values to keep testing what they say they test.
+- **Did not touch** `store_in_vault_until`'s PUT-time ambiguity check (`api/vault_routes.rs`,
+  via `supplies_key`/`offered_keys`) — it has the identical bug in a sibling path (a PUT of a
+  real value can still 409 against another vault's bare declaration) but ADVERSARY's finding and
+  PM's overrule both name `find_ambiguity`/the wire-create path specifically. Worth asking PM
+  whether "presence = stored, everywhere" extends there too before touching it.
+- Web's `request()` helper already treats any 200 JSON body the same as the old 204 (parses and
+  discards); the one caller (`canvas.tsx`) doesn't read fields off `createWire()`'s result, so
+  this is compatible today, but `web/src/lib/api.ts`'s `createWire` return type (`{from,to,type}`)
+  was already wrong before this PR and Web owns fixing it / surfacing the warning in the UI.
+- `cargo test -p wheel-engine`: 265 passed. One unrelated flake seen once under load,
+  `supervisor::tests::an_ephemeral_agent_gets_a_new_session_after_every_turn` — passes solo, matches
+  this doc's own TRAPS note about load-induced timeouts, not a regression from this change.
+
+The CARGO_HOME task I was also handed this session (`1eef3bc`, mode 0700) turned out already
+superseded by a full per-project-cache redesign that landed and was verified live while I was
+mid-task (`7a76a5d`/`0c2d18f`/`860c1d5` — see "Landed after" below); no action needed there.
+
 ## STATE (on origin/main, verifiable)
 
 `wheel-core` (types, wire matrix, name/config validation, schema export), `wheel-engine`
@@ -10,7 +44,8 @@ wire enforcement, vault AES-256-GCM, table nodes, tool nodes end to end, built-i
 
 Findings closed: F015 (children inherited the engine's env — now `env_clear` + a 9-entry
 allowlist, structurally enforced by `child_command`), 018, 021–027. Last verified push before
-this handoff: **`c0c5e4a`** on `origin/main`. 264 engine tests, clippy clean.
+this handoff: **`845480e`** on `origin/main` (this session pulled fresh from there). 265 engine
+tests, clippy clean.
 
 Landed after `d206b95`, all on `origin/main`:
 `7a76a5d` per-project crate cache (QA BUG-021 / ADVERSARY 029) ·
@@ -71,15 +106,10 @@ one asserted row survival that mine did not, and I took that assertion.
    The CLI must print the engine's message and a stable code; the sqlite text goes to the engine
    log with the request id. Gate: `CLI-error-has-a-cause` (QA says it is green for `wheel inbox`
    already — confirm it covers the general boundary, not just that one command).
-4. **028 declared-key ambiguity** — PM ruled: presence = a STORED non-empty value, everywhere.
-   Declared-only keys never make "authenticated", never mask `needs_auth`, never count in
-   `find_ambiguity`. Declared overlap becomes a create-time WARNING, not a 409. Today an operator
-   who declared `CLAUDE_CODE_OAUTH_TOKEN` and left it empty gets a false 409 when wiring the
-   second vault that actually holds the token — which is the multi-account setup we shipped for.
-   Gates: QA `1b56a3d`. ADVERSARY confirms their `run_declared_empty.sh` §5 is the acceptance
-   test and is **currently RED**: a declared-but-empty `CLAUDE_CODE_OAUTH_TOKEN` in vault A still
-   409-blocks wiring vault B that holds the real value. `find_ambiguity` must treat a
-   declared-but-unfilled key as non-blocking, the way presence already became stored-based.
+4. **028 declared-key ambiguity — DONE this session**, `aa8be54`, PR #4 (not yet merged). See the
+   UPDATE section at the top; ask ADVERSARY to re-run `run_declared_empty.sh` §5 once merged and
+   an image is rebuilt, and consider whether the sibling PUT-time check
+   (`store_in_vault_until`/`supplies_key`) needs the same treatment — flagged, not fixed.
 5. **Child reaping** — was session 2's in-flight work (`signal_group`, `cmd.process_group(0)`,
    `GRACE`), uncommitted in `wheel-wt/sdk`, which **does not compile** (borrow error at lib.rs:92).
    Salvage or rewrite; do not assume it is a starting point.
