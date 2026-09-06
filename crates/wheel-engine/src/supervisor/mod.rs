@@ -270,6 +270,26 @@ impl Supervisor {
         let dir = self.cfg.data_dir.join(".cargo");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating the crate cache at {}", dir.display()))?;
+
+        // Before the mode, because every check below follows symlinks
+        // (QA's WOW-toolchain-cargo-owned). A `.cargo` symlinked into a
+        // shared location satisfies a path check AND a mode check -- the mode
+        // read belongs to the target -- while every project quietly shares one
+        // cache. `symlink_metadata` is the only call here that does not follow.
+        let link = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("inspecting the crate cache at {}", dir.display()))?;
+        anyhow::ensure!(
+            link.is_dir(),
+            "the crate cache at {} is a {}, not a directory of this project's own; \
+             a child is not started with it",
+            dir.display(),
+            if link.file_type().is_symlink() {
+                "symlink"
+            } else {
+                "file"
+            }
+        );
+
         std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700))
             .with_context(|| format!("restricting {} to this project", dir.display()))?;
 
@@ -1523,6 +1543,45 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA's WOW-toolchain-cargo-owned. Every other check here follows
+    /// symlinks, so a `.cargo` pointing into a shared directory passes the
+    /// path check and the mode check and shares the cache anyway.
+    #[tokio::test]
+    async fn a_symlinked_crate_cache_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, _id, dir) = shim_supervisor("cargo-symlink", ECHO_HARNESS);
+
+        let shared = dir.join("shared-cache");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, PermissionsExt::from_mode(0o700)).unwrap();
+        let cache = dir.join(".cargo");
+        std::fs::remove_dir_all(&cache).ok();
+        std::os::unix::fs::symlink(&shared, &cache).unwrap();
+
+        let err = sup.cargo_home().unwrap_err().to_string();
+        assert!(
+            err.contains("symlink"),
+            "a symlinked cache must be refused, and named: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA's WOW-toolchain-cargo-distinct. Value and mode on ONE project cannot
+    /// tell a private cache from one shared dir handed to everybody: 0700 and
+    /// "looks per-project" are both true of a single shared cache.
+    #[tokio::test]
+    async fn two_projects_get_different_crate_caches() {
+        let (a, _, dir_a) = shim_supervisor("cargo-p1", ECHO_HARNESS);
+        let (b, _, dir_b) = shim_supervisor("cargo-p2", ECHO_HARNESS);
+
+        let (ca, cb) = (a.cargo_home().unwrap(), b.cargo_home().unwrap());
+        assert_ne!(ca, cb, "two projects were handed the same crate cache");
+
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
     }
 
     /// A directory that already exists keeps the mode it was made with, so
