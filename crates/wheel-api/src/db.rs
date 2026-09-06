@@ -148,8 +148,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsupported_url_is_refused_with_the_scheme_in_the_message() {
-        let e = Db::connect("mysql://localhost/wheel").await.unwrap_err();
-        let msg = format!("{e:#}");
+        // Matched rather than unwrapped: `Db` deliberately has no `Debug`, because a pool's
+        // debug output can carry the connection string, password included.
+        let msg = match Db::connect("mysql://localhost/wheel").await {
+            Ok(_) => panic!("an unsupported url must not connect"),
+            Err(e) => format!("{e:#}"),
+        };
         assert!(msg.contains("mysql"), "{msg}");
         assert!(
             msg.contains("sqlite://"),
@@ -157,8 +161,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pick_returns_the_statement_for_the_backend_in_use() {
+    // Constructing a pool needs a runtime even when lazy, so this is async rather than a plain
+    // `#[test]`.
+    #[tokio::test]
+    async fn pick_returns_the_statement_for_the_backend_in_use() {
         let sqlite = Db::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
         assert_eq!(sqlite.dialect(), Dialect::Sqlite);
         assert_eq!(sqlite.pick("PG", "SQLITE"), "SQLITE");
