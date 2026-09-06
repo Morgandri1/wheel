@@ -23,6 +23,12 @@ SUITES = [os.path.join(ROOT, "qa", "integration"), os.path.join(ROOT, "qa", "con
 
 # `R.check("ID", ...)` / `R.skip("ID", ...)` — the two ways a suite claims an ID.
 CALL = re.compile(r'R\.(?:check|skip)\(\s*"([^"]+)"')
+# An ID assembled at runtime cannot be traced: `SEC-child-env-no-%s` matches nothing in the
+# plan and reports nothing missing, so two S1 criteria sat in a suite and NOT in TESTPLAN
+# with both this gate and a reader of the plan reporting all clear. Interpolating a
+# SUB-case (`WM-setup/%s`) is fine — the parent carries the criterion — but interpolating
+# into the ID body itself invents an untraceable criterion.
+SYNTHETIC = re.compile(r'R\.(?:check|skip)\(\s*"([A-Za-z][A-Za-z0-9-]*)%')
 # Setup and plumbing steps use `NAME/lowercase`; they are not criteria and are not traced.
 PLUMBING = re.compile(r"^[A-Z][A-Za-z-]*/[a-z]")
 # An ID may carry a human description after a colon; the ID is the part before it.
@@ -44,6 +50,11 @@ def normalise(raw):
     return head
 
 
+def synthetic_ids(path, text):
+    """IDs whose body is built by interpolation — untraceable by construction."""
+    return [(os.path.basename(path), m.group(1)) for m in SYNTHETIC.finditer(text)]
+
+
 def plan_ids(text):
     return set(re.findall(r"`([A-Za-z][A-Za-z0-9-]*(?:/[A-Za-z0-9-]+)*)`", text))
 
@@ -54,7 +65,7 @@ def main():
         return SKIP
     known = plan_ids(open(PLAN).read())
 
-    missing, checked, files = {}, 0, 0
+    missing, checked, files, synthetic = {}, 0, 0, []
     for d in SUITES:
         if not os.path.isdir(d):
             continue
@@ -63,6 +74,7 @@ def main():
                 continue
             files += 1
             src = open(os.path.join(d, name)).read()
+            synthetic += synthetic_ids(name, src)
             for raw in CALL.findall(src):
                 tid = normalise(raw)
                 if tid is None or PLUMBING.match(tid):
@@ -73,6 +85,15 @@ def main():
 
     print("%d ID(s) asserted across %d suite file(s); %d named in TESTPLAN"
           % (checked, files, len(known)))
+    if synthetic:
+        print("\nid traceability: %d assertion(s) build the ID body at runtime" % len(synthetic))
+        for where, prefix in sorted(set(synthetic)):
+            print("  - %-38s in %s" % (prefix + "%...", where))
+        print("\nSpell each criterion's ID out literally. An interpolated ID matches nothing "
+              "in the plan, so this gate reports all clear while the criteria it names are "
+              "untraced. Interpolating a sub-case after a '/' is fine.")
+        return 1
+
     if missing:
         print("\nid traceability: %d asserted ID(s) are not in docs/TESTPLAN.md" % len(missing))
         for tid, where in sorted(missing.items()):
