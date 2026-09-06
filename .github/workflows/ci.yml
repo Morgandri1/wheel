@@ -249,6 +249,14 @@ jobs:
     # six agents resident, it is OOM-killed before it finishes -- so it runs HERE, on a
     # runner with the machine to itself, and stays WHEEL_WOW_SKIP_BUILD=1 locally
     # (PM ruling 2026-09-06). The clone leg is the cheap half and runs in both places.
+    #
+    # contents: write, scoped to this job alone. The repo's default_workflow_permissions
+    # is "read", so without this the GITHUB_TOKEN this job hands the agent as
+    # WHEEL_WOW_GH_TOKEN can clone but not push, and WOW-commit-push 403s on every run --
+    # "a gap in the gate, not in the capability" (the test's own words), now closed at the
+    # job that needs it rather than by widening the repo-wide default for every job.
+    permissions:
+      contents: write
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
