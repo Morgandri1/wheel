@@ -275,8 +275,13 @@ fn wired_vaults(conn: &Connection, agent: Uuid) -> Result<Vec<(Uuid, String)>> {
     Ok(out)
 }
 
-/// The name of a vault, other than `exclude`, that already supplies `key` to
-/// this agent.
+/// The name of a vault, other than `exclude`, that already HOLDS a value for
+/// `key` for this agent.
+///
+/// Stored-only (028 face 5, extended to the PUT path): a vault that merely
+/// *declares* `key` is not a competing credential, so it must not block a PUT
+/// of the real value into another vault. See [`declares_key`] for the
+/// non-blocking declared-declared signal.
 pub fn supplies_key(
     conn: &Connection,
     agent: Uuid,
@@ -287,7 +292,29 @@ pub fn supplies_key(
         if id == exclude {
             continue;
         }
-        if offered_keys(conn, id)?.iter().any(|k| k == key) {
+        if list_keys(conn, id)?.iter().any(|k| k == key) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// The name of a vault, other than `exclude`, that DECLARES `key` for this
+/// agent, whether or not either side has a value yet.
+///
+/// Non-blocking (028 face 5): surfaced as a create-time warning, never a
+/// refusal — [`supplies_key`] is the only thing PUT is allowed to refuse on.
+pub fn declares_key(
+    conn: &Connection,
+    agent: Uuid,
+    key: &str,
+    exclude: Uuid,
+) -> Result<Option<String>> {
+    for (id, name) in wired_vaults(conn, agent)? {
+        if id == exclude {
+            continue;
+        }
+        if declared_keys(conn, id)?.iter().any(|k| k == key) {
             return Ok(Some(name));
         }
     }
@@ -586,6 +613,85 @@ mod tests {
             clash.map(|c| c.key),
             Some("ANTHROPIC_API_KEY".to_string()),
             "two REAL values for one key must still clash"
+        );
+    }
+
+    /// 028 face 5, extended to the PUT path (PM ruling): a vault that only
+    /// DECLARES a key must not block `PUT`ting the real value into another
+    /// vault the same agent reads. `supplies_key` is what `store_in_vault`
+    /// refuses on; it must agree with `find_ambiguity`'s stored-only basis.
+    #[test]
+    fn supplies_key_does_not_see_a_declared_but_empty_key() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let declares_only = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let about_to_hold_it = vault("bob", &[]);
+        for n in [&a, &declares_only, &about_to_hold_it] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, declares_only.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(
+            &c,
+            a.id,
+            about_to_hold_it.id,
+            wheel_core::WireType::Read,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            supplies_key(&c, a.id, "ANTHROPIC_API_KEY", about_to_hold_it.id).unwrap(),
+            None,
+            "a bare declaration elsewhere must not block the PUT"
+        );
+    }
+
+    /// The blocking half still works: a vault that already HOLDS the key is
+    /// found and named, so the 409 in `store_in_vault_until` still fires on a
+    /// real clash.
+    #[test]
+    fn supplies_key_still_finds_a_real_stored_value_elsewhere() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let holds_it = vault("alice", &[]);
+        let target = vault("bob", &[]);
+        for n in [&a, &holds_it, &target] {
+            board::create(&c, n).unwrap();
+        }
+        put(
+            &c,
+            &key(),
+            holds_it.id,
+            "ANTHROPIC_API_KEY",
+            "sk-ant-api03-real",
+        )
+        .unwrap();
+        board::add_wire(&c, a.id, holds_it.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(&c, a.id, target.id, wheel_core::WireType::Read, None).unwrap();
+
+        assert_eq!(
+            supplies_key(&c, a.id, "ANTHROPIC_API_KEY", target.id).unwrap(),
+            Some("alice".to_string())
+        );
+    }
+
+    /// The non-blocking signal `store_in_vault_until` warns on: a bare
+    /// declaration elsewhere is still worth surfacing, just never refusing.
+    #[test]
+    fn declares_key_finds_a_bare_declaration_for_the_warning() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let declares_only = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let target = vault("bob", &[]);
+        for n in [&a, &declares_only, &target] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, declares_only.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(&c, a.id, target.id, wheel_core::WireType::Read, None).unwrap();
+
+        assert_eq!(
+            declares_key(&c, a.id, "ANTHROPIC_API_KEY", target.id).unwrap(),
+            Some("alice".to_string())
         );
     }
 

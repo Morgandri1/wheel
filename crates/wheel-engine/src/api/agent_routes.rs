@@ -759,7 +759,7 @@ fn save_credential_to_vault(
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
     let expires_at = found.expires_at.and_then(millis_to_timestamp);
-    crate::api::vault_routes::store_in_vault_until(
+    let declared_overlap = crate::api::vault_routes::store_in_vault_until(
         s,
         &conn,
         vault.id,
@@ -775,11 +775,21 @@ fn save_credential_to_vault(
     if !peers.is_empty() {
         out["shared_with"] = serde_json::json!(peers);
     }
+    // Two independent reasons a login can carry a warning; join both rather
+    // than letting one clobber the other silently.
+    let mut warnings = Vec::new();
     if !found.is_long_lived() {
-        out["warning"] = serde_json::json!(
+        warnings.push(
             "this is a session credential and will expire; for a durable one, \
              run `claude setup-token` and submit that token as api_key instead"
+                .to_string(),
         );
+    }
+    if let Some(w) = declared_overlap {
+        warnings.push(w);
+    }
+    if !warnings.is_empty() {
+        out["warning"] = serde_json::json!(warnings.join(" / "));
     }
     Ok(out)
 }
