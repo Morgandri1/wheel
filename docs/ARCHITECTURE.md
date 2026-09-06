@@ -141,7 +141,7 @@ Per-type `config`:
 - `chest`:    `{}` — blob store; keys are relative paths, no `..`, no absolute paths, max 50 MiB per blob (v1).
 - `tool`:     `{ kind: "http", source: { format: "openapi"|"swagger2"|"postman"|"insomnia"|"manual", raw: string, imported_at }, base_url: string,
                operations: [ { id: string /* slug, unique in node */, method, path /* may contain {param} */, summary?: string, enabled: bool,
-                 params: [ { name, in: "path"|"query"|"header"|"cookie", schema: <json-schema subset>, required: bool, fill: Fill } ],
+                 params: [ { name, location: "path"|"query"|"header"|"cookie"|"body", schema: <json-schema subset>, required: bool, fill: Fill } ], /* `location`, not `in` — matches wheel-core ToolParam; body params are the flat top-level properties */
                  body?: { content_type: "application/json"|"application/x-www-form-urlencoded"|"multipart/form-data"|"text/plain", schema: <json-schema>,
                           fills: { "<top-level body property name>": Fill } /* body fills are FLAT: one param per top-level property; a nested object is one field taking an object — PM ruling 2026-09-06, matches wheel-core ToolParam */ } } ] }`
               where `Fill = { mode: "agent" } | { mode: "static", value } | { mode: "vault", ref: "<vault name>/<key>" } | { mode: "hidden" }`
