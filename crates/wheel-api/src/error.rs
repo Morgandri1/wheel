@@ -40,6 +40,10 @@ pub enum ApiError {
     #[error("upstream timed out")]
     GatewayTimeout,
 
+    /// The machine hosting the project has no room to start it.
+    #[error("the host is out of disk")]
+    InsufficientStorage,
+
     /// The engine answered an ingress request with a bodiless 404: it has no `/ingress/*` route at
     /// all. A blank 404 is indistinguishable from a mistyped path, which is exactly the confusion
     /// this replaces.
@@ -92,6 +96,13 @@ impl ApiError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",
                 "The project engine did not respond in time.".into(),
+            ),
+            ApiError::InsufficientStorage => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_storage",
+                "The machine hosting this project has no room to start it. Free space and try \
+                 again."
+                    .into(),
             ),
             ApiError::IngressUnavailable => (
                 StatusCode::NOT_IMPLEMENTED,

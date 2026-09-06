@@ -16,7 +16,7 @@ use uuid::Uuid;
 use wheel_api::config::{Config, Env};
 use wheel_api::crypto::Secret;
 use wheel_api::models::ProjectStatus;
-use wheel_api::orchestrator::{EngineSecrets, Orchestrator};
+use wheel_api::orchestrator::{EngineSecrets, HostRefusal, Orchestrator};
 use wheel_api::state::{AppState, Inner};
 
 const ISSUER: &str = "https://dev.wheel.local";
@@ -27,6 +27,7 @@ const DEV_SECRET: &str = "integration-test-secret";
 struct FakeOrch {
     status: Arc<Mutex<ProjectStatus>>,
     fail_start: Arc<Mutex<bool>>,
+    out_of_disk: Arc<Mutex<bool>>,
     fail_destroy: Arc<Mutex<bool>>,
     status_errors: Arc<Mutex<bool>>,
     destroyed: Arc<AtomicUsize>,
@@ -38,6 +39,7 @@ impl Default for FakeOrch {
             // Stopped is the honest default for a sandbox nothing has started.
             status: Arc::new(Mutex::new(ProjectStatus::Stopped)),
             fail_start: Arc::new(Mutex::new(false)),
+            out_of_disk: Arc::new(Mutex::new(false)),
             fail_destroy: Arc::new(Mutex::new(false)),
             status_errors: Arc::new(Mutex::new(false)),
             destroyed: Arc::new(AtomicUsize::new(0)),
@@ -55,6 +57,12 @@ impl Orchestrator for FakeOrch {
         Ok(())
     }
     async fn start(&self, _: &Uuid) -> anyhow::Result<()> {
+        if *self.out_of_disk.lock().unwrap() {
+            // Wrapped in context, as the real host client does, so the test also proves the
+            // downcast survives the chain rather than only working on a bare error.
+            return Err(anyhow::Error::new(HostRefusal::OutOfDisk)
+                .context("host returned 507 Insufficient Storage"));
+        }
         if *self.fail_start.lock().unwrap() {
             anyhow::bail!("host refused to start the sandbox");
         }
@@ -512,4 +520,64 @@ async fn a_project_whose_sandbox_will_not_start_is_still_created() {
     let (s, list) = call(&app, "GET", "/v1/projects", &tok, None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
+}
+
+/// A full disk is the owner's to act on, so it must not read as "an unexpected error occurred".
+///
+/// This is the shape of a whole afternoon: the volume filled, sqlite reported it as an error about
+/// shared memory, the host reported that as a failed start, and the API reported that as a 500 with
+/// no cause. The host names the disk now; the API has to carry the name rather than flatten it.
+#[tokio::test]
+async fn a_start_refused_for_disk_says_so_instead_of_internal() {
+    let orch = FakeOrch {
+        out_of_disk: Arc::new(Mutex::new(true)),
+        ..Default::default()
+    };
+    let Some((app, u)) = app(orch).await else {
+        return;
+    };
+    let tok = token(&u);
+    let id = project(&app, &tok).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/start"),
+        &tok,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(body["error"]["code"], "insufficient_storage");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no room"),
+        "the owner has to be told what to do about it: {message}"
+    );
+}
+
+/// And every other host failure still reads as internal, so the new case is a distinction rather
+/// than a relabelling of everything that goes wrong upstream.
+#[tokio::test]
+async fn an_ordinary_host_failure_is_still_internal() {
+    let orch = FakeOrch {
+        fail_start: Arc::new(Mutex::new(true)),
+        ..Default::default()
+    };
+    let Some((app, u)) = app(orch).await else {
+        return;
+    };
+    let tok = token(&u);
+    let id = project(&app, &tok).await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/v1/projects/{id}/start"),
+        &tok,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
 }

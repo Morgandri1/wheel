@@ -212,9 +212,11 @@ Two failures are worth knowing by name, because both were once reported as somet
   its list and a host wedged on the first project used to be the same response; retry rather than
   treat it as an error.
 - **The volume is full.** The host refuses a start below its free-space floor rather than launching
-  a sandbox that will corrupt its own database on the first write, and the error names the disk. It
-  surfaces here as `status: "error"` with the reason in the host's log. This is the failure that
-  took production down once already, wearing a sqlite error about shared memory as a disguise.
+  a sandbox that will corrupt its own database on the first write. `POST /start` returns `507
+  insufficient_storage`; a `POST /v1/projects` that hits it returns `201` with `status: "error"`,
+  because the project was created either way. This is the failure that took production down once
+  already, wearing a sqlite error about shared memory as a disguise, and it is reported by name so
+  the next one is not a 500 with no cause.
 
 ### `ANY /v1/projects/{id}/engine/{*rest}`
 Authenticated proxy to the project's engine control plane (`ARCHITECTURE.md` §4). Ownership is

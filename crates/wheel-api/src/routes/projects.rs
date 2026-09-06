@@ -9,7 +9,7 @@ use crate::crypto;
 use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 use crate::models::{validate_project_name, Capabilities, Project, ProjectRow, ProjectStatus};
-use crate::orchestrator::EngineSecrets;
+use crate::orchestrator::{EngineSecrets, HostRefusal};
 use crate::state::AppState;
 use axum::extract::State;
 use axum::Json;
@@ -268,7 +268,12 @@ async fn start_and_observe(state: &AppState, id: &Uuid) -> ApiResult<ProjectStat
     if let Err(e) = state.orch.start(id).await {
         tracing::error!(project_id = %id, error = ?e, "starting the sandbox failed");
         set_status(state, id, ProjectStatus::Error).await?;
-        return Err(ApiError::Internal(e));
+        // A full disk is the owner's to act on, and the host names it precisely. Reporting it as
+        // "an unexpected error occurred" is how a full volume cost us an afternoon.
+        return Err(match e.downcast_ref::<HostRefusal>() {
+            Some(HostRefusal::OutOfDisk) => ApiError::InsufficientStorage,
+            None => ApiError::Internal(e),
+        });
     }
     let observed = match state.orch.status(id).await {
         Ok(ProjectStatus::Stopped) => {
