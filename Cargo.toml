@@ -28,3 +28,18 @@ incremental = false
 [profile.test]
 debug = "line-tables-only"
 incremental = false
+
+# Railway ships these binaries and pays for the image. Defaults optimise for
+# rebuild speed on a developer's laptop, which is the wrong trade for a
+# container that is built once and run for days.
+#
+# `panic = "unwind"` is deliberate and load-bearing: the delivery loop catches a
+# panic to quarantine the message that caused it, and `abort` would turn one bad
+# body back into a dead project.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+incremental = false
