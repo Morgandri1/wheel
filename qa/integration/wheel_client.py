@@ -318,3 +318,36 @@ def run_suite(main, name, cleanup=None, container=None):
                 cleanup()
             except Exception:
                 pass
+
+
+# Fake-harness steering keys, mapped from the env var each suite used to set.
+FAKE_ENV_TO_KEY = {
+    "WHEEL_FAKE_ENV_DUMP": "env_dump",
+    "WHEEL_FAKE_TRANSCRIPT": "transcript",
+    "WHEEL_FAKE_SCRIPT": "script",
+    "WHEEL_FAKE_ENV_DUMP_KEYS": "env_dump_keys",
+    "WHEEL_FAKE_ENV_SENTINELS": "env_sentinels",
+    "WHEEL_FAKE_AUTH": "auth",
+    "WHEEL_FAKE_SESSION_ID": "session_id",
+}
+
+
+def configure_fakes(container, **opts):
+    """Steer the fake harnesses through /data/wheel-fake.json inside `container`.
+
+    Since ADVERSARY F015 the engine gives a child an empty environment plus a short
+    allowlist, so WHEEL_FAKE_* set on the ENGINE stops at the engine and never reaches the
+    harness. Suites that still set it get a child that spawns perfectly and records nothing,
+    which surfaces as "the child never spawned" or a delivery that never arrives -- a failure
+    that points at the engine and is entirely the test's own.
+
+    I made that change, converted two suites with it, and left three behind. The gate
+    qa/contract/fake_steering.py exists so the fourth one cannot happen.
+    """
+    cfg = json.dumps({k: v for k, v in opts.items() if v is not None})
+    p = subprocess.run(["docker", "exec", "-i", container, "sh", "-c",
+                        "cat > /data/wheel-fake.json"],
+                       input=cfg, capture_output=True, text=True)
+    if p.returncode != 0:
+        return "could not write /data/wheel-fake.json: " + (p.stderr or "")[:160]
+    return None

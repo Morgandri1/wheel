@@ -214,7 +214,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # `version: 9`, like the other two jobs that do this. pnpm/action-setup reads
+      # `packageManager` from the package.json at the REPO ROOT, and ours is in web/ --
+      # so without a version this job died at setup with "No pnpm version is specified",
+      # before a single assertion ran. A job that never starts reports the same red as a
+      # job that found a bug, and I copied the shape from a job that had this right.
       - uses: pnpm/action-setup@v4
+        with: { version: 9 }
       - uses: actions/setup-node@v4
         with:
           node-version: 22

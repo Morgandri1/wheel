@@ -175,6 +175,11 @@ step "qa:ci-lint"      "$PY" qa/contract/ci_workflow_lint.py
 # detectable statically in under a second, so it is caught here instead.
 step "qa:testid-parity" "$PY" qa/contract/testid_parity.py
 
+# A suite that steers the fake harness through the ENGINE's environment steers
+# nothing since F015, and reports the resulting silence as an engine fault. Static,
+# instant, and it caught three suites I had already broken.
+step "qa:fake-steering" "$PY" qa/contract/fake_steering.py
+
 # The image must contain the binaries the contract depends on. BUG-010: the `wheel`
 # CLI was silently absent because the Dockerfile built a bin name that does not exist
 # under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.

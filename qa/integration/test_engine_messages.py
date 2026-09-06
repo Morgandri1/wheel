@@ -11,7 +11,7 @@ test, so it cannot also be the evidence.
 """
 import json, os, subprocess, sys, time, uuid, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, engine as proxy_engine, mint, session_for, unique_sub, api_healthy, wait_for, Results
+from wheel_client import call, engine as proxy_engine, mint, session_for, unique_sub, api_healthy, wait_for, Results, configure_fakes
 
 SKIP = 77
 R = Results()
@@ -70,7 +70,6 @@ def start_direct_engine():
          "-e", "WHEEL_VAULT_KEY=" + key,
          "-e", "WHEEL_ROLE=engine",
          "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
-         "-e", "WHEEL_FAKE_TRANSCRIPT=" + TRANSCRIPT,
          "-p", "%d:7000" % DIRECT_PORT, "wheel-engine:test"],
         capture_output=True, text=True)
     if p.returncode != 0:
@@ -78,7 +77,12 @@ def start_direct_engine():
     for _ in range(60):
         try:
             if _direct("GET", "/healthz")[0] == 200:
-                return None
+                # By FILE, not by env. F015 strips WHEEL_FAKE_* on the way into the child,
+                # so setting WHEEL_FAKE_TRANSCRIPT on the engine steered nothing and the
+                # transcript this suite waits on was never written -- surfacing as
+                # "timed out waiting for message reaching the child's stdin", which points
+                # squarely at the engine and was entirely this suite's own fault.
+                return configure_fakes(NAME, transcript=TRANSCRIPT)
         except Exception:
             pass
         time.sleep(0.5)

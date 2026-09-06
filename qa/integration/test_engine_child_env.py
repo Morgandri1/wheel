@@ -101,10 +101,6 @@ def start_engine():
            "-e", "WHEEL_VAULT_KEY=" + VAULT_KEY_B64,
            "-e", "WHEEL_ROLE=engine",
            "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
-           # Ask the child to report which of its variables carry these values, whatever
-           # they happen to be called.
-           "-e", "WHEEL_FAKE_ENV_SENTINELS=%s,%s,%s" % (
-               digest(ENGINE_SECRET), digest(VAULT_KEY_B64), digest(VAULT_VALUE)),
            "-p", "%d:7000" % PORT, IMAGE)
     if p.returncode != 0:
         return "could not start wheel-engine:test: " + p.stderr.strip()[:200]
