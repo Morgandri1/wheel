@@ -9,5 +9,6 @@
   "wires": [],
   "config": {
     "markdown": "x"
-  }
+  },
+  "_pending": "Position's wire type is now integer (ARCHITECTURE.md \"Position is an integer cell\"); a raw float like -1234.5/0.25 is accepted and rounded by the engine's Deserialize impl, but JSON Schema's `type: integer` correctly rejects a non-whole number by spec, so this can't be a schema-valid fixture. The round-on-input behavior is covered by wheel-core's own tests (node.rs: a_position_rounds_on_the_way_in_from_json) and by the engine's live request/response cycle, not by this static contract check."
 }
