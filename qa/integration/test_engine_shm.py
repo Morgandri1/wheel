@@ -273,9 +273,12 @@ def main():
            "-c", "dd if=/dev/zero of=/data/filler bs=1k count=1990 2>/dev/null; "
                  "exec wheel-engine")
         time.sleep(6)
-        said = sh("docker", "logs", full)
-        first = next((l.strip() for l in (said.stdout + said.stderr).splitlines()
-                      if l.strip()), "")
+        # 2>&1 through a shell, so the lines come back INTERLEAVED as the container
+        # emitted them. Concatenating .stdout + .stderr puts every stdout line first, so
+        # "the FIRST line" became the tracing INFO banner rather than the failure — and the
+        # control correctly refused to judge a first line that was not the first line.
+        said = sh("sh", "-c", "docker logs %s 2>&1" % full)
+        first = next((l.strip() for l in said.stdout.splitlines() if l.strip()), "")
         low = first.lower()
         R.control("ENG-diskfull/engine-failed", "error" in low or "unable" in low,
                   "the engine did not fail on a full volume, so there is no first line to "
