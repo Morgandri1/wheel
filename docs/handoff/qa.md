@@ -50,6 +50,33 @@ does not name, and it reads Playwright specs as well as Python.
 
 ## TRAPS (read this section first)
 
+**A gate that has never been run against the broken code is not a gate.** On 2026-09-06 my
+three panic gates were written before the fix landed -- which PM rightly called the reason
+we could tell a real fix from a moved line number -- and all three passed against an engine
+built from the exact pre-fix source. They asserted that the engine survives a code path
+they never caused it to execute. `escape_envelope_body` runs at DELIVERY
+(supervisor/mod.rs:545), so an agent that is never started never reaches it. The recipe,
+when you need it again:
+
+```
+git -C /Users/metatron/wheel worktree add --detach /tmp/mutant <sha>
+# revert the fix in that worktree, using `git show <fix>^:<path>` for the REAL pre-fix
+# source rather than reconstructing it from the comment the fix left behind, then:
+docker build -f docker/Dockerfile.host -t wheel-engine:mutant-qa .
+docker build -f docker/Dockerfile.test --build-arg BASE=wheel-engine:mutant-qa \
+  -t wheel-engine:mutant-test .
+WHEEL_PANIC_IMAGE=wheel-engine:mutant-test python3 qa/integration/test_engine_panics.py
+```
+
+**`wheel-engine:test` is a mutable tag on a shared host and it goes stale.** It was six
+hours old on 2026-09-06, so every suite anyone ran that afternoon tested a pre-fix engine.
+`pin_image()` resolves it to an immutable ID and suites print which. If a result surprises
+you, check the image date BEFORE reporting anything.
+
+**A panic does not always kill the process.** It unwinds one tokio task, so the pre-fix
+engine answered /healthz 200 with a dead delivery loop. "The board is 502" and "the board
+is up and doing nothing" are the same bug; only the second looks healthy to a health check.
+
 **Everything below cost me hours today. Each is a case where a green, or a red, meant something
 other than what it looked like.**
 

@@ -159,7 +159,15 @@ def main():
         # the only branch that works.
         #
         # So: whatever this is set to, a database on this volume must still end up in a mode
-        # the filesystem can host. Every value, including nonsense.
+        # the filesystem can host.
+        #
+        # With one deliberate exception, added after this gate failed against a74e56d. A
+        # mode name sqlite has never heard of is a CONFIGURATION error, and refusing to
+        # boot on it is right: the alternative is silently picking something the operator
+        # did not ask for, which is the same class of quiet lever that caused the outage.
+        # A typo must fail loudly and say what was wrong. So an unknown name is allowed to
+        # stop the boot, and is instead held to the message it prints -- while every name
+        # sqlite DOES know must still reach a mode this filesystem can host.
         for value in ("TRUNCATE", "WAL", "DELETE", "not-a-mode"):
             vol2 = "%s-%s" % (VOL, value.lower().replace("-", ""))
             name2 = "%s-%s" % (NAME, value.lower().replace("-", ""))
@@ -193,12 +201,24 @@ def main():
             # report look four times worse and tell a reader nothing extra, and the one that
             # matters (TRUNCATE collapsing the negotiation) becomes visible only once the
             # baseline works.
-            R.gated("ENG-journal-override-cannot-disable-recovery/%s" % value.lower(),
-                    "ENG-starts-without-shm", ok2,
-                    "WHEEL_SQLITE_JOURNAL=%s stopped the engine starting on a volume that "
-                    "cannot host a WAL index. An override on a RECOVERY path must not be "
-                    "able to disable the only branch that works: %s"
-                    % (value, ((said.stdout + said.stderr)[-220:])))
+            told = said.stdout + said.stderr
+            if value == "not-a-mode":
+                # Refusing is correct; refusing SILENTLY is not. The message has to name
+                # the variable and the offending value, or the operator is left reading a
+                # sqlite error and guessing at their own env — which is exactly how an
+                # 80-minute outage got its extra hour.
+                R.gated("ENG-journal-override-invalid-fails-loudly", "ENG-starts-without-shm",
+                        (not ok2) and "WHEEL_SQLITE_JOURNAL" in told and value in told,
+                        "an unknown journal mode must stop the boot with a message naming "
+                        "WHEEL_SQLITE_JOURNAL and the bad value. started=%s, said: %s"
+                        % (ok2, told[-220:]))
+            else:
+                R.gated("ENG-journal-override-cannot-disable-recovery/%s" % value.lower(),
+                        "ENG-starts-without-shm", ok2,
+                        "WHEEL_SQLITE_JOURNAL=%s stopped the engine starting on a volume "
+                        "that cannot host a WAL index. An override on a RECOVERY path must "
+                        "not be able to disable the only branch that works: %s"
+                        % (value, told[-220:]))
             sh("docker", "rm", "-f", name2)
             sh("docker", "volume", "rm", vol2)
         # ---- the same property on a HEALTHY volume, which runs today -----------------
