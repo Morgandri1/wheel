@@ -73,6 +73,42 @@ Project **root directory = `web/`**. Everything else is defaults; `vercel.json` 
 manager and adds the response headers. Set `NEXT_PUBLIC_AUTH_MODE=local` and `NEXT_PUBLIC_API_URL`
 for all environments, and redeploy after any change to either.
 
+## `npx wheel-web` — running the board without a build
+
+The same app ships as a package that needs no toolchain: Next's standalone server, prebuilt.
+
+```
+npx wheel-web --api https://api.wheel.dev      # or WHEEL_API_URL
+npx wheel-web --port 3400 --api http://localhost:8080
+```
+
+Build and assemble it with `pnpm build:pkg && pnpm pack:pkg`; the publishable tree lands in
+`dist-pkg/` (gitignored) and is published as `wheel-web`, versioned with the API.
+
+**The API URL is resolved at run time, not baked in.** This is the whole design constraint, and
+it is easy to get wrong: `NEXT_PUBLIC_*` values are inlined into the bundle when it is compiled,
+so a prebuilt package cannot read one from the user's environment. Shipping `WHEEL_API_URL` as a
+`NEXT_PUBLIC_` variable would give the package a single option that silently does nothing. Instead
+the server resolves it per request (`src/lib/runtime-config.ts`) and hands it to the client before
+the first fetch; the build-time value stays as the fallback, which is what keeps the Vercel
+deployment behaving exactly as before. The middleware builds the CSP from the same resolution, so
+the policy can never name a different API than the app is calling.
+
+`NEXT_PUBLIC_AUTH_MODE=local` genuinely is fixed at build time and is baked into the package —
+there is no identity provider in this build to configure.
+
+Three traps in this pipeline, all of which produce a package that looks fine:
+
+1. **Static assets go under the dist-dir the build used**, not a hardcoded `.next`. Build with
+   `NEXT_DIST_DIR=.next-pkg` and copy into `.next/static` and every chunk 404s: the HTML is
+   server-rendered so the page appears, but React never hydrates and nothing is clickable. Nothing
+   looks broken until you click. `pack:pkg` now fails if the chunk directory is missing.
+2. **The manifest must not say `"type": "module"`.** Next's standalone `server.js` is CommonJS and
+   calls `require()`; marked as ESM it dies on its first line. The bin is `.mjs`, which is ESM by
+   extension and needs nothing from the manifest. `pack:pkg` fails on this too.
+3. **`.next/static` and `public/` are not part of standalone output** — it assumes a CDN serves
+   them. A locally-run package has no CDN, so the packer copies both.
+
 ## What API has to do
 
 CORS must allow the Vercel origin, or the browser blocks every call before it reaches our code.

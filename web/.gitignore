@@ -10,3 +10,6 @@ next-env.d.ts
 # vitest coverage output
 coverage/
 /public/monaco/
+
+# the assembled npm package (built by scripts/pack-standalone.mjs)
+dist-pkg/

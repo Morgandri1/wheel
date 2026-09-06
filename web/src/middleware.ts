@@ -1,5 +1,6 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse, type NextFetchEvent, type NextRequest } from "next/server";
+import { serverApiBaseUrl } from "@/lib/runtime-config";
 import { buildCsp } from "@/lib/csp";
 
 /**
@@ -30,7 +31,7 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
   const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
   const csp = buildCsp({
     nonce,
-    apiUrl: process.env.NEXT_PUBLIC_API_URL,
+    apiUrl: serverApiBaseUrl(),
     authMode: process.env.NEXT_PUBLIC_AUTH_MODE,
     dev: process.env.NODE_ENV !== "production",
   });
