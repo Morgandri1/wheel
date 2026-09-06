@@ -118,24 +118,42 @@ wrong in each case:
   this). One process is the requirement; the process backend's `Sandbox` trait already isolates the choice,
   so this is a third backend rather than a change to the other two.
 
-### The store is the real work
+### The store is the real work — and it is smaller than I planned for
 
-The API is Postgres-shaped in ways SQLite does not share, so this is not a connection-string change:
+The plan here was a `Store` trait over ~20 operations with `PgStore` and `SqliteStore`. I spiked the
+dialect differences before writing it, and the spike changed the design: **`$N` placeholders, uuid
+round-tripping, `RETURNING`, `ON CONFLICT … DO UPDATE`, chrono timestamps and case-insensitive
+collation all behave the same on both backends** (`crates/wheel-api/tests/sqlite_dialect.rs` pins
+each one, because each would fail far from its cause if it stopped holding).
 
-- `citext` for `users.email`. Its case-insensitive uniqueness is what stops two accounts differing only in
-  case, which is an account-takeover vector, not a nicety. SQLite gets `TEXT COLLATE NOCASE`.
-- `jsonb` for `projects.capabilities`; `now()` and `interval` in a dozen maintenance and session queries.
-- Row decoding differs: Postgres has native `uuid` and `timestamptz`, SQLite stores both as text.
+So a trait would have duplicated all ~28 queries to serve the ~13 that actually differ, and the
+duplicates would drift the first time someone edited one copy. What shipped instead:
 
-So: a `Store` trait over ~20 *operations* (not queries), with `PgStore` and `SqliteStore`. `sqlx::Any` was
-considered and rejected — it does not solve the schema differences and makes `FromRow` worse, so it would
-cost the same and hide more. The existing DB test suites run against both implementations, so parity is
-proven rather than assumed.
+- `db::Db` — an enum over `PgPool | SqlitePool`. `Db::connect` picks the backend from the URL
+  scheme, so no mode flag can disagree with the connection string.
+- `db_execute!` / `db_fetch_one!` / `db_fetch_optional!` / `db_fetch_all!` / `db_scalar!` — dispatch
+  in one place. A call site writes its query once.
+- `Db::pick(postgres, sqlite)` — used *only* where the dialects genuinely differ, so a query that
+  needs two forms has to say so out loud rather than silently working on one backend.
+
+What genuinely differs, and therefore all that is written twice: Postgres time arithmetic (`now()`,
+`make_interval`, `to_timestamp(floor(extract(epoch …)))`, `interval '2 hours'`) in ~13 statements
+across `auth/local.rs`, `http/authlimit.rs`, `http/ratelimit.rs`, `routes/ws_ticket.rs` and
+`routes/projects.rs`. Nothing else.
+
+Postgres stays the deployed store, and the reason is in those same queries: window boundaries and
+ticket expiry are computed from the *database* clock so N replicas agree even when their own clocks
+differ. Moving that arithmetic into Rust would make the SQL portable and the production semantics
+worse, so it stays in SQL and is written per dialect.
 
 Landing order, each step green on its own:
-1. Introduce the trait; `PgStore` wraps today's queries verbatim. No behaviour change.
-2. `SqliteStore` + a SQLite migration set; run the DB suites against both.
-3. `wheeld` itself: composition, `--data-dir`, embedded migrations, zero-flag `:8080`.
+1. **Done** — `Db`, the URL-scheme selection, the SQLite migration set, the dialect guard, and the
+   dispatch macros, all exercised against a real SQLite database.
+2. **Next, and atomic** — `AppState.db` becomes `Db`. This cannot be partial: the moment the state
+   changes type, all 23 `PgPool` references and the `*_db.rs` suites move with it. ~13 statements
+   gain a `Db::pick` second form; the rest change only their dispatch.
+3. Point `wheeld` at `STORE=sqlite://<data-dir>/wheel.db` so it needs nothing installed, and run the
+   existing DB suites against both backends so parity is proven rather than assumed.
 
 ### Known gap to state rather than hide
 
