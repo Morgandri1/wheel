@@ -40,7 +40,14 @@ export function errorCode(body: string): string | null {
   }
 }
 
-/** `delivered` from ingress's 202 envelope, when it sent one. */
+/**
+ * The `delivered` field of ingress's 202 envelope, read literally.
+ *
+ * The name is the wire's, not ours, and it overstates: the engine increments it once per row it
+ * ENQUEUES, so a stopped or parked agent still counts. Under the message states (§3c #4)
+ * `delivered` means the bytes reached the child's stdin, which this number cannot know. Callers
+ * must phrase it as queued.
+ */
 export function deliveredCount(body: string): number | null {
   try {
     const parsed: unknown = JSON.parse(body);
@@ -59,7 +66,7 @@ export function deliveredCount(body: string): number | null {
  *   403 -> the project capability is off        (fix: the Enable button in this panel)
  *   501 -> this engine predates ingress          (fix: restart the project)
  *   404 -> a real answer about this path         (fix: the path)
- *   202 -> delivered                             (nothing to fix)
+ *   202 -> accepted and queued                   (nothing to fix here; the agent may still be parked)
  * A panel that renders them as one shade of failure is what sent them looking at the path.
  */
 export function probeVerdict({
@@ -84,7 +91,8 @@ export function probeVerdict({
       return "Ingress accepted it, but nothing is wired to this endpoint, so it was dropped.";
     }
     if (delivered !== null) {
-      return `Delivered to ${delivered} wired node${delivered === 1 ? "" : "s"}. This was a real hit, not a simulation.`;
+      const nodes = `${delivered} wired node${delivered === 1 ? "" : "s"}`;
+      return `Ingress accepted it and queued it for ${nodes}. Queued is not read: a parked or stopped agent picks it up when it next runs.`;
     }
     return "The endpoint answered.";
   }
