@@ -34,7 +34,7 @@ no is_candidate "$PROBE" "morgan@avo.so" "$((30 * DAY))"
 echo "probe domains"
 ok is_probe_address "api-verify@wheel.test"
 ok is_probe_address "QA@WheelCheck.dev"
-ok is_probe_address "someone@example.com"
+no is_probe_address "someone@example.com"   # registrable by anyone: a real project, not a probe
 no is_probe_address "someone@wheel.test.attacker.com"
 no is_probe_address "someone@notwheel.test"
 no is_probe_address "someone@sub.wheel.test"
