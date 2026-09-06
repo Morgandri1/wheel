@@ -31,21 +31,33 @@ mirroring `tool-panel.tsx`'s fill-mode picker. A saved config that is `bearer` w
 since removed shows a warning instead of silently dropping the field. `pnpm typecheck` / `lint` /
 `test` (284, 14 new/changed) all green. PM reviewed the design as correct; merge is held only on
 `make check`/integration being red on `main` itself from BUG-022 (journal-mode fast-path — SDK's,
-already filed S1, not this PR's diff) — merge as soon as CI reruns green, nothing more needed from
-web on it.
+already filed S1, not this PR's diff). SDK's fix is PR #12, open, not yet merged by PM — merge #3
+as soon as #12 lands and CI reruns green. Nothing more needed from web on either.
+
+Also open, both docs-only: **PR #10** closes out the coverage-scope CONTRACT item PM ruled on.
+**PR #13** documents the ingress error-shape gap found while re-probing NEXT#1 (see NEXT).
 
 ## NEXT — priority order
 
-1. **Re-probe the endpoint Test button against a real board** once SDK's ingress lands
-   (`crates/wheel-engine/src` has no `/ingress/*` route as of this doc — confirmed directly by
-   grep, not inferred from a stale note; API's CORS/preflight side is already green, per API's own
-   `reports` row: `cors` test `the_public_ingress_answers_any_origin`, 4/4). When ingress lands,
-   the "bodiless 404 → ingress is not built yet" branch in `probeVerdict` becomes unreachable by
-   construction and an E2E hitting a real endpoint is owed. Ask QA for the ID; do not invent one
-   (see TRAPS).
-2. **Coverage include list** (see CONTRACT) — needs a PM ruling before changing.
-3. Nothing else queued. Once PR #3 lands, re-check this list against `origin/main` rather than
+1. **Ingress landed (SDK, `340f318`) — re-probed at the source level, real board E2E still owed.**
+   `crates/wheel-engine/src/api/ingress.rs` exists and is mounted at `/ingress` (confirmed by
+   grep + reading it, not inferred). The "bodiless 404 → ingress is not built yet" branch in
+   `probeVerdict` is now unreachable in practice: the engine's fallback handler always answers
+   404 with a JSON body, never bodiless. Found one real gap while checking: `ingress.rs`'s `err()`
+   helper emits a bare `{"code":"no_such_endpoint"}`, not the `{"error":{"code":...,"message":...}}`
+   envelope every other engine route uses (`wheel_core::ErrorBody`) and that `errorCode()` requires
+   by design — so a real "no endpoint here" 404 shows the generic bodied-404 message instead of the
+   specific one already written for it. Not misleading, just less specific. Reported to SDK; PR #13
+   documents today's real (bare-shape) behavior in a test rather than the intended one, to flip once
+   their fix lands. Still owed: an actual browser E2E clicking Test against a live running board —
+   ask QA for the ID; do not invent one (see TRAPS).
+2. Nothing else queued. Once PR #3 lands, re-check this list against `origin/main` rather than
    trusting it verbatim (see TRAPS #13).
+
+**Standing obligation from the coverage ruling below:** any new `src/lib` module whose wrong
+branch would be silently wrong (permission/wire checks, auth, security headers, state machines,
+anything §3c calls out) gets added to `vitest.config.ts`'s coverage `include` on the same PR that
+introduces it. Not a NEXT item — a check to run on every future PR that touches `src/lib`.
 
 ## TRAPS — every one of these I walked into today
 
@@ -106,17 +118,15 @@ web on it.
 
 ## CONTRACT — where I think a rule is wrong
 
-1. **§0b rule 3 says "≥ 90 % test coverage per crate and per package."** For web that is not what
-   is enforced. `web/vitest.config.ts` measures 90% across **nine hand-picked files**; everything
-   else — every component, `runtime-config.ts`, `api.ts` — is outside the gate entirely. The
-   scoping is defensible (those files encode rules; components are covered by Playwright), but the
-   contract's words and the gate's behaviour disagree, and a successor reading only the contract
-   will believe the package is covered. Either narrow the contract to say "the modules that encode
-   rules, listed in vitest.config.ts", or change the include to `src/lib/**` with explicit
-   exclusions. It needs a ruling, not a quiet edit — I left it alone.
-2. **The release rule has no owner for "when".** Vercel now builds only on a `web/package.json`
+~~1. §0b rule 3's "≥90% per crate and per package" vs. web's actual 9-file-scoped gate.~~
+**Resolved 2026-09-06 (`db1416f`):** PM ruled for narrowing the contract wording (my
+recommendation) rather than widening the gate. §0b/3 in `docs/ARCHITECTURE.md` now says web's bar
+is scoped to the `src/lib` rule-modules enumerated in `vitest.config.ts`'s include list, and that
+the list is a standing obligation — see NEXT.
+
+1. **The release rule has no owner for "when".** Vercel now builds only on a `web/package.json`
    version bump, which correctly stopped 127 no-op deploys. But a fix merged without a bump is
-   invisible in production for an unbounded time, and nothing schedules the next bump. `ea6f2ab` is
-   sitting on main right now in exactly that state. This is fine for cosmetics and *not* fine for a
-   security fix. Suggest: any merge touching auth, CSP, or a secret path bumps the patch version in
-   the same commit, and the rule says so.
+   invisible in production for an unbounded time, and nothing schedules the next bump — `ea6f2ab`
+   sat on main in exactly that state for a while before 0.2.1 finally bumped it. This is fine for
+   cosmetics and *not* fine for a security fix. Suggest: any merge touching auth, CSP, or a secret
+   path bumps the patch version in the same commit, and the rule says so. Still unresolved.
