@@ -59,6 +59,22 @@ fn aad(node: Uuid, key: &str) -> String {
 }
 
 pub fn put(conn: &Connection, vk: &VaultKey, node: Uuid, key: &str, value: &str) -> Result<()> {
+    put_with_expiry(conn, vk, node, key, value, None)
+}
+
+/// Store a value along with when it stops working, if that is known.
+///
+/// The expiry travels WITH the value rather than in a side table: a credential
+/// copied out of a login is only useful to the UI if "what is stored" and
+/// "until when" cannot drift apart.
+pub fn put_with_expiry(
+    conn: &Connection,
+    vk: &VaultKey,
+    node: Uuid,
+    key: &str,
+    value: &str,
+    expires_at: Option<wheel_core::Timestamp>,
+) -> Result<()> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ct = vk
         .cipher
@@ -71,21 +87,65 @@ pub fn put(conn: &Connection, vk: &VaultKey, node: Uuid, key: &str, value: &str)
         )
         .map_err(|_| anyhow::anyhow!("could not encrypt the value"))?;
     conn.execute(
-        "INSERT INTO vault_values (node_id, key, ciphertext, nonce, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO vault_values (node_id, key, ciphertext, nonce, updated_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(node_id, key) DO UPDATE SET
              ciphertext = excluded.ciphertext,
              nonce = excluded.nonce,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at,
+             expires_at = excluded.expires_at",
         params![
             node.to_string(),
             key,
             ct,
             nonce.to_vec(),
-            wheel_core::Timestamp::now().to_string()
+            wheel_core::Timestamp::now().to_string(),
+            expires_at.map(|t| t.to_string())
         ],
     )?;
     Ok(())
+}
+
+/// When a stored credential stops working, if the store knew.
+///
+/// `None` covers both "durable" and "nobody told us", which are different
+/// facts -- so callers report absence as unknown rather than as safe.
+pub fn expiry_of(
+    conn: &Connection,
+    node: Uuid,
+    key: &str,
+) -> Result<Option<wheel_core::Timestamp>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT expires_at FROM vault_values WHERE node_id = ?1 AND key = ?2",
+            params![node.to_string(), key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .and_then(|s| wheel_core::Timestamp::parse_rfc3339(&s).ok()))
+}
+
+/// The vault, key and expiry of the credential an agent would actually run
+/// with, so the UI can name the account AND say when it lapses.
+pub fn credential_detail(
+    conn: &Connection,
+    agent: Uuid,
+    harness: wheel_core::Harness,
+) -> Result<Option<(String, String, Option<wheel_core::Timestamp>)>> {
+    let recognised: &[&str] = match harness {
+        wheel_core::Harness::Claude => &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        wheel_core::Harness::Codex => &["CODEX_API_KEY"],
+    };
+    for (id, name) in wired_vaults(conn, agent)? {
+        for key in offered_keys(conn, id)? {
+            if recognised.contains(&key.as_str()) {
+                return Ok(Some((name, key.clone(), expiry_of(conn, id, &key)?)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn get(conn: &Connection, vk: &VaultKey, node: Uuid, key: &str) -> Result<Option<String>> {
@@ -410,6 +470,76 @@ mod tests {
                 .unwrap(),
             SECRET
         );
+    }
+
+    /// The UI can only warn "re-login by ..." if the expiry survives beside
+    /// the value. It is stored on the row so the two cannot drift.
+    #[test]
+    fn an_expiry_round_trips_with_the_value_it_belongs_to() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        board::create(&c, &v).unwrap();
+
+        let when = wheel_core::Timestamp::parse_rfc3339("2026-09-06T12:00:00Z").unwrap();
+        put_with_expiry(
+            &c,
+            &key(),
+            v.id,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "tok",
+            Some(when),
+        )
+        .unwrap();
+        assert_eq!(
+            expiry_of(&c, v.id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap(),
+            Some(when)
+        );
+
+        // Absent means durable OR unknown -- never "already expired".
+        put(&c, &key(), v.id, "ANTHROPIC_API_KEY", "k").unwrap();
+        assert_eq!(expiry_of(&c, v.id, "ANTHROPIC_API_KEY").unwrap(), None);
+
+        // Overwriting without an expiry CLEARS it: the new value is a
+        // different credential and must not inherit the old one's deadline.
+        put(&c, &key(), v.id, "CLAUDE_CODE_OAUTH_TOKEN", "tok2").unwrap();
+        assert_eq!(
+            expiry_of(&c, v.id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap(),
+            None
+        );
+    }
+
+    /// `GET auth` needs the vault name AND the deadline in one answer.
+    #[test]
+    fn credential_detail_names_the_vault_the_key_and_the_deadline() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("anthropic-alice", &[]);
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        board::create(&c, &v).unwrap();
+        board::create(&c, &a).unwrap();
+        board::add_wire(&c, a.id, v.id, wheel_core::WireType::Read, None).unwrap();
+
+        let when = wheel_core::Timestamp::parse_rfc3339("2026-09-06T12:00:00Z").unwrap();
+        put_with_expiry(
+            &c,
+            &key(),
+            v.id,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "tok",
+            Some(when),
+        )
+        .unwrap();
+
+        let (name, k, exp) = credential_detail(&c, a.id, wheel_core::Harness::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(name, "anthropic-alice");
+        assert_eq!(k, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(exp, Some(when));
+
+        // A codex agent is not authenticated by an Anthropic credential.
+        assert!(credential_detail(&c, a.id, wheel_core::Harness::Codex)
+            .unwrap()
+            .is_none());
     }
 
     /// If a child echoes a vaulted credential, it must not survive into a log

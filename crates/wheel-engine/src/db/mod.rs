@@ -50,7 +50,24 @@ fn configure(conn: &Connection) -> Result<()> {
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("schema.sql"))
         .context("applying schema")?;
+    // Added after the first deploy, so it cannot live in schema.sql: those
+    // statements are CREATE ... IF NOT EXISTS and never touch a table that
+    // already exists.
+    add_column(conn, "vault_values", "expires_at TEXT")?;
     Ok(())
+}
+
+/// Add a column that may already be there.
+///
+/// sqlite has no `ADD COLUMN IF NOT EXISTS`, and a database created before the
+/// column existed is the normal case on a running deployment -- so a duplicate
+/// column is the SUCCESS path here, not an error to report.
+fn add_column(conn: &Connection, table: &str, decl: &str) -> Result<()> {
+    match conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("adding {table}.{decl}")),
+    }
 }
 
 #[cfg(test)]

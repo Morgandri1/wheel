@@ -363,6 +363,7 @@ pub async fn auth_complete(
         mode: Some(kind),
         source: None,
         account: None,
+        expires_at: None,
     });
     if let Some(v) = vaulted {
         out["vault"] = v;
@@ -423,6 +424,9 @@ async fn finish_setup_token(
         mode: Some(wheel_core::CredentialKind::OauthToken),
         source: None,
         account: None,
+        // A `claude setup-token` credential carries no expiry; saying so is
+        // different from saying we do not know.
+        expires_at: None,
     });
     if let Some(v) = vaulted {
         body["vault"] = v;
@@ -450,6 +454,15 @@ async fn resume_if_blocked(s: &AppState, id: Uuid) -> ApiResult<()> {
         at: wheel_core::Timestamp::now(),
     });
     Ok(())
+}
+
+/// The credential stores speak milliseconds since the epoch; this API speaks
+/// RFC3339 UTC (§2). A value that cannot be represented is dropped rather than
+/// rendered as a wrong time.
+fn millis_to_timestamp(ms: i64) -> Option<wheel_core::Timestamp> {
+    time::OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
+        .ok()
+        .map(wheel_core::Timestamp::from)
 }
 
 /// The harness an agent node is configured for, or a 404/400 that says why not.
@@ -555,6 +568,7 @@ async fn finish_paste_code(
         mode: Some(wheel_core::CredentialKind::OauthSession),
         source: None,
         account: None,
+        expires_at: None,
     });
     if let Some(v) = vaulted {
         body["vault"] = v;
@@ -606,10 +620,20 @@ fn save_credential_to_vault(
     }
 
     const KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
-    crate::api::vault_routes::store_in_vault(s, &conn, vault.id, KEY, &found.token)?;
+    // RFC3339, not the store's raw milliseconds: §2 says every time on this
+    // API is RFC3339 UTC, and the UI renders this one directly.
+    let expires_at = found.expires_at.and_then(millis_to_timestamp);
+    crate::api::vault_routes::store_in_vault_until(
+        s,
+        &conn,
+        vault.id,
+        KEY,
+        &found.token,
+        expires_at,
+    )?;
 
     let mut out = serde_json::json!({ "name": vault_name, "key": KEY, "stored": true });
-    if let Some(exp) = found.expires_at {
+    if let Some(exp) = expires_at {
         out["expires_at"] = serde_json::json!(exp);
     }
     if !found.is_long_lived() {
@@ -642,36 +666,26 @@ pub async fn auth_status(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let harness = agent_harness(&s, id)?;
-    // A vault wins over a pasted credential: it is the thing the operator can
-    // see and change on the board, and it is how a project runs several
-    // accounts. Reporting the pasted one while the vault supplies the value
-    // the child actually runs with would be a lie about which account is live.
-    let vault_source = {
-        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        crate::vault::credential_source(&conn, id, harness).unwrap_or(None)
-    };
-    if let Some(source) = vault_source {
-        return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
-            authenticated: true,
-            mode: Some(wheel_core::CredentialKind::Env),
-            source: Some(source),
-            account: None,
-        })));
-    }
 
-    // A wired vault wins: it is the thing the operator can see and change on
-    // the board, and it is how one project runs several accounts of the same
-    // provider. A pasted credential is the fallback, not the other way round.
-    let vault_source = {
+    // A wired vault wins over a pasted credential: it is the thing the
+    // operator can see and change on the board, and it is how one project runs
+    // several accounts of the same provider. Reporting the pasted one while
+    // the vault supplies the value the child actually runs with would be a lie
+    // about which account is live.
+    let from_vault = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        crate::vault::credential_source(&conn, id, harness).unwrap_or(None)
+        crate::vault::credential_detail(&conn, id, harness).unwrap_or(None)
     };
-    if let Some(source) = vault_source {
+    if let Some((source, _key, expires_at)) = from_vault {
         return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
             authenticated: true,
             mode: Some(wheel_core::CredentialKind::Env),
             source: Some(source),
             account: None,
+            // Absent means durable OR unknown. The UI shows "re-login by ..."
+            // only when there is a real time to show, rather than inventing a
+            // deadline for a credential nobody said anything about.
+            expires_at,
         })));
     }
 
@@ -688,11 +702,24 @@ pub async fn auth_status(
         }
     });
 
+    // For a login on disk, the harness's own store is the only thing that
+    // knows when it lapses -- and it is the same store the child reads, so
+    // this is the truth rather than a copy of it.
+    let expires_at = if mode == Some(wheel_core::CredentialKind::OauthSession) {
+        crate::auth::oauth_token_from_store(&config_dir)
+            .ok()
+            .and_then(|t| t.expires_at)
+            .and_then(millis_to_timestamp)
+    } else {
+        None
+    };
+
     Ok(Json(serde_json::json!(wheel_core::AuthStatus {
         authenticated,
         mode,
         source: None,
         account: None,
+        expires_at,
     })))
 }
 
