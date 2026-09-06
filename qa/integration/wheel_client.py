@@ -8,7 +8,7 @@ wrongly in both directions and the test passes.
 mint() is copied from infra/dev/e2e.py (API's implementation, per their instruction to
 reuse rather than reinvent the token format).
 """
-import base64, hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, hashlib, hmac, json, os, socket, subprocess, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import namedtuple
 
 # Tuple-unpackable AND attribute-addressable: `st, body, hdrs = call(...)` and
@@ -280,6 +280,12 @@ def pin_image(tag="wheel-engine:test"):
     return p.stdout.strip() if p.returncode == 0 else None
 
 
+def _any_free_port():
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
 def free_port(preferred):
     """`preferred` if it is bindable right now, otherwise any free port.
 
@@ -288,7 +294,16 @@ def free_port(preferred):
     two SUITES colliding; they do nothing about the same suite running twice, which is
     routine on a host shared by six agents. A wheel-on-wheel run lost its engine that way
     mid-clone, and the retry could not start at all because the first run still held 17426.
+    
+    `preferred = 0` means "any free port". Binding to 0 SUCCEEDS -- the kernel assigns one
+    -- so the obvious implementation reports 0 as bindable and hands back 0, and every
+    caller then connects to port 0 and never reaches anything. That cost me a four-way
+    false failure against a perfectly healthy engine whose own log said "database ready",
+    and I nearly sent it to PM as a production finding.
     """
+    if not preferred:
+        return _any_free_port()
+
     import socket
     with socket.socket() as s:
         try:
