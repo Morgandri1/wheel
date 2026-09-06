@@ -652,3 +652,52 @@ a Linux container and would return the verdict in ~2 minutes instead of at CI ti
 This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
 faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
 that means less than the person reading it believes.
+
+---
+
+## 017 — `SEC-vault-at-rest` grepped an empty file · S2 · QA (mine) · CLOSED
+
+The at-rest check read `/data/wheel.db` and asserted the canary was absent. The engine runs
+sqlite in WAL mode, so on a short-lived test container `wheel.db` is a **4096-byte header**
+and every row lives in `wheel.db-wal`. The suite was scanning nothing and reporting the
+strongest claim it makes: "your secrets are encrypted at rest".
+
+It would have passed against an engine that stored every vault value in plaintext.
+
+Caught by its own positive control (`SEC-vault-at-rest/grep-works`), which asserts a value we
+know is there IS findable by the same scan — it went red while the security assertion above it
+went green. Fixed: scan `wheel.db`, `-wal` and `-shm`, and control on a ctx markdown stored
+deliberately in the clear rather than on a key name. The control now *gates* the verdict: if
+the scan cannot find the plaintext control, the at-rest criterion reports **skipped**, because
+a broken search has no verdict to give.
+
+## 018 — `qa:id-traceability` ignored any ID containing `%` · S2 · QA (mine) · CLOSED
+
+The gate exists so that every ID a suite asserts is named in TESTPLAN. It skipped labels
+containing `%`, reasoning that format placeholders are prose. True for `WM-setup/%s`, where the
+parent carries the criterion. False for `SEC-child-env-no-%s`, which assembles the ID **body**:
+two S1 criteria — the control-plane bearer and the vault key must not reach an agent child —
+were asserted under IDs that appear nowhere in the plan. The gate reported "every asserted ID
+is in the plan" and a reader of the plan saw no gap. Both were right and the criteria were
+untraced.
+
+Fixed: interpolating after a `/` stays legal, interpolating into the ID body fails with the fix
+named. Verified by reintroducing the interpolated form and watching it go red.
+
+## 019 — Integration suites collided on ports, env vars and container names · S3 · QA (mine) · CLOSED
+
+Three suites defaulted to port 17413 and two to 17414; two different suites read
+`WHEEL_ENGINE_PORT` with **different** defaults, so setting it to relocate one silently moved
+the other onto a third. Nothing had failed yet — `run.sh` is serial — which is exactly why it
+was worth fixing before it produced a 2am flake, or worse, one suite asserting confidently
+about another suite's engine.
+
+Then the real version arrived: a second QA session on this shared host ran the same suite at the
+same time, its `docker rm -f` destroyed my wheel-on-wheel engine mid-clone, and the retry could
+not start because it still held the port. Suite-level uniqueness does not help when the same
+suite runs twice.
+
+Fixed in two layers: `qa/contract/suite_isolation.py` (in `make check`) forbids shared default
+ports, shared port env vars and shared container names across suites; and long-running suites
+take a per-run container name plus `wheel_client.free_port()`, which falls back to an
+OS-assigned port when the default is busy. Verified by running two engines side by side.
