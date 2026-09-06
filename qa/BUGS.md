@@ -764,6 +764,22 @@ evidence. `main()` no longer tears down; `run_suite()` owns it, capture then rem
 
 ## 019 — `wheeld` does not compile on main: the one binary we ship · **S1** · API
 
+**2026-09-06 REOPENED — the fix is partial; it still does not compile.** `wheeld` now SETS
+`ready`, but with the wrong type:
+
+```
+expected `Readiness`, found `Arc<Atomic<bool>>`
+   Arc::new(std::sync::atomic::AtomicBool::new(true)),
+error: could not compile `wheeld` (lib) due to 1 previous error
+```
+
+Same root cause as the original, one step along: `HostState` is constructed field-by-field at
+a second call site, so each change to the struct is a separate chance to get it wrong. This is
+the second compile break from the same seam in one day, which is the argument for the
+constructor rather than a second manual fix.
+
+Verified on origin/main after fetch+rebase, not on a stale tree.
+
 `cargo build -p wheeld` on `origin/main` (verified at b15e9c7, after rebasing — my first
 observation was on a worktree that was behind, so I withheld the report until I had re-run it
 on current main):
