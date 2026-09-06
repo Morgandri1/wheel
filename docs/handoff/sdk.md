@@ -17,11 +17,15 @@ Landed after `d206b95`, all on `origin/main`:
 `32a1ff9` a table node's sqlite table follows it through every change of shape ·
 `0692797` table storage re-established on boot (W1).
 
-## IN FLIGHT (this branch — read the commits, they carry the reasoning)
+## IN FLIGHT — all of this is merged and pushed (read the commits, they carry the reasoning)
 
-1. **CARGO_HOME** (QA BUG-021 / ADVERSARY 029) — done, `7a76a5d`. `data_dir/.cargo`, mode SET to 0700 each
-   start then verified; refuses to start a child it cannot make private. The gate asserts the
-   VALUE the child got and the MODE, not that the variable exists.
+1. **CARGO_HOME** (QA BUG-021 / ADVERSARY 029) — done, `7a76a5d` + `0c2d18f`. `data_dir/.cargo`,
+   mode SET to 0700 each start then verified; refuses a cache it cannot make private, or one that
+   is a symlink. Gates assert the VALUE the child got, the MODE, that two projects get DIFFERENT
+   paths, and that a symlinked cache is refused (QA `WOW-toolchain-cargo-distinct` / `-cargo-owned`,
+   `45a9991`). **Still open, from `-cargo-owned`: the ownership half** — the directory should be
+   verified as owned by the uid the child actually runs as, which needs the process backend's uid
+   drop readable from the supervisor. Do it with the uid work.
 2. **Table orphan** — done, `32a1ff9`. Changing a table node's config to another type orphaned `t_<name>`;
    the next table node with that name inherited its rows AND columns. `board::update` now carries
    the table through every transition; `board::delete` propagates a failed drop instead of `.ok()`.
