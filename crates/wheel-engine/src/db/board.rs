@@ -224,7 +224,12 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<bool> {
     // outlives the thing that addressed it.
     if let Some(node) = get(conn, id)? {
         if let NodeConfig::Table(_) = &node.config {
-            tables::drop(conn, &node.name).ok();
+            // Not `.ok()`. A drop that fails and is ignored deletes the node
+            // row anyway, and the tenant's rows outlive the only thing that
+            // addressed them -- invisible on the board, and waiting under a
+            // name someone can create again. Failing the delete leaves a node
+            // the operator can retry; succeeding quietly does not.
+            tables::drop(conn, &node.name)?;
         }
     }
     // Wires, agent_state, messages, tokens and logs all cascade via the schema.
@@ -295,14 +300,31 @@ pub fn update_with(
 ) -> Result<(), BoardError> {
     wheel_core::validate_config_with(&node.config, allow_hosts)?;
 
-    // `t_<name>` is derived from the node name, so a rename that did not carry
-    // the table would leave every row unreachable from the new address.
-    if let NodeConfig::Table(_) = &node.config {
-        let previous = get(conn, node.id).ok().flatten().map(|n| n.name);
-        if let Some(old_name) = previous.filter(|p| p != &node.name) {
-            tables::rename(conn, &old_name, &node.name)
+    // `t_<name>` is a table of its own, so it has to follow the node through
+    // every shape the node can change into. A rename that did not carry the
+    // table would leave every row unreachable from the new address; a node
+    // that stops being a table and is not dropped leaves the rows behind with
+    // nothing on the board addressing them -- and then the next table node to
+    // claim that name inherits a stranger's data.
+    let was = get(conn, node.id).ok().flatten();
+    let was_table = was
+        .as_ref()
+        .filter(|n| matches!(n.config, NodeConfig::Table(_)))
+        .map(|n| n.name.clone());
+    match (&was_table, &node.config) {
+        (Some(old_name), NodeConfig::Table(_)) if old_name != &node.name => {
+            tables::rename(conn, old_name, &node.name)
                 .map_err(|e| BoardError::Storage(e.to_string()))?;
         }
+        (Some(old_name), c) if !matches!(c, NodeConfig::Table(_)) => {
+            tables::drop(conn, old_name).map_err(|e| BoardError::Storage(e.to_string()))?;
+        }
+        (None, NodeConfig::Table(cfg)) => {
+            wheel_core::validate_table_name(node.name.as_str())
+                .map_err(|e| BoardError::Storage(e.to_string()))?;
+            tables::create(conn, &node.name, cfg).map_err(|e| BoardError::Storage(e.to_string()))?;
+        }
+        _ => {}
     }
 
     let (ty, cfg) = split_config(&node.config);
@@ -431,6 +453,127 @@ mod tests {
                 markdown: "hello".into(),
             }),
         )
+    }
+
+    fn table(name: &str, columns: &[&str]) -> Node {
+        node(
+            name,
+            NodeConfig::Table(TableConfig {
+                columns: columns
+                    .iter()
+                    .map(|c| Column {
+                        name: Ident::new(*c).unwrap(),
+                        column_type: ColumnType::Text,
+                    })
+                    .collect(),
+            }),
+        )
+    }
+
+    fn table_cfg(n: &Node) -> &TableConfig {
+        match &n.config {
+            NodeConfig::Table(c) => c,
+            _ => unreachable!(),
+        }
+    }
+
+    /// A table node's rows must not outlive it, and a new node that reuses the
+    /// name must get a table built from ITS config -- not adopt what was
+    /// there.
+    ///
+    /// The route matters: deleting a table node has always dropped its table,
+    /// so a delete-then-recreate test passes whether or not the adoption bug
+    /// is present (mine did, and I only found that by putting the bug back).
+    /// The table outlives its node when the node stops BEING a table --
+    /// `PATCH /v1/nodes/:id` with a config of another type -- after which the
+    /// delete no longer recognises it as one.
+    #[test]
+    fn a_reused_table_name_does_not_inherit_the_previous_nodes_data_or_columns() {
+        let c = mem();
+
+        let mut first = table("ledger", &["amount"]);
+        create(&c, &first).unwrap();
+        tables::put_row(
+            &c,
+            &first.name,
+            table_cfg(&first),
+            "r1",
+            &serde_json::json!({ "amount": "40000" }),
+        )
+        .unwrap();
+        // Positive control: the assertions below say nothing unless there was
+        // something to inherit.
+        assert_eq!(
+            tables::list_rows(&c, &first.name, table_cfg(&first), 10, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        first.config = NodeConfig::Ctx(CtxConfig {
+            markdown: "not a table any more".into(),
+        });
+        update(&c, &first).unwrap();
+        assert!(delete(&c, first.id).unwrap());
+
+        let second = table("ledger", &["note"]);
+        create(&c, &second).unwrap();
+
+        // (1) The new node's table is empty. The operator did not write those
+        // rows and must not be shown them.
+        assert!(
+            tables::list_rows(&c, &second.name, table_cfg(&second), 10, 0)
+                .unwrap()
+                .is_empty(),
+            "the new node inherited the previous node's rows"
+        );
+
+        // (2) And it is THIS node's schema. A table rebuilt from a default
+        // shape would pass (1) and fail here, which is what makes (1) alone
+        // an unreliable gate.
+        tables::put_row(
+            &c,
+            &second.name,
+            table_cfg(&second),
+            "r1",
+            &serde_json::json!({ "note": "fresh" }),
+        )
+        .expect("the rebuilt table must accept the node's configured columns");
+        assert_eq!(
+            tables::list_rows(&c, &second.name, table_cfg(&second), 10, 0).unwrap(),
+            vec![serde_json::json!({ "key": "r1", "note": "fresh" })]
+        );
+    }
+
+    /// The same orphaning route, stated as its own property: a node that stops
+    /// being a table takes its rows with it.
+    #[test]
+    fn a_node_that_stops_being_a_table_drops_its_rows() {
+        let c = mem();
+        let mut n = table("ledger", &["amount"]);
+        create(&c, &n).unwrap();
+        tables::put_row(
+            &c,
+            &n.name,
+            table_cfg(&n),
+            "r1",
+            &serde_json::json!({ "amount": "40000" }),
+        )
+        .unwrap();
+
+        n.config = NodeConfig::Ctx(CtxConfig {
+            markdown: "not a table any more".into(),
+        });
+        update(&c, &n).unwrap();
+
+        let surviving: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='t_ledger'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving, 0, "t_ledger outlived the table node");
     }
 
     #[test]

@@ -67,10 +67,23 @@ fn column_names(cfg: &TableConfig) -> Vec<String> {
     cfg.columns.iter().map(|c| c.name.to_string()).collect()
 }
 
-/// `CREATE TABLE t_<name> (key TEXT PRIMARY KEY, ...)`, idempotently.
+/// `CREATE TABLE t_<name> (key TEXT PRIMARY KEY, ...)` from the node's config.
+///
+/// Reached only when a table node row has just been inserted, so the table it
+/// backs is new by definition and starts empty. It used to be
+/// `CREATE TABLE IF NOT EXISTS`, which read as harmless idempotence and was
+/// an adoption hazard: if a `t_<name>` survived an earlier node of the same
+/// name -- a delete whose drop failed, which [`super::board::delete`] used to
+/// swallow -- the new node silently inherited the old rows AND the old
+/// columns. The operator sees data they never wrote in a node they just made,
+/// and a write of their CONFIGURED columns fails with "no such column".
+///
+/// So the name is claimed rather than adopted: whatever is there is replaced
+/// by a table built from this config.
 pub fn create(conn: &Connection, name: &NodeName, cfg: &TableConfig) -> Result<()> {
     let table = table_name(name)?;
-    let mut ddl = format!("CREATE TABLE IF NOT EXISTS {table} (\n  {KEY_COLUMN} TEXT PRIMARY KEY");
+    drop(conn, name)?;
+    let mut ddl = format!("CREATE TABLE {table} (\n  {KEY_COLUMN} TEXT PRIMARY KEY");
     for c in &cfg.columns {
         // `c.name` is an `Ident`: [a-z0-9_] only, so it cannot close the
         // identifier or introduce a second statement.
@@ -517,6 +530,43 @@ fn untyped(v: ValueRef<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// `create` builds from the config it is given, over anything already
+    /// standing at that name.
+    ///
+    /// With the orphaning route closed in `board::update` nothing SHOULD ever
+    /// be standing there, which is precisely why this is tested here: the
+    /// board-level test cannot reach this line any more, and an untested belt
+    /// is a belt that quietly rots back into `CREATE TABLE IF NOT EXISTS`.
+    #[test]
+    fn create_claims_the_name_rather_than_adopting_what_is_there() {
+        let conn = crate::db::open_memory().unwrap();
+        let name = NodeName::new("ledger").unwrap();
+        let old = wheel_core::TableConfig {
+            columns: vec![wheel_core::Column {
+                name: wheel_core::Ident::new("amount").unwrap(),
+                column_type: wheel_core::ColumnType::Text,
+            }],
+        };
+        create(&conn, &name, &old).unwrap();
+        put_row(&conn, &name, &old, "r1", &serde_json::json!({"amount":"40000"})).unwrap();
+
+        let new = wheel_core::TableConfig {
+            columns: vec![wheel_core::Column {
+                name: wheel_core::Ident::new("note").unwrap(),
+                column_type: wheel_core::ColumnType::Text,
+            }],
+        };
+        create(&conn, &name, &new).unwrap();
+
+        assert!(
+            list_rows(&conn, &name, &new, 10, 0).unwrap().is_empty(),
+            "the rows of the table that was there were adopted"
+        );
+        put_row(&conn, &name, &new, "r1", &serde_json::json!({"note":"fresh"}))
+            .expect("the rebuilt table must accept the configured columns");
+    }
     use wheel_core::{Column, ColumnType, TableConfig};
 
     pub(super) fn cfg() -> TableConfig {
