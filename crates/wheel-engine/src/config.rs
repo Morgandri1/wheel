@@ -103,6 +103,23 @@ impl Config {
     pub fn creds_dir(&self) -> PathBuf {
         self.data_dir.join("creds")
     }
+    /// An agent's working copy, per §3e: `/data/projects/<id>/ws/<name>`,
+    /// which is what `data_dir` already is inside the sandbox.
+    ///
+    /// The child's cwd used to be `data_dir` itself, whose child is `creds/`,
+    /// so every agent ran with its working directory set to the PARENT of
+    /// every node's credential store. `ls .` enumerated them, and anything the
+    /// agent wrote — a clone, a build artifact, a stray tempfile — landed in
+    /// the same tree as the secrets. One did: a `target/` directory next to
+    /// the credential dirs filled the production volume.
+    ///
+    /// This moves where an agent writes. It is NOT the isolation boundary:
+    /// nothing here stops an agent reading `/data/creds`, because today every
+    /// child runs as the same uid. That is §2's per-node uid work and it is
+    /// still a known gap.
+    pub fn workspace_dir(&self, node_name: &str) -> PathBuf {
+        self.data_dir.join("ws").join(node_name)
+    }
     /// Per-node runtime dir holding the 0600 token file and the prompt file —
     /// neither may ever go on a command line or into the environment.
     pub fn node_run_dir(&self, node: uuid::Uuid) -> PathBuf {

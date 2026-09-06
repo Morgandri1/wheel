@@ -39,6 +39,51 @@ use crate::{
 /// for a CLI's error banner, small enough that a runaway child cannot grow it.
 const STARTUP_OUTPUT_TAIL: usize = 8 * 1024;
 
+/// The last few KiB of a child's stdout, kept to explain why it died.
+///
+/// Whole LINES, not bytes. It was a `String` trimmed with
+/// `tail.drain(..drop_to)` where `drop_to` came from arithmetic on lengths --
+/// and draining a `String` at an index that is not a character boundary
+/// panics. That is the same defect as the envelope escaper, one layer down and
+/// with a worse blast radius: it runs on the supervisor's stdout reader, so a
+/// child whose output happens to put a multi-byte character at the cut loses
+/// its start with nothing in the log to say why. Our own agents write em
+/// dashes constantly.
+///
+/// Keeping lines removes the offset arithmetic rather than correcting it. The
+/// unit of this buffer was always the line -- it is stdout being read
+/// line-by-line -- and reasoning about it in bytes was the mistake, not the
+/// particular index.
+#[derive(Default)]
+struct StartupTail {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl StartupTail {
+    fn push(&mut self, line: String) {
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        // Drop whole lines until it fits. A single line longer than the whole
+        // budget leaves one line: an over-long banner is still the best
+        // evidence we have of why the child died.
+        while self.bytes > STARTUP_OUTPUT_TAIL && self.lines.len() > 1 {
+            if let Some(dropped) = self.lines.pop_front() {
+                self.bytes -= dropped.len() + 1;
+            }
+        }
+    }
+
+    fn into_string(self) -> String {
+        let mut out = String::with_capacity(self.bytes);
+        for line in self.lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 mod prompt;
 pub use prompt::compose_prompt;
 
@@ -383,6 +428,16 @@ impl Supervisor {
 
         let run_dir = self.cfg.node_run_dir(agent);
         std::fs::create_dir_all(&run_dir)?;
+        // The agent's own working copy (§3e), not the data root. See
+        // `Config::workspace_dir` for what this does and does not fix.
+        let workspace = self.cfg.workspace_dir(node.name.as_str());
+        std::fs::create_dir_all(&workspace).with_context(|| {
+            format!(
+                "creating the workspace for {} at {}",
+                node.name,
+                workspace.display()
+            )
+        })?;
         let config_dir = self.cfg.creds_dir().join(agent.to_string());
         std::fs::create_dir_all(&config_dir)?;
 
@@ -419,7 +474,7 @@ impl Supervisor {
             mcp_config: Some(mcp_config),
             resume,
             config_dir,
-            cwd: self.cfg.data_dir.clone(),
+            cwd: workspace,
         };
 
         self.set_status(agent, AgentStatus::Starting, None);
@@ -595,7 +650,7 @@ impl Supervisor {
             // The real CLI reports "Not logged in" on stdout, so the reaper
             // needs this text to classify. Bounded: a chatty child must not be
             // able to grow this without limit.
-            let mut tail = String::new();
+            let mut tail = StartupTail::default();
             // Whether a session ever started. A child that initialised and
             // later exited did not FAIL to start, whatever it printed on the
             // way — that distinction is what stops a normal shutdown after a
@@ -607,12 +662,7 @@ impl Supervisor {
                 // protection only: an agent that can read a value can also
                 // transform it past this.
                 let line = crate::vault::redact(&line, &secrets);
-                if tail.len() + line.len() + 1 > STARTUP_OUTPUT_TAIL {
-                    let drop_to = tail.len().min(line.len() + 1);
-                    tail.drain(..drop_to);
-                }
-                tail.push_str(&line);
-                tail.push('\n');
+                tail.push(line.clone());
                 let event = harness.parse_line(&line);
                 match event {
                     HarnessEvent::Init { session_id } => {
@@ -747,8 +797,15 @@ impl Supervisor {
             }
 
             // stdout closed: the child is gone. Reap it.
-            self.reap(agent, slot, stderr_done, run_id, tail, initialised)
-                .await;
+            self.reap(
+                agent,
+                slot,
+                stderr_done,
+                run_id,
+                tail.into_string(),
+                initialised,
+            )
+            .await;
         });
     }
 
@@ -1622,6 +1679,99 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA's WOW-workspace-not-in-creds. The agent's working directory was
+    /// `data_dir`, and `creds/` is a child of it — so every agent ran with its
+    /// cwd set to the PARENT of every node's credential store.
+    ///
+    /// The assertion is the RELATIONSHIP, not the path. A future edit that
+    /// moves the workspace somewhere else is fine; one that puts it back above
+    /// the credentials is not, and a literal path comparison would not know
+    /// the difference.
+    #[tokio::test]
+    async fn an_agents_working_directory_does_not_contain_the_credential_store() {
+        let (sup, id, dir) = shim_supervisor("ws-not-creds", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+
+        let env = std::fs::read_to_string(&dumped).unwrap();
+        let cwd = env
+            .lines()
+            .find_map(|l| l.strip_prefix("PWD="))
+            .map(std::path::PathBuf::from)
+            .expect("the child reported no working directory");
+        // Canonicalised, because the shell reports a RESOLVED path and
+        // `temp_dir()` on macOS is `/var/...` symlinked to `/private/var/...`.
+        // Comparing the two spellings made this assertion unfalsifiable: it
+        // passed with the bug deliberately restored, which is the only reason
+        // I found it.
+        let real =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let cwd = real(&cwd);
+        let creds = real(&sup.cfg.creds_dir());
+
+        assert!(
+            !creds.starts_with(&cwd),
+            "the agent's cwd {} contains the credential store {} — `ls .` enumerates \
+             every node's credentials, and anything the agent writes lands beside them",
+            cwd.display(),
+            creds.display()
+        );
+        assert_ne!(
+            cwd,
+            real(&sup.cfg.data_dir),
+            "the data root is not a working copy"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The startup tail is trimmed by whole lines, so no arithmetic can land
+    /// an index inside a character.
+    ///
+    /// The old buffer drained a `String` at a byte offset computed from
+    /// lengths, which panics off a character boundary — the same defect as the
+    /// envelope escaper, on the supervisor's stdout reader. QA found it by
+    /// grepping the class rather than the instance, which is the right way to
+    /// have found the second one.
+    #[test]
+    fn the_startup_tail_survives_multibyte_output_at_every_alignment() {
+        // Each line carries a multi-byte character, and the lines are of every
+        // length across a character width, so the old byte cut would have
+        // landed inside one. The offset is the variable; the presence of
+        // unicode is not.
+        for pad in 0..8 {
+            let mut tail = StartupTail::default();
+            for i in 0..4_000 {
+                tail.push(format!("{}\u{2014} line {i} \u{1f600}", "x".repeat(pad)));
+            }
+            let out = tail.into_string();
+            assert!(
+                out.len() <= STARTUP_OUTPUT_TAIL + 64,
+                "the tail grew to {} bytes at pad {pad}",
+                out.len()
+            );
+            assert!(out.contains('\u{2014}'), "multibyte content was mangled");
+            assert!(
+                out.contains("line 3999"),
+                "the tail must keep the LAST output, which is what says why it died"
+            );
+        }
+    }
+
+    /// One line longer than the whole budget is still kept: an over-long error
+    /// banner is the best evidence there is of why a child died, and dropping
+    /// it to respect a byte ceiling would discard exactly the thing the buffer
+    /// exists for.
+    #[test]
+    fn a_single_over_long_line_is_kept_rather_than_dropped() {
+        let mut tail = StartupTail::default();
+        tail.push("\u{2014}".repeat(STARTUP_OUTPUT_TAIL));
+        let out = tail.into_string();
+        assert!(!out.is_empty(), "the only line was discarded");
+        assert!(out.contains('\u{2014}'));
     }
 
     /// A harness that records the environment it was actually given.
