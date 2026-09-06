@@ -89,15 +89,40 @@ container image" — see the note at the top of this file for exactly what that 
   INTRA-project half of F007 (every node in ONE project sharing a uid) needed no such image — I found it live,
   today, on the actual wheel-dev board this team runs on, with a real leaked GitHub PAT as the concrete proof.
   See `036-live-same-uid-credential-exposure-wheel-dev.md`. Reported to PM immediately on discovery.
-- **Finding 031 (endpoint/ingress bearer design):** a DESIGN review, since accepted by PM in full
-  (`4c2b631`) — SDK builds to it. Once the endpoint handler + ingress→agent delivery land, VERIFY #0
+- **Finding 031 (endpoint/ingress bearer design):** still just a DESIGN review, accepted by PM in full
+  (`4c2b631`) — grepped for it, no `ingress`/`endpoint` handler exists anywhere in `wheel-engine/src` yet, so
+  there is nothing to verify live. Once the endpoint handler + ingress→agent delivery land, VERIFY #0
   (Authorization/Cookie stripped from forwarded headers), constant-time bearer + indistinguishable 401/404,
   body-size cap, and #4 (ingress body is a prompt-injection channel).
-- **Importer YAML-bomb (023):** grounded in source (serde_yaml 0.9, no size cap); confirm with a bounded
-  serde_yaml harness or the live `POST /v1/tools/import` once a body cap exists.
-- **034/035 (poison-pill / internet-to-dead-board chain):** landed by a parallel session this same day: worth a
-  successor reading those two finding files before touching sqlite/journal-mode or the ingress→envelope path —
-  a lot of P0-outage context sits there that isn't repeated here.
+- **037 (single-uid blast radius, companion to 036)** — verified its crown-jewel claim myself: grepped
+  `config.rs` for where `ENV_ENGINE_SECRET`/`ENV_VAULT_KEY` are read (`:71`, `:86`, plain `std::env::var`) and
+  for every `remove_var` in `wheel-engine` (only the test helper and the CHILD-spawn scrubbing in
+  `supervisor/mod.rs:1568` — neither touches the ENGINE's own environ). So both secrets do sit in
+  `/proc/<engine-pid>/environ` for the engine's whole life, exactly as 037 claims. The interim fix it names
+  (`remove_var` right after `Config::from_env` reads them) is a one-liner, independent of per-node-uid scope —
+  flagged to PM as worth prioritizing on its own.
+
+## RE-VERIFIED, second pass this same day — 034 (both) and 035 fully fixed
+1. **034 poison-pill (`escape_envelope_body` byte-slice panic)** — FIXED. `message.rs`'s escaper now walks
+   `body.as_bytes()` and slices the byte array, never the `&str` — a byte slice cannot land mid-character, so
+   the whole class (an em dash or any multi-byte char landing on the old computed offset) is gone by
+   construction, not by patching the one instance that took the board down. Ran
+   `cargo test -p wheel-core --test envelope`: **18/18 pass**, including
+   `the_body_that_took_the_board_offline_escapes_instead_of_panicking` and
+   `no_stored_body_can_stop_the_engine_from_starting` — direct regression coverage for the actual incident.
+2. **034 (the OTHER 034 — engine journal-mode proven by read-back, not a write)** — FIXED by consolidation, not
+   a patch to the old function. `wheel-engine/src/db/mod.rs` no longer has its own `set_journal_mode`; it now
+   calls `wheel_sqlite::open_configured`/`configure_journal` — the SAME shared crate the host store uses, whose
+   `mode_holds` requires `current_journal_mode == wanted` **AND** `BEGIN IMMEDIATE; COMMIT` to actually succeed
+   (`wheel-sqlite/src/lib.rs:150-154`). One journal implementation for both binaries now, proven by a write.
+3. **035 (chain: message → poison → panic → permanently dead board)** — closed at its single sink (the escaper
+   in #1), so every link PM/my twin traced (agent-sendable today, internet-reachable once ingress lands) is
+   moot regardless of entry point: the panic that made the message "poison" can't happen anymore. Worth
+   re-confirming once ingress actually lands that no OTHER re-parse path was left un-fixed, but the shared sink
+   being fixed is the strong form of closing this.
+4. **032 (host boot availability)** — a design review already concluding "poison-project grid-DoS DEFEATED by
+   design," residual = the accepted single-host SPOF. I read it; nothing to add or re-verify, it's already a
+   concluded review rather than an open item.
 
 ## Standing rules a successor must keep enforcing
 - **42137cd**: the trust boundary is NEVER widened for test convenience (WHEEL_FAKE_* → config file;
