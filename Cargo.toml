@@ -16,3 +16,15 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Agents build Wheel inside a 4.6 GB volume, and debug info is most of what a
+# target directory weighs -- 1.4 GB of the 1.7 GB measured here. Line tables keep
+# backtraces useful and drop the rest; incremental state is another 567 MB that
+# buys nothing for a from-clean build.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
