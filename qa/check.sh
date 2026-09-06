@@ -165,6 +165,8 @@ step "qa:route-parity" "$PY" qa/contract/route_parity.py
 # direction only: a planned ID with no test yet is normal (half the plan is M2/M3).
 step "qa:id-traceability" "$PY" qa/contract/id_traceability.py
 
+step "qa:suite-isolation" "$PY" qa/contract/suite_isolation.py
+
 # A broken workflow file means CI never runs, which reads as "no red" not "no verdict".
 step "qa:ci-lint"      "$PY" qa/contract/ci_workflow_lint.py
 

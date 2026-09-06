@@ -27,7 +27,7 @@ ENVELOPE_CLOSE = "</AgentPrompt>"
 # services being up, and would report their outage as a message-path failure. The proxy
 # path is already covered by API-proxy-auth. Set WHEEL_VIA_API=1 to exercise the chain.
 VIA_API = os.environ.get("WHEEL_VIA_API") == "1"
-DIRECT_PORT = int(os.environ.get("WHEEL_ENGINE_PORT", "17412"))
+DIRECT_PORT = int(os.environ.get("WHEEL_MESSAGES_PORT", "17427"))
 DIRECT_BASE = "http://127.0.0.1:%d" % DIRECT_PORT
 DIRECT_SECRET = "qa-msgpath-secret-at-least-16"
 DIRECT_NAME = "qa-engine-msgpath"

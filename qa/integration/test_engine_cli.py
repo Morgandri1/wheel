@@ -23,7 +23,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 FIXTURE = os.path.join(ROOT, "qa", "fixtures", "envelope-integrity.bin")
 
 NAME = "wheel-qa-cli"
-PORT = int(os.environ.get("WHEEL_CLI_PORT", "17414"))
+PORT = int(os.environ.get("WHEEL_CLI_PORT", "17421"))
 SECRET = "qa-cli-secret-0123456789abcdef"
 BASE = "http://127.0.0.1:%d" % PORT
 IMAGE = "wheel-engine:test"

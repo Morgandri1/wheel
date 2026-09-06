@@ -269,6 +269,25 @@ token is wrong.
 | `AUTH-cred-config-dir` | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are set per node, so two agents never share a credential store. | **S1** |
 | `SEC-no-secret-in-argv` | No credential appears in the child's argv — argv is world-readable across uids (§5b). Asserted from the dump's own record of argv. | **S1** |
 
+### 7b-i. The child's environment is the engine's, minus everything (ADVERSARY F015)
+
+The engine holds `WHEEL_ENGINE_SECRET` (authority over the whole board) and `WHEEL_VAULT_KEY`
+(decrypts every vault in the project, wired or not). Both were inherited by every agent child
+until `5b74640`; a process can always read its own `/proc/self/environ`, so this was full
+board compromise from any agent, and no uid separation would have helped.
+
+SDK's unit test asserts the two names are absent from the spawn spec. These assert the same
+property from **inside a real child in a real container** — the environment the kernel actually
+handed it — and add the case a name check cannot reach.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `SEC-child-env-no-wheel-engine-secret` | `WHEEL_ENGINE_SECRET` is absent from a spawned child's environment. | **S1** |
+| `SEC-child-env-no-wheel-vault-key` | `WHEEL_VAULT_KEY` is absent from a spawned child's environment. | **S1** |
+| `SEC-child-env-no-secret-under-any-name` | Neither secret's **value** appears under *any* variable name, found by sha256 rather than by name. `env_clear()` plus an allowlist is exactly the shape where a secret can come back under a new name, and a name-based check would pass. | **S1** |
+| `SEC-child-env-keeps-essentials` | `PATH`, `WHEEL_NODE` and `WHEEL_TOKEN_FILE` are still present — an over-aggressive `env_clear()` breaks every agent while passing every leak assertion above it. | S2 |
+| `SEC-child-env/sentinel-works` | **Positive control.** A vault value the agent *is* wired to is located by the same digest search. Gates the two assertions above: if this is skipped or red, they report `skip`, never green — an absence found by a broken search is not evidence. | S2 |
+
 ---
 
 ## 6. CLI — the `wheel` binary (§3c)
@@ -404,6 +423,53 @@ what it set.
 |---|---|---|
 | `AUTH-cred-setup` | A token beginning `sk-ant-oat` reaches the child as `CLAUDE_CODE_OAUTH_TOKEN` and in no other variable. | **S1** |
 | `AUTH-cred-key-spawn` | Any other credential reaches the child as `ANTHROPIC_API_KEY` (codex: `CODEX_API_KEY`, never `OPENAI_API_KEY`, which codex ignores for auth). The value itself never appears in the dump, on argv, or in a log. | **S1** |
+
+### 7c. SEC-child-env — a child must not inherit the engine's own secrets (F015)
+
+The engine holds `WHEEL_ENGINE_SECRET` (the control-plane bearer — authority over the whole
+board, including `PUT /v1/vault`) and `WHEEL_VAULT_KEY` (which decrypts every vault in the
+project, wired or not). Agents are untrusted code (§2) and a process can always read its own
+environment, so inheriting either makes the entire wire matrix decorative. Fixed in `5b74640`
+by `env_clear()` plus a short allowlist; asserted here from inside a real child, against the
+environment the kernel actually handed it.
+
+Every criterion below is an *absence*, which is also what a suite reports when pointed at
+nothing at all — so `SEC-child-env/sentinel-works` is a gating positive control: it locates a
+secret that is SUPPOSED to be in the child (a vault value the agent is wired to) by the same
+digest mechanism. If the control fails, the absences are reported as skipped, not passed.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `SEC-child-env/spawned` | A child actually started and produced a record; without one, nothing below is evidence. | gate |
+| `SEC-child-env/sentinel-works` | A secret known to be present IS found by the digest search — proving the search works. | gate |
+| `SEC-child-env-no-wheel-engine-secret` | `WHEEL_ENGINE_SECRET` is absent from the child's environment. | **S1** |
+| `SEC-child-env-no-wheel-vault-key` | `WHEEL_VAULT_KEY` is absent from the child's environment. | **S1** |
+| `SEC-child-env-no-secret-under-any-name` | Neither value is present under **any** variable name — the case a name check cannot reach, and the shape a refactor of the allowlist would produce. | **S1** |
+| `SEC-child-env-keeps-essentials` | The allowlist still passes what a harness needs to run (`PATH`, locale, CA bundle); security that breaks the product is not a fix. | S2 |
+
+### 7d. AUTH-paste — the paste-code OAuth flow (§4)
+
+`claude` uses paste_code: the engine spawns `auth login --claudeai`, scrapes the authorize URL
+off its stdout, and holds the child open until the user pastes the code back. The 15-minute TTL
+reap is covered at unit level by SDK (`oauth.rs`, `LoginSessions::ttl` is settable only from
+Rust); what is covered end to end here is the reaping path a user actually reaches — clicking
+"sign in" twice.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-paste-begin` | `POST /v1/agents/:id/auth/begin` succeeds. | S2 |
+| `AUTH-paste-mode` | It reports `mode: "paste_code"` for a claude agent — distinct from codex's `device_code` (§4). | S2 |
+| `AUTH-paste-url` | It returns an `https://` authorize URL. | S2 |
+| `AUTH-paste-url-intact` | The URL keeps its `state` and PKCE `code_challenge` and picks up **no** surrounding prose. A URL truncated by the scanner fails only later, in the browser, as an opaque "invalid state". | **S1** |
+| `AUTH-paste-child` | Exactly one `auth login` child exists after begin. | S3 |
+| `AUTH-paste-url-fresh` | A retry issues a **new** URL rather than replaying the abandoned login's state. | S2 |
+| `AUTH-paste-supersede` | A second `begin` leaves exactly one child: an abandoned login does not leak a process per retry. | S2 |
+| `AUTH-paste-wrong-code` | A wrong pasted code is rejected (≥400)… | **S1** |
+| `AUTH-paste-wrong-code/state` | …and the agent does **not** report `authenticated` afterwards — no half-authenticated state. | **S1** |
+| `AUTH-paste-complete` | The correct code completes the login… | S2 |
+| `AUTH-paste-complete/state` | …and `GET /v1/agents/:id/auth` then reports `authenticated: true`. | S2 |
+| `AUTH-paste-reaped` | A completed login leaves no `auth login` child behind. | S3 |
+| `AUTH-paste-no-code-in-log` | The pasted code never appears in the agent log. | **S1** |
 
 ---
 

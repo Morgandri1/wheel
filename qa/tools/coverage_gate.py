@@ -32,6 +32,19 @@ def main():
     # target-dir, so <repo>/target may not exist and llvm-cov fails to create the report.
     tmp = tempfile.mkdtemp(prefix="wheel-cov-")
     out = os.path.join(tmp, "qa-coverage.json")
+
+    # A PRIVATE target dir for the instrumented build.
+    #
+    # ~/.cargo/config.toml points every worktree at one shared target-dir so six agents
+    # do not each rebuild the world. That is right for building and wrong for measuring:
+    # llvm-cov reads the profile data it finds there, which includes objects built from
+    # another worktree's copy of the same crate. It reported validate.rs at 0% while the
+    # file was 97% covered, and dragged wheel-core's total to 4.85% -- every per-crate
+    # number in BUG-006 was measured against a mixture of six checkouts.
+    #
+    # Slower (this build is not shared with anyone), and the only way the number means
+    # anything.
+    env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(tmp, "target"))
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
          # PM-approved, requested by API, owned here rather than in their crates so the
@@ -40,7 +53,7 @@ def main():
          # serve). If logic lands in one, the fix is to move the logic into a covered
          # module — NOT to widen this regex.
          "--ignore-filename-regex", r"(^|/)main\.rs$"],
-        cwd=ROOT, capture_output=True, text=True)
+        cwd=ROOT, env=env, capture_output=True, text=True)
     if r.returncode in (137, -9):
         # SIGKILL: the instrumented build was OOM-killed, not a coverage failure.
         # Reporting this as "below the bar" would be a lie, and reporting it as a pass
@@ -59,12 +72,21 @@ def main():
     shutil.rmtree(tmp, ignore_errors=True)
 
     # Sum per crate from per-file line counts; a crate is crates/<name>/...
+    #
+    # Scoped to THIS worktree. "contains /crates/" matches
+    # /Users/metatron/wheel-wt/<other-role>/crates/... just as happily as our own, so an
+    # unscoped filter sums one crate's lines across every checkout on the machine.
+    root = os.path.realpath(ROOT) + os.sep
     per = collections.defaultdict(lambda: [0, 0])   # crate -> [covered, total]
+    foreign = 0
     for export in data.get("data", []):
         for fl in export.get("files", []):
             path = fl.get("filename", "")
             marker = os.sep + "crates" + os.sep
             if marker not in path:
+                continue
+            if not os.path.realpath(path).startswith(root):
+                foreign += 1
                 continue
             crate = path.split(marker, 1)[1].split(os.sep, 1)[0]
             s = fl.get("summary", {}).get("lines", {})
@@ -72,8 +94,13 @@ def main():
             per[crate][1] += s.get("count", 0)
 
     if not per:
-        print("no crate coverage data found — is the workspace empty?")
+        # Never "0% coverage": a report with no files from this worktree is a broken
+        # measurement, and the honest answer is that the gate did not run.
+        print("no crate coverage data from %s (%d file(s) came from other worktrees) — "
+              "the report does not describe this checkout" % (ROOT, foreign))
         return SKIP
+    if foreign:
+        print("note: ignored %d instrumented file(s) from other worktrees" % foreign)
 
     fails, exempted = [], []
     print("per-crate line coverage (bar: %.0f%%)" % MIN)
