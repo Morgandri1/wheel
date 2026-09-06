@@ -49,26 +49,64 @@ pub struct HostState {
 /// mid-reconcile sees a host that has forgotten them. So liveness is immediate and project routes
 /// are 503 until reconcile finishes.
 #[derive(Clone)]
-pub struct Readiness(Arc<std::sync::atomic::AtomicBool>);
+pub struct Readiness {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    /// Projects restored so far, and how many there are to restore.
+    ///
+    /// Not decoration. While the host is closed, every project route answers the same 503, so a
+    /// host working through fourteen sandboxes and a host wedged on the first one are the same
+    /// response — and that ambiguity is what made an outage take an afternoon to read. These
+    /// numbers move, so "slow" and "stuck" stop looking alike.
+    restored: Arc<std::sync::atomic::AtomicUsize>,
+    to_restore: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl Readiness {
     /// For a host whose projects are already accounted for: an embedder that reconciled before
     /// building it, or a test with nothing to reconcile.
     pub fn serving_from_start() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        Self::new(true)
     }
 
     /// For a host that will reconcile behind its own listener, and calls `open` when it has.
     pub fn serving_after_reconcile() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self::new(false)
+    }
+
+    fn new(open: bool) -> Self {
+        Self {
+            open: Arc::new(std::sync::atomic::AtomicBool::new(open)),
+            restored: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            to_restore: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     pub fn open(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn is_open(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.open.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many projects this reconcile has to get through.
+    pub fn expect(&self, total: usize) {
+        self.to_restore
+            .store(total, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One more project settled, whether it came up or failed.
+    pub fn advanced(&self) {
+        self.restored
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// (restored, to restore).
+    pub fn progress(&self) -> (usize, usize) {
+        (
+            self.restored.load(std::sync::atomic::Ordering::SeqCst),
+            self.to_restore.load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 }
 
@@ -125,33 +163,63 @@ pub async fn reconcile_on_boot(state: &HostState) {
             return;
         }
     };
-    tracing::info!(
-        count = wanted.len(),
-        "reconciling projects that were running"
-    );
+    let total = wanted.len();
+    state.ready.expect(total);
+    tracing::info!(count = total, "reconciling projects that were running");
+    let began = std::time::Instant::now();
+
+    // Concurrently, and bounded. Serially, each project waits up to start_timeout_secs for its
+    // engine to answer, so fourteen of them outlast any platform's health-check window and the host
+    // is stopped for being slow — which is how a slow host became indistinguishable from a dead
+    // one. Bounded because the other failure is real too: starting fifty engines at once on one
+    // machine makes every one of them slow.
+    let limit = Arc::new(tokio::sync::Semaphore::new(
+        state.cfg.reconcile_concurrency.max(1),
+    ));
+    let mut tasks = tokio::task::JoinSet::new();
     for rec in wanted {
-        // Rows written before canonicalisation existed still hold an unusable spelling, and boot is
-        // the only moment we look at every project. Rewrite them now, so the next restart is clean
-        // and the engine we are about to start gets a key it can decode.
-        let vault_key = vault_key::canonical_or_passthrough(&rec.vault_key);
-        if vault_key != rec.vault_key {
-            tracing::info!(project = %rec.id, "rewriting a vault key the engine could not decode");
-            if let Err(e) = state
-                .store
-                .upsert(&rec.id, &rec.engine_secret, &vault_key)
-                .await
-            {
-                tracing::error!(project = %rec.id, error = ?e, "could not persist the corrected vault key");
-            }
+        let state = state.clone();
+        let limit = limit.clone();
+        tasks.spawn(async move {
+            let _permit = limit.acquire().await;
+            restore(&state, rec).await;
+            state.ready.advanced();
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+
+    let (restored, _) = state.ready.progress();
+    tracing::info!(
+        restored,
+        of = total,
+        elapsed_ms = began.elapsed().as_millis() as u64,
+        "reconcile finished"
+    );
+}
+
+/// Bring one project back, or say why it did not come back.
+async fn restore(state: &HostState, rec: store::ProjectRecord) {
+    // Rows written before canonicalisation existed still hold an unusable spelling, and boot is
+    // the only moment we look at every project. Rewrite them now, so the next restart is clean
+    // and the engine we are about to start gets a key it can decode.
+    let vault_key = vault_key::canonical_or_passthrough(&rec.vault_key);
+    if vault_key != rec.vault_key {
+        tracing::info!(project = %rec.id, "rewriting a vault key the engine could not decode");
+        if let Err(e) = state
+            .store
+            .upsert(&rec.id, &rec.engine_secret, &vault_key)
+            .await
+        {
+            tracing::error!(project = %rec.id, error = ?e, "could not persist the corrected vault key");
         }
-        let secrets = Secrets {
-            engine_secret: rec.engine_secret.clone(),
-            vault_key,
-        };
-        if let Err(e) = state.sandbox.start(&rec.id, &secrets).await {
-            // One project failing to come back must not stop the others.
-            tracing::error!(project = %rec.id, error = ?e, "reconcile: start failed");
-        }
+    }
+    let secrets = Secrets {
+        engine_secret: rec.engine_secret.clone(),
+        vault_key,
+    };
+    // One project failing to come back must not stop the others.
+    if let Err(e) = state.sandbox.start(&rec.id, &secrets).await {
+        tracing::error!(project = %rec.id, error = ?e, "reconcile: start failed");
     }
 }
 
@@ -476,13 +544,18 @@ async fn require_ready(
     if state.ready.is_open() {
         return next.run(req).await;
     }
+    let (restored, to_restore) = state.ready.progress();
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [("retry-after", "2")],
         Json(json!({
             "error": {
                 "code": "starting",
-                "message": "The host is still restoring projects from its last run.",
+                "message": format!(
+                    "The host is still restoring projects from its last run ({restored} of {to_restore})."
+                ),
+                "restored": restored,
+                "to_restore": to_restore,
             }
         })),
     )

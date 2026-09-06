@@ -45,6 +45,8 @@ pub struct Config {
     /// Megabytes that must be free before a project may start. Not what a build needs — what one
     /// engine needs to open its database and take a message without corrupting it.
     pub disk_floor_mb: u64,
+    /// How many projects the boot reconcile brings back at once.
+    pub reconcile_concurrency: usize,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
 }
@@ -149,6 +151,7 @@ impl Config {
             },
             reap_grace_secs: parse_or("REAP_GRACE_SECS", 5u64)?,
             disk_floor_mb: parse_or("DISK_FLOOR_MB", 256u64)?,
+            reconcile_concurrency: parse_or("RECONCILE_CONCURRENCY", 8usize)?,
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }
@@ -179,6 +182,7 @@ impl Config {
             rlimit_cpu_secs: None,
             reap_grace_secs: 5,
             disk_floor_mb: 1,
+            reconcile_concurrency: 8,
             engine_base_url: "http://127.0.0.1:7000".into(),
         }
     }

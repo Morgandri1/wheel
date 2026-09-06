@@ -93,8 +93,19 @@ QUERY="SELECT p.id, coalesce(u.email::text, ''), EXTRACT(EPOCH FROM (now() - p.c
        FROM projects p LEFT JOIN users u ON u.id::text = p.owner_id
        ORDER BY p.created_at"
 
+# A failed query must not read as an empty database. Without this the tool prints "0 projects, 0
+# candidates" and exits 0 when it cannot reach Postgres at all -- the one output that looks like a
+# clean bill of health. `set -e` does not help: the call is inside a command substitution feeding a
+# loop, so its status is discarded.
 fetch_projects() {
-    psql "$DATABASE_URL" -At -F '|' -c "$QUERY"
+    local rows status
+    rows=$(psql "$DATABASE_URL" -At -F '|' -v ON_ERROR_STOP=1 -c "$QUERY")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "could not read the projects table (psql exited $status)" >&2
+        return "$status"
+    fi
+    printf '%s\n' "$rows"
 }
 
 destroy_sandbox() {
@@ -122,6 +133,12 @@ main() {
         : "${WHEEL_HOST_SECRET:?set WHEEL_HOST_SECRET}"
     fi
 
+    local rows
+    if ! rows=$(fetch_projects); then
+        echo "refusing to continue: the project list is unknown" >&2
+        return 1
+    fi
+
     local total=0 candidates=0 deleted=0 failed=0
     local id owner age
     while IFS='|' read -r id owner age; do
@@ -143,7 +160,7 @@ main() {
             *) failed=$((failed + 1)); printf '  host said %s — row kept\n' "$code" ;;
         esac
     done <<EOF
-$(fetch_projects)
+$rows
 EOF
 
     printf '\n%d projects, %d candidates, %d deleted, %d failed%s\n' \
