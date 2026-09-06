@@ -617,3 +617,35 @@ async fn healthz_reports_the_backend_in_use() {
         "the operator needs to know which backend answered, not just that something did"
     );
 }
+
+/// The one deliberate exception to "every route requires the bearer".
+///
+/// A platform health checker cannot present the host secret. With the whole router behind the
+/// bearer, every check answered 401, Railway stopped the container, and every project create hung
+/// on an unreachable host — an outage caused by the health check that was supposed to prevent one.
+#[tokio::test]
+async fn liveness_answers_without_a_bearer_and_describes_nothing() {
+    let (app, _, _) = harness(FakeSandbox::new());
+
+    let (status, body) = call(&app, "GET", "/healthz", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], serde_json::json!(true));
+
+    // Liveness is not an information endpoint: anything that describes the host stays behind the
+    // bearer, so an unauthenticated caller learns only that a process answered.
+    let rendered = body.to_string();
+    for leak in ["sandbox_backend", "process", "docker", "projects"] {
+        assert!(
+            !rendered.contains(leak),
+            "unauthenticated liveness disclosed {leak}: {rendered}"
+        );
+    }
+}
+
+/// The detailed health endpoint keeps the bearer; only `/healthz` is exempt.
+#[tokio::test]
+async fn the_detailed_health_endpoint_is_still_bearer_gated() {
+    let (app, _, _) = harness(FakeSandbox::new());
+    let (status, _) = call(&app, "GET", "/host/v1/healthz", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

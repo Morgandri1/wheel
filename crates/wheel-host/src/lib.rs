@@ -174,6 +174,17 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Unauthenticated liveness, for the platform's health checker.
+///
+/// A platform health check cannot present the host bearer, so putting the whole router behind
+/// `require_bearer` means every check answers 401 and the platform stops the container — which is
+/// exactly what happened: the host went down and every project create hung on an unreachable host.
+/// This says only that the process is up. Anything that describes the host — backend, project
+/// counts — stays behind the bearer on `/host/v1/healthz`.
+pub async fn liveness() -> Json<serde_json::Value> {
+    Json(json!({ "ok": true }))
+}
+
 pub async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
@@ -336,5 +347,7 @@ pub fn build_router(state: HostState) -> Router {
             state.clone(),
             require_bearer,
         ))
+        // Merged AFTER the layer, so it is the one route the bearer middleware does not cover.
+        .merge(Router::new().route("/healthz", get(liveness)))
         .with_state(state)
 }
