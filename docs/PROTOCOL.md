@@ -29,6 +29,12 @@ Three authentication realms, deliberately disjoint:
 |---|---|---|---|
 | Control plane | `Authorization: Bearer <WHEEL_ENGINE_SECRET>` | per-project, held only by the host | `/v1/*` except `/v1/cli/*` |
 | CLI / agent | `Authorization: Bearer <WHEEL_TOKEN>` | per-node, rotated on every agent start | `/v1/cli/*` only |
+
+**`/v1/cli/*` is the surface an untrusted process talks to**, so it is the one most worth having written
+down. Every route below resolves the caller from its token, checks the wire, and answers `403 wire_denied`
+(exit 3 at the CLI) rather than pretending the target does not exist. `ctx/clear` takes no target because
+an agent may only clear its OWN context: one that could clear a peer's could erase what that peer was told
+without leaving a trace in either transcript.
 | Ingress | none | — | `/ingress/*` only |
 
 **The engine secret is never in a child process's environment.** A node token identifies exactly one node and is
@@ -141,6 +147,20 @@ time.
 PUT    /v1/vault/:id/:key   {value}   → {key, stored: true}   write-only
 DELETE /v1/vault/:id/:key             → 204
 GET    /v1/vault/:id                  → {keys: [...]}         NAMES only
+GET    /v1/cli/whoami                      → {name, id, type, position, wires}
+GET    /v1/cli/connections                 → {wires: [{peer, type, outgoing, semantics}]}
+GET    /v1/cli/list                        → {agents: [{name, status, session_id, hosted_on}]}
+GET    /v1/cli/ls[?node=<n>&prefix=<p>]    → {keyspaces} with no node, else {keys}
+GET    /v1/cli/read?addr=<node>[/<row>]    → ctx markdown / table row / chest blob
+POST   /v1/cli/write   {addr, value}       → upsert; ctx replace, table row, chest blob
+POST   /v1/cli/rm      {addr}              → {node, row, removed}
+POST   /v1/cli/query   {table, sql}        → {rows}   read-only, one table
+POST   /v1/cli/msg     {to, body, reply_to?} → {id, sha256, bytes, state}
+GET    /v1/cli/inbox[?id=<message id>]     → {messages} or one message, verbatim
+POST   /v1/cli/ctx/clear                   → {node, cleared, status}   own context only
+GET    /v1/cli/tool?node=<tool>            → {tool, operations}  agent-fill fields only
+POST   /v1/cli/tool   {node, op, args, curl?} → the call result, or the masked curl
+GET    /v1/cli/mcp/tools                   → {tools} the MCP tool list for this node
 GET    /v1/cli/secret?addr=<vault>/<key>   → {node, key, value}   wire-gated, agents
 GET    /v1/cli/secret/keys?node=<vault>    → {node, keys}         wire-gated, agents
 ```
@@ -927,3 +947,43 @@ to the validated address — a name that answers differently a moment later cann
 destination. **Every** resolved address must be public, not just the one chosen. Redirects are followed
 manually, re-checked per hop, max 3, and the body is sent on the FIRST HOP ONLY so credentials do not
 follow a redirect off-origin. 30s timeout, 5 MiB response ceiling.
+
+## MCP: the board as tools (§3c #1)
+
+The CLI is for scripts and humans. **MCP is what an LLM should use**, because a tool call is structured all
+the way down — a body passed as argv goes through a shell first, where backticks and `$(…)` are substituted
+before `wheel` ever sees it, and what arrives is silently not what was sent.
+
+Every agent is started with an MCP config written to its run directory:
+
+```jsonc
+{ "mcpServers": { "wheel": {
+    "type": "stdio", "command": "wheel", "args": ["mcp-serve"],
+    "env": { "WHEEL_TOKEN_FILE": "/data/run/<node id>/token" } } } }
+```
+
+The token is passed as a **file path**, never a value — argv is world-readable across uids (§5b).
+
+`wheel mcp-serve` speaks JSON-RPC 2.0 over stdio: `initialize`, `ping`, `tools/list`, `tools/call`. A
+notification (no `id`) is never answered. The tool LIST comes from `GET /v1/cli/mcp/tools` rather than being
+compiled in, so it reflects the caller's **current** wires — a tool node wired after the agent started
+appears without a restart.
+
+**Built-in tools**: `msg` · `read` · `write` · `rm` · `ls` · `query` · `secret_get` · `inbox` · `whoami` ·
+`connections` · `ctx_clear`. Each maps to the `/v1/cli/*` route that already implements it, so there is one
+implementation of what a tool does and nothing to drift.
+
+`run` is deliberately **absent** until script nodes exist (M2). A tool whose route returns 404 teaches a
+model that the board is unreliable, and it stops trying things that would have worked.
+
+**Tool-node operations** appear as `<tool>__<op>` (§3d rule 7), with only the agent-fill fields in the input
+schema — the same projection `GET /v1/tools/:id/ops` returns, so what the model is offered and what the
+engine accepts are the same list. Only the FIRST `__` splits node from operation.
+
+Descriptions name the nodes the caller can actually reach (`"Send a message to another agent: reviewer,
+editor"`), which is the difference between a model guessing an address and knowing one. An agent wired to
+nothing is told so plainly rather than shown a dangling list.
+
+**A denial is a tool error, not a protocol error.** A wire refusal comes back as a successful JSON-RPC
+response with `isError: true` and the engine's own message, so the model reconsiders and tries something
+else. Reported as a protocol error it would tell the harness the server is broken, and it would stop asking.

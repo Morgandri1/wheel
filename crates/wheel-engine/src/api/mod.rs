@@ -207,7 +207,13 @@ pub fn router(state: AppState) -> Router {
         .route("/msg", post(cli_routes::msg))
         .route("/inbox", get(cli_routes::inbox))
         .route("/rm", post(cli_routes::rm))
-        .route("/query", post(cli_routes::query));
+        .route("/query", post(cli_routes::query))
+        .route(
+            "/tool",
+            get(cli_routes::tool_ls).post(cli_routes::tool_call),
+        )
+        .route("/ctx/clear", post(cli_routes::ctx_clear))
+        .route("/mcp/tools", get(cli_routes::mcp_tools));
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -255,6 +261,67 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// ADVERSARY 025. `tool_ls` and `tool_call` existed, compiled, were unit
+    /// tested, and were never registered — so the operator path worked, every
+    /// test passed, and every AGENT got a 404. Nothing in the type system
+    /// notices a handler nobody routed.
+    ///
+    /// I made this mistake with a text edit that silently matched nothing, and
+    /// then read a grep that returned empty and carried on. This is the check
+    /// that would have caught both.
+    #[test]
+    fn every_cli_handler_is_actually_routed() {
+        let handlers = include_str!("cli_routes.rs");
+        let router = include_str!("mod.rs");
+
+        let mut unrouted = Vec::new();
+        for line in handlers.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub async fn ") else {
+                continue;
+            };
+            let name = rest.split('(').next().unwrap_or_default().trim();
+            if name.is_empty() {
+                continue;
+            }
+            if !router.contains(&format!("cli_routes::{name}")) {
+                unrouted.push(name.to_string());
+            }
+        }
+        assert!(
+            unrouted.is_empty(),
+            "these handlers exist but no route reaches them: {unrouted:?}"
+        );
+    }
+
+    /// The other direction: the CLI grammar in PROTOCOL.md is a contract, and
+    /// a command whose route was never built is a command that 404s in the
+    /// agent's hands while the docs promise it works.
+    #[test]
+    fn every_documented_cli_route_exists() {
+        let router = include_str!("mod.rs");
+        for path in [
+            "/whoami",
+            "/connections",
+            "/ls",
+            "/list",
+            "/read",
+            "/secret",
+            "/write",
+            "/msg",
+            "/inbox",
+            "/rm",
+            "/query",
+            "/tool",
+            "/ctx/clear",
+            "/mcp/tools",
+        ] {
+            assert!(
+                router.contains(&format!("\"{path}\"")),
+                "PROTOCOL documents {path} but nothing routes it"
+            );
+        }
     }
 
     /// A project spawned without its vault key is a provisioning gap in the
