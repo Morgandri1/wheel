@@ -51,3 +51,27 @@ RUSTUP_HOME: yes (read-only machine fact). CARGO_HOME: yes to the NEED, no to a 
 must be per-project (secret-bearing via credentials.toml + writable cross-tenant state). Not test convenience;
 42137cd is satisfied because the requirement is a genuine runtime need supplied without widening the boundary
 across tenants.
+
+## VERIFIED (2026-09-06, fresh image 05:37Z from d206b95) — 029 conditions met
+Child (pid 15, uid 10001) env read as the child uid:
+- `RUSTUP_HOME=/opt/rust/rustup` — inherited, NOT under `/data` (029 condition met). And the child uid
+  CANNOT write it: `touch /opt/rust/rustup/... -> Permission denied`. So SDK's claim "the agent uid cannot
+  write the shared toolchain" is CONFIRMED — no cross-tenant toolchain poisoning via a writable RUSTUP_HOME.
+- `CARGO_HOME=/data/cargo` (= `$WHEEL_DATA_DIR/cargo`; in process mode `WHEEL_DATA_DIR=/data/projects/<id>`,
+  so this is PER-PROJECT) — NOT the shared `/opt/rust/cargo`, exactly as 029 required. The child can write its
+  OWN CARGO_HOME (expected — cargo needs it); the shared `/opt/rust/cargo` is NOT child-writable either
+  (`Permission denied`). So the shared cargo/toolchain cannot be poisoned across tenants.
+- RESIDUAL (process backend, ties to the open cross-project probe): I verified CARGO_HOME is per-data-dir and
+  the SHARED dirs are read-only to the child, in DOCKER mode (single uid). The per-project CARGO_HOME being
+  0700 and a SIBLING project uid being unable to write it is a PROCESS-backend cross-uid property — to confirm
+  when the process backend is live (same probe as F003/F007 cross-tenant).
+- Process note: a first run mis-parsed the child uid (empty) and ran the write test as ROOT, which produced a
+  false "child wrote into RUSTUP_HOME". Caught it (root can write; the child uid cannot), re-ran with the
+  correct uid. The corrected result is above.
+
+## 027 create=call VERIFIED (same image)
+With `validate_config_with(cfg, allow_hosts)`: an allowlisted `127.0.0.1:18080` tool is now CREATABLE
+(previously 400) AND callable; non-allowlisted `127.0.0.2:18080`, `127.0.0.1:19090`, `169.254.169.254` are
+refused at CREATE (matching call) — create and call are one decision. Full allowed-path re-confirmed via the
+official loopback: header-CRLF REJECTED (this time with the clear `:328` message), 026 all five v6 spellings +
+Teredo client DENIED, redirect no-replay/per-hop/limit, 5 MiB cap, 30 s timeout, prod-boot-refusal.
