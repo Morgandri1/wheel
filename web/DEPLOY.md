@@ -75,11 +75,18 @@ for all environments, and redeploy after any change to either.
 
 ## What API has to do
 
-CORS must allow the Vercel origin, or the browser blocks every call before it reaches our code:
+CORS must allow the Vercel origin, or the browser blocks every call before it reaches our code.
+The Vercel project is **`wheel-2708`**, so the production origin is:
 
 ```
-CORS_ALLOWED_ORIGINS=https://<production-domain>,https://<preview>.vercel.app
+CORS_ALLOWED_ORIGINS=https://wheel-2708.vercel.app
 ```
+
+Preview deployments get their own origin per branch,
+`https://wheel-2708-git-<branch>-<team>.vercel.app`, and are **deliberately not allow-listed**:
+a wildcard `https://*.vercel.app` would let any Vercel app on the internet call this API with a
+user's token, which is a far worse trade than previews that cannot reach the API. Add specific
+preview origins when a preview genuinely needs one.
 
 with `x-auth-token` and `x-project-id` in allowed headers (both already are), and
 `access-control-allow-origin` actually emitted — an unset allowlist matches nothing and silently
