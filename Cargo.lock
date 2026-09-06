@@ -3204,7 +3204,7 @@ dependencies = [
  "axum",
  "base64",
  "libc",
- "rand 0.8.8",
+ "rand 0.9.5",
  "reqwest",
  "serde_json",
  "sha2",

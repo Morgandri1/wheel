@@ -26,7 +26,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
-rand = "0.8"
+rand = "0.9"
 sha2 = "0.10"
 libc = "0.2"
 axum = { workspace = true }
