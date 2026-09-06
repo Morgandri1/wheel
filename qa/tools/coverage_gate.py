@@ -112,6 +112,22 @@ def main():
               "on a loaded machine it cannot complete. Run `make coverage` alone, or rely\n"
               "on CI, where it has the machine to itself.")
         return SKIP
+    combined = (r.stderr or "") + (r.stdout or "")
+    if r.returncode != 0 and ("SIGKILL" in combined or "signal: 9" in combined):
+        # llvm-cov itself exited 101, but only because one of the TEST BINARIES it ran was
+        # killed by the OOM reaper. The 137/-9 check above catches llvm-cov being killed; it
+        # does not catch a child dying, and the difference is invisible in the exit code.
+        #
+        # Reporting this as a coverage failure is the same lie as reporting a skip as a pass,
+        # pointed the other way: it sends somebody to write tests for a crate whose tests
+        # were never allowed to finish. The instrumented binaries are much larger than normal
+        # ones, and this host runs six agents.
+        killed = [ln for ln in combined.splitlines() if "SIGKILL" in ln or "signal: 9" in ln]
+        print("a test binary was KILLED (out of memory), so coverage was never measured:\n  %s\n"
+              "This is a gate that could not run, not a crate that failed. Run `make coverage`\n"
+              "when the machine is quieter, or rely on CI where it has the box to itself."
+              % "\n  ".join(killed[:3]))
+        return SKIP
     if r.returncode != 0 or not os.path.exists(out):
         print("cargo llvm-cov failed (exit %d):\n%s" % (r.returncode, r.stderr[-2000:] or r.stdout[-2000:]))
         return 1
