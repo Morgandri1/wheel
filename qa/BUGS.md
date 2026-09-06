@@ -940,3 +940,21 @@ this reason.
 Found by the gate PM asked for, on the first run after the production fix. The host is safe;
 any project engine on such a volume is not.
 
+**Two things I checked before leaving this filed, because both would have made it wrong:**
+
+*Is it a permissions artifact of my fixture?* No. Re-run with the `-shm` directory owned
+`agent:agent` — writable by the very uid the engine runs as — and it still exits 1 with the same
+error. The block is the directory being a directory, not a mode.
+
+*Did the wheel-sqlite refactor undo the host's fix too?* I thought so from reading:
+`open_configured` tries `configure_journal_to` first and only falls through to the EXCLUSIVE
+escape on `Err`, and I had measured WAL reading back as `wal`. Ran it instead — host role, blocked
+volume — and it starts: *"reconcile complete; project routes are open"*. A fresh `host.db` stays
+in `delete`, the read-back mismatches, and the fall-through works. **The host is fine and I would
+have filed a false S1 on a sound-looking inference.**
+
+That asymmetry IS the bug, stated precisely: the host calls `open_configured(path, true)` and has
+a second line of defence; the engine calls it with `false` — it cannot take the file exclusively
+because `tables::query` opens it a second time — so for the engine the read-back is the *entire*
+protection, and on a database that does report `wal` there is none.
+
