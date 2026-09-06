@@ -48,7 +48,12 @@ def fake_opt(env_name, key):
     return v if v is not None else FAKE_CFG.get(key)
 
 
-DIRECTIVE = re.compile(r"<<FAKE:([A-Z_]+)(?:=([^>]*))?>>")
+# [A-Z0-9_]+, not [A-Z_]+: the name SH_B64 contains digits, so the original pattern
+# matched "SH_B" and then failed on the "6" -- every <<FAKE:SH_B64=...>> ever sent was
+# echoed back as literal text instead of being executed. The directive that runs a real
+# command in the sandbox had therefore never worked, and wheel-on-wheel, which is built
+# entirely on it, could never have passed.
+DIRECTIVE = re.compile(r"<<FAKE:([A-Z0-9_]+)(?:=([^>]*))?>>")
 TRANSCRIPT = fake_opt("WHEEL_FAKE_TRANSCRIPT", "transcript")
 # Where the per-spawn credential-routing record goes.
 #
