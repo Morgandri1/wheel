@@ -313,6 +313,45 @@ def main():
                 "not found in %d bytes of log; %s" % (len(blob), why))
         R.check("INJ-unwired-absent: the UNWIRED ctx never reaches the prompt",
                 "you must not read this" not in blob)
+
+        # ---- a failure must say what failed ----------------------------------------
+        #
+        # Found in production: `wheel inbox` printed exactly "engine error" — no code, no
+        # message, nothing to act on. An agent reading that cannot tell a denied wire from
+        # a missing node from a broken engine, and neither can the operator reading the
+        # transcript afterwards. The CLI is the whole interface an agent has to the board;
+        # an errorless failure there is a dead end at the one moment somebody needs a
+        # direction.
+        #
+        # Asserted across SEVERAL failing commands rather than one, because a single fixed
+        # message proves only that one call site was fixed.
+        bare, failed_at_all = [], []
+        for argv in (["inbox"], ["read", "no-such-node-at-all"], ["ls", "no-such-node"],
+                     ["write", "notes"], ["query", "notes", "SELECT 1"]):
+            p2 = wheel(alice, *argv)
+            if p2.returncode == 0:
+                continue
+            failed_at_all.append(" ".join(argv))
+            said = ((p2.stderr or "") + (p2.stdout or "")).strip()
+            # "engine error" and nothing else is the shape. A message that merely CONTAINS
+            # those words while also naming a code or a reason is fine.
+            informative = len(said) > len("engine error") + 8 and any(
+                ch in said for ch in (":", "—", "-")) and said.lower() != "engine error"
+            if not informative:
+                bare.append("%s -> %r" % (" ".join(argv), said[:80]))
+
+        # Positive control, first. Every assertion below is "the message was informative",
+        # and all of them hold vacuously if nothing failed — which is exactly what a suite
+        # reports when the commands it chose all happen to succeed.
+        if not R.check("CLI-error-has-a-cause/something-failed", bool(failed_at_all),
+                       "none of the five commands failed, so there were no error messages "
+                       "to judge — this check proved nothing about error text"):
+            return R.report("wheel CLI")
+
+        R.check("CLI-error-has-a-cause", not bare,
+                "these failed with nothing a caller could act on: %s. Every CLI failure "
+                "must carry the engine's code and message; an internal error must still "
+                "name its request id so the cause is findable in the log." % bare)
     finally:
         sh("docker", "rm", "-f", NAME)
 
