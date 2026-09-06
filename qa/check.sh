@@ -185,6 +185,19 @@ step "qa:fake-steering" "$PY" qa/contract/fake_steering.py
 # it. Static and instant — it reads the constant and compares it to a pinned list.
 step "qa:env-allowlist" "$PY" qa/contract/env_allowlist.py
 
+# API's own tests for the probe-project pruner. Wired here because the subject is a
+# DELETION tool that runs against production data, and because it costs nothing: plain
+# bash, no deps, no network, sub-second. It has no prerequisites, so exit 0/1 is honest
+# — there is no "could not run" state for it to hide in.
+#
+# Not mine, deliberately left where its owner keeps it. A gate does not have to live in
+# qa/ to be worth running before a merge.
+if [ -x infra/tests/prune-probe-projects.test.sh ]; then
+  step "infra:prune-probe-projects" bash infra/tests/prune-probe-projects.test.sh
+else
+  skip_absent "infra:prune-probe-projects" "infra/tests/prune-probe-projects.test.sh not present"
+fi
+
 # The image must contain the binaries the contract depends on. BUG-010: the `wheel`
 # CLI was silently absent because the Dockerfile built a bin name that does not exist
 # under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.
