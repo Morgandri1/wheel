@@ -24,6 +24,8 @@ wheel — talk to your Wheel board
   wheel ls [<node>] [<prefix>]      reachable keyspaces, or keys inside one
   wheel read  <node>[/<row>]        ctx markdown / table row / chest blob
   wheel write <node>[/<row>] <value>|--file <path>|--stdin
+  wheel rm    <node>/<row>          delete a table row or chest blob
+  wheel query <table> \"<SELECT ...>\"  read-only SQL, scoped to that one table
   wheel msg   <agent> <text>|--file <path>|--stdin
   wheel inbox [<message-id>]        re-read what I was sent
 
@@ -73,7 +75,16 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
 
         "ls" => {
             let path = match rest.first() {
-                Some(node) => format!("/v1/cli/ls?node={}", urlencode(node)),
+                Some(node) => {
+                    let mut p = format!("/v1/cli/ls?node={}", urlencode(node));
+                    // `wheel ls <node> [prefix]` (§3). Without this the
+                    // argument was accepted and silently ignored, which reads
+                    // as "the prefix matched nothing".
+                    if let Some(prefix) = rest.get(1) {
+                        p.push_str(&format!("&prefix={}", urlencode(prefix)));
+                    }
+                    p
+                }
                 None => "/v1/cli/ls".to_string(),
             };
             show(engine.get(&path)?, json_out, render_ls)
@@ -152,6 +163,28 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
                     Ok(1)
                 }
             }
+        }
+
+        "rm" => {
+            let addr = rest.first().ok_or_else(|| usage("rm needs <node>/<row>"))?;
+            show(
+                engine.post("/v1/cli/rm", serde_json::json!({ "addr": addr }))?,
+                json_out,
+                render_ok,
+            )
+        }
+
+        "query" => {
+            let table = rest.first().ok_or_else(|| usage("query needs <table>"))?;
+            let sql = read_value(&rest[1..])?;
+            show(
+                engine.post(
+                    "/v1/cli/query",
+                    serde_json::json!({ "table": table, "sql": sql }),
+                )?,
+                json_out,
+                render_rows,
+            )
         }
 
         "inbox" => {
@@ -343,6 +376,23 @@ fn render_read(v: &serde_json::Value) {
     print!("{}", v["value"].as_str().unwrap_or(""));
     if !v["value"].as_str().unwrap_or("").ends_with('\n') {
         println!();
+    }
+}
+
+/// Query results print one JSON object per line, so `wheel query ... | jq` and
+/// a human reading the terminal both get something usable without `--json`.
+fn render_rows(v: &serde_json::Value) {
+    let rows = v.get("rows").and_then(|r| r.as_array());
+    match rows {
+        Some(rows) if rows.is_empty() => println!("no rows"),
+        Some(rows) => {
+            for row in rows {
+                println!("{row}");
+            }
+            let n = rows.len();
+            eprintln!("{n} row{}", if n == 1 { "" } else { "s" });
+        }
+        None => println!("{v}"),
     }
 }
 
@@ -538,6 +588,13 @@ mod tests {
             (vec!["list"], "GET", "/v1/cli/list"),
             (vec!["read", "notes"], "GET", "/v1/cli/read?addr=notes"),
             (vec!["ls", "table"], "GET", "/v1/cli/ls?node=table"),
+            (
+                vec!["ls", "table", "2026-"],
+                "GET",
+                "/v1/cli/ls?node=table&prefix=2026-",
+            ),
+            (vec!["rm", "notes/r1"], "POST", "/v1/cli/rm"),
+            (vec!["query", "notes", "SELECT 1"], "POST", "/v1/cli/query"),
             (vec!["inbox"], "GET", "/v1/cli/inbox"),
             (
                 vec!["secret", "get", "v/K"],
@@ -606,6 +663,7 @@ mod tests {
             vec!["secret", "get"],
             vec!["secret", "list"],
             vec!["rm"],
+            vec!["query"],
             vec!["not-a-command"],
         ] {
             let args: Vec<String> = bad.iter().map(|a| a.to_string()).collect();
