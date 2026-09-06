@@ -2,6 +2,7 @@
 # Creates the Wheel-on-Wheel board (docs/WHEEL-ON-WHEEL.md) through the public API. Idempotent by project name.
 set -euo pipefail
 : "${WHEEL_API:?set WHEEL_API}"; : "${WHEEL_EMAIL:?}"; : "${WHEEL_PASSWORD:?}"
+case "$WHEEL_API" in http://localhost*|http://127.0.0.1*) ;; *) [ "${WHEEL_ALLOW_REMOTE:-}" = 1 ] || { echo "refusing non-loopback WHEEL_API=$WHEEL_API without WHEEL_ALLOW_REMOTE=1" >&2; exit 2; } ;; esac
 PROJECT_NAME="${PROJECT_NAME:-wheel-dev}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
