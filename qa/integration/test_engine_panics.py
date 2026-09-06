@@ -152,19 +152,32 @@ def main():
                          % (bad.stderr or "")[-200:]):
             return R.report("engine-panics")
 
-        sh("docker", "restart", NAME)
-        back = False
-        for _ in range(60):
-            if http("GET", "/healthz")[0] == 200:
-                back = True
+        # THREE reboots, not one. The failure this guards against is a row that poisons
+        # every boot — "it came back once" and "it comes back" are different claims, and a
+        # single restart can pass by coincidence while the second dies. An engine that
+        # recovers once and then dies is indistinguishable, from one restart, from one that
+        # recovered; the operator only learns the difference at 3am.
+        back = True
+        reboots = 0
+        for attempt in range(1, 4):
+            sh("docker", "restart", NAME)
+            came_up = False
+            for _ in range(60):
+                if http("GET", "/healthz")[0] == 200:
+                    came_up = True
+                    break
+                time.sleep(0.5)
+            if not came_up:
+                back = False
                 break
-            time.sleep(0.5)
+            reboots = attempt
         logs = sh("sh", "-c", "docker logs --tail 6 %s 2>&1" % NAME).stdout[-300:]
         R.gated("ENG-starts-with-unparseable-message", "ENG-panic/bad-row-inserted", back,
                 "the engine did not come back after a restart with ONE unparseable message "
-                "row. The parser must reject the ROW, not the boot: a row it cannot read "
-                "takes the board down on every restart, so the system cannot recover by "
-                "being turned off and on again. Engine said: %s" % logs)
+                "row — it survived %d reboot(s) and then did not. The parser must reject "
+                "the ROW, not the boot: a row it cannot read takes the board down on EVERY "
+                "restart, so the system cannot recover by being turned off and on again. "
+                "Engine said: %s" % (reboots, logs))
     finally:
         sh("docker", "rm", "-f", NAME)
 
