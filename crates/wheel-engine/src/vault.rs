@@ -145,11 +145,10 @@ pub fn credential_detail(
         // is authenticated, and then starts a child with no credential at all,
         // which fails on its first request for a reason the UI has just denied.
         //
-        // The AMBIGUITY check deliberately still uses `offered_keys`: a
-        // declared key is a key this vault may supply at any moment, so two
-        // vaults declaring the same one is a conflict worth refusing before
-        // the value arrives. Existence and availability are different
-        // questions and this is the one place they diverge.
+        // [`find_ambiguity`] agrees: presence is stored-based everywhere (028
+        // face 5). A declared-but-empty key can still overlap another vault's
+        // declaration — see [`find_declared_overlap`] — but that is a warning,
+        // never a block, and never this function's business.
         for key in list_keys(conn, id)? {
             if recognised.contains(&key.as_str()) {
                 return Ok(Some((name, key.clone(), expiry_of(conn, id, &key)?)));
@@ -276,8 +275,13 @@ fn wired_vaults(conn: &Connection, agent: Uuid) -> Result<Vec<(Uuid, String)>> {
     Ok(out)
 }
 
-/// The name of a vault, other than `exclude`, that already supplies `key` to
-/// this agent.
+/// The name of a vault, other than `exclude`, that already HOLDS a value for
+/// `key` for this agent.
+///
+/// Stored-only (028 face 5, extended to the PUT path): a vault that merely
+/// *declares* `key` is not a competing credential, so it must not block a PUT
+/// of the real value into another vault. See [`declares_key`] for the
+/// non-blocking declared-declared signal.
 pub fn supplies_key(
     conn: &Connection,
     agent: Uuid,
@@ -288,7 +292,29 @@ pub fn supplies_key(
         if id == exclude {
             continue;
         }
-        if offered_keys(conn, id)?.iter().any(|k| k == key) {
+        if list_keys(conn, id)?.iter().any(|k| k == key) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// The name of a vault, other than `exclude`, that DECLARES `key` for this
+/// agent, whether or not either side has a value yet.
+///
+/// Non-blocking (028 face 5): surfaced as a create-time warning, never a
+/// refusal — [`supplies_key`] is the only thing PUT is allowed to refuse on.
+pub fn declares_key(
+    conn: &Connection,
+    agent: Uuid,
+    key: &str,
+    exclude: Uuid,
+) -> Result<Option<String>> {
+    for (id, name) in wired_vaults(conn, agent)? {
+        if id == exclude {
+            continue;
+        }
+        if declared_keys(conn, id)?.iter().any(|k| k == key) {
             return Ok(Some(name));
         }
     }
@@ -308,14 +334,16 @@ pub struct Ambiguity {
     pub second: String,
 }
 
-/// Find a duplicated key among the vaults an agent can read.
+/// Find a duplicated key among the vaults an agent can read, judging on
+/// `keys_of` — the caller decides whether "offers" means declared or stored.
 ///
 /// `adding` lets a wire be judged BEFORE it exists, which is what makes the
 /// check at wire-creation time possible at all.
-pub fn find_ambiguity(
+fn find_ambiguity_by(
     conn: &Connection,
     agent: Uuid,
     adding: Option<Uuid>,
+    keys_of: impl Fn(&Connection, Uuid) -> Result<Vec<String>>,
 ) -> Result<Option<Ambiguity>> {
     let mut vaults = wired_vaults(conn, agent)?;
     if let Some(new) = adding {
@@ -331,7 +359,7 @@ pub fn find_ambiguity(
 
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (id, name) in vaults {
-        for key in offered_keys(conn, id)? {
+        for key in keys_of(conn, id)? {
             if let Some(first) = seen.get(&key) {
                 return Ok(Some(Ambiguity {
                     what: if wheel_core::is_credential_key(&key) {
@@ -348,6 +376,35 @@ pub fn find_ambiguity(
         }
     }
     Ok(None)
+}
+
+/// Find a key two of an agent's vaults both actually HOLD a value for.
+///
+/// Judged on stored values only, not on declaration: an agent must never run
+/// with a real choice between two accounts, but a vault that merely declares
+/// a key it has not yet been given is not a competing account. This is the
+/// only ambiguity that blocks — a wire creation or an agent start.
+pub fn find_ambiguity(
+    conn: &Connection,
+    agent: Uuid,
+    adding: Option<Uuid>,
+) -> Result<Option<Ambiguity>> {
+    find_ambiguity_by(conn, agent, adding, list_keys)
+}
+
+/// Find a key two of an agent's vaults both DECLARE, whether or not either
+/// has a value yet.
+///
+/// Non-blocking by design (PM ruling on 028 face 5): declaring a key is a
+/// statement of intent, not a competing credential, so this is surfaced as a
+/// create-time warning rather than refusing the wire. Skips any pair
+/// [`find_ambiguity`] already refuses, since that case never reaches here.
+pub fn find_declared_overlap(
+    conn: &Connection,
+    agent: Uuid,
+    adding: Option<Uuid>,
+) -> Result<Option<Ambiguity>> {
+    find_ambiguity_by(conn, agent, adding, declared_keys)
 }
 
 /// The environment an agent gets from its wired vaults.
@@ -505,29 +562,137 @@ mod tests {
         );
     }
 
-    /// The ambiguity rule deliberately does NOT follow that: a declared key is
-    /// one this vault may supply at any moment, so two vaults declaring the
-    /// same credential is a conflict worth refusing BEFORE the value arrives.
-    /// Existence and availability are different questions and this is the one
-    /// place they diverge on purpose.
+    /// 028 face 5 (PM overrule): a declared-but-unfilled key must never block
+    /// wiring the vault that actually holds the value. `find_ambiguity` is
+    /// stored-based, full stop; the declared/declared clash still exists but
+    /// only as [`find_declared_overlap`], which is not consulted for a block.
     #[test]
-    fn a_declared_key_is_still_enough_to_be_ambiguous() {
+    fn a_declared_but_empty_key_does_not_block_the_vault_with_the_real_value() {
         let c = crate::db::open_memory().unwrap();
         let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
-        let v1 = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let v1 = vault("alice", &["ANTHROPIC_API_KEY"]); // declares, never filled
         let v2 = vault("bob", &["ANTHROPIC_API_KEY"]);
         for n in [&a, &v1, &v2] {
             board::create(&c, n).unwrap();
         }
         board::add_wire(&c, a.id, v1.id, wheel_core::WireType::Read, None).unwrap();
+        put(&c, &key(), v2.id, "ANTHROPIC_API_KEY", "sk-ant-api03-real").unwrap();
 
-        // Neither vault holds a VALUE, yet wiring the second is still refused.
-        let clash = find_ambiguity(&c, a.id, Some(v2.id)).unwrap();
         assert!(
-            clash.is_some(),
-            "two vaults declaring one credential must clash before the value exists"
+            find_ambiguity(&c, a.id, Some(v2.id)).unwrap().is_none(),
+            "a declared-but-empty key in another vault must not block the real one"
         );
-        assert_eq!(clash.unwrap().key, "ANTHROPIC_API_KEY");
+
+        // Two vaults that both merely DECLARE the same key still overlap —
+        // just as a non-blocking signal, not a refusal.
+        let overlap = find_declared_overlap(&c, a.id, Some(v2.id)).unwrap();
+        assert_eq!(
+            overlap.map(|o| o.key),
+            Some("ANTHROPIC_API_KEY".to_string())
+        );
+    }
+
+    /// Two vaults that both actually HOLD a value for the same key are a real
+    /// conflict: the agent would run as whichever one happened to win. This is
+    /// the one case [`find_ambiguity`] still blocks.
+    #[test]
+    fn two_stored_values_for_the_same_key_are_still_blocked() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let v1 = vault("alice", &[]);
+        let v2 = vault("bob", &[]);
+        for n in [&a, &v1, &v2] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, v1.id, wheel_core::WireType::Read, None).unwrap();
+        put(&c, &key(), v1.id, "ANTHROPIC_API_KEY", "sk-ant-api03-one").unwrap();
+        put(&c, &key(), v2.id, "ANTHROPIC_API_KEY", "sk-ant-api03-two").unwrap();
+
+        let clash = find_ambiguity(&c, a.id, Some(v2.id)).unwrap();
+        assert_eq!(
+            clash.map(|c| c.key),
+            Some("ANTHROPIC_API_KEY".to_string()),
+            "two REAL values for one key must still clash"
+        );
+    }
+
+    /// 028 face 5, extended to the PUT path (PM ruling): a vault that only
+    /// DECLARES a key must not block `PUT`ting the real value into another
+    /// vault the same agent reads. `supplies_key` is what `store_in_vault`
+    /// refuses on; it must agree with `find_ambiguity`'s stored-only basis.
+    #[test]
+    fn supplies_key_does_not_see_a_declared_but_empty_key() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let declares_only = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let about_to_hold_it = vault("bob", &[]);
+        for n in [&a, &declares_only, &about_to_hold_it] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, declares_only.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(
+            &c,
+            a.id,
+            about_to_hold_it.id,
+            wheel_core::WireType::Read,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            supplies_key(&c, a.id, "ANTHROPIC_API_KEY", about_to_hold_it.id).unwrap(),
+            None,
+            "a bare declaration elsewhere must not block the PUT"
+        );
+    }
+
+    /// The blocking half still works: a vault that already HOLDS the key is
+    /// found and named, so the 409 in `store_in_vault_until` still fires on a
+    /// real clash.
+    #[test]
+    fn supplies_key_still_finds_a_real_stored_value_elsewhere() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let holds_it = vault("alice", &[]);
+        let target = vault("bob", &[]);
+        for n in [&a, &holds_it, &target] {
+            board::create(&c, n).unwrap();
+        }
+        put(
+            &c,
+            &key(),
+            holds_it.id,
+            "ANTHROPIC_API_KEY",
+            "sk-ant-api03-real",
+        )
+        .unwrap();
+        board::add_wire(&c, a.id, holds_it.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(&c, a.id, target.id, wheel_core::WireType::Read, None).unwrap();
+
+        assert_eq!(
+            supplies_key(&c, a.id, "ANTHROPIC_API_KEY", target.id).unwrap(),
+            Some("alice".to_string())
+        );
+    }
+
+    /// The non-blocking signal `store_in_vault_until` warns on: a bare
+    /// declaration elsewhere is still worth surfacing, just never refusing.
+    #[test]
+    fn declares_key_finds_a_bare_declaration_for_the_warning() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let declares_only = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let target = vault("bob", &[]);
+        for n in [&a, &declares_only, &target] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, declares_only.id, wheel_core::WireType::Read, None).unwrap();
+        board::add_wire(&c, a.id, target.id, wheel_core::WireType::Read, None).unwrap();
+
+        assert_eq!(
+            declares_key(&c, a.id, "ANTHROPIC_API_KEY", target.id).unwrap(),
+            Some("alice".to_string())
+        );
     }
 
     /// The UI can only warn "re-login by ..." if the expiry survives beside
@@ -738,7 +903,8 @@ mod tests {
 
     /// The rule PM set: two vaults offering the same credential is refused,
     /// never resolved, because resolving it means choosing an account for the
-    /// user and being silent about it.
+    /// user and being silent about it. "Offering" means a STORED value (028
+    /// face 5) — a declaration alone does not compete.
     #[test]
     fn two_vaults_offering_the_same_credential_are_ambiguous() {
         let c = crate::db::open_memory().unwrap();
@@ -748,6 +914,22 @@ mod tests {
         for n in [&a, &personal, &work] {
             board::create(&c, n).unwrap();
         }
+        put(
+            &c,
+            &key(),
+            personal.id,
+            "ANTHROPIC_API_KEY",
+            "sk-ant-api03-personal",
+        )
+        .unwrap();
+        put(
+            &c,
+            &key(),
+            work.id,
+            "ANTHROPIC_API_KEY",
+            "sk-ant-api03-work",
+        )
+        .unwrap();
 
         // One vault: fine.
         board::add_wire(&c, a.id, personal.id, WireType::Read, None).unwrap();
@@ -809,6 +991,8 @@ mod tests {
         for n in [&a, &one, &two] {
             board::create(&c, n).unwrap();
         }
+        put(&c, &key(), one.id, "ANTHROPIC_API_KEY", "sk-ant-api03-one").unwrap();
+        put(&c, &key(), two.id, "ANTHROPIC_API_KEY", "sk-ant-api03-two").unwrap();
         // Straight into the table, bypassing add_wire's check exactly as a
         // restored export would.
         for v in [&one, &two] {
