@@ -339,3 +339,64 @@ async fn a_host_that_is_not_listening_is_not_alive() {
     );
     assert!(client.host_alive().await.is_err());
 }
+
+/// A 507 from the host is a refusal the owner can act on, and it must survive as one.
+///
+/// The host says "the volume is full" precisely; everything above it used to flatten that into an
+/// unexpected failure, and the API reported a 500 with no cause. The type has to make it through
+/// the `anyhow` chain, `.context()` and all, or the route cannot tell this apart from any other
+/// upstream error.
+#[tokio::test]
+async fn a_host_out_of_disk_is_a_refusal_not_an_unexplained_failure() {
+    let app = Router::new().route(
+        "/host/v1/projects/{id}/start",
+        any(|| async {
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                Json(json!({"status": "error",
+                            "last_error": "the volume is full: 12 MB free on /data (99% used)"})),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = HostClient::new(reqwest::Client::new(), base, Secret::new("host-secret"));
+    let err = client
+        .start(&Uuid::new_v4())
+        .await
+        .expect_err("a host with no disk must not report a successful start");
+
+    assert!(
+        matches!(
+            err.downcast_ref::<wheel_api::orchestrator::HostRefusal>(),
+            Some(wheel_api::orchestrator::HostRefusal::OutOfDisk)
+        ),
+        "the refusal did not survive the error chain: {err:#}"
+    );
+    // And the operator still gets the host's own words in the log.
+    assert!(format!("{err:#}").contains("507"), "{err:#}");
+}
+
+/// Every other host failure stays untyped, so the disk case is a distinction rather than a
+/// relabelling of everything that goes wrong upstream.
+#[tokio::test]
+async fn an_ordinary_host_error_carries_no_refusal_type() {
+    let app = Router::new().route(
+        "/host/v1/projects/{id}/start",
+        any(|| async { (StatusCode::BAD_GATEWAY, Json(json!({"status": "error"}))) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = HostClient::new(reqwest::Client::new(), base, Secret::new("host-secret"));
+    let err = client
+        .start(&Uuid::new_v4())
+        .await
+        .expect_err("502 is an error");
+    assert!(err
+        .downcast_ref::<wheel_api::orchestrator::HostRefusal>()
+        .is_none());
+}

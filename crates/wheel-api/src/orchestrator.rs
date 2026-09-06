@@ -35,6 +35,18 @@ pub trait Orchestrator: Send + Sync {
     async fn host_alive(&self) -> Result<()>;
 }
 
+/// A refusal the caller can act on, as opposed to a failure they cannot.
+///
+/// Most host errors are ours to fix and read as `internal`. This one is not: the machine is out of
+/// disk, the host says so precisely, and flattening that into "an unexpected error occurred" is how
+/// a full volume cost us an afternoon. Carried through `anyhow` so the trait stays simple; the
+/// route recovers it with `downcast_ref`.
+#[derive(Debug, thiserror::Error)]
+pub enum HostRefusal {
+    #[error("the host has no room to start a project")]
+    OutOfDisk,
+}
+
 pub mod host;
 
 /// Used in tests, where no host service is running.

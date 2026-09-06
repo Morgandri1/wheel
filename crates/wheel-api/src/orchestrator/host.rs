@@ -214,5 +214,11 @@ async fn ensure_ok(r: reqwest::Response) -> Result<()> {
     // Read a bounded amount of the body for the *log*; it never reaches the client.
     let body = r.text().await.unwrap_or_default();
     let snippet: String = body.chars().take(500).collect();
+    if status == reqwest::StatusCode::INSUFFICIENT_STORAGE {
+        return Err(
+            anyhow::Error::new(crate::orchestrator::HostRefusal::OutOfDisk)
+                .context(format!("host returned {status}: {snippet}")),
+        );
+    }
     bail!("host returned {status}: {snippet}");
 }
