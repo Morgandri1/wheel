@@ -12,6 +12,8 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MB: u64 = 1024 * 1024;
 
@@ -100,14 +102,7 @@ pub fn check_room(path: impl AsRef<Path>, floor_mb: u64) -> Result<()> {
     if space.free_mb() < floor_mb {
         anyhow::bail!("the volume is full enough to break a database: {space}, under the {floor_mb} MB a project needs to start");
     }
-    if is_filling(&space) {
-        tracing::warn!(
-            free_mb = space.free_mb(),
-            used_percent = space.used_percent(),
-            floor_mb,
-            "the volume is filling; starts are refused below the floor"
-        );
-    }
+    warn_if_filling(&space, floor_mb);
     Ok(())
 }
 
@@ -122,6 +117,70 @@ const WARN_PERCENT: u64 = 85;
 /// Separate from the logging so the threshold is testable without capturing a subscriber.
 pub fn is_filling(space: &Space) -> bool {
     space.used_percent() >= WARN_PERCENT
+}
+
+/// How often the filling warning may repeat.
+const WARN_EVERY_SECS: u64 = 300;
+
+/// Lets a warning fire on a path that runs constantly, without it becoming noise nobody reads.
+///
+/// A struct rather than a bare static so the interval is testable without waiting five minutes and
+/// without one test's clock leaking into another's.
+pub struct WarnThrottle {
+    last_unix: AtomicU64,
+}
+
+impl WarnThrottle {
+    pub const fn new() -> Self {
+        Self {
+            last_unix: AtomicU64::new(0),
+        }
+    }
+
+    /// True at most once per `WARN_EVERY_SECS`, for exactly one caller when several race.
+    pub fn due(&self, now_unix: u64) -> bool {
+        let last = self.last_unix.load(Ordering::Relaxed);
+        if last != 0 && now_unix.saturating_sub(last) < WARN_EVERY_SECS {
+            return false;
+        }
+        self.last_unix
+            .compare_exchange(last, now_unix, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+impl Default for WarnThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static FILLING: WarnThrottle = WarnThrottle::new();
+
+/// Say so, on any path that has just measured the volume.
+///
+/// The warning used to live only in `check_room`, which runs when a project starts — so a volume
+/// filling under already-running projects was silent all the way to the floor. That is precisely
+/// how it fills: two agents unpacking dependencies wrote 1.7 GB into running sandboxes in an hour,
+/// and nothing started. The health check measures the volume every few seconds anyway, so the
+/// warning rides along there and costs nothing.
+pub fn warn_if_filling(space: &Space, floor_mb: u64) {
+    if !is_filling(space) {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !FILLING.due(now) {
+        return;
+    }
+    tracing::warn!(
+        free_mb = space.free_mb(),
+        used_percent = space.used_percent(),
+        floor_mb,
+        "the volume is filling; starts are refused below the floor"
+    );
 }
 
 #[cfg(test)]
@@ -201,6 +260,32 @@ mod tests {
             total_bytes: 1000 * MB,
         };
         assert_eq!(s.used_percent(), 0);
+    }
+
+    #[test]
+    fn a_warning_repeats_on_a_schedule_rather_than_on_every_health_check() {
+        let t = WarnThrottle::new();
+        assert!(t.due(1_000), "the first warning has to get through");
+        assert!(
+            !t.due(1_001),
+            "a health check every second must not log every second"
+        );
+        assert!(!t.due(1_000 + WARN_EVERY_SECS - 1));
+        assert!(
+            t.due(1_000 + WARN_EVERY_SECS),
+            "a volume still filling five minutes later must say so again"
+        );
+    }
+
+    /// The band is silent, so a quiet log is not evidence of a quiet disk.
+    #[test]
+    fn a_volume_with_room_logs_nothing_and_a_full_one_is_still_below_the_floor() {
+        let comfortable = Space {
+            free_bytes: 60 * MB,
+            total_bytes: 100 * MB,
+        };
+        assert!(!is_filling(&comfortable));
+        warn_if_filling(&comfortable, 10);
     }
 
     /// A zero-sized filesystem is not a volume with infinite headroom.
