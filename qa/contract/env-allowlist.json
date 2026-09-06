@@ -1,0 +1,14 @@
+{
+  "_comment": "The F015 boundary: every variable an agent child inherits from the engine. A change here changes what untrusted code can read, so it is reviewed rather than merged quietly. Each entry records WHY it is safe — a name with no reason is the shape that lets the list grow one convenience at a time.",
+  "reviewed_by": "ADVERSARY (asked to review changes to this list, 2026-09-06)",
+  "allowed": {
+    "PATH": "where binaries live; the harness cannot run without it",
+    "LANG": "locale; describes the machine, not the project",
+    "LC_ALL": "locale; describes the machine, not the project",
+    "TZ": "timezone; describes the machine, not the project",
+    "TMPDIR": "scratch location; describes the machine, not the project",
+    "SSL_CERT_FILE": "CA bundle — without it a private-CA container looks like a network fault",
+    "SSL_CERT_DIR": "CA bundle, as above",
+    "NODE_EXTRA_CA_CERTS": "CA bundle for node-based harnesses, as above"
+  }
+}
