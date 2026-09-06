@@ -104,6 +104,16 @@ the agent is woken, because on a public URL they are the only cost control; and 
 delivers, so a board can be secured after it works.
 
 - **Web releases (operator, Vercel rate limit)**: Vercel builds ONLY when `web/package.json` `version` changes (`ignoreCommand` in `web/vercel.json`). Merging `web/main` to `main` is unchanged; a deploy is a deliberate release: Web bumps the minor version once per bundle of finished work (a feature, or a batch of fixes that together read as a minor version), never per commit. Hotfix = patch bump. No other agent bumps that version.
+- **A test that cannot fail is not evidence — mutation-check every gate**: three tests shipped today
+  passed with their bug deliberately restored. A test written into a `#[cfg(test)]` module that does not
+  exist compiled to nothing and reported 52 unrelated passes. A workspace-path test compared two spellings
+  of the same directory (`/var` vs `/private/var`) and so could not fail. A rollback-journal test set the
+  mode itself after `open()`, proving only that sqlite works. Before believing any green: restore the bug,
+  watch the test go red, restore the fix. Every one of these was found by the author doing exactly that.
+- **Fix the class, not the instance**: the escaper panic had a sibling — the supervisor's stdout tail
+  trimmed a `String` at an arithmetic offset, so an agent printing an em dash at the wrong alignment lost
+  its startup output silently. It was found by grepping for the SHAPE of the bug after fixing the one
+  instance that bit us. Removing the arithmetic beats correcting it.
 - **Measure the machine, never the dashboard (outage 2026-09-06, 80 minutes)**: the platform's volume
   metric read 127 MB while `df` inside the container read 4.5G of 4.6G with **zero available**. PM quoted the
   dashboard to rule out disk space, and the whole team then spent an afternoon fixing sqlite. `xShmMap
