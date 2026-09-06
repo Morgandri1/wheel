@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Field, Input, Select } from "@/components/ui";
 import { OauthPanel } from "@/components/inspector/oauth-panel";
-import { vaultShareNote } from "@/lib/auth-session";
+import { expiryMessage, vaultShareNote } from "@/lib/auth-session";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
 import type { AuthStatus } from "@/lib/schema";
@@ -146,10 +146,19 @@ export function AuthFlow({
     if (token) await saveCredential({ setup_token: token });
   };
 
-  const authData = status.data as (typeof status.data & { source?: string | null }) | undefined;
-  const mode = authData?.mode as string | null | undefined;
-  const source = authData?.source;
+  // `source` and `expires_at` are real fields now (wheel-core exports them), so the local casts
+  // that stood in for them are gone. CredentialKind carries "env" too, which is why `mode` no
+  // longer needs widening to string.
+  const mode = status.data?.mode;
+  const source = status.data?.source;
+  const expiresAt = status.data?.expires_at;
   const fromVault = mode === "env";
+
+  /**
+   * A stored credential that expires should say so BEFORE it lapses. `null` means durable OR
+   * unknown — the engine will not guess between them, so neither does this: no date, no claim.
+   */
+  const expiryNote = expiryMessage(expiresAt, Date.now());
 
   const nextAgentHop =
     nextNeedsAuth && onSelectAgent ? (
@@ -196,6 +205,11 @@ export function AuthFlow({
             </Button>
           )}
         </div>
+        {expiryNote ? (
+          <p className="text-micro" data-testid="auth-expiry" style={{ color: expiryNote.urgent ? "var(--danger)" : "var(--ink-faint)" }}>
+            {expiryNote.text}
+          </p>
+        ) : null}
         {shareNote ? (
           <p className="text-micro text-ink-faint" data-testid="auth-vault-note">
             {shareNote}

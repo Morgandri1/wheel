@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { TicketStore } from "./tickets";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { AgentNode, EngineEvent, ToolOperation, ToolParam, WheelNode, WireType } from "@/lib/schema";
+import type { AgentNode, EngineEvent, WheelNode, WireType } from "@/lib/schema";
 import {
   EngineRefusal,
   OWNER,
@@ -33,7 +33,6 @@ import {
 } from "./state";
 import { seed } from "./fixtures";
 import { assertMatrixMatchesEngine } from "./assert-matrix";
-import { agentInputSchema, mergeOperations, parseSpec } from "./tools";
 import * as localAuth from "./local-auth";
 
 type Credentials = { email?: unknown; password?: unknown };
@@ -388,76 +387,24 @@ async function engine(
     }
   }
 
-  // §3d tool routes. The engine is the only real parser; ./tools is a stand-in so the inspector
-  // can be built now, and is what gets deleted when the engine's importer lands.
-  if (path === "/v1/tools/import" && method === "POST") {
-    const { raw } = await readJson<{ raw: string; format?: string }>(req);
-    json(res, 200, parseSpec(raw ?? ""));
-    return true;
-  }
-
-  const toolImport = /^\/v1\/tools\/([^/]+)\/import$/.exec(path);
-  if (toolImport && method === "POST") {
-    const node = findNode(record, toolImport[1]!);
-    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
-    const { raw } = await readJson<{ raw: string }>(req);
-    const parsed = parseSpec(raw ?? "");
-    const diff = mergeOperations(node.config.operations ?? [], parsed.operations);
-    node.config = { ...node.config, base_url: parsed.base_url, operations: diff.operations };
-    boardChanged(record);
-    json(res, 200, diff);
-    return true;
-  }
-
-  const toolOps = /^\/v1\/tools\/([^/]+)\/ops$/.exec(path);
-  if (toolOps && method === "GET") {
-    const node = findNode(record, toolOps[1]!);
-    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
-    json(res, 200, {
-      operations: (node.config.operations ?? [])
-        .filter((op) => op.enabled !== false)
-        .map((op) => ({
-          id: op.id,
-          description: op.summary ?? undefined,
-          input_schema: agentInputSchema(op),
-        })),
-    });
-    return true;
-  }
-
-  const toolCall = /^\/v1\/tools\/([^/]+)\/call$/.exec(path);
-  if (toolCall && method === "POST") {
-    const node = findNode(record, toolCall[1]!);
-    if (!node || node.type !== "tool") throw new EngineRefusal(404, "tool not found");
-    const { op: opId, args = {}, dry_run } = await readJson<{
-      op: string;
-      args?: Record<string, unknown>;
-      dry_run?: boolean;
-    }>(req);
-    const op = (node.config.operations ?? []).find((o) => o.id === opId);
-    if (!op) throw new EngineRefusal(404, "no such operation");
-
-    // §3d rule 1: an agent-supplied field that is not agent-mode is rejected outright, and the
-    // denial is an event rather than a silent drop.
-    const agentFields = new Set(
-      (op.params ?? []).filter((pm) => (pm.fill?.mode ?? "agent") === "agent").map((pm) => pm.name),
+  /**
+   * §3d tool routes are deliberately ABSENT from the mock.
+   *
+   * The engine is the only parser (§3d), and this file used to re-implement OpenAPI/Swagger/
+   * Postman/Insomnia normalization well enough to build the inspector before the engine's importer
+   * existed. That stand-in is gone now the real one has shipped: a second parser that agrees with
+   * the engine only by coincidence is worse than none, because it turns "the UI works" into a
+   * claim about a fake. Tool nodes are exercised against a real engine.
+   *
+   * 501 with a sentence, not 404 — a 404 reads as "wrong URL" and sends people looking in the
+   * wrong place for something that was never here.
+   */
+  if (/^\/v1\/tools(\/|$)/.test(path)) {
+    throw new EngineRefusal(
+      501,
+      "the mock does not implement tool nodes: the engine is the only spec parser (§3d). Point the app at a real engine to exercise them.",
+      "not_implemented_in_mock",
     );
-    const extra = Object.keys(args).filter((k) => !agentFields.has(k));
-    if (extra.length) {
-      throw new EngineRefusal(400, `fields not open to the caller: ${extra.join(", ")}`);
-    }
-
-    const url = renderUrl(node.config.base_url ?? "", op, args);
-    if (dry_run) {
-      json(res, 200, { curl: renderCurl(node.config.base_url ?? "", op, args) });
-      return true;
-    }
-    json(res, 200, {
-      status: 200,
-      headers: { "content-type": "application/json" },
-      body: { ok: true, note: "mock response — the engine performs the real request", url },
-    });
-    return true;
   }
 
   const vaultMatch = /^\/v1\/vault\/([^/]+)\/(.+)$/.exec(path);
@@ -787,50 +734,3 @@ server.listen(PORT, () => {
   console.log(`seeded project: ${first?.project.name} (${first?.project.id})`);
   console.log(`wire matrix agrees with the engine's export (${allowedWireCount} allowed triples)`);
 });
-
-/**
- * §3d rule 1: an operator-pinned field is never shown to the caller — a static value no less
- * than a vault one. The agent did not supply it, cannot override it, and has no business
- * learning it; a base_url query key or an API version header pinned as `static` is exactly the
- * kind of thing that leaks a tenant id or an internal path.
- *
- * ADVERSARY F012: the two renderers previously masked `vault` and printed `static` verbatim,
- * while this comment claimed both were covered. One function decides it now, so the curl and
- * the URL cannot drift apart again.
- */
-function renderValue(param: ToolParam, args: Record<string, unknown>): string | null {
-  const mode = param.fill?.mode ?? "agent";
-  if (mode === "hidden") return null;
-  if (mode === "vault" || mode === "static") return MASK;
-  return String(args[param.name] ?? "");
-}
-
-const MASK = "****";
-
-function renderUrl(baseUrl: string, op: ToolOperation, args: Record<string, unknown>): string {
-  let path = op.path;
-  const query: string[] = [];
-
-  for (const param of op.params ?? []) {
-    const value = renderValue(param, args);
-    if (value === null) continue;
-    if (param.location === "path") path = path.replace(`{${param.name}}`, encodeURIComponent(value));
-    if (param.location === "query" && value) {
-      query.push(`${encodeURIComponent(param.name)}=${encodeURIComponent(value)}`);
-    }
-  }
-
-  return `${baseUrl.replace(/\/$/, "")}${path}${query.length ? `?${query.join("&")}` : ""}`;
-}
-
-function renderCurl(baseUrl: string, op: ToolOperation, args: Record<string, unknown>): string {
-  const parts = [`curl -X ${op.method}`];
-  for (const param of op.params ?? []) {
-    if (param.location !== "header") continue;
-    const value = renderValue(param, args);
-    if (value === null) continue;
-    parts.push(`-H '${param.name}: ${value}'`);
-  }
-  parts.push(`'${renderUrl(baseUrl, op, args)}'`);
-  return parts.join(" ");
-}
