@@ -43,9 +43,8 @@ async fn the_database_file_is_created_on_first_use() {
 #[tokio::test]
 async fn email_uniqueness_ignores_case() {
     let db = Db::connect(&temp_db()).await.unwrap();
-    let Db::Sqlite(pool) = &db else {
-        panic!("expected sqlite")
-    };
+    #[allow(irrefutable_let_patterns)] // Db has one variant in a build without `postgres`.
+    let pool = db.as_sqlite().expect("a sqlite store");
 
     sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES ($1,$2,$3,$4)")
         .bind(uuid::Uuid::new_v4())
@@ -83,9 +82,8 @@ async fn email_uniqueness_ignores_case() {
 #[tokio::test]
 async fn deleting_a_user_cascades_to_their_sessions() {
     let db = Db::connect(&temp_db()).await.unwrap();
-    let Db::Sqlite(pool) = &db else {
-        panic!("expected sqlite")
-    };
+    #[allow(irrefutable_let_patterns)] // Db has one variant in a build without `postgres`.
+    let pool = db.as_sqlite().expect("a sqlite store");
     let user = uuid::Uuid::new_v4();
 
     sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES ($1,$2,$3,$4)")
@@ -127,9 +125,8 @@ async fn deleting_a_user_cascades_to_their_sessions() {
 #[tokio::test]
 async fn project_capabilities_round_trip_as_json() {
     let db = Db::connect(&temp_db()).await.unwrap();
-    let Db::Sqlite(pool) = &db else {
-        panic!("expected sqlite")
-    };
+    #[allow(irrefutable_let_patterns)] // Db has one variant in a build without `postgres`.
+    let pool = db.as_sqlite().expect("a sqlite store");
     let id = uuid::Uuid::new_v4();
 
     sqlx::query("INSERT INTO projects (id, owner_id, name, capabilities) VALUES ($1,$2,$3,$4)")
@@ -155,9 +152,8 @@ async fn project_capabilities_round_trip_as_json() {
 #[tokio::test]
 async fn ingress_is_disabled_by_default() {
     let db = Db::connect(&temp_db()).await.unwrap();
-    let Db::Sqlite(pool) = &db else {
-        panic!("expected sqlite")
-    };
+    #[allow(irrefutable_let_patterns)] // Db has one variant in a build without `postgres`.
+    let pool = db.as_sqlite().expect("a sqlite store");
     let id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO projects (id, owner_id, name) VALUES ($1,$2,$3)")
         .bind(id)

@@ -13,7 +13,9 @@ name = "wheeld"
 path = "src/lib.rs"
 
 [dependencies]
-wheel-api = { path = "../wheel-api" }
+# SQLite only: a local install has no Postgres, so it must not pay to compile a driver
+# for one -- twelve crates, including a second TLS stack.
+wheel-api = { path = "../wheel-api", default-features = false, features = ["sqlite"] }
 wheel-host = { path = "../wheel-host" }
 wheel-engine = { path = "../wheel-engine" }
 wheel-core = { path = "../wheel-core" }

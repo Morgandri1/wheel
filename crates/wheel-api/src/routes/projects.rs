@@ -72,6 +72,7 @@ pub async fn create(
     let caps = serde_json::to_value(Capabilities::default()).expect("capabilities serialise");
 
     let row: ProjectRow = match &state.db {
+        #[cfg(feature = "postgres")]
         Db::Pg(pool) => {
             let mut tx = pool.begin().await?;
             let row = sqlx::query_as::<_, ProjectRow>(INSERT_PROJECT)
@@ -90,6 +91,7 @@ pub async fn create(
             tx.commit().await?;
             row
         }
+        #[cfg(feature = "sqlite")]
         Db::Sqlite(pool) => {
             let mut tx = pool.begin().await?;
             let row = sqlx::query_as::<_, ProjectRow>(INSERT_PROJECT)
