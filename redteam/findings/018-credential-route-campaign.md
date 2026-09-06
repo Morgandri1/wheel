@@ -51,3 +51,22 @@
 (a provider `ANTHROPIC_API_KEY`, or a codex `CODEX_API_KEY`). A provider key vaulted under
 `CLAUDE_CODE_OAUTH_TOKEN` would be exported to peers under the wrong variable and fail auth (a foot-gun,
 not a leak). Consider keying by the credential's own env var (`token_env(kind,harness)`).
+
+## Follow-up (SDK's two post-fix targets) — source review, NO agent-reachable finding
+**auth/complete false-"rejected":** `oauth.rs complete()` captures `before = output.len()` immediately
+before writing the code, then `verdict(&mut pending, before)` scans ONLY output produced after `before`.
+So the greeting / authorize-URL (printed pre-submission, even if it contains "invalid"/"denied") cannot
+match a REJECTION_MARKER. A marker appearing post-submission would be the CLI's own response — not
+board-agent-controllable — and a false match only DENIES a login (fail-safe direction), never grants one.
+Defended.
+
+**vault expires_at hostile values:** the spawn-time gate (`supervisor::lapsed_credential`) reads the VAULT
+expiry as `wheel_core::Timestamp` (`credential_detail`→`expiry_of`), which is an RFC3339 value parsed with
+`?` at write time — an unparseable/garbage expiry is rejected when stored, not at spawn. `into_inner()` is a
+total function on an already-valid `OffsetDateTime` (no i64→time overflow/panic path here — the i64-millis
+`StoredOauth.expires_at` in auth.rs is response METADATA, not a time gate). A past/negative expiry →
+`<= now` → agent refuses to start with `needs_auth` (fail-CLOSED, recoverable by re-auth), not a permanent
+brick. And vault writes are host-realm (`PUT /v1/vault`, engine secret) storing a RAW STRING value — an
+agent cannot set a structured expiry through any route, so this is not agent-reachable. No finding.
+One thing for SDK to confirm (couldn't see it fully): which route calls `put_with_expiry` (i.e., is a vault
+expiry ever set from a value an agent influences?). If none, target 2 is moot for the agent threat model.
