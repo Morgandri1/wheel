@@ -9,6 +9,7 @@
  */
 import { ApiError, getAuthToken, notifyUnauthorized } from "@/lib/auth";
 import type { LogStreamName } from "@/lib/schema";
+import { apiBaseUrl } from "@/lib/runtime-config";
 import type {
   AuthBegin,
   AuthStatus,
@@ -24,7 +25,7 @@ import type {
   WireType,
 } from "@/lib/schema";
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787").replace(/\/$/, "");
+export { apiBaseUrl } from "@/lib/runtime-config";
 
 interface RequestOptions {
   method?: string;
@@ -45,7 +46,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}${path}`, {
+    res = await fetch(`${apiBaseUrl()}${path}`, {
       method: opts.method ?? "GET",
       headers,
       body: opts.raw ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined),

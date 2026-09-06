@@ -11,7 +11,8 @@
  * Frames are buffered and flushed once per animation frame, so a chatty agent cannot drive one
  * React commit per log line.
  */
-import { API_URL, projects } from "@/lib/api";
+import { projects } from "@/lib/api";
+import { apiBaseUrl } from "@/lib/runtime-config";
 import type { EngineFrame } from "@/lib/schema";
 
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
@@ -48,7 +49,7 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
   };
 
   const wsUrl = (ticket: string) => {
-    const base = API_URL.replace(/^http/, "ws");
+    const base = apiBaseUrl().replace(/^http/, "ws");
     return `${base}/v1/projects/${projectId}/engine/v1/events?ticket=${encodeURIComponent(ticket)}`;
   };
 

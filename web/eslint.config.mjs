@@ -19,6 +19,9 @@ const config = [
     ignores: [
       ".next/**",
       ".next-*/**",
+      // The assembled npm package: Next's own standalone server plus traced node_modules. Linting
+      // build output means thousands of findings about code we did not write.
+      "dist-pkg/**",
       "coverage/**",
       "node_modules/**",
       "public/monaco/**",

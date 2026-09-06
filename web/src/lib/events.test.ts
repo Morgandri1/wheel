@@ -16,8 +16,12 @@ const wsTicket = vi.fn(async (projectId: string) => ({
 }));
 
 vi.mock("@/lib/api", () => ({
-  API_URL: "http://api.test",
   projects: { wsTicket: (id: string) => wsTicket(id) },
+}));
+
+// The base URL is resolved at runtime now, so the socket's origin comes from here.
+vi.mock("@/lib/runtime-config", () => ({
+  apiBaseUrl: () => "http://api.test",
 }));
 
 class FakeSocket {

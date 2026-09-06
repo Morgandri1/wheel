@@ -2,7 +2,7 @@
 
 import { useSyncExternalStore } from "react";
 import { AUTH_MODE, ApiError, setTokenGetter, setUnauthorizedHandler } from "@/lib/auth";
-import { API_URL } from "@/lib/api";
+import { apiBaseUrl } from "@/lib/runtime-config";
 
 /**
  * Local email/password sessions (NEXT_PUBLIC_AUTH_MODE=local).
@@ -132,7 +132,7 @@ async function authRequest(path: string, body: unknown, token?: string): Promise
 
   let res: Response;
   try {
-    res = await fetch(`${API_URL}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+    res = await fetch(`${apiBaseUrl()}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
   } catch {
     throw new ApiError(0, "offline", "Can't reach the API. Check that it's running.");
   }
