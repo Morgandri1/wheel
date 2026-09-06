@@ -28,6 +28,7 @@ pub mod agent_routes;
 pub mod board_routes;
 pub mod cli_routes;
 pub mod events_route;
+pub mod ingress;
 mod table_routes;
 pub mod tool_routes;
 pub mod vault_routes;
@@ -44,6 +45,10 @@ pub struct AppState {
     /// Fan-out for `/v1/events`. Publishing never blocks, so a slow browser
     /// cannot stall the supervisor.
     pub events: Arc<crate::events::Bus>,
+    /// Per-caller ingress rate limit. On a public URL this and the body cap
+    /// are the only cost control, so it lives beside the state the handler
+    /// already has rather than in a lazy static nothing can reset.
+    pub ingress_rate: Arc<crate::api::ingress::RateLimiter>,
     /// Logins waiting for a pasted code. Each holds a live child process, so
     /// this is state with a cost and a TTL, not a cache.
     pub logins: Arc<crate::oauth::LoginSessions>,
@@ -133,7 +138,7 @@ async fn require_engine_secret(
     next.run(req).await
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -219,6 +224,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
         .nest("/v1/cli", cli)
+        // PUBLIC, and the only public surface: mounted outside the
+        // engine-secret layer because a webhook provider has nothing but a URL.
+        .nest("/ingress", ingress::router())
         .with_state(state)
 }
 

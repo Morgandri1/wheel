@@ -84,6 +84,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         db,
         events,
         logins: Arc::new(oauth::LoginSessions::default()),
+        ingress_rate: Arc::new(api::ingress::RateLimiter::default()),
     };
     // Before serving: agents configured to run on startup come up parked, and
     // any message left queued by the previous run resumes exactly the agents
