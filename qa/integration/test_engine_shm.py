@@ -132,6 +132,57 @@ def main():
             R.skip("ENG-concurrent-readers", "the engine never started, so there is nothing "
                                              "to read from")
             R.skip("ENG-busy-timeout-in-effect", "the engine never started")
+        # ---- an override must not be able to disable the only working recovery -------
+        #
+        # PM's lever prolonged an 80-minute outage. WHEEL_SQLITE_JOURNAL names the mode to
+        # try FIRST, and the negotiation then reuses that same `wanted` at the
+        # locking_mode=EXCLUSIVE step — so setting it to TRUNCATE collapses both attempts
+        # onto TRUNCATE and the WAL-under-EXCLUSIVE path, the one that actually works on a
+        # shm-less volume, is never reached. The deploy died with "tried TRUNCATE, then
+        # TRUNCATE" and the operator's own fix could not land.
+        #
+        # A configuration override on a RECOVERY path must be provable, not plausible: it
+        # shipped without a test that the forced value can be reached on a hostile volume,
+        # and the failure mode was silent — a lever that looks set correctly and disables
+        # the only branch that works.
+        #
+        # So: whatever this is set to, a database on this volume must still end up in a mode
+        # the filesystem can host. Every value, including nonsense.
+        for value in ("TRUNCATE", "WAL", "DELETE", "not-a-mode"):
+            vol2 = "%s-%s" % (VOL, value.lower().replace("-", ""))
+            name2 = "%s-%s" % (NAME, value.lower().replace("-", ""))
+            sh("docker", "volume", "create", vol2)
+            sh("docker", "run", "--rm", "-v", "%s:/data" % vol2, "--entrypoint", "sh",
+               "wheel-engine:test", "-c", "mkdir -p /data/wheel.db-shm")
+            port2 = free_port(0)
+            sh("docker", "run", "-d", "--name", name2, "-v", "%s:/data" % vol2,
+               "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+               "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
+               "-e", "WHEEL_VAULT_KEY=" + key,
+               "-e", "WHEEL_ROLE=engine",
+               "-e", "WHEEL_SQLITE_JOURNAL=" + value,
+               "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+               "-p", "%d:7000" % port2, "wheel-engine:test")
+            ok2 = False
+            for _ in range(40):
+                try:
+                    req = urllib.request.Request("http://127.0.0.1:%d/healthz" % port2)
+                    with urllib.request.urlopen(req, None, 3) as r:
+                        if r.status == 200:
+                            ok2 = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            said = sh("docker", "logs", "--tail", "3", name2)
+            R.gated("ENG-journal-override-cannot-disable-recovery/%s" % value.lower(),
+                    "ENG-shm/blocked", ok2,
+                    "WHEEL_SQLITE_JOURNAL=%s stopped the engine starting on a volume that "
+                    "cannot host a WAL index. An override on a RECOVERY path must not be "
+                    "able to disable the only branch that works: %s"
+                    % (value, ((said.stdout + said.stderr)[-220:])))
+            sh("docker", "rm", "-f", name2)
+            sh("docker", "volume", "rm", vol2)
     finally:
         sh("docker", "rm", "-f", NAME)
         sh("docker", "volume", "rm", VOL)

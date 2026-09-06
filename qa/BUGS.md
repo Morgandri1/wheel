@@ -893,3 +893,50 @@ the implementation just lands one level too high.
 implementation not matching its own stated intent, which is the kind that survives review
 because the reasoning next to it reads correctly.
 
+## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK
+
+`ENG-starts-without-shm` is RED against an image built from current main, i.e. **after** the fix
+that recovered production. The engine dies on a shm-less volume with:
+
+```
+wheel-engine: applying schema: attempt to write a readonly database: Error code 8
+```
+
+**Why production recovered anyway:** `e1ce934` puts `locking_mode=EXCLUSIVE` in
+`wheel-host/src/store.rs`, which keeps the WAL index in heap and never opens a `-shm`. The host
+is what opens first on the deployed machine, so the crash loop stopped. The ENGINE's own
+database path did not get the same treatment.
+
+**The defect, in `db/mod.rs::set_journal_mode`:**
+
+```rust
+let _ = conn.pragma_update(None, "journal_mode", wanted);
+let mode = current_journal_mode(conn)?;
+if mode.eq_ignore_ascii_case(wanted) { return Ok(mode); }   // <- fast path
+drain_under_exclusive_lock(conn, wanted)?;                  // <- never reached
+```
+
+On a filesystem that cannot map a `-shm`, `PRAGMA journal_mode=WAL` **reports `wal`**. Measured:
+
+```
+journal_mode after WAL attempt: wal
+first write:                    attempt to write a readonly database
+```
+
+So the fast path matches, returns `Ok`, and the drain — the whole recovery mechanism, and the
+call site SDK already knew was untested — is never reached. The failure surfaces later at
+`migrate()`, as a schema error, which is why it reads as a corrupt database rather than an
+unusable journal mode.
+
+**The read-back is the bug.** The function's own comment says "the pragma's own result is not
+evidence" and then treats a *read-back* as evidence, which sqlite is equally willing to lie
+about here. PM's earlier version proved WAL with `BEGIN IMMEDIATE; COMMIT;` — a write. That
+proof is not in this path.
+
+**Fix:** prove the mode with a write before returning on the fast path, not just after the
+drain. `drain_under_exclusive_lock` already ends with `BEGIN IMMEDIATE; COMMIT;` for exactly
+this reason.
+
+Found by the gate PM asked for, on the first run after the production fix. The host is safe;
+any project engine on such a volume is not.
+
