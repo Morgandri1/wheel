@@ -23,12 +23,28 @@ pub struct ProjectRecord {
     pub vault_key: String,
 }
 
+/// WAL where the filesystem can host its shared-memory index, a rollback journal where it cannot.
+///
+/// WAL keeps that index in a `-shm` file, and Railway's bind-mounted volume cannot resize one: the
+/// host crash-looped on every boot with "disk I/O error ... xShmMap". The pragma is not enough to
+/// find that out, because the mapping only happens on the first write lock -- so the mode is proven
+/// with an immediate transaction and abandoned if the proof fails. Slower, and it boots.
+fn set_journal_mode(conn: &Connection) -> Result<()> {
+    let wal_holds = conn.pragma_update(None, "journal_mode", "WAL").is_ok()
+        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok();
+    if !wal_holds {
+        conn.pragma_update(None, "journal_mode", "TRUNCATE")
+            .context("no usable journal mode for the host database")?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
+        set_journal_mode(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS projects (
+            "CREATE TABLE IF NOT EXISTS projects (
                id               TEXT PRIMARY KEY,
                engine_secret    TEXT NOT NULL,
                vault_key        TEXT NOT NULL,
@@ -371,5 +387,55 @@ mod tests {
         let unique = bases.len();
         bases.dedup();
         assert_eq!(bases.len(), unique, "two projects were handed the same uid");
+    }
+}
+
+#[cfg(test)]
+mod journal_mode_tests {
+    use super::*;
+
+    /// The host reconciles from this database on every boot, so a journal mode it cannot open is a
+    /// crash loop, and one it cannot write to is a host that comes up having forgotten every
+    /// project.
+    #[tokio::test]
+    async fn the_store_takes_writes_whichever_journal_mode_it_settled_on() {
+        let dir = std::env::temp_dir().join(format!("wheel-host-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.db").display().to_string();
+
+        let store = Store::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        store.upsert(&id, "engine-secret", "dmF1bHQ").await.unwrap();
+        store.set_desired_running(&id, true).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_some());
+
+        // Reopening is what a restart does, and restoring what was running is the whole job.
+        drop(store);
+        let again = Store::open(&path).unwrap();
+        assert_eq!(again.all_desired_running().await.unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A volume that cannot host a `-shm` index must not stop the host from opening its database.
+    /// The proof is a real transaction rather than the pragma's return value, because the shared
+    /// memory is mapped on the first write lock -- which is why the pragma reported success in
+    /// production while every boot then died on "disk I/O error ... xShmMap".
+    #[tokio::test]
+    async fn a_rollback_journal_is_a_working_fallback() {
+        let dir = std::env::temp_dir().join(format!("wheel-host-tr-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.db");
+
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "TRUNCATE")
+            .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path.display().to_string()).unwrap();
+        let id = Uuid::new_v4();
+        store.upsert(&id, "s", "dg").await.unwrap();
+        store.set_desired_running(&id, true).await.unwrap();
+        assert_eq!(store.all_desired_running().await.unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
