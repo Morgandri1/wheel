@@ -47,13 +47,33 @@ export function StatusBar({ nodes }: { nodes: WheelNode[] }) {
               x2="18"
               y2="2"
               stroke={WIRE_META[t].color}
-              strokeWidth="2"
+              strokeWidth={t === "write" ? "3" : "2"}
               strokeDasharray={WIRE_META[t].dash === "0" ? undefined : WIRE_META[t].dash}
             />
           </svg>
           {WIRE_META[t].label}
         </span>
       ))}
+
+      {/* Injection is drawn unlike any other wire and means something else entirely — the ctx is
+          prepended to the prompt rather than delivered as a message — so leaving it out of the
+          legend left the one wire nobody can guess unexplained. */}
+      <span className="inline-flex items-center gap-1.5" data-testid="legend-inject">
+        <svg width="18" height="4" aria-hidden>
+          <line x1="0" y1="2" x2="18" y2="2" stroke={WIRE_META.send.color} strokeWidth="4" opacity="0.28" />
+          <line
+            x1="0"
+            y1="2"
+            x2="18"
+            y2="2"
+            stroke={WIRE_META.send.color}
+            strokeWidth="1.4"
+            strokeDasharray="1 5"
+            strokeLinecap="round"
+          />
+        </svg>
+        inject
+      </span>
     </footer>
   );
 }
