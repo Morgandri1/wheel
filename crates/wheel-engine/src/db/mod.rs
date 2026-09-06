@@ -49,17 +49,25 @@ pub fn open_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// The sqlite journal mode this deployment can actually use.
+///
+/// WAL keeps its index in a `-shm` file. Railway's bind mount cannot RESIZE
+/// one — "disk I/O error ... xShmMap" — and a resize happens as the index
+/// grows, not when it is created, so no probe at open time can predict it. The
+/// filesystem is a deployment fact, so it is configuration: `WHEEL_SQLITE_JOURNAL`,
+/// WAL where nothing says otherwise.
+pub fn journal_mode() -> String {
+    std::env::var("WHEEL_SQLITE_JOURNAL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "WAL".into())
+}
+
 fn configure(conn: &Connection) -> Result<()> {
-    // WAL so a reader never blocks the delivery loop's writes, but only where
-    // the filesystem can host its shared-memory index. Railway's bind-mounted
-    // volume cannot resize a `-shm` segment ("disk I/O error ... xShmMap"),
-    // which crash-looped every host boot once the engine began opening every
-    // project's database at start-up. A rollback journal is slower and still
-    // serves several connections, which exclusive locking would not: the query
-    // path opens the file a second time.
-    let wal_holds = conn.pragma_update(None, "journal_mode", "WAL").is_ok()
-        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok();
-    if !wal_holds {
+    // A rollback journal is slower and still serves several connections, which
+    // exclusive locking would not: the query path opens the file a second time.
+    let wanted = journal_mode();
+    if conn.pragma_update(None, "journal_mode", &wanted).is_err() {
         conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -334,5 +342,28 @@ mod storage_mode_tests {
             .unwrap();
         assert_eq!(n, 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod journal_mode_tests {
+    use super::*;
+
+    /// A deployment whose volume cannot host a WAL index must be able to say so
+    /// without a code change. The engine crash-looped for 20 minutes because a
+    /// probe cannot predict a resize that happens later.
+    #[test]
+    fn the_journal_mode_is_configuration_with_wal_as_the_default() {
+        let restore = std::env::var("WHEEL_SQLITE_JOURNAL").ok();
+        unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") };
+        assert_eq!(journal_mode(), "WAL");
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "TRUNCATE") };
+        assert_eq!(journal_mode(), "TRUNCATE");
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "  ") };
+        assert_eq!(journal_mode(), "WAL", "a blank setting is not a mode");
+        match restore {
+            Some(v) => unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", v) },
+            None => unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") },
+        }
     }
 }

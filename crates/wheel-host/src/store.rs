@@ -29,7 +29,17 @@ pub struct ProjectRecord {
 /// host crash-looped on every boot with "disk I/O error ... xShmMap". The pragma is not enough to
 /// find that out, because the mapping only happens on the first write lock -- so the mode is proven
 /// with an immediate transaction and abandoned if the proof fails. Slower, and it boots.
+///
+/// `WHEEL_SQLITE_JOURNAL` skips the proof for a deployment already known to be hostile, so a volume
+/// that has failed once need not fail again on every boot to be believed.
 fn set_journal_mode(conn: &Connection) -> Result<()> {
+    if let Ok(forced) = std::env::var("WHEEL_SQLITE_JOURNAL") {
+        if !forced.trim().is_empty() {
+            conn.pragma_update(None, "journal_mode", forced.trim())
+                .context("WHEEL_SQLITE_JOURNAL names no usable journal mode")?;
+            return Ok(());
+        }
+    }
     let wal_holds = conn.pragma_update(None, "journal_mode", "WAL").is_ok()
         && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok();
     if !wal_holds {
