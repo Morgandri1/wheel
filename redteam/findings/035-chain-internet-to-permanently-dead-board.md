@@ -60,3 +60,27 @@ skipped/dead-lettered, logged, and the engine reaches a serving state without it
 stored body can crash-loop a project even if a new sink appears. And when SDK lands the endpoint delivery,
 send me the code — I will verify link 6 (does the ingress body reach `envelope()`) rather than leave it
 reasoned.
+
+## Link 5, RE-VERIFIED (PM reconciled it to "ctx reaches the sink via envelope-at-injection"; the code disagrees)
+PM pulled the production killing bytes from a CTX node's markdown (nodes table) and reasoned ctx "is injected
+into an agent as a message, so it passes through envelope()." I traced the actual delivery, caller-graph
+first, and it does NOT:
+- `compose_prompt`/`compose_preamble` (preamble.rs) is concat-only — `push_str`/`format!`, no `escape_*`, no
+  `envelope`.
+- The composed system prompt + ctx is written to `prompt.txt` (supervisor:394-395, plain `std::fs::write`,
+  "goes to a file, never argv") and passed to the harness as a FILE arg (:418). `clear_context`
+  re-injection (`:889`) calls `start()` → the same file. Never a Message.
+- Caller graph of the sink: `escape_envelope_body` ← `Message::envelope()` (message.rs:277) ←
+  `encode_turn(&msg.envelope())` at supervisor:545 — the message-DELIVERY loop, and nothing else. No
+  ctx/preamble path builds a Message or calls `envelope()`.
+**Therefore a poison in a ctx node reaches the child through a FILE, never through the escaper, and cannot
+panic at boot.** Link 5 stays NOT-A-LINK. The bytes being present in a ctx node is presence, not the panic
+carrier: the same contract text (`— `) is pasted across messages/ctx alike, and the carrier that reconcile
+replayed to death was a MESSAGE ROW (link 4), whose body IS delivered through `envelope()`. PM's SINK-LEVEL
+quarantine framing is correct and better than a message-table rule — "no content that becomes a message body
+may crash a project" — but the SET of "content that becomes a message body" is wheel-msg bodies, operator
+chat, and (future) ingress bodies; it does NOT include ctx today. If a reproducing test drives ctx→envelope,
+that path is not in the running engine — I want to see it; otherwise the guard belongs on the message-delivery
+path + the messages table, and treating ctx as the carrier would harden a surface the escaper never reads.
+(Method note: I corrected link 5 to false, weighed PM's reconciliation, and re-verified via the caller graph
+rather than accept or reject on authority — the 030 standard, applied to a correction of my own correction.)
