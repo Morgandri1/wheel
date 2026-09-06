@@ -34,3 +34,6 @@ target-cov
 # Run artifacts: engine logs kept from a failed suite. Evidence for the run that
 # produced them, meaningless to anyone else, and stale the moment it is committed.
 qa/artifacts/
+
+# Coverage instrumentation drops these beside the crate that produced them.
+*.profraw

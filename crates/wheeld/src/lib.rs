@@ -225,4 +225,18 @@ mod tests {
             .expect("stop_requested did not resolve within 5s of SIGTERM")
             .expect("the task panicked");
     }
+
+    /// `--help` and `--version` must print and exit without starting a server or touching a data
+    /// directory. A daemon that provisions state to answer `--version` is one nobody can safely ask.
+    #[tokio::test]
+    async fn help_and_version_do_nothing_but_print() {
+        let before = std::env::var("STORE").ok();
+        dispatch(config::Action::PrintUsage).await.unwrap();
+        dispatch(config::Action::PrintVersion).await.unwrap();
+        assert_eq!(
+            std::env::var("STORE").ok(),
+            before,
+            "printing usage configured something"
+        );
+    }
 }

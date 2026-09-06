@@ -145,3 +145,42 @@ async fn restart_leaves_the_engine_serving() {
     assert_eq!(sb.status(&id).await.unwrap(), Status::Running);
     sb.stop(&id).await.unwrap();
 }
+
+/// A start that never becomes healthy has to fail, and clean up after itself.
+///
+/// "Started" must mean "serving": returning Ok as soon as the task is spawned only moves the race
+/// into the caller's next request, and the host would report a project as running that answers
+/// nothing. A zero timeout is the cheapest way to stand in for an engine that is simply too slow.
+#[tokio::test]
+async fn a_start_that_never_becomes_healthy_fails_and_leaves_nothing_running() {
+    let (data, run) = dirs();
+    let sb = EmbeddedSandbox::new(data, run, Duration::ZERO);
+    let id = Uuid::new_v4();
+
+    let err = sb
+        .start(&id, &secrets())
+        .await
+        .expect_err("a start that never became healthy reported success");
+    assert!(
+        format!("{err:#}").contains("did not become healthy"),
+        "the reason has to say what did not happen: {err:#}"
+    );
+    assert_eq!(
+        sb.status(&id).await.unwrap(),
+        Status::Stopped,
+        "a failed start left an engine behind"
+    );
+}
+
+/// Stopping something that was never started is a success, like every other lifecycle call here.
+///
+/// The host calls stop on paths where it cannot know whether a start ever happened — a failed
+/// reconcile, a delete for a project whose engine died with the last process — and an error there
+/// would leave records it refuses to clean up.
+#[tokio::test]
+async fn stopping_an_engine_that_was_never_started_is_not_an_error() {
+    let sb = sandbox();
+    let id = Uuid::new_v4();
+    sb.stop(&id).await.expect("stop must be idempotent");
+    assert_eq!(sb.status(&id).await.unwrap(), Status::Stopped);
+}
