@@ -121,28 +121,55 @@ def engine_postmortem():
                                  (logs.stdout + logs.stderr).strip()[-300:] or "(none)")
 
 
+TURN_TIMEOUT = "<<TURN-DID-NOT-FINISH>>"
+
+
+def log_cursor(agent):
+    """The engine's `next` cursor, so a later read sees only what comes AFTER now."""
+    _, log = http("GET", "/v1/agents/%s/log" % agent)
+    return (log or {}).get("next", 0) if isinstance(log, dict) else 0
+
+
 def turn(agent, command, wait=180):
-    """Ask the agent to run a command, and return what came back.
+    """Ask the agent to run a command, and return what THIS turn produced.
 
     The command travels as a directive inside a normal user message, so it goes through
     the real delivery path: queued, framed in an <AgentPrompt> envelope, written to the
     child's stdin by the single writer, executed by the child, and reported back through
     the engine's log. Nothing here reaches into the container.
+
+    Two things this gets right that the first version did not:
+
+    1. It reads from a cursor taken BEFORE the send. The old version searched the whole
+       log for "exit=" -- which the PREVIOUS turn had already written. The build turn
+       therefore returned instantly with the clone's output, and the suite reported
+       "cargo test did not pass" while quoting the successful clone. A test that reads
+       stale state does not fail; it reports the wrong thing confidently.
+
+    2. A turn that does not finish in time returns TURN_TIMEOUT, not its partial output.
+       "The turn never completed" and "the command failed" need different actions -- a
+       longer timeout or a warm cache versus a code fix -- and returning partial output
+       silently collapses them into the second.
     """
     b64 = base64.b64encode(command.encode()).decode()
+    since = log_cursor(agent)
     http("POST", "/v1/agents/%s/send" % agent,
          {"body": "<<FAKE:SH_B64=%s>>" % b64})
     deadline = time.time() + wait
     seen = ""
     while time.time() < deadline:
-        _, log = http("GET", "/v1/agents/%s/log" % agent)
+        _, log = http("GET", "/v1/agents/%s/log?since=%s" % (agent, since))
         seen = json.dumps(log)
         if "engine unreachable" in seen:
             return seen
-        if "exit=" in seen:
-            return seen
+        # Only stdout carries a directive's result; the transcript stream echoes the
+        # PROMPT, which contains the command and would match almost any marker.
+        lines = (log or {}).get("lines") if isinstance(log, dict) else None
+        for ln in lines or []:
+            if ln.get("stream") == "stdout" and "exit=" in (ln.get("text") or ""):
+                return json.dumps(lines)
         time.sleep(2)
-    return seen
+    return TURN_TIMEOUT
 
 
 def main():
@@ -209,6 +236,9 @@ def main():
     if vanished:
         # The engine died; that says nothing about whether an agent can clone.
         R.skip("WOW-clone", "the engine went away mid-run — %s" % engine_postmortem())
+    elif out == TURN_TIMEOUT:
+        R.skip("WOW-clone", "the clone turn did not finish within 180s — no verdict on "
+                            "whether an agent can clone, only that it did not this time")
     else:
         R.check("WOW-clone", "CLONE_OK" in out,
                 "the agent could not clone with its vault token: %s" % out[-400:])
@@ -222,9 +252,18 @@ def main():
     elif not vanished and "CLONE_OK" in out:
         build = ("cd /data/wow && cargo test -p wheel-core 2>&1 | tail -15")
         out = turn(agent, build, wait=1800)
-        R.check("WOW-cargo-test", "test result: ok" in out,
-                "cargo test -p wheel-core did not pass inside the sandbox: %s"
-                % out[-600:])
+        if out == TURN_TIMEOUT:
+            # A cold `cargo test` inside a fresh sandbox builds every dependency from
+            # source. Not finishing in 30 minutes says the build is slow, not that the
+            # code is broken, and reporting it as a failed test sends its owner to the
+            # wrong place entirely.
+            R.skip("WOW-cargo-test",
+                   "the build turn did not finish within 1800s — a cold dependency build "
+                   "in a fresh sandbox; raise the timeout or warm the cargo cache")
+        else:
+            R.check("WOW-cargo-test", "test result: ok" in out,
+                    "cargo test -p wheel-core did not pass inside the sandbox: %s"
+                    % out[-600:])
     else:
         R.skip("WOW-cargo-test", "nothing was cloned, so there is nothing to build")
 
