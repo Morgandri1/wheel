@@ -99,6 +99,10 @@ def env_dump():
     rec = {"pid": os.getpid(), "argv0": os.path.basename(sys.argv[0]),
            "uid": os.geteuid() if hasattr(os, "geteuid") else None,
            "credentials": creds, "credential_vars_set": sorted(creds),
+           # The working directory the engine gave this child. Recorded because
+           # WHERE an agent writes is a security property: a clone landing beside
+           # the credentials directory is a finding, and nothing else observes it.
+           "cwd": os.getcwd(),
            "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
            "argv": sys.argv[1:]}
     try:

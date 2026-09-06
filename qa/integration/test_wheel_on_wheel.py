@@ -349,6 +349,51 @@ def main():
                     "uid in the sandbox, and §2 gives each agent, script and MCP child its "
                     "own." % (cargo, mode))
 
+    # ---- PM: one toolchain per project, and workspaces away from the secrets ------
+    #
+    # TOOLCHAIN SHARING (N agent nodes -> ONE toolchain, not N). Asserted on the paths the
+    # children were actually given, and on bytes: the toolchain dir must be the same for
+    # every child and must not have been copied per node. A per-node toolchain is ~1 GB
+    # each and would not fail anything — it would just quietly fill the volume.
+    homes = {}
+    for r in recs:
+        cfg = r.get("config") or {}
+        if cfg.get("RUSTUP_HOME"):
+            homes.setdefault(cfg["RUSTUP_HOME"], 0)
+            homes[cfg["RUSTUP_HOME"]] += 1
+    if not homes:
+        R.skip("WOW-toolchain-shared", "no child recorded RUSTUP_HOME")
+    else:
+        du = sh("docker", "exec", NAME, "sh", "-c",
+                "du -s -m /opt/rust 2>/dev/null | cut -f1; "
+                "find /data -maxdepth 3 -name 'toolchains' -type d 2>/dev/null | wc -l")
+        parts = du.stdout.split()
+        copies_under_data = parts[1] if len(parts) > 1 else "?"
+        R.check("WOW-toolchain-shared",
+                len(homes) == 1 and copies_under_data == "0",
+                "children were given %d distinct RUSTUP_HOME values (%s) and %s toolchain "
+                "trees exist under /data — N agents on one project must share ONE toolchain. "
+                "A per-node copy is about a gigabyte each and fails nothing; it just fills "
+                "the volume." % (len(homes), sorted(homes), copies_under_data))
+
+    # WORKSPACE vs CREDENTIALS. supervisor/mod.rs:422 sets cwd to the data dir ROOT, and
+    # creds_dir() is data_dir/creds — so an agent's `git clone` lands in the PARENT of the
+    # directory holding every node's credentials. PM's rule: a build artifact next to
+    # secrets is its own finding, and the working copy belongs under ws/<name>.
+    cwds = {r.get("cwd") for r in recs if r.get("cwd")}
+    creds = sh("docker", "exec", NAME, "sh", "-c",
+               "ls -d /data/creds 2>/dev/null || echo none").stdout.strip()
+    if not cwds:
+        R.skip("WOW-workspace-not-in-creds", "the harness did not record a working directory")
+    else:
+        bad = [c for c in cwds
+               if creds != "none" and (creds.startswith(c.rstrip("/") + "/") or c == creds)]
+        R.check("WOW-workspace-not-in-creds", not bad,
+                "the agent's working directory %s contains the credentials directory %s — a "
+                "clone or a build artifact lands in the same tree as every node's stored "
+                "credentials. §3e puts a working copy under /data/projects/<id>/ws/<name>."
+                % (sorted(bad), creds))
+
     # The token travelled through the engine; it must not have been written down.
     #
     # Gated on the log being READABLE. An unreachable engine returns an error body with

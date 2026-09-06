@@ -285,6 +285,10 @@ def env_dump(a):
                            for k, v in os.environ.items()},
            "sentinel_hits": sentinel_hits(),
            "digests": digests,
+           # The working directory the engine gave this child. Recorded because
+           # WHERE an agent writes is a security property: a clone landing beside
+           # the credentials directory is a finding, and nothing else observes it.
+           "cwd": os.getcwd(),
            "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
            "argv": sys.argv[1:]}
     try:
