@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { createProject, addNode, startProject, deleteProject } from "../api";
 import { T } from "../testids";
+import { expectHydrated } from "../hydration";
 
 const KEY = "sk-test-canary-9f3a-never-echoed";
 
@@ -38,7 +39,10 @@ test("agent api-key auth: needs_auth -> authenticate -> authenticated, key never
 
     // The plate offers the fix, not just the diagnosis.
     await page.getByTestId("node-planner-authenticate").click();
-    await expect(page.getByTestId("auth-needs-auth-callout")).toBeVisible();
+    // The callout is not decoration: it carries the button that fixes the problem it
+    // reports. Visible-but-dead would tell the operator their agent can be authenticated
+    // here and then do nothing when they try.
+    await expectHydrated(page.getByTestId("auth-needs-auth-callout"), "the needs_auth callout");
 
     const field = page.getByTestId("input-api-key");
     await expect(field).toHaveAttribute("type", "password");

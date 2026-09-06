@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { T } from "../testids";
+import { expectHydrated } from "../hydration";
 import { addNode, addWire, board, createProject, deleteProject, startProject, tryWire } from "../api";
 
 /**
@@ -23,7 +24,10 @@ test.describe("M1 vertical slice", () => {
     page.on("pageerror", (e) => errors.push(String(e)));
 
     await page.goto("/");
-    await expect(page.getByTestId(T.ctaApp)).toBeVisible();
+    // Hydration, not presence. With JS disabled this CTA is still visible, still styled,
+    // still has its text — so toBeVisible() passed for a page whose bundle never ran, which
+    // is exactly the green Web caught. expectHydrated asserts React actually attached.
+    await expectHydrated(page.getByTestId(T.ctaApp), "the landing CTA");
 
     // BUG-007's allowlist is gone: WheelMark now rounds its spoke coordinates to three decimals
     // before emitting, so the server and the browser serialise the same string by construction
@@ -36,9 +40,10 @@ test.describe("M1 vertical slice", () => {
     await page.goto("/");
     await page.getByTestId(T.ctaApp).click();
     await expect(page).toHaveURL(/\/app/);
-    await expect(
+    await expectHydrated(
       page.getByTestId(T.projectList).or(page.getByTestId(T.projectNewEmpty)),
-    ).toBeVisible();
+      "the projects list",
+    );
   });
 
   test("E2E-place-nodes + E2E-inspector: the board renders server state", async ({ page }) => {
@@ -70,7 +75,9 @@ test.describe("M1 vertical slice", () => {
 
       await startProject(project.id);
       await page.goto(`/app/${project.id}`);
-      await expect(page.getByTestId(T.board)).toBeVisible();
+      // The board is the one that matters most: a board that renders nodes but never
+      // hydrates cannot be clicked, dragged or wired, and looks entirely correct.
+      await expectHydrated(page.getByTestId(T.board), "the board canvas");
       await expect(page.getByTestId(T.node("house-style"))).toBeVisible();
       await expect(page.getByTestId(T.node("researcher"))).toBeVisible();
 
