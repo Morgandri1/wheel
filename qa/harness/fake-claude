@@ -202,7 +202,12 @@ def root_refusal_guard(a):
 # failure surfaces as needs_auth and points at the user rather than at the routing.
 CRED_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN",
              "CLAUDE_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")
-CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN", "IS_SANDBOX")
+# CARGO_HOME and RUSTUP_HOME are here because ADVERSARY 029 is about WHERE they point,
+# not whether they exist. Without recording them, WOW-toolchain-cargo-per-project could
+# only ever SKIP -- a criterion that reads as covered in the plan and never runs, which
+# is the exact shape this harness exists to make impossible.
+CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN",
+               "IS_SANDBOX", "CARGO_HOME", "RUSTUP_HOME", "HOME")
 
 def credential_class(value):
     """Name the KIND of credential without ever revealing it."""

@@ -75,7 +75,10 @@ SENTINELS = [d for d in (fake_opt("WHEEL_FAKE_ENV_SENTINELS", "env_sentinels") o
 # codex specifically — it authenticates with CODEX_API_KEY and IGNORES OPENAI_API_KEY, so a
 # key routed to the obvious-looking variable fails as "not logged in".
 CRED_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
-CONFIG_VARS = ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN", "IS_SANDBOX")
+# CARGO_HOME/RUSTUP_HOME: ADVERSARY 029 is about WHERE they point, so they have to be
+# recorded or the assertion can only ever skip.
+CONFIG_VARS = ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "WHEEL_TOKEN_FILE", "WHEEL_TOKEN",
+               "IS_SANDBOX", "CARGO_HOME", "RUSTUP_HOME", "HOME")
 
 def credential_class(v):
     if v.startswith("sk-ant-oat"): return "oauth_token"

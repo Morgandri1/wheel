@@ -72,16 +72,32 @@ def clean_env(data_dir):
 
 
 def main():
-    binary = shutil.which("wheeld") or os.path.join(ROOT, "target", "debug", "wheeld")
+    # Build into a PRIVATE target dir, and always build.
+    #
+    # ~/.cargo/config.toml points all six worktrees at one shared target-dir (contract §1,
+    # for throughput). That is fine for building and wrong for a gate: my worktree once sat
+    # on a commit before `bc2ca7a` while another agent's had already built wheel-host from
+    # after it, so this build linked THEIR newer rlib against MY older source and the
+    # compiler reported a missing field that main never had. I filed that as an S1 against
+    # API. It was my build, not their code.
+    #
+    # I had even suspected staleness and rebased first — which rules out a stale CHECKOUT
+    # and says nothing about a stale ARTIFACT. Hours earlier I had fixed exactly this for
+    # the coverage gate and did not think a shared dir could corrupt a compile.
+    #
+    # Always building also matters: taking whatever binary happens to exist means smoking a
+    # wheeld from some earlier commit and reporting it as this one's.
+    target = os.path.join(tempfile.gettempdir(), "wheeld-smoke-target")
+    build = subprocess.run(["cargo", "build", "-p", "wheeld"], cwd=ROOT,
+                           env=dict(os.environ, CARGO_TARGET_DIR=target),
+                           capture_output=True, text=True)
+    if build.returncode != 0:
+        print("could not build wheeld (isolated target dir, so this is the source, not a "
+              "mixed build): %s" % build.stderr[-500:])
+        return SKIP
+    binary = os.path.join(target, "debug", "wheeld")
     if not os.path.exists(binary):
-        build = subprocess.run(["cargo", "build", "-p", "wheeld"], cwd=ROOT,
-                               capture_output=True, text=True)
-        if build.returncode != 0:
-            print("could not build wheeld: %s" % build.stderr[-400:])
-            return SKIP
-        binary = os.path.join(ROOT, "target", "debug", "wheeld")
-    if not os.path.exists(binary):
-        print("wheeld binary not found after build")
+        print("wheeld binary not found after a successful build at %s" % binary)
         return SKIP
 
     data_dir = tempfile.mkdtemp(prefix="wheeld-smoke-")
