@@ -753,3 +753,28 @@ dependents is decoration.
 unproven, never `pass`. Same class as the vault at-rest scan reading `wheel.db` while the engine
 writes WAL: the canary was "absent" because it was in `wheel.db-wal`, and only the control
 (the key NAME was missing from the same scan) caught it.
+
+## 019 — WOW-clone: the agent's turn never reports back · OPEN · QA investigating
+
+`WOW-clone` sends the clone command as a normal user message (`<<FAKE:SH_B64=…>>`), which
+travels the real delivery path, and polls `GET /v1/agents/:id/log` for the `exit=` line the
+fake writes when the command finishes. Green: `WOW/setup`, `WOW-vault-token`,
+`WOW-no-token-in-log`. Red: `WOW-clone` — 180 s with no `exit=`, and the log holds only the
+echoed `<AgentPrompt>`, i.e. the message was delivered and nothing came back.
+
+**Not yet attributed, deliberately.** Three candidates and I have evidence for none:
+the child never ran the turn; the turn ran and its result never reached the log; or the clone
+itself hung on the network inside the sandbox. `SEC-vault-env-scope/wired` already proves the
+vault value reaches the child's environment, so a missing `GH_TOKEN` is ruled out.
+
+Next step is the engine log for a failed run, which is why 020 mattered.
+
+## 020 — The failure artifact was written after the container was destroyed · S3 · QA (mine) · CLOSED
+
+`run_suite()` saves `docker logs` to `qa/artifacts/<suite>-engine.log` before cleanup, on
+failure only. But `main()` had its own `finally: docker rm -f`, which ran first — so the
+artifact for the one run anybody would ever read it for contained 70 bytes of
+`Error response from daemon: No such container`.
+
+Two owners of teardown, and the one that ran first was the one that did not know about the
+evidence. `main()` no longer tears down; `run_suite()` owns it, capture then remove.
