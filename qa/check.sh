@@ -93,7 +93,7 @@ elif ! have cargo; then
 else
   step "rust:fmt"    cargo_locked cargo fmt --all -- --check
   step "rust:clippy" cargo_locked cargo clippy --workspace --all-targets -- -D warnings
-  step "rust:test"   cargo_locked cargo test --workspace
+  step "rust:test"   cargo_locked "$PY" qa/tools/cargo_test_gate.py cargo test --workspace
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
