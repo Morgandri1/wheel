@@ -279,36 +279,37 @@ fn shell_quote(s: &str) -> String {
 /// followed manually because a redirect is a fresh destination the caller
 /// never named, and the most useful thing an attacker can do with an allowed
 /// host is have it point them somewhere else.
-pub async fn send(p: &Prepared) -> Result<Outcome> {
-    send_inner(p, Reach::PublicOnly, CALL_TIMEOUT).await
+/// Exact `host:port` targets permitted despite the SSRF policy.
+///
+/// Empty in production — the engine refuses to boot with it set when
+/// `WHEEL_ENV=prod` — and populated only so tests and red-team probes can
+/// reach a local server. Consulted AFTER the address is resolved and pinned,
+/// so it permits ONE literal target rather than opening a range: with
+/// `127.0.0.1:8080` allowed, `127.0.0.2:8080` and `127.0.0.1:9090` are still
+/// refused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Allowlist<'a> {
+    pub targets: &'a [String],
 }
 
-/// Which destinations a send may reach.
-///
-/// `Loopback` exists ONLY so the redirect, cap and timeout behaviour can be
-/// tested against a real server — every one of those was reasoned about rather
-/// than demonstrated, which is how the two worst bugs today got in.
-///
-/// It permits LOOPBACK and nothing else: every other denial still applies, so
-/// a test can reach a server on 127.0.0.1 and still watch a redirect to the
-/// metadata endpoint be refused. A blanket allowance would have made that test
-/// prove nothing. It is not reachable from production code either — [`send`]
-/// is the only public entry point and always passes `PublicOnly`, and a test
-/// asserts that.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Reach {
-    PublicOnly,
-    #[cfg(test)]
-    Loopback,
+impl Allowlist<'_> {
+    fn permits(&self, host: &str, port: u16) -> bool {
+        let want = format!("{host}:{port}");
+        self.targets.contains(&want)
+    }
 }
 
-async fn send_inner(p: &Prepared, reach: Reach, timeout: Duration) -> Result<Outcome> {
+pub async fn send(p: &Prepared, allow: Allowlist<'_>) -> Result<Outcome> {
+    send_inner(p, allow, CALL_TIMEOUT).await
+}
+
+async fn send_inner(p: &Prepared, allow: Allowlist<'_>, timeout: Duration) -> Result<Outcome> {
     let started = std::time::Instant::now();
     let mut url = p.url.clone();
     let mut hops = 0usize;
 
     loop {
-        let (host, addr) = resolve_for(&url, reach).await?;
+        let (host, addr) = resolve_for(&url, allow).await?;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -401,10 +402,10 @@ async fn finish(
 /// looked up exactly once and the address that was checked is the address that
 /// is used.
 async fn resolve_and_check(url: &str) -> Result<(String, std::net::SocketAddr)> {
-    resolve_for(url, Reach::PublicOnly).await
+    resolve_for(url, Allowlist::default()).await
 }
 
-async fn resolve_for(url: &str, reach: Reach) -> Result<(String, std::net::SocketAddr)> {
+async fn resolve_for(url: &str, allow: Allowlist<'_>) -> Result<(String, std::net::SocketAddr)> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("bad url {url:?}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -416,12 +417,15 @@ async fn resolve_for(url: &str, reach: Reach) -> Result<(String, std::net::Socke
         .to_string();
     // Cheap literal and suffix checks first: they need no DNS and they catch
     // the obvious attempts before we ask the resolver anything.
-    if !host_permitted(reach, &host) {
-        bail!("{host} is not a reachable destination: private, loopback or internal");
-    }
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("no port for {url:?}"))?;
+    // The allowlist is keyed on the literal host:port, so it is checked with
+    // the port in hand rather than on the host alone.
+    let allowed = allow.permits(&host, port);
+    if !allowed && wheel_core::host_is_denied(&host) {
+        bail!("{host} is not a reachable destination: private, loopback or internal");
+    }
 
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.clone(), port))
         .await
@@ -430,12 +434,13 @@ async fn resolve_for(url: &str, reach: Reach) -> Result<(String, std::net::Socke
     if addrs.is_empty() {
         bail!("{host} does not resolve");
     }
-    if let Some(bad) = addrs
-        .iter()
-        .map(|a| a.ip())
-        .find(|ip| !ip_permitted(reach, *ip))
-    {
-        bail!("{host} resolves to {bad}, which is not reachable");
+    // Skipped only for an exactly-allowed target: the allowlist names one
+    // host:port, so permitting it does not widen what any other name may
+    // resolve to.
+    if !allowed {
+        if let Some(bad) = first_denied(&addrs) {
+            bail!("{host} resolves to {bad}, which is not reachable");
+        }
     }
     Ok((host, addrs[0]))
 }
@@ -461,33 +466,6 @@ fn first_denied(addrs: &[std::net::SocketAddr]) -> Option<IpAddr> {
         .iter()
         .map(|a| a.ip())
         .find(|ip| wheel_core::ip_is_denied(*ip))
-}
-
-fn host_permitted(reach: Reach, host: &str) -> bool {
-    if !wheel_core::host_is_denied(host) {
-        return true;
-    }
-    match reach {
-        Reach::PublicOnly => false,
-        // Loopback only. `169.254.169.254` is denied here exactly as it is in
-        // production, which is what makes the per-hop redirect test real.
-        #[cfg(test)]
-        Reach::Loopback => host
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(host == "localhost"),
-    }
-}
-
-fn ip_permitted(reach: Reach, ip: IpAddr) -> bool {
-    if !wheel_core::ip_is_denied(ip) {
-        return true;
-    }
-    match reach {
-        Reach::PublicOnly => false,
-        #[cfg(test)]
-        Reach::Loopback => ip.is_loopback(),
-    }
 }
 
 /// Public for tests and for the SSRF check on `mcp.url`.
@@ -1141,15 +1119,23 @@ mod send_tests {
         }
     }
 
-    async fn send_local(p: &Prepared) -> Result<Outcome> {
-        send_inner(p, Reach::Loopback, Duration::from_secs(5)).await
+    /// The allowlist names the ONE target this test server is on, exactly as
+    /// an operator or a red-team probe would set WHEEL_TOOL_ALLOW_HOST.
+    fn allow(port: u16) -> Vec<String> {
+        vec![format!("127.0.0.1:{port}")]
+    }
+
+    async fn send_via(p: &Prepared, targets: &[String]) -> Result<Outcome> {
+        send_inner(p, Allowlist { targets }, Duration::from_secs(5)).await
     }
 
     /// The control: without this the refusals below prove nothing.
     #[tokio::test]
     async fn a_call_reaches_the_server_and_returns_what_it_said() {
         let (port, seen) = fake_server(vec![json_response("200 OK", r#"{"ok":true}"#)]).await;
-        let got = send_local(&prepared(port, "/send")).await.unwrap();
+        let got = send_via(&prepared(port, "/send"), &allow(port))
+            .await
+            .unwrap();
 
         assert_eq!(got.status, 200);
         assert_eq!(got.body["ok"], true);
@@ -1176,7 +1162,9 @@ mod send_tests {
             json_response("200 OK", r#"{"ok":true}"#),
         ])
         .await;
-        let got = send_local(&prepared(port, "/first")).await.unwrap();
+        let got = send_via(&prepared(port, "/first"), &allow(port))
+            .await
+            .unwrap();
         assert_eq!(got.status, 200);
 
         let seen = seen.lock().unwrap();
@@ -1195,7 +1183,9 @@ mod send_tests {
             json_response("200 OK", "{}"),
         ])
         .await;
-        send_local(&prepared(port, "/a/b")).await.unwrap();
+        send_via(&prepared(port, "/a/b"), &allow(port))
+            .await
+            .unwrap();
         let seen = seen.lock().unwrap();
         assert!(
             seen[1].head.starts_with("POST /moved/here"),
@@ -1218,7 +1208,7 @@ mod send_tests {
         // the metadata address is refused exactly as it would be in
         // production. That is what makes this a test of the per-hop check
         // rather than of the first one.
-        let err = send_local(&prepared(port, "/start"))
+        let err = send_via(&prepared(port, "/start"), &allow(port))
             .await
             .unwrap_err()
             .to_string();
@@ -1247,7 +1237,7 @@ mod send_tests {
             json_response("200 OK", "{}"),
         ])
         .await;
-        let err = send_local(&prepared(port, "/first"))
+        let err = send_via(&prepared(port, "/first"), &allow(port))
             .await
             .unwrap_err()
             .to_string();
@@ -1260,7 +1250,10 @@ mod send_tests {
     #[tokio::test]
     async fn the_production_path_refuses_a_private_destination() {
         let (port, seen) = fake_server(vec![json_response("200 OK", "{}")]).await;
-        let err = send(&prepared(port, "/x")).await.unwrap_err().to_string();
+        let err = send(&prepared(port, "/x"), Allowlist::default())
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a reachable destination"), "{err}");
         assert!(
             seen.lock().unwrap().is_empty(),
@@ -1272,7 +1265,7 @@ mod send_tests {
     async fn a_redirect_loop_stops_at_the_limit() {
         let hops = MAX_REDIRECTS + 2;
         let (port, seen) = fake_server((0..hops).map(|_| redirect_to("/again")).collect()).await;
-        let err = send_local(&prepared(port, "/start"))
+        let err = send_via(&prepared(port, "/start"), &allow(port))
             .await
             .unwrap_err()
             .to_string();
@@ -1290,7 +1283,7 @@ mod send_tests {
             "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
         ])
         .await;
-        let got = send_local(&prepared(port, "/x")).await.unwrap();
+        let got = send_via(&prepared(port, "/x"), &allow(port)).await.unwrap();
         assert_eq!(got.status, 302);
     }
 
@@ -1300,7 +1293,7 @@ mod send_tests {
     async fn an_oversized_response_is_refused_rather_than_buffered() {
         let big = "a".repeat(MAX_RESPONSE_BYTES + 4096);
         let (port, _) = fake_server(vec![json_response("200 OK", &big)]).await;
-        let err = send_local(&prepared(port, "/big"))
+        let err = send_via(&prepared(port, "/big"), &allow(port))
             .await
             .unwrap_err()
             .to_string();
@@ -1312,7 +1305,9 @@ mod send_tests {
     async fn a_response_just_under_the_cap_is_returned() {
         let body = format!("\"{}\"", "a".repeat(64 * 1024));
         let (port, _) = fake_server(vec![json_response("200 OK", &body)]).await;
-        let got = send_local(&prepared(port, "/ok")).await.unwrap();
+        let got = send_via(&prepared(port, "/ok"), &allow(port))
+            .await
+            .unwrap();
         assert_eq!(got.status, 200);
         assert_eq!(got.bytes, body.len());
     }
@@ -1332,7 +1327,9 @@ mod send_tests {
         let started = std::time::Instant::now();
         let err = send_inner(
             &prepared(port, "/silent"),
-            Reach::Loopback,
+            Allowlist {
+                targets: &allow(port),
+            },
             Duration::from_millis(400),
         )
         .await
@@ -1350,7 +1347,9 @@ mod send_tests {
     #[tokio::test]
     async fn a_non_json_body_comes_back_as_text() {
         let (port, _) = fake_server(vec![json_response("200 OK", "not json at all")]).await;
-        let got = send_local(&prepared(port, "/text")).await.unwrap();
+        let got = send_via(&prepared(port, "/text"), &allow(port))
+            .await
+            .unwrap();
         assert_eq!(
             got.body,
             serde_json::Value::String("not json at all".into())
@@ -1381,22 +1380,71 @@ mod send_tests {
         assert!(first_denied(&[]).is_none());
     }
 
-    /// The test-only escape hatch must be unreachable from production. `send`
-    /// is the only public entry point and it always asks for PublicOnly.
-    #[test]
-    fn the_loopback_reach_is_not_reachable_from_production_code() {
-        let src = include_str!("execute.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap();
+    /// The allowlist permits ONE literal host:port. Anything else on the same
+    /// machine — another address, another port — is still refused, which is
+    /// what makes it an allowlist rather than a switch.
+    #[tokio::test]
+    async fn the_allowlist_permits_exactly_what_it_names_and_nothing_else() {
+        let (port, seen) = fake_server(vec![json_response("200 OK", "{}")]).await;
+        let targets = allow(port);
+
+        // The named target works.
+        assert!(send_via(&prepared(port, "/x"), &targets).await.is_ok());
+
+        // A different loopback ADDRESS is not the named target.
+        let other_addr = Prepared {
+            url: format!("http://127.0.0.2:{port}/x"),
+            ..prepared(port, "/x")
+        };
+        let err = send_via(&other_addr, &targets)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            !production.contains("Reach::Loopback"),
-            "production code can reach the test-only loopback allowance"
+            err.contains("not a reachable destination"),
+            "127.0.0.2: {err}"
         );
+
+        // A different PORT on the named host is not the named target either.
+        let other_port = Prepared {
+            url: format!("http://127.0.0.1:{}/x", port.wrapping_add(1)),
+            ..prepared(port, "/x")
+        };
+        let err = send_via(&other_port, &targets)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a reachable destination"),
+            "other port: {err}"
+        );
+
+        // And the metadata endpoint is never reachable, allowlist or not.
+        let metadata = Prepared {
+            url: "http://169.254.169.254/latest/meta-data/".into(),
+            ..prepared(port, "/x")
+        };
+        assert!(send_via(&metadata, &targets).await.is_err());
+
         assert_eq!(
-            production
-                .matches("send_inner(p, Reach::PublicOnly")
-                .count(),
+            seen.lock().unwrap().len(),
             1,
-            "send() must be the only production caller of send_inner"
+            "only the named target was hit"
+        );
+    }
+
+    #[test]
+    fn an_empty_allowlist_permits_nothing() {
+        let empty = Allowlist::default();
+        assert!(!empty.permits("127.0.0.1", 8080));
+        let one = vec!["127.0.0.1:8080".to_string()];
+        let a = Allowlist { targets: &one };
+        assert!(a.permits("127.0.0.1", 8080));
+        assert!(!a.permits("127.0.0.1", 8081));
+        assert!(!a.permits("127.0.0.2", 8080));
+        assert!(
+            !a.permits("localhost", 8080),
+            "no name resolution in the match"
         );
     }
 }

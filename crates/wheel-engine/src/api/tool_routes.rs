@@ -371,7 +371,13 @@ pub async fn run_operation(
     }
 
     let started = std::time::Instant::now();
-    let result = execute::send(&prepared).await;
+    let result = execute::send(
+        &prepared,
+        execute::Allowlist {
+            targets: &s.cfg.tool_allow_hosts,
+        },
+    )
+    .await;
     let (status, bytes) = match &result {
         Ok(o) => (o.status, o.bytes),
         Err(_) => (0u16, 0usize),

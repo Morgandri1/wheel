@@ -209,6 +209,46 @@ pub struct ToolConfig {
     pub operations: Vec<ToolOperation>,
 }
 
+/// Every IPv4 address an IPv6 address carries inside it.
+///
+/// ADVERSARY 026. `169.254.169.254` reached through 6to4 is the same request
+/// to the same metadata service; only the spelling differs, and a deny-list
+/// that reads the spelling rather than the destination is a deny-list an
+/// attacker chooses the spelling to defeat.
+///
+/// Returns more than one where a form carries more than one (Teredo names both
+/// a server and a client), because either would be the destination.
+pub fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Vec<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    let s = v6.segments();
+    let join = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    let mut out = Vec::new();
+
+    // ::ffff:a.b.c.d — the standard mapping.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        out.push(v4);
+    }
+    // ::a.b.c.d — deprecated IPv4-compatible, still routable by some stacks.
+    if s[..6].iter().all(|x| *x == 0) && (s[6] != 0 || s[7] != 0) {
+        out.push(join(s[6], s[7]));
+    }
+    // 2002:a.b.c.d::/48 — 6to4 carries the v4 in the two segments after 2002.
+    if s[0] == 0x2002 {
+        out.push(join(s[1], s[2]));
+    }
+    // 64:ff9b::a.b.c.d — NAT64's well-known prefix, v4 in the last 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        out.push(join(s[6], s[7]));
+    }
+    // 2001:0::/32 — Teredo. The server is bits 32..63 plain; the client is the
+    // last 32 bits, obfuscated by XOR with all-ones.
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        out.push(join(s[2], s[3]));
+        out.push(join(!s[6], !s[7]));
+    }
+    out
+}
+
 /// Hosts an outbound tool call may never reach (§3d rule 4, SSRF policy).
 ///
 /// This catches literal addresses and known-internal suffixes without doing
@@ -271,8 +311,10 @@ pub fn ip_is_denied(ip: std::net::IpAddr) -> bool {
                 || (s[0] & 0xfe00) == 0xfc00
                 // link local fe80::/10
                 || (s[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped: check the embedded v4 address
-                || v6.to_ipv4_mapped().is_some_and(|v4| ip_is_denied(IpAddr::V4(v4)))
+                // Any IPv4 hiding inside this address is judged as itself.
+                || embedded_ipv4(v6)
+                    .into_iter()
+                    .any(|v4| ip_is_denied(IpAddr::V4(v4)))
         }
     }
 }

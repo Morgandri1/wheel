@@ -140,3 +140,113 @@ fn tool_allow_hosts() -> Result<Vec<String>, ConfigError> {
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env is process-global, so these run one at a time.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// The allowlist bypasses the SSRF policy. In production that is a hole,
+    /// so it is a refusal to START rather than a warning nobody reads — the
+    /// engine failing to boot is loud, and the host reports it.
+    #[test]
+    fn the_allowlist_is_a_boot_failure_in_production() {
+        with_env(
+            &[
+                (ENV_TOOL_ALLOW_HOST, Some("127.0.0.1:8080")),
+                (ENV_ENV, Some("prod")),
+            ],
+            || {
+                let err = tool_allow_hosts().unwrap_err();
+                let msg = err.to_string();
+                assert!(matches!(err, ConfigError::AllowlistInProd(_)), "{msg}");
+                assert!(msg.contains("127.0.0.1:8080"), "name the targets: {msg}");
+                assert!(msg.contains("production"), "{msg}");
+            },
+        );
+    }
+
+    #[test]
+    fn outside_production_the_allowlist_is_accepted_as_written() {
+        with_env(
+            &[
+                (ENV_TOOL_ALLOW_HOST, Some("127.0.0.1:8080, 127.0.0.1:9090")),
+                (ENV_ENV, Some("dev")),
+            ],
+            || {
+                assert_eq!(
+                    tool_allow_hosts().unwrap(),
+                    vec!["127.0.0.1:8080".to_string(), "127.0.0.1:9090".to_string()]
+                );
+            },
+        );
+        // ...and unset is the normal case: empty, permitting nothing.
+        with_env(&[(ENV_TOOL_ALLOW_HOST, None), (ENV_ENV, None)], || {
+            assert!(tool_allow_hosts().unwrap().is_empty());
+        });
+    }
+
+    /// Exact host:port only. A bare host would permit every port on it, and a
+    /// wildcard would be a range wearing an allowlist's clothes.
+    #[test]
+    fn only_an_exact_host_and_port_is_a_valid_entry() {
+        for bad in [
+            "127.0.0.1",
+            "*:8080",
+            "127.0.0.*:8080",
+            "127.0.0.1:",
+            ":8080",
+            "127.0.0.1:http",
+        ] {
+            with_env(
+                &[(ENV_TOOL_ALLOW_HOST, Some(bad)), (ENV_ENV, Some("dev"))],
+                || {
+                    assert!(
+                        matches!(tool_allow_hosts(), Err(ConfigError::BadAllowEntry(_))),
+                        "{bad:?} should not be a valid entry"
+                    );
+                },
+            );
+        }
+    }
+
+    /// An empty or whitespace-only value is "not set", not an error — an
+    /// operator clearing the variable should not have to delete it.
+    #[test]
+    fn a_blank_value_reads_as_unset() {
+        for blank in ["", "   ", ",", " , "] {
+            with_env(
+                &[(ENV_TOOL_ALLOW_HOST, Some(blank)), (ENV_ENV, Some("prod"))],
+                || {
+                    assert!(
+                        tool_allow_hosts().unwrap().is_empty(),
+                        "{blank:?} should read as unset, even in prod"
+                    );
+                },
+            );
+        }
+    }
+}
