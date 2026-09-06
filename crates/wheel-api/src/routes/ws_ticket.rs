@@ -20,6 +20,7 @@
 //!   nothing that can open a socket.
 
 use crate::auth::ProjectScope;
+use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::extract::State;
@@ -51,16 +52,22 @@ pub async fn mint(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
     };
 
-    sqlx::query(
-        "INSERT INTO ws_tickets (ticket_hash, user_id, project_id, expires_at) \
-         VALUES ($1, $2, $3, now() + make_interval(secs => $4))",
-    )
-    .bind(hash_ticket(&ticket))
-    .bind(scope.user.id())
-    .bind(scope.project.id)
-    .bind(TICKET_TTL_SECS as f64)
-    .execute(&state.db)
-    .await?;
+    // Expiry is computed by the database, on both backends. A ticket minted against one replica
+    // and redeemed against another must agree on when it dies, and the only clock both see is the
+    // database's.
+    const PG: &str = "INSERT INTO ws_tickets (ticket_hash, user_id, project_id, expires_at) \
+         VALUES ($1, $2, $3, now() + make_interval(secs => $4::double precision))";
+    const SQLITE: &str = "INSERT INTO ws_tickets (ticket_hash, user_id, project_id, expires_at) \
+         VALUES ($1, $2, $3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || $4 || ' seconds'))";
+
+    crate::db_execute!(
+        &state.db,
+        state.db.pick(PG, SQLITE),
+        hash_ticket(&ticket),
+        scope.user.id(),
+        scope.project.id,
+        TICKET_TTL_SECS
+    )?;
 
     // The ticket itself is returned exactly here and never logged.
     Ok(Json(
@@ -83,15 +90,20 @@ pub async fn redeem(state: &AppState, ticket: &str, project_id: &Uuid) -> ApiRes
     // marked used by the time we rejected it, so anyone who could replay a ticket at the wrong
     // project could burn the legitimate owner's ticket. As a WHERE predicate, a mismatch simply
     // matches no row and consumes nothing.
-    let row: Option<(String,)> = sqlx::query_as(
-        "UPDATE ws_tickets SET used_at = now() \
+    const PG: &str = "UPDATE ws_tickets SET used_at = now() \
          WHERE ticket_hash = $1 AND project_id = $2 AND used_at IS NULL AND expires_at > now() \
-         RETURNING user_id",
-    )
-    .bind(hash_ticket(ticket))
-    .bind(project_id)
-    .fetch_optional(&state.db)
-    .await?;
+         RETURNING user_id";
+    const SQLITE: &str = "UPDATE ws_tickets SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE ticket_hash = $1 AND project_id = $2 AND used_at IS NULL \
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         RETURNING user_id";
+
+    let row: Option<(String,)> = crate::db_fetch_optional!(
+        &state.db,
+        state.db.pick(PG, SQLITE),
+        hash_ticket(ticket),
+        project_id
+    )?;
 
     // Unknown, expired, already redeemed, and wrong-project are deliberately indistinguishable.
     let Some((user_id,)) = row else {
@@ -104,9 +116,9 @@ pub async fn redeem(state: &AppState, ticket: &str, project_id: &Uuid) -> ApiRes
 }
 
 /// Delete redeemed and expired tickets. Idempotent, so every replica may run it.
-pub async fn sweep(db: &sqlx::PgPool) -> anyhow::Result<u64> {
-    let r = sqlx::query("DELETE FROM ws_tickets WHERE expires_at < now() - interval '5 minutes'")
-        .execute(db)
-        .await?;
-    Ok(r.rows_affected())
+pub async fn sweep(db: &Db) -> anyhow::Result<u64> {
+    const PG: &str = "DELETE FROM ws_tickets WHERE expires_at < now() - interval '5 minutes'";
+    const SQLITE: &str =
+        "DELETE FROM ws_tickets WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')";
+    Ok(crate::db_execute!(db, db.pick(PG, SQLITE))?)
 }

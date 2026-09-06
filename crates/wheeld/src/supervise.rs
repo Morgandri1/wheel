@@ -99,6 +99,12 @@ pub fn composed_env(data_dir: &Path, keys: &Keys, host_url: &str) -> Vec<(&'stat
         ("WHEEL_HOST_URL", host_url.to_string()),
         ("WHEEL_DATA_DIR", data_dir.display().to_string()),
         ("SANDBOX_BACKEND", "process".into()),
+        // SQLite, so a local install needs nothing installed. Postgres remains production, and
+        // setting STORE explicitly still wins — this is a default, not a restriction.
+        (
+            "STORE",
+            format!("sqlite://{}", data_dir.join("wheel.db").display()),
+        ),
     ]
 }
 
@@ -200,6 +206,16 @@ mod tests {
             "dev is what unlocks the HS256 bypass"
         );
         assert_eq!(env["SANDBOX_BACKEND"], "process");
+        assert!(
+            env["STORE"].starts_with("sqlite://"),
+            "a local install must not need a Postgres: {}",
+            env["STORE"]
+        );
+        assert!(
+            env["STORE"].contains("wheeld-x"),
+            "the database belongs in the data directory: {}",
+            env["STORE"]
+        );
         assert!(!env.contains_key("AUTH_DEV_SECRET"));
         assert!(!env.contains_key("CLERK_JWKS_URL"));
     }

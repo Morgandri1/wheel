@@ -181,3 +181,16 @@ mod tests {
         assert!(Settings::parse(["--bind"]).is_err());
     }
 }
+
+#[cfg(test)]
+mod ready_line_tests {
+    use super::super::displayable;
+
+    /// The first line a new user reads. `0.0.0.0:8080` is not something a browser can open.
+    #[test]
+    fn the_ready_line_gives_an_address_a_browser_can_open() {
+        assert_eq!(displayable("0.0.0.0:8080"), "localhost:8080");
+        assert_eq!(displayable("[::]:8080"), "localhost:8080");
+        assert_eq!(displayable("127.0.0.1:8099"), "127.0.0.1:8099");
+    }
+}

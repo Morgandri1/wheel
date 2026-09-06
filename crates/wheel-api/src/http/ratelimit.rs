@@ -10,6 +10,7 @@
 //! sustained abuse of an unauthenticated public route, not to smooth traffic. A sliding window or
 //! token bucket in redis is the upgrade path if we ever need precision.
 
+use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 use uuid::Uuid;
 
@@ -26,24 +27,28 @@ impl RateLimiter {
     }
 
     /// Count this request and reject it if the project is over budget for the current minute.
-    pub async fn check(&self, db: &sqlx::PgPool, project_id: &Uuid) -> ApiResult<()> {
+    pub async fn check(&self, db: &Db, project_id: &Uuid) -> ApiResult<()> {
         if self.limit_per_min <= 0 {
             return Ok(()); // 0 disables the limit (documented in API.md)
         }
 
-        // `date_trunc` on the server's clock, not ours: replicas must agree on window boundaries,
-        // and their local clocks may differ by seconds.
-        let hits: i64 = sqlx::query_scalar(
-            "INSERT INTO ingress_rate_limits (project_id, window_start, hits) \
+        // The window boundary comes from the DATABASE clock, not ours: replicas must agree on where
+        // a minute starts, and their own clocks may differ by seconds. That is the whole reason
+        // this statement is written per dialect — SQLite has no `date_trunc`, and `strftime` is
+        // the equivalent that keeps the boundary on the database side rather than in Rust.
+        const PG: &str = "INSERT INTO ingress_rate_limits (project_id, window_start, hits) \
              VALUES ($1, date_trunc('minute', now()), 1) \
              ON CONFLICT (project_id, window_start) \
              DO UPDATE SET hits = ingress_rate_limits.hits + 1 \
-             RETURNING hits",
-        )
-        .bind(project_id)
-        .fetch_one(db)
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("rate limit counter")))?;
+             RETURNING hits";
+        const SQLITE: &str = "INSERT INTO ingress_rate_limits (project_id, window_start, hits) \
+             VALUES ($1, strftime('%Y-%m-%dT%H:%M:00Z', 'now'), 1) \
+             ON CONFLICT (project_id, window_start) \
+             DO UPDATE SET hits = ingress_rate_limits.hits + 1 \
+             RETURNING hits";
+
+        let hits: i64 = crate::db_scalar!(db, db.pick(PG, SQLITE), project_id)
+            .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("rate limit counter")))?;
 
         if hits > self.limit_per_min {
             tracing::warn!(%project_id, hits, "ingress rate limit exceeded");
@@ -55,11 +60,10 @@ impl RateLimiter {
 
 /// Drop counter rows for windows that have closed. Cheap, and keeps the table from growing without
 /// bound. Called from the periodic maintenance task.
-pub async fn sweep(db: &sqlx::PgPool) -> anyhow::Result<u64> {
-    let r = sqlx::query(
-        "DELETE FROM ingress_rate_limits WHERE window_start < now() - interval '10 minutes'",
-    )
-    .execute(db)
-    .await?;
-    Ok(r.rows_affected())
+pub async fn sweep(db: &Db) -> anyhow::Result<u64> {
+    const PG: &str =
+        "DELETE FROM ingress_rate_limits WHERE window_start < now() - interval '10 minutes'";
+    const SQLITE: &str =
+        "DELETE FROM ingress_rate_limits WHERE window_start < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')";
+    Ok(crate::db_execute!(db, db.pick(PG, SQLITE))?)
 }

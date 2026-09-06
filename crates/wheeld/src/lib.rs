@@ -130,6 +130,17 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
     })
 }
 
+/// `0.0.0.0:8080` is not an address a browser can open; say `localhost` instead.
+fn displayable(bind: &str) -> String {
+    match bind
+        .strip_prefix("0.0.0.0:")
+        .or_else(|| bind.strip_prefix("[::]:"))
+    {
+        Some(port) => format!("localhost:{port}"),
+        None => bind.to_string(),
+    }
+}
+
 async fn serve_api(bind: &str) -> Result<()> {
     let cfg = wheel_api::config::Config::from_env().context("api configuration")?;
     let http = wheel_api::boot::http_client(&cfg)?;
@@ -142,7 +153,9 @@ async fn serve_api(bind: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(%bind, "wheel is ready — open http://localhost:8080");
+    // The real address, not a guessed one: --bind exists, and telling someone to open a port the
+    // process is not listening on is the least helpful possible first line.
+    tracing::info!("wheel is ready — open http://{}", displayable(bind));
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -22,6 +22,7 @@ fn base_env() {
     std::env::set_var("WHEEL_HOST_URL", "http://host.internal:7100");
     std::env::set_var("WHEEL_HOST_SECRET", "host-secret");
     std::env::remove_var("AUTH_DEV_SECRET");
+    std::env::remove_var("STORE");
     std::env::remove_var("WHEEL_ENV");
     // AUTH_MODE is required in prod (see the assertions at the end of this test); the interlock
     // cases below are about AUTH_DEV_SECRET, so give them a valid mode to isolate what they check.
@@ -203,6 +204,44 @@ fn dev_secret_interlock_and_config_validation() {
 
     std::env::remove_var("SESSION_SECRET");
     std::env::remove_var("AUTH_MODE");
+
+    // --- the store URL --------------------------------------------------------------------------
+    // STORE is the name that says what it is now that Postgres is not the only answer, but every
+    // deployed service sets DATABASE_URL and must keep booting.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::set_var("STORE", "sqlite:///tmp/wheel-config-test.db");
+    assert_eq!(
+        Config::from_env().unwrap().database_url,
+        "sqlite:///tmp/wheel-config-test.db",
+        "STORE must win when both are set"
+    );
+
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::remove_var("STORE");
+    assert!(
+        Config::from_env()
+            .unwrap()
+            .database_url
+            .starts_with("postgres://"),
+        "DATABASE_URL must still work on its own"
+    );
+
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "local");
+    std::env::remove_var("STORE");
+    std::env::remove_var("DATABASE_URL");
+    let e = Config::from_env().unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("STORE") && msg.contains("sqlite://"),
+        "with neither set, the error should name both options: {msg}"
+    );
+    std::env::remove_var("STORE");
 
     // --- ADVERSARY 017: no stub identity provider in production ---------------------------------
     // A mock issuer does not fail closed. It authenticates everyone, as whoever the caller says

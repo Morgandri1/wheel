@@ -8,6 +8,7 @@
 //! matters: a password spray from many addresses against one account. Limiting the account being
 //! attacked is what actually protects it.
 
+use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 
 #[derive(Clone)]
@@ -24,7 +25,7 @@ impl AuthLimiter {
         }
     }
 
-    pub async fn check_login(&self, db: &sqlx::PgPool, email: &str) -> ApiResult<()> {
+    pub async fn check_login(&self, db: &Db, email: &str) -> ApiResult<()> {
         if self.login_per_15min <= 0 {
             return Ok(());
         }
@@ -40,7 +41,7 @@ impl AuthLimiter {
         Ok(())
     }
 
-    pub async fn check_signup(&self, db: &sqlx::PgPool) -> ApiResult<()> {
+    pub async fn check_signup(&self, db: &Db) -> ApiResult<()> {
         if self.signups_per_hour <= 0 {
             return Ok(());
         }
@@ -58,27 +59,31 @@ impl AuthLimiter {
     ///
     /// Fixed windows admit the usual boundary burst — up to twice the limit across two adjacent
     /// windows. Accepted: this exists to stop sustained guessing, not to shape traffic.
-    async fn bump(&self, db: &sqlx::PgPool, key: &str, window_secs: i64) -> ApiResult<i64> {
-        sqlx::query_scalar(
-            "INSERT INTO auth_attempts (key, window_start, attempts) \
-             VALUES ($1, to_timestamp(floor(extract(epoch from now()) / $2) * $2), 1) \
+    async fn bump(&self, db: &Db, key: &str, window_secs: i64) -> ApiResult<i64> {
+        // Both forms floor the database clock's epoch into a window of `$2` seconds. Written twice
+        // because SQLite has neither `to_timestamp` nor `extract`, and computing the boundary in
+        // Rust instead would put replica clock skew into a security control.
+        const PG: &str = "INSERT INTO auth_attempts (key, window_start, attempts) \
+             VALUES ($1, to_timestamp(floor(extract(epoch from now()) / $2::double precision) * $2::double precision), 1) \
              ON CONFLICT (key, window_start) \
              DO UPDATE SET attempts = auth_attempts.attempts + 1 \
-             RETURNING attempts",
-        )
-        .bind(key)
-        .bind(window_secs as f64)
-        .fetch_one(db)
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("auth rate limit")))
+             RETURNING attempts";
+        const SQLITE: &str = "INSERT INTO auth_attempts (key, window_start, attempts) \
+             VALUES ($1, CAST((CAST(strftime('%s','now') AS INTEGER) / $2) * $2 AS TEXT), 1) \
+             ON CONFLICT (key, window_start) \
+             DO UPDATE SET attempts = auth_attempts.attempts + 1 \
+             RETURNING attempts";
+
+        crate::db_scalar!(db, db.pick(PG, SQLITE), key, window_secs)
+            .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("auth rate limit")))
     }
 }
 
 /// Drop counters for windows that have closed.
-pub async fn sweep(db: &sqlx::PgPool) -> anyhow::Result<u64> {
-    let r =
-        sqlx::query("DELETE FROM auth_attempts WHERE window_start < now() - interval '2 hours'")
-            .execute(db)
-            .await?;
-    Ok(r.rows_affected())
+pub async fn sweep(db: &Db) -> anyhow::Result<u64> {
+    const PG: &str = "DELETE FROM auth_attempts WHERE window_start < now() - interval '2 hours'";
+    // The sqlite window_start is an epoch-second string, so the cutoff is one too.
+    const SQLITE: &str =
+        "DELETE FROM auth_attempts WHERE CAST(window_start AS INTEGER) < CAST(strftime('%s','now','-2 hours') AS INTEGER)";
+    Ok(crate::db_execute!(db, db.pick(PG, SQLITE))?)
 }

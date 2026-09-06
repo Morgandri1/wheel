@@ -36,6 +36,8 @@ impl Env {
 pub struct Config {
     pub env: Env,
     pub bind_addr: String,
+    /// Where the API keeps projects, users and sessions. `postgres://…` in production;
+    /// `sqlite://…` for a local install, where there is nothing to install and one writer.
     pub database_url: String,
 
     // Auth
@@ -191,7 +193,13 @@ impl Config {
         let cfg = Config {
             env,
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
-            database_url: var("DATABASE_URL")?,
+            // STORE first, DATABASE_URL second. The new name says what it is — Postgres is no
+            // longer the only answer — and the old one keeps every existing deployment booting.
+            database_url: match std::env::var("STORE") {
+                Ok(s) if !s.trim().is_empty() => s,
+                _ => var("DATABASE_URL")
+                    .context("set STORE (postgres://… or sqlite://…), or DATABASE_URL")?,
+            },
             // Only meaningful under AUTH_MODE=jwks; blank is fine and expected under local.
             clerk_jwks_url: var_or("CLERK_JWKS_URL", ""),
             clerk_issuer: var_or("CLERK_ISSUER", ""),

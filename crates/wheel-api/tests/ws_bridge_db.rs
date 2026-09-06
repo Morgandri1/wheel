@@ -41,14 +41,11 @@ async fn mock_engine_ws() -> String {
 }
 
 /// Serve the real API router on a port, since a websocket upgrade cannot go through `oneshot`.
-async fn serve_api(engine: String) -> Option<(String, sqlx::PgPool)> {
+async fn serve_api(engine: String) -> Option<(String, wheel_api::db::Db)> {
     let url = db_url()?;
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
+    let db = wheel_api::db::Db::connect(&url)
         .await
-        .expect("connect");
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        .expect("connect and migrate");
 
     let state = AppState::new(Inner {
         jwks: wheel_api::auth::jwks::JwksCache::new(

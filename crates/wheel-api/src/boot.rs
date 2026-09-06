@@ -6,6 +6,7 @@
 //! test can reach it.
 
 use crate::config::Config;
+use crate::db::Db;
 use crate::orchestrator::{host::HostClient, Orchestrator};
 use crate::state::{AppState, Inner};
 use anyhow::{Context, Result};
@@ -62,25 +63,22 @@ pub fn http_client(cfg: &Config) -> Result<reqwest::Client> {
         .context("building the http client")
 }
 
-pub async fn connect_and_migrate(cfg: &Config) -> Result<sqlx::PgPool> {
-    let db = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&cfg.database_url)
-        .await
-        .context("connecting to postgres")?;
-    sqlx::migrate!("./migrations")
-        .run(&db)
-        .await
-        .context("running migrations")?;
-    Ok(db)
+pub async fn connect_and_migrate(cfg: &Config) -> Result<Db> {
+    Db::connect(&cfg.database_url).await
 }
 
-pub async fn build_state(cfg: Config, db: sqlx::PgPool, http: reqwest::Client) -> AppState {
+pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState {
     let jwks = crate::auth::jwks::JwksCache::new(cfg.clerk_jwks_url.clone(), http.clone());
-    // Priming is best-effort: the identity provider may be briefly unreachable at boot, and the
-    // cache refetches on demand, so a cold start should not become an outage.
-    if let Err(e) = jwks.prime().await {
-        tracing::warn!(error = ?e, "could not prime JWKS at startup; will fetch on first request");
+    // Only when an external provider is actually in use. Under AUTH_MODE=local there is no JWKS
+    // URL to fetch, and priming one anyway made every local boot print a warning about a failure
+    // that cannot matter — the first thing a new user sees, and entirely misleading.
+    //
+    // Where it does apply, priming is best-effort: the provider may be briefly unreachable at
+    // boot and the cache refetches on demand, so a cold start should not become an outage.
+    if cfg.auth_mode == crate::config::AuthMode::Jwks {
+        if let Err(e) = jwks.prime().await {
+            tracing::warn!(error = ?e, "could not prime JWKS at startup; will fetch on first request");
+        }
     }
     let orch = build_orchestrator(&cfg, http.clone());
     let ingress_limiter = crate::http::ratelimit::RateLimiter::new(cfg.ingress_rate_per_min);
@@ -101,7 +99,7 @@ pub async fn build_state(cfg: Config, db: sqlx::PgPool, http: reqwest::Client) -
 ///
 /// Safe to run in every replica: both sweeps are idempotent deletes of already-expired rows, so
 /// concurrent runs cost a little duplicated work and nothing else. No leader election needed.
-pub async fn run_maintenance_once(db: &sqlx::PgPool) {
+pub async fn run_maintenance_once(db: &Db) {
     if let Err(e) = crate::http::ratelimit::sweep(db).await {
         tracing::warn!(error = ?e, "rate limit sweep failed");
     }
@@ -110,7 +108,7 @@ pub async fn run_maintenance_once(db: &sqlx::PgPool) {
     }
 }
 
-pub fn spawn_maintenance(db: sqlx::PgPool, every: Duration) -> tokio::task::JoinHandle<()> {
+pub fn spawn_maintenance(db: Db, every: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(every);
         loop {
