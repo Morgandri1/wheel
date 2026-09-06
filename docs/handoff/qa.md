@@ -18,19 +18,31 @@ does not name, and it reads Playwright specs as well as Python.
 
 ## IN FLIGHT
 
-- **BUG-022 (S1, SDK)** — `ENG-starts-without-shm` is RED. `wheel_sqlite::set_journal_mode`
-  takes its fast path on a **read-back**, so on a volume that cannot map a `-shm` the engine
-  exits 1 in `migrate()`. The host is safe (`open_configured(path, true)` falls through to an
-  EXCLUSIVE escape); the engine passes `false`, because `tables::query` opens the file a second
-  time, so the read-back is its *entire* protection. Fixture: `qa/fixtures/wal_blocked_shm.py`.
+- **BUG-022 — CLOSED** (`1163cc9`). `try_mode` now proves the mode with `mode_holds`
+  (`BEGIN IMMEDIATE; COMMIT;`) before the fast path returns, for both callers. Verified by
+  reproducing the exact scenario (a directory blocking `-shm`) at the crate level against
+  `wheel-sqlite::open_configured(path, false)` — falls back to `truncate`, write succeeds.
+  **Not verified through the docker fixture** (`qa/fixtures/wal_blocked_shm.py`,
+  `ENG-starts-without-shm`) — this session's sandbox has no `docker` binary at all. Whoever
+  next has docker access should run that fixture before treating the image-level gate as
+  proven rather than "consistent with the fix from two independent crate-level checks" (mine
+  and SDK's).
 - `WOW-table-survives-restart` — RED by design, reproduces a real S1. Goes green when the table
   is re-ensured. Its companion asserts the rebuilt table takes the node's **configured columns**;
   a table rebuilt from a default schema passes the first and fails the second.
-- `make check` — `cargo fmt` (11 diffs in wheel-engine + wheel-sqlite, SDK's) and `wheeld` at
-  89.61%, a third of a point under.
+- `make check` on `origin/main` (`1aa77ac`, then re-checked after rebasing to `340f318`) is
+  green modulo `rust:coverage` and `qa:image-contents`, both `n/a` locally by design (opt-in /
+  needs a built image) — **when the environment is configured correctly** (see TRAPS below for
+  what "correctly" meant here). `cargo fmt` is clean on both SHAs I checked; the 11-diff state
+  this doc listed earlier is not reproducible on current main.
 - **GREEN as of today, and verified not-vacuous**: `wheel-on-wheel` 7 passed / **0 skipped** —
   an agent cloned this repo with a vault-held token and compiled `wheel-core` inside its own
   sandbox, with ADVERSARY 029's toolchain constraints asserted at runtime.
+- CI itself is noisy right now: `gh run list --branch main` is a mix of `in_progress` and
+  `failure` almost continuously, because merges are landing every few minutes. A single red
+  run on `main` is not evidence by itself — read which job failed and on which SHA before
+  reporting it; `integration (docker)` and `wheel-on-wheel` were red for reasons already
+  tracked here, independent of whatever landed most recently.
 
 ## NEXT (in order, each with its gate)
 
