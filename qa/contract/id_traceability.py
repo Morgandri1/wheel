@@ -20,9 +20,16 @@ SKIP = 77
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 PLAN = os.path.join(ROOT, "docs", "TESTPLAN.md")
 SUITES = [os.path.join(ROOT, "qa", "integration"), os.path.join(ROOT, "qa", "contract")]
+# The Playwright specs assert criteria too, and until now this gate did not read them: it
+# printed "every asserted ID is in the plan" while scanning only the Python suites. Three
+# E2E-oauth-* IDs were added and the gate stayed green with none of them in TESTPLAN. A
+# gate whose scope is narrower than its claim is the same failure it exists to prevent.
+E2E_SUITES = [os.path.join(ROOT, "qa", "e2e", "tests")]
 
 # `R.check("ID", ...)` / `R.skip("ID", ...)` — the two ways a suite claims an ID.
 CALL = re.compile(r'R\.(?:check|skip)\(\s*"([^"]+)"')
+# Playwright: test("ID: prose", ...). The ID is the leading token before the colon.
+E2E_CALL = re.compile(r'\btest\(\s*["`]([A-Za-z][A-Za-z0-9-]*)\s*:')
 # An ID assembled at runtime cannot be traced: `SEC-child-env-no-%s` matches nothing in the
 # plan and reports nothing missing, so two S1 criteria sat in a suite and NOT in TESTPLAN
 # with both this gate and a reader of the plan reporting all clear. Interpolating a
@@ -76,6 +83,22 @@ def main():
             src = open(os.path.join(d, name)).read()
             synthetic += synthetic_ids(name, src)
             for raw in CALL.findall(src):
+                tid = normalise(raw)
+                if tid is None or PLUMBING.match(tid):
+                    continue
+                checked += 1
+                if tid.split("/")[0] not in known and tid not in known:
+                    missing.setdefault(tid, []).append(name)
+
+    for d in E2E_SUITES:
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".ts"):
+                continue
+            files += 1
+            src = open(os.path.join(d, name)).read()
+            for raw in E2E_CALL.findall(src):
                 tid = normalise(raw)
                 if tid is None or PLUMBING.match(tid):
                     continue

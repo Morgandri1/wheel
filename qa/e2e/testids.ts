@@ -43,7 +43,12 @@ export const T = {
   nodeDelete: (name: string) => `btn-delete-${name}`,
   wire: (id: string) => `wire-${id}`,
   wireOption: (type: string) => `wire-option-${type}`,
-  wireLegend: "wire-legend",
+  // Web renders one legend entry per wire type plus a distinct one for ctx injection
+  // (board/status-bar.tsx), not a single "wire-legend" container. That name was mine and
+  // Web never adopted it; it sat here unused, so no spec ever failed on it and only
+  // qa:testid-parity noticed. A selector nothing references still has to be true.
+  wireLegendFor: (type: string) => `legend-${type}`,
+  wireLegendInject: "legend-inject",
   widePopover: "wire-popover",
 
   // the UI's channel for a refused action (illegal wire, engine refusal)
@@ -91,16 +96,15 @@ export const T = {
   authOauth: "btn-auth-oauth",
   nodeAuthenticate: (name: string) => `node-${name}-authenticate`,
 
-  // DEFERRED(M2): the engine's OAuth flow (§4 auth/begin device_code | paste_code).
-  // Web ships M1 as API-key-only and disables btn-auth-oauth with an M2 title; these
-  // are the selectors the paste-code/device-code UI will need. testid_parity treats a
-  // DEFERRED block as "not yet rendered, and that is expected" — and FAILS when one
-  // starts being rendered, which is the signal to write the E2E test.
-  // DEFERRED-BEGIN
+  // The engine's OAuth flow (§4 auth/begin | auth/complete). These were DEFERRED(M2)
+  // while Web shipped M1 as API-key-only; components/inspector/oauth-panel.tsx now
+  // renders them, qa:testid-parity went red on exactly that transition, and the test it
+  // was asking for is qa/e2e/tests/oauth-panel.spec.ts. The marker expired by breaking,
+  // which is the only way a marker expires reliably.
+  authPasteCode: "auth-paste-code",
   authLink: "auth-link",
   authCodeInput: "input-auth-code",
   authUserCode: "auth-user-code",
-  // DEFERRED-END
 
   // local email/password auth (§2 AUTH_MODE=local). Web's names, from their f6a02d2.
   // Only the `local-auth` Playwright project uses these: NEXT_PUBLIC_AUTH_MODE is inlined
