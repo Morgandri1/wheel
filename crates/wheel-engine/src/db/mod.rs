@@ -50,10 +50,18 @@ pub fn open_memory() -> Result<Connection> {
 }
 
 fn configure(conn: &Connection) -> Result<()> {
-    // WAL so a reader never blocks the delivery loop's writes.
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    // Set per connection, and node deletion relies on ON DELETE CASCADE, so
-    // this is load-bearing rather than tuning.
+    // WAL so a reader never blocks the delivery loop's writes, but only where
+    // the filesystem can host its shared-memory index. Railway's bind-mounted
+    // volume cannot resize a `-shm` segment ("disk I/O error ... xShmMap"),
+    // which crash-looped every host boot once the engine began opening every
+    // project's database at start-up. A rollback journal is slower and still
+    // serves several connections, which exclusive locking would not: the query
+    // path opens the file a second time.
+    let wal_holds = conn.pragma_update(None, "journal_mode", "WAL").is_ok()
+        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok();
+    if !wal_holds {
+        conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
+    }
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -281,5 +289,50 @@ mod tests {
         // Uniqueness is enforced in the engine, but a bug there must not be
         // able to produce two nodes answering to one address.
         assert!(insert("n2", "notes").is_err());
+    }
+}
+
+#[cfg(test)]
+mod storage_mode_tests {
+    use super::*;
+
+    /// The engine opens a project database more than once -- `tables::query`
+    /// opens the file by path -- so any scheme that makes the first connection
+    /// exclusive locks the agent-facing query path out. I shipped exactly that
+    /// mistake while chasing the shared-memory crash; this is the guard.
+    #[test]
+    fn a_second_connection_can_read_while_the_first_is_open() {
+        let dir = std::env::temp_dir().join(format!("wheel-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        let first = open(&path).unwrap();
+        first.execute("CREATE TABLE t (a TEXT)", []).unwrap();
+        first.execute("INSERT INTO t VALUES ('x')", []).unwrap();
+
+        let second = Connection::open(&path).unwrap();
+        let n: i64 = second
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .expect("a second connection must be able to read the project database");
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A database whose journal mode had to fall back is still writable. The
+    /// deployed volume forces this path; a fallback that cannot take writes
+    /// would trade a crash loop for a silent read-only engine.
+    #[test]
+    fn a_rollback_journal_database_still_takes_writes() {
+        let dir = std::env::temp_dir().join(format!("wheel-db-tr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        let conn = open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "TRUNCATE").unwrap();
+        conn.execute("CREATE TABLE t (a TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES ('y')", []).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
