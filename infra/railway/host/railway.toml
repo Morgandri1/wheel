@@ -21,3 +21,11 @@ restartPolicyMaxRetries = 10
 #   WHEEL_HOST_SECRET  — shared with the API; must never appear in a sandbox's environment
 #   SANDBOX_BACKEND    — "process" in production (no docker daemon on Railway); "docker" locally
 #   WHEEL_DATA_DIR     — /data
+
+# Verifying F015 (child env inheritance) on this backend, since there is no docker exec here:
+#   railway ssh --service wheel-host
+#   # find an engine-spawned harness child, then read its environ AS ITS OWN UID — container root
+#   # cannot (no CAP_SYS_PTRACE), which is itself part of the answer:
+#   setpriv --reuid=$UID --regid=$UID --clear-groups cat /proc/$PID/environ | tr '\0' '\n'
+# Expected, and asserted on 2026-09-06 at be4c678: CLAUDE_CONFIG_DIR, HOME, IS_SANDBOX, PATH, TMPDIR
+# and nothing else — no WHEEL_ENGINE_SECRET, no WHEEL_VAULT_KEY, no WHEEL_HOST_SECRET, no RAILWAY_*.
