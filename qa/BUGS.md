@@ -904,7 +904,33 @@ the implementation just lands one level too high.
 implementation not matching its own stated intent, which is the kind that survives review
 because the reasoning next to it reads correctly.
 
-## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK
+## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK · CLOSED 2026-09-06
+
+**Closed on `1163cc9`** (`try_mode` in `crates/wheel-sqlite/src/lib.rs` now calls `mode_holds`,
+which proves the mode with `BEGIN IMMEDIATE; COMMIT;` before the fast path is allowed to
+return — not a read-back). `set_journal_mode`'s fast path (line 67) and its two escalations
+all route through the same `mode_holds`, so the engine's `allow_exclusive=false` call gets the
+identical proof the host's `true` path always had; the asymmetry this bug reported is gone.
+
+**Verified independently, not from the fix landing.** I could not rebuild `wheel-engine:test`
+to re-run the docker fixture (`qa/fixtures/wal_blocked_shm.py`, `qa:ENG-starts-without-shm`) —
+this sandbox has no `docker` binary at all, not just a stale image. Instead I reproduced
+BUG-022's exact scenario at the crate level, the same way SDK did from their own sandbox: a
+real directory sitting at `<db>-shm` (so sqlite can never map shared memory), opened through
+`wheel_sqlite::open_configured(path, false)` — the engine's own call shape, non-exclusive —
+against current `origin/main` (`1aa77ac`). Result: falls back to `truncate`, and a real
+`CREATE TABLE`/`INSERT` write succeeds. That is BUG-022's own reproduction recipe, run to the
+same conclusion by a method independent of SDK's.
+
+**What is still owed:** `qa/integration/test_engine_shm.py` / `ENG-starts-without-shm` itself
+has not gone green under my hand — it needs a rebuilt `wheel-engine:test` image and a docker
+daemon, neither available here. SDK's incoming crate-level unit test (no docker) will cover
+the same failure mode as permanent regression coverage; this crate-level check is not a
+replacement for eventually confirming the docker fixture on a host that has docker, and
+whoever next has docker access should do that pass before treating the image-level gate as
+proven rather than "consistent with the fix" from two independent crate-level checks.
+
+---
 
 `ENG-starts-without-shm` is RED against an image built from current main, i.e. **after** the fix
 that recovered production. The engine dies on a shm-less volume with:
@@ -969,7 +995,6 @@ a second line of defence; the engine calls it with `false` — it cannot take th
 because `tables::query` opens it a second time — so for the engine the read-back is the *entire*
 protection, and on a database that does report `wal` there is none.
 
-
 ## 023 — `free_port(0)` handed back port 0, and four gates failed against a healthy engine · S2 · QA (mine) · CLOSED
 
 **TESTPLAN:** `ENG-journal-override-cannot-disable-recovery/*`
@@ -1030,7 +1055,6 @@ conditions I will ever have, and mine was wrong twice over in ways that both rea
 new gate is not finished when it is green. It is finished when I have watched it go red against
 the defect it names.
 
-
 ## 025 — `make check` reported `main` red on a run that never happened · S2 · QA (mine) · CLOSED
 
 **TESTPLAN:** the merge gate itself
@@ -1086,3 +1110,138 @@ one, so the two views disagree by construction for any value outside the bounds.
 
 The gate deliberately asserts **agreement** (write response == later board refetch) rather than
 the arithmetic, so it will go green on any implementation that is internally consistent.
+
+---
+
+## 027 — `ENG-journal-override-cannot-disable-recovery` red on a live engine, not reproducible at the crate level · **S2** · SDK · OPEN, root cause not yet located
+
+**Renumbered from 023 to 025 to 027** — a concurrent QA session filed 023 (`free_port(0)`) and
+024 (the panic gates) first; both landed on `main` before this branch first rebased onto it,
+forcing 023→025. A second rebase then collided with `main`'s own real 025 (`make check` gate)
+and 026 (Position-integer-cell), both filed by concurrent sessions in the time this branch sat
+unmerged — forcing 025→027. See 023 for
+a directly relevant finding: `free_port(0)` returning literal port `0` made the SAME
+`ENG-journal-override-cannot-disable-recovery/*` submodes fail this test's own harness bug
+(probing `http://127.0.0.1:0/healthz`) rather than the engine — fixed there. This entry is
+about what remained true once a real port was probed: see PM's follow-up (PR #12, `sdk`) for
+the actual root cause SDK found once the harness bug was out of the way — a redundant journal
+renegotiation in `db::open()` that doubles the slow-escalation attempts past this fixture's
+timeout budget, not a correctness defect in the escalation logic itself. That matches this
+entry's own finding below (every value succeeds at the crate level — this was never a logic
+bug reachable without measuring elapsed time against a real timeout).
+
+PM: main's integration job is red on `9c793c3` (fresh, not stale) — all four
+`ENG-journal-override-cannot-disable-recovery/*` submodes (`qa/integration/test_engine_shm.py`,
+added by `94072d8`) fail against a real `wheel-engine:test` container on the shm-blocked
+volume: `WHEEL_SQLITE_JOURNAL` set to `TRUNCATE`, `WAL` or `DELETE` still stops the engine
+starting; `not-a-mode` is presumably rejected outright (see note below on whether that one is
+actually a bug).
+
+**I could not run the docker fixture myself to see the live failure** — this sandbox has no
+`docker` binary — so I cannot name the exact line yet. What I *could* do is the same
+crate-level technique that closed BUG-022: reproduce the engine's exact call sequence against
+`wheel-sqlite` directly, on a directory blocking `-shm`, with `WHEEL_SQLITE_JOURNAL` forced to
+each value. `crates/wheel-engine/src/db/mod.rs::open()` does two things in order that matter
+here — `wheel_sqlite::open_configured(path, false)` (line 28), then `configure(&conn)` which
+calls `wheel_sqlite::configure_journal(&conn)` **again on the same, already-configured
+connection** (line 58) — a second negotiation the crate-level check for BUG-022 never
+exercised. Reproducing exactly that two-step sequence:
+
+```
+WHEEL_SQLITE_JOURNAL=TRUNCATE  -> configure_journal (2nd call) ok, mode=truncate, write_ok=true
+WHEEL_SQLITE_JOURNAL=WAL       -> configure_journal (2nd call) ok, mode=truncate, write_ok=true
+WHEEL_SQLITE_JOURNAL=DELETE    -> configure_journal (2nd call) ok, mode=delete,   write_ok=true
+```
+
+All three succeed, including a real write, on current `origin/main`. So **`wheel-sqlite`'s own
+logic — `open_configured`, `configure_journal`, the double-call pattern `db::open()` uses — is
+not where this fails.** The live failure PM/SDK are seeing must come from further down
+`db::open()`'s sequence than I can reach without a real engine binary: `migrate()`'s
+`schema.sql` batch, `ensure_node_tables`/`board::ensure_tables`, or the SECOND connection
+`tables::query` opens (which does not go through `open_configured` at all, per the comment at
+`db/mod.rs:24-26`, and so gets none of the escalation). That second connection is my leading
+suspect and the next thing I'd check with docker access: does it open plainly
+(`Connection::open`) without ever negotiating a journal mode, and if so, does *its* first
+write or read hit the "attempt to write a readonly database" error BUG-022 originally
+reported, now one layer further in?
+
+**Separately, worth a ruling before this closes:** the test's own docstring says "whatever
+this is set to, the database must still end up in a mode the filesystem can host — every
+value, including nonsense." But `wheel_sqlite::validate_mode_name` deliberately hard-fails a
+name sqlite has never heard of, immediately, by design (its own doc comment: "loud and
+immediate for a name that cannot work anywhere, patient escalation for a name that cannot work
+here") — precisely so a typo in `WHEEL_SQLITE_JOURNAL` cannot silently settle on the wrong mode.
+If `not-a-mode` refusing to start is the observed failure for that submode specifically, that
+may be the validator working as designed, not a bug, and the test's expectation for that one
+value may need to change rather than the code. I have not seen the live output for this
+submode and am flagging it rather than asserting either way.
+
+**Next step:** whoever has docker access should rebuild `wheel-engine:test` from current main
+and get `docker logs` for the TRUNCATE case specifically (the simplest of the three, and the
+one the original outage was about) — that error message will say which write is failing where
+my crate-level reach stops.
+
+---
+
+## 028 — A table node's sqlite table is not re-ensured on a LIVE read, only at boot · **S1** · SDK
+
+**Renumbered from 024 to 026 to 028** — first collided with a concurrent QA session's unrelated
+023/024 (free_port(0), the panic gates), both already on `main` by the time this branch first
+rebased (024→026); a second rebase then collided with `main`'s own real 026
+(Position-integer-cell), filed by a concurrent session while this branch sat unmerged
+(026→028).
+
+Distinct from the W1 fix (`0692797`, `board::ensure_tables` wired into engine boot) — this is
+the same defect's live half, and boot-time healing does not cover it.
+
+**Repro** (`qa/integration/test_engine_validation.py`, `WOW-table-survives-restart`, no engine
+restart involved): create a `table` node, write a row through the normal API, then — with the
+engine **still running** — drop the underlying `t_<name>` sqlite table out of band (`docker
+exec` + `python3 -c "sqlite3...DROP TABLE"`, since the image carries no `sqlite3` binary).
+Immediately `GET /v1/tables/:id/rows` on the still-running engine.
+
+**Expected:** the node is still on the board, so the engine re-ensures its table the way it
+does at boot, and the read returns empty (or the table is silently rebuilt) rather than
+surfacing a database implementation detail about a node the API is still showing the user.
+
+**Actual (per PM, main red on `9c793c3`):** the read fails — `board::ensure_tables` only runs
+at `db::open()` (engine boot), so a table dropped while the process is already up stays
+missing until the next restart. The companion assertion,
+`WOW-table-survives-restart/columns`, additionally requires that whatever table comes back
+accepts the node's **configured** columns, not a default schema — the same distinction W1's
+gate made, so a fix that merely `CREATE TABLE IF NOT EXISTS`s a bare table without columns
+would pass the first half and fail the second.
+
+**Why S1 and why this is not "the same bug, already fixed":** a restart is one way a project's
+tables can vanish under a node that still exists; an out-of-band drop, a bad migration, or
+disk corruption caught mid-write are others, and none of them wait for a restart to be
+noticed. §3's contract is that a node's wire set is its capability set and the board is
+authoritative for what exists — an agent (or the UI) reading a table node that is still on the
+board must not be told `no such table` about it.
+
+**Likely fix shape:** the read path (`tables::list_rows` / whatever backs `GET
+/v1/tables/:id/rows`, and the CLI's `wheel read <table>`) calls `tables::ensure` (the
+non-destructive one — `tables::create` is destructive, per SDK's own trap note on W1) before
+querying, the same way boot does, rather than assuming a table that exists at boot still
+exists now. I have not located the exact call site — this needs docker to reproduce and a
+debugger or targeted logging to confirm the read path never re-ensures — filing so the gate
+(already written, already red) is tracked as the system of record rather than only visible in
+a CI run someone has to go find.
+
+**CONFIRMED, no longer theoretical** — PM pulled CI run `34047133420` (SDK's PR #12, which
+attempts a self-heal fix for this bug) and the `columns` half fails for real, exactly as
+predicted above:
+
+```
+FAIL WOW-table-survives-restart/columns "the table came back but would not accept its own
+configured columns (404) — it was recreated from something other than the node config"
+```
+
+So PR #12's self-heal does re-ensure a table on a live read (the first half, `/026` itself,
+presumably now green — PM has not said otherwise), but rebuilds it from something other than
+the node's `TableConfig` — a bare `CREATE TABLE` or a default schema, not the configured
+columns. PM is holding #12 out of `main` until SDK rebuilds from the real `TableConfig`
+columns rather than fixing the read path's existence and stopping there. Still needs a
+docker-capable session to locate the exact call site; the CI log now says precisely what
+that session should look for (a table recreated with the wrong shape, not merely a missing
+one).
