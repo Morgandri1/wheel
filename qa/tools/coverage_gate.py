@@ -18,9 +18,25 @@ SKIP = 77
 MIN = float(os.environ.get("COV_MIN", "90"))
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
+def _engine_image_exists():
+    try:
+        return subprocess.run(["docker", "image", "inspect", "wheel-engine:test"],
+                              capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+# crate -> (reason, expiry prose, expired?) where expired? is a PREDICATE, not a promise.
+#
+# An exemption whose expiry is only written down expires when somebody remembers, which is
+# never. wheel-engine's said "expires when the engine is bootable / wheel-engine:test
+# exists" -- and that image has existed for some time, with the whole integration suite
+# running against it, while the exemption quietly went on hiding the largest crate in the
+# workspace at 71%. The condition has to be executable or it is decoration.
 EXEMPT = {
     "wheel-engine": ("scaffolding; not yet bootable",
-                     "expires when the engine is bootable / wheel-engine:test exists"),
+                     "expires when the engine is bootable / wheel-engine:test exists",
+                     _engine_image_exists),
 }
 
 def db_gated_crates():
@@ -174,7 +190,17 @@ def main():
         covered, total = per[crate]
         pct = (100.0 * covered / total) if total else 100.0
         ex = EXEMPT.get(crate)
-        if crate in needs_db:
+        if ex and ex[2]():
+            # The condition the exemption named has come true. This is a ruling for PM to
+            # renew or retire -- not something this gate may quietly keep honouring, and
+            # not something it may silently drop either.
+            fails.append("%s is EXEMPT on a condition that has now been MET (%s). It reads "
+                         "%.2f%%. Renew the exemption with a new expiry or retire it; the "
+                         "gate will not keep hiding the crate on an expired promise."
+                         % (crate, ex[1], pct))
+            print("  EXPIRED %-13s %6.2f%%  (%d/%d)  exemption no longer applies"
+                  % (crate, pct, covered, total))
+        elif crate in needs_db:
             inconclusive.append(
                 "%s reads %.2f%% here, but its *_db.rs suites skipped (TEST_DATABASE_URL "
                 "unset) — this number describes this machine, not the crate" % (crate, pct))
