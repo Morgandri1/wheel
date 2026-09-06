@@ -31,6 +31,16 @@ pub enum NameError {
     BadChar(char),
     #[error("{0:?} is a reserved name")]
     Reserved(String),
+    #[error(
+        "a table node's name becomes the sqlite table `t_<name>`, so it cannot contain {0:?} \
+         (use '_' instead)"
+    )]
+    TableBadChar(char),
+    #[error(
+        "a table node's name becomes the sqlite table `t_<name>`, so it must start with a \
+         lowercase letter, got {0:?}"
+    )]
+    TableBadFirstChar(char),
 }
 
 /// A validated node name. Construct with [`NodeName::new`]; it is impossible to
@@ -89,6 +99,26 @@ pub fn validate_name(raw: &str) -> Result<(), NameError> {
 
     if RESERVED_NAMES.contains(&raw) {
         return Err(NameError::Reserved(raw.to_string()));
+    }
+    Ok(())
+}
+
+/// A table node's name is stricter than a node address: it becomes the sqlite
+/// identifier `t_<name>`, so it must already be one (§3, PM ruling
+/// 2026-09-06): `^[a-z][a-z0-9_]{0,62}$`.
+///
+/// Refused rather than rewritten. Silently turning `table-1` into `table_1`
+/// would give the operator a node at an address they did not choose, and every
+/// `wheel read table-1` afterwards would fail for a reason nothing explains.
+pub fn validate_table_name(raw: &str) -> Result<(), NameError> {
+    validate_name(raw)?;
+    match raw.chars().next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        Some(c) => return Err(NameError::TableBadFirstChar(c)),
+        None => return Err(NameError::Empty),
+    }
+    if let Some(c) = raw.chars().find(|c| *c == '-') {
+        return Err(NameError::TableBadChar(c));
     }
     Ok(())
 }
@@ -438,5 +468,49 @@ mod tests {
         assert!(NameError::Reserved("user".into())
             .to_string()
             .contains("user"));
+    }
+
+    /// PM ruling: a table node's name must already be a sqlite identifier, and
+    /// is REFUSED rather than rewritten. Silently turning `table-1` into
+    /// `table_1` would put the node at an address the operator did not choose,
+    /// and every `wheel read table-1` afterwards would fail for a reason
+    /// nothing explains.
+    #[test]
+    fn a_table_node_name_must_already_be_a_sqlite_identifier() {
+        for ok in ["notes", "my_notes", "t2", "a"] {
+            assert!(validate_table_name(ok).is_ok(), "{ok:?} should be allowed");
+        }
+
+        // Legal as a NODE name, illegal as a TABLE node — which is the whole
+        // reason this is a separate rule rather than a tightening of the one
+        // every node shares.
+        for raw in ["my-notes", "a-b"] {
+            assert!(NodeName::new(raw).is_ok(), "{raw:?} is a legal node name");
+            assert_eq!(validate_table_name(raw), Err(NameError::TableBadChar('-')));
+        }
+        for raw in ["1notes", "0"] {
+            assert!(NodeName::new(raw).is_ok(), "{raw:?} is a legal node name");
+            assert!(matches!(
+                validate_table_name(raw),
+                Err(NameError::TableBadFirstChar(_))
+            ));
+        }
+
+        // Everything the ordinary rule rejects is still rejected.
+        assert_eq!(validate_table_name(""), Err(NameError::Empty));
+        assert_eq!(
+            validate_table_name("user"),
+            Err(NameError::Reserved("user".into()))
+        );
+        assert_eq!(validate_table_name("A"), Err(NameError::BadFirstChar('A')));
+    }
+
+    #[test]
+    fn the_table_name_error_says_what_to_do_instead() {
+        let e = validate_table_name("my-notes").unwrap_err().to_string();
+        assert!(e.contains("t_<name>"), "{e}");
+        assert!(e.contains("'_'"), "the fix must be named: {e}");
+        let e = validate_table_name("1notes").unwrap_err().to_string();
+        assert!(e.contains("lowercase letter"), "{e}");
     }
 }

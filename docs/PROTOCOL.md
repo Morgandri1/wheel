@@ -931,6 +931,17 @@ impossible in JSON Schema, and two params with the same name are prevented at co
 **A field the board owns is REFUSED when an agent names it, never ignored.** Ignoring it would let an
 agent believe it had set an authorization header the operator actually controls.
 
+### Table node names
+
+A `table` node's name becomes the sqlite table `t_<name>`, so it must already BE an identifier:
+**`^[a-z][a-z0-9_]{0,62}$`** — stricter than the name rule every other node type follows, which permits `-`
+and a leading digit. `table-1` is a legal node name and an illegal table node.
+
+It is **refused, never rewritten**. Silently turning `table-1` into `table_1` would put the node at an
+address the operator did not choose, and every `wheel read table-1` afterwards would fail for a reason
+nothing explains. The error names the fix. Web should validate the same rule in the inspector so the
+refusal arrives while the operator is still typing.
+
 ### Import limits
 
 `raw` is capped at **2 MiB**. Separately, **YAML anchors and aliases are refused** (`400 invalid`, naming

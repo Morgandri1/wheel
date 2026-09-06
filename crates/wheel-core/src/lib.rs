@@ -34,7 +34,9 @@ pub use message::{
     escape_envelope_body, sha256_hex, Message, MessageReceipt, MessageSender, MessageState,
     MAX_MESSAGE_BODY,
 };
-pub use name::{validate_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES};
+pub use name::{
+    validate_name, validate_table_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES,
+};
 pub use node::{
     AgentConfig, Budget, ChestConfig, Column, ColumnType, CtxConfig, EndpointAuth, EndpointConfig,
     Harness, HttpMethod, McpConfig, McpTransport, Node, NodeConfig, NodeType, Position,
