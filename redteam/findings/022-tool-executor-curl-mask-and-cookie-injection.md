@@ -71,3 +71,15 @@ object/array where the spec implied a string (no schema validation yet). It cann
 body fill (those are separate top-level keys, `:139`), but it injects arbitrary JSON structure into the
 outbound body → downstream injection (e.g. NoSQL operator objects) depending on the target API. Validate
 agent body values against the parameter schema.
+
+## Update (2026-09-06) — header-CRLF now EXPLICITLY defended (was reasoned-only); cookie fixed
+Header-CRLF-at-send, which I'd flagged as reasoned-not-demonstrated (reqwest-only), is now belt-and-suspenders
+(commit 054335b): `execute.rs:328` bails before setting a header if its value contains `\r`, `\n`, or `\0` —
+"header {k} contains a line break or a null, which would let its value add another header" — naming the header,
+on top of reqwest's own rejection. Agent cannot inject a header NAME (names come from operator-defined
+`op.params`, not args). SDK's regression test `a_header_value_cannot_inject_another_header` asserts on a REAL
+parsed header line (`has_header_line`), NOT a substring — correct, because an ENCODED value would substring-match
+and give a false pass. Cookie values are now `encode()`d (`ParamLocation::Cookie => encode(value)`), closing
+022/2. Both halves of 022 are fixed. NOTE: a live end-to-end run of the :328 bail through `/v1/tools/:id/call`
+is still gated on finding 027 (no creatable allowlisted target), but the defense is explicit + unit-tested, so
+this is no longer a critical gap — only the redirect-no-replay/cap/timeout e2e-via-route remain 027-blocked.
