@@ -22,20 +22,27 @@ fn sigterm_stops_a_daemon_with_a_project_running() {
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wheeld"))
-        .args([
-            "--data-dir",
-            &dir.display().to_string(),
-            "--bind",
-            &format!("127.0.0.1:{port}"),
-        ])
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("wheeld starts");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wheeld"));
+    cmd.args([
+        "--data-dir",
+        &dir.display().to_string(),
+        "--bind",
+        &format!("127.0.0.1:{port}"),
+    ])
+    .env_clear()
+    .env("PATH", std::env::var("PATH").unwrap_or_default())
+    .env("HOME", std::env::var("HOME").unwrap_or_default())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    // `env_clear` is deliberate — this daemon must not inherit a test's DATABASE_URL or the
+    // harness's own environment — but `cargo llvm-cov` proves this binary ran at all by an env var,
+    // and clearing it silently made this whole subprocess (the composed `run`, `serve_api`, and the
+    // SIGTERM handler this test exists to exercise) invisible to coverage. `%p` in the value is
+    // filled in by the profiling runtime with the child's own pid, so parent and child never collide.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut child = cmd.spawn().expect("wheeld starts");
 
     let client = reqwest::blocking::Client::new();
     let deadline = Instant::now() + Duration::from_secs(60);
