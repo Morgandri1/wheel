@@ -415,7 +415,7 @@ GET    /healthz
 | `wheel-host` | **Railway, in its OWN Railway project** (separate private network from the API + Postgres — ADVERSARY finding 003), exactly 1 replica, the biggest machine available | Runs every project's engine + agents as `process` sandboxes. Railway volume mounted at `/data`. Reached by the API over its Railway-issued HTTPS domain with `WHEEL_HOST_SECRET` bearer + TLS (private networking does not cross projects); the host accepts nothing without that bearer. Agents inside sandboxes therefore cannot reach Postgres or API internals at all — only the host's own `:7100` (bearer-gated) and the public internet. Built from `docker/Dockerfile.host` (root inside the container so it can `setuid` per project; drops to the project uid for every child). |
 
 Local dev = `infra/docker-compose.yml`: postgres + api + host (host with `SANDBOX_BACKEND=docker` and the docker socket mounted, OR `process` to mirror prod).
-Railway config lives in `infra/railway/<service>/railway.toml` (or `railway.json`); one Railway service per piece; the web is not on Railway.
+Railway config lives in `infra/railway/settings.json (applied by infra/railway/apply-settings.sh; railway.toml is deprecated by Railway and not read)` (or `railway.json`); one Railway service per piece; the web is not on Railway.
 Residual risks to track (ADVERSARY): all tenants share one kernel; per-uid egress filtering (nftables `owner` match / per-project netns) is
 possible only if the Railway container has `CAP_NET_ADMIN` or unprivileged user namespaces — API runs a **capability spike** on Railway
 (`capsh --print`, `unshare -rn true`, `mount -o remount,hidepid=2 /proc`) and we adopt whichever isolation the platform actually grants;
@@ -437,7 +437,7 @@ point of failure (v1 accepts this; host reconciles on restart).
   - API: `process` backend in `wheel-host` (uid per project from a fixed range, `/data/projects/<id>` 0700, setuid/setgid + cleared
     supplementary groups + no_new_privs, rlimits nproc/fsize/nofile, engine on `/run/wheel/<id>/engine.sock`, reconcile on boot);
     Railway project `wheel` with services `wheel-api` (2 replicas, public domain), `wheel-host` (1 replica, volume at `/data`, no domain),
-    `postgres`; env per `infra/railway/*/railway.toml`; deploy via `railway` CLI (logged in on this host). Locally the process backend is
+    `postgres`; env per `infra/railway/settings.json`; deploy via `railway` CLI (logged in on this host). Locally the process backend is
     exercised by running the host image itself with `SANDBOX_BACKEND=process` (one container = the Railway service).
   - SDK: engine `WHEEL_LISTEN=unix://…` mode verified end-to-end (healthz over the socket, control plane, ingress), runs correctly as a
     dropped uid, honours `WHEEL_DATA_DIR`; then API-key agent auth so hosted agents can actually run.
@@ -458,6 +458,18 @@ point of failure (v1 accepts this; host reconciles on restart).
     (an agent with a vault-provided token clones the repo and runs `cargo test -p wheel-core`).
   - PM: `docs/WHEEL-ON-WHEEL.md` — the bootstrap board (nodes, wires, system prompts, run_on_startup flags) and `infra/bootstrap-board.sh`
     that creates it through the public API; secrets are entered by the operator through the vault inspector, never committed.
+- **M1.7 — OPEN-SOURCE LOCAL RUN (operator requirement).** Wheel is open source; anyone must be able to run it on a laptop or their own
+  cloud cluster from the README. Two artefacts:
+  - **`wheeld`** — ONE executable (Rust) that runs the API + host + engines in a single process: `AUTH_MODE=local`, a **sqlite** store for the
+    API (`STORE=sqlite://./wheel.db`; Postgres stays the production option), the `process` sandbox backend by default (docker if a daemon is
+    present and `--sandbox docker`), embedded migrations, one `--data-dir`, sensible defaults so `wheeld` with no flags serves `http://localhost:8080`.
+    Owners: API (composition binary, sqlite store, config), SDK (engine/host embedding, process backend without root: per-user fallback that
+    documents the reduced isolation). Headless users never need the web app: the `wheel` CLI + `wheeld` are enough.
+  - **`wheel-web`** — ONE command for the web app: `npx wheel-web` (or `pnpm dlx`) runs a prebuilt Next standalone server against
+    `WHEEL_API_URL` (default `http://localhost:8080`), no build step, no repo checkout. Owner: Web (standalone build, npm package, version pinned to the API).
+  - README documents: run locally (`wheeld` + optional `wheel-web`), run on your own cloud (Railway from this repo; any VM/k8s from the two
+    Dockerfiles with Postgres), and the auth/credential model. Owner: PM (README), each team for its section. QA: a `local-run` smoke that
+    boots `wheeld` from a clean checkout and completes signup → project → agent → message.
 - **M2 — All node types + full wire matrix + ingress + vault/chest/table/script/mcp + `tool` (spec import, fills, executor, MCP exposure) + ephemeral context + run_on_startup.**
 - **M3 — Hardening (red-team findings fixed), `process` sandbox backend on Railway, landing page, deploy (Railway ×2 + Vercel), docs.**
 
