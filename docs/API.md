@@ -176,8 +176,13 @@ curl -X POST https://api.wheel.dev/v1/projects \
 ```
 `201` → `Project`. Name is 1–64 characters, no control characters. Generates the project's engine
 secret and vault key, stores them encrypted (AES-256-GCM under `API_MASTER_KEY`), registers the
-sandbox with the host, and returns before the sandbox is necessarily running — poll `GET` for
-`status`.
+sandbox with the host, **and starts it** — a new project comes back `running` and its engine answers
+immediately (`ARCHITECTURE.md` §6 M1: "create project → sandbox starts").
+
+The create still succeeds if the sandbox does not come up: the row exists, so `201` is the honest
+answer, and the returned `status` is `error` rather than `stopped`. Retry with `POST
+/v1/projects/{id}/start`. A `status` of `starting` means the host accepted the start but the engine
+had not reported healthy when we looked — poll `GET`.
 
 ### `GET /v1/projects`
 `200` → `[Project]`, newest first. Only the caller's own projects. `x-project-id` not required.

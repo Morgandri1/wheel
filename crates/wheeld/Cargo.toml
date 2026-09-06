@@ -25,9 +25,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
 rand = "0.8"
+sha2 = "0.10"
+libc = "0.2"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde_json = { workspace = true }
