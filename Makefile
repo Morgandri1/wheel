@@ -83,6 +83,9 @@ clean: ## remove build artefacts
 # --- SDK: images -----------------------------------------------------------
 .PHONY: engine-image engine-image-test image-verify-prod
 
+facts: ## PM ticket A7 — measure disk, memory and toolchain from INSIDE running sandboxes
+	@python3 qa/tools/sandbox_facts.py
+
 engine-image: ## build wheel-engine:dev (production layout)
 	docker build -f docker/Dockerfile.host -t wheel-engine:dev .
 
