@@ -38,6 +38,13 @@ pub struct HostState {
     /// Throttles failed bearer attempts per peer (ADVERSARY: :7100 needs a rate limit as well as
     /// a constant-time compare).
     pub auth_limiter: Arc<auth_limit::AuthLimiter>,
+    /// False until boot reconciliation has finished.
+    ///
+    /// The host has to answer the platform's health check within seconds of starting, but it also
+    /// must not serve project routes while it is still working out which sandboxes it owns — a
+    /// request answered mid-reconcile sees a host that has forgotten them. So liveness is immediate
+    /// and project routes are 503 until this flips.
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Build the sandbox backend named by configuration.
@@ -77,6 +84,9 @@ pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
             .build()
             .context("building the engine http client")?,
         auth_limiter: std::sync::Arc::new(auth_limit::AuthLimiter::new(cfg_auth_failure_budget())),
+        // Flipped by `serve` once reconcile finishes. An embedder that builds state directly and
+        // never reconciles (wheeld) opens the routes itself.
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -365,12 +375,22 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let bind = cfg.bind_addr.clone();
     let state = build_state(cfg)?;
 
-    // Before the listener, not after: a request that arrives while projects are still being
-    // restored would see a host that has forgotten every sandbox it owns.
-    reconcile_on_boot(&state).await;
-
+    // Listen first. Reconciling fourteen projects takes longer than the platform's health-check
+    // window, and a host that is stopped for failing that check is a host that never reconciles at
+    // all. Project routes stay 503 until `ready` flips, so nothing is served from a half-restored
+    // view; only liveness answers early, which is all the checker asks.
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(addr = %bind, "listening");
+
+    let reconciling = state.clone();
+    tokio::spawn(async move {
+        reconcile_on_boot(&reconciling).await;
+        reconciling
+            .ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("reconcile complete; project routes are open");
+    });
+
     serve_on(listener, state).await
 }
 
@@ -384,6 +404,32 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: HostState) -> an
     )
     .await?;
     Ok(())
+}
+
+/// Refuse project routes until boot reconciliation has finished.
+///
+/// A 503 with `Retry-After` is the honest answer: the host is up, it does not yet know which
+/// sandboxes it owns, and the caller should come back. Answering them anyway would report projects
+/// as stopped that are in fact running, and the API would faithfully relay that to the user.
+async fn require_ready(
+    State(state): State<HostState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if state.ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "2")],
+        Json(json!({
+            "error": {
+                "code": "starting",
+                "message": "The host is still restoring projects from its last run.",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Assemble the host router. Split out of `main` so tests can drive the real routes — including
@@ -406,6 +452,12 @@ pub fn build_router(state: HostState) -> Router {
             "/host/v1/projects/{id}/ingress/{*rest}",
             any(proxy::ingress),
         )
+        // Ready-gate inside the bearer layer: an unauthenticated caller learns nothing about
+        // whether we are still starting, because it never gets past the bearer.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_ready,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

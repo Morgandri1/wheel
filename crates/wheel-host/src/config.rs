@@ -109,7 +109,15 @@ impl Config {
         };
 
         Ok(Config {
-            bind_addr: var_or("BIND_ADDR", "0.0.0.0:7100"),
+            // BIND_ADDR wins if set; otherwise $PORT, which is what the platform's health
+            // checker probes. Binding 7100 while the platform checks $PORT means every probe
+            // reaches nothing, the replica is declared unhealthy and the container is stopped —
+            // which has taken this service down twice, once per health-check path tried.
+            bind_addr: match (std::env::var("BIND_ADDR"), std::env::var("PORT")) {
+                (Ok(a), _) if !a.trim().is_empty() => a,
+                (_, Ok(p)) if !p.trim().is_empty() => format!("0.0.0.0:{}", p.trim()),
+                _ => "0.0.0.0:7100".to_string(),
+            },
             secret,
             backend,
             data_dir: var_or("WHEEL_DATA_DIR", "/data"),

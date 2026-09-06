@@ -155,6 +155,7 @@ fn harness_at(
         store: store.clone(),
         http: reqwest::Client::new(),
         auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     (build_router(state), calls, store, path)
 }
@@ -731,6 +732,7 @@ async fn boot_rewrites_a_stored_vault_key_the_engine_could_not_decode() {
         store: store.clone(),
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     wheel_host::reconcile_on_boot(&state).await;
 
@@ -760,6 +762,7 @@ async fn the_server_boots_and_serves_the_real_router() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -860,6 +863,7 @@ async fn reconcile_survives_a_database_it_cannot_read() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     break_the_database(&path);
 
@@ -869,4 +873,88 @@ async fn reconcile_survives_a_database_it_cannot_read() {
         calls.lock().unwrap().started.is_empty(),
         "nothing can be restored from a database that cannot be read"
     );
+}
+
+/// Liveness answers before reconcile finishes; project routes do not.
+///
+/// Both halves are the outage. The host bound its port only after restoring every project, which
+/// takes longer than the platform's 30s health-check window, so the replica was declared unhealthy
+/// and stopped — and a host that is stopped for failing a health check never reconciles at all.
+/// Serving project routes early would have been the opposite mistake: reporting projects as
+/// stopped that are in fact running, which the API relays to the user as fact.
+#[tokio::test]
+async fn liveness_answers_while_still_starting_but_project_routes_do_not() {
+    let (_, _, store) = harness(FakeSandbox::new());
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(FakeSandbox::new()),
+        store,
+        http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        // Still reconciling.
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let ready = state.ready.clone();
+    let app = wheel_host::build_router(state);
+
+    let (status, body) = call(&app, "GET", "/healthz", None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "liveness must not wait for reconcile"
+    );
+    assert_eq!(body["ok"], serde_json::json!(true));
+
+    let id = Uuid::new_v4();
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a project route answered from a half-restored view"
+    );
+    assert_eq!(body["error"]["code"], serde_json::json!("starting"));
+
+    // And they open once reconcile is done.
+    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown project, but served");
+}
+
+/// Starting-up must not be observable without the bearer: the ready gate sits inside the bearer
+/// layer, so an unauthenticated caller gets 401 either way.
+#[tokio::test]
+async fn starting_up_is_not_visible_to_an_unauthenticated_caller() {
+    let (_, _, store) = harness(FakeSandbox::new());
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(FakeSandbox::new()),
+        store,
+        http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let app = wheel_host::build_router(state);
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!("/host/v1/projects/{}", Uuid::new_v4()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

@@ -33,7 +33,9 @@
         "Cargo.lock",
         "docker/Dockerfile.host",
         "docker/entrypoint.sh"
-      ]
+      ],
+      "healthcheckPath": "/healthz",
+      "healthcheckTimeout": 300
     }
   }
 }

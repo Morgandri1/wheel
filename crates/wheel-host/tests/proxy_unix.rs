@@ -136,6 +136,7 @@ async fn harness() -> (Router, Uuid, Seen, std::path::PathBuf) {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(1_000)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     (build_router(state), id, seen, socket)
 }
@@ -264,6 +265,7 @@ async fn a_socket_with_nothing_listening_is_an_enveloped_502() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(1_000)),
+        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     let app = build_router(state);
 
