@@ -60,3 +60,20 @@ needs a COMBINED host+engine RUNTIME image (docker/Dockerfile.host) running in S
 today only a source/cargo test image (wheel-roottest) and an engine-only runtime image (wheel-engine:test,
 no wheel-host) exist. STAGED; runs the moment a combined runtime image is available (or hand it the env
 WHEEL_HOST_CONTAINER/WHEEL_UID_A/WHEEL_PID_A/WHEEL_PID_B in API/QA's harness).
+
+## Process backend — production confirmation (2026-09-05, relayed by API/SDK, citation-verified)
+A production pass on the Railway `process` backend reports child pid 326 running at the SAME uid as its
+engine (21088). Verified this is the **documented, accepted intra-project M3 gap** (PROTOCOL.md:549: "all
+of a project's children share one uid" until M3 for the process backend) — NOT a regression. F015 also
+confirmed fixed in production: pid 326's environ read as its own uid = `CARGO_HOME CLAUDE_CONFIG_DIR HOME
+IS_SANDBOX PATH TMPDIR WHEEL_ENGINE_URL WHEEL_NODE WHEEL_TOKEN_FILE` — no `WHEEL_ENGINE_SECRET`, no
+`WHEEL_VAULT_KEY`, token via file.
+
+**Distinction that matters (and the one still-open live item):** "child shares its engine's uid" is the
+*intra-project* gap (a compromised child can reach sibling tokens within the same project — accepted,
+time-boxed). The *cross-PROJECT* boundary is separate and load-bearing: **one uid per project** +
+**unix-socket tenant boundary** (SO_PEERCRED, admits only its own uid + root; PROTOCOL:109-115,
+process.rs:1). That cross-tenant separation is what `redteam/pocs/child-isolation/t_process_backend_isolation.py`
+must still exercise LIVE — now runnable on the production process backend using **two of my OWN projects**
+(within PM's prod ROE: own accounts only, no other users' data). Premise for it is now confirmed: same-project
+children do share a uid, so the test is squarely whether project A's uid is denied project B's socket/data/proc.
