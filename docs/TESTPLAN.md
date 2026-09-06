@@ -381,11 +381,9 @@ part of what can break, and a model is the only consumer.
 | ID | Criterion | Sev |
 |---|---|---|
 | `MCP-initialize` | `initialize` returns a protocol version. |
-| `MCP-tools-list` | `tools/list` returns tools. |
 | `MCP-advertised-has-handler` | **Every advertised tool resolves to a handler** — no `-32602 unknown tool`. SDK shipped `run` and `ctx_clear` advertised with nothing behind them; a tool that resolves to nothing teaches a model the board is unreliable and it stops trying things that would have worked. Advertising is a promise. A wire denial or bad argument is fine here: the claim is the tool EXISTS, not that the call succeeds. | **S2** |
 | `MCP-unknown-tool-is-refused` | **Positive control.** A made-up tool name *is* refused with `-32602`. Without it, a server that answered every name would make the check above pass vacuously. | S2 |
 | `MCP-tools-live-wires` | A wire added AFTER `mcp-serve` started appears in the next `tools/list`, same process, no restart — otherwise a model must be restarted to notice a node it was just granted. Must run BEFORE any destructive check: the call-everything sweep invokes `ctx_clear`, which rotates the session, and this then fails with "expired token" while reading like an engine bug. | S2 |
-| `MCP-token-not-in-argv` | The node token never appears in any process command line; argv is world-readable across uids (§5b). | **S1** |
 | `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens rotate on agent start, and a client holding the previous one is refused — otherwise a stopped agent's credential outlives the agent. | **S1** |
 | `WM-table-name-hyphen` | A table node named with `-` is REFUSED, the message names the fix, and nothing is silently renamed to `table_1`. PM ruling: §3 permits `-` in node names, a table node's name becomes `t_<name>`, and a node whose address is not what the user typed is unaddressable by the agent that was told about it. | S2 |
 
@@ -542,11 +540,6 @@ digest mechanism. If the control fails, the absences are reported as skipped, no
 | ID | Criterion | Sev |
 |---|---|---|
 | `SEC-child-env/spawned` | A child actually started and produced a record; without one, nothing below is evidence. | gate |
-| `SEC-child-env/sentinel-works` | A secret known to be present IS found by the digest search — proving the search works. | gate |
-| `SEC-child-env-no-wheel-engine-secret` | `WHEEL_ENGINE_SECRET` is absent from the child's environment. | **S1** |
-| `SEC-child-env-no-wheel-vault-key` | `WHEEL_VAULT_KEY` is absent from the child's environment. | **S1** |
-| `SEC-child-env-no-secret-under-any-name` | Neither value is present under **any** variable name — the case a name check cannot reach, and the shape a refactor of the allowlist would produce. | **S1** |
-| `SEC-child-env-keeps-essentials` | The allowlist still passes what a harness needs to run (`PATH`, locale, CA bundle); security that breaks the product is not a fix. | S2 |
 
 ### 7d. AUTH-paste — the paste-code OAuth flow (§4)
 
@@ -588,10 +581,8 @@ Rust); what is covered end to end here is the reaping path a user actually reach
 | `ING-to-table` | `endpoint→table write`: JSON body inserted as a row; malformed JSON → 400, no partial row. | S2 |
 | `ING-to-script-ack` | `response_mode: ack` returns immediately without waiting for the script. | S3 |
 | `ING-to-script-body` | `response_mode: script` returns the script's stdout as the response body. | S3 |
-| `ING-auth-bearer` | With `auth.mode="bearer"`, a request with no / wrong bearer → **401 with no body** (no oracle about the expected token); correct bearer passes. | **S1** |
 | `ING-auth-bearer-wire` | `bearer` requires an `endpoint→vault read` wire; without it the endpoint fails closed (401), never open. | **S1** |
 | `ING-auth-bearer-timing` | Bearer comparison is constant-time; no timing oracle. | S2 |
-| `ING-ratelimit` | Documented rate limit is enforced and returns 429. | S3 |
 | `ING-header-filter` | Only the documented header subset is forwarded; `Authorization`/cookies are not leaked into the agent's prompt. | **S1** |
 
 ---
@@ -823,7 +814,6 @@ matched nothing.
 | `MCP-read-unwired-denied/meaningful` | **Gates the line above.** The denial only counts if the WIRED read succeeded in the same run — the first version of this suite sent the wrong argument name, so the content was absent because the call was malformed, not because a wire was enforced. A denial assertion that passes against a broken request proves nothing. | **S1** |
 | `MCP-denial-is-explained` | A denial says it was a wire denial, so a model can tell "not allowed" from "not there" and stop retrying. | S2 |
 | `MCP-token-not-in-argv` | The node token reaches the server as a FILE path; no token appears in any command line (§5b: argv is world-readable across uids). | **S1** |
-| `MCP-token-rotates` / `MCP-rotated-token-refused` | Tokens change across stop/start, and a rotated token no longer works. Without the first, the second is untestable and rotation is theatre. | **S1** |
 | `VAL-table-name-no-silent-rename` | A table node named with `-` is REFUSED, and the engine does not then create `bad_table` instead. A silent rename would satisfy the atomicity check while handing the user a node at an address they never chose — and every peer's wires, preamble and `wheel read` would use it. | S2 |
 
 ## 11c. ING — endpoint ingress fan-out (§3, SDK session 2 item 1)
@@ -843,6 +833,8 @@ everything else requires a node token or the engine secret.
 | `ING-script-response` | `endpoint→script` with `response_mode: script` returns the script's **stdout** as the HTTP body. With `response_mode: ack` the stdout is NOT returned, so a script cannot leak into a response the operator did not ask for. | S2 |
 | `ING-auth-bearer` | `auth.mode: bearer` resolves via the endpoint's `vault_ref`. A mismatch is **401 with an empty body** — no hint, no length difference, nothing an attacker can measure. | **S1** |
 | `ING-auth-requires-wire` | A `bearer` endpoint with no `endpoint→vault (read)` wire fails CLOSED (refuses every request), never open. | **S1** |
+| `ING-send-wire-requires-auth` | An endpoint wired `send` to an agent **must** authenticate. Unauthenticated is permissible only for `response_mode: ack` with **no send wire**. PM's rule, 2026-09-06, and it is load-bearing: the bridge that lets the local PM talk to the cloud PM is exactly this shape of endpoint and it is reachable from the public internet. An unauthenticated send wire means any stranger can put words into an agent's inbox inside an `<AgentPrompt>` envelope. | **S1** |
+| `ING-auth-missing-config` | A `bearer` endpoint whose `vault_ref` is absent or unresolvable answers **401**, never 500 and never open. Missing configuration must fail closed like a wrong credential — a 500 tells an attacker the endpoint exists and is misconfigured, and an open one tells them nothing because they are already through. | **S1** |
 | `ING-capability-off` | With project capability `http: false`, `/p/<id>/*` is **403 at the API** and the request never reaches the engine — asserted by the engine seeing no request, not merely by the status code. | **S1** |
 | `ING-ratelimit` | The documented rate limit is enforced and the limiter cannot be reset by a spoofed `X-Forwarded-For` (R4, same shape as the auth limiter). | S2 |
 | `ING-no-such-endpoint` | A path with no endpoint node is 404 and does not disclose which project ids or endpoint names exist. | S2 |
