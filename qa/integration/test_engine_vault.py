@@ -270,13 +270,12 @@ def main():
         # Control FIRST: a value we deliberately stored in the clear must be findable by
         # this exact scan. If it is not, the scan is broken and the encryption verdict
         # below carries no information, so refuse to report one.
-        if not R.check("SEC-vault-at-rest/grep-works", PLAIN_CANARY.encode() in db,
-                       "a ctx markdown stored in the clear is not in %d scanned bytes — this "
-                       "scan finds nothing, so any at-rest verdict would be vacuous" % len(db)):
-            R.skip("SEC-vault-at-rest", "the at-rest scan is broken; no verdict is possible")
-        else:
-            R.check("SEC-vault-at-rest", CANARY.encode() not in db,
-                    "the vault plaintext is in the sqlite files (%d bytes scanned)" % len(db))
+        R.control("SEC-vault-at-rest/grep-works", PLAIN_CANARY.encode() in db,
+                  "a ctx markdown stored in the clear is not in %d scanned bytes — this scan "
+                  "finds nothing, so any at-rest verdict would be vacuous" % len(db))
+        R.gated("SEC-vault-at-rest", "SEC-vault-at-rest/grep-works",
+                CANARY.encode() not in db,
+                "the vault plaintext is in the sqlite files (%d bytes scanned)" % len(db))
 
         # ---- wire-gated read
         ok_w, ok_u = wait_token(wired), wait_token(unwired)

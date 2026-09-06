@@ -185,6 +185,41 @@ class Results:
 
     def __init__(self):
         self.passed, self.failed, self.skipped = [], [], []
+        self.controls = {}
+
+    def control(self, tid, cond, detail=""):
+        """A check that proves the MECHANISM works, so absences asserted against it mean
+        something.
+
+        An assertion of the form "X is not present" is true of a system that is broken,
+        switched off, or never reached. The way to tell those apart from "X really is
+        absent" is a companion that hunts something which IS present, by the same means.
+
+        I have hand-rolled this three times — the vault at-rest scan (the canary was
+        'absent' because it was in the WAL), the child-env digest search (its control
+        SKIPPED and the assertion it guarded then reported green against a child that held
+        both secrets, BUG-018), and the CLI error check (vacuously true when none of the
+        chosen commands failed). PM has now named the shape twice. A primitive everyone
+        gets for free beats a lesson each of us learns separately.
+
+        Recorded so `gated` below can refuse to report a verdict the control does not
+        support.
+        """
+        ok = self.check(tid, cond, detail)
+        self.controls[tid] = ok
+        return ok
+
+    def gated(self, tid, control_id, cond, detail=""):
+        """An assertion that is only meaningful if `control_id` passed.
+
+        If the control failed or never ran, this SKIPS naming it, rather than passing. A
+        green here would be the exact lie the control exists to prevent.
+        """
+        if not self.controls.get(control_id):
+            self.skip(tid, "unproven: the control %s did not pass, so an absence here is "
+                           "not evidence" % control_id)
+            return False
+        return self.check(tid, cond, detail)
 
     def check(self, tid, cond, detail=""):
         if cond:

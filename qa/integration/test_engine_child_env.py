@@ -194,7 +194,7 @@ def main():
                            for name, d in ((r.get("env_digests")
                                             or r.get("sentinel_hits") or {})).items()}
         if vault_stored:
-            search_proven = R.check(
+            search_proven = R.control(
                 "SEC-child-env/sentinel-works",
                 digest(VAULT_VALUE) in found_by_digest.values(),
                 "the wired vault value was not located in the child either — this "
@@ -226,15 +226,10 @@ def main():
         # A control that does not gate its dependents is decoration.
         leaked = {n: d for n, d in found_by_digest.items()
                   if d in {digest(v) for v, _ in FORBIDDEN.values()}}
-        if search_proven:
-            R.check("SEC-child-env-no-secret-under-any-name", not leaked,
-                    "an engine secret reached the child under %s — the allowlist "
-                    "repopulated it under a name the F015 check does not look for"
-                    % sorted(leaked))
-        else:
-            R.skip("SEC-child-env-no-secret-under-any-name",
-                   "the digest search is unproven (see SEC-child-env/sentinel-works), so "
-                   "an empty result is not evidence of no leak")
+        R.gated("SEC-child-env-no-secret-under-any-name", "SEC-child-env/sentinel-works",
+                not leaked,
+                "an engine secret reached the child under %s — the allowlist repopulated it "
+                "under a name the F015 check does not look for" % sorted(leaked))
 
         # ---- and the child must still be able to work ------------------------------
         missing = [v for v in REQUIRED if v not in names]
