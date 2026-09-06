@@ -6,7 +6,7 @@ Both are connected to `github.com/Morgandri1/wheel`, branch `main`, and **deploy
 | Service      | Dockerfile               | Replicas | Healthcheck          | Domain |
 |--------------|--------------------------|----------|----------------------|--------|
 | `wheel-api`  | `docker/Dockerfile.api`  | 2        | `/healthz`           | `wheel-api-production.up.railway.app` |
-| `wheel-host` | `docker/Dockerfile.host` | **1**    | `/host/v1/healthz`   | none — private only |
+| `wheel-host` | `docker/Dockerfile.host` | **1**    | `/healthz`           | none — private only |
 
 `wheel-host` must stay at one replica. It owns per-project sandboxes and a sqlite state file on a
 Railway volume; a second replica would fight it for both, and two supervisors reconciling the same
@@ -61,6 +61,11 @@ today.
 * `wheel-host` refuses to boot if `RAILWAY_PUBLIC_DOMAIN` is set (override: `ALLOW_PUBLIC_DOMAIN=1`),
   so that mistake fails loudly instead of silently exposing every tenant's sandbox supervisor.
 * Postgres has no public proxy. To query production, `railway ssh -s postgres` and use `psql` there.
+* A health check must point at an endpoint the platform can actually reach. `wheel-host` puts every
+  `/host/v1/*` route behind the `WHEEL_HOST_SECRET` bearer, which a health checker cannot present:
+  pointing the check at `/host/v1/healthz` made every probe 401, Railway stopped the container, and
+  every project create hung on an unreachable host. Use the unauthenticated `/healthz`, which
+  reports liveness and nothing else.
 
 ## Environment
 
