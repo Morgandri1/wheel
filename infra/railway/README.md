@@ -108,7 +108,20 @@ It is run by hand, not on a schedule. A project is a candidate only if it is not
 destroyed through the host before the row is dropped, so nothing is left running on the host with no
 record of it.
 
-Predicates are covered by `infra/tests/prune-probe-projects.test.sh`.
+Predicates are covered by `infra/tests/prune-probe-projects.test.sh`, and a `psql` that cannot
+connect aborts the run rather than reporting "0 projects, 0 candidates" — the one output that looks
+like a clean bill of health.
+
+**Where to run it.** It needs `DATABASE_URL`, and Postgres has no public proxy: the URL Railway
+hands out resolves only inside the project's private network, so the script cannot reach it from a
+laptop. Run it from a container that can:
+
+```bash
+railway ssh --service Postgres    # psql is on that image; DATABASE_URL resolves there
+```
+
+Enabling a public Postgres proxy would make it runnable from anywhere and is the operator's call,
+not something to turn on for a cleanup script.
 
 ## The volume
 

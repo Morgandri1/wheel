@@ -100,6 +100,22 @@ esac
 [ "$(cat "$DELETED")" = "$PROBE" ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "  FAIL: deleted $(cat "$DELETED")"; }
 rm -f "$DESTROYED" "$DELETED"
 
+echo "a database it cannot read is not an empty database"
+fetch_projects() { echo "psql: could not connect" >&2; return 2; }
+# `|| rc=$?` rather than `rc=$?` on the next line: the sourced script sets -e, so a failing command
+# substitution in a bare assignment would end this test run instead of being measured by it.
+rc=0
+out=$(main 2>&1) || rc=$?
+[ "$rc" -ne 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "  FAIL: a failed query exited 0"; }
+case "$out" in
+    *"refusing to continue"*) pass=$((pass + 1)) ;;
+    *) fail=$((fail + 1)); echo "  FAIL: a failed query did not say so: $out" ;;
+esac
+case "$out" in
+    *"0 projects, 0 candidates"*) fail=$((fail + 1)); echo "  FAIL: a failed query reported a clean run" ;;
+    *) pass=$((pass + 1)) ;;
+esac
+
 echo
 echo "prune-probe-projects: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
