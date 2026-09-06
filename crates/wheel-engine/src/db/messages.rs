@@ -292,9 +292,17 @@ pub fn requeue_all_undelivered(conn: &Connection, node: Uuid, reason: &str) -> R
 /// only ever selects `state = 'queued'`, so a quarantined message is skipped by
 /// construction rather than by a second filter someone could forget to add.
 pub fn quarantine(conn: &Connection, id: Uuid, reason: &str) -> Result<()> {
+    // The state is spelled by the ENUM, not by a literal here.
+    //
+    // A literal would be a second source of truth for the same fact, and the
+    // failure it allows is silent and severe: `state` is read back with
+    // `unwrap_or_default()`, so a spelling this side does not share with
+    // `MessageState` deserialises to `Queued` — and a message that reads back
+    // as queued is retried on every start, which is precisely the poison loop
+    // this function exists to end.
     conn.execute(
-        "UPDATE messages SET state = 'undeliverable', last_error = ?2 WHERE id = ?1",
-        params![id.to_string(), reason],
+        "UPDATE messages SET state = ?2, last_error = ?3 WHERE id = ?1",
+        params![id.to_string(), MessageState::Undeliverable.as_str(), reason],
     )?;
     Ok(())
 }
@@ -659,5 +667,32 @@ mod quarantine_tests {
             .unwrap();
         assert_eq!(state, "undeliverable");
         assert_eq!(err.as_deref(), Some("the body could not be encoded"));
+    }
+
+    /// The assertion above compares the stored string with the same literal
+    /// that wrote it, so it holds whatever that literal says. This one reads
+    /// the row back THROUGH the enum, which is the path the engine uses.
+    ///
+    /// Why it is worth its own test: `state` is parsed with
+    /// `unwrap_or_default()`, and the default is `Queued`. A spelling the enum
+    /// does not recognise therefore fails SILENTLY — it makes a quarantined
+    /// message look queued again, and a queued message is retried at every
+    /// start. That is the poison loop, reintroduced by a rename, with every
+    /// existing test still green.
+    #[test]
+    fn the_quarantined_state_survives_the_round_trip_through_the_enum() {
+        let c = mem();
+        let to = agent(&c, "worker");
+        let m = enqueue(&c, MessageSender::User, to, "bad".into(), None).unwrap();
+
+        quarantine(&c, m.id, "could not be encoded").unwrap();
+
+        let stored = get(&c, m.id).unwrap().unwrap();
+        assert_eq!(
+            stored.state,
+            MessageState::Undeliverable,
+            "the stored state did not survive the round trip; it will be read as \
+             queued and retried for ever"
+        );
     }
 }
