@@ -103,10 +103,12 @@ DATABASE_URL=… WHEEL_HOST_URL=… WHEEL_HOST_SECRET=… \
 ```
 
 It is run by hand, not on a schedule. A project is a candidate only if it is not on the deny list
-(the operator's own account, and the `wheel-dev` board), its owner's address is at `wheel.test`,
-`wheelcheck.dev` or `example.com` exactly, and it is more than 24 hours old. The sandbox is
-destroyed through the host before the row is dropped, so nothing is left running on the host with no
-record of it.
+(the operator's own account, and the `wheel-dev` board), its owner's address is at `wheel.test` or
+`wheelcheck.dev` exactly, and it is more than 24 hours old. `example.com` used to be on that list;
+it was dropped because it is an RFC 2606 domain nobody here controls and signup does not refuse it,
+so a person testing signup by hand with a placeholder address would have been pruned after a day.
+The sandbox is destroyed through the host before the row is dropped, so nothing is left running on
+the host with no record of it.
 
 Predicates are covered by `infra/tests/prune-probe-projects.test.sh`, and a `psql` that cannot
 connect aborts the run rather than reporting "0 projects, 0 candidates" — the one output that looks

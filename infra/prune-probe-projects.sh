@@ -21,7 +21,13 @@ DENY_PROJECTS="6906cadb-45cd-4f27-8151-952b9d9bfb15"
 
 # An address is a probe account only if its domain is one of these exactly. Not a substring: a real
 # user at wheel.test.example.org is not a probe, and neither is one at notwheel.test.
-PROBE_DOMAINS="wheel.test wheelcheck.dev example.com"
+#
+# `example.com` was on this list and is deliberately not anymore (ADVERSARY review note 1): it is
+# an RFC 2606 domain nobody here controls, `validate_email` in wheel-api does not refuse it at
+# signup, and a person testing signup by hand with a placeholder address is exactly the "real-ish
+# account" this tool must not delete after 24h. Only domains we ourselves coined for CI probes
+# belong here.
+PROBE_DOMAINS="wheel.test wheelcheck.dev"
 
 MIN_AGE_SECONDS=86400
 

@@ -34,7 +34,9 @@ no is_candidate "$PROBE" "morgan@avo.so" "$((30 * DAY))"
 echo "probe domains"
 ok is_probe_address "api-verify@wheel.test"
 ok is_probe_address "QA@WheelCheck.dev"
-ok is_probe_address "someone@example.com"
+# example.com is RFC 2606, not ours, and signup does not refuse it (wheel-api's validate_email
+# accepts it) -- a person testing signup by hand with a placeholder address must survive prune.
+no is_probe_address "someone@example.com"
 no is_probe_address "someone@wheel.test.attacker.com"
 no is_probe_address "someone@notwheel.test"
 no is_probe_address "someone@sub.wheel.test"
