@@ -766,6 +766,7 @@ wheel-on-wheel build leg has one. Web identified this gap and asked for the cove
 | `E2E-injection-visible` | The ctx markdown is visible in the agent's log/transcript view, proving injection end-to-end through the UI. |
 | `E2E-vault-masked` | Vault values are never rendered, even in DOM or network responses. **S1.** |
 | `E2E-testids` | Every assertion uses a stable `data-testid`. New ones requested from Web via PM — never by scraping text. |
+| `E2E-endpoint-live-roundtrip` | The endpoint inspector's `btn-endpoint-test` button, clicked against a REAL running board (real `wheel-api`→`wheel-host`→`wheel-engine`, ingress capability on) rather than Web's mock: a `GET`/`ack` endpoint answers with a real 200 and the panel shows a real body, byte-checked; a path with no endpoint node answers a real 404-with-body and the panel does NOT render it as `ingress_unavailable` (the "not built yet" verdict `endpoint-probe.ts` reserves for a bodiless 501 — API turns a bodiless 404 from the engine into that; a real 404 the engine wrote must read as a real answer, not as "come back later"). Every other endpoint E2E/unit test in this repo runs against the mock; this is the one place the client's reachable-vs-not-built-yet distinction is proven against the thing it is actually about. Needs `infra/docker-compose.yml` (postgres + api + host + a real per-project engine) — heavier than every other `E2E-*` here, which is why it is its own ID rather than folded into `E2E-wire`/`E2E-chat`'s existing fixture. | **S2** |
 
 ---
 
