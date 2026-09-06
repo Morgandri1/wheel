@@ -338,14 +338,54 @@ an exit code.
 | Route | Notes | M |
 |---|---|---|
 | `PUT /v1/vault/:id/:key` | `{value}` → `204`. Write-only: no route ever returns a vault value to the control plane. | M2 |
-| `GET /v1/tables/:id/rows?limit&offset` | → `{rows: object[], total}` | M2 |
-| `POST /v1/tables/:id/query` | `{sql}` → `{columns, rows}`. Read-only, 5s timeout. | M2 |
+| `GET /v1/tables/:id/rows?limit&offset` | → `{node, columns, rows: object[], total, limit, offset}` | **M2** |
+| `POST /v1/tables/:id/query` | `{sql}` → `{node, rows}`. Read-only, 5s timeout. | **M2** |
 | `GET /v1/chests/:id/ls?prefix` | → `{entries:[{key,bytes,modified_at}]}` | M2 |
 | `GET /v1/chests/:id/blob?key` | → raw bytes | M2 |
 | `PUT /v1/chests/:id/blob?key` | raw body → `204` | M2 |
 
-Table SQL runs on a **separate read-only sqlite connection** with a `set_authorizer` that makes only that one
-`t_<name>` visible; `ATTACH`, `DETACH`, `PRAGMA` and any write verb are rejected before execution.
+#### Table nodes
+
+A table node **is** its sqlite table: `t_<name>`, with an implicit `key TEXT PRIMARY KEY` plus the configured
+columns. The table is created, renamed and dropped with the node itself (in `db::board`, not in the route), so a
+table node always has storage and a rename never orphans rows from their address. A table node's name must
+already be a sqlite identifier — a node name may contain `-`, an identifier may not — so creating `my-notes` as a
+table fails with a message naming `_` as the fix, rather than silently mangling the name.
+
+| Address | Wire | Behaviour |
+|---|---|---|
+| `read <t>` | read | all rows, paged (`limit`/`offset`, ceiling 10,000) |
+| `read <t>/<row>` | read | one row as JSON, `404` if absent |
+| `write <t>/<row>` | write | upsert by key. The body is a JSON object of column values |
+| `rm <t>/<row>` | write | → `{removed: bool}` |
+| `ls <t> [prefix]` | read | row keys, ordered; the prefix is matched **literally** (`%` and `_` are escaped) |
+| `query <t> "<SELECT …>"` | read | read-only SQL, scoped to that one table |
+
+A write **replaces** the row: a column the caller omits becomes `NULL` rather than keeping its previous value, so
+writing the same key twice with different fields cannot leave a hybrid of the two behind. A column the caller
+invents is a `400` listing the real columns — never a silent no-op, which would report success and write nothing.
+`key` may not appear in the body: it comes from the address, and accepting both would let them disagree. Values
+are checked against the column type rather than coerced (`{"count": "three"}` is refused); `null` is always
+allowed. `blob` columns are base64; `json` columns round-trip as the value written, not as a string containing it.
+
+**`wheel query` is the only place an agent's own string reaches sqlite**, so it is layered rather than clever.
+Each of these alone would be an argument; together they are the boundary:
+
+1. A **separate connection**, opened `READ_ONLY`, so nothing can touch the engine's own connection or its
+   transactions — and a slow query cannot stall message delivery.
+2. An **authorizer that denies by default** and allows reading exactly one table. The allow rule is
+   **case-insensitive**, because sqlite identifiers are: a case-sensitive rule would be bypassed by
+   `SELECT * FROM T_SECRETS`. `sqlite_master` is denied too — which tables exist is itself information the
+   querying node may not be wired to.
+3. **One statement only**, because `prepare` stops at the first and silently discards the rest.
+4. A **5 s deadline**, because `WITH RECURSIVE` can spin without touching a table, so the authorizer would never
+   be consulted again.
+5. **Size caps**: 8 MiB per value (`SELECT randomblob(1e9)` is one row, so the row ceiling never sees it) and
+   16 MiB per response. The 10,000-row ceiling is a fetch counter, not a truncation of something already in
+   memory, so a cartesian self-join costs 10,000 rows rather than all of them.
+
+`ATTACH`, `DETACH`, `PRAGMA`, every write verb, and `load_extension` are all rejected. Refusals name the object
+sqlite blocked and add why.
 
 ### Events — `GET /v1/events` (WebSocket)
 

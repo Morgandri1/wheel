@@ -1089,7 +1089,13 @@ mod tests {
     /// guess about machine load, and these tests spawn real processes while
     /// the rest of the suite runs beside them.
     async fn until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Deliberately generous. These tests spawn REAL child processes on a
+        // dev host shared by six agents, where load averages above 15 and a
+        // cargo waiting on the build-directory lock are normal. The deadline
+        // exists to fail fast when a condition will never hold, not to assert
+        // anything about speed -- and at 10s it was reporting healthy code as
+        // broken whenever the machine was busy, which is worse than slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             if cond() {
                 return;
