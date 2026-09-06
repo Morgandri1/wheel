@@ -1227,3 +1227,21 @@ exists now. I have not located the exact call site — this needs docker to repr
 debugger or targeted logging to confirm the read path never re-ensures — filing so the gate
 (already written, already red) is tracked as the system of record rather than only visible in
 a CI run someone has to go find.
+
+**CONFIRMED, no longer theoretical** — PM pulled CI run `34047133420` (SDK's PR #12, which
+attempts a self-heal fix for this bug) and the `columns` half fails for real, exactly as
+predicted above:
+
+```
+FAIL WOW-table-survives-restart/columns "the table came back but would not accept its own
+configured columns (404) — it was recreated from something other than the node config"
+```
+
+So PR #12's self-heal does re-ensure a table on a live read (the first half, `/026` itself,
+presumably now green — PM has not said otherwise), but rebuilds it from something other than
+the node's `TableConfig` — a bare `CREATE TABLE` or a default schema, not the configured
+columns. PM is holding #12 out of `main` until SDK rebuilds from the real `TableConfig`
+columns rather than fixing the read path's existence and stopping there. Still needs a
+docker-capable session to locate the exact call site; the CI log now says precisely what
+that session should look for (a table recreated with the wrong shape, not merely a missing
+one).
