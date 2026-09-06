@@ -1,14 +1,42 @@
 {
-  "_comment": "The F015 boundary: every variable an agent child inherits from the engine. A change here changes what untrusted code can read, so it is reviewed rather than merged quietly. Each entry records WHY it is safe — a name with no reason is the shape that lets the list grow one convenience at a time.",
-  "reviewed_by": "ADVERSARY (asked to review changes to this list, 2026-09-06)",
+  "_comment": "The F015 boundary: every variable an agent child inherits from the engine. A change here changes what untrusted code can read, so it is reviewed rather than merged quietly. Each entry records WHY it is safe \u2014 a name with no reason is the shape that lets the list grow one convenience at a time. Entries may also carry `constraints`, which are asserted at RUNTIME by the suite named in `checked_by`: membership is not safety, and a variable can be on this list and still point somewhere it must not.",
+  "reviewed_by": "ADVERSARY (decision 029, 7d8970d); PM ruling 2026-09-06",
   "allowed": {
     "PATH": "where binaries live; the harness cannot run without it",
     "LANG": "locale; describes the machine, not the project",
     "LC_ALL": "locale; describes the machine, not the project",
     "TZ": "timezone; describes the machine, not the project",
     "TMPDIR": "scratch location; describes the machine, not the project",
-    "SSL_CERT_FILE": "CA bundle — without it a private-CA container looks like a network fault",
+    "SSL_CERT_FILE": "CA bundle \u2014 without it a private-CA container looks like a network fault",
     "SSL_CERT_DIR": "CA bundle, as above",
-    "NODE_EXTRA_CA_CERTS": "CA bundle for node-based harnesses, as above"
+    "NODE_EXTRA_CA_CERTS": "CA bundle for node-based harnesses, as above",
+    "RUSTUP_HOME": "where the immutable shared toolchain lives; machine configuration, not a secret and not project-scoped. ADVERSARY 029 admits it ONLY under the image's read-only toolchain dir."
+  },
+  "constraints": {
+    "RUSTUP_HOME": {
+      "must_be_under": [
+        "/opt/rust"
+      ],
+      "must_not_be_under": [
+        "/data",
+        "/data/projects"
+      ],
+      "must_not_be_group_or_other_writable": true,
+      "why": "A toolchain a child can WRITE is a toolchain a child can replace, and every later project builds with whatever it left there. Read-only and outside the data dir is what makes inheriting it safe; inheriting the NAME is not the safe part."
+    },
+    "CARGO_HOME": {
+      "never_inherited": true,
+      "must_be_under": [
+        "/data/projects"
+      ],
+      "must_be_mode": "0700",
+      "must_be_owned_by_project_uid": true,
+      "must_not_be_shared_between_projects": true,
+      "why": "What a tenant FETCHES is not immutable. A shared CARGO_HOME puts one project's downloaded sources \u2014 and any registry credentials it configures \u2014 where the next project can read them. Set per project at spawn, never inherited."
+    }
+  },
+  "checked_by": "qa/integration/test_wheel_on_wheel.py (WOW-toolchain-*), per PM: the WOW leg is the acceptance test",
+  "pending": {
+    "RUSTUP_HOME": "ADVERSARY 029 / PM ruling 2026-09-06: SDK adds this after ingress. Pinned ahead of the change so the review is on record BEFORE the code, not after. Expires by breaking: once the engine has it, this marker must go or the gate fails \u2014 a pending note that outlives its change is how a list starts lying."
   }
 }

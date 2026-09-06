@@ -786,6 +786,8 @@ be seconds.
 | `WOW-clone` | The agent clones the repository into its workspace from inside the sandbox. | S2 |
 | `WOW-cargo-test` | `cargo test -p wheel-core` runs to completion inside the sandbox and its exit code reaches the agent. | S2 |
 | `WOW-no-token-in-log` | The git token appears in no log line, no transcript, no event, and no `git remote -v` output the agent can print. Cloning with a token in the URL is the ordinary way to do this and it writes the secret into `.git/config`. | **S1** |
+| `WOW-toolchain-rustup-readonly` | `RUSTUP_HOME` points inside the image's **read-only** toolchain dir, never under `/data` or a project dir, and is not writable by the child uids. Membership in the F015 allowlist is not safety: a toolchain a child can WRITE is a toolchain a child can replace, and every later project then builds with whatever it left there. ADVERSARY 029, PM ruling 2026-09-06 — this leg is the acceptance test. | **S1** |
+| `WOW-toolchain-cargo-per-project` | `CARGO_HOME` is **never inherited**: it is set per project under `/data/projects/<id>/.cargo`, mode 0700, owned by the project uid, and never shared. What a tenant FETCHES is not immutable — a shared cache puts one project's downloaded sources, and any registry credentials it configures, where the next project can read them. | **S1** |
 
 ---
 
@@ -820,6 +822,7 @@ everything else requires a node token or the engine secret.
 |---|---|---|
 | `ING-agent-envelope` | A hit on an `endpoint→agent (send)` wire arrives as `<AgentPrompt from="<endpoint>" type="endpoint">` carrying `{method, path, headers, body}`. `type` is `endpoint`, never `user` — an agent that cannot tell a stranger's request from its operator's instruction has no basis for caution. | **S1** |
 | `ING-headers-subset` | Only the documented header subset is forwarded. `Authorization`, `Cookie` and the bearer the endpoint itself consumed must NOT reach the agent: the agent is untrusted code and the credential is not its business. | **S1** |
+| `ING-bearer-not-in-transcript` | The bearer the ENDPOINT consumed on the agent's behalf (its `auth.vault_ref`) does not appear in the agent's **transcript** — the exact bytes written to the child's stdin — nor in its log. SDK's catch: `ING-headers-subset` only proves the credential is absent from the delivered HEADERS, and a transcript kept for debugging is the obvious second place the whole request gets written down. An agent that can read back a credential it was never given is the same leak by a slower route. | **S1** |
 | `ING-body-cap` | A body over 5 MiB is refused at the boundary with no partial delivery — never truncated into an agent's context, where a half-body reads as a whole one. | S2 |
 | `ING-table-insert` | `endpoint→table (write)` inserts the JSON body as a row; a body that does not match the columns is refused, not silently coerced. | S2 |
 | `ING-script-response` | `endpoint→script` with `response_mode: script` returns the script's **stdout** as the HTTP body. With `response_mode: ack` the stdout is NOT returned, so a script cannot leak into a response the operator did not ask for. | S2 |
@@ -828,6 +831,8 @@ everything else requires a node token or the engine secret.
 | `ING-capability-off` | With project capability `http: false`, `/p/<id>/*` is **403 at the API** and the request never reaches the engine — asserted by the engine seeing no request, not merely by the status code. | **S1** |
 | `ING-ratelimit` | The documented rate limit is enforced and the limiter cannot be reset by a spoofed `X-Forwarded-For` (R4, same shape as the auth limiter). | S2 |
 | `ING-no-such-endpoint` | A path with no endpoint node is 404 and does not disclose which project ids or endpoint names exist. | S2 |
+| `ING-405-vs-404` | A known path with the wrong METHOD answers 405 and an unknown path answers 404 — distinguishable, because collapsing them makes a misconfigured method indistinguishable from a typo and costs the operator an afternoon. Neither response may reveal which other methods or paths exist beyond the standard `Allow` header. PM ruling 2026-09-06. | S2 |
+| `ING-ack-after-durable` | `response_mode: ack` returns **202 only after the delivery is durable** — the message row is committed and will be delivered. A 202 that means "accepted into memory" is a lie to a caller who cannot retry, and the caller here is a stranger with no session. PM ruling 2026-09-06. | **S1** |
 
 ## 11d. SCR — script nodes (§3, SDK session 2 item 2)
 
