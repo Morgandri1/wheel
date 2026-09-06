@@ -8,7 +8,7 @@ wrongly in both directions and the test passes.
 mint() is copied from infra/dev/e2e.py (API's implementation, per their instruction to
 reuse rather than reinvent the token format).
 """
-import base64, hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.request, uuid
+import base64, hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import namedtuple
 
 # Tuple-unpackable AND attribute-addressable: `st, body, hdrs = call(...)` and
@@ -103,8 +103,37 @@ def session_for(sub):
     return tok
 
 
+_LOOPBACK = ("127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0")
+ALLOW_REMOTE = os.environ.get("WHEEL_ALLOW_REMOTE") == "1"
+
+
+def assert_local(url):
+    """Refuse to send a test request anywhere but this machine.
+
+    The integration suites create and DELETE projects. Every base URL they use defaults to
+    loopback, but a base is overridable by environment (WHEEL_API_URL) and our own docs
+    show `export WHEEL_API=https://wheel-api-production...` as a happy path, so one stale
+    variable in one shell is all it takes for a teardown sweep to run against production
+    with whatever account happens to be configured.
+
+    Loopback is not a restriction on what tests may do -- it is the reason they are allowed
+    to be destructive at all. Set WHEEL_ALLOW_REMOTE=1 deliberately if you really mean it.
+    """
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host in _LOOPBACK or ALLOW_REMOTE:
+        return
+    raise RuntimeError(
+        "refusing to send a test request to %r.\n"
+        "These suites create, mutate and DELETE projects, and they are only safe because "
+        "they talk to a throwaway local stack. Point them at a shared or production host "
+        "and they will delete somebody's work.\n"
+        "If you genuinely mean to run against %s, set WHEEL_ALLOW_REMOTE=1." % (url, host))
+
+
 def call(method, path, token=None, body=None, headers=None, base=None, timeout=60, raw_body=None):
-    req = urllib.request.Request((base or API) + path, method=method)
+    url = (base or API) + path
+    assert_local(url)
+    req = urllib.request.Request(url, method=method)
     if token:
         req.add_header("x-auth-token", token)
     for k, v in (headers or {}).items():
