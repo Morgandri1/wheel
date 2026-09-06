@@ -40,7 +40,7 @@ pub use name::{
 pub use node::{
     AgentConfig, Budget, ChestConfig, Column, ColumnType, CtxConfig, EndpointAuth, EndpointConfig,
     Harness, HttpMethod, McpConfig, McpTransport, Node, NodeConfig, NodeType, Position,
-    ResponseMode, ScriptConfig, ScriptLanguage, TableConfig, VaultConfig,
+    GitSource, ResponseMode, ScriptConfig, ScriptLanguage, TableConfig, VaultConfig, Workspace,
     DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_SCRIPT_TIMEOUT_SECS,
 };
 pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, WireLine};
