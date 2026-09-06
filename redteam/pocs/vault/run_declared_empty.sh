@@ -42,9 +42,12 @@ echo; echo "== 4) child env: is CLAUDE_CODE_OAUTH_TOKEN exported (empty?) or abs
 CPID=$(docker exec "$NAME" sh -lc 'for p in $(ls /proc|grep -E "^[0-9]+$"); do [ "$p" = 1 ]&&continue; ppid=$(grep -m1 "^PPid:" /proc/$p/status 2>/dev/null|tr -dc 0-9); [ "$ppid" = 1 ]||continue; c=$(cat /proc/$p/comm 2>/dev/null); case "$c" in claude|node|codex) echo "$p $(grep -m1 ^Uid: /proc/$p/status|awk "{print \$2}")"; break;; esac; done')
 if [ -n "$CPID" ]; then set -- $CPID; echo "   child pid=$1 uid=$2"; docker exec -u "$2" "$NAME" sh -lc "tr '\0' '\n' </proc/$1/environ 2>/dev/null | grep -iE 'CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC' || echo '   (no CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC in child env)'"; else echo "   (no child caught)"; fi
 
-echo; echo "== 5) ambiguity misfire: does the declared-empty key BLOCK wiring a 2nd vault with the REAL key? =="
-mk '{"name":"v2","type":"vault","config":{"keys":["CLAUDE_CODE_OAUTH_TOKEN"]}}'
+echo; echo "== 5) FACE #5 (PM overruled 409->warning): does an EMPTY declaration in v 409-block a REAL cred in v2? =="
+curl -s "${ES[@]}" -X POST "$URL/v1/nodes" -d '{"name":"v2","type":"vault","config":{"keys":["CLAUDE_CODE_OAUTH_TOKEN"]}}' >/dev/null
 V2=$(idof v2)
-echo "   wire a->v2 (v2 also declares the key): $(curl -s "${ES[@]}" -X POST "$URL/v1/wires" -d "{\"from\":\"$AID\",\"to\":\"$V2\",\"type\":\"read\"}")"
-echo "   (409 ambiguous = the empty declaration participates in ambiguity; a real setup could be blocked by an empty decl)"
+curl -s "${ES[@]}" -X PUT "$URL/v1/vault/$V2/CLAUDE_CODE_OAUTH_TOKEN" -d '{"value":"sk-ant-oat01-real"}' >/dev/null
+body="{\"from\":\"$AID\",\"to\":\"$V2\",\"type\":\"read\"}"
+resp=$(curl -s -w ' [HTTP %{http_code}]' "${ES[@]}" -X POST "$URL/v1/wires" -d "$body")
+echo "   wire a->v2 (v2 has the REAL value; v is declared-empty): $resp"
+echo "   ACCEPTANCE: PM overruled SDK -> this should be a WARNING (wire created), NOT a 409. A 409 = not yet implemented."
 echo "== done =="

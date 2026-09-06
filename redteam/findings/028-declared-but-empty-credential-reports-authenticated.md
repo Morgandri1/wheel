@@ -52,3 +52,22 @@ Base credential PRESENCE on an actual STORED value, not on a declaration:
   while presence is stored-based resolves both #1-#2 and #5 without losing the early-signal intent.
 Declared keys are fine for UI hints ("this vault will supply X"); they must not decide "is this agent
 authenticated" or block a real credential.
+
+## RE-VERIFY (2026-09-06, fresh image 05:37Z from d206b95 / engine 58a333c) — Face 1 FIXED
+- **Face 1 (the S1) FIXED**: `GET /v1/agents/:id/auth` for a declared-but-empty `CLAUDE_CODE_OAUTH_TOKEN`
+  now returns `{"authenticated":false,"mode":null}` (was `authenticated:true mode:env`). `credential_detail`
+  now reads `list_keys` (STORED only), with a comment citing this finding's rationale. Faces 3-4 unchanged-
+  correct (secret get → not_found; child env carries no credential).
+- **Face 5 (PM overruled SDK 409→warning) — STILL 409, acceptance test RED**: an empty declaration in vault
+  `v` still 409-blocks wiring a second vault `v2` that holds the REAL value ("ambiguous credential … both v
+  and v2 supply it"). SDK deliberately KEPT declared-key ambiguity (test `a_declared_key_is_still_enough_to_
+  be_ambiguous`, `find_ambiguity` still uses `offered_keys`). PM has overruled this to warning-not-409; this
+  PoC (`run_declared_empty.sh` §5) is the acceptance test and is currently RED — the change is not yet
+  implemented. Hand to SDK: `find_ambiguity`/the wire-create path must WARN, not 409, on a declared-but-
+  unfilled key (presence is stored-based per Face 1; ambiguity should be too, or at least non-blocking).
+- **"no longer starts a child" — NOT isolable in my offline container (control-proven)**: I nearly reported
+  the declared-empty agent as still spawning a child (it sits in `starting` with a live `claude` child). A
+  control — an agent with NO vault wire at all — behaves IDENTICALLY (`starting` + child, 13s). So
+  "starting-with-a-child" is generic behaviour for ANY unauthenticated agent in an offline test container (no
+  reachable Anthropic auth), NOT a declared-empty bug. The load-bearing fix (`authenticated:false`) is
+  confirmed; the child-spawn nuance can't be judged offline and I make no claim on it.
