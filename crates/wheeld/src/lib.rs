@@ -25,6 +25,67 @@ pub async fn run(settings: Settings) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
+    start_host(&data_dir, &keys).await?;
+    serve_api(&settings.bind).await
+}
+
+/// Everything the binary does, so that `main` is a call and nothing else.
+///
+/// The runtime is built here rather than by `#[tokio::main]` for the same reason the dispatch is:
+/// it is a decision — how many threads, which drivers — and decisions belong where they can be read
+/// and changed in one place. `--help` and `--version` still get a runtime, because building one is
+/// cheaper than a second code path that avoids it.
+pub fn cli_main<I, T>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    let action = config::Settings::parse(args)?;
+    if matches!(action, config::Action::Run(_)) {
+        init_tracing();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(dispatch(action))
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,wheeld=debug".into()),
+        )
+        .init();
+}
+
+/// What the binary does with a parsed command line.
+///
+/// Here rather than in `main` so it can be tested: `--help` and `--version` must print and exit
+/// cleanly, and neither may start a server or touch a data directory as a side effect.
+pub async fn dispatch(action: config::Action) -> Result<()> {
+    match action {
+        config::Action::PrintUsage => {
+            print!("{}", config::USAGE);
+            Ok(())
+        }
+        config::Action::PrintVersion => {
+            println!("wheeld {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        config::Action::Run(settings) => run(settings).await,
+    }
+}
+
+/// Bind the sandbox host, reconcile it, and start serving it in the background.
+///
+/// Split out of `run` because it is the half of the composition that owns no database: a test can
+/// drive the whole host — router, store, embedded engines — without standing up Postgres, and what
+/// it exercises is the real wiring rather than a rehearsal of it.
+///
+/// Returns the loopback URL the API should use.
+pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<String> {
     // Loopback only, on a port the OS picks. Nothing outside this machine may reach the host: it
     // is the half of the process that can start and stop any project's engine.
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -33,9 +94,9 @@ pub async fn run(settings: Settings) -> Result<()> {
     let host_addr = host_listener.local_addr()?;
     let host_url = format!("http://{host_addr}");
 
-    supervise::apply_defaults(&supervise::composed_env(&data_dir, &keys, &host_url));
+    supervise::apply_defaults(&supervise::composed_env(data_dir, keys, &host_url));
 
-    let host_state = build_host_state(&data_dir)?;
+    let host_state = build_host_state(data_dir)?;
     wheel_host::reconcile_on_boot(&host_state).await;
     tokio::spawn(async move {
         if let Err(e) = wheel_host::serve_on(host_listener, host_state).await {
@@ -43,8 +104,7 @@ pub async fn run(settings: Settings) -> Result<()> {
         }
     });
     tracing::info!(%host_url, "sandbox host ready");
-
-    serve_api(&settings.bind).await
+    Ok(host_url)
 }
 
 /// The host, with engines embedded rather than spawned.
