@@ -143,7 +143,7 @@ Per-type `config`:
                operations: [ { id: string /* slug, unique in node */, method, path /* may contain {param} */, summary?: string, enabled: bool,
                  params: [ { name, in: "path"|"query"|"header"|"cookie", schema: <json-schema subset>, required: bool, fill: Fill } ],
                  body?: { content_type: "application/json"|"application/x-www-form-urlencoded"|"multipart/form-data"|"text/plain", schema: <json-schema>,
-                          fills: { "<json-pointer or dotted path>": Fill } } } ] }`
+                          fills: { "<top-level body property name>": Fill } /* body fills are FLAT: one param per top-level property; a nested object is one field taking an object — PM ruling 2026-09-06, matches wheel-core ToolParam */ } } ] }`
               where `Fill = { mode: "agent" } | { mode: "static", value } | { mode: "vault", ref: "<vault name>/<key>" } | { mode: "hidden" }`
               (default `agent` for everything on import). See §3d.
 
