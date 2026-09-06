@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Field, Input, Select } from "@/components/ui";
 import { OauthPanel } from "@/components/inspector/oauth-panel";
@@ -9,36 +9,39 @@ import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
 import type { AuthStatus } from "@/lib/schema";
 
+export type AuthView = "checking" | "stored" | "sign-in";
+
 /**
- * Signing an agent in.
- *
- * An API key is the live path today (PROTOCOL.md §auth: POST auth/complete {api_key}), so it is
- * what this panel leads with. OAuth needs `auth/begin` to hold a live child process open for the
- * device or paste-code exchange; that lands in M2, and its buttons are present-but-disabled with
- * the reason rather than hidden — an absent control is something people hunt for.
- *
- * The credential is write-only in the strongest sense available: it is posted and the field is
- * cleared, it is never read back (no route returns it), and it is never put in a URL, a query key
- * or a toast. What comes back is whether a credential is STORED — which is not the same as it
- * working, and the copy here is careful to say only the true one.
+ * Which of three states this panel is in. Pure, because the operator's bug was a decision rather
+ * than a rendering: `?? false` collapsed "not read yet" into "no credential". See the tests.
  */
-/**
- * What a stored credential is, in words, per `AuthStatus.mode`.
- *
- * The engine's CredentialKind can grow — "env" arrived with vault-provided tokens after this
- * file was written — so an unrecognised mode falls back to a truthful generic rather than
- * rendering nothing or crashing. A client that breaks when a server enum gains a member is a
- * client that forces lockstep deploys.
- */
-function credentialLabel(mode: string | null | undefined, source: string | null | undefined, vaults: string[]): string {
+export function authView({
+  credential,
+  unreadable,
+  agentRefusedCredentials,
+  replacing,
+}: {
+  /** What `/auth` said, or null while it has not said anything yet. */
+  credential: { authenticated: boolean } | null;
+  /** `/auth` failed: a credential can be neither confirmed nor denied, and sign-in must stay reachable. */
+  unreadable: boolean;
+  /** The agent tried to start and refused what it had. Its verdict outranks the store. */
+  agentRefusedCredentials: boolean;
+  replacing: boolean;
+}): AuthView {
+  if (agentRefusedCredentials || replacing) return "sign-in";
+  if (credential) return credential.authenticated ? "stored" : "sign-in";
+  return unreadable ? "sign-in" : "checking";
+}
+
+/** What a stored credential is, in words. An unknown mode falls back rather than forcing a lockstep deploy. */
+export function credentialLabel(
+  mode: string | null | undefined,
+  source: string | null | undefined,
+  vaults: string[],
+): string {
   if (mode === "env") {
-    // A token handed to the agent from a wired vault at spawn. Nobody typed it into this panel,
-    // so "Replace" would be wrong — the value lives in the vault and is edited there.
-    //
-    // The engine names the vault in `source`; the wire list is only a fallback for an engine that
-    // does not send it yet. Inference is a worse answer than a fact, and with one vault per
-    // account (contract) an agent can legitimately be wired to several — so guessing from wires
-    // can name the wrong one.
+    // An agent may be wired to several vaults, so the wire-list fallback can name the wrong one.
     if (source) return `Credentials from vault ${source}`;
     return vaults.length === 1
       ? `Credentials from vault ${vaults[0]}`
@@ -52,6 +55,14 @@ function credentialLabel(mode: string | null | undefined, source: string | null 
   return "Credentials saved";
 }
 
+/** A stored credential and a refusing agent are not a contradiction to hide — an empty vault key is still a key. */
+export function refusalCallout(hasStoredCredential: boolean, source: string | null | undefined): string {
+  if (!hasStoredCredential) {
+    return "This agent has no usable credentials, so it stopped at startup. Nothing sent to it was lost — anything queued stays queued and is delivered once a credential is saved.";
+  }
+  return `A credential is stored${source ? ` (from vault ${source})` : ""}, but this agent refused it at startup — stored is not the same as working. Signing in below replaces it. Nothing queued for the agent was lost.`;
+}
+
 export function AuthFlow({
   api,
   nodeId,
@@ -63,16 +74,12 @@ export function AuthFlow({
 }: {
   api: EngineApi;
   nodeId: string;
-  /** The agent tried to start and had no credentials — the one moment this panel is urgent. */
+  /** The agent tried to start and had no usable credentials — the one moment this panel is urgent. */
   needsAuth: boolean;
   /** Names of vaults this agent has a read wire to, for the `env` mode hint. */
   vaults?: string[];
   onAuthenticated: () => void;
-  /**
-   * The next agent on this board still waiting for credentials. One login per agent is the
-   * durable arrangement, so a board of agents means repeating this — the least we can do is
-   * hand over the next one instead of making someone hunt for it on the canvas.
-   */
+  /** The next agent still waiting. One login per agent is the arrangement, so hand the next one over. */
   nextNeedsAuth?: { id: string; name: string } | null;
   onSelectAgent?: (id: string) => void;
 }) {
@@ -80,12 +87,12 @@ export function AuthFlow({
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [savedHere, setSavedHere] = useState(false);
   const [replacing, setReplacing] = useState(false);
   const [setupToken, setSetupToken] = useState("");
   const [vault, setVault] = useState("");
   const [shareNote, setShareNote] = useState<string | null>(null);
   const [showOther, setShowOther] = useState(false);
-  const keyRef = useRef<HTMLInputElement>(null);
 
   const status = useQuery({
     queryKey: ["auth", nodeId],
@@ -95,18 +102,23 @@ export function AuthFlow({
     refetchInterval: justSaved ? 2000 : false,
   });
 
-  const authenticated = status.data?.authenticated ?? false;
+  const credential = status.isSuccess ? status.data : null;
+  const hasStoredCredential = credential?.authenticated === true;
+
+  const view = authView({
+    credential,
+    unreadable: status.isError,
+    // The agent judged the credential it HAD. Saving a new one in this panel retires that verdict.
+    agentRefusedCredentials: needsAuth && !savedHere,
+    replacing,
+  });
 
   useEffect(() => {
-    if (authenticated && justSaved) {
+    if (hasStoredCredential && justSaved) {
       setJustSaved(false);
       onAuthenticated();
     }
-  }, [authenticated, justSaved, onAuthenticated]);
-
-  useEffect(() => {
-    if (needsAuth && !authenticated) keyRef.current?.focus();
-  }, [needsAuth, authenticated]);
+  }, [hasStoredCredential, justSaved, onAuthenticated]);
 
   const saveCredential = async (body: { api_key?: string; setup_token?: string }) => {
     setBusy(true);
@@ -117,11 +129,11 @@ export function AuthFlow({
       })) as AuthStatus & {
         saved_to_vault?: { expires_at?: string | null; warning?: string | null } | null;
       };
-      // Clear immediately: the credential has left, and there is no reason for it to sit in a form.
       setApiKey("");
       setSetupToken("");
       setReplacing(false);
       setJustSaved(true);
+      setSavedHere(true);
       setShareNote(vault ? vaultShareNote(next.saved_to_vault ?? {}) : null);
       if (next.authenticated) {
         toast("Credentials saved. Anything queued for this agent will be delivered.");
@@ -129,7 +141,6 @@ export function AuthFlow({
       }
       await status.refetch();
     } catch (e) {
-      // The engine explains a rejected credential in words (wrong harness, empty value); say what it said.
       toastError(e, "The engine would not accept that credential.");
     } finally {
       setBusy(false);
@@ -146,19 +157,46 @@ export function AuthFlow({
     if (token) await saveCredential({ setup_token: token });
   };
 
-  // `source` and `expires_at` are real fields now (wheel-core exports them), so the local casts
-  // that stood in for them are gone. CredentialKind carries "env" too, which is why `mode` no
-  // longer needs widening to string.
-  const mode = status.data?.mode;
-  const source = status.data?.source;
-  const expiresAt = status.data?.expires_at;
+  const mode = credential?.mode;
+  const source = credential?.source;
   const fromVault = mode === "env";
 
-  /**
-   * A stored credential that expires should say so BEFORE it lapses. `null` means durable OR
-   * unknown — the engine will not guess between them, so neither does this: no date, no claim.
-   */
-  const expiryNote = expiryMessage(expiresAt, Date.now());
+  // `null` means durable OR unknown, and the engine will not guess between them — so neither does this.
+  const expiryNote = expiryMessage(credential?.expires_at, Date.now());
+
+  const storedChip = (
+    <div
+      className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
+      data-testid="auth-status"
+      data-authenticated={hasStoredCredential ? "true" : "false"}
+      data-mode={mode ?? ""}
+      data-source={source ?? ""}
+    >
+      <span className="text-micro text-ink-dim">
+        {credentialLabel(mode, source, vaults)}
+        {credential?.account ? ` · ${credential.account}` : ""}
+      </span>
+      {view !== "stored" ? null : fromVault ? (
+        // This used to be a dead sentence ("edit it in the vault"), which left the browser sign-in
+        // unreachable on the boards that need it most — a vault gets its FIRST value from here.
+        <Button
+          size="sm"
+          tone="ghost"
+          data-testid="btn-auth-different-account"
+          onClick={() => {
+            if (source) setVault(source);
+            setReplacing(true);
+          }}
+        >
+          Sign in with a different account…
+        </Button>
+      ) : (
+        <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
+          Replace
+        </Button>
+      )}
+    </div>
+  );
 
   const nextAgentHop =
     nextNeedsAuth && onSelectAgent ? (
@@ -176,37 +214,24 @@ export function AuthFlow({
       </div>
     ) : null;
 
-  if (authenticated && !replacing) {
+  if (view === "checking") {
+    return (
+      <div className="flex items-center border border-rule px-2.5 py-2" data-testid="auth-pending">
+        <span className="flex h-7 items-center text-micro text-ink-faint">Checking credentials…</span>
+      </div>
+    );
+  }
+
+  if (view === "stored") {
     return (
       <div className="flex flex-col gap-2">
-        <div
-          className="flex items-center justify-between gap-2 border border-rule px-2.5 py-2"
-          data-testid="auth-status"
-          data-authenticated="true"
-          data-mode={mode ?? ""}
-          data-source={source ?? ""}
-        >
-          {/* SDK: `authenticated: true` means a credential is STORED, not that it works — only the
-              harness's own probe can say that. "Connected" here would be a lie an expired token
-              tells, and the support round-trip lands on us. */}
-          <span className="text-micro text-ink-dim">
-            {credentialLabel(mode, source, vaults)}
-            {status.data?.account ? ` · ${status.data.account}` : ""}
-          </span>
-          {fromVault ? (
-            // Nothing to replace here: the value lives in the vault node and is edited there.
-            // Offering "Replace" would invite someone to shadow their own vault by hand.
-            <span className="text-micro text-ink-faint" data-testid="auth-from-vault">
-              edit it in the vault
-            </span>
-          ) : (
-            <Button size="sm" tone="ghost" data-testid="btn-auth-replace" onClick={() => setReplacing(true)}>
-              Replace
-            </Button>
-          )}
-        </div>
+        {storedChip}
         {expiryNote ? (
-          <p className="text-micro" data-testid="auth-expiry" style={{ color: expiryNote.urgent ? "var(--danger)" : "var(--ink-faint)" }}>
+          <p
+            className="text-micro"
+            data-testid="auth-expiry"
+            style={{ color: expiryNote.urgent ? "var(--danger)" : "var(--ink-faint)" }}
+          >
             {expiryNote.text}
           </p>
         ) : null}
@@ -222,14 +247,18 @@ export function AuthFlow({
 
   return (
     <div className="flex flex-col gap-3 border border-rule p-2.5" data-testid="auth-flow">
-      {needsAuth && !authenticated ? (
-        <p
-          data-testid="auth-needs-auth-callout"
-          className="text-micro"
-          style={{ color: "var(--danger)" }}
-        >
-          This agent has no usable credentials, so it stopped at startup. Nothing sent to it was
-          lost — anything queued stays queued and is delivered once a credential is saved.
+      {hasStoredCredential ? storedChip : null}
+
+      {needsAuth && !savedHere ? (
+        <p data-testid="auth-needs-auth-callout" className="text-micro" style={{ color: "var(--danger)" }}>
+          {refusalCallout(hasStoredCredential, source)}
+        </p>
+      ) : null}
+
+      {status.isError ? (
+        <p data-testid="auth-unreadable" className="text-micro text-ink-faint">
+          This agent&rsquo;s credential status could not be read, so signing in is offered rather
+          than assumed. Saving here is safe either way — it replaces whatever is stored.
         </p>
       ) : null}
 
@@ -238,19 +267,19 @@ export function AuthFlow({
         api={api}
         nodeId={nodeId}
         vaults={vaults}
+        defaultVault={vault}
         onAuthenticated={() => {
           setJustSaved(true);
+          setSavedHere(true);
           onAuthenticated();
           void status.refetch();
         }}
         onShareNote={setShareNote}
       />
 
-      {/* While replacing a credential the section is already open BECAUSE the person asked for it,
-          so the toggle would be a control whose label disagrees with what is on screen: it would
-          read "Other ways to sign in" above an open panel, and the first click would appear to do
-          nothing. QA hit the mirror image of this in the spec — a bare toggle is only honest when
-          it is the sole owner of the state it describes. */}
+      {/* While replacing, the section below is already open BECAUSE the person asked for it, so a
+          toggle would be a control whose label disagrees with the screen. A toggle is only honest
+          when it is the sole owner of the state it describes. */}
       {replacing ? null : (
         <div className="border-t border-rule pt-2.5">
           <button
@@ -304,7 +333,6 @@ export function AuthFlow({
             }
           >
             <Input
-              ref={keyRef}
               type="password"
               mono
               autoComplete="off"
@@ -350,11 +378,18 @@ export function AuthFlow({
               {busy ? "Saving…" : "Save credential"}
             </Button>
             {replacing ? (
-              <Button size="sm" tone="ghost" onClick={() => { setReplacing(false); setApiKey(""); }}>
+              <Button
+                size="sm"
+                tone="ghost"
+                onClick={() => {
+                  setReplacing(false);
+                  setApiKey("");
+                }}
+              >
                 Cancel
               </Button>
             ) : null}
-            {justSaved && !authenticated ? (
+            {justSaved && !hasStoredCredential ? (
               <span className="text-micro text-ink-faint" data-testid="auth-checking">
                 Saving…
               </span>

@@ -96,6 +96,14 @@ export const T = {
   // account sign-in above them is the path the contract wants people on.
   authOtherWays: "btn-auth-other-ways",
   authReplace: "btn-auth-replace",
+  // Painted while /auth has not answered yet. It exists so the panel never has to guess:
+  // the sign-in form used to be painted from `?? false` and swapped out on the answer,
+  // which the operator saw as a dialog that "opens for a moment before disappearing".
+  authPending: "auth-pending",
+  // env-mode credentials come from a vault, and used to end in a dead sentence. This is the
+  // way back into the OAuth flow — and the only way a vault gets its first value from a browser.
+  authDifferentAccount: "btn-auth-different-account",
+  authVaultShare: "select-auth-vault",
   authOauth: "btn-auth-oauth",
   nodeAuthenticate: (name: string) => `node-${name}-authenticate`,
 
