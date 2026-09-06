@@ -253,4 +253,4 @@ def _cleanup():
 
 
 if __name__ == "__main__":
-    sys.exit(run_suite(main, "wheel-on-wheel", _cleanup))
+    sys.exit(run_suite(main, "wheel-on-wheel", _cleanup, container=NAME))

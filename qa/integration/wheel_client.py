@@ -266,7 +266,10 @@ def free_port(preferred):
         return s.getsockname()[1]
 
 
-def run_suite(main, name, cleanup=None):
+SKIP_RC = 77
+
+
+def run_suite(main, name, cleanup=None, container=None):
     """Entry point wrapper: an unexpected exception is a reported failure, not a traceback.
 
     A suite that dies mid-way prints a stack trace and exits 1. Exit 1 reads as "the
@@ -275,18 +278,41 @@ def run_suite(main, name, cleanup=None):
     reason at all. Naming the suite and the exception keeps the two apart, and cleanup
     still runs so the next run does not inherit a stray container.
     """
+    rc = 1
     try:
-        return main()
+        rc = main()
+        return rc
     except KeyboardInterrupt:
+        rc = 130
         print("%s: interrupted" % name)
-        return 130
+        return rc
     except Exception as e:
         import traceback
         traceback.print_exc()
+        rc = 1
         print("\n%s: the SUITE failed (%s: %s) — this is a broken test, not a verdict on "
               "the subject. Nothing below it ran." % (name, type(e).__name__, e))
-        return 1
+        return rc
     finally:
+        # Save the engine's own account of a bad run BEFORE tearing it down.
+        #
+        # Teardown that runs on failure destroys the evidence for the failure. A
+        # wheel-on-wheel run died with "connection reset by peer" mid-turn -- either the
+        # engine fell over or it dropped a long poll, and those want opposite fixes -- and
+        # the cleanup I had just added removed the container, and with it the only log that
+        # could tell them apart. Cleanup on success; on failure, keep the account first.
+        if container and rc not in (0, SKIP_RC):
+            try:
+                art = os.path.join("qa", "artifacts")
+                os.makedirs(art, exist_ok=True)
+                dest = os.path.join(art, "%s-engine.log" % name)
+                logs = subprocess.run(["docker", "logs", "--tail", "400", container],
+                                      capture_output=True, text=True)
+                with open(dest, "w") as fh:
+                    fh.write(logs.stdout + logs.stderr)
+                print("engine log for the failed run saved to %s" % dest)
+            except Exception:
+                pass
         if cleanup:
             try:
                 cleanup()
