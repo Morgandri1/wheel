@@ -9,11 +9,12 @@ overrides it.
 |---|---|---|
 | Auth panel never paints an unread state | `9a81ca9` (`0dd01ca`) | `pnpm vitest run src/components/inspector/auth-flow.test.tsx` (19) · `qa/e2e` `tests/auth-first-paint.spec.ts` (2) |
 | Endpoint panel truthfulness + web **0.2.0** | `f477666` (`2ec1782`) | `pnpm vitest run src/lib/endpoint-probe.test.ts src/components/inspector/endpoint-panel.test.tsx` (23) |
-| A 404 the engine *wrote* is not excused as a missing feature | `ea6f2ab` (`e83ac87`) | same suite; `probeVerdict` table |
+| A 404 the engine *wrote* is not excused as a missing feature, web **0.2.1** | `ea6f2ab` (`36b5b21`) | same suite; `probeVerdict` table |
 
-0.2.0 is the deployed release: auth first-paint + endpoint panel + Test button. Vercel built it —
-I simulated the `ignoreCommand` against the real merge rather than assuming (`git diff HEAD^ HEAD
--- package.json | grep -q '^+.*"version"'` → exit 1 = build).
+0.2.1 is the release on `origin/main` and includes the `ea6f2ab` 404-wording fix — it is no longer
+sitting unreleased (a past version of this doc said it was; that was stale, not current truth).
+Vercel builds only on a `web/package.json` version bump; verify with `git diff HEAD^ HEAD --
+package.json | grep -q '^+.*"version"'` rather than assuming.
 
 Earlier and still live: `npx wheel-web` (standalone package, runtime API resolution proven by
 building against :8787 and running with `--api :9911`), CSP with per-request nonce, tool panel
@@ -21,24 +22,30 @@ against the live engine, local email/password auth.
 
 ## IN FLIGHT
 
-Nothing. Worktree `/Users/metatron/wheel-wt/web` is clean, `web/main` is merged and pushed.
-
-**One thing is merged but NOT released:** `ea6f2ab` has no version bump, so production still runs
-0.2.0 and shows the old 404 wording. Harmless today — the corrected wording only triggers on a 404
-*with a body*, which needs ingress to exist. It ships with the next bump. Do not forget it.
+**PR #3 — endpoint bearer-auth UI**, branch `web/endpoint-bearer-auth-ui`, commit `a676f51`, not
+yet merged. `EndpointConfig.auth` (`{mode:"bearer", vault_ref}`) existed in the schema/engine
+contract with no UI; added the picker, gated so bearer is only selectable once the endpoint holds
+a `read` wire to a vault (the wire matrix already had `endpoint → vault (read)`, so no
+wire-matrix change was needed) and the vault-key datalist only offers keys from wired vaults,
+mirroring `tool-panel.tsx`'s fill-mode picker. A saved config that is `bearer` whose vault wire was
+since removed shows a warning instead of silently dropping the field. `pnpm typecheck` / `lint` /
+`test` (284, 14 new/changed) all green. PM reviewed the design as correct; merge is held only on
+`make check`/integration being red on `main` itself from BUG-022 (journal-mode fast-path — SDK's,
+already filed S1, not this PR's diff) — merge as soon as CI reruns green, nothing more needed from
+web on it.
 
 ## NEXT — priority order
 
-1. **Re-probe the endpoint Test button against a real board** once API's CORS/preflight merge and
-   SDK's ingress land (API owes a hash; they confirmed `Access-Control-Allow-Origin: *`, no
-   credentials, on `/p/<project>/<path>`). When ingress lands, the "bodiless 404 → ingress is not
-   built yet" branch becomes unreachable by construction and an E2E hitting a real endpoint is
-   owed. Ask QA for the ID; do not invent one (see TRAPS).
-2. **Bump `web/package.json` to ship `ea6f2ab`**, bundled with whatever else is ready. One minor
-   bump per bundle, changelog in the bump commit.
-3. **Endpoint `auth: {mode:"bearer", vault_ref}` UI** — M2, not built. Needs the endpoint→vault
-   read wire in the picker.
-4. **Coverage include list** (see CONTRACT) — needs a PM ruling before changing.
+1. **Re-probe the endpoint Test button against a real board** once SDK's ingress lands
+   (`crates/wheel-engine/src` has no `/ingress/*` route as of this doc — confirmed directly by
+   grep, not inferred from a stale note; API's CORS/preflight side is already green, per API's own
+   `reports` row: `cors` test `the_public_ingress_answers_any_origin`, 4/4). When ingress lands,
+   the "bodiless 404 → ingress is not built yet" branch in `probeVerdict` becomes unreachable by
+   construction and an E2E hitting a real endpoint is owed. Ask QA for the ID; do not invent one
+   (see TRAPS).
+2. **Coverage include list** (see CONTRACT) — needs a PM ruling before changing.
+3. Nothing else queued. Once PR #3 lands, re-check this list against `origin/main` rather than
+   trusting it verbatim (see TRAPS #13).
 
 ## TRAPS — every one of these I walked into today
 
@@ -88,6 +95,14 @@ Nothing. Worktree `/Users/metatron/wheel-wt/web` is clean, `web/main` is merged 
     / `CHECK_ONLY=qa` run in seconds; the rust gates take ~28 min under a contended cargo lock and
     are not yours to re-prove for a web-only diff — say so instead of implying green (PM ruled this
     correct).
+13. **This file is a snapshot, not truth.** A prior version of this doc said `ea6f2ab` was merged
+    but unreleased — `git log -- web/package.json` showed it had already shipped as 0.2.1
+    (`36b5b21`). It said NEXT#1 just needed "API's CORS/preflight merge and SDK's ingress" without
+    saying whether either had actually landed — a grep of `crates/wheel-engine/src` (no
+    `/ingress/*` route) settled it in one command, and both API and SDK independently confirmed the
+    same thing minutes later. Before acting on anything in STATE or NEXT, check it against
+    `git log`/grep on the actual paths named — a stale handoff read as current truth wastes a whole
+    agent (or worse, a whole turn) that a two-minute check would have caught.
 
 ## CONTRACT — where I think a rule is wrong
 
