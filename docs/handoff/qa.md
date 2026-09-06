@@ -28,9 +28,13 @@ does not name, and it reads Playwright specs as well as Python.
 
 ## NEXT (in order, each with its gate)
 
-1. Ingress, when SDK lands it — 28 `ING-*` IDs in §11c are written and will be red until it
+1. Ingress, when SDK lands it — 29 `ING-*` IDs in §11c are written and will be red until it
    exists. Build against `ING-headers-subset` and `ING-bearer-not-in-transcript` first: the
-   endpoint's bearer must reach neither the delivered headers **nor** the transcript.
+   endpoint's bearer must reach neither the delivered headers **nor** the transcript. Then
+   `ING-envelope-forge-from-stranger` — `MSG-envelope-forge` covers a body written by a WIRED
+   agent, and ingress is where an anonymous stranger writes it into the same parser. If any
+   operator-to-operator channel is ever exposed as an endpoint, that is the criterion standing
+   between a passer-by and impersonating the operator.
 2. Credential refresh — `AUTH-refresh-outlives-access-token` (the operator's acceptance: an
    agent alive past the ORIGINAL expiry, untouched), `AUTH-refresh-vault-updated`,
    `AUTH-durable-only-when-declared`, `AUTH-refresh-failure-is-visible`, `AUTH-refresh-not-in-log`.
