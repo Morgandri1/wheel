@@ -44,6 +44,8 @@ struct FakeSandbox {
     fail_restart: bool,
     fail_destroy: bool,
     engine_base: String,
+    /// How long a start takes, for tests about how long a reconcile takes.
+    start_delay: std::time::Duration,
 }
 
 impl FakeSandbox {
@@ -56,6 +58,15 @@ impl FakeSandbox {
             fail_restart: false,
             fail_destroy: false,
             engine_base: "http://127.0.0.1:1".into(),
+            start_delay: std::time::Duration::ZERO,
+        }
+    }
+
+    /// A sandbox whose engines take a while to answer, which is what a real one does.
+    fn slow(start_delay: std::time::Duration) -> Self {
+        Self {
+            start_delay,
+            ..Self::new()
         }
     }
 }
@@ -69,6 +80,9 @@ impl Sandbox for FakeSandbox {
     async fn start(&self, id: &Uuid, s: &Secrets) -> anyhow::Result<()> {
         if self.fail_start {
             anyhow::bail!("engine did not become healthy");
+        }
+        if !self.start_delay.is_zero() {
+            tokio::time::sleep(self.start_delay).await;
         }
         let mut c = self.calls.lock().unwrap();
         c.started.push(*id);
@@ -128,6 +142,7 @@ fn test_config() -> Config {
         rlimit_cpu_secs: None,
         reap_grace_secs: 1,
         disk_floor_mb: 1,
+        reconcile_concurrency: 8,
         engine_base_url: "http://127.0.0.1:1".into(),
     }
 }
@@ -136,6 +151,22 @@ fn test_config() -> Config {
 fn harness(sandbox: FakeSandbox) -> (axum::Router, Arc<Mutex<Calls>>, Arc<Store>) {
     let (app, calls, store, _) = harness_at(sandbox);
     (app, calls, store)
+}
+
+/// A host that has not finished reconciling, for the routes that must say so.
+fn harness_closed(sandbox: FakeSandbox) -> (axum::Router, Arc<Mutex<Calls>>, Arc<Store>) {
+    let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
+    let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
+    let calls = sandbox.calls.clone();
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(sandbox),
+        store: store.clone(),
+        http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: wheel_host::Readiness::serving_after_reconcile(),
+    };
+    (build_router(state), calls, store)
 }
 
 /// Same, but also returns the database path, for tests that need to damage it.
@@ -1028,4 +1059,64 @@ async fn healthz_reports_how_full_the_volume_is() {
     );
     let used = body["disk_used_percent"].as_u64().expect("used percent");
     assert!(used <= 100, "{used}% used");
+}
+
+/// A slow reconcile must look slow, not dead — and must not take N × the start timeout.
+///
+/// Serially, fourteen projects that each take a moment to answer outlast any platform's
+/// health-check window, the replica is stopped for being slow, and a host that is stopped never
+/// reconciles at all. The 503 also has to move: while the host is closed every project route
+/// answers the same thing, so a host working through its list and a host wedged on the first
+/// project were the same response. That ambiguity cost an afternoon.
+#[tokio::test]
+async fn reconcile_restores_projects_together_and_reports_how_far_it_got() {
+    let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
+    let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
+    let sandbox = FakeSandbox::slow(std::time::Duration::from_millis(300));
+    let calls = sandbox.calls.clone();
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(sandbox),
+        store: store.clone(),
+        http: reqwest::Client::new(),
+        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        ready: wheel_host::Readiness::serving_after_reconcile(),
+    };
+
+    for _ in 0..8 {
+        let id = Uuid::new_v4();
+        store.upsert(&id, "s", "dg==").await.unwrap();
+        store.set_desired_running(&id, true).await.unwrap();
+    }
+
+    let began = std::time::Instant::now();
+    wheel_host::reconcile_on_boot(&state).await;
+    let elapsed = began.elapsed();
+
+    assert_eq!(calls.lock().unwrap().started.len(), 8);
+    assert_eq!(state.ready.progress(), (8, 8));
+    assert!(
+        elapsed < std::time::Duration::from_millis(8 * 300),
+        "eight 300ms starts took {elapsed:?} — they ran one after another"
+    );
+}
+
+/// The 503 a caller gets mid-reconcile has to say how far along the host is.
+#[tokio::test]
+async fn a_project_route_says_how_much_of_the_restore_is_done() {
+    let (app, _calls, _store) = harness_closed(FakeSandbox::new());
+    let (status, body) = call(
+        &app,
+        "GET",
+        &format!("/host/v1/projects/{}", Uuid::new_v4()),
+        Some(SECRET),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "starting");
+    assert!(
+        body["error"]["to_restore"].as_u64().is_some(),
+        "a caller cannot tell a slow host from a stuck one: {body}"
+    );
 }
