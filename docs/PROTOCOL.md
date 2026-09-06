@@ -238,6 +238,42 @@ discover that.
 `codex` signs in by device code, which is a poll rather than a submit; `auth/begin` on a codex node returns
 `400` saying so rather than a paste-code envelope nothing can satisfy.
 
+#### Handing the credential to the rest of the board (`save_to_vault`)
+
+`auth/complete` accepts an optional `save_to_vault: "<vault name>"`. After a successful login the engine
+reads the credential out of that node's own store and writes it to the named vault as
+**`CLAUDE_CODE_OAUTH_TOKEN`**, through the same encrypted, write-only path as `PUT /v1/vault/:id/:key` —
+so the ambiguity rule applies and the value never appears on `/v1/board`, in a log, or in a transcript.
+Every agent with a read wire to that vault then authenticates with `mode: "env"` on its next start, which
+is how one browser round-trip authenticates a board of six agents.
+
+The agent **must already have a `read` wire to the vault**; without one this is `403 wire_denied`. The
+wire is the capability here as everywhere else: an agent may not write its credential into a keyspace it
+has no relationship with.
+
+**Which credential ends up in the vault, and the catch.** The engine takes the access token from the
+harness's own credential store. A subscription login stores a **session** credential that the CLI
+refreshes in place, so a copy of it in a vault works now and stops working when it expires — silently,
+for every agent reading that vault. The response therefore reports what was stored:
+
+```jsonc
+{ "authenticated": true, "mode": "oauth_session",
+  "vault": { "name": "anthropic", "key": "CLAUDE_CODE_OAUTH_TOKEN", "stored": true,
+             "expires_at": 1799999999000,
+             "warning": "this is a session credential and will expire; for a durable one, run
+                         `claude setup-token` and submit that token as api_key instead" } }
+```
+
+`warning` is present whenever what was found is not durable. **The durable path is
+`claude setup-token`**, which mints a long-lived `sk-ant-oat…` with no expiry; submit that through
+`auth/complete {api_key}` (the engine routes it to `CLAUDE_CODE_OAUTH_TOKEN` by prefix) or store it in the
+vault directly with `PUT /v1/vault/:id/CLAUDE_CODE_OAUTH_TOKEN`. Prefer it for anything shared.
+
+If the CLI reorganises its credential store and the engine cannot find a token, this is `502` naming the
+file and pointing at `setup-token` — never a success that vaulted the wrong string.
+
+
+
 **Authenticating resumes the agent.** Saving a credential on a `needs_auth` agent moves it to `parked` and
 delivers anything queued immediately — no restart, no second call. With an empty queue it stays parked and
 costs nothing. The agent was started by someone who wanted it running, and a stuck queue behind a solved

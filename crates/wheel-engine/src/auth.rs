@@ -159,6 +159,97 @@ pub fn has_stored_credentials(config_dir: &Path, harness: Harness) -> bool {
     config_dir.join(file).exists() || config_dir.join(dir_name).join(file).exists()
 }
 
+/// A credential recovered from the harness's own store, so it can be handed to
+/// other agents through a vault.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredOauth {
+    pub token: String,
+    /// Milliseconds since the epoch, when the store says so. `None` means the
+    /// store did not say -- NOT that the token is durable.
+    pub expires_at: Option<i64>,
+}
+
+impl StoredOauth {
+    /// Long-lived tokens from `claude setup-token` carry the `oat` marker and
+    /// no expiry. A session access token is the other thing this can find, and
+    /// the caller has to be able to tell them apart before copying one into a
+    /// vault that five other agents will read.
+    pub fn is_long_lived(&self) -> bool {
+        self.expires_at.is_none() && self.token.starts_with(OAUTH_TOKEN_PREFIX)
+    }
+}
+
+/// Pull a value usable as `CLAUDE_CODE_OAUTH_TOKEN` out of the node's own
+/// credential store.
+///
+/// Deliberately shape-tolerant: it looks for an access-token field anywhere in
+/// the document and otherwise for anything carrying the `sk-ant-oat` marker,
+/// rather than hard-coding a path into a file this engine does not own. If the
+/// CLI reorganises its store, this degrades to "could not find it" -- which the
+/// caller reports -- instead of silently vaulting the wrong string.
+pub fn oauth_token_from_store(config_dir: &Path) -> Result<StoredOauth> {
+    let path = claude_credentials_path(config_dir)
+        .ok_or_else(|| anyhow::anyhow!("this node has no stored claude credentials"))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+
+    find_access_token(&doc).ok_or_else(|| {
+        anyhow::anyhow!(
+            "found {} but no OAuth token in it; the credential may be stored in a form \
+             this engine cannot forward (run `claude setup-token` and paste that instead)",
+            path.display()
+        )
+    })
+}
+
+/// Where `claude auth login` leaves its credentials, checking both layouts the
+/// spawn env can produce.
+fn claude_credentials_path(config_dir: &Path) -> Option<std::path::PathBuf> {
+    let direct = config_dir.join(".credentials.json");
+    if direct.exists() {
+        return Some(direct);
+    }
+    let under_home = config_dir.join(".claude").join(".credentials.json");
+    under_home.exists().then_some(under_home)
+}
+
+fn find_access_token(v: &serde_json::Value) -> Option<StoredOauth> {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                let named_token =
+                    k.eq_ignore_ascii_case("accessToken") || k.eq_ignore_ascii_case("access_token");
+                if named_token {
+                    if let Some(t) = val.as_str().filter(|t| !t.is_empty()) {
+                        return Some(StoredOauth {
+                            token: t.to_string(),
+                            expires_at: expiry_in(map),
+                        });
+                    }
+                }
+                // A token by its marker, wherever it sits.
+                if let Some(t) = val.as_str().filter(|t| t.starts_with(OAUTH_TOKEN_PREFIX)) {
+                    return Some(StoredOauth {
+                        token: t.to_string(),
+                        expires_at: expiry_in(map),
+                    });
+                }
+            }
+            map.values().find_map(find_access_token)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(find_access_token),
+        _ => None,
+    }
+}
+
+fn expiry_in(map: &serde_json::Map<String, serde_json::Value>) -> Option<i64> {
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("expiresAt") || k.eq_ignore_ascii_case("expires_at"))
+        .and_then(|(_, v)| v.as_i64())
+}
+
 /// `$CODEX_HOME/config.toml` content forcing file-based credential storage.
 ///
 /// `cli_auth_credentials_store` defaults to "auto", which may use the OS
@@ -436,6 +527,101 @@ mod tests {
             std::fs::read_to_string(d.join("config.toml")).unwrap(),
             "custom = true\n"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod vault_handoff_tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("wheel-oauthstore-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The shape `claude auth login` is expected to leave behind.
+    #[test]
+    fn the_token_is_found_in_the_stores_normal_shape() {
+        let d = dir("normal");
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"sk-ant-ort01-xyz","expiresAt":1799999999000,"subscriptionType":"max"}}"#,
+        )
+        .unwrap();
+        let got = oauth_token_from_store(&d).unwrap();
+        assert_eq!(got.token, "sk-ant-oat01-abc");
+        assert_eq!(got.expires_at, Some(1799999999000));
+        // It carries an expiry, so it is NOT the durable credential however
+        // much its prefix looks like one.
+        assert!(!got.is_long_lived());
+        // The refresh token must not be what we picked.
+        assert!(!got.token.contains("ort"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// We set HOME to the same directory, so the CLI may write one level down.
+    #[test]
+    fn the_token_is_found_under_the_home_layout_too() {
+        let d = dir("home");
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        std::fs::write(
+            d.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-home"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            oauth_token_from_store(&d).unwrap().token,
+            "sk-ant-oat01-home"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A long-lived `claude setup-token` credential has no expiry, and that is
+    /// the difference the caller has to be able to see before handing it to
+    /// five other agents.
+    #[test]
+    fn a_durable_token_is_distinguishable_from_a_session_one() {
+        let d = dir("durable");
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-durable"}"#,
+        )
+        .unwrap();
+        assert!(oauth_token_from_store(&d).unwrap().is_long_lived());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// If the CLI reorganises its store, the honest answer is "I could not
+    /// find it" -- vaulting the wrong string would authenticate nothing and
+    /// look like success.
+    #[test]
+    fn an_unrecognisable_store_is_reported_not_guessed() {
+        let d = dir("weird");
+        std::fs::write(d.join(".credentials.json"), r#"{"something":{"else":1}}"#).unwrap();
+        let err = oauth_token_from_store(&d).unwrap_err().to_string();
+        assert!(err.contains("no OAuth token"), "{err}");
+        assert!(
+            err.contains("setup-token"),
+            "the error must say the way out: {err}"
+        );
+
+        // ...and a node that never logged in at all says that instead.
+        let empty = dir("empty");
+        let err = oauth_token_from_store(&empty).unwrap_err().to_string();
+        assert!(err.contains("no stored claude credentials"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn a_malformed_store_is_an_error_rather_than_a_panic() {
+        let d = dir("malformed");
+        std::fs::write(d.join(".credentials.json"), "not json at all").unwrap();
+        assert!(oauth_token_from_store(&d).is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 }
