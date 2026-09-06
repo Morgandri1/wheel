@@ -56,14 +56,7 @@ async fn an_embedded_engine_starts_serves_and_stops() {
 
 /// A second start must return the engine already running rather than race another onto the same
 /// database — the same rule the process backend follows.
-/// Blocked on wheel-engine: `serve` installs a *global* tracing subscriber, so the second engine in
-/// a process panics ("a global default trace dispatcher has already been set"). Every integration
-/// test file is one process, so exactly one test here may start an engine until that is fixed —
-/// reported to SDK. These are written and ready; drop the attribute when their fix lands.
-const _: () = ();
-
 #[tokio::test]
-#[ignore = "wheel-engine installs a global tracing subscriber; only one engine per process"]
 async fn starting_twice_does_not_start_a_second_engine() {
     let sb = sandbox();
     let id = Uuid::new_v4();
@@ -84,7 +77,6 @@ async fn starting_twice_does_not_start_a_second_engine() {
 
 /// Each project gets its own engine, its own socket and its own database.
 #[tokio::test]
-#[ignore = "wheel-engine installs a global tracing subscriber; only one engine per process"]
 async fn projects_do_not_share_an_engine() {
     let sb = sandbox();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
@@ -106,7 +98,6 @@ async fn projects_do_not_share_an_engine() {
 }
 
 #[tokio::test]
-#[ignore = "wheel-engine installs a global tracing subscriber; only one engine per process"]
 async fn destroy_removes_the_project_and_is_idempotent() {
     let sb = sandbox();
     let id = Uuid::new_v4();
@@ -145,7 +136,6 @@ async fn project_directories_are_private_to_this_user() {
 }
 
 #[tokio::test]
-#[ignore = "wheel-engine installs a global tracing subscriber; only one engine per process"]
 async fn restart_leaves_the_engine_serving() {
     let sb = sandbox();
     let id = Uuid::new_v4();

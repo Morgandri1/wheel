@@ -106,46 +106,56 @@ mod tests {
         }
     }
 
+    /// Every case that reads or writes the environment, in one test.
+    ///
+    /// Environment variables are process-global and Rust runs tests in parallel threads, so these
+    /// as separate `#[test]`s race: one clears `WHEEL_DATA_DIR` while another sets it, and which
+    /// one wins depends on timing. It failed that way once here before being noticed, which is the
+    /// worst kind of test — it passes on rerun and teaches you to ignore it. Sequencing the cases
+    /// inside a single test makes the interference impossible rather than unlikely. Same reasoning,
+    /// and same shape, as wheel-api's config_interlock.
     #[test]
-    fn no_arguments_is_a_working_configuration() {
-        std::env::remove_var("WHEEL_DATA_DIR");
-        std::env::remove_var("BIND_ADDR");
+    fn configuration_comes_from_flags_then_environment_then_defaults() {
+        fn clear() {
+            std::env::remove_var("WHEEL_DATA_DIR");
+            std::env::remove_var("BIND_ADDR");
+        }
+
+        // Nothing set: the defaults are a working configuration on their own, which is the whole
+        // promise of "zero flags".
+        clear();
         std::env::set_var("HOME", "/home/someone");
         let s = run(&[]);
         assert_eq!(s.data_dir, PathBuf::from("/home/someone/.wheel"));
         assert_eq!(s.bind, "0.0.0.0:8080");
-    }
 
-    #[test]
-    fn flags_win_over_the_environment() {
-        std::env::set_var("WHEEL_DATA_DIR", "/from/env");
-        std::env::set_var("BIND_ADDR", "0.0.0.0:9999");
-        let s = run(&["--data-dir", "/from/flag", "--bind", "127.0.0.1:1234"]);
-        assert_eq!(s.data_dir, PathBuf::from("/from/flag"));
-        assert_eq!(s.bind, "127.0.0.1:1234");
-        std::env::remove_var("WHEEL_DATA_DIR");
-        std::env::remove_var("BIND_ADDR");
-    }
-
-    #[test]
-    fn the_equals_form_works_too() {
-        std::env::remove_var("WHEEL_DATA_DIR");
-        std::env::remove_var("BIND_ADDR");
-        std::env::set_var("HOME", "/home/someone");
-        let s = run(&["--data-dir=/x", "--bind=[::1]:80"]);
-        assert_eq!(s.data_dir, PathBuf::from("/x"));
-        assert_eq!(s.bind, "[::1]:80");
-    }
-
-    #[test]
-    fn the_environment_supplies_defaults_when_no_flags_are_given() {
+        // The environment supplies defaults when no flags are given.
         std::env::set_var("WHEEL_DATA_DIR", "/from/env");
         std::env::set_var("BIND_ADDR", "0.0.0.0:9999");
         let s = run(&[]);
         assert_eq!(s.data_dir, PathBuf::from("/from/env"));
         assert_eq!(s.bind, "0.0.0.0:9999");
-        std::env::remove_var("WHEEL_DATA_DIR");
-        std::env::remove_var("BIND_ADDR");
+
+        // ...and a flag overrides it.
+        let s = run(&["--data-dir", "/from/flag", "--bind", "127.0.0.1:1234"]);
+        assert_eq!(s.data_dir, PathBuf::from("/from/flag"));
+        assert_eq!(s.bind, "127.0.0.1:1234");
+
+        // The --flag=value form is equivalent.
+        clear();
+        let s = run(&["--data-dir=/x", "--bind=[::1]:80"]);
+        assert_eq!(s.data_dir, PathBuf::from("/x"));
+        assert_eq!(s.bind, "[::1]:80");
+
+        // No HOME and no flag: there is nothing to derive a data directory from, so the error has
+        // to name the flag that fixes it rather than invent a location.
+        clear();
+        std::env::remove_var("HOME");
+        let e = Settings::parse::<[&str; 0], &str>([]).unwrap_err();
+        assert!(format!("{e:#}").contains("--data-dir"), "{e:#}");
+
+        clear();
+        std::env::set_var("HOME", "/home/someone");
     }
 
     #[test]
@@ -169,14 +179,5 @@ mod tests {
     fn a_flag_without_its_value_is_an_error() {
         assert!(Settings::parse(["--data-dir"]).is_err());
         assert!(Settings::parse(["--bind"]).is_err());
-    }
-
-    #[test]
-    fn without_a_home_the_error_says_what_to_pass() {
-        std::env::remove_var("WHEEL_DATA_DIR");
-        std::env::remove_var("HOME");
-        let e = Settings::parse::<[&str; 0], &str>([]).unwrap_err();
-        assert!(format!("{e:#}").contains("--data-dir"));
-        std::env::set_var("HOME", "/home/someone");
     }
 }
