@@ -686,23 +686,44 @@ untraced.
 Fixed: interpolating after a `/` stays legal, interpolating into the ID body fails with the fix
 named. Verified by reintroducing the interpolated form and watching it go red.
 
-## 019 — Integration suites collided on ports, env vars and container names · S3 · QA (mine) · CLOSED
+## 019 — WITHDRAWN. `wheeld` compiled fine; the break was in MY build, not on main · QA (mine)
 
-Three suites defaulted to port 17413 and two to 17414; two different suites read
-`WHEEL_ENGINE_PORT` with **different** defaults, so setting it to relocate one silently moved
-the other onto a third. Nothing had failed yet — `run.sh` is serial — which is exactly why it
-was worth fixing before it produced a 2am flake, or worse, one suite asserting confidently
-about another suite's engine.
+**I filed this as an S1 against API and it was wrong. Withdrawn, with the mechanism recorded,
+because the way I got it wrong is more useful than the bug I thought I had.**
 
-Then the real version arrived: a second QA session on this shared host ran the same suite at the
-same time, its `docker rm -f` destroyed my wheel-on-wheel engine mid-clone, and the retry could
-not start because it still held the port. Suite-level uniqueness does not help when the same
-suite runs twice.
+PM produced the contradicting evidence: CI run 34027530976 (head `b15e9c7`, integration job)
+ran the wheeld smoke and got `5 passed, 1 failed` — so the binary built and served. That cannot
+be true of a workspace that does not compile.
 
-Fixed in two layers: `qa/contract/suite_isolation.py` (in `make check`) forbids shared default
-ports, shared port env vars and shared container names across suites; and long-running suites
-take a per-run container name plus `wheel_client.free_port()`, which falls back to an
-OS-assigned port when the default is busy. Verified by running two engines side by side.
+Reconciled from git rather than from argument:
+
+* `bc2ca7a` added `pub ready` to `wheel_host::HostState` **and** `ready:` to
+  `crates/wheeld/src/lib.rs` in the SAME commit. No commit on `main` ever had one without the
+  other, so the window I claimed never existed.
+* At `b15e9c7` neither side had the field. It compiled, which is what CI observed.
+
+**What actually happened to me.** `~/.cargo/config.toml` points all six worktrees at ONE shared
+`target-dir` (contract §1, for build throughput). My worktree was on a commit *before* `bc2ca7a`
+while another agent's worktree had already built `wheel-host` from *after* it. My
+`cargo build -p wheeld` linked against that newer `wheel-host` rlib while compiling my older
+`wheeld` source — so the compiler correctly reported a field my source did not set and the
+dependency required. Source and dependency from different commits, in one build.
+
+**Why I did not catch it.** I *did* suspect staleness: I saw the failure, noticed my worktree was
+behind, rebased, and rebuilt before filing. That felt like ruling staleness out. It ruled out one
+kind — a stale *checkout* — and I never considered the other, a stale *artifact*, despite having
+fixed exactly that hazard for the coverage gate hours earlier by giving it a private
+`CARGO_TARGET_DIR`. I knew the shared target dir corrupts measurements and did not think it could
+corrupt a compile.
+
+**Fixed:** `test_wheeld_smoke.py` now builds into its own target dir, so the suite can never again
+compile one commit's source against another's artifacts. Anything of mine that shells out to
+cargo needs the same treatment.
+
+**The real finding is unaffected and stands with API:** `WHEELD-engine-reachable` fails with
+`502 engine_unreachable` — the per-project engine does not answer through the API in the same
+process. That is what CI caught, it is genuine, and PM had already routed it. My false S1 cost
+API nothing except the noise of it.
 
 ## 017 — Suites can test an image another agent replaced mid-run · S2 · QA (mine) · CLOSED
 
