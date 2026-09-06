@@ -64,6 +64,20 @@ export const T = {
   agentSave: "btn-agent-save",
   ctxSave: "btn-ctx-save",
 
+  // endpoint panel. The notice carries its own switch: the operator could not find the toggle
+  // on the project-list card, and a notice naming a setting you cannot reach from it is a hunt.
+  endpointHttpOff: "endpoint-http-off",
+  endpointEnableHttp: "btn-endpoint-enable-http",
+  // "Reachable" is a measurement, not an inference from a config flag. Ingress does not exist
+  // engine-side yet, so today this legitimately reports a failure on every board — the verdict
+  // says "not built yet", never "your path is wrong", which is the confusion it exists to end.
+  endpointTest: "btn-endpoint-test",
+  endpointProbe: "endpoint-probe",
+  endpointProbeStatus: "endpoint-probe-status",
+  endpointProbeVerdict: "endpoint-probe-verdict",
+  endpointProbeBody: "endpoint-probe-body",
+  endpointProbeUnreadable: "endpoint-probe-unreadable",
+
   // agent drawer, logs and chat
   agentDrawer: "agent-drawer",
   drawerToggle: "btn-drawer-toggle",

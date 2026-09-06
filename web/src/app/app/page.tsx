@@ -164,7 +164,10 @@ export default function ProjectsPage() {
                     checked={p.capabilities.http}
                     onChange={(http) => setHttp.mutate({ id: p.id, http })}
                     label="Public HTTP"
-                    hint={p.capabilities.http ? "Endpoints are reachable" : "Endpoints return 403"}
+                    // "Reachable" was a claim about the world made from a config flag. The switch
+                    // only decides whether the API refuses the hit; whether anything serves it is
+                    // a separate fact, and the endpoint panel's Test button is where it is measured.
+                    hint={p.capabilities.http ? "Endpoints are not refused" : "Endpoints return 403"}
                     testId={`project-http-${p.name}`}
                   />
                 </div>

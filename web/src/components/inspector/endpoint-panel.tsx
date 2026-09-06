@@ -1,10 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button, CopyField, Field, Input, Select } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
 import { validateEndpointPath } from "@/lib/validate";
 import { HTTP_METHODS } from "@/lib/schema";
+import { probeEndpoint, probeVerdict, type Probe } from "@/lib/endpoint-probe";
+import { projects } from "@/lib/api";
 import type { EngineApi } from "@/lib/api";
 import type { EndpointNode, HttpMethod, Project, ResponseMode, WheelNode } from "@/lib/schema";
 
@@ -30,11 +33,18 @@ export function EndpointPanel({
   const [path, setPath] = useState(node.config.path);
   const [responseMode, setResponseMode] = useState<ResponseMode>(node.config.response_mode);
   const [saving, setSaving] = useState(false);
+  const [enabling, setEnabling] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probe, setProbe] = useState<Probe | null>(null);
+  const qc = useQueryClient();
 
   useEffect(() => {
     setMethod(node.config.method);
     setPath(node.config.path);
     setResponseMode(node.config.response_mode);
+    // A measurement belongs to the URL it was taken against. Keeping it across a node switch, or
+    // across an edit to the path, would show a reading of somewhere else.
+    setProbe(null);
   }, [node.id, node.config.method, node.config.path, node.config.response_mode]);
 
   const pathError = validateEndpointPath(path);
@@ -57,6 +67,30 @@ export function EndpointPanel({
       .filter((x): x is { wire: (typeof x)["wire"]; target: WheelNode } => Boolean(x.target));
   }, [node.wires, nodes]);
 
+  const enableHttp = async () => {
+    setEnabling(true);
+    try {
+      await projects.patch(project.id, { capabilities: { http: true } });
+      await qc.invalidateQueries({ queryKey: ["project", project.id] });
+      onChanged();
+      toast("Public HTTP is on for this project.");
+    } catch (e) {
+      toastError(e, "Couldn't turn public HTTP on.");
+    } finally {
+      setEnabling(false);
+    }
+  };
+
+  const test = async () => {
+    setProbing(true);
+    setProbe(null);
+    try {
+      setProbe(await probeEndpoint(url));
+    } finally {
+      setProbing(false);
+    }
+  };
+
   const save = async () => {
     setSaving(true);
     try {
@@ -78,19 +112,72 @@ export function EndpointPanel({
           be able to blank the board. Absent capabilities read as "off", which is the safe claim —
           telling someone a URL is live when it is not costs more than the reverse. */}
       {!project.capabilities?.http ? (
-        <p
+        <div
           data-testid="endpoint-http-off"
-          className="border border-[color-mix(in_srgb,var(--wire-write)_50%,transparent)] px-2.5 py-2 text-micro"
-          style={{ color: "var(--wire-write)" }}
+          className="flex items-center justify-between gap-2 border border-[color-mix(in_srgb,var(--wire-write)_50%,transparent)] px-2.5 py-2"
         >
-          Public HTTP is off for this project, so this URL answers 403. Turn it on from the project
-          list to make endpoints reachable.
-        </p>
+          {/* The switch lives here, not only on the project-list card. A notice that names a
+              setting the reader cannot reach from it sends them hunting; the operator hunted. */}
+          <span className="text-micro" style={{ color: "var(--wire-write)" }}>
+            Public HTTP is off for this project, so this URL answers 403.
+          </span>
+          <Button
+            size="sm"
+            data-testid="btn-endpoint-enable-http"
+            disabled={enabling}
+            onClick={enableHttp}
+          >
+            {enabling ? "Enabling…" : "Enable endpoints"}
+          </Button>
+        </div>
       ) : null}
 
       <Field label="Public URL" hint="Anyone with this link can hit it. There is no allowlist.">
         <CopyField value={url} testId="inspector-endpoint-url" />
       </Field>
+
+      <div className="flex items-center gap-2">
+        <Button size="sm" data-testid="btn-endpoint-test" disabled={probing} onClick={test}>
+          {probing ? "Testing…" : "Test"}
+        </Button>
+        <span className="text-micro text-ink-faint">
+          Sends a real GET from this browser. If this endpoint is wired to an agent, it will get a
+          message.
+        </span>
+      </div>
+
+      {probe ? (
+        <div className="flex flex-col gap-1.5 border border-rule px-2.5 py-2" data-testid="endpoint-probe">
+          {probe.kind === "answered" ? (
+            <>
+              <div className="flex items-baseline gap-2">
+                <span className="ident text-meta" data-testid="endpoint-probe-status">
+                  {probe.status}
+                </span>
+                <span className="text-micro text-ink-faint">{probe.statusText}</span>
+              </div>
+              <p className="text-micro text-ink-dim" data-testid="endpoint-probe-verdict">
+                {probeVerdict(probe.status, probe.code)}
+              </p>
+              {probe.body ? (
+                <pre
+                  className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-rule pt-1.5 text-micro text-ink-faint"
+                  data-testid="endpoint-probe-body"
+                >
+                  {probe.body}
+                  {probe.truncated ? "\n… truncated" : ""}
+                </pre>
+              ) : (
+                <p className="text-micro text-ink-faint">The response had no body.</p>
+              )}
+            </>
+          ) : (
+            <p className="text-micro text-ink-dim" data-testid="endpoint-probe-unreadable">
+              {probe.reason}
+            </p>
+          )}
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-[96px_1fr] gap-2">
         <Field label="Method">
