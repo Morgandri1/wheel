@@ -62,15 +62,25 @@ container image" — see the note at the top of this file for exactly what that 
    process backend (does the HOST really set `WHEEL_DATA_DIR` per-project the way `host/sandbox/process.rs:119`
    claims) — that's an integration fact about the host+engine running together, not something a `wheel-engine`
    unit test can settle, and I have no process-backend host to run it against here.
-4. **028 face 5 (PM's ruling: declared-but-empty key should WARN, not 409-block) — STILL NOT IMPLEMENTED.**
-   `find_ambiguity` (`vault.rs:96`) still uses `offered_keys` (declared ∪ stored) with no distinction for
-   "declared but never stored," and both callers (`db/board.rs:294` at wire-creation, `api/mod.rs:98` mapping
-   `Ambiguous` to `ApiError`) still turn that into a hard `409 ambiguous_credential`, unconditionally. Ran
-   `vault::tests::a_declared_key_is_still_enough_to_be_ambiguous` fresh from HEAD: **PASS** — meaning the test
-   still asserts (and gets) the OLD blocking behavior PM overruled. `docs/handoff/sdk.md`'s own NEXT list (#4,
-   as of the version I read) independently confirms this is queued but not started. Face 1 (declared-but-empty
-   ≠ authenticated) remains correctly fixed — `a_declared_key_with_no_value_is_not_a_credential`: **PASS**.
-   **This is the one real acceptance-test gap left open of the four PM asked me to check.**
+4. **028 face 5 (PM's ruling: declared-but-empty key should WARN, not 409-block) — NOT on `main` as of
+   `1aa77ac`, but SDK's fix is ready and I independently verified it on their unmerged commit.** At `1aa77ac`,
+   `find_ambiguity` (`vault.rs:96`) still used `offered_keys` (declared ∪ stored) with no distinction for
+   "declared but never stored," and both callers (`db/board.rs:294`, `api/mod.rs:98`) still turned that into a
+   hard `409 ambiguous_credential`, unconditionally — confirmed by running
+   `vault::tests::a_declared_key_is_still_enough_to_be_ambiguous` fresh (PASS, meaning the OLD blocking
+   behavior). SDK then shipped `aa8be54` (handoff `db5f6c2`, unmerged as of this writing): I checked it out and
+   built it myself. `find_ambiguity` is now stored-only (`list_keys`) so a REAL clash (both vaults hold a
+   value) still 409s; a separate `find_declared_overlap` (declared-only) feeds a non-blocking `warning` that
+   `db/board.rs::add_wire` returns alongside the created wire, surfaced by `POST /v1/wires` as
+   `200 {"warning": "..."}`. Ran `a_declared_but_empty_key_does_not_block_the_vault_with_the_real_value`: PASS.
+   This is a correct, clean implementation of PM's ruling — good to merge as far as I can tell. Face 1
+   (declared-but-empty ≠ authenticated) remains correctly fixed on `main` —
+   `a_declared_key_with_no_value_is_not_a_credential`: **PASS**.
+5. **023 (importer YAML-bomb) — already FIXED on `main`, re-confirmed.** All 21 `tools::import::tests::*`
+   pass fresh from HEAD, including `a_yaml_bomb_is_refused_before_it_is_expanded`,
+   `an_anchor_alone_is_refused_too`, and `an_oversized_document_is_refused_without_being_parsed`. The finding
+   file's own status line already said FIXED; I re-ran it myself rather than take that on faith given how much
+   this file itself had drifted from reality earlier today.
 
 ## STILL BLOCKED on external deps (run when they exist)
 - **Cross-tenant process backend (F003/F007), intra-project half now observed live (finding 036).** The
@@ -79,15 +89,40 @@ container image" — see the note at the top of this file for exactly what that 
   INTRA-project half of F007 (every node in ONE project sharing a uid) needed no such image — I found it live,
   today, on the actual wheel-dev board this team runs on, with a real leaked GitHub PAT as the concrete proof.
   See `036-live-same-uid-credential-exposure-wheel-dev.md`. Reported to PM immediately on discovery.
-- **Finding 031 (endpoint/ingress bearer design):** a DESIGN review, since accepted by PM in full
-  (`4c2b631`) — SDK builds to it. Once the endpoint handler + ingress→agent delivery land, VERIFY #0
+- **Finding 031 (endpoint/ingress bearer design):** still just a DESIGN review, accepted by PM in full
+  (`4c2b631`) — grepped for it, no `ingress`/`endpoint` handler exists anywhere in `wheel-engine/src` yet, so
+  there is nothing to verify live. Once the endpoint handler + ingress→agent delivery land, VERIFY #0
   (Authorization/Cookie stripped from forwarded headers), constant-time bearer + indistinguishable 401/404,
   body-size cap, and #4 (ingress body is a prompt-injection channel).
-- **Importer YAML-bomb (023):** grounded in source (serde_yaml 0.9, no size cap); confirm with a bounded
-  serde_yaml harness or the live `POST /v1/tools/import` once a body cap exists.
-- **034/035 (poison-pill / internet-to-dead-board chain):** landed by a parallel session this same day: worth a
-  successor reading those two finding files before touching sqlite/journal-mode or the ingress→envelope path —
-  a lot of P0-outage context sits there that isn't repeated here.
+- **037 (single-uid blast radius, companion to 036)** — verified its crown-jewel claim myself: grepped
+  `config.rs` for where `ENV_ENGINE_SECRET`/`ENV_VAULT_KEY` are read (`:71`, `:86`, plain `std::env::var`) and
+  for every `remove_var` in `wheel-engine` (only the test helper and the CHILD-spawn scrubbing in
+  `supervisor/mod.rs:1568` — neither touches the ENGINE's own environ). So both secrets do sit in
+  `/proc/<engine-pid>/environ` for the engine's whole life, exactly as 037 claims. The interim fix it names
+  (`remove_var` right after `Config::from_env` reads them) is a one-liner, independent of per-node-uid scope —
+  flagged to PM as worth prioritizing on its own.
+
+## RE-VERIFIED, second pass this same day — 034 (both) and 035 fully fixed
+1. **034 poison-pill (`escape_envelope_body` byte-slice panic)** — FIXED. `message.rs`'s escaper now walks
+   `body.as_bytes()` and slices the byte array, never the `&str` — a byte slice cannot land mid-character, so
+   the whole class (an em dash or any multi-byte char landing on the old computed offset) is gone by
+   construction, not by patching the one instance that took the board down. Ran
+   `cargo test -p wheel-core --test envelope`: **18/18 pass**, including
+   `the_body_that_took_the_board_offline_escapes_instead_of_panicking` and
+   `no_stored_body_can_stop_the_engine_from_starting` — direct regression coverage for the actual incident.
+2. **034 (the OTHER 034 — engine journal-mode proven by read-back, not a write)** — FIXED by consolidation, not
+   a patch to the old function. `wheel-engine/src/db/mod.rs` no longer has its own `set_journal_mode`; it now
+   calls `wheel_sqlite::open_configured`/`configure_journal` — the SAME shared crate the host store uses, whose
+   `mode_holds` requires `current_journal_mode == wanted` **AND** `BEGIN IMMEDIATE; COMMIT` to actually succeed
+   (`wheel-sqlite/src/lib.rs:150-154`). One journal implementation for both binaries now, proven by a write.
+3. **035 (chain: message → poison → panic → permanently dead board)** — closed at its single sink (the escaper
+   in #1), so every link PM/my twin traced (agent-sendable today, internet-reachable once ingress lands) is
+   moot regardless of entry point: the panic that made the message "poison" can't happen anymore. Worth
+   re-confirming once ingress actually lands that no OTHER re-parse path was left un-fixed, but the shared sink
+   being fixed is the strong form of closing this.
+4. **032 (host boot availability)** — a design review already concluding "poison-project grid-DoS DEFEATED by
+   design," residual = the accepted single-host SPOF. I read it; nothing to add or re-verify, it's already a
+   concluded review rather than an open item.
 
 ## Standing rules a successor must keep enforcing
 - **42137cd**: the trust boundary is NEVER widened for test convenience (WHEEL_FAKE_* → config file;
