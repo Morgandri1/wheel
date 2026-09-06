@@ -1,0 +1,41 @@
+{
+  "project": "c6049c66-9530-4900-a3c1-659529328c1e",
+  "environment": "69d3c09b-8a50-4fde-9a7c-53b3307c6ad6",
+  "services": {
+    "wheel-api": {
+      "serviceId": "03fc91ee-25dc-415b-b79c-898fef249efc",
+      "dockerfilePath": "docker/Dockerfile.api",
+      "numReplicas": 2,
+      "healthcheckPath": "/healthz",
+      "healthcheckTimeout": 30,
+      "restartPolicyType": "ON_FAILURE",
+      "restartPolicyMaxRetries": 10,
+      "watchPatterns": [
+        "crates/wheel-api/**",
+        "crates/wheel-core/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        "docker/Dockerfile.api"
+      ]
+    },
+    "wheel-host": {
+      "serviceId": "c359eaf4-d766-485b-9c1e-8e5e368382f4",
+      "dockerfilePath": "docker/Dockerfile.host",
+      "numReplicas": 1,
+      "healthcheckPath": "/host/v1/healthz",
+      "healthcheckTimeout": 30,
+      "restartPolicyType": "ON_FAILURE",
+      "restartPolicyMaxRetries": 10,
+      "watchPatterns": [
+        "crates/wheel-host/**",
+        "crates/wheel-engine/**",
+        "crates/wheel-cli/**",
+        "crates/wheel-core/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        "docker/Dockerfile.host",
+        "docker/entrypoint.sh"
+      ]
+    }
+  }
+}
