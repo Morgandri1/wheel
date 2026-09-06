@@ -36,6 +36,21 @@ The feature gate we have is real but partial:
   workspace also builds wheel-api's own binary with default features, and wheeld's copy inherits
   Postgres. A laptop compiles a Postgres driver it will never call.
 
+## What this proposal is NOT
+
+It is not an auth-mode change, and it has nothing to do with Clerk, `AUTH_MODE`, or what ships in
+the web bundle. Those are a separate decision in a separate document
+(`api-auth-mode-and-client-bundle.md`).
+
+The phrase that caused the confusion is mine and I should have been more precise: this rewrites the
+code path that *reads the rows* the login path reads. It does not change what a valid session is,
+which provider issues one, how a token is verified, or what any client sends. `AuthMode`,
+`x-auth-token`, the JWKS verifier and the local session issuer are all untouched, and no file under
+`src/auth/` changes except the store calls inside it.
+
+A useful test of the distinction: this change is invisible from outside the process. A client cannot
+tell which driver read the row.
+
 ## What the current code path does
 
 `crates/wheel-api/src/db.rs` holds `enum Db { Pg(sqlx::PgPool), Sqlite(sqlx::SqlitePool) }`, chosen by
