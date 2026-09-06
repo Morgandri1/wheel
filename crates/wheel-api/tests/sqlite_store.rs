@@ -232,3 +232,36 @@ async fn the_dispatch_macros_work_against_a_real_backend() {
     let broken: Result<(String,), _> = db_fetch_one!(&db, "SELECT nope FROM projects");
     assert!(broken.is_err());
 }
+
+/// The same property, asserted through the code paths that rely on it rather than at the schema.
+///
+/// `email_uniqueness_ignores_case` proves the column collates correctly. This proves the
+/// application actually benefits: that `create_user` refuses the duplicate, and — the part that
+/// matters — that `authenticate` finds the one account by any spelling. If it did not, the owner
+/// would be locked out of their own account by capitalising their address.
+#[tokio::test]
+async fn one_account_answers_to_every_spelling_of_its_address() {
+    let db = Db::connect(&temp_db()).await.expect("connect and migrate");
+
+    let first = wheel_api::auth::local::create_user(&db, "Alice@Example.com", "correct-horse-42!")
+        .await
+        .expect("the first signup should succeed");
+
+    assert!(
+        wheel_api::auth::local::create_user(&db, "alice@example.com", "another-Passw0rd!")
+            .await
+            .is_err(),
+        "a second account was created for the same address in different case"
+    );
+
+    for spelling in [
+        "Alice@Example.com",
+        "alice@example.com",
+        "ALICE@EXAMPLE.COM",
+    ] {
+        let user = wheel_api::auth::local::authenticate(&db, spelling, "correct-horse-42!")
+            .await
+            .unwrap_or_else(|| panic!("{spelling} should authenticate the one account"));
+        assert_eq!(user.id, first.id);
+    }
+}

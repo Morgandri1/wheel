@@ -122,8 +122,11 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("wheeld-test-{}", std::process::id()));
-        let p = p.join(format!("{:?}", std::time::SystemTime::now()).replace([' ', ':'], "_"));
+        // A uuid rather than pid + timestamp. The timestamp is unique only if the clock ticks
+        // between two calls, and it does not always: two tests running in parallel threads landed
+        // in the same directory, the second regenerated the key, and the first one's "the master
+        // key survives a restart" failed for a reason that had nothing to do with it.
+        let p = std::env::temp_dir().join(format!("wheeld-test-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
