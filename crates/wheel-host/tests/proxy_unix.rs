@@ -111,6 +111,7 @@ fn cfg() -> Config {
         rlimit_cpu_secs: None,
         reap_grace_secs: 1,
         disk_floor_mb: 1,
+        reconcile_concurrency: 8,
         engine_base_url: "unused".into(),
     }
 }
