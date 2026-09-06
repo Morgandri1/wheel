@@ -11,20 +11,26 @@ engine-cli 25, engine-mcp 14, engine-vault 21, engine-messages 24, engine-events
 engine-child-env 7, engine-auth-paste 15, engine-auth-routing 10, engine-validation 21,
 wire-matrix (all 243 cells). E2E: chromium + local-auth + `packaged` (the real `npx wheel-web`).
 
-TESTPLAN has ~570 named criteria; `qa:id-traceability` fails if a suite asserts an ID the plan
+Absence assertions use `R.control()` / `R.gated()` in `wheel_client`: a gated assertion SKIPS when its control did not pass, instead of passing vacuously. It is already catching things in the wild — three `ENG-journal-override-*` checks report "unproven" rather than green whenever the engine fails to start.
+
+TESTPLAN has ~580 named criteria; `qa:id-traceability` fails if a suite asserts an ID the plan
 does not name, and it reads Playwright specs as well as Python.
 
 ## IN FLIGHT
 
-- `WOW-table-survives-restart` is **RED by design** — it reproduces a real S1 (a table node
-  whose sqlite table is gone answers `400 no such table` about a node the board still shows).
-  Goes green when SDK re-ensures the table. Its companion asserts the rebuilt table accepts the
-  node's **configured columns**; a table rebuilt from a default schema passes the first and
-  fails the second, and would look like a fix.
-- `WOW-toolchain-cargo-per-project` is **RED** — `CARGO_HOME=/data/cargo mode=755`. The PATH is
-  correct on the docker backend; the **mode** is the violation. SDK has a fix described but not
-  on main.
-- `make check` is red on `wheeld` at 89.61% (0.39% under). API's.
+- **BUG-022 (S1, SDK)** — `ENG-starts-without-shm` is RED. `wheel_sqlite::set_journal_mode`
+  takes its fast path on a **read-back**, so on a volume that cannot map a `-shm` the engine
+  exits 1 in `migrate()`. The host is safe (`open_configured(path, true)` falls through to an
+  EXCLUSIVE escape); the engine passes `false`, because `tables::query` opens the file a second
+  time, so the read-back is its *entire* protection. Fixture: `qa/fixtures/wal_blocked_shm.py`.
+- `WOW-table-survives-restart` — RED by design, reproduces a real S1. Goes green when the table
+  is re-ensured. Its companion asserts the rebuilt table takes the node's **configured columns**;
+  a table rebuilt from a default schema passes the first and fails the second.
+- `make check` — `cargo fmt` (11 diffs in wheel-engine + wheel-sqlite, SDK's) and `wheeld` at
+  89.61%, a third of a point under.
+- **GREEN as of today, and verified not-vacuous**: `wheel-on-wheel` 7 passed / **0 skipped** —
+  an agent cloned this repo with a vault-held token and compiled `wheel-core` inside its own
+  sandbox, with ADVERSARY 029's toolchain constraints asserted at runtime.
 
 ## NEXT (in order, each with its gate)
 
@@ -81,6 +87,18 @@ other than what it looked like.**
    passed with the bug restored. Only the type-change route reaches the adoption.
 10. **Fixed ports let a leftover container impersonate a broken engine.** All suites use
     `free_port()`; `suite_isolation` enforces it.
+11. **A sound-looking code reading will hand you a false S1.** I read `open_configured` and
+    concluded the `wheel-sqlite` refactor had undone the production fix: it returns on a
+    read-back before reaching the EXCLUSIVE escape, and I had *measured* WAL reading back as
+    `wal`. Every step was true and the conclusion was wrong — a fresh `host.db` stays in
+    `delete`, so the read-back mismatches and the fall-through works. Running it took ninety
+    seconds. I was wrong the same way earlier with BUG-019 (withdrawn), and both times the
+    reasoning was fine; it was answering a question the experiment answers better.
+12. **Check the tool is in the image before probing with it.** A health probe of mine used
+    `wget`; the image has `curl` and no `wget`, so it spun the full timeout and then failed its
+    own control with "the engine did not start" — the right failure for entirely the wrong
+    reason. I had verified `curl` was present hours earlier and did not think to reuse what I
+    already knew.
 
 11. **A gate that checks one direction is blind in the other, and mine was.**
     `id_traceability` verified every asserted ID exists in the plan and never checked that a
