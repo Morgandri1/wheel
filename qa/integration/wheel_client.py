@@ -8,7 +8,7 @@ wrongly in both directions and the test passes.
 mint() is copied from infra/dev/e2e.py (API's implementation, per their instruction to
 reuse rather than reinvent the token format).
 """
-import base64, hashlib, hmac, json, os, socket, subprocess, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, datetime, hashlib, hmac, json, os, re, socket, subprocess, time, urllib.error, urllib.parse, urllib.request, uuid
 from collections import namedtuple
 
 # Tuple-unpackable AND attribute-addressable: `st, body, hdrs = call(...)` and
@@ -277,13 +277,74 @@ def pin_image(tag="wheel-engine:test"):
     """
     p = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", tag],
                        capture_output=True, text=True)
-    return p.stdout.strip() if p.returncode == 0 else None
+    if p.returncode != 0:
+        return None
+    fresh, why = image_freshness(tag)
+    if not fresh and os.environ.get("WHEEL_ALLOW_STALE_IMAGE") != "1":
+        raise StaleImage(why)
+    return p.stdout.strip()
 
 
 def _any_free_port():
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         return sk.getsockname()[1]
+
+
+class StaleImage(Exception):
+    """The image under test predates the code under test.
+
+    Raised rather than returned so it cannot be ignored by a suite that forgot to look.
+    `run_suite` turns it into a SKIP with the reason, because a stale image makes every
+    result in the run an answer to a different question -- and on 2026-09-06 that was not
+    hypothetical: deploy decisions were made on suites that had passed against a six-hour
+    old engine. Set WHEEL_ALLOW_STALE_IMAGE=1 to override deliberately.
+    """
+
+
+def image_freshness(tag, root=None):
+    """(fresh, detail) — was this image built from source at least as new as the tree?
+
+    PM made deploy decisions on 2026-09-06 believing `wheel-engine:test` matched main. It
+    was built at 09:55 and the fix under test landed at ~15:20, so every suite that ran
+    against it that afternoon tested a PRE-FIX engine and reported green. A stale image is
+    not a wrong answer, it is an answer to a different question, and nothing in the run
+    says so.
+
+    The comparison is the image's build time against the commit time of the last commit
+    that touched code the image contains (`crates/`, `docker/`) -- not the whole tree, so a
+    docs commit does not invalidate an image, and not file mtimes, which a checkout
+    rewrites. Cheap enough to run at the top of every docker suite.
+    """
+    root = root or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    built = subprocess.run(["docker", "image", "inspect", "--format", "{{.Created}}", tag],
+                           capture_output=True, text=True)
+    if built.returncode != 0:
+        return False, "image %s is not built" % tag
+    stamp = built.stdout.strip()
+    src = subprocess.run(["git", "-C", root, "log", "-1", "--format=%ct", "--",
+                          "crates", "docker"], capture_output=True, text=True)
+    if src.returncode != 0 or not src.stdout.strip():
+        return True, "no source commit time available — not calling it stale"
+    return staleness(tag, stamp, int(src.stdout.strip()))
+
+
+def staleness(tag, built_iso, src_epoch):
+    """The comparison, separated so it can be tested without waiting six hours for an
+    image to go stale. A helper that has only ever returned "fresh" is not known to be
+    able to return anything else."""
+    try:
+        # RFC3339 with nanoseconds, which datetime will not parse; seconds are plenty.
+        built_at = datetime.datetime.fromisoformat(re.sub(r"\.\d+", "", built_iso)).timestamp()
+    except ValueError:
+        return True, "could not parse the image timestamp %r — not calling it stale" % built_iso
+    if built_at >= src_epoch:
+        return True, "image built %s, newest code commit %s" % (built_iso[:19], src_epoch)
+    behind = int((src_epoch - built_at) / 60)
+    return False, ("%s was built %d minutes BEFORE the newest commit touching crates/ or "
+                   "docker/. It does not contain the code under test, so a green from this "
+                   "run would describe a different engine. Run `make engine-image-test`."
+                   % (tag, behind))
 
 
 def free_port(preferred):
@@ -331,6 +392,10 @@ def run_suite(main, name, cleanup=None, container=None):
     rc = 1
     try:
         rc = main()
+        return rc
+    except StaleImage as e:
+        print("%s: SKIPPED — %s" % (name, e))
+        rc = 77
         return rc
     except KeyboardInterrupt:
         rc = 130
