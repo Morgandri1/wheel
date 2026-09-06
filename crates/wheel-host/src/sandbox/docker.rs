@@ -148,9 +148,24 @@ impl DockerSandbox {
                 config,
             )
             .await
-            .context("creating project container")?;
+            .map_err(|e| explain_create_failure(e, &self.cfg.engine_image))?;
         Ok(())
     }
+}
+
+/// Docker answers "no such image" with a bare 404, which surfaces to the user as a 500 on project
+/// start and says nothing about what to do. Name the missing tag and the command that builds it.
+fn explain_create_failure(e: bollard::errors::Error, image: &str) -> anyhow::Error {
+    if let bollard::errors::Error::DockerResponseServerError {
+        status_code: 404, ..
+    } = e
+    {
+        return anyhow::anyhow!(
+            "engine image {image} is not present on this docker daemon — build it with \
+             `make engine-image`, or set ENGINE_IMAGE to an image that exists"
+        );
+    }
+    anyhow::Error::new(e).context("creating project container")
 }
 
 #[async_trait]
@@ -260,5 +275,48 @@ impl Sandbox for DockerSandbox {
 
     fn engine_base(&self, id: &Uuid) -> String {
         self.cfg.engine_url(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn docker_404() -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such image: wheel-engine:dev".into(),
+        }
+    }
+
+    /// BUG-014: the compose stack defaulted to a tag nobody builds, and every project start came
+    /// back as an opaque 500. The message has to name the tag and the command that produces it.
+    #[test]
+    fn a_missing_image_names_the_tag_and_how_to_build_it() {
+        let msg = explain_create_failure(docker_404(), "wheel-engine:dev").to_string();
+        assert!(msg.contains("wheel-engine:dev"), "{msg}");
+        assert!(msg.contains("make engine-image"), "{msg}");
+    }
+
+    /// Every other docker failure keeps its own text: swallowing it into the image message would
+    /// send an operator to rebuild an image over a permissions or daemon problem.
+    #[test]
+    fn other_docker_failures_are_not_reported_as_a_missing_image() {
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "Conflict. The container name is already in use".into(),
+        };
+        let msg = format!("{:#}", explain_create_failure(e, "wheel-engine:dev"));
+        assert!(msg.contains("creating project container"), "{msg}");
+        assert!(!msg.contains("make engine-image"), "{msg}");
+    }
+    /// Every docker object name is derived from a uuid the API generated, never from user input.
+    #[test]
+    fn object_names_are_derived_only_from_the_project_uuid() {
+        let cfg = Config::for_tests("/tmp/wheel-docker-test");
+        let id = Uuid::new_v4();
+        assert!(cfg.container_name(&id).contains(&id.to_string()));
+        assert!(cfg.volume_name(&id).contains(&id.to_string()));
+        assert_ne!(cfg.container_name(&id), cfg.volume_name(&id));
     }
 }
