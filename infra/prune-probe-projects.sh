@@ -21,6 +21,10 @@ DENY_PROJECTS="6906cadb-45cd-4f27-8151-952b9d9bfb15"
 
 # An address is a probe account only if its domain is one of these exactly. Not a substring: a real
 # user at wheel.test.example.org is not a probe, and neither is one at notwheel.test.
+#
+# example.com is deliberately NOT here (PM ruling, ADVERSARY residual). It is registrable by anyone,
+# so a genuine project owned at one would be deleted at 24h by a tool whose whole design is
+# deny-first; our own probes use example.test and wheel.test already.
 PROBE_DOMAINS="wheel.test wheelcheck.dev"
 
 MIN_AGE_SECONDS=86400

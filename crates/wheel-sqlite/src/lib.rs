@@ -28,7 +28,11 @@ const BUSY_TIMEOUT_MS: i64 = 5_000;
 pub fn target_mode() -> String {
     std::env::var("WHEEL_SQLITE_JOURNAL")
         .ok()
-        .filter(|v| !v.trim().is_empty())
+        // Trimmed, not merely tested for blankness: the untrimmed value used to be the one
+        // returned, so `WHEEL_SQLITE_JOURNAL=" WAL "` passed every check and then failed the
+        // pragma, and the escalator quietly settled the deployment on TRUNCATE instead.
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "WAL".into())
 }
 
@@ -59,6 +63,7 @@ pub fn current_journal_mode(conn: &Connection) -> Result<String> {
 /// and would be locked out (7 tests caught exactly that) -- so it is held only
 /// across the conversion and dropped again.
 pub fn set_journal_mode(conn: &Connection, wanted: &str) -> Result<String> {
+    validate_mode_name(wanted)?;
     if try_mode(conn, wanted) {
         return current_journal_mode(conn);
     }
@@ -94,6 +99,34 @@ pub fn set_journal_mode(conn: &Connection, wanted: &str) -> Result<String> {
 
 /// The mode to fall back to. Needs no shared memory of any kind.
 const ROLLBACK: &str = "TRUNCATE";
+
+/// Every journal mode sqlite has. Anything else is a typo, not a deployment.
+const JOURNAL_MODES: [&str; 6] = ["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"];
+
+/// Reject a mode NAME sqlite has never heard of, before the database is touched.
+///
+/// The escalator below exists for a mode that is real but unusable HERE — WAL on a volume whose
+/// `-shm` cannot be resized — and its whole design is to keep going until something works. A typo
+/// in `WHEEL_SQLITE_JOURNAL` is not that. Handing one to the escalator means every boot drains the
+/// database under an exclusive lock twice and then silently settles on TRUNCATE, so the operator
+/// gets a mode they did not ask for and no indication they mistyped anything; making it a hard
+/// error at the END of that road instead would turn the typo into the crash loop we just spent
+/// eighty minutes on, caused by that exact variable.
+///
+/// Two different failures, two different answers: loud and immediate for a name that cannot work
+/// anywhere, patient escalation for a name that cannot work here.
+fn validate_mode_name(wanted: &str) -> Result<()> {
+    if JOURNAL_MODES
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(wanted.trim()))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{wanted:?} is not a sqlite journal mode; expected one of {} — check WHEEL_SQLITE_JOURNAL",
+        JOURNAL_MODES.join(", ")
+    )
+}
 
 /// Ask for a mode, then find out whether the database is really in it and
 /// really usable.
@@ -147,6 +180,9 @@ fn mode_holds(conn: &Connection, wanted: &str) -> bool {
 /// Every step is judged by READING THE MODE BACK, never by the pragma's result.
 pub fn open_configured(path: &str, allow_exclusive: bool) -> Result<Connection> {
     let wanted = target_mode();
+    // Before the file is opened at all, so a mistyped mode cannot leave a database behind or a
+    // journal beside it on the way to failing.
+    validate_mode_name(&wanted)?;
 
     let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
     if let Ok(mode) = configure_journal_to(&conn, &wanted) {
@@ -350,7 +386,9 @@ mod tests {
 
         let reported = set_journal_mode(&conn, "nonsense-mode").unwrap_err();
         assert!(
-            reported.to_string().contains("could not put the database"),
+            reported
+                .to_string()
+                .contains("is not a sqlite journal mode"),
             "a refused mode must be reported as refused, not as success: {reported}"
         );
 
@@ -397,6 +435,12 @@ mod target_mode_tests {
         assert_eq!(target_mode(), "TRUNCATE");
         unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "  ") };
         assert_eq!(target_mode(), "WAL", "a blank setting is not a mode");
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", " TRUNCATE ") };
+        assert_eq!(
+            target_mode(),
+            "TRUNCATE",
+            "a padded value is the mode it names, not one the pragma will refuse"
+        );
         match restore {
             Some(v) => unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", v) },
             None => unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") },
@@ -524,5 +568,121 @@ mod sequence_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod mode_name_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Every mode sqlite actually has is accepted. The list is a closed set written down by hand,
+    /// so the way it rots is by rejecting something legitimate — and a deployment that needs
+    /// PERSIST or OFF would then be unable to say so at all.
+    #[test]
+    fn every_journal_mode_sqlite_has_is_allowed() {
+        for mode in JOURNAL_MODES {
+            validate_mode_name(mode).unwrap_or_else(|e| panic!("{mode} was refused: {e}"));
+            validate_mode_name(&mode.to_lowercase())
+                .unwrap_or_else(|e| panic!("{mode} in lower case was refused: {e}"));
+        }
+        // Environment variables arrive with whatever whitespace a config file left on them.
+        validate_mode_name(" wal ").expect("a padded value is the same mode");
+    }
+
+    /// A typo is a configuration error, and it has to read as one. Escalating instead means the
+    /// operator silently gets TRUNCATE, and failing at the END of the escalation instead means a
+    /// crash loop — which is what WHEEL_SQLITE_JOURNAL actually did to production today.
+    #[test]
+    fn a_name_sqlite_has_never_heard_of_is_a_configuration_error() {
+        for bogus in [
+            "nonsense-mode",
+            "wall",
+            "",
+            "  ",
+            "WAL;DROP",
+            "WAL, TRUNCATE",
+        ] {
+            let Err(e) = validate_mode_name(bogus) else {
+                panic!("{bogus:?} was accepted as a journal mode");
+            };
+            let msg = e.to_string();
+            assert!(msg.contains("is not a sqlite journal mode"), "{msg}");
+            assert!(
+                msg.contains("WHEEL_SQLITE_JOURNAL"),
+                "the message must name the thing to fix: {msg}"
+            );
+            assert!(
+                msg.contains("WAL") && msg.contains("TRUNCATE"),
+                "the message must say what is allowed: {msg}"
+            );
+        }
+    }
+
+    /// "Before the database is touched" is the requirement, and this is what makes it observable:
+    /// a mistyped mode leaves no database file, no journal, and no `-shm` behind. Nothing was
+    /// opened, so nothing had to be escalated, drained, or cleaned up.
+    #[test]
+    fn a_mistyped_mode_creates_no_database_at_all() {
+        let dir = std::env::temp_dir().join(format!("wheel-sql-name-{}", uuid_ish()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.db");
+
+        let restore = std::env::var("WHEEL_SQLITE_JOURNAL").ok();
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "nonsense-mode") };
+        let refused = open_configured(path.to_str().unwrap(), true);
+        match restore {
+            Some(v) => unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", v) },
+            None => unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") },
+        }
+
+        let err = refused
+            .expect_err("a mistyped mode must not open a database")
+            .to_string();
+        assert!(err.contains("is not a sqlite journal mode"), "{err}");
+        let left_behind: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            left_behind.is_empty(),
+            "the database was touched before the name was checked: {left_behind:?}"
+        );
+    }
+
+    /// The escalator is untouched: a mode that IS real still goes the whole way, and a database
+    /// already in WAL is still converted. Guarding the door must not have closed the corridor.
+    #[test]
+    fn a_real_mode_still_reaches_the_escalator() {
+        let dir = std::env::temp_dir().join(format!("wheel-sql-real-{}", uuid_ish()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.db");
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.pragma_update(None, "journal_mode", "WAL").unwrap();
+            seed.execute_batch("CREATE TABLE t (a); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(set_journal_mode(&conn, "TRUNCATE").unwrap(), "truncate");
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the rows in the WAL were not carried over");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A unique-enough suffix without pulling `uuid` into this crate for four tests.
+    fn uuid_ish() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
     }
 }
