@@ -2,7 +2,10 @@
 
 - **Severity:** Medium (DoS of the engine import path; when the route lands, a hostile spec can OOM/hang the
   engine, which serves the whole project sandbox). Owner: **SDK/Engine** (`crates/wheel-engine/src/tools/import.rs`).
-- **Status:** Source-grounded, HIGH confidence; **not executed in-crate here** (PyYAML absent on host; a
+- **Status:** FIXED & VERIFIED e2e (shipped with the routes @ 6c371c7): `parse_document` now enforces
+  `MAX_DOCUMENT_BYTES` (execute/import.rs:57) AND rejects documents containing YAML anchors/aliases
+  ("this YAML uses an anchor or alias (&a0)" — confirmed live via `POST /v1/tools/import`). Both gaps closed.
+  Was: source-grounded, HIGH confidence, **not executed in-crate** (PyYAML absent on host; a
   bounded Rust harness or the live `POST /v1/tools/import` route will confirm — see below). No HTTP route yet.
 - **Boundary:** TB7 (tool import). PM's named target: "malicious spec DoS on import (YAML bombs, loops)."
 
