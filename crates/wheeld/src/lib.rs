@@ -127,6 +127,10 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
             .build()
             .context("building the host http client")?,
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        // wheeld reconciles before it serves anything, so its routes are open from the start.
+        // The gate exists for the deployed host, where reconciling every tenant takes longer than
+        // the platform's health-check window.
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     })
 }
 

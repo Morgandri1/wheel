@@ -6,7 +6,7 @@ Both are connected to `github.com/Morgandri1/wheel`, branch `main`, and **deploy
 | Service      | Dockerfile               | Replicas | Healthcheck          | Domain |
 |--------------|--------------------------|----------|----------------------|--------|
 | `wheel-api`  | `docker/Dockerfile.api`  | 2        | `/healthz`           | `wheel-api-production.up.railway.app` |
-| `wheel-host` | `docker/Dockerfile.host` | **1**    | none — see below     | none — private only |
+| `wheel-host` | `docker/Dockerfile.host` | **1**    | `/healthz`           | none — private only |
 
 `wheel-host` must stay at one replica. It owns per-project sandboxes and a sqlite state file on a
 Railway volume; a second replica would fight it for both, and two supervisors reconciling the same
@@ -61,15 +61,18 @@ today.
 * `wheel-host` refuses to boot if `RAILWAY_PUBLIC_DOMAIN` is set (override: `ALLOW_PUBLIC_DOMAIN=1`),
   so that mistake fails loudly instead of silently exposing every tenant's sandbox supervisor.
 * Postgres has no public proxy. To query production, `railway ssh -s postgres` and use `psql` there.
-* **`wheel-host` must have no Railway health check.** It has no domain, so Railway has no target
-  port for it and probes something other than `:7100`; every attempt answers "service unavailable",
-  Railway declares the replica unhealthy and stops the container, and then every project create
-  hangs on an unreachable host. This cost two outages: first pointed at `/host/v1/healthz` (which is
-  behind the `WHEEL_HOST_SECRET` bearer a health checker cannot present), then at the
-  unauthenticated `/healthz`, which failed the same way — proving the problem was reachability, not
-  the bearer. Liveness for this service is Railway's process supervision plus `restartPolicyType`.
-  The host still serves `/healthz` for anything inside the container that can reach `:7100`; it is
-  the platform check that must stay off.
+* **A health check must point at a port the platform actually probes.** `wheel-host` used to bind
+  `0.0.0.0:7100` and ignore `$PORT`, so every probe reached nothing and answered "service
+  unavailable" — whatever path it was pointed at. That took the service down twice: once with
+  `/host/v1/healthz` (which is behind the `WHEEL_HOST_SECRET` bearer a checker cannot present, a
+  real bug, fixed by adding an unauthenticated `/healthz`) and then again with `/healthz`, which
+  failed identically. The second failure is what proved the cause was the port, not the path. The
+  host now binds `$PORT` when the platform sets it, `PORT=7100` keeps `WHEEL_HOST_URL` working, and
+  the check is back on `/healthz`.
+* **The host serves before it reconciles.** Restoring fourteen projects takes longer than the 30s
+  health-check window, and a host stopped for failing that check never reconciles at all. Liveness
+  answers immediately; project routes return 503 `starting` until reconcile finishes, so nothing is
+  ever served from a half-restored view.
 * To remove a health check, delete the key from `settings.json` rather than setting it to `null`:
   Railway's API accepts a null and ignores it, reporting success while the old path stays in force.
 * Setting a health check on a service whose replica is already stopped does not fail loudly — the

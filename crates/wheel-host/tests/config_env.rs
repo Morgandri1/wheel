@@ -12,6 +12,7 @@ fn base() {
     std::env::remove_var("ENGINE_BASE_URL");
     std::env::remove_var("CONTAINER_MEMORY_MB");
     std::env::remove_var("BIND_ADDR");
+    std::env::remove_var("PORT");
 }
 
 #[test]
@@ -96,4 +97,35 @@ fn host_config_validation() {
     assert_eq!(cfg.container_name(&id), format!("wheel-p-{id}"));
     assert_eq!(cfg.volume_name(&id), format!("wheel-p-{id}-data"));
     assert_eq!(cfg.engine_url(&id), format!("http://wheel-p-{id}:7000"));
+    // --- where we listen ------------------------------------------------------------------------
+    // The platform tells the app which port to use through $PORT, and probes that port. Binding
+    // 7100 while the checker probes $PORT means every probe reaches nothing, the replica is
+    // declared unhealthy and the container is stopped — which took this service down twice, once
+    // per health-check path tried, before the cause turned out to be the port and not the path.
+    base();
+    assert_eq!(
+        Config::from_env().unwrap().bind_addr,
+        "0.0.0.0:7100",
+        "the documented default, when the platform says nothing"
+    );
+
+    base();
+    std::env::set_var("PORT", "8080");
+    assert_eq!(Config::from_env().unwrap().bind_addr, "0.0.0.0:8080");
+
+    base();
+    std::env::set_var("PORT", " 7100 ");
+    assert_eq!(
+        Config::from_env().unwrap().bind_addr,
+        "0.0.0.0:7100",
+        "a padded PORT must not produce an unparseable address"
+    );
+
+    // An explicit BIND_ADDR still wins, for anyone binding a specific interface.
+    base();
+    std::env::set_var("PORT", "8080");
+    std::env::set_var("BIND_ADDR", "127.0.0.1:9000");
+    assert_eq!(Config::from_env().unwrap().bind_addr, "127.0.0.1:9000");
+
+    base();
 }
