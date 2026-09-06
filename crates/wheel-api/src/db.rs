@@ -170,3 +170,73 @@ mod tests {
         assert_eq!(sqlite.pick("PG", "SQLITE"), "SQLITE");
     }
 }
+
+/// Run a statement on whichever backend is configured, returning rows affected.
+///
+/// The two arms are identical apart from the pool type, which is the price of sqlx being generic
+/// over the database: one query string and one bind list still have to be dispatched twice. Doing
+/// it in a macro keeps that cost in one place instead of duplicating every query at its call site,
+/// where the two copies would drift.
+#[macro_export]
+macro_rules! db_execute {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+        match $db {
+            $crate::db::Db::Pg(pool) => sqlx::query($sql)$(.bind($bind))*
+                .execute(pool).await.map(|r| r.rows_affected()),
+            $crate::db::Db::Sqlite(pool) => sqlx::query($sql)$(.bind($bind))*
+                .execute(pool).await.map(|r| r.rows_affected()),
+        }
+    }};
+}
+
+/// Exactly one row, as a `FromRow` type or a tuple.
+#[macro_export]
+macro_rules! db_fetch_one {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+        match $db {
+            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_one(pool).await,
+            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_one(pool).await,
+        }
+    }};
+}
+
+/// At most one row.
+#[macro_export]
+macro_rules! db_fetch_optional {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+        match $db {
+            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_optional(pool).await,
+            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_optional(pool).await,
+        }
+    }};
+}
+
+/// Every matching row.
+#[macro_export]
+macro_rules! db_fetch_all {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+        match $db {
+            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_all(pool).await,
+            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
+                .fetch_all(pool).await,
+        }
+    }};
+}
+
+/// A single value from a single row.
+#[macro_export]
+macro_rules! db_scalar {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+        match $db {
+            $crate::db::Db::Pg(pool) => sqlx::query_scalar($sql)$(.bind($bind))*
+                .fetch_one(pool).await,
+            $crate::db::Db::Sqlite(pool) => sqlx::query_scalar($sql)$(.bind($bind))*
+                .fetch_one(pool).await,
+        }
+    }};
+}
