@@ -214,3 +214,52 @@ def pin_image(tag="wheel-engine:test"):
     p = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", tag],
                        capture_output=True, text=True)
     return p.stdout.strip() if p.returncode == 0 else None
+
+
+def free_port(preferred):
+    """`preferred` if it is bindable right now, otherwise any free port.
+
+    Suites use a fixed default port so a human can find the engine while debugging, and
+    qa/contract/suite_isolation.py keeps those defaults distinct. Distinct defaults stop
+    two SUITES colliding; they do nothing about the same suite running twice, which is
+    routine on a host shared by six agents. A wheel-on-wheel run lost its engine that way
+    mid-clone, and the retry could not start at all because the first run still held 17426.
+    """
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            pass
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def run_suite(main, name, cleanup=None):
+    """Entry point wrapper: an unexpected exception is a reported failure, not a traceback.
+
+    A suite that dies mid-way prints a stack trace and exits 1. Exit 1 reads as "the
+    subject is broken" when what actually happened is "the suite fell over" -- and when
+    the output is captured rather than watched, a truncated log can leave no visible
+    reason at all. Naming the suite and the exception keeps the two apart, and cleanup
+    still runs so the next run does not inherit a stray container.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("%s: interrupted" % name)
+        return 130
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("\n%s: the SUITE failed (%s: %s) — this is a broken test, not a verdict on "
+              "the subject. Nothing below it ran." % (name, type(e).__name__, e))
+        return 1
+    finally:
+        if cleanup:
+            try:
+                cleanup()
+            except Exception:
+                pass

@@ -190,6 +190,15 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
 
+> **2026-09-06 — THE NUMBERS BELOW ARE SUSPECT AND ARE BEING RE-MEASURED.**
+> `make coverage` ran `cargo llvm-cov` against the shared `target-dir` that every worktree
+> uses, and summed per-crate lines with a filter that accepted any path containing
+> `/crates/` — so one crate's coverage was totalled across six checkouts of it. `validate.rs`
+> read 0% while it was actually 97%, which dragged `wheel-core` to 4.85%. Fixed in
+> `qa/tools/coverage_gate.py` (private `CARGO_TARGET_DIR`, files scoped to this worktree, and
+> an empty result is a SKIP rather than 0%). CI was never affected — one checkout, one target
+> dir. Re-publishing the table after a clean local run.
+
 Latest numbers, CI run 33961539782 (bar 90%, per crate). `wheel-api` has gone 35% -> 89.02%:
 
 | crate | lines | status | owner |
@@ -652,3 +661,85 @@ a Linux container and would return the verdict in ~2 minutes instead of at CI ti
 This is BUG-013's lesson in a different key. There the gate was disabled; here the gate runs
 faithfully and is measuring the wrong platform. Both produce the same artefact: a green check
 that means less than the person reading it believes.
+
+---
+
+## 017 — `SEC-vault-at-rest` grepped an empty file · S2 · QA (mine) · CLOSED
+
+The at-rest check read `/data/wheel.db` and asserted the canary was absent. The engine runs
+sqlite in WAL mode, so on a short-lived test container `wheel.db` is a **4096-byte header**
+and every row lives in `wheel.db-wal`. The suite was scanning nothing and reporting the
+strongest claim it makes: "your secrets are encrypted at rest".
+
+It would have passed against an engine that stored every vault value in plaintext.
+
+Caught by its own positive control (`SEC-vault-at-rest/grep-works`), which asserts a value we
+know is there IS findable by the same scan — it went red while the security assertion above it
+went green. Fixed: scan `wheel.db`, `-wal` and `-shm`, and control on a ctx markdown stored
+deliberately in the clear rather than on a key name. The control now *gates* the verdict: if
+the scan cannot find the plaintext control, the at-rest criterion reports **skipped**, because
+a broken search has no verdict to give.
+
+## 018 — `qa:id-traceability` ignored any ID containing `%` · S2 · QA (mine) · CLOSED
+
+The gate exists so that every ID a suite asserts is named in TESTPLAN. It skipped labels
+containing `%`, reasoning that format placeholders are prose. True for `WM-setup/%s`, where the
+parent carries the criterion. False for `SEC-child-env-no-%s`, which assembles the ID **body**:
+two S1 criteria — the control-plane bearer and the vault key must not reach an agent child —
+were asserted under IDs that appear nowhere in the plan. The gate reported "every asserted ID
+is in the plan" and a reader of the plan saw no gap. Both were right and the criteria were
+untraced.
+
+Fixed: interpolating after a `/` stays legal, interpolating into the ID body fails with the fix
+named. Verified by reintroducing the interpolated form and watching it go red.
+
+## 019 — Integration suites collided on ports, env vars and container names · S3 · QA (mine) · CLOSED
+
+Three suites defaulted to port 17413 and two to 17414; two different suites read
+`WHEEL_ENGINE_PORT` with **different** defaults, so setting it to relocate one silently moved
+the other onto a third. Nothing had failed yet — `run.sh` is serial — which is exactly why it
+was worth fixing before it produced a 2am flake, or worse, one suite asserting confidently
+about another suite's engine.
+
+Then the real version arrived: a second QA session on this shared host ran the same suite at the
+same time, its `docker rm -f` destroyed my wheel-on-wheel engine mid-clone, and the retry could
+not start because it still held the port. Suite-level uniqueness does not help when the same
+suite runs twice.
+
+Fixed in two layers: `qa/contract/suite_isolation.py` (in `make check`) forbids shared default
+ports, shared port env vars and shared container names across suites; and long-running suites
+take a per-run container name plus `wheel_client.free_port()`, which falls back to an
+OS-assigned port when the default is busy. Verified by running two engines side by side.
+
+## 017 — Suites can test an image another agent replaced mid-run · S2 · QA (mine) · CLOSED
+
+Six agents share one docker daemon, and at least SDK and I both build `wheel-engine:test`.
+A tag is a mutable pointer: a suite that runs `docker run wheel-engine:test` twenty times over
+four minutes can test containers from more than one build, and cannot tell.
+
+This produced a nearly-sent **false S1 against SDK**. `test_engine_child_env.py` reported F015
+unfixed and had `/proc/<pid>/environ` output showing `WHEEL_ENGINE_SECRET` and `WHEEL_VAULT_KEY`
+in a live agent child. The fix was already on `main` and working; the image had been rebuilt
+under me between my build and my assertions. The evidence was real and the conclusion was wrong,
+which is the worst combination a bug report can have.
+
+**Fixed:** `pin_image()` in `qa/integration/wheel_client.py` resolves the tag to its immutable
+image ID once at startup; every container in the run comes from the ID, and the report prints it,
+so a result names the build it describes.
+
+**Worth copying:** anyone testing against a shared tag on this host has the same hazard.
+
+## 018 — A skipped positive control silently un-guarded its assertions · S2 · QA (mine) · CLOSED
+
+`SEC-child-env/sentinel-works` proves the digest search can find a secret that IS present, so
+that "no secret found" means something. It skipped (my vault key was 31 bytes, so nothing could
+be stored) — and `SEC-child-env-no-secret-under-any-name` then reported **green**, against a
+child that at that moment held both engine secrets.
+
+The absence assertions did not know their control had not run. A control that does not gate its
+dependents is decoration.
+
+**Fixed:** the control returns a boolean; its dependents report `skip` with the reason when it is
+unproven, never `pass`. Same class as the vault at-rest scan reading `wheel.db` while the engine
+writes WAL: the canary was "absent" because it was in `wheel.db-wal`, and only the control
+(the key NAME was missing from the same scan) caught it.
