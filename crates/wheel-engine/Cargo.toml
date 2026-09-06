@@ -33,3 +33,4 @@ hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 rand = "0.8"
 time = { version = "0.3", features = ["std"] }
+serde_yaml = "0.9"
