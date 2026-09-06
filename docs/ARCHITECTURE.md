@@ -58,6 +58,22 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+### Position is an integer cell (operator ruling, 2026-09-06)
+
+`Position { x: i16, y: i16 }`. A board coordinate is a cell, not a measurement, and floats bought us
+nothing while making `-0.0`, `NaN` and `Infinity` representable in a type we serialise, compare and
+store.
+
+- **Cell size is 1.** "Snap to nearest" means round to the nearest whole unit — it does NOT mean snap
+  to the 40 px background grid. The engine rounds on the way in, so an existing client sending `10.5`
+  lands on `11` and keeps working. A larger cell would make every node visibly jump after a save,
+  because what the operator dropped is not what comes back; if we ever want a coarser grid it is a
+  client-side `snapGrid` change and needs no contract change.
+- **Out of range CLAMPS, it does not reject.** A drag past ±32767 clamps to the bound, and the engine
+  returns the clamped value it stored. Both sides clamp identically, so a node stops at the edge of the
+  world instead of appearing to save and then springing back on the next refetch — "it looked like it
+  worked" is the worst failure shape a UI can have, and a 400 mid-drag is not better.
+
 ### Endpoint auth (operator ruling, 2026-09-06)
 
 An endpoint is a webhook. It MUST be usable by a sender that can be given nothing but a URL, so
