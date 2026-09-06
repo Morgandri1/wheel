@@ -51,7 +51,7 @@ pub async fn create_node(
         config: body.config,
     };
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    board::create(&conn, &node)?;
+    board::create_with(&conn, &node, &s.cfg.tool_allow_hosts)?;
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });
@@ -84,7 +84,7 @@ pub async fn patch_node(
             .map_err(|e| ApiError::invalid(format!("config does not match node type: {e}")))?;
     }
 
-    board::update(&conn, &node)?;
+    board::update_with(&conn, &node, &s.cfg.tool_allow_hosts)?;
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });

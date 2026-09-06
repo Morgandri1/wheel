@@ -428,3 +428,119 @@ fn a_normalised_key_never_contains_a_traversal_segment() {
         );
     }
 }
+
+/// ADVERSARY 027: the SSRF allowlist at CREATE time.
+mod allowlist_at_create {
+    use wheel_core::{
+        url_host_port, validate_config, validate_config_with, ConfigError, NodeConfig, ToolConfig,
+        ToolFormat, ToolKind, ToolSource,
+    };
+
+    fn tool(base_url: &str) -> NodeConfig {
+        NodeConfig::Tool(ToolConfig {
+            kind: ToolKind::Http,
+            source: ToolSource {
+                format: ToolFormat::Manual,
+                raw: String::new(),
+                imported_at: wheel_core::Timestamp::now(),
+            },
+            base_url: base_url.into(),
+            operations: vec![],
+        })
+    }
+
+    /// The bug: the allowlist was honoured when a call was MADE but not when
+    /// the node was created, so an allowlisted target could never be
+    /// configured through the API. The feature existed and was unusable.
+    #[test]
+    fn an_allowlisted_target_can_be_configured() {
+        let allow = vec!["127.0.0.1:8080".to_string()];
+        assert!(validate_config_with(&tool("http://127.0.0.1:8080"), &allow).is_ok());
+        // ...and a path on it, since base_url may carry one.
+        assert!(validate_config_with(&tool("http://127.0.0.1:8080/v1"), &allow).is_ok());
+    }
+
+    /// It permits exactly what it names. A different address or port on the
+    /// same machine is still refused — otherwise it is a switch, not a list.
+    #[test]
+    fn the_allowlist_does_not_widen_at_create_time_either() {
+        let allow = vec!["127.0.0.1:8080".to_string()];
+        for refused in [
+            "http://127.0.0.2:8080",
+            "http://127.0.0.1:9090",
+            "http://127.0.0.1",      // port 80 by scheme, not 8080
+            "http://localhost:8080", // a name is not the address it resolves to
+            "http://169.254.169.254:8080",
+            "http://10.0.0.5:8080",
+        ] {
+            assert!(
+                matches!(
+                    validate_config_with(&tool(refused), &allow),
+                    Err(ConfigError::ToolDeniedHost(_))
+                ),
+                "{refused} must still be refused"
+            );
+        }
+    }
+
+    /// Production has no allowlist — the engine refuses to boot with one — so
+    /// the plain entry point must answer exactly as it always did.
+    #[test]
+    fn without_an_allowlist_nothing_private_is_configurable() {
+        for refused in [
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://10.0.0.5",
+            "http://169.254.169.254",
+            "http://postgres.railway.internal:5432",
+        ] {
+            assert!(
+                matches!(
+                    validate_config(&tool(refused)),
+                    Err(ConfigError::ToolDeniedHost(_))
+                ),
+                "{refused} must be refused with no allowlist"
+            );
+            assert!(validate_config_with(&tool(refused), &[]).is_err());
+        }
+        // A public base_url is unaffected either way.
+        assert!(validate_config(&tool("https://api.example.com")).is_ok());
+    }
+
+    /// The allowlist is keyed on host:port, so the parse has to agree with the
+    /// one `send` uses or the two checks disagree again — which IS 027.
+    #[test]
+    fn a_base_url_yields_the_same_host_and_port_the_call_path_uses() {
+        assert_eq!(
+            url_host_port("http://127.0.0.1:8080/v1"),
+            Some(("127.0.0.1".into(), 8080))
+        );
+        // Defaults come from the scheme, as they do at call time.
+        assert_eq!(
+            url_host_port("http://example.com/x"),
+            Some(("example.com".into(), 80))
+        );
+        assert_eq!(
+            url_host_port("https://example.com/x"),
+            Some(("example.com".into(), 443))
+        );
+        // IPv6 literals KEEP their brackets, because the call path's parser
+        // (reqwest) keeps them and the allowlist is matched as host:port on
+        // both sides. Stripping them here made an entry that permitted
+        // creation fail to permit the call — 027 recurring in miniature, and
+        // caught by the test that pins the two parsers together.
+        assert_eq!(
+            url_host_port("http://[::1]:8080/"),
+            Some(("[::1]".into(), 8080))
+        );
+        assert_eq!(url_host_port("https://[::1]/"), Some(("[::1]".into(), 443)));
+        // Userinfo is not the host.
+        assert_eq!(
+            url_host_port("http://user:pass@example.com:8080/"),
+            Some(("example.com".into(), 8080))
+        );
+        // Not a URL we will call.
+        assert_eq!(url_host_port("ftp://example.com"), None);
+        assert_eq!(url_host_port("http://"), None);
+    }
+}

@@ -139,7 +139,18 @@ pub fn credential_detail(
         wheel_core::Harness::Codex => &["CODEX_API_KEY"],
     };
     for (id, name) in wired_vaults(conn, agent)? {
-        for key in offered_keys(conn, id)? {
+        // STORED values only, not declared keys. A vault that lists
+        // ANTHROPIC_API_KEY in its config but holds no value for it supplies
+        // nothing: reporting it as a credential tells the operator the agent
+        // is authenticated, and then starts a child with no credential at all,
+        // which fails on its first request for a reason the UI has just denied.
+        //
+        // The AMBIGUITY check deliberately still uses `offered_keys`: a
+        // declared key is a key this vault may supply at any moment, so two
+        // vaults declaring the same one is a conflict worth refusing before
+        // the value arrives. Existence and availability are different
+        // questions and this is the one place they diverge.
+        for key in list_keys(conn, id)? {
             if recognised.contains(&key.as_str()) {
                 return Ok(Some((name, key.clone(), expiry_of(conn, id, &key)?)));
             }
@@ -364,27 +375,6 @@ pub fn env_for_agent(
     Ok(env)
 }
 
-/// Which vault authenticates this agent's harness, if any. Feeds
-/// `GET auth {mode:"env", source}`.
-pub fn credential_source(
-    conn: &Connection,
-    agent: Uuid,
-    harness: wheel_core::Harness,
-) -> Result<Option<String>> {
-    let recognised: &[&str] = match harness {
-        wheel_core::Harness::Claude => &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-        wheel_core::Harness::Codex => &["CODEX_API_KEY"],
-    };
-    for (id, name) in wired_vaults(conn, agent)? {
-        for key in offered_keys(conn, id)? {
-            if recognised.contains(&key.as_str()) {
-                return Ok(Some(name));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Blank out any secret that appears in a line bound for a log or transcript.
 ///
 /// Accidental-echo protection ONLY. An agent is untrusted code holding these
@@ -470,6 +460,74 @@ mod tests {
                 .unwrap(),
             SECRET
         );
+    }
+
+    /// AUTH-declared-key-not-credential. A vault node's config can LIST a key
+    /// with no value stored for it — that is the normal state between
+    /// creating the vault and the operator pasting the secret in.
+    ///
+    /// Counting a declared key as a credential told the operator the agent was
+    /// authenticated and then started a child with no credential at all, which
+    /// fails on its first request for the exact reason the UI had just denied.
+    #[test]
+    fn a_declared_key_with_no_value_is_not_a_credential() {
+        let c = crate::db::open_memory().unwrap();
+        // Declared in the config, nothing stored.
+        let v = vault("creds", &["ANTHROPIC_API_KEY"]);
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        board::create(&c, &v).unwrap();
+        board::create(&c, &a).unwrap();
+        board::add_wire(&c, a.id, v.id, wheel_core::WireType::Read, None).unwrap();
+
+        assert_eq!(
+            credential_detail(&c, a.id, wheel_core::Harness::Claude).unwrap(),
+            None,
+            "a declared key supplies nothing until a value is stored"
+        );
+        // ...and nothing is exported to the child either, so the two agree.
+        assert!(env_for_agent(&c, &key(), a.id).unwrap().is_empty());
+
+        // Store the value: NOW it is a credential.
+        put(&c, &key(), v.id, "ANTHROPIC_API_KEY", "sk-ant-api03-real").unwrap();
+        let (name, k, _) = credential_detail(&c, a.id, wheel_core::Harness::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(name, "creds");
+        assert_eq!(k, "ANTHROPIC_API_KEY");
+
+        // Remove it and it stops being one, rather than lingering because the
+        // config still lists the name.
+        delete(&c, v.id, "ANTHROPIC_API_KEY").unwrap();
+        assert_eq!(
+            credential_detail(&c, a.id, wheel_core::Harness::Claude).unwrap(),
+            None,
+            "a removed value must not still read as authenticated"
+        );
+    }
+
+    /// The ambiguity rule deliberately does NOT follow that: a declared key is
+    /// one this vault may supply at any moment, so two vaults declaring the
+    /// same credential is a conflict worth refusing BEFORE the value arrives.
+    /// Existence and availability are different questions and this is the one
+    /// place they diverge on purpose.
+    #[test]
+    fn a_declared_key_is_still_enough_to_be_ambiguous() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let v1 = vault("alice", &["ANTHROPIC_API_KEY"]);
+        let v2 = vault("bob", &["ANTHROPIC_API_KEY"]);
+        for n in [&a, &v1, &v2] {
+            board::create(&c, n).unwrap();
+        }
+        board::add_wire(&c, a.id, v1.id, wheel_core::WireType::Read, None).unwrap();
+
+        // Neither vault holds a VALUE, yet wiring the second is still refused.
+        let clash = find_ambiguity(&c, a.id, Some(v2.id)).unwrap();
+        assert!(
+            clash.is_some(),
+            "two vaults declaring one credential must clash before the value exists"
+        );
+        assert_eq!(clash.unwrap().key, "ANTHROPIC_API_KEY");
     }
 
     /// The UI can only warn "re-login by ..." if the expiry survives beside

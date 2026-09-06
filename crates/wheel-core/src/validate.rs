@@ -144,6 +144,15 @@ fn validate_vault_key(key: &str) -> Result<(), ConfigError> {
 /// Validate a node's config. Called by the engine on create and patch, and by
 /// the API before it forwards.
 pub fn validate_config(cfg: &NodeConfig) -> Result<(), ConfigError> {
+    validate_config_with(cfg, &[])
+}
+
+/// As [`validate_config`], honouring an SSRF allowlist for `tool` nodes.
+///
+/// `allow_hosts` is the engine's `WHEEL_TOOL_ALLOW_HOST` (exact `host:port`).
+/// It is empty in production — the engine refuses to boot with one set — so
+/// this is the same function with the same answers there.
+pub fn validate_config_with(cfg: &NodeConfig, allow_hosts: &[String]) -> Result<(), ConfigError> {
     match cfg {
         NodeConfig::Agent(a) => {
             if a.system_prompt.len() > MAX_SYSTEM_PROMPT {
@@ -195,7 +204,7 @@ pub fn validate_config(cfg: &NodeConfig) -> Result<(), ConfigError> {
             Ok(())
         }
         NodeConfig::Chest(_) => Ok(()),
-        NodeConfig::Tool(t) => validate_tool(t),
+        NodeConfig::Tool(t) => validate_tool(t, allow_hosts),
     }
 }
 
@@ -224,6 +233,45 @@ fn validate_fill(field: &str, fill: &Fill) -> Result<(), ConfigError> {
 /// Extract the bare host from an `http(s)://` URL: no scheme, no userinfo, no
 /// port, IPv6 literals unbracketed. Shared by tool `base_url` and mcp `url`,
 /// which are both outbound targets subject to the same SSRF pre-filter.
+/// The host AND the port a URL addresses, defaulting by scheme.
+///
+/// The allowlist is keyed on `host:port`, so a check that only had the host
+/// could not consult it — which is how the create-time check and the call-time
+/// check came to disagree (ADVERSARY 027).
+pub fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme_port, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (443u16, r)
+    } else {
+        (80u16, url.strip_prefix("http://")?)
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
+        // `[::1]:8080`. The BRACKETS ARE KEPT, because the call path gets its
+        // host from `reqwest::Url::host_str`, which keeps them — and the
+        // allowlist is matched as `host:port` on both sides. Stripping them
+        // here made an entry that permitted creation fail to permit the call,
+        // which is ADVERSARY 027 recurring in a narrower place. A test pins
+        // the two parsers together.
+        let (h, tail) = after.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .map(|p| p.parse().ok())
+            .unwrap_or(Some(scheme_port))?;
+        (format!("[{h}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (authority.to_string(), scheme_port),
+        }
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port))
+    }
+}
+
 pub fn url_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
@@ -245,9 +293,15 @@ pub fn url_host(url: &str) -> Option<String> {
     }
 }
 
-fn validate_tool(cfg: &ToolConfig) -> Result<(), ConfigError> {
-    let host = url_host(&cfg.base_url).ok_or(ConfigError::ToolBadBaseUrl)?;
-    if crate::tool::host_is_denied(&host) {
+fn validate_tool(cfg: &ToolConfig, allow_hosts: &[String]) -> Result<(), ConfigError> {
+    let (host, port) = url_host_port(&cfg.base_url).ok_or(ConfigError::ToolBadBaseUrl)?;
+    // ADVERSARY 027. The allowlist was honoured when a call was MADE but not
+    // when the node was created, so an allowlisted loopback target could never
+    // be configured through the API — the feature existed and was unusable.
+    // Both checks now consult it, and both still refuse in production, where
+    // the list is empty because the engine will not boot with one.
+    let allowed = allow_hosts.iter().any(|t| *t == format!("{host}:{port}"));
+    if !allowed && crate::tool::host_is_denied(&host) {
         return Err(ConfigError::ToolDeniedHost(host));
     }
 

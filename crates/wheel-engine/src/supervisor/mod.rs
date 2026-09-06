@@ -84,6 +84,17 @@ const INHERITED_ENV: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    // Where the machine's shared, read-only Rust toolchain lives. A path, not
+    // a secret -- the same class as PATH.
+    //
+    // Dropping this is what broke the first Wheel-on-Wheel run: the agent
+    // cloned the repo and then could not build, with "rustup could not choose
+    // a version of cargo to run". The image installs a default toolchain and
+    // it was fine; clearing the environment for F015 took away the variable
+    // that says where it is, and rustup fell back to a $HOME that has no
+    // settings.toml. CARGO_HOME survived only because the supervisor sets it
+    // per project explicitly.
+    "RUSTUP_HOME",
 ];
 
 /// Where to look for the harness when the engine itself was started without a
@@ -1401,6 +1412,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Sets environment variables for the life of a test and puts them back.
+    ///
+    /// Env is process-global; cargo runs tests in parallel in one process. A
+    /// test that sets a variable and walks away is changing the world for
+    /// every test scheduled after it, which shows up as failures somewhere
+    /// else entirely and only under parallelism.
+    struct EnvGuard {
+        previous: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = vars
+                .iter()
+                .map(|(k, _)| ((*k).to_string(), std::env::var(k).ok()))
+                .collect();
+            for (k, v) in vars {
+                std::env::set_var(k, v);
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.previous {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// A harness that records the environment it was actually given.
     const ENV_DUMP_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
@@ -1422,8 +1474,17 @@ done
     async fn a_child_is_not_given_the_engines_own_secrets() {
         // Set on the ENGINE's process, which is exactly how the host supplies
         // them in production.
-        std::env::set_var("WHEEL_ENGINE_SECRET", "engine-bearer-must-not-leak");
-        std::env::set_var("WHEEL_VAULT_KEY", "dmF1bHQta2V5LW11c3Qtbm90LWxlYWs=");
+        // Restored on the way out. Environment is PROCESS-global and tests run
+        // in parallel: leaving WHEEL_ENGINE_SECRET and WHEEL_VAULT_KEY set
+        // would hand every sibling test this fixture's canaries instead of
+        // their own. Writing a test to prove secrets do not leak to children,
+        // and leaking them to other tests in the process, is not a mistake to
+        // make twice.
+        let _restore = EnvGuard::set(&[
+            ("RUSTUP_HOME", "/opt/rust/rustup"),
+            ("WHEEL_ENGINE_SECRET", "engine-bearer-must-not-leak"),
+            ("WHEEL_VAULT_KEY", "dmF1bHQta2V5LW11c3Qtbm90LWxlYWs="),
+        ]);
 
         let (sup, id, dir) = shim_supervisor("env-hygiene", ENV_DUMP_HARNESS);
         sup.start(id).await.unwrap();
@@ -1453,6 +1514,11 @@ done
         // cannot find its own binary would pass the assertions above and
         // break every agent on the board.
         assert!(env.contains("PATH="), "the harness needs a PATH:\n{env}");
+        assert!(
+            env.contains("RUSTUP_HOME="),
+            "without RUSTUP_HOME an agent cannot build anything, which is what \
+             broke the first Wheel-on-Wheel run:\n{env}"
+        );
         assert!(env.contains("WHEEL_NODE="), "the child lost its identity");
         assert!(
             env.contains("WHEEL_TOKEN_FILE="),

@@ -9,8 +9,8 @@ use super::tables;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use wheel_core::{
-    check_wire, validate_config, AgentState, Node, NodeConfig, NodeName, NodeType, Position,
-    Timestamp, Wire, WireType,
+    check_wire, AgentState, Node, NodeConfig, NodeName, NodeType, Position, Timestamp, Wire,
+    WireType,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +72,19 @@ fn split_config(config: &NodeConfig) -> (String, String) {
 }
 
 pub fn create(conn: &Connection, node: &Node) -> Result<(), BoardError> {
-    validate_config(&node.config)?;
+    create_with(conn, node, &[])
+}
+
+/// As [`create`], honouring the engine's SSRF allowlist for `tool` nodes.
+///
+/// Empty in production, where the engine refuses to boot with one set, so this
+/// is the same function with the same answers there (ADVERSARY 027).
+pub fn create_with(
+    conn: &Connection,
+    node: &Node,
+    allow_hosts: &[String],
+) -> Result<(), BoardError> {
+    wheel_core::validate_config_with(&node.config, allow_hosts)?;
     let (ty, cfg) = split_config(&node.config);
     let now = Timestamp::now().to_rfc3339();
 
@@ -272,7 +284,16 @@ pub fn add_wire(
 /// updatable: `patch_node` re-tags any config patch with the existing type, so
 /// a node can never change what kind of thing it is.
 pub fn update(conn: &Connection, node: &Node) -> Result<(), BoardError> {
-    validate_config(&node.config)?;
+    update_with(conn, node, &[])
+}
+
+/// As [`update`], honouring the engine's SSRF allowlist for `tool` nodes.
+pub fn update_with(
+    conn: &Connection,
+    node: &Node,
+    allow_hosts: &[String],
+) -> Result<(), BoardError> {
+    wheel_core::validate_config_with(&node.config, allow_hosts)?;
 
     // `t_<name>` is derived from the node name, so a rename that did not carry
     // the table would leave every row unreachable from the new address.

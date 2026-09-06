@@ -55,7 +55,8 @@ pub use tool::{
     ToolFormat, ToolKind, ToolMethod, ToolOperation, ToolParam, ToolSource,
 };
 pub use validate::{
-    normalize_chest_key, url_host, validate_config, validate_endpoint_path, ConfigError,
+    normalize_chest_key, url_host, url_host_port, validate_config, validate_config_with,
+    validate_endpoint_path, ConfigError,
 };
 pub use wire::{allowed_wires, check_wire, wire_allowed, Wire, WireError, WireSpec, WireType};
 
