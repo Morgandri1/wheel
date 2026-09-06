@@ -11,7 +11,7 @@ test, so it cannot also be the evidence.
 """
 import json, os, subprocess, sys, time, uuid, urllib.error, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import call, engine as proxy_engine, mint, session_for, unique_sub, api_healthy, wait_for, Results, configure_fakes
+from wheel_client import call, engine as proxy_engine, mint, session_for, unique_sub, api_healthy, wait_for, Results, configure_fakes, free_port
 
 SKIP = 77
 R = Results()
@@ -27,7 +27,7 @@ ENVELOPE_CLOSE = "</AgentPrompt>"
 # services being up, and would report their outage as a message-path failure. The proxy
 # path is already covered by API-proxy-auth. Set WHEEL_VIA_API=1 to exercise the chain.
 VIA_API = os.environ.get("WHEEL_VIA_API") == "1"
-DIRECT_PORT = int(os.environ.get("WHEEL_MESSAGES_PORT", "17427"))
+DIRECT_PORT = free_port(int(os.environ.get("WHEEL_MESSAGES_PORT", "17427")))
 DIRECT_BASE = "http://127.0.0.1:%d" % DIRECT_PORT
 DIRECT_SECRET = "qa-msgpath-secret-at-least-16"
 DIRECT_NAME = "qa-engine-msgpath"

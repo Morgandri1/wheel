@@ -20,6 +20,30 @@ PORT_RE = re.compile(r'os\.environ\.get\(\s*"([A-Z0-9_]+)"\s*,\s*"(\d+)"\s*\)')
 NAME_RE = re.compile(r'^NAME\s*=\s*"([^"]+)"', re.M)
 
 
+def check_free_port(suite_dir):
+    """A fixed port makes a leftover container indistinguishable from a broken engine.
+
+    test_engine_messages.py bound a hardcoded 17427. A container of mine from a killed run
+    still held it, so the suite's own engine could not bind and it reported "engine never
+    became healthy" -- which reads as the ENGINE being broken, not as debris on the host. I
+    lost several runs to that before looking at `lsof`.
+
+    Distinct DEFAULTS (checked above) stop two SUITES colliding. They do nothing about the
+    same suite running twice, or about anything left behind, which on a six-agent host is
+    routine. free_port() prefers the documented default and falls back to any free one.
+    """
+    import os, re
+    bad = []
+    for name in sorted(os.listdir(suite_dir)):
+        if not name.startswith("test_") or not name.endswith(".py"):
+            continue
+        src = open(os.path.join(suite_dir, name)).read()
+        if re.search(r'^\w*PORT = int\(os\.environ\.get\(', src, re.M) and "free_port(" not in src:
+            bad.append(name)
+    return ["%s binds a FIXED port — wrap it in free_port() so a leftover container cannot "
+            "masquerade as a broken engine" % n for n in bad]
+
+
 def main():
     if not os.path.isdir(INTEGRATION):
         print("no qa/integration directory")
@@ -50,6 +74,8 @@ def main():
         if len(set(files)) > 1:
             problems.append("container name %r is used by %s"
                             % (name, ", ".join(sorted(set(files)))))
+
+    problems.extend(check_free_port(INTEGRATION))
 
     if problems:
         print("suite isolation violated:")
