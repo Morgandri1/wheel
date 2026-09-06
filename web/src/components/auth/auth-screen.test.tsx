@@ -25,6 +25,37 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
+/**
+ * Every <form> in web/, not just this one. A GET form serialises its NAMED fields into the URL on
+ * any submission we do not intercept — and "no field is named today" is one password-manager
+ * attribute away from being false. Pinning the rule for all forms is what stops the next one
+ * being written the leaky way.
+ */
+describe("no form in web/ is a GET form", () => {
+  it("declares method=post everywhere a <form> is used", async () => {
+    const { readFileSync, readdirSync, statSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (full.endsWith(".tsx") && !full.endsWith(".test.tsx")) files.push(full);
+      }
+    };
+    walk("src");
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/<form\b([\s\S]{0,400}?)>/g)) {
+        if (!/method=["{]?["']?post/i.test(match[1]!)) offenders.push(file);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe("the auth form cannot leak credentials into a URL", () => {
   // Production bug: a click before React hydrated ran the BROWSER's submission rather than ours.
   // A form with no method defaults to GET, which serialises every named field into the query
