@@ -33,8 +33,30 @@ pub const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 /// How long to wait for the CLI to print its authorize URL.
 const URL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for the CLI to accept or reject a pasted code.
-const CODE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for a verdict on a submitted code.
+///
+/// The CLI does not necessarily EXIT when it rejects one -- it prints the
+/// reason and prompts again -- so waiting for exit waits forever. This bounds
+/// the wait to well inside what the API and the browser will tolerate: a
+/// request that never answers is reported to the operator as a gateway
+/// timeout, which tells them nothing about their code being wrong.
+const CODE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often to look for a verdict while waiting.
+const VERDICT_POLL: Duration = Duration::from_millis(100);
+
+/// What the CLI says when it did not accept a code. Matched only against
+/// output produced AFTER the code was submitted, so the greeting cannot look
+/// like a rejection.
+const REJECTION_MARKERS: &[&str] = &[
+    "login failed",
+    "invalid",
+    "error",
+    "failed",
+    "expired",
+    "denied",
+    "unauthorized",
+];
 
 /// How long to wait for the child's own output after it has exited.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +84,12 @@ pub enum LoginError {
     Rejected(String),
     #[error("the login did not finish in time")]
     Timeout,
+    #[error(
+        "the login process did not respond to that code within {}s; \
+         start the sign-in again",
+        CODE_TIMEOUT.as_secs()
+    )]
+    NoResponse,
     #[error("{0}")]
     Spawn(String),
 }
@@ -202,6 +230,10 @@ impl LoginSessions {
             }
         }
 
+        // Everything after this point is the CLI's response to THIS code, so
+        // a rejection can be recognised without the greeting matching first.
+        let before = pending.output.lock().map(|o| o.len()).unwrap_or(0);
+
         let line = format!("{}\n", code.trim());
         if pending.stdin.write_all(line.as_bytes()).await.is_err() {
             // The child is already gone, which means it has already said why.
@@ -213,18 +245,7 @@ impl LoginSessions {
         }
         let _ = pending.stdin.flush().await;
 
-        match tokio::time::timeout(CODE_TIMEOUT, pending.child.wait()).await {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(Ok(_)) => {
-                drain(pending.pumps).await;
-                Err(LoginError::Rejected(tail(&pending.output)))
-            }
-            Ok(Err(e)) => Err(LoginError::Rejected(e.to_string())),
-            Err(_) => {
-                let _ = pending.child.kill().await;
-                Err(LoginError::Timeout)
-            }
-        }
+        verdict(&mut pending, before).await
     }
 
     /// Collect this login once its TTL is up, so `SESSION_TTL` is a fact
@@ -289,6 +310,73 @@ impl LoginSessions {
     }
 }
 
+/// Decide what happened to a submitted code, without waiting for an exit that
+/// may never come.
+///
+/// Three outcomes race: the child exits (its status is the answer), the child
+/// prints a rejection and prompts again (the common failure, and the one that
+/// used to hang until the caller gave up), or nothing happens at all. A login
+/// that answers nothing is reported as such rather than as a gateway timeout
+/// somewhere further up, where nobody can tell it was the code that was wrong.
+async fn verdict(pending: &mut Pending, before: usize) -> Result<(), LoginError> {
+    let deadline = Instant::now() + CODE_TIMEOUT;
+    loop {
+        match pending.child.try_wait() {
+            Ok(Some(status)) => {
+                let pumps = std::mem::take(&mut pending.pumps);
+                drain(pumps).await;
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(LoginError::Rejected(tail_since(&pending.output, before)))
+                };
+            }
+            Err(e) => return Err(LoginError::Rejected(e.to_string())),
+            Ok(None) => {}
+        }
+
+        if let Some(reason) = rejection_since(&pending.output, before) {
+            // It is still running and waiting for another code. We are not
+            // going to give it one, so it must not outlive this answer.
+            let _ = pending.child.kill().await;
+            return Err(LoginError::Rejected(reason));
+        }
+
+        if Instant::now() >= deadline {
+            let _ = pending.child.kill().await;
+            return Err(LoginError::NoResponse);
+        }
+        tokio::time::sleep(VERDICT_POLL).await;
+    }
+}
+
+/// Everything the child said since `from`, if it looks like a refusal.
+fn rejection_since(
+    output: &std::sync::Arc<std::sync::Mutex<String>>,
+    from: usize,
+) -> Option<String> {
+    let text = output.lock().ok()?.clone();
+    let fresh = text.get(from..)?.trim();
+    if fresh.is_empty() {
+        return None;
+    }
+    let lower = fresh.to_ascii_lowercase();
+    REJECTION_MARKERS
+        .iter()
+        .any(|m| lower.contains(m))
+        .then(|| clean(fresh))
+}
+
+fn tail_since(output: &std::sync::Arc<std::sync::Mutex<String>>, from: usize) -> String {
+    let text = output.lock().map(|o| o.clone()).unwrap_or_default();
+    let fresh = text.get(from..).unwrap_or("").trim();
+    if fresh.is_empty() {
+        // Nothing new: the whole transcript is better than nothing at all.
+        return tail(output);
+    }
+    clean(fresh)
+}
+
 /// Wait for the pipe readers to finish before reporting what the child said.
 ///
 /// `wait()` returns when the process exits, which is NOT when its output has
@@ -316,9 +404,15 @@ const PASTE_PROMPT: &str = "Paste code here if prompted >";
 
 fn tail(output: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
     let text = output.lock().map(|o| o.clone()).unwrap_or_default();
-    // Without this the operator is told "that code was not accepted: Paste
-    // code here if prompted > Login failed: ..." — the prompt is furniture,
-    // and the reason is the part they need.
+    clean(&text)
+}
+
+/// The last few lines, with the CLI's stdin prompt stripped out.
+///
+/// Without this the operator is told "that code was not accepted: Paste code
+/// here if prompted > Login failed: ..." — the prompt is furniture, and the
+/// reason is the part they need.
+fn clean(text: &str) -> String {
     let text = text.replace(PASTE_PROMPT, " ");
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -571,6 +665,67 @@ mod tests {
             }
             other => panic!("expected a rejection, got {other}"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// S2 from Web: a bad code never answered. The real CLI does not EXIT when
+    /// it rejects one -- it prints the reason and prompts again -- so waiting
+    /// for an exit waits until the caller gives up, and the operator is shown
+    /// a gateway timeout instead of "that code was wrong".
+    #[tokio::test]
+    async fn a_rejected_code_answers_even_though_the_cli_keeps_running() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-reprompt-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude-stub");
+        // Rejects, then waits for another code -- forever, like the real one.
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo 'Opening browser to sign in…'\n\
+             echo 'visit: https://claude.com/cai/oauth/authorize?state=abc123'\n\
+             while true; do\n\
+               printf 'Paste code here if prompted > '\n\
+               read code || exit 0\n\
+               echo 'Login failed: invalid authorization code' >&2\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let s = LoginSessions::default();
+        let node = Uuid::new_v4();
+        let (session, _) = s
+            .begin(node, &program.display().to_string(), &dir.join("creds"))
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let err = s
+            .complete(node, Some(session), "not-a-real-code")
+            .await
+            .unwrap_err();
+
+        // Seconds, not the full timeout: the answer is in the output, and
+        // waiting for an exit that is not coming is the bug.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a rejected code must answer promptly, took {:?}",
+            started.elapsed()
+        );
+        match err {
+            LoginError::Rejected(why) => assert!(
+                why.contains("invalid authorization code"),
+                "the operator needs the CLI's reason: {why}"
+            ),
+            other => panic!("expected a rejection, got {other}"),
+        }
+        // The child must not be left running once we have answered.
+        assert_eq!(s.len().await, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -363,3 +363,158 @@ mod tests {
         }
     }
 }
+
+/// The HTTP transport is what every agent uses in docker mode (§2), and it was
+/// the one path with no test at all: the unix-socket tests cover process mode
+/// only. A bug here is invisible until an agent on a real board cannot talk to
+/// its engine.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve one canned response with a CORRECT Content-Length, and hand back
+    /// the request bytes we received. Counting the length by hand in each
+    /// fixture is how you get a test that fails for its own reasons.
+    fn serve_json(status: &str, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        serve_raw(response)
+    }
+
+    fn serve_raw(response: String) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read until the headers are complete AND the declared body has
+            // arrived. A single read() returns whatever one write produced,
+            // and a client is free to send the body separately -- which ureq
+            // does, so a one-shot read sees headers and no body.
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got);
+                let Some(headers_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let want: usize = text[..headers_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if got.len() >= headers_end + 4 + want {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).ok();
+            stream.flush().ok();
+            String::from_utf8_lossy(&got).into_owned()
+        });
+        (port, handle)
+    }
+
+    fn engine_on(port: u16) -> Engine {
+        Engine {
+            target: Target::Http(format!("http://127.0.0.1:{port}")),
+            token: "test-token".into(),
+        }
+    }
+
+    #[test]
+    fn a_get_carries_the_bearer_and_returns_the_body() {
+        let (port, server) = serve_json("200 OK", "{\"name\":\"worker\"}");
+        let reply = engine_on(port).get("/v1/cli/whoami").unwrap();
+        let sent = server.join().unwrap();
+
+        assert!(sent.starts_with("GET /v1/cli/whoami HTTP/1.1"), "{sent}");
+        assert!(
+            sent.to_lowercase()
+                .contains("authorization: bearer test-token"),
+            "the node token must prove identity on every call: {sent}"
+        );
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body["name"], "worker");
+    }
+
+    #[test]
+    fn a_post_sends_json_and_says_so() {
+        let (port, server) = serve_json("200 OK", "{\"ok\":true}");
+        let reply = engine_on(port)
+            .post("/v1/cli/msg", serde_json::json!({"to": "pm", "body": "hi"}))
+            .unwrap();
+        let sent = server.join().unwrap();
+
+        assert!(sent.starts_with("POST /v1/cli/msg HTTP/1.1"), "{sent}");
+        assert!(
+            sent.to_lowercase()
+                .contains("content-type: application/json"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("\"to\":\"pm\""),
+            "the body must arrive: {sent}"
+        );
+        assert_eq!(reply.body["ok"], true);
+    }
+
+    /// A wire denial is an ANSWER the CLI turns into exit 3. Flattening it into
+    /// a transport error would lose the engine's reason and report a network
+    /// fault for a permissions decision.
+    #[test]
+    fn a_denial_comes_back_as_a_reply_not_an_error() {
+        let (port, server) = serve_json(
+            "403 Forbidden",
+            "{\"error\":{\"code\":\"wire_denied\",\"message\":\"no wire from a to b (need: write)\"}}",
+        );
+        let reply = engine_on(port).get("/v1/cli/read?addr=b").unwrap();
+        let _ = server.join();
+
+        assert_eq!(reply.status, 403);
+        assert_eq!(reply.body["error"]["code"], "wire_denied");
+        assert!(reply.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("need: write"));
+    }
+
+    /// A 500 with no body must not panic the CLI: the agent still needs its
+    /// exit code.
+    #[test]
+    fn an_empty_or_unparseable_body_is_null_rather_than_a_panic() {
+        let (port, server) = serve_raw(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_string(),
+        );
+        let reply = engine_on(port).get("/v1/cli/whoami").unwrap();
+        let _ = server.join();
+        assert_eq!(reply.status, 500);
+        assert_eq!(reply.body, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_engine_that_is_not_listening_is_an_error_with_context() {
+        // Bind and drop, so the port is almost certainly closed.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = engine_on(port).get("/v1/cli/whoami").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reaching the engine"),
+            "the operator needs to know WHICH hop failed: {msg}"
+        );
+    }
+}

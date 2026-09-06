@@ -564,6 +564,81 @@ mod tests {
         assert_eq!(urlencode("é"), "%C3%A9");
     }
 
+    /// A renderer runs on whatever the engine actually sent, which on a bad
+    /// day is not the shape it expects. Panicking there kills the agent's
+    /// command and loses the reply it was about to print -- strictly worse
+    /// than printing something ugly. Every renderer must be total.
+    #[test]
+    fn every_renderer_survives_a_payload_it_did_not_expect() {
+        type Renderer = fn(&serde_json::Value);
+        let renderers: Vec<(&str, Renderer)> = vec![
+            ("whoami", render_whoami),
+            ("connections", render_connections),
+            ("list", render_list),
+            ("ls", render_ls),
+            ("read", render_read),
+            ("rows", render_rows),
+            ("ok", render_ok),
+            ("receipt", render_receipt),
+            ("inbox", render_inbox),
+            ("secret", render_secret),
+            ("keys", render_keys),
+        ];
+        // Empty, wrong-typed, null-valued, and deeply wrong. None of these is
+        // hypothetical: an older engine, a proxy that rewrote the body, or a
+        // route returning its error shape all produce one of them.
+        let hostile = vec![
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!("a string"),
+            serde_json::json!(null),
+            serde_json::json!(0),
+            serde_json::json!({"name": 1, "wires": "not an array", "rows": {}, "keys": 3}),
+            serde_json::json!({"agents": [{}], "keyspaces": [{}], "rows": [{}], "wires": [{}]}),
+            serde_json::json!({"name": null, "value": null, "id": null, "sha256": null}),
+        ];
+        for (name, render) in &renderers {
+            for payload in &hostile {
+                render(payload);
+                let _ = name;
+            }
+        }
+    }
+
+    /// ...and on the shapes they are actually for, so the happy path is
+    /// exercised rather than only the defences.
+    #[test]
+    fn every_renderer_handles_its_own_shape() {
+        render_whoami(&serde_json::json!({
+            "name": "worker", "type": "agent", "id": "00000000-0000-0000-0000-000000000000",
+            "position": {"x": 1.0, "y": 2.0},
+            "wires": [{"peer": "notes", "type": "read", "outgoing": true, "semantics": "you can access its data"}]
+        }));
+        render_connections(&serde_json::json!({
+            "wires": [{"peer": "notes", "type": "read", "outgoing": true, "semantics": "you can access its data"}]
+        }));
+        render_list(&serde_json::json!({
+            "agents": [{"name": "a", "status": "idle", "hosted_on": "cloud"}]
+        }));
+        render_ls(&serde_json::json!({
+            "keyspaces": [{"name": "notes", "type": "table", "wire": "write"}]
+        }));
+        render_ls(&serde_json::json!({ "keys": ["a", "b"] }));
+        render_read(&serde_json::json!({ "node": "ctx", "type": "ctx", "value": "# hi" }));
+        render_rows(&serde_json::json!({ "rows": [{"key": "r1", "n": 1}] }));
+        render_rows(&serde_json::json!({ "rows": [] }));
+        render_ok(&serde_json::json!({ "ok": true }));
+        render_receipt(&serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "sha256": "abc", "bytes": 3, "state": "queued"
+        }));
+        render_inbox(&serde_json::json!({
+            "messages": [{"id": "x", "from": "pm", "created_at": "2026-09-06T00:00:00Z", "body": "hi"}]
+        }));
+        render_secret(&serde_json::json!({ "value": "s3cret" }));
+        render_keys(&serde_json::json!({ "keys": ["K1"] }));
+    }
+
     /// The grammar-to-route mapping is a documented contract (PROTOCOL.md) and
     /// nothing else checks it. A command wired to the wrong path still returns
     /// 200 and still prints something plausible — it just asks the engine a
