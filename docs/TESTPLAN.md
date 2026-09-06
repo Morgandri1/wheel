@@ -646,6 +646,10 @@ carries S1 criteria, and an S1 nobody runs is an S1 nobody catches.
 | ID | Criterion |
 |---|---|
 | `E2E-landing` | Landing page renders, no console errors. |
+| `E2E-wire-illegal` | A wire the matrix denies is refused by the ENGINE, not merely disabled in the UI. A UI that hides the option and an engine that enforces the rule look identical from the browser, and only one of them survives a caller who is not the browser. |
+| `E2E-oauth-begin` | The paste-code panel renders the engine's `url`, `user_code` and `instructions` **verbatim**; the link is `target=_blank` with `rel=noopener`; the code box starts empty. A panel that rebuilds or normalises the URL sends the user to a login that does not match the session, and the failure looks like the user mistyping. A pre-filled code would be the panel guessing at the one step where guessing is indistinguishable from a phishing prompt. |
+| `E2E-oauth-complete` | The code the user typed is submitted **byte-exact**, together with the `session` from the `auth/begin` that issued it. Dropping `session` is what lets a stale code from an earlier attempt succeed. |
+| `E2E-oauth-expiry` | When the sign-in window closes, the input is disabled and the hint says to start again. An expired sign-in cannot be retyped out of; a live box invites the user to paste a valid code, be told it is wrong, and blame themselves. |
 | `E2E-signin` | Sign-in through whatever `NEXT_PUBLIC_AUTH_MODE` is built with; unauthenticated `/app` redirects. |
 | `E2E-local-signup` | (`AUTH_MODE=local`) Sign-up page creates an account and lands on `/app` already authenticated — no second login step. |
 | `E2E-local-login` | Sign-in page authenticates an existing account; the session survives a full page reload. |
