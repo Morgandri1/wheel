@@ -215,6 +215,9 @@ fi
 # no compile -- so it belongs in the gate everyone runs rather than a job nobody watches.
 # Binary size is the other half and needs a real release build, so it is `make size` and CI.
 step "qa:deps-budget" "$PY" qa/tools/deps_gate.py
+# The size gate itself only runs in CI (it needs a release build), but its RATCHET
+# decides here, and a ratchet pointing the wrong way is silently green forever.
+step "qa:size-ratchet" "$PY" qa/contract/size_ratchet.py
 
 if docker image inspect wheel-engine:dev >/dev/null 2>&1 || \
    docker image inspect wheel-engine:test >/dev/null 2>&1; then
