@@ -58,6 +58,29 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+### Endpoint auth (operator ruling, 2026-09-06)
+
+An endpoint is a webhook. It MUST be usable by a sender that can be given nothing but a URL, so
+authentication is **optional and off by default** — a public `/p/<project>/<path>` that delivers a
+correct-URL hit is the baseline, and no create-time obstacle may require otherwise. Optional
+`config.auth`, absent or `{"mode":"none"}` meaning public:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `none` · `shared_secret` (a value the sender presents) · `hmac` (the sender signs the raw body) |
+| `secret_key` | Key in a **wired vault**. The secret never appears inline in the node config, so it is not in the board JSON, the events stream or an export. An `auth` that names a key no wired vault supplies is refused at create. |
+| `location` | `header` · `query` · `path` — a sender that cannot set a header can be given a longer URL. |
+| `name` | Header or query parameter to read (`authorization`, `x-hub-signature-256`, `token`, …). |
+| `scheme` | For `shared_secret`: `raw` · `bearer` · `basic`. For `hmac`: `github` · `stripe` · `slack` · `hmac_sha256`, computed over the RAW body before any parsing. |
+| `ip_allow` | Optional CIDR list, additive to the above, never a substitute for it. |
+
+Rules that hold whatever `auth` says: comparisons are constant-time; a failure is a bare 401 that
+never says which part was wrong and never wakes the agent; the presented credential never reaches
+the delivered message, the transcript or the log; rate limit and body-size cap are enforced BEFORE
+the agent is woken, because on a public URL they are the only cost control; and the hit arrives as
+`type=endpoint`, never `type=user`. Adding auth to an endpoint never changes what a valid hit
+delivers, so a board can be secured after it works.
+
 - **Web releases (operator, Vercel rate limit)**: Vercel builds ONLY when `web/package.json` `version` changes (`ignoreCommand` in `web/vercel.json`). Merging `web/main` to `main` is unchanged; a deploy is a deliberate release: Web bumps the minor version once per bundle of finished work (a feature, or a batch of fixes that together read as a minor version), never per commit. Hotfix = patch bump. No other agent bumps that version.
 - **Build throughput on the shared dev host**: `~/.cargo/config.toml` sets one shared `target-dir` (`/Users/metatron/wheel-target`) and `jobs = 4` for every worktree — do not override them; `qa/check.sh` serialises cargo gates with `flock /tmp/wheel-cargo.lock`. Run long gates in the background and wait on completion; a foreground cargo killed by load is not a pass. **Exception (QA, BUG-019 withdrawn 91b9e21): the shared target-dir links one worktree's rlibs against another's source when they sit on different commits, so any build whose result you REPORT — a gate, a smoke, a verification run, a coverage measurement — uses a private `CARGO_TARGET_DIR` and always rebuilds; only exploratory `cargo check`/`cargo test` while editing may use the shared dir.** A failure seen only under the shared dir is not a bug until it reproduces in a private one.
 - Toolchain (host is macOS, Docker present, **no cargo/node installed yet**): install Rust via
