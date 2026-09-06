@@ -288,6 +288,23 @@ handed it — and add the case a name check cannot reach.
 | `SEC-child-env-keeps-essentials` | `PATH`, `WHEEL_NODE` and `WHEEL_TOKEN_FILE` are still present — an over-aggressive `env_clear()` breaks every agent while passing every leak assertion above it. | S2 |
 | `SEC-child-env/sentinel-works` | **Positive control.** A vault value the agent *is* wired to is located by the same digest search. Gates the two assertions above: if this is skipped or red, they report `skip`, never green — an absence found by a broken search is not evidence. | S2 |
 
+**Standing constraint — a test harness must not be configured by inherited environment.**
+
+The engine gives a child an empty environment plus a short allowlist. Any fake, probe or
+harness that takes its instructions from an inherited `WHEEL_FAKE_*` variable is therefore
+**wrong by construction**: it either stops working the moment the boundary is tightened, or
+it only keeps working because the boundary leaks. Both readings are bad, and the second is
+worse — a harness that still works is evidence the thing under test is broken.
+
+The temptation, every time, is to ask for one more name on the allowlist. A deny-by-default
+list that grows test-only entries has stopped being one, and the hole is in exactly the
+boundary these tests exist to check.
+
+So: fakes read `/data/wheel-fake.json` (per-node overrides keyed by `WHEEL_NODE`); the
+environment is consulted only when a fake is run *directly* by a test that spawned it, where
+there is no boundary to cross. This applies to anything QA ships into the sandbox image, not
+just the two harnesses. (PM ruling, 2026-09-06, from ADVERSARY F015.)
+
 ---
 
 ## 6. CLI — the `wheel` binary (§3c)
