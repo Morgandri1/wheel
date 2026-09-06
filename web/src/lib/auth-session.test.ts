@@ -48,12 +48,13 @@ describe("completeFailure", () => {
     expect(f).toEqual({ kind: "rejected", message: "that code is too short" });
   });
 
-  // The live engine answers a wrong code with a gateway timeout rather than a 400, so this is
-  // the path an ordinary typo actually takes.
-  it.each([502, 503, 504])("turns a %s into advice instead of a stack of jargon", (status) => {
+  // A wrong code is a 400 now, so a 5xx must NOT be described as a possible typo — that sends
+  // someone looking for a mistake they did not make.
+  it.each([502, 503, 504])("blames the engine, not the code, on a %s", (status) => {
     const f = completeFailure(new ApiError(status, "gateway_timeout", "The project engine did not respond in time."));
-    expect(f.message).toMatch(/code was wrong or the window closed/i);
-    expect(f.message).not.toMatch(/did not respond in time/);
+    expect(f.message).toMatch(/engine did not answer/i);
+    expect(f.message).toMatch(/code is fine/i);
+    expect(f.message).not.toMatch(/code was wrong/i);
   });
 
   it("keeps other API errors as-is rather than inventing a cause", () => {

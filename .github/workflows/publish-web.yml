@@ -1,0 +1,96 @@
+name: publish wheel-web
+
+# Versioned as one product: the tag IS the package version (PM ruling). Nothing publishes off a
+# branch, so a merge can never move what `npx wheel-web` resolves to.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-web-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: pack, prove, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Job level, not step level: a step's `if:` is evaluated BEFORE that step's own env exists, so
+    # `env.NPM_TOKEN` in a condition next to `env:` on the same step is always empty and the gate
+    # silently never fires.
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+
+      # --prod=false for the same reason the Vercel build needs it: without devDependencies there
+      # is no typescript, so Next never reads tsconfig.json, the "@/*" alias goes unregistered and
+      # every internal import fails as "Module not found" — a source error with a config cause.
+      - name: install
+        working-directory: web
+        run: pnpm install --frozen-lockfile --prod=false
+
+      - name: build standalone
+        working-directory: web
+        run: pnpm build:pkg
+
+      - name: assemble the package
+        working-directory: web
+        run: pnpm pack:pkg
+
+      # The tag is the version. Written into the assembled manifest rather than the repo's, which
+      # stays private and unpublished.
+      - name: stamp the version from the tag
+        working-directory: web/dist-pkg
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            m.version = process.argv[1];
+            fs.writeFileSync("package.json", JSON.stringify(m, null, 2) + "\n");
+          ' "$version"
+          echo "publishing version $version"
+          cat package.json
+
+      # Pack and RUN the tarball. This is the step that would have caught every packaging bug we
+      # have hit: a manifest with no bin, a `type: module` that stops Next's CommonJS server on its
+      # first line, and missing client chunks. `--help` exits 0 only if the bin resolves and runs.
+      - name: prove the tarball actually runs
+        working-directory: web/dist-pkg
+        run: |
+          npm pack
+          tarball=$(ls *.tgz)
+          echo "packed $tarball"
+          mkdir -p /tmp/pkgtest && cd /tmp/pkgtest && npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/web/dist-pkg/$tarball"
+          npx wheel-web --help
+          test -f node_modules/wheel-web/server.js
+          test -d node_modules/wheel-web/.next-pkg/static/chunks
+
+      # Publishing is gated on the secret, so a tag before the operator supplies a token still
+      # exercises everything above rather than failing the release.
+      - name: publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        working-directory: web/dist-pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: say why nothing was published
+        if: ${{ env.NPM_TOKEN == '' }}
+        run: |
+          echo "NPM_TOKEN is not set, so this was a dry run."
+          echo "The package was built, assembled, packed and executed — only the upload was skipped."

@@ -81,6 +81,15 @@ if (manifest.type === "module") {
   console.error("pack: manifest says type=module, which stops Next's CommonJS server.js.");
   process.exit(1);
 }
+// The repo's own package.json is private and has no `bin` — correct, since it is never published
+// and its bin would point at a server.js that does not exist in the source tree. The PUBLISHED
+// manifest is the one that needs it, and that distinction is easy to miss by reading either file
+// alone, so it is asserted rather than explained.
+if (!manifest.bin?.["wheel-web"] || !existsSync(join(dist, manifest.bin["wheel-web"]))) {
+  console.error("pack: the published manifest needs a `bin` pointing at a file that exists;");
+  console.error(`      got ${JSON.stringify(manifest.bin)} — npx would resolve to nothing.`);
+  process.exit(1);
+}
 
 console.log(`packed → ${dist}`);
 console.log(`  client chunks at ${distDirName}/static/chunks`);
