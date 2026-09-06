@@ -174,10 +174,54 @@ def main():
         R.check("NODE-engine-enforced-count", len(engine_enforced) == 12,
                 "expected 12 engine-enforced fixtures, found %d — a fixture was retagged "
                 "and the BUG-001 coverage claim no longer holds" % len(engine_enforced))
+        # ---- a table node must own its table, not merely have created one once -------
+        #
+        # Found in production by the wheel-dev `pm` agent's first three commands: the
+        # sqlite table is created at node CREATE (db/board.rs) and re-ensured nowhere, so a
+        # board that survives a database restore keeps its nodes and loses its tables.
+        # `wheel read reports` then says "no such table: t_reports" about a node that is
+        # plainly on the board. A fresh project is fine, which is why nobody saw it.
+        #
+        # Dropped out of band with python3's sqlite3 (there is no sqlite3 binary in the
+        # image) rather than by asking the engine to do it — the point is the state a
+        # restore leaves behind, which the engine never agreed to.
+        st, tbl = http("POST", "/v1/nodes",
+                       {"name": "reports", "type": "table", "position": {"x": 0, "y": 0},
+                        "config": {"columns": [{"name": "title", "type": "text"},
+                                               {"name": "count", "type": "integer"}]}})
+        tid = (tbl or {}).get("id")
+        if not R.check("TBL-restore/setup", 200 <= st < 300 and tid,
+                       "could not create the table node: %s %s" % (st, str(tbl)[:120])):
+            return R.report("engine-validation")
+
+        http("PUT", "/v1/tables/%s/rows/r1" % tid, {"title": "before", "count": 1})
+
+        drop = subprocess.run(
+            ["docker", "exec", NAME, "python3", "-c",
+             "import sqlite3;c=sqlite3.connect('/data/wheel.db');"
+             "c.execute('DROP TABLE IF EXISTS t_reports');c.commit();print('dropped')"],
+            capture_output=True, text=True)
+        if not R.check("TBL-restore/dropped", "dropped" in drop.stdout,
+                       "could not drop t_reports out of band: %s" % (drop.stderr or "")[:160]):
+            return R.report("engine-validation")
+
+        st, rows = http("GET", "/v1/tables/%s/rows" % tid)
+        R.check("WOW-table-survives-restart", st == 200,
+                "reading a table node whose sqlite table is gone answered %s %s — the node "
+                "exists on the board, so the engine must re-ensure its table rather than "
+                "report `no such table` about something it is still showing the user"
+                % (st, str(rows)[:160]))
+
+        # Re-created EMPTY, and with the configured columns — a table rebuilt without its
+        # columns is a different bug wearing the fix's clothes.
+        if st == 200:
+            st2, _ = http("PUT", "/v1/tables/%s/rows/r2" % tid,
+                          {"title": "after", "count": 2})
+            R.check("WOW-table-survives-restart/columns", 200 <= st2 < 300,
+                    "the table came back but would not accept its own configured columns "
+                    "(%s) — it was recreated from something other than the node config" % st2)
     finally:
         subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
-
-
 
     return R.report("engine-validation")
 
