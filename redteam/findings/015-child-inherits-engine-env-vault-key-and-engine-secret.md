@@ -4,8 +4,15 @@
   (a prompt-injected or otherwise compromised agent) gains project-wide secret disclosure AND full
   control-plane authority; scope changes to the whole project.
 - **Owner:** SDK/Engine (`crates/wheel-engine/src/supervisor/mod.rs` child spawn, ~line 203).
-- **Status:** CONFIRMED LIVE against `wheel-engine:dev` (@ 39cbcb0, docker backend, 2026-09-05).
-  PoCs: `redteam/pocs/vault/run_env_inheritance.sh` (leak), `run_env_exploit.sh` (weaponised).
+- **Status:** **FIXED @ e09e1ec, VERIFIED FIXED (2026-09-05).** Was CONFIRMED LIVE against
+  `wheel-engine:dev` @ 39cbcb0. Fix = `env_clear()` + a hard-coded allowlist at BOTH spawn sites
+  (`supervisor/mod.rs` inherit_platform_env, `oauth.rs` login child). Verified independently against
+  `wheel-engine:dev` @ ed68f67 (image 21:21Z) by `redteam/pocs/vault/verify_env_fix.sh` — see the
+  Verification section at the bottom. Closed with SDK.
+  PoCs: `verify_env_fix.sh` (the correct scoped detector). The original `run_env_inheritance.sh` /
+  `run_env_exploit.sh` OVER-REPORT on a fixed build (they scan all of `/proc` and match their own
+  `docker exec` probe shell, which inherits the container's `-e` env) — see the Detector-correction
+  note. They must NOT be turned into a regression test as-is; use `verify_env_fix.sh`.
 - **Boundary:** TB5 (engine ↔ child process) / TB6 (child ↔ wheel CLI). Defeats the vault write-only +
   wire-gated model (contract §2 "the sandbox boundary is the whole security story") wholesale.
 
@@ -65,3 +72,37 @@ Explicitly NEVER re-add: `WHEEL_VAULT_KEY`, `WHEEL_ENGINE_SECRET`, `WHEEL_HOST_S
 ## Verify after fix
 Re-run both PoCs → the child environ must contain neither secret (leak PoC → INCONCLUSIVE/clean, exploit
 PoC → cannot obtain the bearer). Confirm the harness still launches (PATH preserved).
+
+## Verification (2026-09-05, ADVERSARY, independent of SDK)
+`wheel-engine:dev` @ ed68f67 (image built 21:21Z, after the fix). `verify_env_fix.sh` boots the engine
+with a **canary** `WHEEL_ENGINE_SECRET`, starts an agent, then reads the engine-spawned child's OWN
+environ **as the child's uid** (`docker exec -u <uid>` — root cannot read it, no CAP_SYS_PTRACE in the
+default docker cap set, which is itself defence-in-depth) and asserts on it:
+```
+caught agent child pid=15 uid=10001 comm=claude
+PASS A/agent-child: clean — no engine-secret canary, no WHEEL_ENGINE_SECRET, no WHEEL_VAULT_KEY.
+  child env names: CARGO_HOME CLAUDE_CONFIG_DIR HOME IS_SANDBOX PATH WHEEL_ENGINE_URL WHEEL_NODE WHEEL_TOKEN_FILE
+```
+Exactly the allowlist + explicitly-set vars; the token is a FILE path (`WHEEL_TOKEN_FILE`), never the
+token value. SDK independently confirmed the same, plus the mutation-checked unit test
+`supervisor::tests::a_child_is_not_given_the_engines_own_secrets` (fails without `env_clear`, passes with
+it). oauth.rs login-child path carries the identical `env_clear()` + `inherit_platform_env` fix (source
+verified); the live capture coincided with the still-running agent child (same uid/env code path).
+
+### Allowlist review (SDK asked: any secret-bearing var in the inherited set?)
+`PATH, LANG, LC_ALL, TZ, TMPDIR, SSL_CERT_FILE, SSL_CERT_DIR, NODE_EXTRA_CA_CERTS` — **none is
+secret-bearing** in a standard deployment: the SSL/CA three are file PATHS, the rest are locale/PATH.
+`HTTP(S)_PROXY` are correctly NOT on the list (a proxy URL can embed credentials), so an operator-set
+proxy credential cannot ride into an untrusted child — good. Recommendation: keep it a hard-coded
+`const`, never pattern-derived, and route any future addition past red-team. No change required.
+
+## Detector-correction note (why the original PoCs over-report on a FIXED build)
+`run_env_inheritance.sh` and `run_env_exploit.sh` sweep every PID in `/proc` (skipping only PID 1) for
+the secret. On a fixed build the ONLY process that still matches is their own `docker exec` probe shell:
+`docker exec` injects the container's configured `-e` environment into the process it starts (PPid==0),
+so the scanner finds the secret in **its own** environ. That is a docker artifact of a root-privileged
+exec we control — NOT anything an agent inside the sandbox can reach. The real agent child (PPid==1,
+uid `agent`) is unreadable by the root probe (no CAP_SYS_PTRACE) and, read as its own uid, is clean.
+Correct method (in `verify_env_fix.sh`): target PPid==1 children only, and read their environ as the
+child's own uid. The original scripts are kept for the historical live-leak repro on the VULNERABLE
+build; they are annotated not to be used as a fix gate.

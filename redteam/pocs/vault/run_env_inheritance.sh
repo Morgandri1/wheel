@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# ⚠️  DETECTOR NOTE (F015): this scans all of /proc and matches its OWN `docker exec` probe
+#     shell, which inherits the container `-e` env — so it OVER-REPORTS on a FIXED build.
+#     It reproduces the leak on the VULNERABLE build only. To GATE a fix use verify_env_fix.sh
+#     (targets PPid==1 children, reads environ as the child's own uid). See findings/015.
 # F-VAULT-ENV: the engine spawns agent children with NO env_clear (supervisor/mod.rs:203),
 # so every child inherits the engine's WHEEL_VAULT_KEY (project-wide AES-256 master key) and
 # WHEEL_ENGINE_SECRET (the /v1/* control-plane bearer) in its OWN /proc/self/environ — readable
