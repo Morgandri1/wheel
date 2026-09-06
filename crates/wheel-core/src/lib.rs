@@ -28,7 +28,7 @@ pub mod wire;
 pub use event::{Event, LogLine, LogStream, WireDenial, LAGGED_HINT};
 pub use host::{
     Capabilities, ErrorBody, ErrorDetail, HostHealth, SandboxBackend, SandboxInfo, SandboxStatus,
-    SandboxUpsert,
+    SandboxUpsert, UidIsolation, ENV_ALLOW_SHARED_UID, SHARED_UID_WARNING,
 };
 pub use message::{
     escape_envelope_body, sha256_hex, Message, MessageReceipt, MessageSender, MessageState,

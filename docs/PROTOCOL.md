@@ -686,3 +686,49 @@ end its own turn early, skip accounting, or desynchronise the delivery loop. Two
 shadowing `/usr/local/bin/{claude,codex}`. The fakes speak the same stream-json protocol, so **the engine cannot
 tell the difference** and tests exercise the real supervision path rather than a mock of it. The fakes are absent
 from the production image and a make target asserts it.
+
+## Embedding the engine (M1.7)
+
+`wheel-engine` is a library with a thin binary, so `wheeld` can run an engine
+in-process instead of shelling out to one:
+
+```rust
+use wheel_engine::{serve, Config};
+
+let cfg = Config::from_env()?;          // or build one directly
+runtime.block_on(serve(cfg))?;          // runs until SIGTERM / shutdown
+```
+
+`serve` does not own a runtime and does not call `std::process::exit`, so an
+embedder can host it alongside other work. The binary is a wrapper around this
+exact call — there is one implementation of what an engine is, and no second
+copy to drift from it.
+
+### Shared-uid mode ("laptop mode")
+
+The supported posture is **one unix uid per project** (§2, §5b): the data dir is
+0700 to that uid and the engine socket is openable only by it. A local user
+without the privileges to `setuid` can opt out of that:
+
+```
+WHEEL_ALLOW_SHARED_UID=1
+```
+
+It is an **opt-in, never a fallback**. A production host that silently dropped
+to a shared uid after a permissions change would keep serving, keep looking
+healthy, and have no tenant isolation — and nothing in its logs would be
+alarming enough to catch it. So `setuid` failing is an error, not a downgrade.
+
+With it set, the engine logs `SHARED_UID_WARNING` at **warn** on every boot,
+naming what is gone rather than saying "reduced isolation":
+
+> every project runs as THIS user, so the per-project boundary does not exist.
+> Any agent can read any project's data directory, open any project's engine
+> socket, and read any other child's environment. Vault values are protected
+> only by the encryption key, which lives in that same environment.
+
+**The host must refuse to start a second project in this mode.** One project as
+one user is a convenience; two projects as one user is a tenancy boundary that
+does not exist while claiming to. `wheel_core::UidIsolation::from_env()` is the
+single reader of that variable, so the host and the engine cannot disagree about
+which mode they are in.

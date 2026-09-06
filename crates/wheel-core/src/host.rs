@@ -59,6 +59,65 @@ pub struct Capabilities {
     pub http: bool,
 }
 
+/// How tenants are kept apart on one machine.
+///
+/// The contract's isolation story is a uid per project (§2, §5b): the data dir
+/// is 0700 to that uid and the engine socket is only openable by it. Anything
+/// else is a different product with the same API, so it is named rather than
+/// left as an absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UidIsolation {
+    /// One unix uid per project. The supported posture.
+    #[default]
+    PerProject,
+    /// Every project runs as the SAME uid, because setuid was unavailable.
+    /// A laptop convenience; never a deployment.
+    Shared,
+}
+
+/// Opt IN to running every project as one uid. Never inferred.
+///
+/// Deliberately an opt-in rather than a fallback when setuid fails: a
+/// production host that silently drops to a shared uid after a permissions
+/// change would keep serving, keep looking healthy, and have no isolation —
+/// and nothing in its logs would be alarming enough to notice.
+pub const ENV_ALLOW_SHARED_UID: &str = "WHEEL_ALLOW_SHARED_UID";
+
+/// What a shared uid actually gives up, in the words an operator needs.
+///
+/// Specific on purpose. "Reduced isolation" tells nobody anything; this says
+/// which boundary is gone and what an agent can therefore reach.
+pub const SHARED_UID_WARNING: &str = concat!(
+    "running in shared-uid mode: every project runs as THIS user, so the ",
+    "per-project boundary does not exist. Any agent can read any project's ",
+    "data directory, open any project's engine socket, and read any other ",
+    "child's environment. Vault values are protected only by the encryption ",
+    "key, which lives in that same environment. Use this for one local user ",
+    "on a machine you trust, never for a deployment serving anyone else."
+);
+
+impl UidIsolation {
+    /// What the environment asks for. `Shared` only when explicitly requested.
+    pub fn from_env() -> Self {
+        match std::env::var(ENV_ALLOW_SHARED_UID).ok().as_deref() {
+            Some("1") | Some("true") | Some("yes") => Self::Shared,
+            _ => Self::PerProject,
+        }
+    }
+
+    pub fn is_shared(self) -> bool {
+        self == Self::Shared
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerProject => "per_project",
+            Self::Shared => "shared",
+        }
+    }
+}
+
 /// `GET /host/v1/healthz`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostHealth {
@@ -120,6 +179,32 @@ impl ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared-uid mode is opt-IN. A deployment that lost setuid must fail or
+    /// warn, never quietly serve every tenant as one user.
+    #[test]
+    fn a_shared_uid_is_never_inferred_only_requested() {
+        // The default is the supported posture, whatever the machine can do.
+        assert_eq!(UidIsolation::default(), UidIsolation::PerProject);
+        assert!(!UidIsolation::default().is_shared());
+        assert_eq!(UidIsolation::PerProject.as_str(), "per_project");
+        assert_eq!(UidIsolation::Shared.as_str(), "shared");
+        assert!(UidIsolation::Shared.is_shared());
+    }
+
+    /// The warning has to name the boundary that is gone. "Reduced isolation"
+    /// tells an operator nothing they can act on.
+    #[test]
+    fn the_shared_uid_warning_says_what_is_actually_lost() {
+        let w = SHARED_UID_WARNING;
+        for must_mention in ["data directory", "engine socket", "environment", "never"] {
+            assert!(
+                w.contains(must_mention),
+                "warning must mention {must_mention:?}: {w}"
+            );
+        }
+        assert_eq!(ENV_ALLOW_SHARED_UID, "WHEEL_ALLOW_SHARED_UID");
+    }
 
     /// The host API is a contract between three crates and QA. These spellings
     /// are what API sends and Web reads, so they are pinned rather than

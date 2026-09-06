@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Per-project Wheel engine: control plane, sqlite, wire enforcement, agent supervisor."
 
+[lib]
+name = "wheel_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wheel-engine"
+path = "src/main.rs"
+
 [dependencies]
 wheel-core = { path = "../wheel-core" }
 serde = { workspace = true }
