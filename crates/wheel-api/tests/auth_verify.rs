@@ -43,6 +43,7 @@ fn config(env: Env, jwks_url: &str, dev_secret: Option<&str>) -> Config {
         ingress_rate_per_min: 60,
         ingress_body_limit_bytes: 5 * 1024 * 1024,
         proxy_timeout_secs: 30,
+        host_connect_timeout_secs: 3,
     }
 }
 

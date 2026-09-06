@@ -64,6 +64,8 @@ pub struct Config {
     pub ingress_rate_per_min: u32,
     pub ingress_body_limit_bytes: usize,
     pub proxy_timeout_secs: u64,
+    /// How long to wait for a TCP connection to the host before calling it unreachable.
+    pub host_connect_timeout_secs: u64,
 }
 
 /// Derive the session signing key from the master key, with domain separation.
@@ -206,6 +208,7 @@ impl Config {
             ingress_rate_per_min: parse_or("INGRESS_RATE_PER_MIN", 60u32)?,
             ingress_body_limit_bytes: parse_or("INGRESS_BODY_LIMIT_BYTES", 5 * 1024 * 1024usize)?,
             proxy_timeout_secs: parse_or("PROXY_TIMEOUT_SECS", 30u64)?,
+            host_connect_timeout_secs: parse_or("HOST_CONNECT_TIMEOUT_SECS", 3u64)?,
         };
 
         if cfg.host_secret.expose().is_empty() {

@@ -39,6 +39,13 @@ pub fn build_orchestrator(cfg: &Config, http: reqwest::Client) -> Arc<dyn Orches
 pub fn http_client(cfg: &Config) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.proxy_timeout_secs))
+        // Separate from the overall timeout, and much shorter, because the two describe different
+        // failures. A slow *response* is normal — a project start legitimately blocks while the
+        // engine comes up. A slow *connect* means the host is not there, and no amount of waiting
+        // fixes it: when the host container was stopped, project creation sat for the full request
+        // timeout and the platform edge returned its own 502 before we could answer. Failing the
+        // connect quickly lets the handler report the outage in our own error envelope.
+        .connect_timeout(Duration::from_secs(cfg.host_connect_timeout_secs))
         // Never follow a redirect on the proxy path.
         //
         // This client speaks to the host, which speaks to tenant engines, from inside a private
