@@ -22,6 +22,7 @@ pub mod harness;
 pub mod oauth;
 pub mod peercred;
 pub mod supervisor;
+pub mod tools;
 pub mod vault;
 
 use anyhow::Context;
