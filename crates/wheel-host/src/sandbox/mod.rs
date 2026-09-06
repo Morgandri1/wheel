@@ -51,3 +51,35 @@ pub trait Sandbox: Send + Sync {
     /// Base URL of this project's engine control plane, for the host's proxy.
     fn engine_base(&self, id: &Uuid) -> String;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Secrets` is carried through provisioning and lands in `tracing` spans by accident sooner or
+    /// later. Its `Debug` must never render the values.
+    #[test]
+    fn debugging_secrets_never_prints_them() {
+        let s = Secrets {
+            engine_secret: "engine-secret-plaintext".into(),
+            vault_key: "vault-key-plaintext".into(),
+        };
+        let rendered = format!("{s:?} {:?}", Some(s.clone()));
+        assert!(!rendered.contains("plaintext"), "leaked: {rendered}");
+    }
+
+    /// The wire form of status is part of the host API, so a rename would silently break the API's
+    /// deserialiser rather than fail a build.
+    #[test]
+    fn status_serialises_as_the_documented_lowercase_words() {
+        for (s, want) in [
+            (Status::Stopped, "\"stopped\""),
+            (Status::Starting, "\"starting\""),
+            (Status::Running, "\"running\""),
+            (Status::Error, "\"error\""),
+        ] {
+            assert_eq!(serde_json::to_string(&s).unwrap(), want);
+            assert_eq!(serde_json::from_str::<Status>(want).unwrap(), s);
+        }
+    }
+}

@@ -187,3 +187,189 @@ impl Store {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn store() -> (Store, String) {
+        let path = std::env::temp_dir()
+            .join(format!("wheel-store-{}.db", Uuid::new_v4().simple()))
+            .display()
+            .to_string();
+        (Store::open(&path).unwrap(), path)
+    }
+
+    async fn project(s: &Store) -> Uuid {
+        let id = Uuid::new_v4();
+        s.upsert(&id, "engine-secret", "vault-key").await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn an_unknown_project_reads_back_as_none() {
+        let (s, _p) = store();
+        assert!(s.get(&Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_uid_is_sticky_for_the_life_of_a_project() {
+        let (s, _p) = store();
+        let id = project(&s).await;
+        let first = s.allocate_uid(&id, 20_000, 64).await.unwrap();
+        assert_eq!(s.allocate_uid(&id, 20_000, 64).await.unwrap(), first);
+        assert_eq!(s.get(&id).await.unwrap().unwrap().uid_base, Some(first));
+    }
+
+    #[tokio::test]
+    async fn two_projects_never_share_a_uid() {
+        let (s, _p) = store();
+        let (a, b) = (project(&s).await, project(&s).await);
+        let ua = s.allocate_uid(&a, 20_000, 64).await.unwrap();
+        let ub = s.allocate_uid(&b, 20_000, 64).await.unwrap();
+        assert_ne!(ua, ub);
+        assert_eq!(ub - ua, 64, "each project owns a whole stride");
+    }
+
+    /// The invariant the watermark exists for. A uid is a filesystem identity: reissuing a deleted
+    /// project's uid hands the next tenant ownership of whatever the old one left on disk. Deriving
+    /// the next uid from `max(uid_base)` looks equivalent and is not, because deleting the row
+    /// removes the maximum.
+    #[tokio::test]
+    async fn a_deleted_projects_uid_is_never_reissued() {
+        let (s, _p) = store();
+        let first = project(&s).await;
+        let taken = s.allocate_uid(&first, 20_000, 64).await.unwrap();
+        s.delete(&first).await.unwrap();
+
+        let second = project(&s).await;
+        let fresh = s.allocate_uid(&second, 20_000, 64).await.unwrap();
+        assert!(
+            fresh > taken,
+            "uid {fresh} was reissued after {taken} was freed"
+        );
+    }
+
+    /// The same invariant across a host restart, which is when it actually matters: the watermark
+    /// has to be durable, not merely correct in one process.
+    #[tokio::test]
+    async fn the_watermark_survives_reopening_the_database() {
+        let (s, path) = store();
+        let first = project(&s).await;
+        let taken = s.allocate_uid(&first, 20_000, 64).await.unwrap();
+        s.delete(&first).await.unwrap();
+        drop(s);
+
+        let s = Store::open(&path).unwrap();
+        let second = project(&s).await;
+        assert!(s.allocate_uid(&second, 20_000, 64).await.unwrap() > taken);
+    }
+
+    #[tokio::test]
+    async fn a_uid_cannot_be_allocated_for_a_project_that_does_not_exist() {
+        let (s, _p) = store();
+        assert!(s.allocate_uid(&Uuid::new_v4(), 20_000, 64).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stride_of_zero_is_refused_rather_than_overlapping_every_project() {
+        let (s, _p) = store();
+        let id = project(&s).await;
+        assert!(s.allocate_uid(&id, 20_000, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_uid_range_is_an_error_not_a_wrapped_uid() {
+        let (s, _p) = store();
+        let id = project(&s).await;
+        assert!(s.allocate_uid(&id, u32::MAX - 8, 64).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn re_provisioning_rotates_the_secrets_and_keeps_everything_else() {
+        let (s, _p) = store();
+        let id = project(&s).await;
+        let uid = s.allocate_uid(&id, 20_000, 64).await.unwrap();
+        s.set_desired_running(&id, true).await.unwrap();
+
+        s.upsert(&id, "rotated-secret", "rotated-key")
+            .await
+            .unwrap();
+
+        let rec = s.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.engine_secret, "rotated-secret");
+        assert_eq!(rec.vault_key, "rotated-key");
+        assert_eq!(
+            rec.uid_base,
+            Some(uid),
+            "re-provisioning must not move a uid"
+        );
+        assert_eq!(
+            s.all_desired_running().await.unwrap().len(),
+            1,
+            "re-provisioning must not stop a running project"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_projects_meant_to_be_running_are_restored_on_boot() {
+        let (s, _p) = store();
+        let (running, stopped) = (project(&s).await, project(&s).await);
+        s.set_desired_running(&running, true).await.unwrap();
+
+        let restored = s.all_desired_running().await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, running);
+        assert_eq!(restored[0].engine_secret, "engine-secret");
+        assert!(restored.iter().all(|r| r.id != stopped));
+    }
+
+    #[tokio::test]
+    async fn stopping_and_deleting_both_drop_a_project_from_the_restore_set() {
+        let (s, _p) = store();
+        let (a, b) = (project(&s).await, project(&s).await);
+        s.set_desired_running(&a, true).await.unwrap();
+        s.set_desired_running(&b, true).await.unwrap();
+
+        s.set_desired_running(&a, false).await.unwrap();
+        s.delete(&b).await.unwrap();
+
+        assert!(s.all_desired_running().await.unwrap().is_empty());
+        assert!(s.get(&b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_project_that_was_never_there_is_not_an_error() {
+        let (s, _p) = store();
+        assert!(s.delete(&Uuid::new_v4()).await.is_ok());
+    }
+
+    /// Two provisions arriving together must not take the same base. The UNIQUE constraint is the
+    /// backstop; this asserts the transaction stops it happening in the first place.
+    #[tokio::test]
+    async fn concurrent_allocations_take_distinct_ranges() {
+        let (s, _p) = store();
+        let s = Arc::new(s);
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(project(&s).await);
+        }
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let s = Arc::clone(&s);
+            handles.push(tokio::spawn(async move {
+                s.allocate_uid(&id, 20_000, 64).await
+            }));
+        }
+        let mut bases = Vec::new();
+        for h in handles {
+            bases.push(h.await.unwrap().unwrap());
+        }
+        bases.sort_unstable();
+        let unique = bases.len();
+        bases.dedup();
+        assert_eq!(bases.len(), unique, "two projects were handed the same uid");
+    }
+}
