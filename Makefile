@@ -83,6 +83,12 @@ clean: ## remove build artefacts
 # --- SDK: images -----------------------------------------------------------
 .PHONY: engine-image engine-image-test image-verify-prod
 
+deps: ## PM A10 — crate-count budget and duplicate check (cheap, no build)
+	@python3 qa/tools/deps_gate.py
+
+size: ## PM A10 — release binary size budget (real release build; minutes)
+	@python3 qa/tools/size_gate.py
+
 facts: ## PM ticket A7 — measure disk, memory and toolchain from INSIDE running sandboxes
 	@python3 qa/tools/sandbox_facts.py
 

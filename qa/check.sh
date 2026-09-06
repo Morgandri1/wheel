@@ -211,6 +211,11 @@ fi
 # builds one. That is only honest if something guarantees it still runs SOMEWHERE, which is
 # why ci_workflow_lint.py asserts image_contents.py is invoked by a job that also runs
 # `make engine-image`. Moving a gate out of check must not be how it quietly stops running.
+# PM A10: dependency weight is P1 and it drifts silently. Cheap -- `cargo metadata` only,
+# no compile -- so it belongs in the gate everyone runs rather than a job nobody watches.
+# Binary size is the other half and needs a real release build, so it is `make size` and CI.
+step "qa:deps-budget" "$PY" qa/tools/deps_gate.py
+
 if docker image inspect wheel-engine:dev >/dev/null 2>&1 || \
    docker image inspect wheel-engine:test >/dev/null 2>&1; then
   step "qa:image-contents" "$PY" qa/contract/image_contents.py
