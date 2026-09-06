@@ -39,6 +39,9 @@ pub struct Config {
     pub rlimit_fsize_bytes: u64,
     pub rlimit_nofile: u64,
     pub rlimit_cpu_secs: Option<u64>,
+    /// How long a process left over from a previous engine gets to exit on SIGTERM before it is
+    /// killed. Short on purpose: this runs on the start path, once per project, on host boot.
+    pub reap_grace_secs: u64,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
 }
@@ -133,6 +136,7 @@ impl Config {
                 0 => None,
                 n => Some(n),
             },
+            reap_grace_secs: parse_or("REAP_GRACE_SECS", 5u64)?,
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
         })
     }
@@ -161,6 +165,7 @@ impl Config {
             rlimit_fsize_bytes: 8 * 1024 * 1024 * 1024,
             rlimit_nofile: 16384,
             rlimit_cpu_secs: None,
+            reap_grace_secs: 5,
             engine_base_url: "http://127.0.0.1:7000".into(),
         }
     }

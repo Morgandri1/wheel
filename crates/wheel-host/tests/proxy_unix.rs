@@ -109,6 +109,7 @@ fn cfg() -> Config {
         rlimit_fsize_bytes: 8 * 1024 * 1024 * 1024,
         rlimit_nofile: 16384,
         rlimit_cpu_secs: None,
+        reap_grace_secs: 1,
         engine_base_url: "unused".into(),
     }
 }
