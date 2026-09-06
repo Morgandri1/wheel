@@ -313,6 +313,14 @@ pub struct AuthComplete {
     /// not read (ADVERSARY 018).
     #[serde(default)]
     pub vault_key: Option<String>,
+    /// Store a credential that EXPIRES into a vault other agents read.
+    ///
+    /// Refused without this, because the blast radius is every reader: when
+    /// the session lapses they all stop at once, and a warning in a response
+    /// body is a poor place to learn that. `claude setup-token` produces a
+    /// credential that does not expire and needs no override.
+    #[serde(default)]
+    pub allow_shared_expiry: bool,
 }
 
 /// `POST /v1/agents/:id/auth/complete`
@@ -336,6 +344,7 @@ pub async fn auth_complete(
             &code,
             body.save_to_vault.as_deref(),
             body.vault_key.as_deref(),
+            body.allow_shared_expiry,
         )
         .await;
     }
@@ -348,6 +357,7 @@ pub async fn auth_complete(
             &token,
             body.save_to_vault.as_deref(),
             body.vault_key.as_deref(),
+            body.allow_shared_expiry,
         )
         .await;
     }
@@ -384,6 +394,9 @@ pub async fn auth_complete(
                 vault,
                 &found,
                 body.vault_key.as_deref(),
+                // A provider key carries no expiry, so the shared-vault
+                // refusal cannot fire here; passed for the signature only.
+                body.allow_shared_expiry,
             )?)
         }
         None => None,
@@ -420,6 +433,7 @@ async fn finish_setup_token(
     token: &str,
     save_to_vault: Option<&str>,
     vault_key: Option<&str>,
+    allow_shared_expiry: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = token.trim();
     if harness != wheel_core::Harness::Claude {
@@ -430,7 +444,8 @@ async fn finish_setup_token(
     let kind = crate::auth::classify_token(token, harness);
     if kind != wheel_core::CredentialKind::OauthToken {
         return Err(ApiError::invalid(
-            "that is not a `claude setup-token` credential (expected one starting `sk-ant-oat`);              submit a provider key as api_key instead",
+            "that is not a `claude setup-token` credential (expected one starting \
+             `sk-ant-oat`); submit a provider key as api_key instead",
         ));
     }
 
@@ -447,7 +462,13 @@ async fn finish_setup_token(
                 expires_at: None,
             };
             Some(save_credential_to_vault(
-                s, id, harness, vault, &found, vault_key,
+                s,
+                id,
+                harness,
+                vault,
+                &found,
+                vault_key,
+                allow_shared_expiry,
             )?)
         }
         None => None,
@@ -566,6 +587,7 @@ async fn finish_paste_code(
     code: &str,
     save_to_vault: Option<&str>,
     vault_key: Option<&str>,
+    allow_shared_expiry: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
     if code.trim().is_empty() {
         return Err(ApiError::invalid("the code is empty"));
@@ -602,7 +624,13 @@ async fn finish_paste_code(
                     ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
                 })?;
             Some(save_credential_to_vault(
-                s, id, harness, vault, &found, vault_key,
+                s,
+                id,
+                harness,
+                vault,
+                &found,
+                vault_key,
+                allow_shared_expiry,
             )?)
         }
         None => None,
@@ -638,6 +666,7 @@ fn save_credential_to_vault(
     vault_name: &str,
     found: &crate::auth::StoredOauth,
     requested_key: Option<&str>,
+    allow_shared_expiry: bool,
 ) -> ApiResult<serde_json::Value> {
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let vault = board::get_by_name(&conn, vault_name)
@@ -664,6 +693,42 @@ fn save_credential_to_vault(
             format!(
                 "no wire from {} to {vault_name} (need: read) -- wire the agent to the vault first",
                 me.name
+            ),
+        ));
+    }
+
+    // ADVERSARY 021: a session credential in a SHARED vault strands every
+    // reader at once when it lapses -- `lapsed_credential` gates each agent on
+    // the vault's expiry, so N readers become N stopped agents for one
+    // expiry. The setup_token path already refuses a non-durable credential
+    // for exactly this reason; a warning in a response body is not the same
+    // protection, and the person who reads it is not the person stranded.
+    //
+    // Refused by DEFAULT, with an explicit override rather than a hard no:
+    // an operator with no CLI cannot run `claude setup-token`, and for them
+    // paste-code + save_to_vault is the only way to authenticate a board. The
+    // refusal makes it a decision instead of a surprise.
+    let peers: Vec<String> = crate::vault::agents_reading(&conn, vault.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| *a != agent)
+        .filter_map(|a| {
+            board::get(&conn, a)
+                .ok()
+                .flatten()
+                .map(|n| n.name.to_string())
+        })
+        .collect();
+    if !peers.is_empty() && !found.is_long_lived() && !allow_shared_expiry {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "shared_expiry",
+            format!(
+                "this credential expires, and {} also read{} {vault_name}: when it lapses they all \
+                 stop at once. Use a `claude setup-token` credential, which does not expire, or \
+                 resend with allow_shared_expiry to accept that.",
+                peers.join(", "),
+                if peers.len() == 1 { "s" } else { "" }
             ),
         ));
     }
@@ -706,6 +771,9 @@ fn save_credential_to_vault(
     let mut out = serde_json::json!({ "name": vault_name, "key": key, "stored": true });
     if let Some(exp) = expires_at {
         out["expires_at"] = serde_json::json!(exp);
+    }
+    if !peers.is_empty() {
+        out["shared_with"] = serde_json::json!(peers);
     }
     if !found.is_long_lived() {
         out["warning"] = serde_json::json!(

@@ -287,6 +287,24 @@ so the ambiguity rule applies and the value never appears on `/v1/board`, in a l
 Every agent with a read wire to that vault then authenticates with `mode: "env"` on its next start, which
 is how one browser round-trip authenticates a board of six agents.
 
+**A credential that expires is REFUSED for a vault other agents read.** The spawn gate checks the vault's
+expiry per agent, so one lapsed session credential in a vault with N readers stops all N at once — and the
+person who saw the warning is not the person stranded. Response is `409 shared_expiry`, naming every peer
+that would be affected:
+
+```jsonc
+{ "error": { "code": "shared_expiry", "message":
+  "this credential expires, and researcher, reviewer also read anthropic: when it lapses they all stop at
+   once. Use a `claude setup-token` credential, which does not expire, or resend with allow_shared_expiry
+   to accept that." } }
+```
+
+`allow_shared_expiry: true` proceeds anyway — it exists because an operator with no CLI cannot run
+`claude setup-token`, and for them paste-code + `save_to_vault` is the only way to authenticate a board.
+The point is to make it a decision rather than a surprise. The success response then carries `shared_with`
+listing the peers. A durable credential (`sk-ant-oat…`) never triggers this, and a provider API key has no
+expiry to begin with.
+
 The agent **must already have a `read` wire to the vault**; without one this is `403 wire_denied`. The
 wire is the capability here as everywhere else: an agent may not write its credential into a keyspace it
 has no relationship with.
