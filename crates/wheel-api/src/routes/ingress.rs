@@ -86,11 +86,30 @@ pub async fn ingress(
 
     let status = resp.status();
     let out_headers = hop::sanitize_from_upstream(resp.headers());
+
+    // An engine that serves endpoints answers an unknown path with our envelope and a
+    // `no_such_endpoint` code. A 404 with no body at all comes from an engine that has no
+    // `/ingress/*` route — nothing is wrong with the caller's path, the feature is not there — and
+    // relaying it unchanged tells the operator they made a typo. 501 says which it is. A 404 that
+    // does carry a body is the endpoint's own answer and passes through untouched.
+    let body = if status == axum::http::StatusCode::NOT_FOUND {
+        let bytes = resp.bytes().await.map_err(|e| {
+            tracing::warn!(error = ?e, "reading the ingress response failed");
+            ApiError::BadGateway("engine response truncated")
+        })?;
+        if bytes.is_empty() {
+            return Err(ApiError::IngressUnavailable);
+        }
+        Body::from(bytes)
+    } else {
+        Body::from_stream(resp.bytes_stream())
+    };
+
     let mut builder = Response::builder().status(status);
     for (k, v) in out_headers.iter() {
         builder = builder.header(k, v);
     }
     builder
-        .body(Body::from_stream(resp.bytes_stream()))
+        .body(body)
         .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("building ingress response")))
 }

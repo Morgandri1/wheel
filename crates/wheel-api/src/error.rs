@@ -40,6 +40,12 @@ pub enum ApiError {
     #[error("upstream timed out")]
     GatewayTimeout,
 
+    /// The engine answered an ingress request with a bodiless 404: it has no `/ingress/*` route at
+    /// all. A blank 404 is indistinguishable from a mistyped path, which is exactly the confusion
+    /// this replaces.
+    #[error("ingress is not implemented by this engine")]
+    IngressUnavailable,
+
     /// Anything unexpected. The inner error is logged and dropped from the response.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -86,6 +92,11 @@ impl ApiError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "gateway_timeout",
                 "The project engine did not respond in time.".into(),
+            ),
+            ApiError::IngressUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
+                "ingress_unavailable",
+                "This project's engine does not serve endpoints yet.".into(),
             ),
             ApiError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
