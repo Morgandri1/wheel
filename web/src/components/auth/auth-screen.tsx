@@ -36,6 +36,20 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
   const [error, setError] = useState<string | null>(null);
   const [fieldError, setFieldError] = useState<{ email?: string; password?: string }>({});
   const [busy, setBusy] = useState(false);
+  /**
+   * Whether React has taken over this form.
+   *
+   * Before hydration the submit button is just a button in a form, so a click performs the
+   * BROWSER's submission, not ours — and a form with no method defaults to GET, which serialises
+   * every named field into the query string. Observed in production: submitting early put
+   * `?email=…&password=…` in the URL, where it reaches browser history, the Referer header on the
+   * next request, and the CDN's access logs. `preventDefault` cannot help, because the handler it
+   * lives in is not attached yet.
+   *
+   * So the button does not exist as a submitter until we can honour the submission.
+   */
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
   const emailRef = useRef<HTMLInputElement>(null);
 
   // `next` is where the user was headed before we intercepted them. Same-origin paths only —
@@ -110,7 +124,16 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
             {isSignUp ? "One account, every board you build." : "Your boards are where you left them."}
           </p>
 
-          <form onSubmit={submit} className="flex flex-col gap-4" noValidate data-testid="auth-form">
+          {/* method="post" is the belt to the hydration braces: if a submission ever escapes us
+              anyway, a POST puts the credentials in a body that goes nowhere rather than in a URL
+              that is written down in several places. */}
+          <form
+            onSubmit={submit}
+            method="post"
+            className="flex flex-col gap-4"
+            noValidate
+            data-testid="auth-form"
+          >
             <Field label="Email" htmlFor="auth-email" error={fieldError.email}>
               <Input
                 id="auth-email"
@@ -161,7 +184,7 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
               </p>
             ) : null}
 
-            <Button type="submit" tone="primary" disabled={busy} data-testid="btn-auth-submit">
+            <Button type="submit" tone="primary" disabled={busy || !hydrated} data-testid="btn-auth-submit">
               {busy ? (isSignUp ? "Creating\u2026" : "Signing in\u2026") : isSignUp ? "Create account" : "Sign in"}
             </Button>
           </form>
