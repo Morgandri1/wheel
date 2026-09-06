@@ -76,15 +76,22 @@ def start_direct_engine():
         return "could not start wheel-engine:test: " + p.stderr.strip()[:200]
     for _ in range(60):
         try:
-            if _direct("GET", "/healthz")[0] == 200:
-                # By FILE, not by env. F015 strips WHEEL_FAKE_* on the way into the child,
-                # so setting WHEEL_FAKE_TRANSCRIPT on the engine steered nothing and the
-                # transcript this suite waits on was never written -- surfacing as
-                # "timed out waiting for message reaching the child's stdin", which points
-                # squarely at the engine and was entirely this suite's own fault.
-                return configure_fakes(NAME, transcript=TRANSCRIPT)
+            healthy = _direct("GET", "/healthz")[0] == 200
         except Exception:
-            pass
+            healthy = False
+        if healthy:
+            # Configured OUTSIDE the try on purpose. This call used to live inside it, and
+            # it named a variable this module does not have (NAME, not DIRECT_NAME). The
+            # NameError was swallowed by `except Exception: pass`, the loop kept polling a
+            # perfectly healthy engine, and the suite reported "engine never became
+            # healthy" -- against an engine that answered 200 the instant I probed it by
+            # hand. A blanket except around a health loop converts any bug inside it into a
+            # timeout that blames the subject.
+            #
+            # By FILE, not by env: F015 strips WHEEL_FAKE_* on the way into the child, so
+            # setting WHEEL_FAKE_TRANSCRIPT on the engine steered nothing and the transcript
+            # this suite waits on was never written.
+            return configure_fakes(DIRECT_NAME, transcript=TRANSCRIPT)
         time.sleep(0.5)
     return "engine never became healthy"
 
