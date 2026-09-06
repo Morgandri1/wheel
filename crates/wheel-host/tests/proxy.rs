@@ -439,3 +439,66 @@ async fn a_websocket_without_the_bearer_is_refused() {
         "the bearer gate does not apply to the websocket route"
     );
 }
+
+/// A dead engine must fail the upgrade cleanly.
+///
+/// The host connects upstream *before* accepting the client's upgrade precisely so this is a 502
+/// the caller can read, rather than a websocket that opens and then vanishes — which the browser
+/// reports as an ordinary disconnect and tells the user nothing.
+#[tokio::test]
+async fn a_websocket_to_an_unreachable_engine_is_refused_before_the_upgrade() {
+    // Port 1 on loopback: nothing listens, and the connection is refused rather than hanging.
+    let (base, id) = serve_host("http://127.0.0.1:1").await;
+    let url = format!("{base}/host/v1/projects/{id}/engine/v1/events");
+
+    let err = tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .expect_err("an unreachable engine must not produce an open websocket");
+
+    // tungstenite reports the failed upgrade as an HTTP response; the status is the contract.
+    if let tokio_tungstenite::tungstenite::Error::Http(resp) = err {
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    } else {
+        panic!("expected an HTTP error carrying the status, got {err:?}");
+    }
+}
+
+/// The websocket route for a project that does not exist must not reveal that it does not exist by
+/// behaving differently from one that does: both are a 404 before any upstream work happens.
+#[tokio::test]
+async fn a_websocket_for_an_unknown_project_is_a_404() {
+    let engine = mock_engine_ws().await;
+    let (base, _) = serve_host(&engine).await;
+    let url = format!(
+        "{base}/host/v1/projects/{}/engine/v1/events",
+        Uuid::new_v4()
+    );
+
+    let err = tokio_tungstenite::connect_async(ws_request(&url, SECRET))
+        .await
+        .expect_err("an unknown project must not upgrade");
+    if let tokio_tungstenite::tungstenite::Error::Http(resp) = err {
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    } else {
+        panic!("expected an HTTP error carrying the status, got {err:?}");
+    }
+}
+
+/// A plain GET on the events path is not an upgrade request. It must be answered, not treated as a
+/// websocket: an engine that streams events over a normal response would otherwise be unreachable.
+#[tokio::test]
+async fn a_non_upgrade_request_to_the_events_path_is_proxied_as_http() {
+    let engine = mock_engine().await;
+    let (app, id) = harness(&engine.0).await;
+    let (status, _) = get(
+        &app,
+        &format!("/host/v1/projects/{id}/engine/v1/events"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-upgrade GET must take the ordinary http path"
+    );
+}

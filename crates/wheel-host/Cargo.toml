@@ -39,4 +39,5 @@ http-body-util = "0.1"
 
 [dev-dependencies]
 base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }

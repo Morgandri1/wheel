@@ -29,6 +29,10 @@ use uuid::Uuid;
 pub struct ProcessSandbox {
     cfg: Config,
     store: Arc<Store>,
+    /// Where to look for running processes. Always `/proc` in production; a test points it at a
+    /// fixture so the reaper can be proven to actually kill without being aimed at the real
+    /// process table.
+    proc_root: PathBuf,
     /// Live children, so stop/status act on the process we actually started rather than on a pid
     /// we read back from somewhere and hoped was still ours.
     children: Mutex<HashMap<Uuid, tokio::process::Child>>,
@@ -39,8 +43,16 @@ impl ProcessSandbox {
         Self {
             cfg,
             store,
+            proc_root: PathBuf::from("/proc"),
             children: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Aim the leftover sweep at a different process table. Tests only.
+    #[cfg(test)]
+    fn with_proc_root(mut self, root: PathBuf) -> Self {
+        self.proc_root = root;
+        self
     }
 
     /// Kill anything still running under this project's uids before its engine starts.
@@ -58,7 +70,7 @@ impl ProcessSandbox {
     /// backstop for when that path does not get to run.
     async fn reap_leftovers(&self, id: &Uuid, uid_base: u32) {
         let range = uid_base..uid_base.saturating_add(self.cfg.uid_stride);
-        let leftovers = leftover_pids(Path::new("/proc"), &range);
+        let leftovers = leftover_pids(&self.proc_root, &range);
         if leftovers.is_empty() {
             return;
         }
@@ -75,7 +87,7 @@ impl ProcessSandbox {
 
         let deadline = Instant::now() + Duration::from_secs(self.cfg.reap_grace_secs);
         while Instant::now() < deadline {
-            if leftover_pids(Path::new("/proc"), &range).is_empty() {
+            if leftover_pids(&self.proc_root, &range).is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -84,7 +96,7 @@ impl ProcessSandbox {
         // Whatever is still there ignored SIGTERM or was never going to handle it. It cannot be
         // supervised — we hold no handle to it — so leaving it would mean a second process for
         // this project's nodes the moment the new engine starts.
-        for pid in leftover_pids(Path::new("/proc"), &range) {
+        for pid in leftover_pids(&self.proc_root, &range) {
             tracing::warn!(project = %id, pid, "killing a process that outlived its engine");
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
@@ -727,6 +739,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(real_uid(&root.join("status")), Some(20_005));
+    }
+
+    // Liveness of a child is `wait`, never `kill(pid, 0)`: an exited child we have not reaped is a
+    // zombie, and a zombie still answers signal-zero. Checking that way would have made the reaper
+    // test pass whether or not anything died.
+
+    /// The reaper, proven against a real process rather than only against its selection rule.
+    ///
+    /// It ships enabled on the production start path and kills things, so "it compiles and the
+    /// filter looks right" is not enough. The fixture confines it to one pid we spawned: the range
+    /// is this test's own uid, and the process table it reads lists only our child.
+    #[tokio::test]
+    async fn a_leftover_process_is_asked_to_exit_and_then_killed() {
+        let me = unsafe { libc::getuid() };
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a victim");
+        let pid = child.id().expect("child pid") as i32;
+
+        let proc = fake_proc(&[(&pid.to_string(), &status_for(me))]);
+        let dir = tempdir();
+        let mut cfg = Config::for_tests(&dir.display().to_string());
+        // The project "owns" exactly this uid, so nothing else can be selected.
+        cfg.uid_range_start = me;
+        cfg.uid_stride = 1;
+        cfg.reap_grace_secs = 1;
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        let sb = ProcessSandbox::new(cfg, store).with_proc_root(proc);
+
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the victim should be running before the sweep"
+        );
+
+        sb.reap_leftovers(&Uuid::new_v4(), me).await;
+
+        let exited = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("a process left behind by a previous engine was never reaped")
+            .expect("wait");
+        assert!(
+            !exited.success(),
+            "the victim should have died by signal, not exited cleanly: {exited:?}"
+        );
+    }
+
+    /// The sweep must do nothing when there is nothing to sweep — it runs on every start, including
+    /// the first start of a brand-new project.
+    #[tokio::test]
+    async fn a_sweep_with_nothing_to_reap_is_a_no_op() {
+        let dir = tempdir();
+        let mut cfg = Config::for_tests(&dir.display().to_string());
+        cfg.reap_grace_secs = 1;
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        let sb = ProcessSandbox::new(cfg, store).with_proc_root(fake_proc(&[]));
+
+        // Chiefly: this must return promptly rather than waiting out the grace period.
+        let started = Instant::now();
+        sb.reap_leftovers(&Uuid::new_v4(), 20_000).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// A process outside the project's range is never touched, even when the sweep runs.
+    #[tokio::test]
+    async fn a_process_outside_the_range_survives_the_sweep() {
+        let me = unsafe { libc::getuid() };
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a bystander");
+        let pid = child.id().expect("child pid") as i32;
+        let _ = pid;
+
+        let proc = fake_proc(&[(&pid.to_string(), &status_for(me))]);
+        let dir = tempdir();
+        let mut cfg = Config::for_tests(&dir.display().to_string());
+        // A range that deliberately excludes this process's uid.
+        cfg.uid_range_start = me + 1000;
+        cfg.uid_stride = 8;
+        cfg.reap_grace_secs = 1;
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        let sb = ProcessSandbox::new(cfg, store).with_proc_root(proc);
+
+        sb.reap_leftovers(&Uuid::new_v4(), me + 1000).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a bystander outside the uid range was killed"
+        );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 
     /// Readiness has to mean the engine answered, not merely that a process exists. Reporting a

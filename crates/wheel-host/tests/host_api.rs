@@ -133,6 +133,19 @@ fn test_config() -> Config {
 
 /// A router backed by a throwaway on-disk sqlite file.
 fn harness(sandbox: FakeSandbox) -> (axum::Router, Arc<Mutex<Calls>>, Arc<Store>) {
+    let (app, calls, store, _) = harness_at(sandbox);
+    (app, calls, store)
+}
+
+/// Same, but also returns the database path, for tests that need to damage it.
+fn harness_at(
+    sandbox: FakeSandbox,
+) -> (
+    axum::Router,
+    Arc<Mutex<Calls>>,
+    Arc<Store>,
+    std::path::PathBuf,
+) {
     let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
     let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
     let calls = sandbox.calls.clone();
@@ -143,7 +156,7 @@ fn harness(sandbox: FakeSandbox) -> (axum::Router, Arc<Mutex<Calls>>, Arc<Store>
         http: reqwest::Client::new(),
         auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
     };
-    (build_router(state), calls, store)
+    (build_router(state), calls, store, path)
 }
 
 async fn call(
@@ -730,5 +743,130 @@ async fn boot_rewrites_a_stored_vault_key_the_engine_could_not_decode() {
         store.get(&id).await.unwrap().unwrap().vault_key,
         standard,
         "and the correction must be persisted, so the next boot is already clean"
+    );
+}
+
+/// The boot path, driven over a real socket.
+///
+/// `serve_on` is what the binary runs; before this it had no test at all, so the wiring that only
+/// executes in production — connect info for the bearer limiter, the router assembled for real —
+/// was the one part of the host nothing exercised.
+#[tokio::test]
+async fn the_server_boots_and_serves_the_real_router() {
+    let (_, _, store) = harness(FakeSandbox::new());
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(FakeSandbox::new()),
+        store,
+        http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { wheel_host::serve_on(listener, state).await });
+
+    let http = reqwest::Client::new();
+    let live = http
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .expect("liveness over a real socket");
+    assert_eq!(live.status(), 200);
+    assert_eq!(live.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+    // The bearer really is enforced by the served router, not only by the in-process one.
+    let denied = http
+        .get(format!("http://{addr}/host/v1/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+
+    let allowed = http
+        .get(format!("http://{addr}/host/v1/healthz"))
+        .bearer_auth(SECRET)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+
+    server.abort();
+}
+
+/// Break the host's own database out from under it.
+///
+/// Dropping the table is the closest reachable stand-in for the real thing — a corrupt file, a full
+/// or unmounted volume — and it makes every store call fail at once.
+fn break_the_database(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).expect("open the store directly");
+    conn.execute_batch("DROP TABLE projects;")
+        .expect("drop the table");
+}
+
+/// Every route must answer with our error envelope when the store is broken, not panic and not
+/// report success. A host whose database is gone still has to say so in a way the API can relay.
+#[tokio::test]
+async fn a_broken_database_is_reported_on_every_route_rather_than_panicking() {
+    let (app, _, _, path) = harness_at(FakeSandbox::new());
+    let id = Uuid::new_v4();
+    break_the_database(&path);
+
+    let cases: Vec<(&str, String, Option<serde_json::Value>)> = vec![
+        (
+            "PUT",
+            format!("/host/v1/projects/{id}"),
+            Some(serde_json::json!({"engine_secret": "s", "vault_key": "k"})),
+        ),
+        ("GET", format!("/host/v1/projects/{id}"), None),
+        ("POST", format!("/host/v1/projects/{id}/start"), None),
+        ("POST", format!("/host/v1/projects/{id}/stop"), None),
+        ("POST", format!("/host/v1/projects/{id}/restart"), None),
+        ("DELETE", format!("/host/v1/projects/{id}"), None),
+    ];
+
+    for (method, path, body) in cases {
+        let (status, body) = call(&app, method, &path, Some(SECRET), body).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{method} {path} did not report the broken store"
+        );
+        assert!(
+            body["error"]["code"].is_string(),
+            "{method} {path} answered without an error envelope: {body}"
+        );
+        // The message must not carry sqlite's own text to the caller: it is the API's job to relay
+        // this, and a storage detail is not something a tenant should read.
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("no such table"),
+            "{method} {path} leaked the storage error: {message}"
+        );
+    }
+}
+
+/// Reconcile has to survive a database it cannot read: the host still needs to come up and serve,
+/// so an operator can see what is wrong instead of finding a process that exited at boot.
+#[tokio::test]
+async fn reconcile_survives_a_database_it_cannot_read() {
+    let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
+    let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
+    let sandbox = FakeSandbox::new();
+    let calls = sandbox.calls.clone();
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(sandbox),
+        store,
+        http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+    };
+    break_the_database(&path);
+
+    wheel_host::reconcile_on_boot(&state).await;
+
+    assert!(
+        calls.lock().unwrap().started.is_empty(),
+        "nothing can be restored from a database that cannot be read"
     );
 }

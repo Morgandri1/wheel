@@ -4,11 +4,11 @@
 //! only process that holds engine secrets at runtime. It has no public domain: the API reaches it
 //! over private networking with a bearer secret, and nothing else may.
 //!
-//! Thin by design — the wiring with decisions in it lives in the library, where tests can reach it.
+//! A wrapper around `wheel_host::serve`, so the boot sequence has one implementation and tests can
+//! reach it.
 
 use anyhow::{Context, Result};
 use wheel_host::config::Config;
-use wheel_host::{build_router, build_state, reconcile_on_boot};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,21 +22,5 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env().context("configuration")?;
     tracing::info!(backend = ?cfg.backend, "wheel-host starting");
-
-    let bind = cfg.bind_addr.clone();
-    let state = build_state(cfg)?;
-
-    reconcile_on_boot(&state).await;
-
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(addr = %bind, "listening");
-    // With connect info, so the failed-bearer limiter can key on the peer address rather than
-    // throttling every caller together.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    wheel_host::serve(cfg).await
 }

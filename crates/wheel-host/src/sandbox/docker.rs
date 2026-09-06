@@ -24,14 +24,23 @@ impl DockerSandbox {
     pub fn connect(cfg: Config) -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .context("connecting to the docker daemon (is the socket mounted?)")?;
-        Ok(Self {
+        Ok(Self::with_client(docker, cfg))
+    }
+
+    /// Build a backend around an existing docker client.
+    ///
+    /// The container we ask for is a security decision — every capability dropped but two, no
+    /// published ports, hard resource caps — and asserting it needs a daemon that records the
+    /// request. This is how the tests point the backend at one.
+    pub fn with_client(docker: Docker, cfg: Config) -> Self {
+        Self {
             docker,
             cfg,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("build http client"),
-        })
+        }
     }
 
     async fn inspect_state(&self, id: &Uuid) -> Result<Option<String>> {
