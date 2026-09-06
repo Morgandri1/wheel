@@ -44,7 +44,13 @@ def main():
     #
     # Slower (this build is not shared with anyone), and the only way the number means
     # anything.
-    env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(tmp, "target"))
+    # PERSISTENT, not a temp dir: separate from the shared build cache so the measurement
+    # is honest, but reused between runs so it is not a cold rebuild every time. The first
+    # version put it under the temp dir that gets rmtree'd at the end, which made every
+    # `make coverage` a full instrumented rebuild -- on a six-agent host that is minutes of
+    # load average 50, and a gate nobody can afford to run is a gate nobody runs.
+    cov_target = os.path.join(ROOT, "target-cov")
+    env = dict(os.environ, CARGO_TARGET_DIR=cov_target)
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
          # PM-approved, requested by API, owned here rather than in their crates so the

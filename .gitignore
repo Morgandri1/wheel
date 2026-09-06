@@ -29,3 +29,4 @@ qa/e2e/playwright-report/
 qa/e2e/node_modules/
 qa/e2e/playwright-report/
 qa/e2e/test-results/
+target-cov
