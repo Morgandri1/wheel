@@ -17,6 +17,30 @@ CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 # did not, and 127 assertions ran only on one laptop while CI reported green.
 DISABLED_OK = {}
 
+def check_pnpm_pinned(doc):
+    """Every pnpm/action-setup must pin a version.
+
+    The action reads `packageManager` from the package.json at the REPO ROOT; ours lives in
+    web/, so an unpinned setup dies with "No pnpm version is specified" before a single
+    assertion runs. My packaged-web job did exactly that -- red for a whole CI run, and a job
+    that never STARTED is indistinguishable in the summary from one that found a bug.
+    """
+    fails = []
+    for name, job in (doc.get("jobs") or {}).items():
+        for st in job.get("steps") or []:
+            if not isinstance(st, dict):
+                continue
+            if str(st.get("uses") or "").startswith("pnpm/action-setup"):
+                with_ = st.get("with") or {}
+                if not with_.get("version"):
+                    fails.append(
+                        "job '%s' uses pnpm/action-setup without `with: {version: N}` — the "
+                        "action looks for packageManager in the ROOT package.json and ours is "
+                        "in web/, so this job will die at setup before running anything"
+                        % name)
+    return fails
+
+
 def check_relocated_gates(doc):
     """Gates that `make check` cannot run must still run SOMEWHERE, provably.
 
@@ -88,6 +112,7 @@ def main():
                 "add it below with the reason and the event that turns it back on." % n)
 
     fails.extend(check_relocated_gates(d))
+    fails.extend(check_pnpm_pinned(d))
 
     print("ci.yml: %d job(s) — %s" % (len(jobs), ", ".join(sorted(jobs))))
     print("cancel-in-progress: %s" % (cip or "(unset)"))

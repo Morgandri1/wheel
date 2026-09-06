@@ -70,7 +70,6 @@ def start_engine():
          "-e", "WHEEL_VAULT_KEY=" + key,
          "-e", "WHEEL_ROLE=engine",
          "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
-         "-e", "WHEEL_FAKE_ENV_DUMP=" + DUMP,
          "-p", "%d:7000" % PORT, "wheel-engine:test"],
         capture_output=True, text=True)
     if p.returncode != 0:
@@ -78,11 +77,30 @@ def start_engine():
     for _ in range(60):
         try:
             if req("GET", "/healthz")[0] == 200:
-                return None
+                return configure_fakes()
         except Exception:
             pass
         time.sleep(0.5)
     return "engine never became healthy"
+
+
+def configure_fakes():
+    """Steer the fake harness by FILE, not by the engine's environment.
+
+    This suite set WHEEL_FAKE_ENV_DUMP on the engine container and relied on the child
+    inheriting it. Since F015 the engine gives a child an empty environment plus a short
+    allowlist, so that variable stops at the engine and the child writes no dump -- which
+    this suite reported as "the child never spawned (no env-dump record in 30s)". The child
+    spawned perfectly; it simply had nothing telling it to record anything.
+
+    I made that change and converted the vault and child-env suites with it, and missed this
+    one. It skipped rather than lied, which is the only reason it did not read as an engine
+    fault for a day.
+    """
+    cfg = json.dumps({"env_dump": DUMP})
+    p = subprocess.run(["docker", "exec", "-i", NAME, "sh", "-c", "cat > /data/wheel-fake.json"],
+                       input=cfg, capture_output=True, text=True)
+    return None if p.returncode == 0 else "could not write the fake config: " + p.stderr[:160]
 
 
 def read_dump():

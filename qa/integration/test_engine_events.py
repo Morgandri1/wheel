@@ -19,7 +19,7 @@ empty sets are equal, and that is the failure mode of every parity test.
 """
 import json, os, subprocess, sys, threading, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results
+from wheel_client import Results, configure_fakes
 
 SKIP = 77
 R = Results()
@@ -61,7 +61,6 @@ def start_engine():
          "-e", "WHEEL_VAULT_KEY=" + key,
          "-e", "WHEEL_ROLE=engine",
          "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
-         "-e", "WHEEL_FAKE_TRANSCRIPT=" + TRANSCRIPT,
          "-p", "%d:7000" % PORT, "wheel-engine:test"],
         capture_output=True, text=True)
     if p.returncode != 0:
@@ -69,7 +68,7 @@ def start_engine():
     for _ in range(60):
         try:
             if http("GET", "/healthz")[0] == 200:
-                return None
+                return configure_fakes(NAME, transcript=TRANSCRIPT)
         except Exception:
             pass
         time.sleep(0.5)
