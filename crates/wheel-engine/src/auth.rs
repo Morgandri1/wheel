@@ -144,12 +144,19 @@ pub fn has_stored_credentials(config_dir: &Path, harness: Harness) -> bool {
     if read_token(config_dir).is_some() {
         return true;
     }
-    match harness {
+    // Both locations, because we set both `CLAUDE_CONFIG_DIR`/`CODEX_HOME`
+    // AND `HOME` to this directory: the CLI writes to the config dir it was
+    // told about, but if it ever falls back to `$HOME`, the file lands one
+    // level down instead. The child reads it either way, so treating the
+    // second layout as "no credentials" would fail a login that actually
+    // worked — the worst answer available here.
+    let (dir_name, file) = match harness {
         // Written by `claude auth login`. On Linux there is no keyring, so a
         // plain 0600 file is the whole story.
-        Harness::Claude => config_dir.join(".credentials.json").exists(),
-        Harness::Codex => config_dir.join("auth.json").exists(),
-    }
+        Harness::Claude => (".claude", ".credentials.json"),
+        Harness::Codex => (".codex", "auth.json"),
+    };
+    config_dir.join(file).exists() || config_dir.join(dir_name).join(file).exists()
 }
 
 /// `$CODEX_HOME/config.toml` content forcing file-based credential storage.
@@ -378,6 +385,25 @@ mod tests {
         // ...and the two harnesses look in different places.
         assert!(!has_stored_credentials(&d, Harness::Codex));
         std::fs::write(d.join("auth.json"), "{}").unwrap();
+        assert!(has_stored_credentials(&d, Harness::Codex));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// We set HOME to the same directory, so a CLI that ignored
+    /// CLAUDE_CONFIG_DIR would still write somewhere the child can read.
+    /// Calling that "not signed in" would fail a login that worked.
+    #[test]
+    fn credentials_under_the_home_layout_count_too() {
+        let d = tmp("home-layout");
+        assert!(!has_stored_credentials(&d, Harness::Claude));
+
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        std::fs::write(d.join(".claude/.credentials.json"), "{}").unwrap();
+        assert!(has_stored_credentials(&d, Harness::Claude));
+        assert!(!has_stored_credentials(&d, Harness::Codex));
+
+        std::fs::create_dir_all(d.join(".codex")).unwrap();
+        std::fs::write(d.join(".codex/auth.json"), "{}").unwrap();
         assert!(has_stored_credentials(&d, Harness::Codex));
         std::fs::remove_dir_all(&d).ok();
     }

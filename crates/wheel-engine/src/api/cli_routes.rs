@@ -252,10 +252,7 @@ pub async fn secret_get(
     let (name, key) = split_address(&q.addr);
     let key = key.ok_or_else(|| ApiError::invalid("secret get needs <vault>/<key>"))?;
 
-    let vk = s
-        .supervisor
-        .vault_key()
-        .ok_or_else(|| ApiError::internal("this project has no usable vault key"))?;
+    let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let node = me
         .require(&conn, name, WireType::Read)

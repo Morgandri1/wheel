@@ -197,7 +197,7 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 | Route | Body → Response | M |
 |---|---|---|
 | `POST /v1/agents/:id/auth/begin` | → `AuthBegin {mode, url, instructions, session}` (claude only) | **M1** |
-| `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code M2 |
+| `POST /v1/agents/:id/auth/complete` | `{api_key?}` \| `{code?}` → `AuthStatus` | api_key **M1** · code **M2** |
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
 | `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |
 
@@ -220,8 +220,12 @@ The engine parses the URL by looking for `https://`, not for the sentence around
 bytes of `claude 2.1.261`, which are pinned in a test.
 
 `session` is optional but recommended: it stops a stale browser tab completing a login the user already
-restarted. A second `auth/begin` kills the first child rather than leaking a process per retry, and a login
-that is abandoned is evicted after **15 minutes**.
+restarted. A second `auth/begin` kills the first child rather than leaking a process per retry.
+
+A login that is abandoned — the common case, a user who signs in halfway and closes the tab — is collected
+after **15 minutes** by a timer armed when it starts, so nothing has to call back in for that child to be
+reaped. One timer per login rather than a sweep: an engine where nobody is signing in must not wake up to
+discover that.
 
 | Outcome | Response |
 |---|---|

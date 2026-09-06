@@ -388,7 +388,8 @@ pub async fn auth_begin(
         // and is a different shape end to end. Saying so beats returning a
         // paste-code envelope that nothing on the other side can satisfy.
         return Err(ApiError::invalid(
-            "codex uses device-code login, which is not implemented yet;              use auth/complete with an api_key for now",
+            "codex uses device-code login, which is not implemented yet; \
+             use auth/complete with an api_key for now",
         ));
     }
 

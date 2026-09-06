@@ -60,6 +60,13 @@ impl ApiError {
     pub fn invalid(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid", msg)
     }
+    /// The engine cannot do this because of how it was STARTED, not because
+    /// of anything in the request. 503 rather than 500 so a provisioning gap
+    /// is not read as an engine bug — and the message names the variable.
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "config", msg)
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
@@ -234,5 +241,30 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// A project spawned without its vault key is a provisioning gap in the
+    /// caller, not a fault in this engine. It answered 500 `internal` once,
+    /// and was duly debugged as an engine bug.
+    #[test]
+    fn a_missing_vault_key_is_a_503_that_names_the_variable() {
+        let ApiError(status, code, message) = ApiError::config(crate::supervisor::NO_VAULT_KEY);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "config");
+        assert!(
+            message.contains("WHEEL_VAULT_KEY"),
+            "whoever reads this has to know which variable to set: {message}"
+        );
+    }
+
+    /// A key that is present but malformed has a different fix from one that
+    /// was never set, so the two must not collapse into one message.
+    #[test]
+    fn an_unusable_vault_key_reads_differently_from_a_missing_one() {
+        assert_ne!(
+            crate::supervisor::NO_VAULT_KEY,
+            crate::supervisor::BAD_VAULT_KEY
+        );
+        assert!(crate::supervisor::BAD_VAULT_KEY.contains("base64"));
     }
 }

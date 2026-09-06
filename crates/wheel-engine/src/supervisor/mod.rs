@@ -67,11 +67,57 @@ type AgentSlot = Arc<AsyncMutex<Option<Running>>>;
 /// delivery to a different agent.
 type AgentSlots = Arc<AsyncMutex<HashMap<Uuid, AgentSlot>>>;
 
+/// Environment variables a child inherits from the engine when they are set.
+///
+/// Every one of these describes the MACHINE, not the project: where binaries
+/// live, what locale and timezone to use, where scratch files go, and which
+/// CA bundle to trust. None is a secret, and the harness cannot run without
+/// at least `PATH`. Everything else the engine holds is dropped.
+const INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "TMPDIR",
+    // A container with a private CA is unreachable without these, and the
+    // failure would look like a network fault rather than a missing variable.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+/// Where to look for the harness when the engine itself was started without a
+/// `PATH`. Matches what the host uses for the engine.
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+pub(crate) fn inherit_platform_env(cmd: &mut tokio::process::Command) {
+    for key in INHERITED_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    if std::env::var_os("PATH").is_none() {
+        cmd.env("PATH", DEFAULT_PATH);
+    }
+}
+
+/// Said when a project has no vault key at all — a provisioning gap in
+/// whatever spawned this engine, not something the caller did wrong.
+pub const NO_VAULT_KEY: &str =
+    "this engine started without WHEEL_VAULT_KEY, so secrets cannot be stored or read";
+
+/// Said when the key is present but not a key. Different cause, different fix,
+/// so it must not collapse into the message above.
+pub const BAD_VAULT_KEY: &str =
+    "this engine started with an unusable WHEEL_VAULT_KEY (expected base64 of 32 bytes), \
+     so secrets cannot be stored or read";
+
 pub struct Supervisor {
     cfg: Arc<Config>,
     /// Parsed once at construction: a project with an unusable vault key
     /// should fail loudly at boot, not on the first secret read.
     vault_key: Option<crate::vault::VaultKey>,
+    vault_key_error: Option<&'static str>,
     db: Arc<Mutex<rusqlite::Connection>>,
     agents: AgentSlots,
     harness: Arc<dyn Harness>,
@@ -95,18 +141,31 @@ impl Supervisor {
         events: Arc<crate::events::Bus>,
         harness: Arc<dyn Harness>,
     ) -> Self {
-        let vault_key = cfg.vault_key.as_deref().and_then(|raw| {
-            match crate::vault::VaultKey::from_base64(raw) {
-                Ok(k) => Some(k),
-                Err(e) => {
-                    tracing::error!(error = %e, "vault key unusable; secrets will be unavailable");
-                    None
-                }
+        // Said at boot, not discovered later from a failed write: a missing
+        // key is a provisioning gap in whoever spawned this engine, and the
+        // person who can fix it is reading the startup log.
+        let (vault_key, vault_key_error) = match cfg.vault_key.as_deref() {
+            None => {
+                tracing::warn!(
+                    "WHEEL_VAULT_KEY is not set; vault nodes will refuse reads and writes"
+                );
+                (None, Some(NO_VAULT_KEY))
             }
-        });
+            Some(raw) => match crate::vault::VaultKey::from_base64(raw) {
+                Ok(k) => (Some(k), None),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "WHEEL_VAULT_KEY is unusable; vault nodes will refuse reads and writes"
+                    );
+                    (None, Some(BAD_VAULT_KEY))
+                }
+            },
+        };
         Self {
             cfg,
             vault_key,
+            vault_key_error,
             db,
             agents: Arc::new(AsyncMutex::new(HashMap::new())),
             harness,
@@ -117,6 +176,17 @@ impl Supervisor {
     /// The project's vault key, if it has a usable one.
     pub fn vault_key(&self) -> Option<&crate::vault::VaultKey> {
         self.vault_key.as_ref()
+    }
+
+    /// The project's vault key, or the reason there isn't one.
+    ///
+    /// Callers get a sentence naming the missing environment variable rather
+    /// than a bare failure: without it, a provisioning gap arrives as a 500
+    /// and gets debugged as an engine bug.
+    pub fn require_vault_key(&self) -> Result<&crate::vault::VaultKey, &'static str> {
+        self.vault_key
+            .as_ref()
+            .ok_or(self.vault_key_error.unwrap_or(NO_VAULT_KEY))
     }
 
     pub fn events(&self) -> &Arc<crate::events::Bus> {
@@ -207,6 +277,19 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The child starts from an EMPTY environment and is given back only
+        // what it needs (ADVERSARY F015). A process can always read its own
+        // /proc/self/environ, so anything inherited here is readable by
+        // untrusted code no matter which uid it runs as: the engine's own
+        // WHEEL_ENGINE_SECRET and WHEEL_VAULT_KEY were both inherited, which
+        // handed an agent the control-plane bearer and the key to every vault
+        // in the project -- including vaults it had no wire to.
+        //
+        // An allowlist rather than a deny-list, so a variable added to the
+        // engine's environment later is dropped by default rather than leaked
+        // until somebody remembers to name it.
+        cmd.env_clear();
+        inherit_platform_env(&mut cmd);
         for (k, v) in self.harness.env(&spec) {
             cmd.env(k, v);
         }
@@ -1100,6 +1183,68 @@ mod tests {
 
     /// A harness that answers every turn, reporting the session it was told to
     /// resume so a test can see whether the context survived.
+    /// A harness that records the environment it was actually given.
+    const ENV_DUMP_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+env > "$dir/child-env.tmp"
+mv "$dir/child-env.tmp" "$dir/child-env"
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}"
+while IFS= read -r line; do
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"s1\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    /// ADVERSARY F015. A child inherited the ENGINE's whole environment, so an
+    /// agent could read `WHEEL_ENGINE_SECRET` (the control-plane bearer) and
+    /// `WHEEL_VAULT_KEY` (which decrypts every vault in the project) straight
+    /// out of its own `/proc/self/environ` — no wire, no token, no uid trick.
+    /// Both were demonstrated live: the agent self-granted a wire to a vault
+    /// it was never connected to.
+    #[tokio::test]
+    async fn a_child_is_not_given_the_engines_own_secrets() {
+        // Set on the ENGINE's process, which is exactly how the host supplies
+        // them in production.
+        std::env::set_var("WHEEL_ENGINE_SECRET", "engine-bearer-must-not-leak");
+        std::env::set_var("WHEEL_VAULT_KEY", "dmF1bHQta2V5LW11c3Qtbm90LWxlYWs=");
+
+        let (sup, id, dir) = shim_supervisor("env-hygiene", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+
+        for secret in [
+            "WHEEL_ENGINE_SECRET",
+            "WHEEL_VAULT_KEY",
+            "WHEEL_HOST_SECRET",
+            "WHEEL_PROJECT_ID",
+            "WHEEL_ROLE",
+            "WHEEL_LISTEN",
+        ] {
+            assert!(
+                !env.contains(secret),
+                "{secret} reached an untrusted child:\n{env}"
+            );
+        }
+        // And the values themselves, in case a name is ever spelled anew.
+        assert!(!env.contains("engine-bearer-must-not-leak"));
+        assert!(!env.contains("dmF1bHQta2V5LW11c3Qtbm90LWxlYWs="));
+
+        // The child must still be able to WORK: an empty environment that
+        // cannot find its own binary would pass the assertions above and
+        // break every agent on the board.
+        assert!(env.contains("PATH="), "the harness needs a PATH:\n{env}");
+        assert!(env.contains("WHEEL_NODE="), "the child lost its identity");
+        assert!(
+            env.contains("WHEEL_TOKEN_FILE="),
+            "the child lost its capability token"
+        );
+
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     const ECHO_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 echo run >> "$dir/runs"
