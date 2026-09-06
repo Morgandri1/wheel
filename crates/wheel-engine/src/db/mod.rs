@@ -25,8 +25,21 @@ pub fn open(path: &Path) -> Result<Connection> {
     // (`tables::query`) opens it a second time, so an exclusive engine is an
     // engine whose agents cannot read their own tables -- a hard error naming
     // the mode the database is stuck in is the better failure.
+    //
+    // `open_configured` already negotiates the journal mode -- including the
+    // slow escalation path on a volume that cannot host WAL (BEGIN IMMEDIATE
+    // write-proofs, an exclusive drain, a retry, all real I/O). Running
+    // `configure`'s `configure_journal` a SECOND time here, on the connection
+    // it just returned, repeated every one of those slow attempts for no
+    // reason: this connection is already in a working mode. On a hostile
+    // volume that doubled the boot's worst-case latency, which is what pushed
+    // it past the CI fixture's patience (`ENG-journal-override-cannot-
+    // disable-recovery`, which timed the container out rather than seeing it
+    // stay unhealthy -- the engine's own log shows it reaching "listening"
+    // every time, just too late). `foreign_keys` still needs setting; it does
+    // not need the journal negotiated a second time to get it.
     let conn = wheel_sqlite::open_configured(&path.display().to_string(), false)?;
-    configure(&conn)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     migrate(&conn)?;
     ensure_node_tables(&conn)?;
     Ok(conn)
