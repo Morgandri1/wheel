@@ -307,6 +307,41 @@ just the two harnesses. (PM ruling, 2026-09-06, from ADVERSARY F015.)
 
 ---
 
+### 5b. Table-node naming — a deliberate divergence from §3
+
+§3's node-name rule (`^[a-z0-9][a-z0-9-_]{0,62}$`) permits `-` for every node type. The engine
+narrows it for **table** nodes only, because the name becomes the sqlite table `t_<name>` and
+`-` is a subtraction operator there. Refusing beats mangling, and refusing at creation beats
+refusing on first write.
+
+**This divergence is with PM.** Either the contract narrows for table nodes, or the engine
+quotes identifiers. Until then these assert the behaviour, so whichever way it is ruled the
+tests are updated deliberately rather than drifting.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `VAL-table-name-identifier` | A table node named with `-` is refused at **creation**, with a message naming both the offending character and the fix. | S3 |
+| `VAL-table-name-atomic` | That refusal leaves no node behind. A table node that exists but has nowhere to put rows is worse than one that was never created. | S2 |
+| `VAL-hyphen-legal-elsewhere` | The same name is accepted for a `ctx` node — the narrowing is table-specific, not a general retreat from §3. Without this, the engine could tighten every node name and the suite above would still be green. | S3 |
+
+---
+
+### 5c. Post-deploy healthchecks (incident #2)
+
+A deploy reporting success is not evidence that anything is reachable. The only evidence is a
+request from outside, after the deploy, to the path the service's own config declares. Run by
+`qa/tools/deploy_healthcheck.py` with `WHEEL_DEPLOY_API` set; skips by name when nothing was
+deployed.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `DEPLOY-healthz-declared` | Every service in `infra/railway/settings.json` declares a `healthcheckPath`. One that declares none is called healthy by Railway the moment its container boots — "the process started", not "it can serve", which is what incident #2 actually was. **`wheel-host` currently declares none.** | S2 |
+| `DEPLOY-healthz-reachable` | `GET <deployed base><configured path>` answers 200 from outside. The path is read from the config, never typed here: a gate curling a hardcoded path keeps passing after the config moves, and is then testing itself. | **S1** |
+| `DEPLOY-healthz-is-ours` | The 200 carries our health body. A parked page, an edge cache or another service on the domain answers 200 just as happily, so status alone proves only that something on the internet replied. | S2 |
+| `DEPLOY-healthz-host` | The same for `wheel-host`. It has no public domain by design (§5b), so this needs an API-proxied liveness route; **skipped by name** until API adds one — the host holds every project's engine secret, and "never checked" must not read as "fine". | S2 |
+
+---
+
 ## 6. CLI — the `wheel` binary (§3c)
 
 Grammar mirrors `yoke`. **Denial is exit code 3** throughout, so scripts can branch on it.
