@@ -3,9 +3,46 @@
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
-COPY Cargo.toml Cargo.lock* ./
+
+# Dependencies first, from manifests alone. Without this every deploy recompiles all 243 crates
+# wheel-api depends on, because a one-line change to a handler invalidates the layer that builds
+# them. With it, a code change reuses that layer and only the workspace is rebuilt.
+#
+# The stub sources exist so cargo can resolve the graph before any real code is here. `-p wheel-api`
+# picks one member, but cargo still reads every member's manifest, and a declared target whose file
+# is missing is an error.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/wheel-api/Cargo.toml crates/wheel-api/
+COPY crates/wheel-cli/Cargo.toml crates/wheel-cli/
+COPY crates/wheel-core/Cargo.toml crates/wheel-core/
+COPY crates/wheel-engine/Cargo.toml crates/wheel-engine/
+COPY crates/wheel-host/Cargo.toml crates/wheel-host/
+COPY crates/wheel-sqlite/Cargo.toml crates/wheel-sqlite/
+COPY crates/wheeld/Cargo.toml crates/wheeld/
+RUN set -eu; \
+    for d in crates/*/; do \
+        mkdir -p "$d/src/bin"; \
+        : > "$d/src/lib.rs"; \
+        echo 'fn main() {}' > "$d/src/main.rs"; \
+        echo 'fn main() {}' > "$d/src/bin/export_schema.rs"; \
+    done; \
+    cargo build --release --locked -p wheel-api; \
+    rm -rf crates
+
+# --locked, here and above: a deploy must build the versions CI tested, not whatever resolves today.
 COPY crates ./crates
-RUN cargo build --release -p wheel-api
+# `touch`, and it is load-bearing: cargo fingerprints a path crate by mtime, and COPY preserves the
+# mtimes from the build context, which are older than the stub build above. Without this the real
+# build finishes in 0.2s having done nothing and the image ships the stub. It did, once, here.
+#
+# The size check is the guard for next time: a wheel-api that links axum, sqlx and rustls is tens of
+# megabytes, and `fn main() {}` is a third of one.
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked -p wheel-api \
+    && size=$(stat -c %s target/release/wheel-api) \
+    && if [ "$size" -lt 5000000 ]; then \
+         echo "wheel-api is $size bytes: that is the stub, not the API" >&2; exit 1; \
+       fi
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
