@@ -188,60 +188,38 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ---
 
-## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
+## 006 — Per-crate coverage below the §0b bar · S2 · SDK+API · CLOSED 2026-09-06
 
-> **2026-09-06 03:39Z, CI run 34009465273 on `main`** — the only red gate in `make check`
-> is `rust:coverage`, and only two crates are now under the bar: **`wheel-cli` 86.88 %**
-> (was 0.00 % — SDK's `ce3bdc8` covered the transport and command dispatch) and
-> **`wheel-host` 76.94 %**. `wheel-core` and `wheel-api` pass. `rust:clippy` and
-> `rust:test` are GREEN, which closes 016.
+**Closed on CI run 34016518762 (d1e4381), verified by reading the run rather than the report.**
+Every crate is over the 90% bar:
 
-> **2026-09-06 — RE-MEASURED. The table below it is superseded; the old numbers were wrong.**
->
-> `make coverage` ran `cargo llvm-cov` against the shared `target-dir` every worktree uses, and
-> summed per-crate lines with a filter that accepted any path containing `/crates/` — so each
-> crate's coverage was totalled across six checkouts of it. Fixed in `qa/tools/coverage_gate.py`
-> (private `CARGO_TARGET_DIR`, files scoped to this worktree, empty result is a SKIP not 0%).
->
-> | crate | was reported | actually | verdict |
-> |---|---|---|---|
-> | `wheel-core` | 69.56% FAIL | **96.96%** (1594/1644) | **PASSES.** SDK was carrying a failure it did not have. |
-> | `wheel-cli` | 0.00% FAIL | **86.88%** (192/221) | 3 points under. |
-> | `wheel-host` | 70.69% FAIL | **84.74%** (1133/1337) | 5 points under. |
-> | `wheel-engine` | 57.02% | 70.81% (3515/4964) | still exempt (scaffolding). |
-> | `wheel-api` | 89.02% (CI) | **not measurable locally** | see below. |
->
-> **`wheel-api` reads 33.38% on a laptop and that number is meaningless.** Its eight
-> `tests/*_db.rs` suites self-skip when `TEST_DATABASE_URL` is unset, so locally the crate is
-> measured with most of its suite absent. Reporting that as FAIL would have sent API after a
-> 57-point gap that does not exist. The gate now marks such crates **INCONCLUSIVE** and does not
-> fail on them; CI sets `TEST_DATABASE_URL` (and `WHEEL_CI_HAS_DB=1`, which turns the skip into a
-> hard error), so the bar is enforced exactly where the measurement is complete. CI's 89.02%
-> stands as wheel-api's real number.
+| crate | lines | |
+|---|---|---|
+| `wheel-api` | 90.62% (2000/2207) | ok |
+| `wheel-cli` | 94.39% (555/588) | ok |
+| `wheel-core` | 97.40% (1647/1691) | ok |
+| `wheel-host` | 90.43% (1710/1891) | ok — from 82.11% |
+| `wheeld` | 91.73% (344/375) | ok — from 79.20%, a new crate that met the bar without ever being exempted |
+| `wheel-engine` | ratcheted (PM ruling), floor rises with each merge, hard expiry at M2 |
 
-`wheel-host` was at **0.00%** when this was filed and is now at 72.21% — that was the urgent one
-(it holds every project's engine secret, performs the setuid, and is the only process touching the
-docker socket), so the risk has dropped a lot. All three are still below the bar.
+API reported the number and explicitly did NOT declare the bug closed, on the grounds that
+the ID goes green before the bug does and the close is mine. That is the right order and it
+is worth recording that they held it.
 
-**The gate itself was broken until now, and this is worth knowing:** `coverage_gate.py` wrote its
-llvm-cov report to `<repo>/target/`, but `~/.cargo/config.toml` points every worktree at one
-shared target-dir, so that directory does not exist and `llvm-cov` exited with "failed to create
-file". Every "coverage" result before this fix was that error surfacing as a red gate, not a
-measurement. Fixed to use a temp dir. So treat the numbers above as the first trustworthy ones.
+**The history matters more than the close.** Most of the original table was wrong: coverage
+was summed across six worktrees of each crate, so `wheel-core` read 69.56% while it was
+actually 96.96%, and `wheel-cli` read 0.00% while it was 86.88%. SDK carried a failure that
+was never theirs. Fixed in `qa/tools/coverage_gate.py` — private `CARGO_TARGET_DIR`,
+worktree-scoped file filtering, an empty result is a SKIP rather than 0%, an OOM-killed test
+binary is a SKIP rather than a FAIL, and a crate whose DB-gated suites did not run is
+INCONCLUSIVE rather than failed.
 
-`wheel-core` at 68% matters for a specific reason: `validate.rs` is the code that must be
-enforcing the twelve rejections in BUG-001 that the exported schema does not. Untested branches
-there are the difference between "the schema is loose but the engine catches it" and "nothing
-catches it". Those twelve are marked `_enforced_by: engine` in the fixtures and will be asserted
-against a real engine once `wheel-engine:test` exists; coverage is the cheaper earlier signal.
-
-**Repro:** `make coverage`, or CI's `make check-strict`.
-
-**Note on the exemption:** it is declared in `qa/tools/coverage_gate.py` naming the crate, the
-reason and the event that expires it. If `wheel-engine` reaches 90% while still exempt, the gate
-FAILS and tells us to remove the exemption — a stale exemption cannot outlive its reason.
-
----
+Still deliberately uncovered in `wheel-host`, on the record rather than as a later surprise:
+the privilege drop (setgroups/setgid/setuid/no_new_privs/rlimits), the recursive chown of a
+project tree, and the real engine spawn — roughly 60 lines that cannot execute without root
+or a real engine binary. API asked PM for a root-capable CI job (`WHEEL_CI_HAS_ROOT=1`) and
+did not write tests that route around them to make the number. That restraint is the correct
+call and the ask still stands.
 
 ## 007 — Landing page hydration mismatch from trig floating-point · S3 · Web
 

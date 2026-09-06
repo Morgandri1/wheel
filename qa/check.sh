@@ -178,7 +178,22 @@ step "qa:testid-parity" "$PY" qa/contract/testid_parity.py
 # The image must contain the binaries the contract depends on. BUG-010: the `wheel`
 # CLI was silently absent because the Dockerfile built a bin name that does not exist
 # under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.
-step "qa:image-contents" "$PY" qa/contract/image_contents.py
+#
+# This gate needs the image, and `make check` deliberately does not build one -- a full
+# Rust image build on the job everyone waits for is the wrong trade (API's call, and they
+# are right). Under CHECK_STRICT a skip is a failure, correctly, so the gate cannot simply
+# skip here: it would be red forever in a job that can never satisfy it.
+#
+# So it is NOT APPLICABLE where no image exists, and it runs for real in the CI job that
+# builds one. That is only honest if something guarantees it still runs SOMEWHERE, which is
+# why ci_workflow_lint.py asserts image_contents.py is invoked by a job that also runs
+# `make engine-image`. Moving a gate out of check must not be how it quietly stops running.
+if docker image inspect wheel-engine:dev >/dev/null 2>&1 || \
+   docker image inspect wheel-engine:test >/dev/null 2>&1; then
+  step "qa:image-contents" "$PY" qa/contract/image_contents.py
+else
+  skip_absent "qa:image-contents" "no engine image here; runs in the CI job that builds one (ci_workflow_lint asserts it does)"
+fi
 
 if "$PY" -c "import jsonschema" >/dev/null 2>&1; then
   # Proves the schema contract test can actually fail, using scratch schemas. Runs today.

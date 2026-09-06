@@ -160,6 +160,13 @@ jobs:
       - name: Verify image contents
         run: make image-verify-prod
 
+      # qa:image-contents lives here rather than in `make check`, which builds no image and
+      # would therefore fail it forever under CHECK_STRICT. ci_workflow_lint.py asserts this
+      # step still exists in a job that builds the image — otherwise "moved" and "silently
+      # stopped running" look identical, which is the failure this repo keeps finding.
+      - name: Contract — image contents (qa:image-contents)
+        run: python3 qa/contract/image_contents.py
+
       - name: Docker-backed sandbox tests
         env:
           WHEEL_CI_HAS_DOCKER: "1"
