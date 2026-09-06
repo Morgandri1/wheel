@@ -351,7 +351,7 @@ pub async fn auth_complete(
                 token: key.trim().to_string(),
                 expires_at: None,
             };
-            Some(save_credential_to_vault(&s, id, vault, &found)?)
+            Some(save_credential_to_vault(&s, id, harness, vault, &found)?)
         }
         None => None,
     };
@@ -412,7 +412,7 @@ async fn finish_setup_token(
                 token: token.to_string(),
                 expires_at: None,
             };
-            Some(save_credential_to_vault(s, id, vault, &found)?)
+            Some(save_credential_to_vault(s, id, harness, vault, &found)?)
         }
         None => None,
     };
@@ -556,7 +556,7 @@ async fn finish_paste_code(
             let found = crate::auth::oauth_token_from_store(&config_dir).map_err(|e| {
                 ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
             })?;
-            Some(save_credential_to_vault(s, id, vault, &found)?)
+            Some(save_credential_to_vault(s, id, harness, vault, &found)?)
         }
         None => None,
     };
@@ -587,6 +587,7 @@ async fn finish_paste_code(
 fn save_credential_to_vault(
     s: &AppState,
     agent: Uuid,
+    harness: wheel_core::Harness,
     vault_name: &str,
     found: &crate::auth::StoredOauth,
 ) -> ApiResult<serde_json::Value> {
@@ -619,7 +620,16 @@ fn save_credential_to_vault(
         ));
     }
 
-    const KEY: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+    // The env var the credential ACTUALLY is, not a fixed one (ADVERSARY,
+    // finding 018). Vaulting an `ANTHROPIC_API_KEY` under
+    // `CLAUDE_CODE_OAUTH_TOKEN` would export it to every peer agent under a
+    // name the harness does not read, and they would all fail to authenticate
+    // with a credential that is sitting right there and perfectly valid.
+    // These are the same two functions that route a pasted credential into a
+    // child's environment, so the vault and the spawn cannot disagree.
+    let kind = crate::auth::classify_token(&found.token, harness);
+    let key = crate::auth::token_env(kind, harness);
+
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
     let expires_at = found.expires_at.and_then(millis_to_timestamp);
@@ -627,18 +637,19 @@ fn save_credential_to_vault(
         s,
         &conn,
         vault.id,
-        KEY,
+        key,
         &found.token,
         expires_at,
     )?;
 
-    let mut out = serde_json::json!({ "name": vault_name, "key": KEY, "stored": true });
+    let mut out = serde_json::json!({ "name": vault_name, "key": key, "stored": true });
     if let Some(exp) = expires_at {
         out["expires_at"] = serde_json::json!(exp);
     }
     if !found.is_long_lived() {
         out["warning"] = serde_json::json!(
-            "this is a session credential and will expire; for a durable one, run              `claude setup-token` and submit that token as api_key instead"
+            "this is a session credential and will expire; for a durable one, \
+             run `claude setup-token` and submit that token as api_key instead"
         );
     }
     Ok(out)
@@ -651,6 +662,12 @@ fn login_error(e: crate::oauth::LoginError) -> ApiError {
         L::NoSession | L::Expired => ApiError::new(StatusCode::CONFLICT, "expired", e.to_string()),
         L::Rejected(_) => ApiError::invalid(e.to_string()),
         L::Timeout => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string()),
+        // 400, not 504: a 5xx here is relayed to the operator as a gateway
+        // timeout, which reads as "the service is broken" when the actual
+        // situation is that their code produced no verdict and they should
+        // start again. The message is the useful part and it is theirs to act
+        // on.
+        L::NoResponse => ApiError::invalid(e.to_string()),
         L::Spawn(m) => ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", m),
     }
 }

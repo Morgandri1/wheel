@@ -543,6 +543,42 @@ mod vault_handoff_tests {
         d
     }
 
+    /// ADVERSARY finding 018. `save_to_vault` applies to the api_key path too,
+    /// and it stored EVERY credential under CLAUDE_CODE_OAUTH_TOKEN. A
+    /// provider key vaulted under that name is exported to every peer agent
+    /// under a variable the harness does not read -- so a whole board fails to
+    /// authenticate with a credential that is present and perfectly valid.
+    /// The vault key must be the variable the credential actually is.
+    #[test]
+    fn a_vaulted_credential_is_keyed_by_the_variable_it_actually_is() {
+        let cases = [
+            (
+                "sk-ant-oat01-abc",
+                Harness::Claude,
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ),
+            ("sk-ant-api03-abc", Harness::Claude, "ANTHROPIC_API_KEY"),
+            ("sk-proj-abc", Harness::Codex, "CODEX_API_KEY"),
+        ];
+        for (token, harness, want) in cases {
+            let kind = classify_token(token, harness);
+            assert_eq!(
+                token_env(kind, harness),
+                want,
+                "{token} on {harness:?} must be vaulted as {want}"
+            );
+        }
+        // ...and every name it can produce is one the engine recognises as a
+        // credential, or the ambiguity rule would never fire on it.
+        for (token, harness, _) in cases {
+            let k = token_env(classify_token(token, harness), harness);
+            assert!(
+                wheel_core::is_credential_key(k),
+                "{k} must be a recognised credential key"
+            );
+        }
+    }
+
     /// The shape `claude auth login` is expected to leave behind.
     #[test]
     fn the_token_is_found_in_the_stores_normal_shape() {
