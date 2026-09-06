@@ -30,7 +30,7 @@ function NodePlateInner({ data, selected }: NodeProps) {
   }, [editing]);
 
   const commit = () => {
-    const err = validateNodeName(draft, takenNames.filter((n) => n !== node.name));
+    const err = validateNodeName(draft, takenNames.filter((n) => n !== node.name), node.type);
     if (err) {
       setError(err);
       return;
