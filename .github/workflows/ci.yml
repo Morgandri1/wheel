@@ -198,6 +198,32 @@ jobs:
           name: integration-logs-${{ matrix.backend }}
           path: qa/.artifacts/
 
+  packaged-web:
+    name: packaged board (npx wheel-web)
+    runs-on: ubuntu-latest
+    # A real `next build` — minutes, so it is opt-in locally (`make test-pkg`) and lives
+    # here, for the same reason the wheel-on-wheel build leg does. This is the only job that
+    # tests what a user installs rather than what we develop against.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm -C web install --frozen-lockfile
+      - run: pnpm -C web exec playwright install --with-deps chromium
+      - run: make test-pkg
+
+      - name: Upload the report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-web-report
+          path: qa/e2e/playwright-report/
+
   wheel-on-wheel:
     name: wheel-on-wheel (agent clones and builds Wheel)
     runs-on: ubuntu-latest
