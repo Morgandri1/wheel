@@ -17,13 +17,13 @@
   "platforms": {
     "aarch64-apple-darwin": {
       "crates": {
-        "wheel-api": 246,
+        "wheel-api": 243,
         "wheel-cli": 63,
         "wheel-core": 29,
-        "wheel-engine": 194,
-        "wheel-host": 206,
+        "wheel-engine": 195,
+        "wheel-host": 203,
         "wheel-sqlite": 32,
-        "wheeld": 281
+        "wheeld": 278
       },
       "duplicates": [
         "bitflags",
@@ -38,17 +38,17 @@
         "syn",
         "webpki-roots"
       ],
-      "total": 284
+      "total": 281
     },
     "x86_64-unknown-linux-gnu": {
       "crates": {
-        "wheel-api": 246,
+        "wheel-api": 243,
         "wheel-cli": 63,
         "wheel-core": 29,
-        "wheel-engine": 195,
-        "wheel-host": 206,
+        "wheel-engine": 196,
+        "wheel-host": 203,
         "wheel-sqlite": 32,
-        "wheeld": 281
+        "wheeld": 278
       },
       "duplicates": [
         "bitflags",
@@ -64,7 +64,7 @@
         "syn",
         "webpki-roots"
       ],
-      "total": 284
+      "total": 281
     }
   }
 }
