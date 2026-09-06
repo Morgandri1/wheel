@@ -41,15 +41,15 @@ export function completeFailure(e: unknown): CompleteFailure {
       };
     }
     if (e.status === 400) return { kind: "rejected", message: e.message };
-    // Observed against the live API: submitting a wrong code makes the engine sit on the
-    // exchange until the gateway gives up, so the operator gets a timeout for what is almost
-    // always a typo. We cannot claim to know which it was, so the wording covers both without
-    // asserting either — and does not leave them staring at "the engine did not respond".
+    // A wrong code is a 400 now (SDK fb74bfd, verified in production: 400 in 1.1s with
+    // "Invalid code. Please make sure the full code was copied."). So a 5xx here no longer means
+    // "probably a typo" — it means the engine genuinely did not answer, and saying otherwise
+    // would send someone hunting for a mistake they did not make.
     if (e.status === 502 || e.status === 503 || e.status === 504) {
       return {
         kind: "other",
         message:
-          "The engine did not answer in time. That usually means the code was wrong or the window closed — start the sign-in again. If it keeps happening, the project may need a restart.",
+          "The engine did not answer, so this sign-in could not be finished. The code is fine — try again in a moment, and if it keeps happening the project needs a restart.",
       };
     }
     return { kind: "other", message: e.message };
