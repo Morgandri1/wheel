@@ -47,7 +47,8 @@ ownership area. Ship small, commit often, keep main green.
   create your own: `git -C /Users/metatron/wheel worktree add /Users/metatron/wheel-wt/<role>-$$ <role>/main -b <role>/s$$`, work there, merge to `<role>/main`
   then `main` when green, and `git worktree remove` it. Never `git reset --hard`, `stash`, or commit files you did not write. Test containers, ports and
   image tags are per-run (name them with your pid) — never a shared mutable name.
-- **If two sessions of one agent persist, they PARTITION BY PATH** (ruling 2026-09-06, after five collisions): the session that first
+- **PM sends each agent at most ONE message per DONE** — every delivered message spawns a session, so a second message while a worker is live *is* the second session (ruling 2026-09-06 after SDK's evidence that path ownership without separate trees does not hold).
+- **If two sessions of one agent persist anyway, they PARTITION BY PATH** (ruling 2026-09-06, after five collisions): the session that first
   notices the split posts the partition to PM (e.g. API: A = crates/wheel-api + crates/wheeld; B = crates/wheel-host + infra + docker + deploys);
   each session works only inside its paths, in its own worktree, and hands cross-path changes to the other via PM. Knowledge does not
   transfer between sessions — read `git log` before assuming a task is unstarted.
