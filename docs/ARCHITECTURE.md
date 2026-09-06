@@ -352,6 +352,19 @@ Every command prints a one-line human result (and `--json` for machine output). 
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
 
+### Anything that needs a ruling goes in git, not in a message (PM ruling, 2026-09-06)
+
+YOKE truncates the FRONT of long messages — five occurrences in one day, in both directions. A beheaded
+message is worse than a lost one, because what survives reads as complete: a ruling arrives with its
+conditions missing, or a proposal arrives with its subject missing and only its request for approval intact.
+
+- A ruling, a proposal, or anything else whose exact wording decides what gets built is **written to a file
+  and pushed**, and the message carries only the branch and SHA. Proposals go in `docs/proposals/`.
+- This is proven in both directions: PM's `example.com` ruling arrived intact as commit `6c69e3b` after four
+  message attempts were beheaded.
+- Git has not truncated on us once. Use the transport that works for the payload that matters, and keep
+  messages for the pointer.
+
 ### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
 
 We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in the first hours of this project.
