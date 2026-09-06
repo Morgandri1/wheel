@@ -19,7 +19,8 @@ Wheel is open source. You can run it three ways.
 
 ### 1. Locally (single executable) — M1.7, in progress
 ```bash
-wheeld                       # API + host + sandboxed agents in one process, sqlite store, http://localhost:8080
+wheeld                       # API + host + sandboxed agents in one process, http://localhost:8080
+                             # (today: needs DATABASE_URL=postgres://…; the sqlite store is being wired — then no database service at all)
 npx wheel-web                # optional: the board UI against http://localhost:8080 (headless users skip this)
 wheel --help                 # the agent-side CLI (also what your agents use inside their sandboxes)
 ```
