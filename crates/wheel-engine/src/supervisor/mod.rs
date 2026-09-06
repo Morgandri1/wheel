@@ -389,6 +389,11 @@ impl Supervisor {
         // project can read them.
         let cargo_home = self.cfg.data_dir.join("cargo");
         std::fs::create_dir_all(&cargo_home).ok();
+        std::fs::set_permissions(
+            &cargo_home,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .context("setting CARGO_HOME to 0700")?;
         cmd.env("CARGO_HOME", &cargo_home);
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
@@ -1523,6 +1528,41 @@ done
         assert!(
             env.contains("WHEEL_TOKEN_FILE="),
             "the child lost its capability token"
+        );
+
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// qa/BUGS.md 020/021, ADVERSARY 030. `CARGO_HOME` sits under the
+    /// project's own data dir, but a 0755 directory is readable by every
+    /// other uid in the sandbox regardless of WHERE it lives — what a
+    /// tenant fetches (sources, and any registry credentials it configures)
+    /// must be private to the project uid.
+    #[tokio::test]
+    async fn cargo_home_is_private_to_the_project() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (sup, id, dir) = shim_supervisor("cargo-privacy", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+
+        let cargo_home = env
+            .lines()
+            .find_map(|l| l.strip_prefix("CARGO_HOME="))
+            .expect("the child lost CARGO_HOME");
+        assert!(
+            std::path::Path::new(cargo_home).starts_with(&dir),
+            "CARGO_HOME={cargo_home:?} must live under the project's own data dir {dir:?}"
+        );
+        let mode = std::fs::metadata(cargo_home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "CARGO_HOME={cargo_home:?} is {mode:o} — every other uid in the sandbox can read \
+             a tenant's fetched sources unless it is private to the project uid"
         );
 
         sup.stop(id).await.ok();
