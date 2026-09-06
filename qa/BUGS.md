@@ -190,6 +190,12 @@ per §1 of the contract. Filed as blocking for that reason alone.
 
 ## 006 — Per-crate coverage below the §0b bar; `wheel-host` at zero · S2 · SDK
 
+> **2026-09-06 03:39Z, CI run 34009465273 on `main`** — the only red gate in `make check`
+> is `rust:coverage`, and only two crates are now under the bar: **`wheel-cli` 86.88 %**
+> (was 0.00 % — SDK's `ce3bdc8` covered the transport and command dispatch) and
+> **`wheel-host` 76.94 %**. `wheel-core` and `wheel-api` pass. `rust:clippy` and
+> `rust:test` are GREEN, which closes 016.
+
 > **2026-09-06 — THE NUMBERS BELOW ARE SUSPECT AND ARE BEING RE-MEASURED.**
 > `make coverage` ran `cargo llvm-cov` against the shared `target-dir` that every worktree
 > uses, and summed per-crate lines with a filter that accepted any path containing
@@ -635,7 +641,11 @@ build. The integration gate is red until this lands.
 
 ---
 
-## 016 — `main` is red on `rust:clippy`, Linux only · S2 · API
+## 016 — `main` is red on `rust:clippy`, Linux only · S2 · API · CLOSED
+
+> Closed 2026-09-06: CI run 34009465273 on `main` has `rust:clippy` green on
+> Linux; `rust:coverage` is the only remaining red gate. Verified from the run
+> log, not from a fix notification.
 
 `crates/wheel-host/src/sandbox/process.rs`, `Rlimits::as_pairs`: `libc::RLIMIT_NPROC as u32`
 and five siblings. On glibc `RLIMIT_NPROC` is already `u32`, so clippy fires
