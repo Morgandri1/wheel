@@ -36,8 +36,6 @@
         "rand_core",
         "schemars",
         "syn",
-        "tokio-tungstenite",
-        "tungstenite",
         "webpki-roots"
       ],
       "total": 284
@@ -64,8 +62,6 @@
         "rand_core",
         "schemars",
         "syn",
-        "tokio-tungstenite",
-        "tungstenite",
         "webpki-roots"
       ],
       "total": 284
