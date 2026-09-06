@@ -203,4 +203,90 @@ fn dev_secret_interlock_and_config_validation() {
 
     std::env::remove_var("SESSION_SECRET");
     std::env::remove_var("AUTH_MODE");
+
+    // --- ADVERSARY 017: no stub identity provider in production ---------------------------------
+    // A mock issuer does not fail closed. It authenticates everyone, as whoever the caller says
+    // they are, and the API's own ownership checks then work perfectly against the wrong identity.
+    // The only safe place to stop that is boot.
+    for stub in [
+        "http://localhost:9999/.well-known/jwks.json",
+        "https://localhost/jwks",
+        "https://127.0.0.1:3000/jwks",
+        "https://[::1]/jwks",
+        "https://10.0.0.4/jwks",
+        "https://192.168.1.10/jwks",
+        "https://172.16.0.9/jwks",
+        "https://169.254.169.254/jwks",
+        "https://auth.internal/jwks",
+        "https://clerk.local/jwks",
+        "clerk.example.test/jwks",
+    ] {
+        base_env();
+        std::env::set_var("WHEEL_ENV", "prod");
+        std::env::set_var("AUTH_MODE", "jwks");
+        std::env::set_var("CLERK_JWKS_URL", stub);
+        assert!(
+            Config::from_env().is_err(),
+            "a production build must refuse the stub identity provider {stub:?}"
+        );
+    }
+
+    // The issuer is checked too: it is what pins a token to our tenant, so a local issuer is the
+    // same hole by another name.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "prod");
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("CLERK_ISSUER", "http://localhost:9999");
+    assert!(
+        Config::from_env().is_err(),
+        "a production build must refuse a local CLERK_ISSUER"
+    );
+
+    // Addresses that merely look private must still be allowed: 172.15 and 172.32 are outside
+    // 172.16.0.0/12, and a hostname containing "localhost" is not localhost.
+    for real in [
+        "https://clerk.example.test/jwks",
+        "https://172.15.0.1/jwks",
+        "https://172.32.0.1/jwks",
+        "https://not-localhost.example.com/jwks",
+        "https://internal-tools.example.com/jwks",
+    ] {
+        base_env();
+        std::env::set_var("WHEEL_ENV", "prod");
+        std::env::set_var("AUTH_MODE", "jwks");
+        std::env::set_var("CLERK_JWKS_URL", real);
+        assert!(
+            Config::from_env().is_ok(),
+            "a real provider must still boot: {real:?}"
+        );
+    }
+
+    // Dev is exactly where a local issuer belongs, so the check must not apply there.
+    base_env();
+    std::env::set_var("WHEEL_ENV", "dev");
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("CLERK_JWKS_URL", "http://localhost:9999/jwks");
+    std::env::set_var("CLERK_ISSUER", "http://localhost:9999");
+    assert!(
+        Config::from_env().is_ok(),
+        "dev must still be able to point at a local issuer"
+    );
+
+    // Every auth mode that is not one of ours is refused by name, in either environment: "mock",
+    // "dev" and "none" are the spellings someone reaches for when they want the bypass.
+    for env_name in ["prod", "dev"] {
+        for mode in ["mock", "dev", "none", "test", "off", "MOCK", ""] {
+            base_env();
+            std::env::set_var("WHEEL_ENV", env_name);
+            std::env::set_var("AUTH_MODE", mode);
+            assert!(
+                Config::from_env().is_err(),
+                "AUTH_MODE={mode:?} must be refused in {env_name}"
+            );
+        }
+    }
+
+    base_env();
+    std::env::remove_var("WHEEL_ENV");
+    std::env::remove_var("AUTH_MODE");
 }
