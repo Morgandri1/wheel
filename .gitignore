@@ -30,3 +30,7 @@ qa/e2e/node_modules/
 qa/e2e/playwright-report/
 qa/e2e/test-results/
 target-cov
+
+# Run artifacts: engine logs kept from a failed suite. Evidence for the run that
+# produced them, meaningless to anyone else, and stale the moment it is committed.
+qa/artifacts/
