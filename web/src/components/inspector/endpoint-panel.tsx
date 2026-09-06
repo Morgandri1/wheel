@@ -85,7 +85,7 @@ export function EndpointPanel({
     setProbing(true);
     setProbe(null);
     try {
-      setProbe(await probeEndpoint(url));
+      setProbe(await probeEndpoint(url, { method: node.config.method }));
     } finally {
       setProbing(false);
     }
@@ -138,11 +138,11 @@ export function EndpointPanel({
 
       <div className="flex items-center gap-2">
         <Button size="sm" data-testid="btn-endpoint-test" disabled={probing} onClick={test}>
-          {probing ? "Testing…" : "Test"}
+          {probing ? "Sending…" : `Send test ${node.config.method}`}
         </Button>
         <span className="text-micro text-ink-faint">
-          Sends a real GET from this browser. If this endpoint is wired to an agent, it will get a
-          message.
+          A real {node.config.method} from this browser, using this endpoint&rsquo;s own method —
+          anything wired to it receives the hit.
         </span>
       </div>
 

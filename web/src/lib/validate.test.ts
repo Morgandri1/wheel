@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { NODE_TYPES } from "@/lib/schema";
 import {
+  POSITION_MAX,
+  POSITION_MIN,
+  clampPosition,
   suggestName,
   validateChestKey,
   validateColumnName,
@@ -156,5 +159,32 @@ describe("column names match wheel-core's Ident", () => {
 
   it("refuses a hyphen", () => {
     expect(validateColumnName("first-name")).not.toBeNull();
+  });
+});
+
+/**
+ * Position is an i16 cell (contract 710239f). The engine rounds and clamps and returns what it
+ * stored; this side must do the SAME arithmetic, or a node saves, is silently changed, and moves
+ * on the next refetch — success followed by an unexplained jump.
+ */
+describe("board positions are an integer cell", () => {
+  it("rounds to whole units, because the store has no sub-pixels", () => {
+    expect(clampPosition({ x: 10.5, y: -3.2 })).toEqual({ x: 11, y: -3 });
+  });
+
+  it("clamps a far drag to the bound instead of letting it 400", () => {
+    expect(clampPosition({ x: 99999, y: -99999 })).toEqual({ x: POSITION_MAX, y: POSITION_MIN });
+  });
+
+  it("keeps an ordinary position exactly as it is", () => {
+    expect(clampPosition({ x: 120, y: 340 })).toEqual({ x: 120, y: 340 });
+  });
+
+  it("does not send NaN to the engine when a drag produces one", () => {
+    expect(clampPosition({ x: NaN, y: Infinity })).toEqual({ x: 0, y: POSITION_MAX });
+  });
+
+  it("uses the i16 bounds the contract names, not approximations of them", () => {
+    expect([POSITION_MIN, POSITION_MAX]).toEqual([-32768, 32767]);
   });
 });

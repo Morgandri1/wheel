@@ -74,3 +74,25 @@ export function suggestName(type: NodeType, taken: string[]): string {
   }
   return `${base}${sep}${Date.now()}`;
 }
+
+/**
+ * Board positions are an i16 cell (contract: "Position is an integer cell", 710239f).
+ *
+ * The engine rounds and clamps on the way in and returns what it stored; this does the SAME
+ * arithmetic before sending so the two can never disagree. A node that appears to save, is
+ * rejected, and springs back on the next refetch is the worst shape a UI bug can have — the
+ * operator sees success and gets none. Clamping means a far drag stops at the edge instead.
+ */
+export const POSITION_MIN = -32768;
+export const POSITION_MAX = 32767;
+
+export function clampCell(value: number): number {
+  // NaN carries no direction, so it cannot be clamped toward anything — 0 is the only honest
+  // answer. Infinity does carry one, and clamps to that bound like any other far drag.
+  if (Number.isNaN(value)) return 0;
+  return Math.min(POSITION_MAX, Math.max(POSITION_MIN, Math.round(value)));
+}
+
+export function clampPosition(position: { x: number; y: number }): { x: number; y: number } {
+  return { x: clampCell(position.x), y: clampCell(position.y) };
+}

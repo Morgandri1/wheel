@@ -40,15 +40,27 @@ export function errorCode(body: string): string | null {
   }
 }
 
+/** `delivered` from ingress's 202 envelope, when it sent one. */
+export function deliveredCount(body: string): number | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const n = (parsed as { delivered?: unknown })?.delivered;
+    return typeof n === "number" ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * What a status actually tells you. Deliberately short of a verdict it cannot support.
  *
- * The distinction that matters is between a 404 nobody wrote and a 404 the engine WROTE. API
- * turns a bodiless 404 into `501 ingress_unavailable`, because that is an engine with no
- * `/ingress/*` route at all; a 404 carrying a body passed through their proxy untouched and is a
- * real answer about this path. Treating both as "ingress is not built yet" would, the moment
- * ingress lands, tell someone their correct-looking path is fine when it is the thing that is
- * wrong — the same misreading this button exists to end, pointed the other way.
+ * These are four DIFFERENT problems with four different fixes, and the operator hit two of them
+ * in one afternoon while trying to work out whether their own URL was wrong:
+ *   403 -> the project capability is off        (fix: the Enable button in this panel)
+ *   501 -> this engine predates ingress          (fix: restart the project)
+ *   404 -> a real answer about this path         (fix: the path)
+ *   202 -> delivered                             (nothing to fix)
+ * A panel that renders them as one shade of failure is what sent them looking at the path.
  */
 export function probeVerdict({
   status,
@@ -59,22 +71,35 @@ export function probeVerdict({
   code?: string | null;
   body?: string;
 }): string {
-  if (code === "ingress_unavailable") return "This project's engine does not serve endpoints yet.";
+  if (code === "ingress_unavailable") {
+    return "This project's engine predates endpoint ingress — restart the project to pick it up.";
+  }
   if (code === "no_such_endpoint") {
     return "The engine is serving ingress but has no endpoint at this path — check the path above.";
   }
   if (status === 403) return "Reached the API, which refused it — public HTTP is off for this project.";
+  if (status === 202 || (status >= 200 && status < 300)) {
+    const delivered = deliveredCount(body);
+    if (delivered === 0) {
+      return "Ingress accepted it, but nothing is wired to this endpoint, so it was dropped.";
+    }
+    if (delivered !== null) {
+      return `Delivered to ${delivered} wired node${delivered === 1 ? "" : "s"}. This was a real hit, not a simulation.`;
+    }
+    return "The endpoint answered.";
+  }
   if (status === 404) {
-    // This branch retires itself: once API's honesty fix lands, a bodiless 404 arrives as a 501.
+    // Retires itself: API turns a BODILESS 404 into 501, so once every engine is current this arm
+    // is unreachable. A 404 the engine WROTE is a real answer about the path and must not be
+    // excused as a missing feature.
     return body.trim()
       ? "Something answered 404, with a body. That is a real answer about this path, not a missing feature — read it below."
-      : "Reached the API, which served nothing here and said nothing about why. Endpoint ingress is not built yet, so a bodiless 404 is expected on every board today — it does not mean your path is wrong.";
+      : "Reached the API, which served nothing here and said nothing about why — most likely an engine that predates ingress. Restarting the project is the first thing to try.";
   }
-  if (status === 405) return "Reached the ingress; this path does not accept GET.";
-  if (status === 501) return "Reached the API; ingress is not implemented yet.";
+  if (status === 405) return "Reached the ingress; this path does not accept that method.";
+  if (status === 501) return "This project's engine predates endpoint ingress — restart the project to pick it up.";
   if (status === 429) return "Reached the API and was rate-limited.";
   if (status >= 500) return "Reached the API; it failed on the way to the endpoint.";
-  if (status >= 200 && status < 300) return "The endpoint answered.";
   return "The API answered.";
 }
 
@@ -82,9 +107,23 @@ export function probeVerdict({
  * Never sends credentials: this URL is public by definition and a session token has no business
  * on it. `no-store` so a cached 404 cannot be mistaken for a live measurement.
  */
-export async function probeEndpoint(url: string, fetchImpl: typeof fetch = fetch): Promise<Probe> {
+export async function probeEndpoint(
+  url: string,
+  { method = "GET", fetchImpl = fetch }: { method?: string; fetchImpl?: typeof fetch } = {},
+): Promise<Probe> {
+  // The endpoint's OWN method, not always GET: ingress routes on the method, so a GET against a
+  // POST endpoint can only ever produce 404/405 and the delivered-202 state would be unreachable
+  // from the one button that exists to show it.
+  const sendsBody = method !== "GET" && method !== "HEAD";
   try {
-    const res = await fetchImpl(url, { method: "GET", credentials: "omit", cache: "no-store" });
+    const res = await fetchImpl(url, {
+      method,
+      credentials: "omit",
+      cache: "no-store",
+      ...(sendsBody
+        ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ source: "wheel-endpoint-test" }) }
+        : {}),
+    });
     const text = await res.text().catch(() => "");
     return {
       kind: "answered",

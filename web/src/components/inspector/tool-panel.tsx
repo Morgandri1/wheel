@@ -222,7 +222,23 @@ function FillEditor({
         </Select>
       </div>
 
-      <p className="mt-1 text-micro text-ink-faint">{FILL_HINT[mode]}</p>
+      <p className="mt-1 text-micro text-ink-faint">
+        {FILL_HINT[mode]}
+        {vaults.length === 0 && mode !== "vault"
+          ? " Wire this tool to a vault node to fill it from a secret."
+          : ""}
+      </p>
+
+      {/* §3d says `hidden` omits the field. A path parameter is not a field — it is a hole in the
+          URL, and omitting it builds a different URL rather than a smaller request. The engine is
+          the authority, so this warns instead of refusing; a greyed option with no reason is the
+          thing we just removed. */}
+      {mode === "hidden" && param.location === "path" ? (
+        <p className="mt-1 text-micro" style={{ color: "var(--danger)" }} data-testid={`${testId}-hidden-path`}>
+          Hiding a path parameter does not omit a field, it changes the URL — {param.name} is part
+          of the path itself. Pin it with static or vault instead.
+        </p>
+      ) : null}
 
       {mode === "static" ? (
         <Input
@@ -256,7 +272,6 @@ function FillEditor({
         </datalist>
       ) : null}
 
-      {vaults.length === 0 && mode !== "vault" ? null : null}
     </div>
   );
 }

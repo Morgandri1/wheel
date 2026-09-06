@@ -6,13 +6,13 @@ const respond = (status: number, body = "", statusText = "") =>
 
 describe("probing an endpoint's public URL", () => {
   it("reports the status and body verbatim, so the panel measures instead of claiming", async () => {
-    const probe = await probeEndpoint("https://api.example/p/1/hook", respond(404, "no route"));
+    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: respond(404, "no route") });
     expect(probe).toMatchObject({ kind: "answered", status: 404, body: "no route" });
   });
 
   it("never sends credentials to a URL that is public by definition", async () => {
     const f = respond(200);
-    await probeEndpoint("https://api.example/p/1/hook", f);
+    await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
     expect(f).toHaveBeenCalledWith(
       "https://api.example/p/1/hook",
       expect.objectContaining({ credentials: "omit", cache: "no-store" }),
@@ -20,14 +20,14 @@ describe("probing an endpoint's public URL", () => {
   });
 
   it("truncates a body that would take the panel over, and says that it did", async () => {
-    const probe = await probeEndpoint("https://api.example/p/1/hook", respond(200, "x".repeat(5000)));
+    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: respond(200, "x".repeat(5000)) });
     expect(probe).toMatchObject({ kind: "answered", truncated: true });
     if (probe.kind === "answered") expect(probe.body.length).toBe(2000);
   });
 
   it("does not call a blocked read a failure — the browser refuses to say which it was", async () => {
     const f = vi.fn().mockRejectedValue(new TypeError("Failed to fetch")) as unknown as typeof fetch;
-    const probe = await probeEndpoint("https://api.example/p/1/hook", f);
+    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
     expect(probe.kind).toBe("unreadable");
     if (probe.kind === "unreadable") {
       expect(probe.reason).toMatch(/not evidence that the endpoint is down/i);
@@ -42,7 +42,7 @@ describe("probing an endpoint's public URL", () => {
       text: () => Promise.reject(new Error("stream already consumed")),
     };
     const f = vi.fn().mockResolvedValue(bad) as unknown as typeof fetch;
-    await expect(probeEndpoint("https://api.example/p/1/hook", f)).resolves.toMatchObject({
+    await expect(probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f })).resolves.toMatchObject({
       kind: "answered",
       body: "",
     });
@@ -54,10 +54,12 @@ describe("probing an endpoint's public URL", () => {
  * path wrong". Those two readings send someone to completely different places for an hour.
  */
 describe("what a status code is allowed to claim", () => {
-  it("refuses to let a bodiless 404 read as a bad path, because today it never is one", () => {
+  // Ingress is live (340f318), so a bodiless 404 no longer means "not built" — it means an engine
+  // that predates the deploy. The assertion that must survive is the one about the PATH.
+  it("refuses to let a bodiless 404 read as a bad path", () => {
     const verdict = probeVerdict({ status: 404 });
-    expect(verdict).toMatch(/not built yet/i);
-    expect(verdict).toMatch(/does not mean your path is wrong/i);
+    expect(verdict).toMatch(/predates ingress|restarting the project/i);
+    expect(verdict).not.toMatch(/check the path/i);
   });
 
   /**
@@ -77,18 +79,45 @@ describe("what a status code is allowed to claim", () => {
   });
 
   it("uses the engine's own words once the API sends a code", () => {
-    expect(probeVerdict({ status: 501, code: "ingress_unavailable" })).toBe(
-      "This project's engine does not serve endpoints yet.",
+    expect(probeVerdict({ status: 501, code: "ingress_unavailable" })).toMatch(
+      /predates endpoint ingress — restart the project/i,
     );
     // The code outranks the status: a code is a fact, a status is an inference.
-    expect(probeVerdict({ status: 404, code: "ingress_unavailable" })).toMatch(
-      /does not serve endpoints yet/i,
-    );
+    expect(probeVerdict({ status: 404, code: "ingress_unavailable" })).toMatch(/predates endpoint ingress/i);
   });
 
   it("distinguishes the capability being off from nothing being served", () => {
     expect(probeVerdict({ status: 403 })).toMatch(/public HTTP is off/i);
-    expect(probeVerdict({ status: 404 })).toMatch(/not built yet/i);
+    expect(probeVerdict({ status: 404 })).toMatch(/predates ingress/i);
+  });
+
+  /**
+   * The four states are four different fixes. The operator hit two of them in one afternoon and
+   * could not tell them apart, so no two of these may render as the same sentence.
+   */
+  it("gives each of the four states its own answer", () => {
+    const verdicts = [
+      probeVerdict({ status: 403 }),
+      probeVerdict({ status: 501, code: "ingress_unavailable" }),
+      probeVerdict({ status: 404, body: "no such route" }),
+      probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' }),
+    ];
+    expect(new Set(verdicts).size).toBe(4);
+  });
+
+  it("reports a real delivery as a delivery, with the count ingress gave", () => {
+    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' })).toMatch(
+      /delivered to 1 wired node\b/i,
+    );
+    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":2}' })).toMatch(
+      /delivered to 2 wired nodes/i,
+    );
+  });
+
+  it("does not call an accepted-but-undelivered hit a delivery", () => {
+    const verdict = probeVerdict({ status: 202, body: '{"accepted":true,"delivered":0}' });
+    expect(verdict).toMatch(/nothing is wired/i);
+    expect(verdict).not.toMatch(/delivered to/i);
   });
 
   it("only says the endpoint answered when it actually did", () => {
@@ -123,7 +152,7 @@ describe("reading the API's error envelope", () => {
       .mockResolvedValue(
         new Response('{"error":{"code":"ingress_unavailable","message":"not built"}}', { status: 501 }),
       ) as unknown as typeof fetch;
-    const probe = await probeEndpoint("https://api.example/p/1/hook", f);
+    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
     expect(probe).toMatchObject({ kind: "answered", status: 501, code: "ingress_unavailable" });
   });
 });
