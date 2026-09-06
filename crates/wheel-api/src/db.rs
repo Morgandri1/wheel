@@ -111,66 +111,6 @@ fn scheme_of(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_url_scheme_decides_the_backend_and_nothing_else_does() {
-        assert!(sqlite_path("postgres://u:p@host/db").is_none());
-        assert!(sqlite_path("postgresql://u:p@host/db").is_none());
-        assert_eq!(
-            sqlite_path("sqlite://wheel.db").as_deref(),
-            Some("wheel.db")
-        );
-        assert_eq!(sqlite_path("sqlite:wheel.db").as_deref(), Some("wheel.db"));
-        assert_eq!(
-            sqlite_path("sqlite:///var/lib/wheel.db").as_deref(),
-            Some("/var/lib/wheel.db")
-        );
-    }
-
-    /// Query parameters are not part of the path. `sqlite://x.db?mode=rwc` naming a file called
-    /// `x.db?mode=rwc` is the kind of thing that only shows up as a mysteriously empty database.
-    #[test]
-    fn query_parameters_are_not_part_of_the_filename() {
-        assert_eq!(
-            sqlite_path("sqlite://wheel.db?mode=rwc").as_deref(),
-            Some("wheel.db")
-        );
-    }
-
-    #[test]
-    fn a_url_with_no_recognised_scheme_names_what_it_saw() {
-        assert_eq!(scheme_of("mysql://host/db"), "mysql");
-        assert_eq!(scheme_of("wheel.db"), "wheel.db");
-    }
-
-    #[tokio::test]
-    async fn an_unsupported_url_is_refused_with_the_scheme_in_the_message() {
-        // Matched rather than unwrapped: `Db` deliberately has no `Debug`, because a pool's
-        // debug output can carry the connection string, password included.
-        let msg = match Db::connect("mysql://localhost/wheel").await {
-            Ok(_) => panic!("an unsupported url must not connect"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(msg.contains("mysql"), "{msg}");
-        assert!(
-            msg.contains("sqlite://"),
-            "the message should say what is accepted: {msg}"
-        );
-    }
-
-    // Constructing a pool needs a runtime even when lazy, so this is async rather than a plain
-    // `#[test]`.
-    #[tokio::test]
-    async fn pick_returns_the_statement_for_the_backend_in_use() {
-        let sqlite = Db::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
-        assert_eq!(sqlite.dialect(), Dialect::Sqlite);
-        assert_eq!(sqlite.pick("PG", "SQLITE"), "SQLITE");
-    }
-}
-
 /// Run a statement on whichever backend is configured, returning rows affected.
 ///
 /// The two arms are identical apart from the pool type, which is the price of sqlx being generic
@@ -239,4 +179,64 @@ macro_rules! db_scalar {
                 .fetch_one(pool).await,
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_url_scheme_decides_the_backend_and_nothing_else_does() {
+        assert!(sqlite_path("postgres://u:p@host/db").is_none());
+        assert!(sqlite_path("postgresql://u:p@host/db").is_none());
+        assert_eq!(
+            sqlite_path("sqlite://wheel.db").as_deref(),
+            Some("wheel.db")
+        );
+        assert_eq!(sqlite_path("sqlite:wheel.db").as_deref(), Some("wheel.db"));
+        assert_eq!(
+            sqlite_path("sqlite:///var/lib/wheel.db").as_deref(),
+            Some("/var/lib/wheel.db")
+        );
+    }
+
+    /// Query parameters are not part of the path. `sqlite://x.db?mode=rwc` naming a file called
+    /// `x.db?mode=rwc` is the kind of thing that only shows up as a mysteriously empty database.
+    #[test]
+    fn query_parameters_are_not_part_of_the_filename() {
+        assert_eq!(
+            sqlite_path("sqlite://wheel.db?mode=rwc").as_deref(),
+            Some("wheel.db")
+        );
+    }
+
+    #[test]
+    fn a_url_with_no_recognised_scheme_names_what_it_saw() {
+        assert_eq!(scheme_of("mysql://host/db"), "mysql");
+        assert_eq!(scheme_of("wheel.db"), "wheel.db");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_url_is_refused_with_the_scheme_in_the_message() {
+        // Matched rather than unwrapped: `Db` deliberately has no `Debug`, because a pool's
+        // debug output can carry the connection string, password included.
+        let msg = match Db::connect("mysql://localhost/wheel").await {
+            Ok(_) => panic!("an unsupported url must not connect"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("mysql"), "{msg}");
+        assert!(
+            msg.contains("sqlite://"),
+            "the message should say what is accepted: {msg}"
+        );
+    }
+
+    // Constructing a pool needs a runtime even when lazy, so this is async rather than a plain
+    // `#[test]`.
+    #[tokio::test]
+    async fn pick_returns_the_statement_for_the_backend_in_use() {
+        let sqlite = Db::Sqlite(sqlx::sqlite::SqlitePool::connect_lazy("sqlite::memory:").unwrap());
+        assert_eq!(sqlite.dialect(), Dialect::Sqlite);
+        assert_eq!(sqlite.pick("PG", "SQLITE"), "SQLITE");
+    }
 }
