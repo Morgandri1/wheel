@@ -69,18 +69,28 @@ function WireEdgeInner({ id, sourceX, sourceY, targetX, targetY, sourcePosition,
       )}
 
       <EdgeLabelRenderer>
+        {/* No text on the wire: the legend names the types once, and repeating it per edge turned
+            a board into a wall of words. The stroke still carries the type twice (colour and
+            dash), and this stays as the hover/selection target so a wire can still be removed. */}
         <div
           data-testid={`wire-${fromName}-${toName}-${wireType}`}
-          className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2"
+          data-wire-type={wireType}
+          className="group pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 p-2"
           style={{ transform: `translate(-50%,-50%) translate(${labelX}px,${labelY}px)` }}
         >
           <button
             onClick={onRemove}
             title={`Remove ${wireType} wire ${fromName} → ${toName}`}
-            className="border bg-[var(--panel-1)] px-1.5 py-px text-micro leading-4 text-ink-dim transition-colors hover:text-ink"
+            aria-label={`Remove ${wireType} wire ${fromName} to ${toName}`}
+            // Invisible AND inert until revealed. An opacity-0 button still takes clicks, which
+            // would mean deleting a wire by clicking something you cannot see — so visibility and
+            // clickability are turned on together, never separately.
+            className={`flex h-4 w-4 items-center justify-center border bg-[var(--panel-1)] text-micro leading-none transition-opacity focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 ${
+              selected ? "opacity-100" : "pointer-events-none opacity-0"
+            }`}
             style={{ borderColor: meta.color, color: meta.color }}
           >
-            {injection ? "inject" : meta.label}
+            ×
           </button>
         </div>
       </EdgeLabelRenderer>
