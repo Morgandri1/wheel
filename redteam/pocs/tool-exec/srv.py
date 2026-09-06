@@ -32,12 +32,13 @@ class H(BaseHTTPRequestHandler):
                               "raw_header_names": raw_names, "body": body}).encode()
             self.send_response(200); self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(out))); self.end_headers(); self.wfile.write(out)
-        elif n == "/redir-meta": self._redir("http://169.254.169.254/")
-        elif n == "/redir-2nd":  self._redir(f"http://127.0.0.1:{OTHER}/echo")
-        elif n == "/redir-bad":  self._redir("http://127.0.0.1:19999/")
+        elif n == "/redir-meta": self._redir("http://169.254.169.254/")     # per-hop revalidation must refuse
+        elif n == "/redir-2nd":  self._redir(f"http://echo2.test:{OTHER}/echo")  # 2nd allowlisted hop (body must not follow)
+        elif n == "/redir-bad":  self._redir("http://127.0.0.1:19999/")     # unallowlisted literal -> refused
         elif n == "/c1": self._redir("/c2")
         elif n == "/c2": self._redir("/c3")
         elif n == "/c3": self._redir("/c4")
+        elif n == "/c4": self._redir("/c5")   # c1..c5 = 4 redirects > MAX_REDIRECTS(3) -> must bail
         elif n == "/big":
             blob = b"A" * (6 * 1024 * 1024)
             self.send_response(200); self.send_header("content-length", str(len(blob))); self.end_headers()

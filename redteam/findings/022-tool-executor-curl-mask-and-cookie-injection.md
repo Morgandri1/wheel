@@ -83,3 +83,24 @@ and give a false pass. Cookie values are now `encode()`d (`ParamLocation::Cookie
 022/2. Both halves of 022 are fixed. NOTE: a live end-to-end run of the :328 bail through `/v1/tools/:id/call`
 is still gated on finding 027 (no creatable allowlisted target), but the defense is explicit + unit-tested, so
 this is no longer a critical gap — only the redirect-no-replay/cap/timeout e2e-via-route remain 027-blocked.
+
+## send() ALLOWED-PATH VERIFIED LIVE (2026-09-06) — via a hostname allowlist entry
+PM's insight unblocked this without the 027 fix: a HOSTNAME passes create-time validation (`host_is_denied`
+is a literal/suffix check; `echo.test` is neither), is allowlisted by that literal (`WHEEL_TOOL_ALLOW_HOST=
+echo.test:18080`), and resolves via `/etc/hosts` to a loopback witness server. All loopback → RoE-safe.
+PoC: `redteam/pocs/tool-exec/run_allowed_via_hostname.sh` + `srv.py`. Results (image 00:55, HEAD 2a50695):
+- **header-CRLF at send → REJECTED**: `X-Try: a\r\nX-Injected: pwned` → "builder error: failed to parse
+  header value"; no `X-Injected` reached the witness. reqwest attempted to set the header and rejected the
+  CRLF, so the header path is live and the defense holds.
+- **per-hop revalidation**: a 302 to `http://169.254.169.254/` → hop 2 REFUSED ("169.254.169.254 is not a
+  reachable destination"). A 302 to an unallowlisted `127.0.0.1:19999` → REFUSED. Relative redirects resolve
+  against the origin (chain followed on-host).
+- **redirect limit**: a 4-redirect chain → "too many redirects (limit 3)".
+- **body-not-replayed on redirect**: POST with body `BODYSECRET`, 302 to a second allowlisted hop → hop-2
+  witness received `method=POST, body="", headers={accept,host}` — the body did NOT follow the redirect.
+  (Credential/body safety across an off-origin redirect.)
+- **5 MiB cap**: a 6 MiB response → "response exceeded 5 MiB". **30s timeout**: a 35s server → errored at ~30s.
+NOTE for SDK (minor, UX not security): the CRLF rejection surfaces as reqwest's opaque "builder error:
+failed to parse header value" — the clearer `:328` message ("header X-Try contains a line break or a null…")
+does NOT surface, so reqwest's `.header()` preempts the explicit check. If the clear message is wanted, run
+the `:328` scan before `req.header()`. Defense is intact either way.
