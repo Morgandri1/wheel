@@ -340,14 +340,6 @@ impl Supervisor {
     /// The mode is SET rather than left to the umask, and then verified: a
     /// directory that already existed keeps whatever mode it was made with,
     /// so creating it correctly is not the same as finding it correct.
-    /// A cache shared by every agent on this project.
-    ///
-    /// The guarantee that it is per PROJECT and not per node is the signature,
-    /// not the test below it: this function is not given a node id, so it
-    /// cannot produce a path that varies by node. I tried to write a mutation
-    /// that made it per-node and could not without changing the signature —
-    /// which is the point. The test asserts the resolved path mentions no node
-    /// id, which would catch someone threading one in.
     fn project_cache(&self, name: &str) -> Result<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -391,6 +383,80 @@ impl Supervisor {
             "the {name} cache at {} is readable or writable by other uids (mode {:o}); \
              it holds fetched packages and any registry credentials, so a child is not \
              started with it",
+            dir.display(),
+            std::fs::metadata(&dir)?.permissions().mode() & 0o777
+        );
+        Ok(dir)
+    }
+
+    /// Root for everything a build or a script produces that is not worth
+    /// keeping: cargo's `target/`, `$TMPDIR`. Off `/data` on purpose.
+    ///
+    /// `/data` is the one persistent volume, sized for `wheel.db` and the
+    /// project's own state -- not for a `cargo build --workspace`'s object
+    /// files, which run to gigabytes and are trivially reproducible. Every
+    /// agent independently discovering this by hitting ENOSPC and pointing
+    /// its own `CARGO_TARGET_DIR` at `/tmp` (as happened live on wheel-dev,
+    /// more than once) is the same fix done N times instead of once, here.
+    fn scratch_root(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/wheel-scratch").join(self.cfg.project_id.to_string())
+    }
+
+    /// Where a spawned child's `CARGO_TARGET_DIR` points. Per-project, not
+    /// per-agent: cargo's own file locking already serialises concurrent
+    /// builds against one target dir, and a build cache shared across this
+    /// project's agents is the point (a second agent's build reuses the
+    /// first's compiled dependencies instead of starting cold).
+    fn cargo_target_dir(&self) -> Result<std::path::PathBuf> {
+        Self::private_scratch_dir(
+            self.scratch_root().join("cargo-target"),
+            "build scratch dir",
+        )
+    }
+
+    /// Where a spawned child's `TMPDIR` points, for the same reason as
+    /// [`Self::cargo_target_dir`]: build tooling (and plenty else) writes
+    /// temp files there, and the default is `/tmp` on a real machine but
+    /// whatever `$TMPDIR` says otherwise -- pin it off `/data` explicitly
+    /// rather than hope nothing has overridden it.
+    fn tmp_dir(&self) -> Result<std::path::PathBuf> {
+        Self::private_scratch_dir(self.scratch_root().join("tmp"), "scratch tmp dir")
+    }
+
+    /// Create (or find) `dir`, make it 0700, and refuse it if it turns out to
+    /// be a symlink or if the mode does not stick -- the same hardening
+    /// [`Self::project_cache`] applies to the registry cache, because the
+    /// threat is identical: every agent, script and MCP child in this project
+    /// has its own uid (§2), and a scratch dir any of them can read is not
+    /// private to the one that is supposed to own it.
+    fn private_scratch_dir(dir: std::path::PathBuf, what: &str) -> Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating the {what} at {}", dir.display()))?;
+
+        let link = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("inspecting the {what} at {}", dir.display()))?;
+        anyhow::ensure!(
+            link.is_dir(),
+            "the {what} at {} is a {}, not a directory of this project's own; \
+             a child is not started with it",
+            dir.display(),
+            if link.file_type().is_symlink() {
+                "symlink"
+            } else {
+                "file"
+            }
+        );
+
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700))
+            .with_context(|| format!("restricting {} to this project", dir.display()))?;
+
+        let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o077;
+        anyhow::ensure!(
+            mode == 0,
+            "the {what} at {} is readable or writable by other uids (mode {:o}); \
+             a child is not started with it",
             dir.display(),
             std::fs::metadata(&dir)?.permissions().mode() & 0o777
         );
@@ -660,6 +726,17 @@ impl Supervisor {
                 Err(e) => return Err(e),
             }
         }
+        // Build output and temp files off the small persistent volume (PM
+        // ruling, live ENOSPC + memory-pressure incident on wheel-dev): a
+        // `cargo build --workspace` on `/data` is both the disk-full failure
+        // mode and the biggest measured contributor to reported memory
+        // pressure (page cache from that I/O counts against the project's
+        // cgroup). Set for every agent, not left for each one to hit ENOSPC
+        // and fix its own session. Unlike `TOOL_CACHES` above, this is build
+        // OUTPUT, not a registry cache -- not worth keeping, so it lives off
+        // `/data` entirely rather than under it.
+        cmd.env("CARGO_TARGET_DIR", self.cargo_target_dir()?);
+        cmd.env("TMPDIR", self.tmp_dir()?);
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
         // answer is its probe rather than our guess.
@@ -2801,6 +2878,79 @@ done
             "the child was not given this project's own cache:\n{env}"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The ENOSPC/memory-pressure incident this fixes: `CARGO_TARGET_DIR` and
+    /// `TMPDIR` must be OFF the project's data dir, unlike `CARGO_HOME` above
+    /// which deliberately stays on it. A build's object files run to
+    /// gigabytes on a volume sized for `wheel.db`.
+    #[tokio::test]
+    async fn the_scratch_dirs_are_off_the_data_volume_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, _id, dir) = shim_supervisor("scratch-off-data", ECHO_HARNESS);
+
+        for scratch in [sup.cargo_target_dir().unwrap(), sup.tmp_dir().unwrap()] {
+            assert!(
+                !scratch.starts_with(&dir),
+                "a build scratch dir must not live on the (small) data volume: {}",
+                scratch.display()
+            );
+            let mode = std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} is mode {mode:o}; every uid in the sandbox could read a build's output",
+                scratch.display()
+            );
+        }
+
+        std::fs::remove_dir_all(sup.scratch_root()).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same reasoning as `two_projects_get_different_crate_caches`: two
+    /// projects sharing a scratch dir would build each other's code in it.
+    #[tokio::test]
+    async fn two_projects_get_different_scratch_dirs() {
+        let (a, _, dir_a) = shim_supervisor("scratch-p1", ECHO_HARNESS);
+        let (b, _, dir_b) = shim_supervisor("scratch-p2", ECHO_HARNESS);
+
+        assert_ne!(a.cargo_target_dir().unwrap(), b.cargo_target_dir().unwrap());
+        assert_ne!(a.tmp_dir().unwrap(), b.tmp_dir().unwrap());
+
+        std::fs::remove_dir_all(a.scratch_root()).ok();
+        std::fs::remove_dir_all(b.scratch_root()).ok();
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    /// The gate that matters: not that `cargo_target_dir()`/`tmp_dir()` compute
+    /// something reasonable, but that the SPAWNED CHILD actually receives it —
+    /// the same distinction QA drew for `CARGO_HOME` (BUG-021/029).
+    #[tokio::test]
+    async fn the_child_actually_receives_the_off_volume_scratch_dirs() {
+        let (sup, id, dir) = shim_supervisor("scratch-child-env", ENV_DUMP_HARNESS);
+        let target_dir = sup.cargo_target_dir().unwrap();
+        let tmp_dir = sup.tmp_dir().unwrap();
+
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+
+        let env = std::fs::read_to_string(&dumped).unwrap();
+        assert!(
+            env.lines()
+                .any(|l| l == format!("CARGO_TARGET_DIR={}", target_dir.display())),
+            "the child was not given the off-volume CARGO_TARGET_DIR:\n{env}"
+        );
+        assert!(
+            env.lines()
+                .any(|l| l == format!("TMPDIR={}", tmp_dir.display())),
+            "the child was not given the off-volume TMPDIR:\n{env}"
+        );
+
+        std::fs::remove_dir_all(sup.scratch_root()).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
