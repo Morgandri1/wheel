@@ -334,13 +334,56 @@ pub async fn delete_project(State(state): State<HostState>, Path(id): Path<Uuid>
     }
 }
 
+/// A 500 in the shape every Wheel service renders errors in.
+///
+/// The uniform envelope matters here specifically because the API relays this body to the user: a
+/// bare `{"error":"internal"}` from one route and `{"error":{"code","message"}}` from the proxy
+/// means a client cannot read a host failure without knowing which code path produced it.
+///
+/// The cause is logged and never returned. Storage and orchestration details are operator
+/// information, and `what` is written for an operator reading logs, not for a tenant.
 pub fn internal(e: anyhow::Error, what: &str) -> Response {
-    tracing::error!(error = ?e, "{what} failed");
+    tracing::error!(error = %format_args!("{e:#}"), "{what} failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "internal"})),
+        Json(json!({
+            "error": {
+                "code": "internal",
+                "message": format!("The host could not complete this request while {what}."),
+            }
+        })),
     )
         .into_response()
+}
+
+/// Bind and serve until the process is asked to stop.
+///
+/// The binary is a wrapper around this, so the boot sequence — reconcile before accepting traffic,
+/// connect info for the bearer limiter — has one implementation that tests can drive rather than
+/// a second copy in `main` that only ever runs in production.
+pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
+    let bind = cfg.bind_addr.clone();
+    let state = build_state(cfg)?;
+
+    // Before the listener, not after: a request that arrives while projects are still being
+    // restored would see a host that has forgotten every sandbox it owns.
+    reconcile_on_boot(&state).await;
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(addr = %bind, "listening");
+    serve_on(listener, state).await
+}
+
+/// Serve an already-bound listener. Split out so a test can bind port 0 and drive the real router.
+pub async fn serve_on(listener: tokio::net::TcpListener, state: HostState) -> anyhow::Result<()> {
+    // With connect info, so the failed-bearer limiter can key on the peer address rather than
+    // throttling every caller together.
+    axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Assemble the host router. Split out of `main` so tests can drive the real routes — including
