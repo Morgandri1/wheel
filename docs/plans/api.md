@@ -98,3 +98,47 @@ confusion attack) · missing header · malformed bearer · other user's project 
 - **Blocked-but-routed-around:** Docker daemon was not running on this host; I started OrbStack. `wheel-core`
   and `PROTOCOL.md` don't exist yet — per brief I build against ARCHITECTURE §3/§4 and mock the engine in
   tests rather than waiting on SDK.
+
+## M1.7 — `wheeld`, one executable for local and open-source use
+
+Operator requirement: a single binary running api + host + engines, `AUTH_MODE=local`, process backend,
+embedded migrations, `--data-dir`, and a zero-flag default on `:8080`. Postgres stays production.
+
+### Shape
+
+`crates/wheeld` composes the three crates. Two decisions worth stating, because the cheaper alternative is
+wrong in each case:
+
+- **The host keeps its loopback HTTP listener** rather than being called in-process. The engine proxy and the
+  events WebSocket bridge are the most intricate code in the API, and an in-process shortcut would mean the
+  local build exercises a path production never runs. wheeld binds the host on `127.0.0.1` with a random
+  per-boot secret; only `:8080` is reachable. The extra hop is a loopback socket, and it buys "what a
+  contributor runs is what we ship".
+- **Engines are embedded**, using SDK's `wheel_engine::serve` (they made the engine a library for exactly
+  this). One process is the requirement; the process backend's `Sandbox` trait already isolates the choice,
+  so this is a third backend rather than a change to the other two.
+
+### The store is the real work
+
+The API is Postgres-shaped in ways SQLite does not share, so this is not a connection-string change:
+
+- `citext` for `users.email`. Its case-insensitive uniqueness is what stops two accounts differing only in
+  case, which is an account-takeover vector, not a nicety. SQLite gets `TEXT COLLATE NOCASE`.
+- `jsonb` for `projects.capabilities`; `now()` and `interval` in a dozen maintenance and session queries.
+- Row decoding differs: Postgres has native `uuid` and `timestamptz`, SQLite stores both as text.
+
+So: a `Store` trait over ~20 *operations* (not queries), with `PgStore` and `SqliteStore`. `sqlx::Any` was
+considered and rejected — it does not solve the schema differences and makes `FromRow` worse, so it would
+cost the same and hide more. The existing DB test suites run against both implementations, so parity is
+proven rather than assumed.
+
+Landing order, each step green on its own:
+1. Introduce the trait; `PgStore` wraps today's queries verbatim. No behaviour change.
+2. `SqliteStore` + a SQLite migration set; run the DB suites against both.
+3. `wheeld` itself: composition, `--data-dir`, embedded migrations, zero-flag `:8080`.
+
+### Known gap to state rather than hide
+
+The process backend drops privileges per project, which needs root. Run as an ordinary user, wheeld gives
+every project the invoking uid. Per PM's ruling that is opt-in (`WHEEL_ALLOW_SHARED_UID=1`), never a silent
+fallback, and wheeld says at boot which boundary is absent.
