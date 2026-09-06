@@ -97,7 +97,16 @@ def main():
         ids = {}
         for t, cfg in CONFIGS.items():
             for n in (1, 2):
-                nm = "%s-%d" % (t, n)
+                # A table node's name becomes the sqlite table `t_<name>`, so the engine
+                # requires it to already be an identifier — `table-1` would be `t_table-1`,
+                # where the hyphen is a subtraction operator. Refusing beats mangling, and
+                # creation fails atomically rather than leaving a node with nowhere to put
+                # rows (db/board.rs:113). This suite generated exactly that name and had
+                # gone red on it; API found that before I did, running my own suite.
+                #
+                # Hyphens stay in every OTHER type's name on purpose: §3 permits them and
+                # the address path should keep being exercised with one.
+                nm = "%s_%d" % (t, n) if t == "table" else "%s-%d" % (t, n)
                 st, body, _ = api("POST", "/v1/nodes",
                                   {"name": nm, "type": t, "position": {"x": 0.0, "y": 0.0},
                                    "config": cfg})

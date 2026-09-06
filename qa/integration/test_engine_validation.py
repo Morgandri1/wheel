@@ -128,11 +128,46 @@ def main():
                     "already accepts it (BUG-001), so nothing rejects it."
                     % (st, json.dumps(resp)[:120]))
 
+        # ---- a table node's name must already be a sqlite identifier ------------
+        #
+        # §3 permits '-' in ANY node name, and the engine narrows that for table nodes
+        # only, because the name becomes `t_<name>` and '-' is subtraction in SQL. That
+        # divergence is deliberate and is with PM to write into the contract; what is
+        # asserted here is the BEHAVIOUR, so whichever way the ruling goes this test has
+        # to be updated on purpose rather than drifting.
+        st, body = http("POST", "/v1/nodes",
+                        {"name": "bad-table", "type": "table", "position": {"x": 0, "y": 0},
+                         "config": {"columns": [{"name": "col", "type": "text"}]}})
+        R.check("VAL-table-name-identifier", 400 <= st < 500,
+                "a hyphenated table name answered %s; it becomes `t_bad-table`" % st)
+        R.check("VAL-table-name-identifier/says-why",
+                "-" in json.dumps(body) and "_" in json.dumps(body),
+                "the refusal should name the character AND the fix: %s" % json.dumps(body)[:160])
+
+        # Atomic: the refusal must not leave a node on the board with nowhere to put rows.
+        st, board = http("GET", "/v1/board")
+        names = [n.get("name") for n in (board or {}).get("nodes", [])]
+        R.check("VAL-table-name-atomic", "bad-table" not in names,
+                "a table node survived a failed table creation: %s" % names)
+
+        # The SAME name is fine for a type that is not backed by a sqlite table — the
+        # narrowing is table-specific, not a general retreat from §3's name rule.
+        # A DIFFERENT name: reusing "bad-table" made this assert uniqueness, not naming.
+        # It failed with 409 and read as "the engine refuses hyphens everywhere", which
+        # would have been a much more alarming report than the truth.
+        st, _ = http("POST", "/v1/nodes",
+                     {"name": "hyphen-ok-ctx", "type": "ctx", "position": {"x": 0, "y": 0},
+                      "config": {"markdown": "hyphens are legal in a node address"}})
+        R.check("VAL-hyphen-legal-elsewhere", st in (200, 201),
+                "a hyphenated CTX name was refused (%s) — §3 allows it" % st)
+
         R.check("NODE-engine-enforced-count", len(engine_enforced) == 12,
                 "expected 12 engine-enforced fixtures, found %d — a fixture was retagged "
                 "and the BUG-001 coverage claim no longer holds" % len(engine_enforced))
     finally:
         subprocess.run(["docker", "rm", "-f", NAME], capture_output=True)
+
+
 
     return R.report("engine-validation")
 
