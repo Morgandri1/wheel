@@ -625,3 +625,78 @@ mod vault_handoff_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 }
+
+#[cfg(test)]
+mod setup_token_tests {
+    use super::*;
+
+    /// The whole promise of `setup_token` is that it will not expire under
+    /// five other agents. That promise is only worth anything if a short-lived
+    /// credential submitted to it is REFUSED rather than accepted and vaulted.
+    #[test]
+    fn only_a_durable_credential_classifies_as_a_setup_token() {
+        assert_eq!(
+            classify_token("sk-ant-oat01-durable", Harness::Claude),
+            CredentialKind::OauthToken
+        );
+        // A provider API key is a key, not a setup-token, however useful.
+        assert_eq!(
+            classify_token("sk-ant-api03-key", Harness::Claude),
+            CredentialKind::ApiKey
+        );
+        for not_durable in ["sk-ant-api03-key", "sk-live-something", "", "oat"] {
+            assert_ne!(
+                classify_token(not_durable, Harness::Claude),
+                CredentialKind::OauthToken,
+                "{not_durable:?} must not pass as a setup-token"
+            );
+        }
+    }
+
+    /// Whichever field it arrives in, a durable token has to reach the child
+    /// as CLAUDE_CODE_OAUTH_TOKEN -- an API key in that variable authenticates
+    /// nothing, and the failure looks like a bad credential rather than a
+    /// misrouted one.
+    #[test]
+    fn a_setup_token_reaches_the_child_in_the_right_variable() {
+        assert_eq!(
+            token_env(CredentialKind::OauthToken, Harness::Claude),
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        );
+        assert_eq!(
+            token_env(CredentialKind::ApiKey, Harness::Claude),
+            "ANTHROPIC_API_KEY"
+        );
+
+        let d = std::env::temp_dir().join(format!("wheel-setuptok-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        let kind = store_token(&d, "sk-ant-oat01-durable", Harness::Claude).unwrap();
+        assert_eq!(kind, CredentialKind::OauthToken);
+        let env = credential_env(&d, Harness::Claude);
+        assert_eq!(
+            env,
+            vec![(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "sk-ant-oat01-durable".to_string()
+            )]
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A durable token carries no expiry, which is what suppresses the
+    /// "this will expire" warning on the vault response.
+    #[test]
+    fn a_setup_token_is_reported_as_long_lived() {
+        let durable = StoredOauth {
+            token: "sk-ant-oat01-durable".into(),
+            expires_at: None,
+        };
+        assert!(durable.is_long_lived());
+
+        let session = StoredOauth {
+            token: "sk-ant-oat01-session".into(),
+            expires_at: Some(1799999999000),
+        };
+        assert!(!session.is_long_lived(), "an expiry disqualifies it");
+    }
+}
