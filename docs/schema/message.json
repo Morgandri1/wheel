@@ -168,6 +168,13 @@
           "enum": [
             "consumed"
           ]
+        },
+        {
+          "description": "The body could not be encoded for delivery, so it was set aside rather than retried forever. A stored message that kills the encoder is replayed at every start, which turns one bad body into a board that never comes up (ADVERSARY 035); quarantine is what makes that impossible independently of whether the encoder has a bug today.",
+          "type": "string",
+          "enum": [
+            "undeliverable"
+          ]
         }
       ]
     },
