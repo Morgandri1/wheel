@@ -22,7 +22,7 @@ import { WirePopover } from "@/components/board/wire-popover";
 import { CommandPalette } from "@/components/board/command-palette";
 import { NODE_META } from "@/lib/node-meta";
 import { canConnect, explainDenial, isInjection } from "@/lib/wire-matrix";
-import { suggestName } from "@/lib/validate";
+import { clampPosition, suggestName } from "@/lib/validate";
 import { newNodeInput } from "@/lib/node-defaults";
 import { useBoardStore } from "@/store/board";
 import { toast, toastError } from "@/components/ui/toast";
@@ -147,7 +147,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
 
   const onNodeDragStop = useCallback(
     async (_: unknown, node: RFNode) => {
-      const position = { x: Math.round(node.position.x), y: Math.round(node.position.y) };
+      const position = clampPosition(node.position);
       try {
         await api.patchNode(node.id, { position });
       } catch (e) {
@@ -225,8 +225,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   const create = useCallback(
     async (type: NodeType, position: Position, config?: Record<string, unknown>) => {
       const input = newNodeInput(type, suggestName(type, takenNames), {
-        x: Math.round(position.x),
-        y: Math.round(position.y),
+        ...clampPosition(position),
       });
       try {
         const created = await api.createNode(

@@ -90,9 +90,11 @@ describe("testing the public URL", () => {
     fireEvent.click(screen.getByTestId("btn-endpoint-test"));
 
     await waitFor(() => expect(screen.getByTestId("endpoint-probe-verdict")).toBeDefined());
+    // Ingress is live now, so a bodiless 404 means an engine that predates it. The invariant that
+    // must not weaken: the panel never sends the operator to look at their own path.
     const verdict = screen.getByTestId("endpoint-probe-verdict").textContent ?? "";
-    expect(verdict).toMatch(/not built yet/i);
-    expect(verdict).toMatch(/does not mean your path is wrong/i);
+    expect(verdict).toMatch(/predates ingress|restarting the project/i);
+    expect(verdict).not.toMatch(/check the path/i);
     vi.unstubAllGlobals();
   });
 
@@ -108,7 +110,7 @@ describe("testing the public URL", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("endpoint-probe-verdict").textContent).toMatch(
-        /does not serve endpoints yet/i,
+        /predates endpoint ingress — restart the project/i,
       ),
     );
     vi.unstubAllGlobals();
