@@ -13,6 +13,7 @@ pub mod config;
 pub mod proxy;
 pub mod sandbox;
 pub mod store;
+pub mod vault_key;
 
 use anyhow::Context as _;
 use axum::extract::{Path, Request, State};
@@ -96,9 +97,23 @@ pub async fn reconcile_on_boot(state: &HostState) {
         "reconciling projects that were running"
     );
     for rec in wanted {
+        // Rows written before canonicalisation existed still hold an unusable spelling, and boot is
+        // the only moment we look at every project. Rewrite them now, so the next restart is clean
+        // and the engine we are about to start gets a key it can decode.
+        let vault_key = vault_key::canonical_or_passthrough(&rec.vault_key);
+        if vault_key != rec.vault_key {
+            tracing::info!(project = %rec.id, "rewriting a vault key the engine could not decode");
+            if let Err(e) = state
+                .store
+                .upsert(&rec.id, &rec.engine_secret, &vault_key)
+                .await
+            {
+                tracing::error!(project = %rec.id, error = ?e, "could not persist the corrected vault key");
+            }
+        }
         let secrets = Secrets {
             engine_secret: rec.engine_secret.clone(),
-            vault_key: rec.vault_key.clone(),
+            vault_key,
         };
         if let Err(e) = state.sandbox.start(&rec.id, &secrets).await {
             // One project failing to come back must not stop the others.
@@ -208,16 +223,21 @@ pub async fn put_project(
     Path(id): Path<Uuid>,
     Json(body): Json<PutProject>,
 ) -> Response {
+    // Canonicalise once, here, and store that. The engine decodes the vault key with the standard
+    // base64 alphabet; storing whatever spelling arrived means a host restart reconciles every
+    // engine with a key it cannot use, and the API's own fix-up would only reach projects that get
+    // started through it again.
+    let vault_key = vault_key::canonical_or_passthrough(&body.vault_key);
     if let Err(e) = state
         .store
-        .upsert(&id, &body.engine_secret, &body.vault_key)
+        .upsert(&id, &body.engine_secret, &vault_key)
         .await
     {
         return internal(e, "storing project record");
     }
     let secrets = Secrets {
         engine_secret: body.engine_secret,
-        vault_key: body.vault_key,
+        vault_key,
     };
     match state.sandbox.provision(&id, &secrets).await {
         Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),

@@ -31,6 +31,8 @@ struct Calls {
     restarted: Vec<Uuid>,
     /// Secrets the host handed down. Used to prove the host passes through what it stored.
     start_secrets: Vec<String>,
+    /// Vault keys the host handed down, to prove the engine gets a key it can decode.
+    start_vault_keys: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,7 @@ impl Sandbox for FakeSandbox {
         let mut c = self.calls.lock().unwrap();
         c.started.push(*id);
         c.start_secrets.push(s.engine_secret.clone());
+        c.start_vault_keys.push(s.vault_key.clone());
         Ok(())
     }
     async fn stop(&self, id: &Uuid) -> anyhow::Result<()> {
@@ -648,4 +651,84 @@ async fn the_detailed_health_endpoint_is_still_bearer_gated() {
     let (app, _, _) = harness(FakeSandbox::new());
     let (status, _) = call(&app, "GET", "/host/v1/healthz", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A vault key stored in the wrong base64 alphabet must be corrected *in host.db*, not only on the
+/// path the API happens to take.
+///
+/// The engine decodes WHEEL_VAULT_KEY with the standard alphabet. Keys were minted URL-safe, so
+/// every engine reconciled at host boot logged "WHEEL_VAULT_KEY is unusable" and served no vaults —
+/// a fix applied only when a project is started through the API never reaches those.
+#[tokio::test]
+async fn a_vault_key_the_engine_cannot_decode_is_corrected_when_it_is_stored() {
+    use base64::Engine as _;
+    let bytes = [0xfbu8; 32]; // encodes differently in the two alphabets
+    let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let standard = base64::engine::general_purpose::STANDARD.encode(bytes);
+    assert_ne!(
+        url_safe, standard,
+        "the test key must distinguish alphabets"
+    );
+
+    let (app, calls, store) = harness(FakeSandbox::new());
+    let id = Uuid::new_v4();
+    let (status, _) = call(
+        &app,
+        "PUT",
+        &format!("/host/v1/projects/{id}"),
+        Some(SECRET),
+        Some(serde_json::json!({"engine_secret": "s", "vault_key": url_safe})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let stored = store.get(&id).await.unwrap().expect("record");
+    assert_eq!(
+        stored.vault_key, standard,
+        "host.db must hold the key in the form the engine decodes"
+    );
+    assert_eq!(
+        calls.lock().unwrap().provisioned,
+        vec![id],
+        "the sandbox is still provisioned"
+    );
+}
+
+/// Rows written before canonicalisation existed are rewritten on boot, which is the only moment the
+/// host looks at every project.
+#[tokio::test]
+async fn boot_rewrites_a_stored_vault_key_the_engine_could_not_decode() {
+    use base64::Engine as _;
+    let bytes = [0xfbu8; 32];
+    let url_safe = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let standard = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    let path = std::env::temp_dir().join(format!("wheel-host-test-{}.db", Uuid::new_v4()));
+    let store = Arc::new(Store::open(path.to_str().unwrap()).expect("open store"));
+    let id = Uuid::new_v4();
+    // Exactly what an older host left behind: the unusable spelling, marked as running.
+    store.upsert(&id, "engine-secret", &url_safe).await.unwrap();
+    store.set_desired_running(&id, true).await.unwrap();
+
+    let sandbox = FakeSandbox::new();
+    let calls = sandbox.calls.clone();
+    let state = HostState {
+        cfg: test_config(),
+        sandbox: Arc::new(sandbox),
+        store: store.clone(),
+        http: reqwest::Client::new(),
+        auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+    };
+    wheel_host::reconcile_on_boot(&state).await;
+
+    assert_eq!(
+        calls.lock().unwrap().start_vault_keys,
+        vec![standard.clone()],
+        "the reconciled engine must be started with a decodable key"
+    );
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().vault_key,
+        standard,
+        "and the correction must be persisted, so the next boot is already clean"
+    );
 }
