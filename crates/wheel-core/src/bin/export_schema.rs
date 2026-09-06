@@ -95,6 +95,23 @@ fn export(dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A directory nobody else is using. Keying only on the pid collides when
+    /// two runs of this binary overlap, and the failure looks like a schema
+    /// drift rather than the temp-dir clash it is -- which sends whoever sees
+    /// it looking in entirely the wrong place.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wheel-schema-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::remove_dir_all(&d).ok();
+        d
+    }
+
     fn committed_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/schema")
@@ -108,8 +125,7 @@ mod tests {
     /// type that no longer exists.
     #[test]
     fn the_export_matches_what_is_committed_in_docs_schema() {
-        let tmp = std::env::temp_dir().join(format!("wheel-schema-{}", std::process::id()));
-        fs::remove_dir_all(&tmp).ok();
+        let tmp = scratch("committed");
         export(&tmp).unwrap();
 
         let names = |d: &Path| {
@@ -133,9 +149,8 @@ mod tests {
     /// identical bytes.
     #[test]
     fn the_export_is_deterministic_and_valid_json() {
-        let base = std::env::temp_dir().join(format!("wheel-schema-det-{}", std::process::id()));
+        let base = scratch("det");
         let (a, b) = (base.join("a"), base.join("b"));
-        fs::remove_dir_all(&base).ok();
         export(&a).unwrap();
         export(&b).unwrap();
 
@@ -161,8 +176,7 @@ mod tests {
     /// not a transcription of the table.
     #[test]
     fn the_wire_matrix_dump_agrees_with_the_function_that_enforces_it() {
-        let tmp = std::env::temp_dir().join(format!("wheel-schema-wm-{}", std::process::id()));
-        fs::remove_dir_all(&tmp).ok();
+        let tmp = scratch("wm");
         export(&tmp).unwrap();
 
         let v: serde_json::Value =
