@@ -59,30 +59,66 @@ pub fn current_journal_mode(conn: &Connection) -> Result<String> {
 /// and would be locked out (7 tests caught exactly that) -- so it is held only
 /// across the conversion and dropped again.
 pub fn set_journal_mode(conn: &Connection, wanted: &str) -> Result<String> {
-    let _ = conn.pragma_update(None, "journal_mode", wanted);
-    let mode = current_journal_mode(conn)?;
-    if mode.eq_ignore_ascii_case(wanted) {
-        return Ok(mode);
+    if try_mode(conn, wanted) {
+        return current_journal_mode(conn);
     }
+
     // An in-memory database has no file to journal and always reports
-    // `memory`; it cannot be WAL and is not failing to be. Every other
-    // mismatch is a database that would not go where we asked it to.
+    // `memory`; it cannot be WAL and is not failing to be.
+    let mode = current_journal_mode(conn)?;
     if mode.eq_ignore_ascii_case("memory") {
         return Ok(mode);
     }
 
     drain_under_exclusive_lock(conn, wanted)?;
+    if mode_holds(conn, wanted) {
+        return current_journal_mode(conn);
+    }
 
-    // Read back, for the same reason as above: the pragma's own result is not
-    // evidence. My first draft of this function returned that result here and
-    // reported success for a mode sqlite had refused -- the exact mistake this
-    // function exists to stop, made inside it.
+    // A rollback journal needs no shared memory AT ALL, so it is the mode that
+    // survives a volume which cannot give us a `-shm` at any price. Slower, and
+    // it boots.
+    if !wanted.eq_ignore_ascii_case(ROLLBACK) {
+        if try_mode(conn, ROLLBACK) {
+            return current_journal_mode(conn);
+        }
+        drain_under_exclusive_lock(conn, ROLLBACK)?;
+        if mode_holds(conn, ROLLBACK) {
+            return current_journal_mode(conn);
+        }
+    }
+
     let settled = current_journal_mode(conn)?;
-    anyhow::ensure!(
-        settled.eq_ignore_ascii_case(wanted),
-        "could not put the database into {wanted}; it is in {settled}"
-    );
-    Ok(settled)
+    anyhow::bail!("could not put the database into {wanted} or {ROLLBACK}; it is in {settled}")
+}
+
+/// The mode to fall back to. Needs no shared memory of any kind.
+const ROLLBACK: &str = "TRUNCATE";
+
+/// Ask for a mode, then find out whether the database is really in it and
+/// really usable.
+fn try_mode(conn: &Connection, wanted: &str) -> bool {
+    let _ = conn.pragma_update(None, "journal_mode", wanted);
+    mode_holds(conn, wanted)
+}
+
+/// Two questions, and BOTH have caught a different bug today.
+///
+/// Is the database in the mode we asked for? `pragma_update` answers with the
+/// RESULTING mode rather than failing, so its `Ok` is not evidence --
+/// `journal_mode = nonsense-mode` returns Ok and changes nothing.
+///
+/// And does that mode WORK? A volume that cannot give us a `-shm` file lets
+/// `PRAGMA journal_mode = WAL` report `wal` quite happily, because the shared
+/// memory is mapped on the first write LOCK, not on the pragma. The database
+/// then refuses every write with "attempt to write a readonly database". I
+/// dropped this half when I moved to reading the mode back and QA's fixture --
+/// a DIRECTORY where the `-shm` file needs to go -- caught it immediately.
+fn mode_holds(conn: &Connection, wanted: &str) -> bool {
+    current_journal_mode(conn)
+        .map(|m| m.eq_ignore_ascii_case(wanted))
+        .unwrap_or(false)
+        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok()
 }
 
 /// Open a Wheel database on whatever terms the filesystem actually allows.
@@ -141,7 +177,9 @@ pub fn open_configured(path: &str, allow_exclusive: bool) -> Result<Connection> 
             return Ok(conn);
         }
     }
-    anyhow::bail!("no journal mode {path} can host: tried {wanted}, then TRUNCATE, both exclusively")
+    anyhow::bail!(
+        "no journal mode {path} can host: tried {wanted}, then TRUNCATE, both exclusively"
+    )
 }
 
 fn annotated(conn: Connection, mode: &str, path: &str) -> Connection {
@@ -175,7 +213,6 @@ fn drain_under_exclusive_lock(conn: &Connection, wanted: &str) -> Result<()> {
     let _ = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;");
     Ok(())
 }
-
 
 /// Put a database into the mode this deployment can actually use, and give it
 /// the durability setting that mode requires. Returns the live mode.
@@ -335,7 +372,10 @@ mod tests {
         let sync: i64 = conn
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(sync, 2, "expected synchronous=FULL (2) on a rollback journal");
+        assert_eq!(
+            sync, 2,
+            "expected synchronous=FULL (2) on a rollback journal"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

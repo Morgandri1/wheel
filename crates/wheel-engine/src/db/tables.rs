@@ -570,7 +570,6 @@ fn untyped(v: ValueRef<'_>) -> Value {
 mod tests {
     use super::*;
 
-
     /// `create` builds from the config it is given, over anything already
     /// standing at that name.
     ///
@@ -589,7 +588,14 @@ mod tests {
             }],
         };
         create(&conn, &name, &old).unwrap();
-        put_row(&conn, &name, &old, "r1", &serde_json::json!({"amount":"40000"})).unwrap();
+        put_row(
+            &conn,
+            &name,
+            &old,
+            "r1",
+            &serde_json::json!({"amount":"40000"}),
+        )
+        .unwrap();
 
         let new = wheel_core::TableConfig {
             columns: vec![wheel_core::Column {
@@ -603,8 +609,14 @@ mod tests {
             list_rows(&conn, &name, &new, 10, 0).unwrap().is_empty(),
             "the rows of the table that was there were adopted"
         );
-        put_row(&conn, &name, &new, "r1", &serde_json::json!({"note":"fresh"}))
-            .expect("the rebuilt table must accept the configured columns");
+        put_row(
+            &conn,
+            &name,
+            &new,
+            "r1",
+            &serde_json::json!({"note":"fresh"}),
+        )
+        .expect("the rebuilt table must accept the configured columns");
     }
     use wheel_core::{Column, ColumnType, TableConfig};
 

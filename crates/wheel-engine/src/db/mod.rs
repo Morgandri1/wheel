@@ -136,7 +136,10 @@ mod tests {
         };
         let rows = tables::list_rows(&conn, &node.name, cfg, 10, 0)
             .expect("a read must not fail with \"no such table\" while the node exists");
-        assert!(rows.is_empty(), "restored empty, not populated from nowhere");
+        assert!(
+            rows.is_empty(),
+            "restored empty, not populated from nowhere"
+        );
 
         // And it is the node's own schema, not a default one.
         tables::put_row(
@@ -168,8 +171,14 @@ mod tests {
                 wheel_core::NodeConfig::Table(c) => c,
                 _ => unreachable!(),
             };
-            tables::put_row(&conn, &node.name, cfg, "r1", &serde_json::json!({"title":"kept"}))
-                .unwrap();
+            tables::put_row(
+                &conn,
+                &node.name,
+                cfg,
+                "r1",
+                &serde_json::json!({"title":"kept"}),
+            )
+            .unwrap();
         }
 
         node.config = wheel_core::NodeConfig::Table(wheel_core::TableConfig {
@@ -194,10 +203,18 @@ mod tests {
             wheel_core::NodeConfig::Table(c) => c,
             _ => unreachable!(),
         };
-        tables::put_row(&conn, &node.name, cfg, "r2", &serde_json::json!({"title":"t","body":"b"}))
-            .expect("the new column must be there after a restart");
+        tables::put_row(
+            &conn,
+            &node.name,
+            cfg,
+            "r2",
+            &serde_json::json!({"title":"t","body":"b"}),
+        )
+        .expect("the new column must be there after a restart");
         assert_eq!(
-            tables::list_rows(&conn, &node.name, cfg, 10, 0).unwrap().len(),
+            tables::list_rows(&conn, &node.name, cfg, 10, 0)
+                .unwrap()
+                .len(),
             2,
             "reconciling columns must not discard rows"
         );
