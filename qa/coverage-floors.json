@@ -2,5 +2,8 @@
   "_comment": "Ratchet floors for crates exempt from the \u00a70b 90% bar (PM ruling 2026-09-06). The gate FAILS if a crate drops below its floor and RAISES the floor when a merge exceeds it, so an exemption can never be used to go backwards. Committed deliberately: a floor kept only in CI state is a floor nobody can review in a diff.",
   "floors": {
     "wheel-engine": 72.88
+  },
+  "pending_crates": {
+    "wheel-sqlite": "SDK is extracting the journal logic into this crate so wheel-engine and wheel-host share ONE implementation \u2014 the host's store opens first on the deployed machine and still had the crash-looping version. New crate, so it meets the 90% bar from the start: no floor, no exemption. Recorded here only so its arrival is expected rather than a surprise, and so wheel-engine's count DROPPING by four reads as the storage_mode tests moving rather than as coverage lost."
   }
 }
