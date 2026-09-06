@@ -104,7 +104,8 @@ DATABASE_URL=… WHEEL_HOST_URL=… WHEEL_HOST_SECRET=… \
 
 It is run by hand, not on a schedule. A project is a candidate only if it is not on the deny list
 (the operator's own account, and the `wheel-dev` board), its owner's address is at `wheel.test`,
-`wheelcheck.dev` or `example.com` exactly, and it is more than 24 hours old. The sandbox is
+`wheelcheck.dev` exactly (not `example.com` — anyone can register an address there, and a real
+project owned at one would be deleted), and it is more than 24 hours old. The sandbox is
 destroyed through the host before the row is dropped, so nothing is left running on the host with no
 record of it.
 

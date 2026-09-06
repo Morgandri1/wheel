@@ -34,7 +34,14 @@ no is_candidate "$PROBE" "morgan@avo.so" "$((30 * DAY))"
 echo "probe domains"
 ok is_probe_address "api-verify@wheel.test"
 ok is_probe_address "QA@WheelCheck.dev"
-no is_probe_address "someone@example.com"   # registrable by anyone: a real project, not a probe
+# example.com is registrable by anyone, so it is not a probe domain: a real project owned at one
+# would be deleted at 24h by a tool that is otherwise deny-first. PM ruling.
+no is_probe_address "someone@example.com"
+no is_probe_address "SOMEONE@Example.COM"
+no is_candidate "$PROBE" "someone@example.com" "$((30 * DAY))"
+# example.test stays refused too, and it is what our own probes use — they clean up after
+# themselves in the same run rather than relying on this tool.
+no is_probe_address "someone@example.test"
 no is_probe_address "someone@wheel.test.attacker.com"
 no is_probe_address "someone@notwheel.test"
 no is_probe_address "someone@sub.wheel.test"
