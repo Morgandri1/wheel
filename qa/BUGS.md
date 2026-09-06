@@ -5,6 +5,17 @@ privilege escalation · **S2** spec violation · **S3** wrong but workaroundable
 
 A bug is closed only when its TESTPLAN ID goes green — not when someone says it's fixed.
 
+**Numbers 017, 018, 019 and 020 were each issued twice**, by concurrent sessions of me filing
+into this file from separate worktrees and merging cleanly — the numbers do not collide in a
+diff, only in meaning. I have not renumbered them, because commit messages, test comments and
+messages already sent cite them; renumbering would silently repoint those. **Cite the title, not
+the number.** The pairs are: 017 = "vault-at-rest grepped an empty file" and "suites can test an
+image another agent replaced mid-run"; 018 = "id-traceability ignored any ID containing %" and
+"a skipped positive control silently un-guarded its assertions"; 019 = the WITHDRAWN wheeld
+build, the WOW-clone turn, and API's S1 wheeld compile break; 020 = "failure artifact written
+after the container was destroyed" and "CARGO_HOME is 0755". This is itself a defect in the
+system of record and the reason the next entry is 023.
+
 | # | TESTPLAN | Sev | Owner | Status | Title |
 |---|----------|-----|-------|--------|-------|
 | 001 | `NODE-config-unknown-key`, `NODE-endpoint-path`, `NODE-mcp-transport`, `NODE-script-lang`, `NODE-state-not-config`, `NODE-vault-writeonly`, `NODE-endpoint-auth` | ~~S2~~ **S3** | SDK | ~~closed~~ | Exported JSON Schema accepts 12 configs the contract forbids |
@@ -958,3 +969,63 @@ a second line of defence; the engine calls it with `false` — it cannot take th
 because `tables::query` opens it a second time — so for the engine the read-back is the *entire*
 protection, and on a database that does report `wal` there is none.
 
+
+## 023 — `free_port(0)` handed back port 0, and four gates failed against a healthy engine · S2 · QA (mine) · CLOSED
+
+**TESTPLAN:** `ENG-journal-override-cannot-disable-recovery/*`
+
+`free_port(preferred)` returns `preferred` if it is bindable and any free port otherwise.
+Binding to port **0 succeeds** — the kernel assigns an ephemeral port — so `free_port(0)` reported
+0 as bindable and handed back `0`. The override loop then published the container on a random
+port and probed `http://127.0.0.1:0/healthz`, which cannot reach anything, for 20 seconds per
+case.
+
+All four override cases failed identically. The report I had drafted said the override still
+disables the recovery path on `main` — during an outage caused by exactly that, to the operator
+who caused it. It was wrong; the engine was healthy in all four.
+
+**What stopped it** was not discipline, it was the shape of the evidence: four identical
+failures, and inside my own failure text the engine's log line `"message":"database ready"`. A
+healthy engine does not say that while failing to start. The failure detail I had written for
+someone else's benefit is what caught it.
+
+**Fix:** `free_port(0)` now means "any free port" and returns the kernel-assigned one, so every
+suite is protected rather than this one call site. The incident is in the docstring, because the
+next person to read it will be reading it for a reason.
+
+
+## 024 — Both panic gates passed against the engine that took the board down · **S1** · QA (mine) · CLOSED
+
+**TESTPLAN:** `ENG-escaper-never-panics`, `ENG-escaper-engine-survives`
+
+PM asked for two gates during a 56-minute outage. I wrote them, they went green, and they were
+worthless. Verified by building `wheel-engine` from `455b753^` — the exact pre-fix source that
+was live during the outage — and running them against it: **all green.**
+
+Two independent reasons, both mine:
+
+1. **The agent was never started.** `escape_envelope_body` has one production call site,
+   `Message::envelope` at `supervisor/mod.rs:545`, and it runs at **delivery**. A message to a
+   stopped agent queues; the escaper is never called. The gate proved that an engine stays up
+   while a code path does not execute.
+2. **The inputs could not panic.** The shape is `<` with a multi-byte character straddling
+   `name_at + TAG.len()`. Mine put the character before the `<` or after a complete
+   `</AgentPrompt>`, where every offset is a character boundary. Measured killing shape: `<` or
+   `</`, then 9–10 ASCII bytes, then a 3-byte character (8–10 for a 4-byte one).
+
+**Fix:** the agent is started, the fake harness writes a transcript, and a delivered benign body
+found in that transcript is the control (`ENG-panic/escaper-runs`) — so "the engine stayed up"
+can never again mean "the code never ran". Offsets 0..14 are walked for em dash, emoji, CJK and a
+ZWJ family. Now RED on `455b753^`, GREEN on `main`.
+
+**What the mutation also found**, which no amount of reading would have: at the moment of the
+panic the process does **not** die. Send drops the connection, `/healthz` answers **200**, the
+container is **running**, and a benign message sent afterwards is **never delivered**. The tokio
+task unwinds alone and the delivery loop is gone while every healthcheck passes. Filed to SDK as
+a policy question and gated as `ENG-delivery-survives-escaper`, which asserts delivery rather
+than liveness.
+
+**The rule this cost me:** a gate written during an incident is written under the worst
+conditions I will ever have, and mine was wrong twice over in ways that both read as success. A
+new gate is not finished when it is green. It is finished when I have watched it go red against
+the defect it names.
