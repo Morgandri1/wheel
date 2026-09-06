@@ -25,10 +25,8 @@ ROUTE_RE = re.compile(r"\b(%s)\s+`?(/[A-Za-z0-9_:/*\-{}.]+(?:\|[A-Za-z0-9_\-]+)*
 
 # Routes the contract defines but PROTOCOL.md v1 legitimately defers to a later milestone.
 DEFERRED = {
-    ("POST", "/v1/tools/import"): "M2 — tool nodes (§3d)",
-    ("POST", "/v1/tools/:id/import"): "M2 — tool nodes (§3d)",
-    ("GET", "/v1/tools/:id/ops"): "M2 — tool nodes (§3d)",
-    ("POST", "/v1/tools/:id/call"): "M2 — tool nodes (§3d)",
+    # Every /v1/tools/* entry that used to live here has been retired: PROTOCOL.md now
+    # documents them, and the marker expires by BREAKING rather than by being remembered.
     ("ANY", "/ingress/*"): "M2 — ingress (§2)",
 }
 
@@ -54,6 +52,141 @@ def extract(path, section=None):
         else:
             found.add((method, raw))
     return found
+
+
+# ---------------------------------------------------------------------------
+# 4. HANDLERS vs ROUTER vs PROTOCOL  (ADVERSARY 025, PM 2026-09-06)
+#
+# The three checks above all start from a documented or served route, so they
+# are blind in one direction: a handler that exists, compiles, and is wired to
+# NOTHING is invisible to every one of them. That is exactly how the engine's
+# tool_ls/tool_call CLI handlers sat unreachable -- undocumented, so check 1
+# could not miss them; unrouted, so checks 2 and 3 never saw them. ADVERSARY
+# found it by reading the source, which is not a gate.
+#
+# So: walk the handlers themselves. Every handler must be reachable through a
+# registered route AND its path must be in PROTOCOL.md.
+# ---------------------------------------------------------------------------
+API_DIR = os.path.join(ROOT, "crates", "wheel-engine", "src", "api")
+ROUTER = os.path.join(API_DIR, "mod.rs")
+
+# A handler is an async fn that takes an axum EXTRACTOR. `run_operation` in
+# tool_routes.rs is `pub async fn` too, and is a shared helper called by both the
+# operator route and the CLI path -- it takes &AppState, not State(s): State<_>.
+# Distinguishing structurally beats an allowlist of known non-handlers, which
+# would need a human to remember to update it, which is the failure mode here.
+EXTRACTOR = re.compile(
+    r"\b(?:State|Path|Json|Query|Extension|Form|Multipart)\s*\(|"
+    r"\bHeaderMap\b|\bWebSocketUpgrade\b|\bRequest\s*<"
+)
+HANDLER_DEF = re.compile(r"^pub(?:\(crate\))?\s+async\s+fn\s+(\w+)\s*\(", re.M)
+
+
+def rust_handlers():
+    """{module: {fn_name}} for every handler defined under src/api/."""
+    out = {}
+    if not os.path.isdir(API_DIR):
+        return out
+    for name in sorted(os.listdir(API_DIR)):
+        if not name.endswith(".rs") or name == "mod.rs":
+            continue
+        module = name[:-3]
+        src = open(os.path.join(API_DIR, name)).read()
+        for m in HANDLER_DEF.finditer(src):
+            # Signature runs to the closing paren of the parameter list.
+            tail = src[m.end():m.end() + 600]
+            sig = tail.split(") ->")[0] if ") ->" in tail else tail
+            if EXTRACTOR.search(sig):
+                out.setdefault(module, set()).add(m.group(1))
+    return out
+
+
+def routed_handlers(router_src):
+    """{(module, fn)} referenced anywhere in the router, and fn -> path."""
+    refs = set(re.findall(r"\b(\w+_routes?)::(\w+)\b", router_src))
+    paths = {}
+    for m in re.finditer(r'\.route\(\s*"([^"]+)"\s*,(.*?)\)\s*(?=\.route\(|;|\.)',
+                         router_src, re.S):
+        path, body = m.group(1), m.group(2)
+        for mod_, fn in re.findall(r"\b(\w+_routes?)::(\w+)\b", body):
+            paths.setdefault((mod_, fn), path)
+    return refs, paths
+
+
+def mount_prefixes(router_src):
+    """Every prefix the engine nests a sub-router under, read from the source.
+
+    `.nest("/v1/cli", cli)` means cli_routes::whoami is served at /v1/cli/whoami, not
+    /v1/whoami. Hardcoding "/v1" reported all eight CLI routes as undocumented. Reading
+    the mounts means a future `.nest("/v2", ...)` is handled without anyone remembering
+    to update this file -- and if a mount is REMOVED, the routes under it stop resolving
+    and this check goes red, which is the correct direction.
+    """
+    found = re.findall(r'\.nest\(\s*"([^"]+)"', router_src)
+    # Longest first, so /v1/cli wins over /v1 for a path both could prefix.
+    return sorted(set(found + [""]), key=len, reverse=True)
+
+
+MOUNTS = [""]
+
+
+def documented(path, proto_text):
+    """Is this router path written down in PROTOCOL.md?
+
+    The router and the document spell the same route differently: axum uses
+    `/vault/{id}/{key}` and is mounted under `/v1`, while PROTOCOL.md writes
+    `PUT /v1/vault/:id/:key`. Comparing the raw strings reported fifteen documented
+    routes as undocumented -- a gate that cries wolf fifteen times is one nobody reads
+    the sixteenth time, which would have buried the three real orphans below it.
+
+    Parameter NAMES are deliberately ignored: `{id}` and `:node` name the same hole, and
+    forcing them to agree would fail on a rename that changes nothing a caller can see.
+    """
+    variants = {path} | {prefix + path for prefix in MOUNTS}
+    out = set()
+    for v in variants:
+        out.add(v)
+        out.add(re.sub(r"\{(\w+)\}", r":\1", v))          # {id}  -> :id
+        out.add(re.sub(r"\{(\w+)\}", "<PARAM>", v))        # name-insensitive form
+    if any(v in proto_text for v in out):
+        return True
+    # Last resort: compare shape with parameter names blanked on both sides.
+    shapes = [re.sub(r"[:{]\w+\}?", "<PARAM>", pfx + path) for pfx in MOUNTS]
+    blanked = re.sub(r"[:{]\w+\}?", "<PARAM>", proto_text)
+    return any(sh in blanked for sh in shapes)
+
+
+def check_handlers(proto_text):
+    fails = []
+    defined = rust_handlers()
+    if not defined:
+        return ["no handlers found under crates/wheel-engine/src/api — this check just "
+                "stopped checking anything; has the layout moved?"]
+    router = open(ROUTER).read() if os.path.exists(ROUTER) else ""
+    if not router:
+        return ["crates/wheel-engine/src/api/mod.rs not found — cannot tell routed from orphaned"]
+    global MOUNTS
+    MOUNTS = mount_prefixes(router)
+    refs, paths = routed_handlers(router)
+
+    total = 0
+    for module, fns in sorted(defined.items()):
+        for fn in sorted(fns):
+            total += 1
+            if (module, fn) not in refs:
+                fails.append(
+                    "%s::%s is a handler wired to NOTHING — it compiles, it is dead, and "
+                    "no route-vs-doc check can see it. Register it in api/mod.rs or delete it."
+                    % (module, fn))
+                continue
+            path = paths.get((module, fn))
+            if path and not documented(path, proto_text):
+                fails.append(
+                    "%s::%s serves %s, which is NOT in PROTOCOL.md — served surface nobody "
+                    "documented is surface nobody reviewed." % (module, fn, path))
+    print("handlers: %d checked across %d module(s)" % (total, len(defined)))
+    return fails
+
 
 def main():
     if not os.path.exists(PROTO):
@@ -104,6 +237,9 @@ def main():
         print("\n%d deferred route(s):" % len(gaps))
         for g in gaps:
             print("  -", g)
+
+    # Direction 4: from the handlers outward (ADVERSARY 025).
+    fails.extend(check_handlers(proto_txt))
 
     url = os.environ.get("WHEEL_ENGINE_URL")
     if not url:
