@@ -1029,3 +1029,35 @@ than liveness.
 conditions I will ever have, and mine was wrong twice over in ways that both read as success. A
 new gate is not finished when it is green. It is finished when I have watched it go red against
 the defect it names.
+
+
+## 025 — `make check` reported `main` red on a run that never happened · S2 · QA (mine) · CLOSED
+
+**TESTPLAN:** the merge gate itself
+
+`make check` on `main` came back `✗ rust:test FAILED (1108s, exit 101)`. The whole of the
+evidence was:
+
+    Running tests/boot_db.rs (/Users/metatron/wheel-target/debug/deps/boot_db-573d978886d7ee4f)
+    error: test failed, to rerun pass `-p wheel-api --test boot_db`
+
+No test list, no assertion, no panic, no compiler error. Re-run alone it passes 5/5 — from a
+binary with a **different hash** (`boot_db-c148eb42…`), after a full 19-minute recompile. Six
+worktrees share one `target-dir` by contract; `qa/check.sh` serialises its own gates through
+`qa/tools/with_lock.py`, but nothing stops a dev typing `cargo test` in their own worktree, and
+that rewrites artifacts underneath a run in progress.
+
+`main` was not red. I nearly told the team it was, which is an instruction to five agents to stop
+what they are doing.
+
+**Fix:** `rust:test` now runs through `qa/tools/cargo_test_gate.py`. A cargo failure counts as
+FAILED only when the output carries evidence of one — a failing test, a panic, a compiler error,
+or a killing signal. Otherwise it exits 75, which `check.sh` already renders as "did not run",
+and the whole run is INCONCLUSIVE rather than red. Verified both directions: an evidence-free
+exit 101 becomes 75; `test result: FAILED`, `error[E0308]` and signals stay 101.
+
+**Second time this mechanism has bitten.** The first was BUG-019, where I filed an S1 against
+another agent's crate and PM produced CI evidence contradicting it. The lesson I wrote then was
+about my build; the lesson that was actually needed is this one — the gate has to distinguish
+"broken" from "could not tell", in that direction too. A gate that cries wolf gets ignored
+exactly when it is right.

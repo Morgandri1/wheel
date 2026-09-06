@@ -453,13 +453,26 @@ def main():
             "name": "secrets", "type": "vault", "position": {"x": 0, "y": 200},
             "config": {"keys": ["API_KEY"]}})
         if ok(st):
-            engine("PUT", pid, "/v1/vault/%s/API_KEY" % vault["id"], owner,
-                   {"value": "VAULT-CANARY-91ab"})
+            # The PUT's status used to be discarded here. If it 404s or 400s the secret was
+            # never stored, and "the canary is not in the board" is then true for the most
+            # boring reason there is — the same shape as BUG-018, in a different suite.
+            # Absence is only evidence once the thing is known to be present.
+            put_st, _, _ = engine("PUT", pid, "/v1/vault/%s/API_KEY" % vault["id"], owner,
+                                  {"value": "VAULT-CANARY-91ab"})
             st, board, _ = engine("GET", pid, "/v1/board", owner)
-            R.check("SEC-vault-never-read", "VAULT-CANARY-91ab" not in json.dumps(board),
+            board_json = json.dumps(board)
+            R.control("SEC-vault/canary-stored",
+                      ok(put_st) and vault["id"] in board_json,
+                      "PUT /v1/vault/:id/API_KEY -> %s, vault node %s in board: %s. Without a "
+                      "stored secret and a board that contains the vault node, 'the canary is "
+                      "absent' says nothing"
+                      % (put_st, vault["id"], vault["id"] in board_json))
+            R.gated("SEC-vault-never-read", "SEC-vault/canary-stored",
+                    "VAULT-CANARY-91ab" not in board_json,
                     "vault value present in GET /v1/board")
             st, log, _ = engine("GET", pid, "/v1/agents/%s/log" % agent_id, owner)
-            R.check("SEC-vault-never-read/log", "VAULT-CANARY-91ab" not in json.dumps(log),
+            R.gated("SEC-vault-never-read/log", "SEC-vault/canary-stored",
+                    "VAULT-CANARY-91ab" not in json.dumps(log),
                     "vault value present in the agent log")
     finally:
         # Belt and braces. The API's DELETE is supposed to remove the sandbox, and
