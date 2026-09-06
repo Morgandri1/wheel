@@ -865,3 +865,31 @@ executed nothing. Fixed in the same change (754f138).
 > Per the contract, `qa/BUGS.md` in git is the system of record and a message is only a
 > notification; this is the record.
 
+## 021 — CARGO_HOME is one shared dir at 0755, not per project · S2 · SDK
+
+Found by `WOW-toolchain-cargo-per-project`, the acceptance test PM assigned for ADVERSARY 029.
+The RUSTUP_HOME half passes; this half does not.
+
+```
+CARGO_HOME='/data/cargo' mode='755'
+```
+
+`supervisor/mod.rs:390` does `self.cfg.data_dir.join("cargo")` — one directory for the whole
+project data dir, created with default permissions.
+
+**Two ways this misses 029.** It is not per project: on the process backend `/data` is the
+host's, so `/data/cargo` is shared across every project on the machine, which is exactly the
+cross-tenant leak the comment above that line describes wanting to prevent. And at 0755 it is
+world-readable inside the sandbox, so even within one project every other uid can read it —
+§2 gives each agent, script and MCP child its own uid precisely so they are not each other's.
+
+**What is in there.** Downloaded sources and, if a tenant ever configures one,
+`~/.cargo/credentials.toml` with a registry token. The code comment already names this risk;
+the implementation just lands one level too high.
+
+**Fix per 029:** `/data/projects/<id>/.cargo`, mode 0700, owned by the project uid.
+
+**Credit where due:** the comment beside the bug is right about why it matters. This is the
+implementation not matching its own stated intent, which is the kind that survives review
+because the reasoning next to it reads correctly.
+
