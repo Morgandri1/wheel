@@ -116,3 +116,104 @@ impl ErrorBody {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The host API is a contract between three crates and QA. These spellings
+    /// are what API sends and Web reads, so they are pinned rather than
+    /// assumed.
+    #[test]
+    fn sandbox_status_and_backend_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&SandboxBackend::Docker).unwrap(),
+            "\"docker\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SandboxBackend::Process).unwrap(),
+            "\"process\""
+        );
+        for (s, want) in [
+            (SandboxStatus::Stopped, "stopped"),
+            (SandboxStatus::Starting, "starting"),
+            (SandboxStatus::Running, "running"),
+            (SandboxStatus::Error, "error"),
+        ] {
+            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{want}\""));
+            assert_eq!(s.as_str(), want);
+            assert_eq!(s.to_string(), want);
+            // as_str and serde must never drift apart.
+            assert_eq!(
+                serde_json::from_str::<SandboxStatus>(&format!("\"{want}\"")).unwrap(),
+                s
+            );
+        }
+    }
+
+    /// A sandbox nobody has started is `stopped`, not `running`: the default
+    /// has to be the safe end of that axis.
+    #[test]
+    fn a_sandbox_defaults_to_stopped_and_no_capabilities() {
+        assert_eq!(SandboxStatus::default(), SandboxStatus::Stopped);
+        assert!(!Capabilities::default().http, "ingress is off by default");
+    }
+
+    /// Public ingress is served only when `http` is true, so a payload that
+    /// omits it must read as disabled rather than fail or default open.
+    #[test]
+    fn omitted_capabilities_read_as_disabled() {
+        let c: Capabilities = serde_json::from_str("{}").unwrap();
+        assert!(!c.http);
+        let up: SandboxUpsert =
+            serde_json::from_str(r#"{"engine_secret":"s","vault_key":"k"}"#).unwrap();
+        assert!(!up.capabilities.http);
+        assert_eq!(up.engine_secret, "s");
+        assert_eq!(up.vault_key, "k");
+    }
+
+    #[test]
+    fn sandbox_info_omits_absent_fields_rather_than_sending_null() {
+        let info = SandboxInfo {
+            id: Uuid::nil(),
+            status: SandboxStatus::Running,
+            last_error: None,
+            started_at: None,
+            capabilities: Capabilities { http: true },
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("last_error"), "{json}");
+        assert!(!json.contains("started_at"), "{json}");
+        assert!(json.contains("\"status\":\"running\""), "{json}");
+        assert!(json.contains("\"http\":true"), "{json}");
+
+        // ...and it survives the trip back.
+        let back: SandboxInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, info);
+    }
+
+    #[test]
+    fn an_error_body_has_the_uniform_shape_both_services_render() {
+        let e = ErrorBody::new("wire_denied", "no wire from a to b (need: write)");
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"error":{"code":"wire_denied","message":"no wire from a to b (need: write)"}}"#
+        );
+        let back: ErrorBody =
+            serde_json::from_str(r#"{"error":{"code":"not_found","message":"gone"}}"#).unwrap();
+        assert_eq!(back.error.code, "not_found");
+        assert_eq!(back.error.message, "gone");
+    }
+
+    #[test]
+    fn host_health_reports_the_backend_it_is_actually_running() {
+        let h = HostHealth {
+            ok: true,
+            sandbox_backend: SandboxBackend::Process,
+            projects_running: 3,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("\"sandbox_backend\":\"process\""), "{json}");
+        assert_eq!(serde_json::from_str::<HostHealth>(&json).unwrap(), h);
+    }
+}

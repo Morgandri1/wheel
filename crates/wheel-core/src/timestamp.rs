@@ -69,3 +69,83 @@ impl schemars::JsonSchema for Timestamp {
         .into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything on the wire is RFC3339 UTC (§2). API, Web and the host all
+    /// parse these strings, so the exact rendering is a contract.
+    #[test]
+    fn a_timestamp_renders_as_rfc3339_utc_with_a_z() {
+        let t = Timestamp::parse_rfc3339("2026-09-05T00:21:00Z").unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-09-05T00:21:00Z");
+        assert_eq!(t.to_string(), "2026-09-05T00:21:00Z");
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            "\"2026-09-05T00:21:00Z\""
+        );
+    }
+
+    /// An offset timestamp is accepted but NORMALISED to UTC: two clients in
+    /// different zones must not produce two spellings of one instant.
+    #[test]
+    fn an_offset_is_converted_to_utc_rather_than_preserved() {
+        let t = Timestamp::parse_rfc3339("2026-09-05T02:21:00+02:00").unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-09-05T00:21:00Z");
+        assert_eq!(t, Timestamp::parse_rfc3339("2026-09-05T00:21:00Z").unwrap());
+    }
+
+    #[test]
+    fn a_timestamp_round_trips_through_json() {
+        let t = Timestamp::now();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Timestamp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_rfc3339(), t.to_rfc3339());
+    }
+
+    #[test]
+    fn a_string_that_is_not_a_timestamp_is_refused_on_the_wire() {
+        for bad in [
+            "\"\"",
+            "\"not a date\"",
+            "\"2026-09-05\"",
+            "\"2026-09-05 00:21:00\"",
+            "\"2026-13-05T00:21:00Z\"",
+            "1757030460",
+        ] {
+            assert!(
+                serde_json::from_str::<Timestamp>(bad).is_err(),
+                "{bad} must not deserialize into a Timestamp"
+            );
+        }
+    }
+
+    /// Message ordering and log cursors compare timestamps, so `Ord` has to
+    /// agree with chronology across offsets, not with the string.
+    #[test]
+    fn timestamps_order_chronologically_across_offsets() {
+        let earlier = Timestamp::parse_rfc3339("2026-09-05T00:21:00Z").unwrap();
+        let later = Timestamp::parse_rfc3339("2026-09-05T00:22:00Z").unwrap();
+        assert!(earlier < later);
+        // Same instant, two spellings: equal, not merely close.
+        let same = Timestamp::parse_rfc3339("2026-09-05T02:21:00+02:00").unwrap();
+        assert_eq!(earlier, same);
+        assert!(!(earlier < same) && !(same < earlier));
+    }
+
+    #[test]
+    fn now_is_utc_and_round_trips_through_the_inner_type() {
+        let t = Timestamp::now();
+        assert!(t.to_rfc3339().ends_with('Z'));
+        let inner = t.into_inner();
+        assert_eq!(Timestamp::from(inner), t);
+        // Sub-second precision survives the string form.
+        assert_eq!(
+            Timestamp::parse_rfc3339(&t.to_rfc3339())
+                .unwrap()
+                .to_rfc3339(),
+            t.to_rfc3339()
+        );
+    }
+}

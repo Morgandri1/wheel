@@ -230,3 +230,213 @@ impl schemars::JsonSchema for Ident {
         .into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shapes_the_contract_allows_are_accepted() {
+        for ok in [
+            "a",
+            "0",
+            "researcher",
+            "agent-1",
+            "agent_1",
+            "a-b_c-9",
+            &"x".repeat(NAME_MAX_LEN),
+        ] {
+            assert!(NodeName::new(ok).is_ok(), "{ok:?} should be a valid name");
+        }
+    }
+
+    #[test]
+    fn a_name_must_start_with_a_lowercase_letter_or_digit() {
+        // Leading '-' and '_' are the interesting ones: both are legal LATER
+        // in a name, so only the first-character rule rejects them.
+        for (raw, want) in [
+            ("-lead", NameError::BadFirstChar('-')),
+            ("_lead", NameError::BadFirstChar('_')),
+            ("Agent", NameError::BadFirstChar('A')),
+        ] {
+            assert_eq!(NodeName::new(raw).unwrap_err(), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_name_is_empty_rather_than_a_char_error() {
+        assert_eq!(NodeName::new("").unwrap_err(), NameError::Empty);
+    }
+
+    /// Uppercase is the one worth naming: node names are addresses, and two
+    /// nodes differing only in case would be two addresses an operator reads
+    /// as one.
+    #[test]
+    fn the_charset_is_lowercase_only_and_excludes_path_and_sql_punctuation() {
+        for (raw, bad) in [
+            ("agentA", 'A'),
+            ("a b", ' '),
+            ("a.b", '.'),
+            ("a/b", '/'),
+            ("a'b", '\''),
+            ("a;b", ';'),
+            ("a\"b", '"'),
+            ("a\\b", '\\'),
+            ("a\nb", '\n'),
+            ("a\0b", '\0'),
+            ("café", 'é'),
+        ] {
+            assert_eq!(
+                NodeName::new(raw).unwrap_err(),
+                NameError::BadChar(bad),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn length_is_capped_and_counted_in_characters_not_bytes() {
+        assert!(NodeName::new("x".repeat(NAME_MAX_LEN)).is_ok());
+        assert_eq!(
+            NodeName::new("x".repeat(NAME_MAX_LEN + 1)).unwrap_err(),
+            NameError::TooLong(NAME_MAX_LEN + 1)
+        );
+        // 64 three-byte chars: 192 bytes, but the operator is told 64.
+        let wide = "☃".repeat(NAME_MAX_LEN + 1);
+        assert_eq!(
+            NodeName::new(&wide).unwrap_err(),
+            NameError::TooLong(NAME_MAX_LEN + 1),
+            "length must be reported in characters, not bytes"
+        );
+    }
+
+    /// `user` is the `from_node` the engine stamps on UI-originated messages,
+    /// so a node called `user` would make `wheel msg user ...` ambiguous about
+    /// who is being addressed.
+    #[test]
+    fn reserved_names_are_refused() {
+        for name in RESERVED_NAMES {
+            assert_eq!(
+                NodeName::new(*name).unwrap_err(),
+                NameError::Reserved(name.to_string()),
+                "{name:?} must stay reserved"
+            );
+        }
+        // Only the exact word: these are ordinary names.
+        for ok in ["users", "user-1", "user_data", "wheelhouse", "systemd"] {
+            assert!(NodeName::new(ok).is_ok(), "{ok:?} should be allowed");
+        }
+    }
+
+    /// `sqlite_table` interpolates straight into DDL, so the ONLY thing
+    /// standing between a node name and SQL is this charset plus the '-' rule.
+    #[test]
+    fn a_table_name_is_only_produced_when_it_is_safe_to_interpolate() {
+        assert_eq!(
+            NodeName::new("notes").unwrap().sqlite_table().as_deref(),
+            Some("t_notes")
+        );
+        assert_eq!(
+            NodeName::new("my_notes_2")
+                .unwrap()
+                .sqlite_table()
+                .as_deref(),
+            Some("t_my_notes_2")
+        );
+        // A hyphen is a valid node name but a bare '-' in an identifier is
+        // subtraction to sqlite, so it must refuse rather than emit it.
+        assert_eq!(NodeName::new("my-notes").unwrap().sqlite_table(), None);
+
+        // Whatever comes out contains nothing that could end an identifier.
+        for raw in ["notes", "a", "z9_z"] {
+            let t = NodeName::new(raw).unwrap().sqlite_table().unwrap();
+            assert!(
+                t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{t:?} is not a bare sqlite identifier"
+            );
+        }
+    }
+
+    /// The type claims an invalid name is unconstructable. serde is the way in
+    /// that bypasses `new`, so it has to re-validate — otherwise any name on
+    /// the wire lands in the database unchecked.
+    #[test]
+    fn deserialization_revalidates_rather_than_trusting_the_wire() {
+        let good: NodeName = serde_json::from_str("\"researcher\"").unwrap();
+        assert_eq!(good.as_str(), "researcher");
+        assert_eq!(serde_json::to_string(&good).unwrap(), "\"researcher\"");
+
+        for bad in ["\"\"", "\"User\"", "\"user\"", "\"a b\"", "\"a;drop\""] {
+            assert!(
+                serde_json::from_str::<NodeName>(bad).is_err(),
+                "{bad} must not deserialize into a NodeName"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_round_trips_through_every_conversion() {
+        let n: NodeName = "researcher".parse().unwrap();
+        assert_eq!(n.to_string(), "researcher");
+        assert_eq!(n.as_ref() as &str, "researcher");
+        assert_eq!(n.as_str(), "researcher");
+        assert_eq!(n.clone().into_string(), "researcher");
+        assert!("User".parse::<NodeName>().is_err());
+    }
+
+    /// Injected `# Context:` blocks are ordered by ctx node name so the
+    /// preamble is stable and board-position-independent (§3). That ordering
+    /// is this `Ord`, and it must be plain byte order.
+    #[test]
+    fn names_order_by_bytes_so_injected_context_is_stable() {
+        let mut names: Vec<NodeName> = ["ctx-b", "ctx_a", "ctx-a", "0first", "zlast"]
+            .iter()
+            .map(|s| NodeName::new(*s).unwrap())
+            .collect();
+        names.sort();
+        let got: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+        assert_eq!(got, ["0first", "ctx-a", "ctx-b", "ctx_a", "zlast"]);
+    }
+
+    #[test]
+    fn an_ident_allows_reserved_words_but_never_a_hyphen() {
+        // These are terrible node names and perfectly good column names.
+        for ok in ["user", "system", "engine", "wheel", "col_1"] {
+            assert!(Ident::new(ok).is_ok(), "{ok:?} should be a valid column");
+        }
+        // A column name goes into DDL bare, so '-' is rejected outright rather
+        // than handled later like it is for NodeName.
+        assert_eq!(Ident::new("a-b").unwrap_err(), NameError::BadChar('-'));
+        assert_eq!(Ident::new("").unwrap_err(), NameError::Empty);
+        assert_eq!(Ident::new("A").unwrap_err(), NameError::BadFirstChar('A'));
+        assert_eq!(Ident::new("a;b").unwrap_err(), NameError::BadChar(';'));
+        assert_eq!(
+            Ident::new("x".repeat(NAME_MAX_LEN + 1)).unwrap_err(),
+            NameError::TooLong(NAME_MAX_LEN + 1)
+        );
+    }
+
+    #[test]
+    fn an_ident_round_trips_and_revalidates_on_the_wire() {
+        let i = Ident::new("col_1").unwrap();
+        assert_eq!(i.to_string(), "col_1");
+        assert_eq!(i.as_str(), "col_1");
+        assert_eq!(serde_json::to_string(&i).unwrap(), "\"col_1\"");
+        assert_eq!(
+            serde_json::from_str::<Ident>("\"col_1\"").unwrap().as_str(),
+            "col_1"
+        );
+        assert!(serde_json::from_str::<Ident>("\"a-b\"").is_err());
+    }
+
+    #[test]
+    fn the_error_messages_name_the_offending_character() {
+        assert!(NameError::BadChar(';').to_string().contains("';'"));
+        assert!(NameError::BadFirstChar('A').to_string().contains("'A'"));
+        assert!(NameError::TooLong(64).to_string().contains("64"));
+        assert!(NameError::Reserved("user".into())
+            .to_string()
+            .contains("user"));
+    }
+}
