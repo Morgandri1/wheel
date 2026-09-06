@@ -323,6 +323,67 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// BUG-022, docker-free. QA's own gate (`ENG-starts-without-shm`,
+    /// `qa/integration/test_engine_shm.py`) proves the same failure mode by
+    /// starting a real `wheel-engine:test` container with a DIRECTORY sitting
+    /// where sqlite wants to put `-wal.db-shm` -- "verified to reproduce the
+    /// production symptom exactly." That needs docker, which is not always
+    /// at hand; the fixture is a filesystem fact, not a container one, so it
+    /// reproduces here too, in milliseconds, in plain `cargo test`.
+    ///
+    /// This does not replace QA's gate -- a real container proves the whole
+    /// engine binary starts and serves; this proves the negotiation `open_
+    /// configured` does gets to a working mode on the volume that broke
+    /// production. Different technique, same failure mode, cheap enough to
+    /// run on every `cargo test`.
+    #[test]
+    fn open_configured_recovers_on_a_volume_that_cannot_host_a_shm_file() {
+        let dir = std::env::temp_dir().join(format!("wheel-shm-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+
+        // Seed a database already in WAL, the shape that actually crash-looped
+        // production: journal_mode persists in the file header, so this is
+        // what every boot rediscovers on the volume that broke.
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.pragma_update(None, "journal_mode", "WAL").unwrap();
+            seed.execute_batch("CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('kept');")
+                .unwrap();
+        }
+        // The fixture: a DIRECTORY at the `-shm` path. sqlite's shared-memory
+        // file cannot be created OR mapped through a directory, which is what
+        // a bind mount that cannot host shared memory looks like from here.
+        std::fs::create_dir_all(format!("{}-shm", path.display())).unwrap();
+
+        // `false`: the engine's own mode -- it never takes the file
+        // exclusively, because `tables::query` opens it a second time.
+        let conn = open_configured(path.to_str().unwrap(), false)
+            .expect("the engine must still start on a volume that cannot host a WAL index");
+
+        let mode = current_journal_mode(&conn).unwrap();
+        assert_ne!(
+            mode, "wal",
+            "settling back on WAL is not recovery -- it is the mode that just failed"
+        );
+
+        // The real proof: a WRITE succeeds. `open_configured` returning Ok is
+        // not enough on its own -- that is exactly the bug (a pragma can
+        // report success on a mode that then fails the first real write).
+        conn.execute("INSERT INTO t VALUES ('after-recovery')", [])
+            .expect("the recovered mode must actually accept a write");
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "the row from before the recovery must have survived it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The deployed shape: a database ALREADY in WAL that has to be converted
     /// to a rollback journal. On the volume that took production down, the
     /// plain pragma cannot do this -- leaving WAL needs a checkpoint, which
