@@ -111,3 +111,15 @@ uid `agent`) is unreadable by the root probe (no CAP_SYS_PTRACE) and, read as it
 Correct method (in `verify_env_fix.sh`): target PPid==1 children only, and read their environ as the
 child's own uid. The original scripts are kept for the historical live-leak repro on the VULNERABLE
 build; they are annotated not to be used as a fix gate.
+
+## STANDING RULE (SDK + ADVERSARY, 2026-09-06): the boundary is never widened for test convenience
+An entry earns a place on `INHERITED_ENV` (or any trust-boundary allowlist) by being a legitimate RUNTIME
+need whose VALUE is non-secret — e.g. `RUSTUP_HOME`, a machine-fact path the engine can't compute, same class
+as `PATH`/`SSL_CERT_*`/`NODE_EXTRA_CA_CERTS`. It does NOT earn a place because a test suite finds it
+convenient. SDK made this concrete: the `WHEEL_FAKE_*` test variables were moved to a config file rather than
+added to the allowlist; and `WHEEL_TOOL_ALLOW_HOST` is the correct shape for a real test need — a test-only
+mechanism that is REFUSED AT BOOT in `WHEEL_ENV=prod` and WARN-logged, so it cannot widen the production
+boundary at all. **Red-team enforcement (SDK's own request): if an allowlist/boundary entry is justified by
+"a suite of mine needs it," push back hard — the test moves to a config file or a prod-refused test-only env,
+the boundary does not move.** (Companion to the proxy-URL standing watch above: a credential-bearing inherited
+var is a finding; a test-convenience entry is refused before it becomes one.)
