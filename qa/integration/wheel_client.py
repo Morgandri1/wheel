@@ -214,3 +214,24 @@ def pin_image(tag="wheel-engine:test"):
     p = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", tag],
                        capture_output=True, text=True)
     return p.stdout.strip() if p.returncode == 0 else None
+
+
+def free_port(preferred):
+    """`preferred` if it is bindable right now, otherwise any free port.
+
+    Suites use a fixed default port so a human can find the engine while debugging, and
+    qa/contract/suite_isolation.py keeps those defaults distinct. Distinct defaults stop
+    two SUITES colliding; they do nothing about the same suite running twice, which is
+    routine on a host shared by six agents. A wheel-on-wheel run lost its engine that way
+    mid-clone, and the retry could not start at all because the first run still held 17426.
+    """
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            pass
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]

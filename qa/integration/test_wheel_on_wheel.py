@@ -18,12 +18,17 @@ inside a container does not belong in a gate developers run before every merge.
 """
 import base64, json, os, subprocess, sys, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results
+from wheel_client import Results, free_port
 
 SKIP = 77
 R = Results()
-NAME = "qa-engine-wow"
-PORT = int(os.environ.get("WHEEL_ENGINE_WOW_PORT", "17426"))
+# Unique per RUN, not just per suite. A fixed name means any second runner — another
+# agent's session on this shared host, a stale container from a killed run — is removed by
+# our own `docker rm -f` and removes ours by theirs. This run lost its engine mid-clone
+# exactly that way. Suite-level uniqueness (qa/contract/suite_isolation.py) is not enough
+# when the same suite can be running twice.
+NAME = "qa-engine-wow-%s" % uuid.uuid4().hex[:8]
+PORT = free_port(int(os.environ.get("WHEEL_ENGINE_WOW_PORT", "17426")))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-wow-secret-at-least-16chars"
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
@@ -65,6 +70,10 @@ def http(method, path, body=None):
             return e.code, json.loads(txt)
         except Exception:
             return e.code, txt
+    except urllib.error.URLError as e:
+        # The engine went away mid-run. Report it as a value the caller can assert on; a
+        # traceback here reads as "the test is broken" when the subject is what vanished.
+        return 0, {"error": "engine unreachable: %s" % e.reason}
 
 
 def node(name, typ, cfg, x=0):
@@ -111,6 +120,8 @@ def turn(agent, command, wait=180):
     while time.time() < deadline:
         _, log = http("GET", "/v1/agents/%s/log" % agent)
         seen = json.dumps(log)
+        if "engine unreachable" in seen:
+            return seen
         if "exit=" in seen:
             return seen
         time.sleep(2)
