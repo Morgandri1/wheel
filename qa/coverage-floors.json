@@ -1,0 +1,6 @@
+{
+  "_comment": "Ratchet floors for crates exempt from the §0b 90% bar (PM ruling 2026-09-06). The gate FAILS if a crate drops below its floor and RAISES the floor when a merge exceeds it, so an exemption can never be used to go backwards. Committed deliberately: a floor kept only in CI state is a floor nobody can review in a diff.",
+  "floors": {
+    "wheel-engine": 71.24
+  }
+}

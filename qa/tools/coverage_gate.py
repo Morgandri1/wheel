@@ -18,25 +18,80 @@ SKIP = 77
 MIN = float(os.environ.get("COV_MIN", "90"))
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-def _engine_image_exists():
+FLOORS_FILE = os.path.join(ROOT, "qa", "coverage-floors.json")
+
+
+def _m2_complete():
+    """Has M2 landed for tool nodes? The hard expiry of wheel-engine's exemption.
+
+    Three conditions, all readable from the repo (PM ruling 2026-09-06):
+      1. PROTOCOL.md documents the tool-node control-plane routes,
+      2. docs/schema exports ToolConfig, so Web can generate types from it,
+      3. QA's M2 tool suite exists.
+    "The M2 suite is GREEN" is not re-run here -- that suite runs in the integration job and
+    a red CI already blocks the merge. Re-running it inside a coverage gate would be a
+    second, slower, differently-configured opinion about the same thing.
+    """
     try:
-        return subprocess.run(["docker", "image", "inspect", "wheel-engine:test"],
-                              capture_output=True).returncode == 0
-    except FileNotFoundError:
-        return False
+        with open(os.path.join(ROOT, "docs", "PROTOCOL.md")) as fh:
+            documented = "/v1/tools/" in fh.read()
+    except OSError:
+        documented = False
+    schema_dir = os.path.join(ROOT, "docs", "schema")
+    exported = False
+    if os.path.isdir(schema_dir):
+        for name in os.listdir(schema_dir):
+            try:
+                with open(os.path.join(schema_dir, name)) as fh:
+                    if "ToolConfig" in fh.read():
+                        exported = True
+                        break
+            except OSError:
+                pass
+    suite = os.path.exists(os.path.join(ROOT, "qa", "integration", "test_engine_tools.py"))
+    return documented and exported and suite
+
+
+def load_floors():
+    try:
+        with open(FLOORS_FILE) as fh:
+            return json.load(fh).get("floors", {}) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_floor(crate, pct):
+    """Raise a crate's floor and leave the change in the working tree to be committed.
+
+    Deliberately a file in the repo rather than CI state: a floor nobody can see in a diff
+    is a floor nobody can argue with, and this one exists precisely so that a drop has to be
+    argued with.
+    """
+    try:
+        with open(FLOORS_FILE) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        doc = {"floors": {}}
+    doc.setdefault("floors", {})[crate] = round(pct, 2)
+    with open(FLOORS_FILE, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
 
 
 # crate -> (reason, expiry prose, expired?) where expired? is a PREDICATE, not a promise.
 #
 # An exemption whose expiry is only written down expires when somebody remembers, which is
-# never. wheel-engine's said "expires when the engine is bootable / wheel-engine:test
-# exists" -- and that image has existed for some time, with the whole integration suite
-# running against it, while the exemption quietly went on hiding the largest crate in the
-# workspace at 71%. The condition has to be executable or it is decoration.
+# never. The first version of this one said "expires when wheel-engine:test exists" -- and
+# that image had existed for hours, with the whole integration suite running against it,
+# while the exemption went on hiding the largest crate in the workspace at 71%.
+#
+# Renewed by PM ruling as a RATCHET: exempt from the 90% bar, but the floor only ever goes
+# up, so the exemption cannot be used to go backwards. Hard expiry is M2.
 EXEMPT = {
-    "wheel-engine": ("scaffolding; not yet bootable",
-                     "expires when the engine is bootable / wheel-engine:test exists",
-                     _engine_image_exists),
+    "wheel-engine": ("scaffolding for M2; ratcheted, not excused",
+                     "expires when M2 lands (tool routes in PROTOCOL.md + ToolConfig in "
+                     "docs/schema + QA's M2 tool suite)",
+                     _m2_complete),
 }
 
 def db_gated_crates():
@@ -183,8 +238,9 @@ def main():
     if foreign:
         print("note: ignored %d instrumented file(s) from other worktrees" % foreign)
 
-    fails, exempted, inconclusive = [], [], []
+    fails, exempted, inconclusive, raised = [], [], [], []
     needs_db = db_gated_crates()
+    floors = load_floors()
     print("per-crate line coverage (bar: %.0f%%)" % MIN)
     for crate in sorted(per):
         covered, total = per[crate]
@@ -200,6 +256,41 @@ def main():
                          % (crate, ex[1], pct))
             print("  EXPIRED %-13s %6.2f%%  (%d/%d)  exemption no longer applies"
                   % (crate, pct, covered, total))
+        elif ex and crate in needs_db:
+            # An exempt crate whose measurement is incomplete must NOT touch its floor.
+            # Ratcheting on a partial number would either lock in an unreachable floor or,
+            # worse, let a real drop pass because the run that would have caught it was the
+            # one that could not measure.
+            inconclusive.append("%s is exempt-with-ratchet, but its measurement here is "
+                                "incomplete, so the floor was neither checked nor raised"
+                                % crate)
+            print("  ????   %-14s %6.2f%%  (%d/%d)  floor not checked" %
+                  (crate, pct, covered, total))
+        elif ex:
+            floor = floors.get(crate)
+            if floor is None:
+                fails.append("%s is exempt-with-ratchet but has no floor in "
+                             "qa/coverage-floors.json — an exemption with no floor is just "
+                             "an exemption" % crate)
+                print("  NOFLOOR %-13s %6.2f%%  (%d/%d)" % (crate, pct, covered, total))
+            elif round(pct, 2) < round(floor, 2):
+                # The whole point. Exempt from the 90% bar, never exempt from not regressing.
+                fails.append("%s FELL BELOW its ratchet floor: %.2f%% < %.2f%%. The crate is "
+                             "exempt from the %.0f%% bar, not from going backwards. Restore "
+                             "the coverage or take a new ruling to lower the floor -- do not "
+                             "edit qa/coverage-floors.json to make this pass."
+                             % (crate, pct, floor, MIN))
+                print("  BELOW  %-14s %6.2f%%  (%d/%d)  floor %.2f%%"
+                      % (crate, pct, covered, total, floor))
+            elif round(pct, 2) > round(floor, 2):
+                save_floor(crate, pct)
+                raised.append("%s %.2f%% -> %.2f%%" % (crate, floor, pct))
+                print("  RATCHET %-13s %6.2f%%  (%d/%d)  floor raised from %.2f%%"
+                      % (crate, pct, covered, total, floor))
+            else:
+                exempted.append("%s at %.2f%% — %s (%s); holding its ratchet floor"
+                                % (crate, pct, ex[0], ex[1]))
+                print("  FLOOR  %-14s %6.2f%%  (%d/%d)  at floor" % (crate, pct, covered, total))
         elif crate in needs_db:
             inconclusive.append(
                 "%s reads %.2f%% here, but its *_db.rs suites skipped (TEST_DATABASE_URL "
@@ -223,6 +314,10 @@ def main():
         print("\n%d exempt crate(s):" % len(exempted))
         for e in exempted:
             print("  -", e)
+    if raised:
+        print("\nratchet floor RAISED for %d crate(s): %s" % (len(raised), ", ".join(raised)))
+        print("  qa/coverage-floors.json has been updated — COMMIT IT, or the next run "
+              "measures against the old floor and the gain is not locked in.")
     if inconclusive:
         print("\n%d crate(s) NOT MEASURED here:" % len(inconclusive))
         for i in inconclusive:
