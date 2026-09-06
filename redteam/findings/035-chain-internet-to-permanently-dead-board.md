@@ -84,3 +84,24 @@ that path is not in the running engine — I want to see it; otherwise the guard
 path + the messages table, and treating ctx as the carrier would harden a surface the escaper never reads.
 (Method note: I corrected link 5 to false, weighed PM's reconciliation, and re-verified via the caller graph
 rather than accept or reject on authority — the 030 standard, applied to a correction of my own correction.)
+
+## Link 6 — first real consumer named: a TELEGRAM webhook → the PM agent (pin before it ships)
+The operator has named the first ingress consumer: a Telegram webhook delivering into the PM agent. This
+makes link 6 concrete the day it ships, and it is the SHARPEST instance of endpoint-R4 (finding 031): the PM
+agent is (by role) among the most wire-capable agents on the board — send to peers, write to ctx/plans — so a
+public webhook body is an internet → most-capable-agent channel. Two overlapping risks on the SAME path: the
+034/035 panic sink (a poison body → the PM agent's message → envelope()), and R4 prompt-injection (attacker
+text steering the PM agent within its broad wire set). Pre-ship requirements (verify when SDK's ingress lands):
+1. The webhook MUST be authenticated, NOT `mode:none`. Telegram supports a `secret_token`
+   (`X-Telegram-Bot-Api-Secret-Token` header set at setWebhook) — use `shared_secret`/`hmac` against a wired
+   vault (031 R6). A `mode:none` webhook to the PM agent is an open internet → PM-agent injection channel.
+2. Verify link 6 itself: does the ingress body reach `envelope()` (the fixed sink)? If yes, the panic is
+   defused by the 034 fix — I will confirm reached-and-safe against SDK's code rather than assume.
+3. R3: cap the raw body before it becomes a message (≤256 KiB), rate-limit (project, trusted-IP not raw XFF),
+   both BEFORE the PM agent is woken. R1: Telegram has no per-update nonce the engine validates by default →
+   the PM agent's actions on a webhook must be idempotent or dedup on Telegram's `update_id`.
+4. R4: the PM agent's preamble must flag `type=endpoint` bodies as UNTRUSTED EXTERNAL INPUT; and given its
+   blast radius, prefer routing the webhook to a MINIMAL-wire intake agent that relays to PM, not straight
+   into the agent that can write plans and message everyone.
+I will run the full endpoint/ingress live campaign (SSRF is N/A for inbound, but auth-bypass, poison-body →
+sink, size/rate/replay, and the R4 injection blast-radius) against this path the moment the ingress code lands.
