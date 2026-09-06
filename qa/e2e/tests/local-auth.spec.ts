@@ -25,6 +25,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { T } from "../testids";
+import { SEEDED_SHAPE, SESSION_KEY } from "../session";
 
 const API = process.env.WHEEL_LOCAL_API_URL ?? "http://localhost:8788";
 const SEEDED = { email: "dev@wheel.dev", password: "wheel-dev-password" };
@@ -152,6 +153,42 @@ test("E2E-local-session-gate: a returning user is never shown as signed out firs
   await expect(page.getByTestId(T.sessionBadge)).toBeVisible();
   expect(redirected.filter((u) => u.includes("/sign-in"))).toEqual([]);
   await expect(page.getByTestId(T.sessionRedirecting)).toHaveCount(0);
+});
+
+test("E2E-local-session-shape: what a real sign-in stores is what seedSession fakes", async ({ page }) => {
+  // The guard for qa/e2e/session.ts. Other specs seed a session instead of driving this
+  // form, which is steadier and keeps sign-in failures in one place — but a seeded session
+  // is a fake of the app's own state, and a fake nobody compares to the real thing drifts.
+  // If the stored shape ever gains a field, or nests the user, or renames the token, every
+  // seeded spec keeps passing against a shape the app stopped producing. This is the test
+  // that makes the seed safe to rely on, so it must sign in FOR REAL.
+  await page.goto("/sign-in");
+  await submit(page, SEEDED.email, SEEDED.password);
+  await page.waitForURL(/\/app$/);
+
+  const stored = await page.evaluate((k) => {
+    const raw = window.localStorage.getItem(k);
+    return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+  }, SESSION_KEY);
+
+  expect(stored, "a real sign-in stored no session at all").toBeTruthy();
+
+  // Compared as SHAPE, not value: keys and types, since the token and id are per-session.
+  const shapeOf = (o: unknown): unknown =>
+    o && typeof o === "object" && !Array.isArray(o)
+      ? Object.fromEntries(
+          Object.entries(o as Record<string, unknown>)
+            .map(([k, v]) => [k, shapeOf(v)])
+            .sort(([a], [b]) => (a as string).localeCompare(b as string)),
+        )
+      : typeof o;
+
+  expect(
+    shapeOf(stored),
+    "a real sign-in no longer stores what seedSession() fakes — update SEEDED_SHAPE in " +
+      "qa/e2e/session.ts, or every spec that seeds a session is testing a shape that no " +
+      "longer exists",
+  ).toEqual(shapeOf(SEEDED_SHAPE));
 });
 
 test("E2E-local-token-storage: the token is sent as x-auth-token and never appears in a URL", async ({ page }) => {
