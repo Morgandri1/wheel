@@ -6,7 +6,7 @@
 //!   "id": "uuid",
 //!   "name": "researcher",
 //!   "type": "agent",
-//!   "position": { "x": 120.0, "y": 340.0 },
+//!   "position": { "x": 120, "y": 340 },
 //!   "wires": [ { "to": "<node id>", "type": "read" } ],
 //!   "config": { ... }
 //! }
@@ -91,17 +91,48 @@ impl std::fmt::Display for NodeType {
     }
 }
 
-/// Board coordinates. Floats because the canvas pans/zooms continuously.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+/// Board coordinates: a cell, not a measurement (ARCHITECTURE.md "Position is
+/// an integer cell", operator ruling 2026-09-06).
+///
+/// Accepts any JSON number on the way in -- an existing client mid-drag still
+/// sends floats -- but rounds to the nearest cell and clamps to `i16::MIN..=
+/// i16::MAX` before it is ever stored, compared, or serialised back out. That
+/// clamp-on-write is why the fields are `i16` rather than `f64`: it makes
+/// "already a valid cell" a property of the type instead of something every
+/// reader has to re-check.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Position {
-    pub x: f64,
-    pub y: f64,
+    pub x: i16,
+    pub y: i16,
 }
 
 impl Position {
     pub fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
+        Self {
+            x: clamp_cell(x),
+            y: clamp_cell(y),
+        }
+    }
+}
+
+fn clamp_cell(v: f64) -> i16 {
+    v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
+impl<'de> Deserialize<'de> for Position {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            x: f64,
+            y: f64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Position::new(raw.x, raw.y))
     }
 }
 
@@ -685,13 +716,40 @@ mod tests {
     #[test]
     fn a_position_is_a_plain_pair_and_defaults_to_the_origin() {
         let p = Position::new(1.5, -2.5);
-        assert_eq!(p.x, 1.5);
-        assert_eq!(p.y, -2.5);
+        // Rounds to the nearest cell, symmetric about zero: 1.5 -> 2, -2.5 -> -3.
+        assert_eq!(p.x, 2);
+        assert_eq!(p.y, -3);
         assert_eq!(Position::default(), Position::new(0.0, 0.0));
         assert_eq!(
             serde_json::to_value(p).unwrap(),
-            serde_json::json!({"x": 1.5, "y": -2.5})
+            serde_json::json!({"x": 2, "y": -3})
         );
+    }
+
+    #[test]
+    fn a_position_clamps_out_of_range_instead_of_overflowing() {
+        assert_eq!(
+            Position::new(99999.0, -99999.0),
+            Position::new(32767.0, -32768.0)
+        );
+        assert_eq!(
+            Position::new(f64::MAX, f64::MIN),
+            Position::new(32767.0, -32768.0)
+        );
+    }
+
+    #[test]
+    fn a_position_rounds_on_the_way_in_from_json() {
+        let p: Position =
+            serde_json::from_value(serde_json::json!({"x": 10.6, "y": -10.6})).unwrap();
+        assert_eq!(p, Position::new(11.0, -11.0));
+    }
+
+    #[test]
+    fn a_position_still_denies_unknown_fields() {
+        let r: Result<Position, _> =
+            serde_json::from_value(serde_json::json!({"x": 1, "y": 2, "z": 3}));
+        assert!(r.is_err());
     }
 
     #[test]
