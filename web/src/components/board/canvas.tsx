@@ -401,7 +401,10 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
             <p className="mb-2 text-meta">
               Where do this tool&apos;s requests go? Every operation is resolved against it.
             </p>
+            {/* POST for the same reason as every other form here: a submission that happens
+                before React attaches must not be able to put fields in a URL. */}
             <form
+              method="post"
               onSubmit={(e) => {
                 e.preventDefault();
                 const url = toolUrl.trim();

@@ -74,7 +74,12 @@ export function VaultPanel({
         )}
       </div>
 
+      {/* No input here carries a `name`, so a pre-hydration submit serialises nothing today. That
+          is one attribute away from being false — adding name="value" for a password manager
+          would put a vault secret in the query string, which is exactly how the sign-in form
+          leaked a password. method="post" makes the dangerous default unreachable. */}
       <form
+        method="post"
         className="flex flex-col gap-3 border-t border-rule pt-4"
         data-testid="vault-add-form"
         onSubmit={(e) => {

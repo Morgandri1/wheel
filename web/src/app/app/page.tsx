@@ -203,7 +203,10 @@ export default function ProjectsPage() {
       </main>
 
       <Dialog open={creating} onClose={() => setCreating(false)} title="New project" testId="dialog-new-project">
+        {/* POST so a submission before hydration cannot serialise fields into the URL. Nothing
+            here is secret today; the point is that the leak-shaped default never applies. */}
         <form
+          method="post"
           onSubmit={(e) => {
             e.preventDefault();
             if (name.trim()) create.mutate(name.trim());
