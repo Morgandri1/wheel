@@ -28,6 +28,7 @@ export function OauthPanel({
   api,
   nodeId,
   vaults,
+  defaultVault,
   onAuthenticated,
   onShareNote,
 }: {
@@ -35,6 +36,11 @@ export function OauthPanel({
   nodeId: string;
   /** Vaults this agent has a read wire to — the only places a login may be shared. */
   vaults: string[];
+  /**
+   * Preselected share target. Signing in again on an agent whose credential already comes FROM a
+   * vault almost always means replacing that vault's value, not shadowing it with a private copy.
+   */
+  defaultVault?: string;
   onAuthenticated: () => void;
   /**
    * Hand the vault warning to the parent. A successful sign-in unmounts this panel in favour of
@@ -48,7 +54,7 @@ export function OauthPanel({
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [code, setCode] = useState("");
-  const [vault, setVault] = useState("");
+  const [vault, setVault] = useState(defaultVault ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
