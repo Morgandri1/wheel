@@ -62,15 +62,25 @@ container image" — see the note at the top of this file for exactly what that 
    process backend (does the HOST really set `WHEEL_DATA_DIR` per-project the way `host/sandbox/process.rs:119`
    claims) — that's an integration fact about the host+engine running together, not something a `wheel-engine`
    unit test can settle, and I have no process-backend host to run it against here.
-4. **028 face 5 (PM's ruling: declared-but-empty key should WARN, not 409-block) — STILL NOT IMPLEMENTED.**
-   `find_ambiguity` (`vault.rs:96`) still uses `offered_keys` (declared ∪ stored) with no distinction for
-   "declared but never stored," and both callers (`db/board.rs:294` at wire-creation, `api/mod.rs:98` mapping
-   `Ambiguous` to `ApiError`) still turn that into a hard `409 ambiguous_credential`, unconditionally. Ran
-   `vault::tests::a_declared_key_is_still_enough_to_be_ambiguous` fresh from HEAD: **PASS** — meaning the test
-   still asserts (and gets) the OLD blocking behavior PM overruled. `docs/handoff/sdk.md`'s own NEXT list (#4,
-   as of the version I read) independently confirms this is queued but not started. Face 1 (declared-but-empty
-   ≠ authenticated) remains correctly fixed — `a_declared_key_with_no_value_is_not_a_credential`: **PASS**.
-   **This is the one real acceptance-test gap left open of the four PM asked me to check.**
+4. **028 face 5 (PM's ruling: declared-but-empty key should WARN, not 409-block) — NOT on `main` as of
+   `1aa77ac`, but SDK's fix is ready and I independently verified it on their unmerged commit.** At `1aa77ac`,
+   `find_ambiguity` (`vault.rs:96`) still used `offered_keys` (declared ∪ stored) with no distinction for
+   "declared but never stored," and both callers (`db/board.rs:294`, `api/mod.rs:98`) still turned that into a
+   hard `409 ambiguous_credential`, unconditionally — confirmed by running
+   `vault::tests::a_declared_key_is_still_enough_to_be_ambiguous` fresh (PASS, meaning the OLD blocking
+   behavior). SDK then shipped `aa8be54` (handoff `db5f6c2`, unmerged as of this writing): I checked it out and
+   built it myself. `find_ambiguity` is now stored-only (`list_keys`) so a REAL clash (both vaults hold a
+   value) still 409s; a separate `find_declared_overlap` (declared-only) feeds a non-blocking `warning` that
+   `db/board.rs::add_wire` returns alongside the created wire, surfaced by `POST /v1/wires` as
+   `200 {"warning": "..."}`. Ran `a_declared_but_empty_key_does_not_block_the_vault_with_the_real_value`: PASS.
+   This is a correct, clean implementation of PM's ruling — good to merge as far as I can tell. Face 1
+   (declared-but-empty ≠ authenticated) remains correctly fixed on `main` —
+   `a_declared_key_with_no_value_is_not_a_credential`: **PASS**.
+5. **023 (importer YAML-bomb) — already FIXED on `main`, re-confirmed.** All 21 `tools::import::tests::*`
+   pass fresh from HEAD, including `a_yaml_bomb_is_refused_before_it_is_expanded`,
+   `an_anchor_alone_is_refused_too`, and `an_oversized_document_is_refused_without_being_parsed`. The finding
+   file's own status line already said FIXED; I re-ran it myself rather than take that on faith given how much
+   this file itself had drifted from reality earlier today.
 
 ## STILL BLOCKED on external deps (run when they exist)
 - **Cross-tenant process backend (F003/F007), intra-project half now observed live (finding 036).** The
