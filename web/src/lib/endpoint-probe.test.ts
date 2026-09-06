@@ -54,29 +54,47 @@ describe("probing an endpoint's public URL", () => {
  * path wrong". Those two readings send someone to completely different places for an hour.
  */
 describe("what a status code is allowed to claim", () => {
-  it("refuses to let a bare 404 read as a bad path, because today it never is one", () => {
-    const verdict = probeVerdict(404);
+  it("refuses to let a bodiless 404 read as a bad path, because today it never is one", () => {
+    const verdict = probeVerdict({ status: 404 });
     expect(verdict).toMatch(/not built yet/i);
     expect(verdict).toMatch(/does not mean your path is wrong/i);
   });
 
+  /**
+   * API turns a BODILESS 404 into 501 ingress_unavailable — an engine with no /ingress/* route at
+   * all — and passes a 404 the engine wrote straight through. Excusing the second as "not built
+   * yet" would tell someone their wrong path is fine, which is this button's own bug inverted.
+   */
+  it("does not excuse a 404 the engine actually wrote as a missing feature", () => {
+    const verdict = probeVerdict({ status: 404, body: "<html>no such route</html>" });
+    expect(verdict).toMatch(/real answer about this path/i);
+    expect(verdict).not.toMatch(/not built yet/i);
+    expect(verdict).not.toMatch(/does not mean your path is wrong/i);
+  });
+
+  it("says so plainly when the engine names the path as the problem", () => {
+    expect(probeVerdict({ status: 404, code: "no_such_endpoint" })).toMatch(/no endpoint at this path/i);
+  });
+
   it("uses the engine's own words once the API sends a code", () => {
-    expect(probeVerdict(501, "ingress_unavailable")).toBe(
+    expect(probeVerdict({ status: 501, code: "ingress_unavailable" })).toBe(
       "This project's engine does not serve endpoints yet.",
     );
     // The code outranks the status: a code is a fact, a status is an inference.
-    expect(probeVerdict(404, "ingress_unavailable")).toMatch(/does not serve endpoints yet/i);
+    expect(probeVerdict({ status: 404, code: "ingress_unavailable" })).toMatch(
+      /does not serve endpoints yet/i,
+    );
   });
 
   it("distinguishes the capability being off from nothing being served", () => {
-    expect(probeVerdict(403)).toMatch(/public HTTP is off/i);
-    expect(probeVerdict(404)).toMatch(/not built yet/i);
+    expect(probeVerdict({ status: 403 })).toMatch(/public HTTP is off/i);
+    expect(probeVerdict({ status: 404 })).toMatch(/not built yet/i);
   });
 
   it("only says the endpoint answered when it actually did", () => {
-    expect(probeVerdict(200)).toBe("The endpoint answered.");
-    for (const s of [403, 404, 405, 500, 501]) {
-      expect(probeVerdict(s)).not.toBe("The endpoint answered.");
+    expect(probeVerdict({ status: 200 })).toBe("The endpoint answered.");
+    for (const status of [403, 404, 405, 500, 501]) {
+      expect(probeVerdict({ status })).not.toBe("The endpoint answered.");
     }
   });
 
