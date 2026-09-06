@@ -33,6 +33,8 @@ enum Engine {
     NoSuchEndpoint,
     /// An endpoint answered.
     Answers,
+    /// A webhook hit was accepted: the engine enqueued it for the wired agents.
+    AcceptsWebhook,
 }
 
 async fn mock_engine(behaviour: Engine) -> String {
@@ -48,6 +50,11 @@ async fn mock_engine(behaviour: Engine) -> String {
                 )
                     .into_response(),
                 Engine::Answers => (StatusCode::OK, "hello").into_response(),
+                Engine::AcceptsWebhook => (
+                    StatusCode::ACCEPTED,
+                    axum::Json(json!({"accepted": true, "queued": 1})),
+                )
+                    .into_response(),
             }
         })
         .with_state(behaviour);
@@ -219,4 +226,32 @@ async fn a_working_endpoint_is_untouched() {
     let (status, body) = hit(&app, &id).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"hello");
+}
+
+/// The 202 body is the engine's report, and it crosses this proxy unchanged.
+///
+/// `queued` is the honest count: at the moment the response is written the messages have been
+/// enqueued and nothing has been delivered — the pump is asynchronous, and an agent may be parked,
+/// unauthenticated or mid-turn. The field said `delivered` once, and production answered
+/// `delivered: 1` for a message that never reached a child. A webhook provider reads that, marks
+/// the hook succeeded and never retries.
+///
+/// The API cannot police a word the engine chooses. What it can guarantee, and what this pins, is
+/// that the proxy is never the layer that inflates the claim: the status and the bytes are the
+/// engine's own.
+#[tokio::test]
+async fn an_accepted_webhook_reports_what_was_queued_not_what_was_delivered() {
+    let app = app(Engine::AcceptsWebhook).await;
+    let id = project_with_ingress(&app).await;
+
+    let (status, body) = hit(&app, &id).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "202 is the honest status");
+
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["accepted"], true);
+    assert_eq!(v["queued"], 1);
+    assert!(
+        v.get("delivered").is_none(),
+        "nothing has been delivered when this response is written: {v}"
+    );
 }
