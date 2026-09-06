@@ -85,19 +85,39 @@ def main():
             "or another service on the domain answers 200 just as happily: %r"
             % (base, path, status, body))
 
+    # API merged the proxied liveness route (b2da35a), so this no longer needs configuring
+    # by hand: it hangs off the API base at a known path. The env var stays an override.
+    api_base = (os.environ.get("WHEEL_DEPLOY_API") or "").strip().rstrip("/")
     host_url = (os.environ.get("WHEEL_DEPLOY_HOST") or "").strip()
+    if not host_url and api_base:
+        host_url = api_base + "/v1/host/healthz"
+
     if not host_url:
-        # wheel-host has no public domain by design (§5b), so it can only be reached
-        # through an API-proxied liveness route. Skipped BY NAME rather than quietly
-        # dropped: the host is the process that holds every project's engine secret, and
-        # "we never checked it" must not read the same as "it is fine".
+        # Skipped BY NAME rather than quietly dropped: the host holds every project's
+        # engine secret, and "we never checked it" must not read like "it is fine".
         R.skip("DEPLOY-healthz-host",
-               "no API-proxied host liveness route yet (API owns it); the host has no "
-               "public domain, so nothing outside can reach it directly")
+               "no deployed API base (set WHEEL_DEPLOY_API) — the host has no public "
+               "domain, so it is reachable only through the API's proxied route")
     else:
         status, body = get(host_url)
-        R.check("DEPLOY-healthz-host", status == 200,
-                "GET %s -> %s %s" % (host_url, status, body))
+        # A green API does NOT imply a green host: the API stayed healthy through an outage
+        # where the host was stopped and every project create hung. That is why this route
+        # exists, so the check must hit the HOST path and never settle for /healthz.
+        ok = R.check("DEPLOY-healthz-host", status == 200,
+                     "GET %s -> %s %s" % (host_url, status, body))
+        if ok:
+            # Liveness ONLY. The route is unauthenticated by design, so whatever it says is
+            # said to the whole internet: which sandbox backend is in use, how many projects
+            # are running, or an upstream error string are each free reconnaissance. API
+            # withheld all three deliberately; this is the check that it stays that way,
+            # because the tempting next commit is "include the reason so we can debug it".
+            text = body.lower() if isinstance(body, str) else json.dumps(body).lower()
+            leaks = [w for w in ("docker", "process", "railway", "projects_running",
+                                 "backend", "traceback", "refused", "timed out", "secret")
+                     if w in text]
+            R.check("DEPLOY-healthz-host/liveness-only", not leaks,
+                    "the unauthenticated host liveness route disclosed %s in %r — it may "
+                    "say whether the pair is serving, and nothing else" % (sorted(leaks), body))
 
     return R.report("deploy-healthcheck")
 
