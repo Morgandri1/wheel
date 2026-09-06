@@ -230,7 +230,8 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `WHEEL_ENV` | no | `prod` | `dev` or `prod`. Anything else refuses to boot. Unset means prod. |
-| `DATABASE_URL` | yes | — | Postgres. |
+| `STORE` | yes* | — | `postgres://…` or `sqlite://path/to/wheel.db`. The scheme picks the backend, so there is no mode flag that can disagree with the connection string. |
+| `DATABASE_URL` | yes* | — | Accepted as an alias for `STORE`; production, the compose stack and every deploy already set it. (*one of the two is required.) |
 | `CLERK_JWKS_URL`, `CLERK_ISSUER` | yes | — | |
 | `CLERK_AZP` | no | — | Comma-separated `azp` allowlist. |
 | `API_MASTER_KEY` | yes | — | 32 bytes, base64. `openssl rand -base64 32`. |
@@ -242,6 +243,7 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `INGRESS_RATE_PER_MIN` | no | `60` | `0` disables. |
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
+| `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
 
 ### The dev-bypass interlock
 
@@ -251,6 +253,53 @@ is a complete authentication bypass, deliberately, for local testing.
 **If it is set while `WHEEL_ENV` is not `dev`, the process refuses to start.** An unset `WHEEL_ENV`
 counts as prod, because in practice nobody sets `WHEEL_ENV=prod` by hand — they just don't set it,
 and that must not be the permissive case. Covered by `tests/config_interlock.rs`.
+
+### Why connecting and responding have different timeouts
+
+A slow *response* is normal: a project start legitimately blocks while an engine boots. A slow
+*connect* means the host is not there, and waiting does not help. They were once the same 30s, and
+when the host went down, `POST /v1/projects` sat for the full request timeout until the platform
+edge returned its own 502 — so the browser got an edge error page instead of our error envelope and
+the UI simply hung. Connect now gives up after `HOST_CONNECT_TIMEOUT_SECS`, and the outage is
+reported as a project in `error` state with a body the client can read.
+
+### Two backends, one API
+
+Postgres is production. SQLite exists so a local or open-source install has no dependency to stand
+up first — it is what `wheeld` uses by default, and it is a real backend rather than a stub: the
+same routes, the same migrations in `migrations_sqlite/`, and the DB-backed test suites run against
+both so parity is proven rather than assumed.
+
+Where the SQL differs it is written out per dialect, with `Db::pick` choosing between two named
+statements rather than a string being assembled. The differences are deliberate rather than
+incidental:
+
+* **The rate limiters.** The window boundary comes from the *database* clock on both, because the
+  API runs as N replicas whose own clocks may differ by seconds and a boundary they disagree about
+  is a limit that admits more than it says. Postgres truncates with `date_trunc`; SQLite has no
+  such function and uses `strftime` to the same effect.
+* **Timestamps stay on the database side.** SQLite has no `now()`, and its `CURRENT_TIMESTAMP` is a
+  different text format from the one the driver writes — comparing against that would be a
+  lexicographic accident rather than a comparison. The SQLite statements use
+  `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`, which produces exactly the format stored, so both
+  backends keep reading the clock the rows were written against.
+
+A duplicate-email signup is a 409 on both, which needs saying because the two report the constraint
+differently (`23505` vs `2067`/`1555`); without that mapping a local install would answer 500 where
+production answers 409, and "works locally" would stop meaning anything.
+
+### The production identity-provider interlock
+
+Under `AUTH_MODE=jwks` with `WHEEL_ENV=prod`, `CLERK_JWKS_URL` and `CLERK_ISSUER` must both be
+`https://` and must not point at loopback, RFC1918, link-local, unique-local IPv6, or a `.local` /
+`.internal` name. Otherwise the process refuses to start.
+
+This is not tidiness. A stub identity provider does not fail closed — it authenticates everyone, as
+whoever the caller claims to be, and the ownership checks then work perfectly against an identity
+the attacker chose (ADVERSARY 017, where a mock-auth build resolved every token to a single
+`owner_id`). Boot is the only place to catch it. Dev is unaffected: pointing at a local issuer is
+exactly what dev is for. The host is checked as a literal, without DNS — boot is not the place to
+trust a resolver, and a name that resolves publicly today may not tomorrow.
 
 ## CORS
 
