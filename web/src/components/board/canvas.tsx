@@ -7,7 +7,6 @@ import {
   MiniMap,
   ReactFlow,
   ReactFlowProvider,
-  applyNodeChanges,
   useReactFlow,
   type Connection,
   type Edge,
@@ -55,6 +54,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
 
   /** Positions being dragged right now; they win over the server's copy until drag ends. */
   const [dragged, setDragged] = useState<Record<string, Position>>({});
+  const [measured, setMeasured] = useState<Record<string, { width: number; height: number }>>({});
   const [confirmDelete, setConfirmDelete] = useState<WheelNode | null>(null);
   const [pendingTool, setPendingTool] = useState<{ position: Position } | null>(null);
   const [toolUrl, setToolUrl] = useState("");
@@ -80,6 +80,9 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
         type: "plate",
         position: dragged[n.id] ?? n.position,
         selected: n.id === selectedNodeId,
+        // The minimap sizes its rects from the node objects we pass, not from xyflow's internal
+        // measurements, so a node without `measured` is simply absent from it.
+        measured: measured[n.id],
         data: {
           node: n,
           takenNames,
@@ -88,7 +91,7 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
           onAuthenticate: select,
         } satisfies PlateData,
       })),
-    [nodes, dragged, selectedNodeId, takenNames, rename, openTab, select],
+    [nodes, dragged, measured, selectedNodeId, takenNames, rename, openTab, select],
   );
 
   const removeWire = useCallback(
@@ -130,15 +133,16 @@ function CanvasInner({ nodes, api, onChanged }: CanvasProps) {
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       const positions: Record<string, Position> = {};
+      const sizes: Record<string, { width: number; height: number }> = {};
       for (const c of changes) {
         if (c.type === "position" && c.position) positions[c.id] = c.position;
         if (c.type === "select" && c.selected) select(c.id);
+        if (c.type === "dimensions" && c.dimensions) sizes[c.id] = c.dimensions;
       }
       if (Object.keys(positions).length) setDragged((prev) => ({ ...prev, ...positions }));
-      // Keep xyflow's internal bookkeeping (dimensions, z-index) in step.
-      void applyNodeChanges(changes, rfNodes);
+      if (Object.keys(sizes).length) setMeasured((prev) => ({ ...prev, ...sizes }));
     },
-    [rfNodes, select],
+    [select],
   );
 
   const onNodeDragStop = useCallback(
