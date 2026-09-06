@@ -158,6 +158,14 @@ pub struct AuthStatus {
     /// Display-only account identifier (e.g. an email). Never a token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// When the stored credential stops working, if it is the kind that does.
+    ///
+    /// `None` means durable OR unknown -- those are not the same thing, and
+    /// the engine will not guess. A session credential copied into a vault
+    /// expires for every agent reading that vault at once, so the UI needs
+    /// this to say "re-login by ..." before it lapses rather than after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<crate::timestamp::Timestamp>,
 }
 
 /// What kind of credential an agent node holds.
@@ -395,6 +403,7 @@ mod tests {
             mode: None,
             source: None,
             account: None,
+            expires_at: None,
         };
         let v = serde_json::to_value(&none).unwrap();
         assert_eq!(v["authenticated"], false);
@@ -408,10 +417,26 @@ mod tests {
             mode: Some(CredentialKind::Env),
             source: Some("anthropic-personal".into()),
             account: None,
+            expires_at: None,
         };
         let v = serde_json::to_value(&from_vault).unwrap();
         assert_eq!(v["mode"], "env");
         assert_eq!(v["source"], "anthropic-personal");
+        // Absent means durable OR unknown. It must be OMITTED rather than
+        // sent as null, so a UI cannot mistake "we were not told" for a
+        // deadline it should render.
+        assert!(v.get("expires_at").is_none(), "{v}");
+
+        // ...and when there IS a deadline it is RFC3339, because the UI shows
+        // it to a person.
+        let expiring = AuthStatus {
+            expires_at: Some(
+                crate::timestamp::Timestamp::parse_rfc3339("2026-09-06T12:00:00Z").unwrap(),
+            ),
+            ..from_vault
+        };
+        let v = serde_json::to_value(&expiring).unwrap();
+        assert_eq!(v["expires_at"], "2026-09-06T12:00:00Z");
     }
 
     /// These three names decide what counts as a credential, and therefore

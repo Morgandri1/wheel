@@ -56,6 +56,18 @@ Every non-2xx response from every route:
 | `conflict` | 409 | Illegal state transition (e.g. `auth/complete` for a finished session). |
 | `harness_error` | 502 | The agent's CLI failed in a way the engine could not recover. |
 | `timeout` | 504 | Script/query exceeded its deadline. |
+| `conflict`/`expired` | 409 | `auth/complete` with no login in flight, an expired one, or a superseded `session`. |
+| `ambiguous_credential` | 409 | Two vaults an agent can read supply the same key. Names both vaults and the key. |
+| `config` | 503 | The engine cannot do this because of how it was STARTED (e.g. no `WHEEL_VAULT_KEY`). Names the variable. Not the caller's fault and not retryable without an operator. |
+| `agent_running` | 409 | Rename of an agent that is running or starting. Stop or park it first. |
+| `internal` | 500 | A fault in the engine. Anything else is a code above; a 500 is a bug worth reporting. |
+
+**Every error response carries a body**, always the same shape — there is no code that returns a bare
+status. Clients can render `error.message` verbatim for every one of them:
+
+```json
+{ "error": { "code": "wire_denied", "message": "no wire from worker to secrets (need: read)" } }
+```
 
 `wire_denied` is also emitted as a `wire.denied` WS event so denials are visible in the UI and to QA/ADVERSARY,
 not silent.
@@ -201,8 +213,18 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 | `GET /v1/agents/:id/auth` | → `AuthStatus {authenticated, mode, account?}` | **M1** |
 | `DELETE /v1/agents/:id/auth` | → `204`, forgets the stored credential | **M1** |
 
-**`mode` is `CredentialKind`**: `"api_key"` · `"oauth_token"` · `"oauth_session"` · `null` when nothing is
-stored. It says what kind of credential the node holds, which is a different axis from `AuthMode` on
+**`expires_at`** (RFC3339, omitted when absent) says when the stored credential stops working. It is
+reported for `mode: "env"` (from the vault row the credential was stored on) and for
+`mode: "oauth_session"` (from the harness's own store, which is the same file the child reads).
+
+**Absent means durable OR unknown — those are not the same thing, and the engine will not guess.** A UI
+must not render a deadline when the field is missing. When it IS present and in the past, the agent will
+not start: `POST /v1/agents/:id/start` returns `needs_auth` with a `last_error` naming the vault and the
+durable fix, and no child process is spawned — the operator sees the one status they can act on instead
+of a harness failing on its first request.
+
+**`mode` is `CredentialKind`**: `"api_key"` · `"oauth_token"` · `"oauth_session"` · `"env"` · `null` when
+nothing is stored. It says what kind of credential the node holds, which is a different axis from `AuthMode` on
 `auth/begin` (how one is *obtained*) — the two share a field name and nothing else.
 
 #### Paste-code OAuth (`claude`)

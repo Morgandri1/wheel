@@ -208,6 +208,26 @@ impl Supervisor {
             .ok_or(self.vault_key_error.unwrap_or(NO_VAULT_KEY))
     }
 
+    /// Why this agent cannot start on the credential it holds, if that is
+    /// already known.
+    ///
+    /// Only an expiry the store actually recorded counts. A credential with no
+    /// recorded expiry is treated as usable -- "we were not told" is not the
+    /// same as "it has lapsed", and refusing to start on a guess would strand
+    /// an agent whose credential is fine.
+    fn lapsed_credential(&self, agent: Uuid, harness: wheel_core::Harness) -> Option<String> {
+        let conn = self.db.lock().ok()?;
+        let (vault, _key, expires_at) =
+            crate::vault::credential_detail(&conn, agent, harness).ok()??;
+        let expires_at = expires_at?;
+        (expires_at.into_inner() <= time::OffsetDateTime::now_utc()).then(|| {
+            format!(
+                "the credential from vault {vault} expired at {expires_at}; \
+                 sign in again, or store a `claude setup-token` token which does not expire"
+            )
+        })
+    }
+
     pub fn events(&self) -> &Arc<crate::events::Bus> {
         &self.events
     }
@@ -250,6 +270,16 @@ impl Supervisor {
             .as_agent()
             .ok_or_else(|| anyhow::anyhow!("not an agent config"))?
             .clone();
+
+        // A credential that has already lapsed fails on the child's first
+        // request, and the harness reports that as its own confusing error --
+        // so the operator sees a broken agent rather than one that needs a
+        // login. Checking before we spawn turns it into the one status they
+        // can act on, without burning a process to discover it.
+        if let Some(reason) = self.lapsed_credential(agent, agent_cfg.harness) {
+            self.set_status(agent, AgentStatus::NeedsAuth, Some(reason));
+            return Ok(AgentStatus::NeedsAuth);
+        }
 
         let run_dir = self.cfg.node_run_dir(agent);
         std::fs::create_dir_all(&run_dir)?;
@@ -1244,6 +1274,98 @@ mod tests {
             "these spawn a child without env_clear -- use supervisor::child_command:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// PM/Web: a lapsed credential must surface as `needs_auth`, cleanly.
+    ///
+    /// A session credential copied into a vault expires for every agent
+    /// reading it at once. Spawning anyway means the harness fails on its
+    /// first request and reports something of its own devising, so the
+    /// operator sees a broken agent instead of one that needs a login -- and
+    /// pays for a process to find that out.
+    #[tokio::test]
+    async fn an_expired_vault_credential_is_needs_auth_before_anything_spawns() {
+        let (sup, id, dir) = shim_supervisor("lapsed", ECHO_HARNESS);
+
+        let vk = {
+            use base64::Engine as _;
+            crate::vault::VaultKey::from_base64(
+                &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+            )
+            .unwrap()
+        };
+        {
+            let conn = sup.db.lock().unwrap();
+            let v = wheel_core::Node::new(
+                Uuid::new_v4(),
+                "anthropic".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Vault(wheel_core::VaultConfig { keys: vec![] }),
+            );
+            board::create(&conn, &v).unwrap();
+            board::add_wire(&conn, id, v.id, wheel_core::WireType::Read, None).unwrap();
+            let past = wheel_core::Timestamp::parse_rfc3339("2020-01-01T00:00:00Z").unwrap();
+            crate::vault::put_with_expiry(
+                &conn,
+                &vk,
+                v.id,
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "stale",
+                Some(past),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(sup.start(id).await.unwrap(), AgentStatus::NeedsAuth);
+        assert_eq!(status_of(&sup, id), AgentStatus::NeedsAuth);
+        assert_eq!(
+            runs(&dir),
+            0,
+            "an expired credential must not spawn a child"
+        );
+
+        // The operator is told which vault, and what to do about it.
+        let err = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap().last_error.unwrap()
+        };
+        assert!(err.contains("anthropic"), "name the vault: {err}");
+        assert!(err.contains("setup-token"), "name the durable fix: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ...and a credential with NO recorded expiry starts normally. "Nobody
+    /// told us" is not "it has lapsed", and refusing on a guess would strand
+    /// an agent whose credential is perfectly good.
+    #[tokio::test]
+    async fn a_credential_without_a_recorded_expiry_still_starts() {
+        let (sup, id, dir) = shim_supervisor("no-expiry", ECHO_HARNESS);
+
+        let vk = {
+            use base64::Engine as _;
+            crate::vault::VaultKey::from_base64(
+                &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+            )
+            .unwrap()
+        };
+        {
+            let conn = sup.db.lock().unwrap();
+            let v = wheel_core::Node::new(
+                Uuid::new_v4(),
+                "anthropic".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Vault(wheel_core::VaultConfig { keys: vec![] }),
+            );
+            board::create(&conn, &v).unwrap();
+            board::add_wire(&conn, id, v.id, wheel_core::WireType::Read, None).unwrap();
+            crate::vault::put(&conn, &vk, v.id, "CLAUDE_CODE_OAUTH_TOKEN", "fine").unwrap();
+        }
+
+        assert_ne!(sup.start(id).await.unwrap(), AgentStatus::NeedsAuth);
+        until("the child to start", || runs(&dir) == 1).await;
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A harness that records the environment it was actually given.

@@ -67,6 +67,22 @@ pub(crate) fn store_in_vault(
     key: &str,
     value: &str,
 ) -> ApiResult<()> {
+    store_in_vault_until(s, conn, vault, key, value, None)
+}
+
+/// As above, recording when the value stops working.
+///
+/// A credential lifted out of a login carries an expiry, and the UI can only
+/// warn before it lapses if the expiry is stored beside the value it belongs
+/// to.
+pub(crate) fn store_in_vault_until(
+    s: &AppState,
+    conn: &rusqlite::Connection,
+    vault: Uuid,
+    key: &str,
+    value: &str,
+    expires_at: Option<wheel_core::Timestamp>,
+) -> ApiResult<()> {
     let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
 
     let node = board::get(conn, vault)
@@ -107,7 +123,7 @@ pub(crate) fn store_in_vault(
         }
     }
 
-    crate::vault::put(conn, vk, vault, key, value)
+    crate::vault::put_with_expiry(conn, vk, vault, key, value, expires_at)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // Keep the declared key list in step with what is stored, so the UI and

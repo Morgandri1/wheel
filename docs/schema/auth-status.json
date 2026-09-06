@@ -18,6 +18,17 @@
       "description": "Whether credentials are STORED. Not whether they work: only the harness's own probe can say that, and claiming otherwise would tell an operator they are fine right up until the first request fails.",
       "type": "boolean"
     },
+    "expires_at": {
+      "description": "When the stored credential stops working, if it is the kind that does.\n\n`None` means durable OR unknown -- those are not the same thing, and the engine will not guess. A session credential copied into a vault expires for every agent reading that vault at once, so the UI needs this to say \"re-login by ...\" before it lapses rather than after.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "mode": {
       "description": "Which kind of credential is stored, or `null` when there is none.",
       "anyOf": [
@@ -27,6 +38,13 @@
         {
           "type": "null"
         }
+      ]
+    },
+    "source": {
+      "description": "For `mode: \"env\"`, the name of the vault node supplying it. Never the value.",
+      "type": [
+        "string",
+        "null"
       ]
     }
   },
@@ -54,8 +72,20 @@
           "enum": [
             "oauth_session"
           ]
+        },
+        {
+          "description": "Supplied by a wired `vault` node and exported into the child's environment at spawn. This is how one project runs several accounts of the same provider: one vault per account, and an agent uses the vault it has a read wire to.",
+          "type": "string",
+          "enum": [
+            "env"
+          ]
         }
       ]
+    },
+    "Timestamp": {
+      "description": "RFC3339 UTC timestamp, e.g. 2026-09-05T00:21:00Z",
+      "type": "string",
+      "format": "date-time"
     }
   }
 }
