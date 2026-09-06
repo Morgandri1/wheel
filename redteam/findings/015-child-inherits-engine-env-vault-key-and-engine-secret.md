@@ -96,6 +96,11 @@ secret-bearing** in a standard deployment: the SSL/CA three are file PATHS, the 
 proxy credential cannot ride into an untrusted child — good. Recommendation: keep it a hard-coded
 `const`, never pattern-derived, and route any future addition past red-team. No change required.
 
+**STANDING WATCH (SDK directive, 2026-09-05):** a credential-embedding proxy URL
+(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` = `http://user:pass@host`) is *exactly* the kind of variable that
+looks like platform config but carries a secret. If any of these is ever added to `INHERITED_ENV`, that is
+a **finding**, not a config change — file it and block the merge.
+
 ## Detector-correction note (why the original PoCs over-report on a FIXED build)
 `run_env_inheritance.sh` and `run_env_exploit.sh` sweep every PID in `/proc` (skipping only PID 1) for
 the secret. On a fixed build the ONLY process that still matches is their own `docker exec` probe shell:
