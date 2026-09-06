@@ -246,19 +246,28 @@ export function AuthFlow({
         onShareNote={setShareNote}
       />
 
-      <div className="border-t border-rule pt-2.5">
-        <button
-          type="button"
-          className="text-micro text-ink-faint underline"
-          data-testid="btn-auth-other-ways"
-          onClick={() => setShowOther((v) => !v)}
-        >
-          {showOther ? "Hide other ways to sign in" : "Other ways to sign in"}
-        </button>
-      </div>
+      {/* While replacing a credential the section is already open BECAUSE the person asked for it,
+          so the toggle would be a control whose label disagrees with what is on screen: it would
+          read "Other ways to sign in" above an open panel, and the first click would appear to do
+          nothing. QA hit the mirror image of this in the spec — a bare toggle is only honest when
+          it is the sole owner of the state it describes. */}
+      {replacing ? null : (
+        <div className="border-t border-rule pt-2.5">
+          <button
+            type="button"
+            className="text-micro text-ink-faint underline"
+            data-testid="btn-auth-other-ways"
+            aria-expanded={showOther}
+            aria-controls="auth-other-ways"
+            onClick={() => setShowOther((v) => !v)}
+          >
+            {showOther ? "Hide other ways to sign in" : "Other ways to sign in"}
+          </button>
+        </div>
+      )}
 
       {showOther || replacing ? (
-        <div className="flex flex-col gap-3" data-testid="auth-other-ways">
+        <div className="flex flex-col gap-3" id="auth-other-ways" data-testid="auth-other-ways">
           <Field
             label="Setup token"
             hint="From `claude setup-token` on a machine that has the CLI. Starts with sk-ant-oat."
