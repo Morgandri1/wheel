@@ -113,14 +113,19 @@ pub async fn create(
     // Provision outside the transaction: sandbox creation is not transactional, and holding a pg
     // transaction open across it would pin a connection for seconds.
     let mut project: Project = row.into();
-    if let Err(e) = state.orch.provision(&id, &secrets).await {
-        tracing::error!(project_id = %id, error = ?e, "provisioning failed after row insert");
-        set_status(&state, &id, ProjectStatus::Error).await?;
-        // Report what we just persisted. Returning the pre-update row would tell the caller
-        // "stopped" while the database says "error", and the UI would offer a Start button for a
-        // project that has no sandbox to start.
-        project.status = ProjectStatus::Error;
-    }
+    project.status = match state.orch.provision(&id, &secrets).await {
+        // A new project comes up running (ARCHITECTURE M1: "create project -> sandbox starts"). The
+        // first thing anyone does after signing up is create a project, and a project whose engine
+        // answers nothing is indistinguishable from a broken install.
+        Ok(()) => start_and_observe(&state, &id)
+            .await
+            .unwrap_or(ProjectStatus::Error),
+        Err(e) => {
+            tracing::error!(project_id = %id, error = ?e, "provisioning failed after row insert");
+            set_status(&state, &id, ProjectStatus::Error).await?;
+            ProjectStatus::Error
+        }
+    };
 
     Ok((axum::http::StatusCode::CREATED, Json(project)))
 }
@@ -246,32 +251,39 @@ async fn reprovision(state: &AppState, id: &Uuid) -> ApiResult<()> {
 
 pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
     reprovision(&state, &scope.project.id).await?;
-    set_status(&state, &scope.project.id, ProjectStatus::Starting).await?;
-    state
-        .orch
-        .start(&scope.project.id)
-        .await
-        .map_err(ApiError::Internal)?;
-    // A start that the host reported as successful, followed by a status of `stopped`, is not a
-    // stopped project — it is an inconsistency between the two, and reporting "stopped" invites the
-    // caller to sit in a poll loop that will never terminate. Surface it as `error` so the UI shows
-    // something is wrong instead of something is pending.
-    let observed = match state.orch.status(&scope.project.id).await {
+    start_and_observe(&state, &scope.project.id).await?;
+    reload(&state, &scope).await
+}
+
+/// Start a project's sandbox and persist the status the runtime actually reports.
+///
+/// A start the host accepted, followed by a status of `stopped`, is not a stopped project — it is a
+/// disagreement between the two, and reporting "stopped" invites the caller into a poll loop that
+/// will never terminate. It reads as `error`, so the UI shows something is wrong rather than
+/// something is pending.
+async fn start_and_observe(state: &AppState, id: &Uuid) -> ApiResult<ProjectStatus> {
+    set_status(state, id, ProjectStatus::Starting).await?;
+    if let Err(e) = state.orch.start(id).await {
+        tracing::error!(project_id = %id, error = ?e, "starting the sandbox failed");
+        set_status(state, id, ProjectStatus::Error).await?;
+        return Err(ApiError::Internal(e));
+    }
+    let observed = match state.orch.status(id).await {
         Ok(ProjectStatus::Stopped) => {
             tracing::warn!(
-                project_id = %scope.project.id,
+                project_id = %id,
                 "host reported a successful start but the sandbox is still stopped"
             );
             ProjectStatus::Error
         }
         Ok(other) => other,
         Err(e) => {
-            tracing::warn!(project_id = %scope.project.id, error = ?e, "status probe after start failed");
+            tracing::warn!(project_id = %id, error = ?e, "status probe after start failed");
             ProjectStatus::Starting
         }
     };
-    set_status(&state, &scope.project.id, observed).await?;
-    reload(&state, &scope).await
+    set_status(state, id, observed).await?;
+    Ok(observed)
 }
 
 pub async fn stop(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {

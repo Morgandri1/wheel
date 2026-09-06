@@ -38,13 +38,37 @@ pub struct HostState {
     /// Throttles failed bearer attempts per peer (ADVERSARY: :7100 needs a rate limit as well as
     /// a constant-time compare).
     pub auth_limiter: Arc<auth_limit::AuthLimiter>,
-    /// False until boot reconciliation has finished.
-    ///
-    /// The host has to answer the platform's health check within seconds of starting, but it also
-    /// must not serve project routes while it is still working out which sandboxes it owns — a
-    /// request answered mid-reconcile sees a host that has forgotten them. So liveness is immediate
-    /// and project routes are 503 until this flips.
-    pub ready: Arc<std::sync::atomic::AtomicBool>,
+    pub ready: Readiness,
+}
+
+/// Whether the host will answer for the projects it owns yet.
+///
+/// The host has to answer the platform's health check within seconds of starting, but it must not
+/// serve project routes while it is still working out which sandboxes it owns — a request answered
+/// mid-reconcile sees a host that has forgotten them. So liveness is immediate and project routes
+/// are 503 until reconcile finishes.
+#[derive(Clone)]
+pub struct Readiness(Arc<std::sync::atomic::AtomicBool>);
+
+impl Readiness {
+    /// For a host whose projects are already accounted for: an embedder that reconciled before
+    /// building it, or a test with nothing to reconcile.
+    pub fn serving_from_start() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+    }
+
+    /// For a host that will reconcile behind its own listener, and calls `open` when it has.
+    pub fn serving_after_reconcile() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    pub fn open(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Build the sandbox backend named by configuration.
@@ -84,9 +108,7 @@ pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
             .build()
             .context("building the engine http client")?,
         auth_limiter: std::sync::Arc::new(auth_limit::AuthLimiter::new(cfg_auth_failure_budget())),
-        // Flipped by `serve` once reconcile finishes. An embedder that builds state directly and
-        // never reconciles (wheeld) opens the routes itself.
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ready: Readiness::serving_after_reconcile(),
     })
 }
 
@@ -385,9 +407,7 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let reconciling = state.clone();
     tokio::spawn(async move {
         reconcile_on_boot(&reconciling).await;
-        reconciling
-            .ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reconciling.ready.open();
         tracing::info!("reconcile complete; project routes are open");
     });
 
@@ -416,7 +436,7 @@ async fn require_ready(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if state.ready.load(std::sync::atomic::Ordering::SeqCst) {
+    if state.ready.is_open() {
         return next.run(req).await;
     }
     (

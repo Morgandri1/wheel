@@ -113,11 +113,10 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
     )?);
-    let sandbox = Arc::new(embedded::EmbeddedSandbox::new(
+    let sandbox = Arc::new(embedded::EmbeddedSandbox::for_data_dir(
         data_dir.to_path_buf(),
-        data_dir.join("run"),
         std::time::Duration::from_secs(cfg.start_timeout_secs),
-    ));
+    )?);
     Ok(wheel_host::HostState {
         cfg,
         sandbox,
@@ -127,10 +126,7 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
             .build()
             .context("building the host http client")?,
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        // wheeld reconciles before it serves anything, so its routes are open from the start.
-        // The gate exists for the deployed host, where reconciling every tenant takes longer than
-        // the platform's health-check window.
-        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: wheel_host::Readiness::serving_from_start(),
     })
 }
 
@@ -160,6 +156,37 @@ async fn serve_api(bind: &str) -> Result<()> {
     // The real address, not a guessed one: --bind exists, and telling someone to open a port the
     // process is not listening on is the least helpful possible first line.
     tracing::info!("wheel is ready — open http://{}", displayable(bind));
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(stop_requested())
+        .await?;
     Ok(())
+}
+
+/// Resolves when the daemon has been asked to stop.
+///
+/// A person runs `wheeld` in a terminal and stops it with ctrl-c, and a service manager stops it
+/// with SIGTERM; either must end the process. The embedded engines install SIGTERM handlers of
+/// their own for their clean shutdown, and a handled signal no longer terminates the process by
+/// default — so without this, `wheeld` keeps serving something that has been told to go away.
+async fn stop_requested() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot listen for SIGTERM");
+            return;
+        }
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot listen for SIGINT");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+    tracing::info!("stopping");
 }

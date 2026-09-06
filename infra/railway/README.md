@@ -89,3 +89,23 @@ Set in the Railway dashboard or with `railway variables --set`, never in git.
 
 `wheel-host`: `WHEEL_HOST_SECRET` (same value as the API's), `SANDBOX_BACKEND=process`,
 `WHEEL_DATA_DIR=/data`, volume mounted at `/data`.
+
+## Pruning probe projects
+
+Automated probes create projects on production and mostly clean up after themselves; the ones that
+do not each keep an engine resident on the single host, which costs memory and slows the next
+person's project creation (0.71 s with fourteen engines up, 0.49 s with one).
+
+```bash
+DATABASE_URL=… ./infra/prune-probe-projects.sh              # list candidates, delete nothing
+DATABASE_URL=… WHEEL_HOST_URL=… WHEEL_HOST_SECRET=… \
+  ./infra/prune-probe-projects.sh --apply
+```
+
+It is run by hand, not on a schedule. A project is a candidate only if it is not on the deny list
+(the operator's own account, and the `wheel-dev` board), its owner's address is at `wheel.test`,
+`wheelcheck.dev` or `example.com` exactly, and it is more than 24 hours old. The sandbox is
+destroyed through the host before the row is dropped, so nothing is left running on the host with no
+record of it.
+
+Predicates are covered by `infra/tests/prune-probe-projects.test.sh`.

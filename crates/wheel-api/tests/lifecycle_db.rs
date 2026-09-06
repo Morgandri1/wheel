@@ -445,3 +445,71 @@ async fn healthz_needs_no_credentials() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn creating_a_project_starts_its_sandbox() {
+    let orch = FakeOrch {
+        status: Arc::new(Mutex::new(ProjectStatus::Running)),
+        ..Default::default()
+    };
+    let Some((app, u)) = app(orch).await else {
+        return;
+    };
+    let tok = token(&u);
+
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/v1/projects",
+        &tok,
+        Some(json!({"name": "new"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(
+        v["status"], "running",
+        "a project nobody has started yet is a product that does nothing on first use"
+    );
+
+    let (_, v) = call(
+        &app,
+        "GET",
+        &format!("/v1/projects/{}", v["id"].as_str().unwrap()),
+        &tok,
+        None,
+    )
+    .await;
+    assert_eq!(
+        v["status"], "running",
+        "the started status was not persisted"
+    );
+}
+
+#[tokio::test]
+async fn a_project_whose_sandbox_will_not_start_is_still_created() {
+    // The row exists, so the create succeeded. Failing the request would leave the caller with a
+    // project they never saw and cannot list, and no way to retry the start.
+    let orch = FakeOrch {
+        fail_start: Arc::new(Mutex::new(true)),
+        ..Default::default()
+    };
+    let Some((app, u)) = app(orch).await else {
+        return;
+    };
+    let tok = token(&u);
+
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/v1/projects",
+        &tok,
+        Some(json!({"name": "dud"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(v["status"], "error");
+
+    let (s, list) = call(&app, "GET", "/v1/projects", &tok, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+}

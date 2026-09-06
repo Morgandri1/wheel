@@ -60,7 +60,9 @@ impl Orchestrator for NoopOrchestrator {
     async fn destroy(&self, _: &Uuid) -> Result<()> {
         Ok(())
     }
+    /// It stands in for a host on which everything works. Reporting `stopped` after a start it just
+    /// accepted would make it a fake of a broken host instead.
     async fn status(&self, _: &Uuid) -> Result<ProjectStatus> {
-        Ok(ProjectStatus::Stopped)
+        Ok(ProjectStatus::Running)
     }
 }

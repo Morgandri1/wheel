@@ -155,7 +155,7 @@ fn harness_at(
         store: store.clone(),
         http: reqwest::Client::new(),
         auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: wheel_host::Readiness::serving_from_start(),
     };
     (build_router(state), calls, store, path)
 }
@@ -732,7 +732,7 @@ async fn boot_rewrites_a_stored_vault_key_the_engine_could_not_decode() {
         store: store.clone(),
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: wheel_host::Readiness::serving_from_start(),
     };
     wheel_host::reconcile_on_boot(&state).await;
 
@@ -762,7 +762,7 @@ async fn the_server_boots_and_serves_the_real_router() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: wheel_host::Readiness::serving_from_start(),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -863,7 +863,7 @@ async fn reconcile_survives_a_database_it_cannot_read() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ready: wheel_host::Readiness::serving_from_start(),
     };
     break_the_database(&path);
 
@@ -891,8 +891,7 @@ async fn liveness_answers_while_still_starting_but_project_routes_do_not() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        // Still reconciling.
-        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ready: wheel_host::Readiness::serving_after_reconcile(),
     };
     let ready = state.ready.clone();
     let app = wheel_host::build_router(state);
@@ -922,7 +921,7 @@ async fn liveness_answers_while_still_starting_but_project_routes_do_not() {
     assert_eq!(body["error"]["code"], serde_json::json!("starting"));
 
     // And they open once reconcile is done.
-    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    ready.open();
     let (status, _) = call(
         &app,
         "GET",
@@ -945,7 +944,7 @@ async fn starting_up_is_not_visible_to_an_unauthenticated_caller() {
         store,
         http: reqwest::Client::new(),
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
-        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ready: wheel_host::Readiness::serving_after_reconcile(),
     };
     let app = wheel_host::build_router(state);
     let (status, _) = call(

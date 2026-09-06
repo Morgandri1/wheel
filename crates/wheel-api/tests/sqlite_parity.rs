@@ -377,3 +377,25 @@ async fn the_login_limiter_counts_on_sqlite() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_created_project_is_running_on_sqlite_too() {
+    // The store the local install uses must agree with Postgres about the lifecycle, not only about
+    // the columns: `wheeld`'s whole promise is that the first project a person creates works.
+    let (app, _db) = app().await;
+    let token = signup(&app, "create-starts@example.test").await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/projects",
+        Some(&token),
+        Some(json!({"name": "first"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "running");
+
+    let (_, listed) = call(&app, "GET", "/v1/projects", Some(&token), None).await;
+    assert_eq!(listed[0]["status"], "running");
+}
