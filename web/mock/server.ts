@@ -58,8 +58,12 @@ function cors(req: IncomingMessage, res: ServerResponse) {
   res.setHeader("access-control-allow-origin", origin && ORIGINS.includes(origin) ? origin : ORIGINS[0]!);
   res.setHeader("access-control-allow-methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type,x-auth-token,x-project-id");
-  res.setHeader("access-control-expose-headers", "retry-after");
+  res.setHeader("access-control-expose-headers", "retry-after,x-wheel-mock");
   res.setHeader("access-control-max-age", "600");
+  // Stamped on every response so the disclaimer travels with the traffic. A console banner is
+  // only seen by whoever started the process; a captured HAR, a screenshot of devtools or a CI
+  // artefact reviewed later has no other way to tell this apart from the real API.
+  res.setHeader("x-wheel-mock", "no-tenancy; not-a-security-boundary");
 }
 
 function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
@@ -767,6 +771,18 @@ const allowedWireCount = assertMatrixMatchesEngine();
 
 server.listen(PORT, () => {
   const [first] = [...projects.values()];
+  // ADVERSARY 017: this server exists so the UI can be built and driven, and for nothing else.
+  // It has NO tenancy: every request is the same single user, ownership is never checked, and a
+  // project id is enough to reach any project. A green result here says the UI works, never that
+  // the boundary holds — the only thing that can say that is the real API. Said loudly because
+  // "it worked against the mock" is exactly the sentence this is here to prevent.
+  console.log("");
+  console.log("  ┌────────────────────────────────────────────────────────────────┐");
+  console.log("  │  MOCK — NO TENANCY.  Not a security boundary. Never deploy it. │");
+  console.log("  │  One implicit user · no ownership checks · no isolation.       │");
+  console.log("  │  Passing here proves the UI works, not that the API is safe.   │");
+  console.log("  └────────────────────────────────────────────────────────────────┘");
+  console.log("");
   console.log(`mock api on http://localhost:${PORT}`);
   console.log(`seeded project: ${first?.project.name} (${first?.project.id})`);
   console.log(`wire matrix agrees with the engine's export (${allowedWireCount} allowed triples)`);
