@@ -48,6 +48,16 @@ impl Engine {
         })
     }
 
+    /// An engine that points nowhere, for tests that exercise the protocol
+    /// rather than the network.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            target: Target::Http("http://127.0.0.1:1".into()),
+            token: "test-token".into(),
+        }
+    }
+
     pub fn get(&self, path: &str) -> Result<Reply> {
         self.request("GET", path, None)
     }

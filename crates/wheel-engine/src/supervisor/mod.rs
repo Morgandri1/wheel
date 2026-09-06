@@ -102,6 +102,33 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// A process can always read its own `/proc/self/environ`, so anything
 /// inherited here is readable by untrusted code whatever uid it runs as.
 /// Enforced by `every_child_process_is_started_through_child_command`.
+/// Write the harness's MCP config: one stdio server, `wheel mcp-serve`.
+///
+/// The engine URL and the token FILE are passed as env on the server entry
+/// rather than baked into the prompt or an argument, so the token never
+/// reaches a command line (§5b: argv is world-readable across uids).
+fn write_mcp_config(
+    run_dir: &std::path::Path,
+    token_file: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let path = run_dir.join("mcp.json");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "wheel": {
+                "type": "stdio",
+                "command": "wheel",
+                "args": ["mcp-serve"],
+                "env": {
+                    wheel_core::spawn::ENV_TOKEN_FILE: token_file.display().to_string(),
+                },
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)
+        .context("writing the mcp config")?;
+    Ok(path)
+}
+
 pub(crate) fn child_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.env_clear();
@@ -294,17 +321,6 @@ impl Supervisor {
         let prompt_file = run_dir.join("prompt.txt");
         std::fs::write(&prompt_file, prompt).context("writing the composed prompt")?;
 
-        let spec = SpawnSpec {
-            node_id: agent,
-            node_name: node.name.to_string(),
-            model: agent_cfg.model.clone(),
-            prompt_file,
-            mcp_config: None,
-            resume,
-            config_dir,
-            cwd: self.cfg.data_dir.clone(),
-        };
-
         // Mint the node's capability token and hand it over as a 0600 FILE.
         // Rotating here bounds a leaked token to one run, and a file rather
         // than an env var keeps it out of /proc/<pid>/environ, which any
@@ -316,6 +332,22 @@ impl Supervisor {
             write_secret_file(&token_file, &minted.plaintext)
                 .context("writing the node token file")?;
         }
+
+        // The board as MCP tools (§3c#1). Written per start, next to the
+        // prompt, so a harness that reads it once at launch gets the current
+        // shape -- and so the token file it points at is this run's.
+        let mcp_config = write_mcp_config(&run_dir, &token_file)?;
+
+        let spec = SpawnSpec {
+            node_id: agent,
+            node_name: node.name.to_string(),
+            model: agent_cfg.model.clone(),
+            prompt_file,
+            mcp_config: Some(mcp_config),
+            resume,
+            config_dir,
+            cwd: self.cfg.data_dir.clone(),
+        };
 
         self.set_status(agent, AgentStatus::Starting, None);
 

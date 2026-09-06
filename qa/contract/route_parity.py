@@ -25,10 +25,6 @@ ROUTE_RE = re.compile(r"\b(%s)\s+`?(/[A-Za-z0-9_:/*\-{}.]+(?:\|[A-Za-z0-9_\-]+)*
 
 # Routes the contract defines but PROTOCOL.md v1 legitimately defers to a later milestone.
 DEFERRED = {
-    ("POST", "/v1/tools/import"): "M2 — tool nodes (§3d)",
-    ("POST", "/v1/tools/:id/import"): "M2 — tool nodes (§3d)",
-    ("GET", "/v1/tools/:id/ops"): "M2 — tool nodes (§3d)",
-    ("POST", "/v1/tools/:id/call"): "M2 — tool nodes (§3d)",
     ("ANY", "/ingress/*"): "M2 — ingress (§2)",
 }
 

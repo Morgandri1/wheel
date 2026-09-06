@@ -691,3 +691,28 @@ pub async fn mcp_tools(
         "tools": crate::mcp::tools_for(&conn, &me),
     })))
 }
+
+/// `POST /v1/cli/ctx/clear` — an agent clearing its own context (§3 grammar).
+///
+/// Only its OWN: the token names the node, and there is nothing to address.
+/// An agent that could clear a peer's context could erase what that peer was
+/// told without leaving a trace in either transcript.
+pub async fn ctx_clear(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    if me.node.node_type() != NodeType::Agent {
+        return Err(ApiError::invalid("only an agent has a context to clear"));
+    }
+    let status = s
+        .supervisor
+        .clear_context(me.node.id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "node": me.node.name,
+        "cleared": true,
+        "status": status.as_str(),
+    })))
+}
