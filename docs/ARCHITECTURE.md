@@ -119,7 +119,7 @@ All nodes share these traits (per spec): `name`, `position`, `wires`, `type`. Ca
 ```jsonc
 {
   "id": "uuid",
-  "name": "researcher",            // unique per project; ^[a-z0-9][a-z0-9-_]{0,62}$ ; this is the address agents use
+  "name": "researcher",            // unique per project; ^[a-z0-9][a-z0-9-_]{0,62}$ ; this is the address agents use. TABLE nodes: ^[a-z][a-z0-9_]{0,62}$ (no "-", must be a sqlite identifier) — refused with a message, never silently renamed (ruling 2026-09-06)
   "type": "agent",                 // agent | ctx | table | endpoint | script | mcp | vault | chest | tool
   "position": { "x": 120.0, "y": 340.0 },
   "wires": [ { "to": "<node id>", "type": "read" } ],   // OUTGOING wires only; type: read | write | send
