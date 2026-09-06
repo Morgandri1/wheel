@@ -25,7 +25,20 @@ pub fn open(path: &Path) -> Result<Connection> {
         Connection::open(path).with_context(|| format!("opening sqlite at {}", path.display()))?;
     configure(&conn)?;
     migrate(&conn)?;
+    ensure_node_tables(&conn)?;
     Ok(conn)
+}
+
+/// Re-establish the sqlite table behind every table node, on every open.
+///
+/// The work is [`board::ensure_tables`]; this is only about WHERE it is
+/// called. A concurrent session wired it into `serve`, which covers the engine
+/// booting; opening the database is the narrower choke point and covers every
+/// other way a project db is opened too, so the property holds unconditionally
+/// rather than for one caller. Both call sites stand: it is idempotent, and
+/// removing another session's integration mid-flight is the larger risk.
+fn ensure_node_tables(conn: &Connection) -> Result<()> {
+    board::ensure_tables(conn)
 }
 
 /// In-memory database, for tests.
@@ -73,6 +86,119 @@ fn add_column(conn: &Connection, table: &str, decl: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table_node(name: &str, columns: &[&str]) -> wheel_core::Node {
+        wheel_core::Node::new(
+            uuid::Uuid::new_v4(),
+            wheel_core::NodeName::new(name).unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Table(wheel_core::TableConfig {
+                columns: columns
+                    .iter()
+                    .map(|c| wheel_core::Column {
+                        name: wheel_core::Ident::new(*c).unwrap(),
+                        column_type: wheel_core::ColumnType::Text,
+                    })
+                    .collect(),
+            }),
+        )
+    }
+
+    /// PM's W1, from production: the wheel-dev board showed a `reports` table
+    /// node and every `wheel read reports` answered "no such table: t_reports".
+    /// The node survived; the table did not.
+    #[test]
+    fn a_table_node_whose_table_went_missing_gets_it_back_on_boot() {
+        let dir = std::env::temp_dir().join(format!("wheel-ensure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+
+        let node = {
+            let conn = open(&path).unwrap();
+            let n = table_node("reports", &["title"]);
+            crate::db::board::create(&conn, &n).unwrap();
+            // Out-of-band, which is what a restore or a migration looks like
+            // from in here.
+            conn.execute_batch("DROP TABLE t_reports").unwrap();
+            n
+        };
+
+        let conn = open(&path).unwrap();
+        let cfg = match &node.config {
+            wheel_core::NodeConfig::Table(c) => c,
+            _ => unreachable!(),
+        };
+        let rows = tables::list_rows(&conn, &node.name, cfg, 10, 0)
+            .expect("a read must not fail with \"no such table\" while the node exists");
+        assert!(rows.is_empty(), "restored empty, not populated from nowhere");
+
+        // And it is the node's own schema, not a default one.
+        tables::put_row(
+            &conn,
+            &node.name,
+            cfg,
+            "r1",
+            &serde_json::json!({ "title": "hello" }),
+        )
+        .expect("the restored table must accept the node's configured columns");
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A column added to a table node's config after the table was built.
+    /// Boot reconciles it; the rows already there are kept.
+    #[test]
+    fn a_column_added_to_the_config_appears_after_a_restart_without_losing_rows() {
+        let dir = std::env::temp_dir().join(format!("wheel-ensure-col-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+
+        let mut node = table_node("reports", &["title"]);
+        {
+            let conn = open(&path).unwrap();
+            crate::db::board::create(&conn, &node).unwrap();
+            let cfg = match &node.config {
+                wheel_core::NodeConfig::Table(c) => c,
+                _ => unreachable!(),
+            };
+            tables::put_row(&conn, &node.name, cfg, "r1", &serde_json::json!({"title":"kept"}))
+                .unwrap();
+        }
+
+        node.config = wheel_core::NodeConfig::Table(wheel_core::TableConfig {
+            columns: vec![
+                wheel_core::Column {
+                    name: wheel_core::Ident::new("title").unwrap(),
+                    column_type: wheel_core::ColumnType::Text,
+                },
+                wheel_core::Column {
+                    name: wheel_core::Ident::new("body").unwrap(),
+                    column_type: wheel_core::ColumnType::Text,
+                },
+            ],
+        });
+        {
+            let conn = open(&path).unwrap();
+            crate::db::board::update(&conn, &node).unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let cfg = match &node.config {
+            wheel_core::NodeConfig::Table(c) => c,
+            _ => unreachable!(),
+        };
+        tables::put_row(&conn, &node.name, cfg, "r2", &serde_json::json!({"title":"t","body":"b"}))
+            .expect("the new column must be there after a restart");
+        assert_eq!(
+            tables::list_rows(&conn, &node.name, cfg, 10, 0).unwrap().len(),
+            2,
+            "reconciling columns must not discard rows"
+        );
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn schema_applies_and_is_reentrant() {
