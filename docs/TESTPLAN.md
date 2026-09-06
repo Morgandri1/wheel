@@ -891,3 +891,27 @@ rather than re-deriving them.
 - Fake harness contract: `qa/harness/README.md`.
 - Open bugs by ID: `qa/BUGS.md`.
 - Suites: `qa/contract/` · `qa/integration/` · `qa/e2e/`.
+
+---
+
+## 12. WHEELD — one binary, nothing installed (M1.7)
+
+Every other suite proves a piece of the system with a stack already standing. This one proves
+the promise a NEW USER meets: download one executable, run it, have a working Wheel — no
+Postgres, no docker daemon, no toolchain. It is the only suite whose failure means "the thing
+we ship does not start".
+
+It deliberately provides nothing, and scrubs every `WHEEL_*` and `DATABASE_URL` from the
+child's environment before launching. A variable sitting in a developer's shell would supply
+what a real user does not have, and turn the one honest test of this promise into a test of
+that laptop.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `WHEELD-starts` | `wheeld --data-dir <tmp> --bind …` serves `/healthz` within 60s from a scrubbed environment. If it exited instead, its output is quoted — "did not start" and "started and was unreachable" need different fixes. | **S1** |
+| `WHEELD-sqlite-store` | A sqlite file appears in the data dir: the store is the one that needs nothing installed, not a Postgres it silently found. | S2 |
+| `WHEELD-signup` | Local email/password signup returns a session token — the daemon ships its own auth, with no identity provider configured. | **S1** |
+| `WHEELD-project` | A project can be created through the API in that same process. | **S1** |
+| `WHEELD-engine-reachable` | The per-project engine answers `GET /v1/board` **through the API**, in one process. This is the claim that distinguishes wheeld from "an API that starts": a green API does not imply a reachable engine. | **S1** |
+| `WHEELD-sigterm` | SIGTERM (not kill) stops it within 20s. A daemon a person runs in a terminal has to stop when they press ctrl-c, and must not leave the store wedged for the next start. | S2 |
+
