@@ -20,7 +20,7 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -41,6 +41,29 @@ impl ProcessSandbox {
             store,
             children: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The complete environment of an engine child. `env_clear` plus this list is the whole of it:
+    /// the engine inherits nothing from the host process, so a secret the host holds for some other
+    /// project can never reach it.
+    fn engine_env(
+        &self,
+        id: &Uuid,
+        secrets: &Secrets,
+        socket: &Path,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("WHEEL_ROLE", "engine".to_string()),
+            ("WHEEL_PROJECT_ID", id.to_string()),
+            ("WHEEL_ENGINE_SECRET", secrets.engine_secret.clone()),
+            ("WHEEL_VAULT_KEY", secrets.vault_key.clone()),
+            ("WHEEL_DATA_DIR", self.project_dir(id).display().to_string()),
+            ("WHEEL_LISTEN", format!("unix://{}", socket.display())),
+            ("WHEEL_LOG", "json".to_string()),
+            ("TMPDIR", self.tmp_dir(id).display().to_string()),
+            ("HOME", self.project_dir(id).display().to_string()),
+            ("PATH", "/usr/local/bin:/usr/bin:/bin".to_string()),
+        ]
     }
 
     pub fn project_dir(&self, id: &Uuid) -> PathBuf {
@@ -278,18 +301,10 @@ impl Sandbox for ProcessSandbox {
 
         let limits = Rlimits::from(&self.cfg);
         let mut cmd = tokio::process::Command::new("wheel-engine");
-        cmd.env_clear()
-            .env("WHEEL_ROLE", "engine")
-            .env("WHEEL_PROJECT_ID", id.to_string())
-            .env("WHEEL_ENGINE_SECRET", &secrets.engine_secret)
-            .env("WHEEL_VAULT_KEY", &secrets.vault_key)
-            .env("WHEEL_DATA_DIR", self.project_dir(id))
-            .env("WHEEL_LISTEN", format!("unix://{}", socket.display()))
-            .env("WHEEL_LOG", "json")
-            .env("TMPDIR", self.tmp_dir(id))
-            .env("HOME", self.project_dir(id))
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .kill_on_drop(false);
+        cmd.env_clear().kill_on_drop(false);
+        for (k, v) in self.engine_env(id, secrets, &socket) {
+            cmd.env(k, v);
+        }
 
         #[cfg(unix)]
         {
@@ -444,6 +459,94 @@ mod tests {
             &name[..2.min(name.len())],
             &id[..8]
         ))
+    }
+
+    /// A unique data directory for one test. Deliberately not cleaned up: it holds an empty
+    /// sqlite file, and a directory left behind is easier to inspect than one raced away.
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("wheel-host-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn sandbox_in(dir: &std::path::Path) -> ProcessSandbox {
+        let cfg = Config::for_tests(&dir.display().to_string());
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        ProcessSandbox::new(cfg, store)
+    }
+
+    /// The bug this pins: the vault key reached the host and stopped there, so every vault write in
+    /// production failed with "this engine started without WHEEL_VAULT_KEY". The spawn env is the
+    /// contract between host and engine, and nothing else asserts its contents.
+    #[test]
+    fn the_engine_child_is_given_the_project_vault_key() {
+        let dir = tempdir();
+        let sb = sandbox_in(&dir);
+        let id = Uuid::new_v4();
+        let secrets = Secrets {
+            engine_secret: "engine-secret-value".into(),
+            vault_key: "dmF1bHQta2V5LTMyLWJ5dGVzLWV4YWN0bHkhIQ==".into(),
+        };
+        let env: HashMap<_, _> = sb
+            .engine_env(&id, &secrets, std::path::Path::new("/run/wheel/x.sock"))
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            env.get("WHEEL_VAULT_KEY").map(String::as_str),
+            Some(secrets.vault_key.as_str())
+        );
+        assert_eq!(
+            env.get("WHEEL_ENGINE_SECRET").map(String::as_str),
+            Some(secrets.engine_secret.as_str())
+        );
+        assert_eq!(
+            env.get("WHEEL_PROJECT_ID").map(String::as_str),
+            Some(id.to_string().as_str())
+        );
+        assert_eq!(
+            env.get("WHEEL_LISTEN").map(String::as_str),
+            Some("unix:///run/wheel/x.sock")
+        );
+        assert_eq!(env.get("WHEEL_ROLE").map(String::as_str), Some("engine"));
+    }
+
+    /// `env_clear` plus an explicit list is the whole environment. Asserting the exact key set means
+    /// a future edit that lets something else through — a host-wide secret, an inherited token — has
+    /// to change this test on purpose rather than by omission.
+    #[test]
+    fn the_engine_child_inherits_nothing_beyond_the_explicit_list() {
+        let dir = tempdir();
+        let sb = sandbox_in(&dir);
+        let secrets = Secrets {
+            engine_secret: "s".into(),
+            vault_key: "k".into(),
+        };
+        let mut keys: Vec<_> = sb
+            .engine_env(
+                &Uuid::new_v4(),
+                &secrets,
+                std::path::Path::new("/run/x.sock"),
+            )
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "HOME",
+                "PATH",
+                "TMPDIR",
+                "WHEEL_DATA_DIR",
+                "WHEEL_ENGINE_SECRET",
+                "WHEEL_LISTEN",
+                "WHEEL_LOG",
+                "WHEEL_PROJECT_ID",
+                "WHEEL_ROLE",
+                "WHEEL_VAULT_KEY",
+            ]
+        );
     }
 
     /// Readiness has to mean the engine answered, not merely that a process exists. Reporting a

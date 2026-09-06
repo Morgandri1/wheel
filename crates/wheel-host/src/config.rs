@@ -137,6 +137,34 @@ impl Config {
         })
     }
 
+    /// A config with production defaults and no environment, for tests that need a `Config` but
+    /// have nothing to say about it.
+    #[cfg(test)]
+    pub fn for_tests(data_dir: &str) -> Self {
+        Config {
+            bind_addr: "127.0.0.1:0".into(),
+            secret: "test-host-secret".into(),
+            backend: Backend::Process,
+            data_dir: data_dir.into(),
+            engine_image: "wheel-engine:test".into(),
+            docker_network: "wheel".into(),
+            engine_port: 7000,
+            memory_bytes: 1024 * 1024 * 1024,
+            nano_cpus: 1_000_000_000,
+            pids_limit: 512,
+            start_timeout_secs: 30,
+            uid_range_start: 20_000,
+            uid_stride: 64,
+            run_dir: format!("{data_dir}/run"),
+            rlimit_nproc: 4096,
+            rlimit_address_space_bytes: None,
+            rlimit_fsize_bytes: 8 * 1024 * 1024 * 1024,
+            rlimit_nofile: 16384,
+            rlimit_cpu_secs: None,
+            engine_base_url: "http://127.0.0.1:7000".into(),
+        }
+    }
+
     pub fn container_name(&self, id: &uuid::Uuid) -> String {
         format!("wheel-p-{id}")
     }

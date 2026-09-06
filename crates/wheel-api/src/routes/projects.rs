@@ -51,7 +51,7 @@ pub async fn create(
     let id = Uuid::new_v4();
     let secrets = EngineSecrets {
         engine_secret: crypto::generate_secret(),
-        vault_key: crypto::generate_secret(),
+        vault_key: crypto::generate_vault_key(),
     };
     let engine_enc = crypto::seal(&state.cfg.master_key, &secrets.engine_secret)?;
     let vault_enc = crypto::seal(&state.cfg.master_key, &secrets.vault_key)?;
@@ -180,7 +180,39 @@ pub async fn destroy(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Decrypt this project's engine secrets, in the encoding the engine spawn contract requires.
+async fn load_secrets(state: &AppState, id: &Uuid) -> ApiResult<EngineSecrets> {
+    let row: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT engine_secret_enc, vault_key_enc FROM project_secrets WHERE project_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    let engine_secret = crypto::open(&state.cfg.master_key, &row.0).map_err(ApiError::Internal)?;
+    let vault_key = crypto::open(&state.cfg.master_key, &row.1).map_err(ApiError::Internal)?;
+    let vault_key = crypto::canonical_vault_key(&vault_key).map_err(ApiError::Internal)?;
+    Ok(EngineSecrets {
+        engine_secret,
+        vault_key,
+    })
+}
+
+/// Re-send this project's secrets to the host before starting it.
+///
+/// `PUT` is idempotent by contract, so this costs one call and buys two things: a project whose
+/// key was provisioned in an encoding the engine could not decode heals on its next start, and a
+/// host that came up on an empty volume gets its record back instead of starting a keyless engine.
+async fn reprovision(state: &AppState, id: &Uuid) -> ApiResult<()> {
+    let secrets = load_secrets(state, id).await?;
+    state
+        .orch
+        .provision(id, &secrets)
+        .await
+        .map_err(ApiError::Internal)
+}
+
 pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
+    reprovision(&state, &scope.project.id).await?;
     set_status(&state, &scope.project.id, ProjectStatus::Starting).await?;
     state
         .orch
@@ -223,6 +255,7 @@ pub async fn restart(
     State(state): State<AppState>,
     scope: ProjectScope,
 ) -> ApiResult<Json<Project>> {
+    reprovision(&state, &scope.project.id).await?;
     state
         .orch
         .restart(&scope.project.id)
