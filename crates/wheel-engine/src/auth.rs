@@ -6,7 +6,10 @@
 //! same per-node directory via the harness's own login, so the two modes do not
 //! need separate isolation stories.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{bail, Context, Result};
 use wheel_core::{CredentialKind, Harness};
@@ -187,8 +190,11 @@ impl StoredOauth {
 /// rather than hard-coding a path into a file this engine does not own. If the
 /// CLI reorganises its store, this degrades to "could not find it" -- which the
 /// caller reports -- instead of silently vaulting the wrong string.
-pub fn oauth_token_from_store(config_dir: &Path) -> Result<StoredOauth> {
-    let path = claude_credentials_path(config_dir)
+pub fn oauth_token_from_store(
+    config_dir: &Path,
+    not_before: Option<SystemTime>,
+) -> Result<StoredOauth> {
+    let path = claude_credentials_path(config_dir, not_before)
         .ok_or_else(|| anyhow::anyhow!("this node has no stored claude credentials"))?;
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -206,13 +212,43 @@ pub fn oauth_token_from_store(config_dir: &Path) -> Result<StoredOauth> {
 
 /// Where `claude auth login` leaves its credentials, checking both layouts the
 /// spawn env can produce.
-fn claude_credentials_path(config_dir: &Path) -> Option<std::path::PathBuf> {
-    let direct = config_dir.join(".credentials.json");
-    if direct.exists() {
-        return Some(direct);
+fn claude_credentials_path(
+    config_dir: &Path,
+    not_before: Option<SystemTime>,
+) -> Option<std::path::PathBuf> {
+    // The child's HOME *is* this directory, and an agent is untrusted code
+    // (§2). So it can write `.credentials.json` here itself. Two consequences,
+    // both handled:
+    //
+    // 1. Take the NEWEST candidate, not a fixed preference. Preferring the
+    //    top-level path meant an agent could plant one there and have it win
+    //    over the file the CLI actually wrote a level down.
+    // 2. When the caller knows when the login began, refuse anything older.
+    //    A credential the agent planted before the operator ever started
+    //    signing in is not the credential that login produced -- and vaulting
+    //    it would hand an agent-chosen token to every peer on the board.
+    let mut best: Option<(std::path::PathBuf, SystemTime)> = None;
+    for candidate in [
+        config_dir.join(".credentials.json"),
+        config_dir.join(".claude").join(".credentials.json"),
+    ] {
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if let Some(floor) = not_before {
+            // Second granularity on some filesystems, so allow the boundary.
+            if modified + Duration::from_secs(1) < floor {
+                continue;
+            }
+        }
+        if best.as_ref().is_none_or(|(_, t)| modified > *t) {
+            best = Some((candidate, modified));
+        }
     }
-    let under_home = config_dir.join(".claude").join(".credentials.json");
-    under_home.exists().then_some(under_home)
+    best.map(|(p, _)| p)
 }
 
 fn find_access_token(v: &serde_json::Value) -> Option<StoredOauth> {
@@ -634,7 +670,7 @@ mod vault_handoff_tests {
             r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"sk-ant-ort01-xyz","expiresAt":1799999999000,"subscriptionType":"max"}}"#,
         )
         .unwrap();
-        let got = oauth_token_from_store(&d).unwrap();
+        let got = oauth_token_from_store(&d, None).unwrap();
         assert_eq!(got.token, "sk-ant-oat01-abc");
         assert_eq!(got.expires_at, Some(1799999999000));
         // It carries an expiry, so it is NOT the durable credential however
@@ -656,7 +692,7 @@ mod vault_handoff_tests {
         )
         .unwrap();
         assert_eq!(
-            oauth_token_from_store(&d).unwrap().token,
+            oauth_token_from_store(&d, None).unwrap().token,
             "sk-ant-oat01-home"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -673,7 +709,7 @@ mod vault_handoff_tests {
             r#"{"accessToken":"sk-ant-oat01-durable"}"#,
         )
         .unwrap();
-        assert!(oauth_token_from_store(&d).unwrap().is_long_lived());
+        assert!(oauth_token_from_store(&d, None).unwrap().is_long_lived());
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -684,7 +720,7 @@ mod vault_handoff_tests {
     fn an_unrecognisable_store_is_reported_not_guessed() {
         let d = dir("weird");
         std::fs::write(d.join(".credentials.json"), r#"{"something":{"else":1}}"#).unwrap();
-        let err = oauth_token_from_store(&d).unwrap_err().to_string();
+        let err = oauth_token_from_store(&d, None).unwrap_err().to_string();
         assert!(err.contains("no OAuth token"), "{err}");
         assert!(
             err.contains("setup-token"),
@@ -693,17 +729,86 @@ mod vault_handoff_tests {
 
         // ...and a node that never logged in at all says that instead.
         let empty = dir("empty");
-        let err = oauth_token_from_store(&empty).unwrap_err().to_string();
+        let err = oauth_token_from_store(&empty, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no stored claude credentials"), "{err}");
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// The child's HOME *is* the node's credential directory, and an agent is
+    /// untrusted code, so it can write `.credentials.json` there itself.
+    /// Preferring the top-level path let a planted file beat the one the CLI
+    /// actually wrote a level down — and `save_to_vault` would then push an
+    /// agent-chosen token to every peer agent on the board.
+    #[test]
+    fn a_planted_credential_does_not_beat_the_one_the_login_wrote() {
+        let d = dir("planted");
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+
+        // The agent gets there first, at the path that used to win.
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-ATTACKER"}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Then the real login writes its own, one level down.
+        let login_started = SystemTime::now();
+        std::fs::write(
+            d.join(".claude/.credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-REAL"}"#,
+        )
+        .unwrap();
+
+        // Newest wins, regardless of which path it is on.
+        assert_eq!(
+            oauth_token_from_store(&d, None).unwrap().token,
+            "sk-ant-oat01-REAL"
+        );
+        // ...and with a freshness floor, the stale planted one is not even a
+        // candidate.
+        assert_eq!(
+            oauth_token_from_store(&d, Some(login_started))
+                .unwrap()
+                .token,
+            "sk-ant-oat01-REAL"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// If the ONLY credential present predates the login, there is nothing
+    /// this login produced — and saying so beats vaulting whatever was lying
+    /// around.
+    #[test]
+    fn a_credential_older_than_the_login_is_not_evidence_of_a_login() {
+        let d = dir("stale-only");
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-PLANTED"}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let login_started = SystemTime::now();
+
+        let err = oauth_token_from_store(&d, Some(login_started))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no stored claude credentials"), "{err}");
+
+        // Without a floor it is still readable — that path only reports an
+        // expiry for display and is not a decision about anyone else.
+        assert!(oauth_token_from_store(&d, None).is_ok());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
     fn a_malformed_store_is_an_error_rather_than_a_panic() {
         let d = dir("malformed");
         std::fs::write(d.join(".credentials.json"), "not json at all").unwrap();
-        assert!(oauth_token_from_store(&d).is_err());
+        assert!(oauth_token_from_store(&d, None).is_err());
         std::fs::remove_dir_all(&d).ok();
     }
 }
