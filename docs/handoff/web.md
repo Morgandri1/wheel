@@ -31,18 +31,26 @@ mirroring `tool-panel.tsx`'s fill-mode picker. A saved config that is `bearer` w
 since removed shows a warning instead of silently dropping the field. `pnpm typecheck` / `lint` /
 `test` (284, 14 new/changed) all green. PM reviewed the design as correct; merge is held only on
 `make check`/integration being red on `main` itself from BUG-022 (journal-mode fast-path — SDK's,
-already filed S1, not this PR's diff) — merge as soon as CI reruns green, nothing more needed from
-web on it.
+already filed S1, not this PR's diff). SDK's fix is PR #12, open, not yet merged by PM — merge #3
+as soon as #12 lands and CI reruns green. Nothing more needed from web on either.
+
+Also open, both docs-only: **PR #10** closes out the coverage-scope CONTRACT item PM ruled on.
+**PR #13** documents the ingress error-shape gap found while re-probing NEXT#1 (see NEXT).
 
 ## NEXT — priority order
 
-1. **Re-probe the endpoint Test button against a real board** once SDK's ingress lands
-   (`crates/wheel-engine/src` has no `/ingress/*` route as of this doc — confirmed directly by
-   grep, not inferred from a stale note; API's CORS/preflight side is already green, per API's own
-   `reports` row: `cors` test `the_public_ingress_answers_any_origin`, 4/4). When ingress lands,
-   the "bodiless 404 → ingress is not built yet" branch in `probeVerdict` becomes unreachable by
-   construction and an E2E hitting a real endpoint is owed. Ask QA for the ID; do not invent one
-   (see TRAPS).
+1. **Ingress landed (SDK, `340f318`) — re-probed at the source level, real board E2E still owed.**
+   `crates/wheel-engine/src/api/ingress.rs` exists and is mounted at `/ingress` (confirmed by
+   grep + reading it, not inferred). The "bodiless 404 → ingress is not built yet" branch in
+   `probeVerdict` is now unreachable in practice: the engine's fallback handler always answers
+   404 with a JSON body, never bodiless. Found one real gap while checking: `ingress.rs`'s `err()`
+   helper emits a bare `{"code":"no_such_endpoint"}`, not the `{"error":{"code":...,"message":...}}`
+   envelope every other engine route uses (`wheel_core::ErrorBody`) and that `errorCode()` requires
+   by design — so a real "no endpoint here" 404 shows the generic bodied-404 message instead of the
+   specific one already written for it. Not misleading, just less specific. Reported to SDK; PR #13
+   documents today's real (bare-shape) behavior in a test rather than the intended one, to flip once
+   their fix lands. Still owed: an actual browser E2E clicking Test against a live running board —
+   ask QA for the ID; do not invent one (see TRAPS).
 2. Nothing else queued. Once PR #3 lands, re-check this list against `origin/main` rather than
    trusting it verbatim (see TRAPS #13).
 
