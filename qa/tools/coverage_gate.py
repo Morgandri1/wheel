@@ -206,7 +206,20 @@ def main():
               % "\n  ".join(killed[:3]))
         return SKIP
     if r.returncode != 0 or not os.path.exists(out):
-        print("cargo llvm-cov failed (exit %d):\n%s" % (r.returncode, r.stderr[-2000:] or r.stdout[-2000:]))
+        # `r.stderr[-2000:] or r.stdout[-2000:]` (the previous version) showed ONLY stderr
+        # whenever stderr was non-empty, and only its last 2000 chars -- cargo puts the
+        # actual failing test's name and panic in the MIDDLE of a long stream (test binaries
+        # for crates alphabetically after the one that failed still get listed afterwards),
+        # so the slice reliably cut the one thing worth reading and kept the noise after it.
+        # A CI run diagnosed from exactly this cut a bug's real cause off (PM, PR #12).
+        #
+        # Find where the actual failure starts instead of guessing a byte offset from the
+        # end: the last "failures:" summary block if cargo printed one, else the last
+        # "panicked at" if it did not (a hard panic/abort can end the run before cargo gets
+        # to print its own summary).
+        marker = max(combined.rfind("\nfailures:"), combined.rfind("panicked at"))
+        excerpt = combined[marker:] if marker != -1 else combined
+        print("cargo llvm-cov failed (exit %d):\n%s" % (r.returncode, excerpt[-4000:]))
         return 1
 
     with open(out) as f:
