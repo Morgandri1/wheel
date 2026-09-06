@@ -205,6 +205,17 @@ will ever clean up.
 `200` → `Project`. `start` blocks until the engine reports healthy (up to ~30 s) or the host
 returns a timeout.
 
+Two failures are worth knowing by name, because both were once reported as something else:
+
+- **The host is still restoring.** For a short window after the host restarts, project routes answer
+  `503` and the body says how far through it is (`restored` of `to_restore`). A host working through
+  its list and a host wedged on the first project used to be the same response; retry rather than
+  treat it as an error.
+- **The volume is full.** The host refuses a start below its free-space floor rather than launching
+  a sandbox that will corrupt its own database on the first write, and the error names the disk. It
+  surfaces here as `status: "error"` with the reason in the host's log. This is the failure that
+  took production down once already, wearing a sqlite error about shared memory as a disguise.
+
 ### `ANY /v1/projects/{id}/engine/{*rest}`
 Authenticated proxy to the project's engine control plane (`ARCHITECTURE.md` §4). Ownership is
 proven before any byte is forwarded.
