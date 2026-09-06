@@ -40,7 +40,7 @@ web-test: ## web unit tests
 	@CHECK_ONLY=web:test bash qa/check.sh
 
 coverage: ## coverage gate only (§0b: >=90% lines)
-	@CHECK_ONLY=rust:coverage bash qa/check.sh
+	@CHECK_ONLY=rust:coverage COVERAGE=1 bash qa/check.sh
 
 qa-selftest: ## test the fake harness itself
 	@python3 qa/harness/selftest.py
