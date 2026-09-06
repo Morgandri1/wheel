@@ -267,8 +267,19 @@ reported as a project in `error` state with a body the client can read.
 
 Postgres is production. SQLite exists so a local or open-source install has no dependency to stand
 up first — it is what `wheeld` uses by default, and it is a real backend rather than a stub: the
-same routes, the same migrations in `migrations_sqlite/`, and the DB-backed test suites run against
-both so parity is proven rather than assumed.
+same routes and the same schema, translated in `migrations_sqlite/`.
+
+How much parity is actually proven, stated precisely because "both backends are tested" is the kind
+of claim that gets believed:
+
+* `sqlite_parity.rs` drives the **real router** against SQLite — signup, login, `/auth/me`, logout,
+  password change, project create/list/rename, the per-user cap, the cross-tenant 404, the shared
+  login limiter and the maintenance sweeps. It needs no `TEST_DATABASE_URL`, so it runs everywhere.
+* `ratelimit_db.rs` runs its assertions against both backends in one pass.
+* `sqlite_store.rs` and `sqlite_dialect.rs` pin the schema and the dialect assumptions the shared
+  SQL rests on, against a real database.
+* The remaining `*_db.rs` suites are **Postgres-only** and skip without `TEST_DATABASE_URL`. Their
+  SQLite coverage is whatever `sqlite_parity.rs` reaches, which is the routes above and not more.
 
 Where the SQL differs it is written out per dialect, with `Db::pick` choosing between two named
 statements rather than a string being assembled. The differences are deliberate rather than
