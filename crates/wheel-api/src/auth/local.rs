@@ -227,6 +227,7 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
     const SET_PASSWORD: &str = "UPDATE users SET password_hash = $2 WHERE id = $1";
     const REVOKE_SESSIONS: &str = "DELETE FROM sessions WHERE user_id = $1";
     match db {
+        #[cfg(feature = "postgres")]
         Db::Pg(pool) => {
             let mut tx = pool.begin().await?;
             sqlx::query(SET_PASSWORD)
@@ -240,6 +241,7 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
                 .await?;
             tx.commit().await?;
         }
+        #[cfg(feature = "sqlite")]
         Db::Sqlite(pool) => {
             let mut tx = pool.begin().await?;
             sqlx::query(SET_PASSWORD)

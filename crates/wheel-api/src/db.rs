@@ -12,9 +12,16 @@
 
 use anyhow::{bail, Context, Result};
 
+/// Which stores this build can actually talk to is a compile-time choice, not only a runtime one.
+///
+/// A local install runs on SQLite and has no business compiling a Postgres driver: `sqlx-postgres`
+/// and its TLS stack are twelve crates a laptop pays for and never loads. The deployed API keeps
+/// both, so the same binary can be pointed at either and the dialect parity suite still runs.
 #[derive(Clone)]
 pub enum Db {
+    #[cfg(feature = "postgres")]
     Pg(sqlx::PgPool),
+    #[cfg(feature = "sqlite")]
     Sqlite(sqlx::SqlitePool),
 }
 
@@ -30,6 +37,7 @@ impl Db {
     /// The scheme is the whole of the decision, so there is no mode flag that can disagree with the
     /// connection string.
     pub async fn connect(url: &str) -> Result<Self> {
+        #[cfg(feature = "postgres")]
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(10)
@@ -43,6 +51,12 @@ impl Db {
             return Ok(Db::Pg(pool));
         }
 
+        #[cfg(not(feature = "postgres"))]
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            bail!("this build has no Postgres driver: rebuild with the `postgres` feature, or point STORE at a sqlite:// URL");
+        }
+
+        #[cfg(feature = "sqlite")]
         if let Some(path) = sqlite_path(url) {
             // create_if_missing: a local install's first run has no file, and failing there would
             // mean telling the user to create a database before they can create anything else.
@@ -66,6 +80,11 @@ impl Db {
             return Ok(Db::Sqlite(pool));
         }
 
+        #[cfg(not(feature = "sqlite"))]
+        if sqlite_path(url).is_some() {
+            bail!("this build has no SQLite driver: rebuild with the `sqlite` feature, or point STORE at a postgres:// URL");
+        }
+
         bail!(
             "STORE must be a postgres:// or sqlite:// URL, got {:?}",
             scheme_of(url)
@@ -74,8 +93,32 @@ impl Db {
 
     pub fn dialect(&self) -> Dialect {
         match self {
+            #[cfg(feature = "postgres")]
             Db::Pg(_) => Dialect::Postgres,
+            #[cfg(feature = "sqlite")]
             Db::Sqlite(_) => Dialect::Sqlite,
+        }
+    }
+
+    /// The Postgres pool, for the few tests that are about Postgres itself rather than about the
+    /// API. `Option` rather than a `let ... else`, because in a build with one backend the pattern
+    /// is irrefutable and the caller's fallback is dead code.
+    #[cfg(feature = "postgres")]
+    pub fn as_pg(&self) -> Option<&sqlx::PgPool> {
+        match self {
+            Db::Pg(pool) => Some(pool),
+            #[cfg(feature = "sqlite")]
+            _ => None,
+        }
+    }
+
+    /// The SQLite pool, for the tests that are about SQLite itself.
+    #[cfg(feature = "sqlite")]
+    pub fn as_sqlite(&self) -> Option<&sqlx::SqlitePool> {
+        match self {
+            Db::Sqlite(pool) => Some(pool),
+            #[cfg(feature = "postgres")]
+            _ => None,
         }
     }
 
@@ -124,74 +167,89 @@ fn scheme_of(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-/// Run a statement on whichever backend is configured, returning rows affected.
+/// Run one expression against whichever pool this build and this configuration provide.
 ///
-/// The two arms are identical apart from the pool type, which is the price of sqlx being generic
-/// over the database: one query string and one bind list still have to be dispatched twice. Doing
-/// it in a macro keeps that cost in one place instead of duplicating every query at its call site,
-/// where the two copies would drift.
+/// sqlx is generic over its database, so a single query string and bind list still has to be
+/// dispatched once per pool type. Doing that here keeps the cost in one place instead of at every
+/// call site, where the two copies would drift.
+///
+/// It is defined three times, under `cfg`, rather than carrying `cfg` on its arms: a `cfg` inside a
+/// macro body is evaluated against the CALLING crate's features, which for `wheeld` would be the
+/// wrong answer entirely. On the definition it is evaluated here, where the pools actually exist.
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
 #[macro_export]
-macro_rules! db_execute {
-    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
+macro_rules! db_dispatch {
+    ($db:expr, $pool:ident => $body:expr) => {{
         match $db {
-            $crate::db::Db::Pg(pool) => sqlx::query($sql)$(.bind($bind))*
-                .execute(pool).await.map(|r| r.rows_affected()),
-            $crate::db::Db::Sqlite(pool) => sqlx::query($sql)$(.bind($bind))*
-                .execute(pool).await.map(|r| r.rows_affected()),
+            $crate::db::Db::Pg($pool) => $body,
+            $crate::db::Db::Sqlite($pool) => $body,
         }
     }};
+}
+
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! db_dispatch {
+    ($db:expr, $pool:ident => $body:expr) => {{
+        match $db {
+            $crate::db::Db::Pg($pool) => $body,
+        }
+    }};
+}
+
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+#[macro_export]
+macro_rules! db_dispatch {
+    ($db:expr, $pool:ident => $body:expr) => {{
+        match $db {
+            $crate::db::Db::Sqlite($pool) => $body,
+        }
+    }};
+}
+
+/// Run a statement, returning rows affected.
+#[macro_export]
+macro_rules! db_execute {
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+        $crate::db_dispatch!($db, pool => sqlx::query($sql)$(.bind($bind))*
+            .execute(pool).await.map(|r| r.rows_affected()))
+    };
 }
 
 /// Exactly one row, as a `FromRow` type or a tuple.
 #[macro_export]
 macro_rules! db_fetch_one {
-    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
-        match $db {
-            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_one(pool).await,
-            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_one(pool).await,
-        }
-    }};
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+        $crate::db_dispatch!($db, pool => sqlx::query_as($sql)$(.bind($bind))*
+            .fetch_one(pool).await)
+    };
 }
 
 /// At most one row.
 #[macro_export]
 macro_rules! db_fetch_optional {
-    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
-        match $db {
-            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_optional(pool).await,
-            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_optional(pool).await,
-        }
-    }};
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+        $crate::db_dispatch!($db, pool => sqlx::query_as($sql)$(.bind($bind))*
+            .fetch_optional(pool).await)
+    };
 }
 
 /// Every matching row.
 #[macro_export]
 macro_rules! db_fetch_all {
-    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
-        match $db {
-            $crate::db::Db::Pg(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_all(pool).await,
-            $crate::db::Db::Sqlite(pool) => sqlx::query_as($sql)$(.bind($bind))*
-                .fetch_all(pool).await,
-        }
-    }};
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+        $crate::db_dispatch!($db, pool => sqlx::query_as($sql)$(.bind($bind))*
+            .fetch_all(pool).await)
+    };
 }
 
 /// A single value from a single row.
 #[macro_export]
 macro_rules! db_scalar {
-    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
-        match $db {
-            $crate::db::Db::Pg(pool) => sqlx::query_scalar($sql)$(.bind($bind))*
-                .fetch_one(pool).await,
-            $crate::db::Db::Sqlite(pool) => sqlx::query_scalar($sql)$(.bind($bind))*
-                .fetch_one(pool).await,
-        }
-    }};
+    ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {
+        $crate::db_dispatch!($db, pool => sqlx::query_scalar($sql)$(.bind($bind))*
+            .fetch_one(pool).await)
+    };
 }
 
 #[cfg(test)]

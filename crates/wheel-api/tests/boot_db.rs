@@ -1,3 +1,7 @@
+// Postgres-only: it asserts on a `Db::Pg` pool, which a build without the `postgres` feature does
+// not have. The SQLite half of the same wiring is `tests/sqlite_store.rs`.
+#![cfg(feature = "postgres")]
+
 //! Startup wiring.
 //!
 //! `main` is now a shell, so what is worth testing is that the pieces it assembles actually work:
@@ -39,9 +43,7 @@ async fn migrations_run_against_an_empty_database() {
     ] {
         // information_schema is Postgres's, and this suite only runs against Postgres; the SQLite
         // schema is covered by tests/sqlite_store.rs, which applies it for real.
-        let wheel_api::db::Db::Pg(pool) = &db else {
-            panic!("this suite runs against postgres");
-        };
+        let pool = db.as_pg().expect("a postgres store");
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
         )
