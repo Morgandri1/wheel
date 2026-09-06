@@ -55,3 +55,16 @@ proven by API's e2e; re-confirmed incidentally.
 `/v1/cli/*` through the authenticated proxy: the proxy forwards it and the (bearer-gated) stub returned
 404 — i.e. the host/engine bearer DOES reach that path. Not an API bug (proxy correctly forwards); the
 token-type discrimination is the engine-side invariant already routed to SDK (findings 002 #2 / 005).
+
+## Update — F010 ws-ticket VERIFIED (2026-09-05, code)
+The ws-ticket route (flagged unimplemented above) is now implemented and correct
+(`crates/wheel-api/src/routes/ws_ticket.rs`): `mint` takes `ProjectScope` (ownership before a ticket
+exists), 32-byte OsRng ticket stored as **SHA-256 hash**, bound to (user_id, project_id), 30s TTL, and
+returned only from mint (never logged). `redeem` is a SINGLE atomic UPDATE —
+`SET used_at=now() WHERE ticket_hash=$1 AND project_id=$2 AND used_at IS NULL AND expires_at>now()
+RETURNING user_id` — so single-use, freshness, and project-binding are one race-free predicate (no TOCTOU
+across replicas), and unknown/expired/used/wrong-project are indistinguishable (no oracle); a wrong-project
+presentation consumes nothing (can't burn the owner's ticket). `sweep` reaps old rows. This is what makes
+the ticket-in-URL (the ONLY sensitive value Web puts in a URL) safe: a ticket harvested from a log is
+single-use + 30s + hashed → dead on arrival. F010 closed. (Live replay/expiry/wrong-project probe optional;
+the atomic-UPDATE design is unambiguous.)
