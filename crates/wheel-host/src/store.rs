@@ -23,11 +23,23 @@ pub struct ProjectRecord {
     pub vault_key: String,
 }
 
+/// The sqlite journal mode this deployment can use, `WHEEL_SQLITE_JOURNAL`,
+/// WAL where nothing says otherwise. The engine reads the same variable: a
+/// volume that cannot host a WAL index cannot host one for the host's own
+/// database either, and the host crash-loops first.
+fn journal_mode() -> String {
+    std::env::var("WHEEL_SQLITE_JOURNAL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "WAL".into())
+}
+
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
+        conn.pragma_update(None, "journal_mode", journal_mode())?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "
              CREATE TABLE IF NOT EXISTS projects (
                id               TEXT PRIMARY KEY,
                engine_secret    TEXT NOT NULL,
