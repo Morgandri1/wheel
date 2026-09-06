@@ -1061,3 +1061,28 @@ another agent's crate and PM produced CI evidence contradicting it. The lesson I
 about my build; the lesson that was actually needed is this one — the gate has to distinguish
 "broken" from "could not tell", in that direction too. A gate that cries wolf gets ignored
 exactly when it is right.
+
+
+## 026 — "Position is an integer cell" is ruled but not implemented · S2 · SDK · OPEN
+
+**TESTPLAN:** `POS-is-an-integer/*`, `POS-rounds-and-clamps/*`, `POS-move-clamps` — 17 red on
+`main`.
+
+`docs/ARCHITECTURE.md:61` ("Position is an integer cell", operator ruling 2026-09-06) says the
+engine rounds on the way in, clamps out-of-range values to ±32767 rather than rejecting them, and
+**returns the clamped value it stored**. `crates/wheel-core/src/node.rs:97` is still:
+
+    pub struct Position { pub x: f64, pub y: f64 }
+
+with no rounding and no clamping anywhere in the crate. Measured against the engine: `10.4`
+comes back `10.4`, `99999` comes back `99999.0`, and a PATCH past the bound returns
+`{'x': 99999.0, 'y': -99999.0}`.
+
+**Why S2 and not S4.** The ruling's own reasoning is the failure mode: rounding and clamping are
+implemented twice, once each side, and the operator-visible bug is not wrong arithmetic but the
+two halves drifting — a node that appears to save and springs back to a different place on the
+next refetch. While the engine returns whatever it was handed, the client's clamp is the only
+one, so the two views disagree by construction for any value outside the bounds.
+
+The gate deliberately asserts **agreement** (write response == later board refetch) rather than
+the arithmetic, so it will go green on any implementation that is internally consistent.
