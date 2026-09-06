@@ -349,7 +349,8 @@ pub fn update_with(
         (None, NodeConfig::Table(cfg)) => {
             wheel_core::validate_table_name(node.name.as_str())
                 .map_err(|e| BoardError::Storage(e.to_string()))?;
-            tables::create(conn, &node.name, cfg).map_err(|e| BoardError::Storage(e.to_string()))?;
+            tables::create(conn, &node.name, cfg)
+                .map_err(|e| BoardError::Storage(e.to_string()))?;
         }
         _ => {}
     }
@@ -527,11 +528,9 @@ mod tests {
         ensure_tables(&c).unwrap();
 
         // (1) The read works and is empty -- never "no such table".
-        assert!(
-            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
+            .unwrap()
+            .is_empty());
         // (2) And it is THIS node's schema, not a default one.
         tables::put_row(
             &c,
