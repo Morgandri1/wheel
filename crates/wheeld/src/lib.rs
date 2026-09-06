@@ -190,3 +190,39 @@ async fn stop_requested() {
     }
     tracing::info!("stopping");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `0.0.0.0` and `[::]` are what `--bind` accepts to listen on every interface; neither is
+    /// something a person can type into a browser, so both are rewritten to `localhost`. Anything
+    /// else — the address a browser actually opens — must pass through unchanged.
+    #[test]
+    fn unbindable_addresses_become_localhost() {
+        assert_eq!(displayable("0.0.0.0:8080"), "localhost:8080");
+        assert_eq!(displayable("[::]:8080"), "localhost:8080");
+        assert_eq!(displayable("127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(displayable("localhost:8080"), "localhost:8080");
+    }
+
+    /// `stop_requested` is what makes ctrl-c and `docker stop`/systemd's SIGTERM actually end the
+    /// process (see the doc comment above it). Driven directly, rather than only through the
+    /// subprocess in `tests/shutdown.rs`: a real SIGTERM sent to *this* test binary is exactly the
+    /// signal tokio's own listener is registered for, so once `signal()` has run, delivering it here
+    /// exercises the same `term.recv()` branch that ctrl-c would — without needing a second process.
+    #[tokio::test]
+    async fn a_sigterm_resolves_stop_requested() {
+        let waiting = tokio::spawn(stop_requested());
+        // Give the signal handlers a moment to register before the signal is sent — otherwise it
+        // could be delivered (and lost, since nothing is listening yet) before `stop_requested` gets
+        // as far as `signal(SignalKind::terminate())`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("stop_requested did not resolve within 5s of SIGTERM")
+            .expect("the task panicked");
+    }
+}
