@@ -25,7 +25,7 @@ INVALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "invalid")
 VALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "valid")
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
 NAME = "qa-validation-%s" % uuid.uuid4().hex[:8]
-PORT = int(os.environ.get("WHEEL_ENGINE_PORT", "17311"))
+PORT = int(os.environ.get("WHEEL_VALIDATION_PORT", "17428"))
 SECRET = "qa-engine-secret-at-least-16-chars"
 
 R = Results()

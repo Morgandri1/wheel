@@ -24,7 +24,7 @@ from wheel_client import Results
 SKIP = 77
 R = Results()
 
-PORT = int(os.environ.get("WHEEL_AUTH_ENGINE_PORT", "17413"))
+PORT = int(os.environ.get("WHEEL_AUTH_ENGINE_PORT", "17422"))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-authroute-secret-at-least-16"
 NAME = "qa-engine-authroute"

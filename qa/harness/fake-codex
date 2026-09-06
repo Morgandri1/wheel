@@ -9,9 +9,61 @@ Tracked as TESTPLAN open question Q-HARNESS-CODEX.
 """
 import json, os, sys, uuid, time, re, hashlib
 
+# ---------------------------------------------------------------------------
+# Steering configuration.
+#
+# The engine starts every child from an empty environment and repopulates only a
+# short allowlist (supervisor/mod.rs INHERITED_ENV, ADVERSARY F015). That is
+# correct and must stay that way -- an allowlist that grows test-only entries is
+# how a deny-by-default list rots -- so these fakes cannot be steered by
+# inherited WHEEL_FAKE_* variables any more. They read a file instead.
+#
+# Precedence is env first, then the file, so running a fake DIRECTLY (the
+# harness selftest does) still works exactly as before.
+# ---------------------------------------------------------------------------
+FAKE_CONFIG_PATH = os.environ.get("WHEEL_FAKE_CONFIG") or "/data/wheel-fake.json"
+
+
+def _fake_config():
+    try:
+        with open(FAKE_CONFIG_PATH) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    # Per-node overrides win over the defaults, so one file can steer a whole board.
+    node = os.environ.get("WHEEL_NODE")
+    merged = {k: v for k, v in cfg.items() if k != "nodes"}
+    merged.update((cfg.get("nodes") or {}).get(node) or {})
+    return merged
+
+
+FAKE_CFG = _fake_config()
+
+
+def fake_opt(env_name, key):
+    """A steering value from the environment if present, else from the config file."""
+    v = os.environ.get(env_name)
+    return v if v is not None else FAKE_CFG.get(key)
+
+
 DIRECTIVE = re.compile(r"<<FAKE:([A-Z_]+)(?:=([^>]*))?>>")
-TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")
-ENV_DUMP = os.environ.get("WHEEL_FAKE_ENV_DUMP")
+TRANSCRIPT = fake_opt("WHEEL_FAKE_TRANSCRIPT", "transcript")
+# Where the per-spawn credential-routing record goes.
+#
+# The engine deliberately does NOT pass its own environment to children (F015): it clears
+# the env and re-adds a short allowlist, so a dump path exported to the ENGINE container
+# cannot reach this child at all. The harness therefore has to know its own default. An
+# explicit WHEEL_FAKE_ENV_DUMP still wins for anything spawned directly by a test.
+DEFAULT_ENV_DUMP = "/data/wheel-fake-env.jsonl"
+
+
+ENV_DUMP = fake_opt("WHEEL_FAKE_ENV_DUMP", "env_dump") or (
+    DEFAULT_ENV_DUMP if os.path.isdir(os.path.dirname(DEFAULT_ENV_DUMP)) else None)
+# sha256 digests a test wants located by NAME in this child's environment.
+# Names are the answer; values never leave this process.
+SENTINELS = [d for d in (fake_opt("WHEEL_FAKE_ENV_SENTINELS", "env_sentinels") or "").split(",") if d]
 
 # Duplicated from fake-claude rather than shared: both files are installed standalone on
 # the image's PATH, so a sibling import would not resolve. §4 makes this worth testing for
@@ -69,7 +121,7 @@ def main():
         else: prompt = t
         i += 1
 
-    thread_id = os.environ.get("WHEEL_FAKE_SESSION_ID") or str(uuid.uuid4())
+    thread_id = fake_opt("WHEEL_FAKE_SESSION_ID", "session_id") or str(uuid.uuid4())
     emit({"type": "thread.started", "thread_id": thread_id})
 
     turn = 0

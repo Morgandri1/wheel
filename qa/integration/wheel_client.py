@@ -8,7 +8,7 @@ wrongly in both directions and the test passes.
 mint() is copied from infra/dev/e2e.py (API's implementation, per their instruction to
 reuse rather than reinvent the token format).
 """
-import base64, hashlib, hmac, json, os, time, urllib.error, urllib.request, uuid
+import base64, hashlib, hmac, json, os, subprocess, time, urllib.error, urllib.request, uuid
 from collections import namedtuple
 
 # Tuple-unpackable AND attribute-addressable: `st, body, hdrs = call(...)` and
@@ -195,3 +195,22 @@ def new_project(token, name="qa-project"):
     if st not in (200, 201) or not isinstance(proj, dict):
         raise AssertionError("could not create project %r: %s %r" % (name, st, proj))
     return proj
+
+
+def pin_image(tag="wheel-engine:test"):
+    """Resolve an image TAG to the immutable ID it points at right now.
+
+    Six agents share one docker daemon on this host, and several of them build
+    `wheel-engine:test`. A suite that runs `docker run wheel-engine:test` twenty times
+    over four minutes can therefore test twenty containers from more than one build:
+    the tag is a mutable pointer, and somebody else's `make engine-image-test` moves it
+    mid-run. This bit me for real — a suite reported F015 unfixed, in detail, with
+    /proc evidence, against an image another agent had just replaced under me. The fix
+    was already on main and the report would have been false.
+
+    Returns the sha256 ID, which every `docker run` in the run should use instead of the
+    tag, so a result describes one build and says which.
+    """
+    p = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+                       capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None

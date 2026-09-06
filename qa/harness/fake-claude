@@ -13,12 +13,64 @@ Design rules:
   * Steerable from the test side via <<FAKE:...>> directives in the message body
     and via WHEEL_FAKE_* env vars, so QA never has to rebuild the image.
 """
-import json, os, sys, time, uuid, re, hashlib, datetime, signal
+import base64, json, os, subprocess, sys, time, uuid, re, hashlib, datetime, signal
+
+# ---------------------------------------------------------------------------
+# Steering configuration.
+#
+# The engine starts every child from an empty environment and repopulates only a
+# short allowlist (supervisor/mod.rs INHERITED_ENV, ADVERSARY F015). That is
+# correct and must stay that way -- an allowlist that grows test-only entries is
+# how a deny-by-default list rots -- so these fakes cannot be steered by
+# inherited WHEEL_FAKE_* variables any more. They read a file instead.
+#
+# Precedence is env first, then the file, so running a fake DIRECTLY (the
+# harness selftest does) still works exactly as before.
+# ---------------------------------------------------------------------------
+FAKE_CONFIG_PATH = os.environ.get("WHEEL_FAKE_CONFIG") or "/data/wheel-fake.json"
+
+
+def _fake_config():
+    try:
+        with open(FAKE_CONFIG_PATH) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    # Per-node overrides win over the defaults, so one file can steer a whole board.
+    node = os.environ.get("WHEEL_NODE")
+    merged = {k: v for k, v in cfg.items() if k != "nodes"}
+    merged.update((cfg.get("nodes") or {}).get(node) or {})
+    return merged
+
+
+FAKE_CFG = _fake_config()
+
+
+def fake_opt(env_name, key):
+    """A steering value from the environment if present, else from the config file."""
+    v = os.environ.get(env_name)
+    return v if v is not None else FAKE_CFG.get(key)
+
 
 VERSION = "2.1.261 (Claude Code)"
-SCRIPT_PATH = os.environ.get("WHEEL_FAKE_SCRIPT")  # JSONL of canned turns, one object per turn
-TRANSCRIPT = os.environ.get("WHEEL_FAKE_TRANSCRIPT")  # optional: append every stdin line here
-ENV_DUMP = os.environ.get("WHEEL_FAKE_ENV_DUMP")  # optional: append one JSON record per spawn
+SCRIPT_PATH = fake_opt("WHEEL_FAKE_SCRIPT", "script")  # JSONL of canned turns, one object per turn
+TRANSCRIPT = fake_opt("WHEEL_FAKE_TRANSCRIPT", "transcript")  # optional: append every stdin line here
+# Where the per-spawn credential-routing record goes.
+#
+# The engine deliberately does NOT pass its own environment to children (F015): it clears
+# the env and re-adds a short allowlist, so a dump path exported to the ENGINE container
+# cannot reach this child at all. The harness therefore has to know its own default. An
+# explicit WHEEL_FAKE_ENV_DUMP still wins for anything spawned directly by a test.
+DEFAULT_ENV_DUMP = "/data/wheel-fake-env.jsonl"
+
+
+ENV_DUMP = fake_opt("WHEEL_FAKE_ENV_DUMP", "env_dump") or (
+    DEFAULT_ENV_DUMP if os.path.isdir(os.path.dirname(DEFAULT_ENV_DUMP)) else None)
+# sha256 digests a test wants located by NAME in this child's environment.
+# Names are the answer; values never leave this process.
+SENTINELS = [d for d in (fake_opt("WHEEL_FAKE_ENV_SENTINELS", "env_sentinels") or "").split(",") if d]  # optional: append one JSON record per spawn
 
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -33,6 +85,55 @@ def die(msg, code=1):
     sys.exit(code)
 
 # ---------------------------------------------------------------- arg parsing
+def auth_login():
+    """`claude auth login --claudeai` — the paste-code half of the OAuth flow (§4).
+
+    The engine spawns this, reads stdout until an authorize URL appears, then holds the
+    child open and writes the user's pasted code to its stdin. The shape matters: the
+    engine's URL scanner must pick the URL out of surrounding prose, so print prose too.
+
+    Blocking on stdin forever is deliberate — an ABANDONED login is exactly a child sitting
+    here, and that is the process leak the engine's reaping is supposed to prevent.
+    """
+    if fake_opt("WHEEL_FAKE_LOGIN_NO_URL", "login_no_url") == "1":
+        die("login failed before it could print a url", 1)
+
+    state = fake_opt("WHEEL_FAKE_LOGIN_STATE", "login_state") or uuid.uuid4().hex[:12]
+    url = ("https://claude.com/cai/oauth/authorize?code=true&client_id=fake-client"
+           "&response_type=code&state=%s&code_challenge=%s&code_challenge_method=S256"
+           % (state, uuid.uuid4().hex))
+    sys.stdout.write("Browser didn't open? Use the url below to sign in:\n\n")
+    sys.stdout.write(url + "\n\n")
+    sys.stdout.write("Paste code here if prompted > ")
+    sys.stdout.flush()
+
+    line = sys.stdin.readline()
+    if not line:
+        die("login aborted: stdin closed before a code arrived", 1)
+    want = fake_opt("WHEEL_FAKE_LOGIN_CODE", "login_code") or "fake-auth-code"
+    if line.strip() != want:
+        die("OAuth error: invalid code", 1)
+
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        try:
+            os.makedirs(cfg, exist_ok=True)
+            cred = os.path.join(cfg, ".credentials.json")
+            with open(cred, "w") as fh:
+                json.dump({"claudeAiOauth": {"accessToken": "sk-ant-oat-fake-%s" % state,
+                                             "account": {"email_address": "qa@wheel.test"}}}, fh)
+            os.chmod(cred, 0o600)
+        except OSError as e:
+            if not ENV_DUMP:
+                # Nobody asked for this dump by name; a suite that needs it asserts on its
+                # contents and fails there, so do not take down an unrelated spawn.
+                return
+            die("could not write credentials: %s" % e, 1)
+    sys.stdout.write("\nLogin successful.\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
 def parse_args(argv):
     a = {
         "print": False, "input_format": "text", "output_format": "text",
@@ -88,7 +189,7 @@ def root_refusal_guard(a):
     the exit code alone reports needs_auth forever for what is really a privilege
     misconfiguration. WHEEL_FAKE_ROOT=1 forces it without needing a root container.
     """
-    forced = os.environ.get("WHEEL_FAKE_ROOT") == "1"
+    forced = fake_opt("WHEEL_FAKE_ROOT", "root") == "1"
     is_root = hasattr(os, "geteuid") and os.geteuid() == 0
     if (forced or is_root) and a.get("permission_mode") == "bypassPermissions":
         die(ROOT_REFUSAL, 1)
@@ -115,6 +216,26 @@ def credential_class(value):
         return "openai_style"
     return "opaque"
 
+def sentinel_hits():
+    """Which environment variables carry a value the test already knows the digest of.
+
+    A leak check that only looks at variable NAMES passes when the same secret arrives
+    under a different name, which is the shape a refactor produces. Hashing every value
+    and reporting the names that match answers "did this secret reach the child, under
+    any name at all" -- and the same mechanism proves itself, because a test supplies
+    the digest of a secret that is SUPPOSED to arrive alongside the ones that are not.
+    """
+    if not SENTINELS:
+        return {}
+    want = set(SENTINELS)
+    hits = {}
+    for name, value in os.environ.items():
+        d = hashlib.sha256(value.encode()).hexdigest()
+        if d in want:
+            hits[name] = d
+    return hits
+
+
 def env_dump(a):
     """Append one record describing HOW this spawn was credentialed.
 
@@ -137,7 +258,7 @@ def env_dump(a):
     # the names the test asks about (WHEEL_FAKE_ENV_DUMP_KEYS=a,b,c). That is enough to
     # prove "the child received exactly this secret under exactly this name" without the
     # secret existing anywhere a later grep could find it.
-    asked = [k for k in (os.environ.get("WHEEL_FAKE_ENV_DUMP_KEYS") or "").split(",") if k]
+    asked = [k for k in (fake_opt("WHEEL_FAKE_ENV_DUMP_KEYS", "env_dump_keys") or "").split(",") if k]
     digests = {}
     for name in asked:
         v = os.environ.get(name)
@@ -150,6 +271,14 @@ def env_dump(a):
            "credentials": creds,
            "credential_vars_set": sorted(creds),
            "env_names": sorted(os.environ),
+           # sha256 of EVERY value, keyed by name. Names alone cannot answer "did the
+           # engine's own secret reach this child?", because a leak under a DIFFERENT
+           # variable name passes a name check. Comparing digests catches the rename. No
+           # value is ever written; this dump only exists inside the throwaway test
+           # container, and only when WHEEL_FAKE_ENV_DUMP is set.
+           "env_digests": {k: hashlib.sha256(v.encode()).hexdigest()
+                           for k, v in os.environ.items()},
+           "sentinel_hits": sentinel_hits(),
            "digests": digests,
            "config": {k: os.environ.get(k) for k in CONFIG_VARS if os.environ.get(k) is not None},
            "argv": sys.argv[1:]}
@@ -163,10 +292,10 @@ def env_dump(a):
 
 def auth_state():
     """Mirrors the engine's needs_auth flow. WHEEL_FAKE_AUTH=needs_auth|ok."""
-    st = os.environ.get("WHEEL_FAKE_AUTH", "ok")
+    st = fake_opt("WHEEL_FAKE_AUTH", "auth") or "ok"
     if st == "ok" and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")):
         # Default fake is authenticated even without creds; opt in to strictness.
-        if os.environ.get("WHEEL_FAKE_STRICT_AUTH"):
+        if fake_opt("WHEEL_FAKE_STRICT_AUTH", "strict_auth"):
             return "needs_auth"
     return st
 
@@ -193,8 +322,11 @@ def text_of(msg):
 
 def main():
     argv = sys.argv[1:]
+    # Subcommand, not a flag: `auth login` never reaches the stream-json path.
+    if argv[:2] == ["auth", "login"]:
+        auth_login()
     a = parse_args(argv)
-    session_id = a["resume"] or os.environ.get("WHEEL_FAKE_SESSION_ID") or str(uuid.uuid4())
+    session_id = a["resume"] or fake_opt("WHEEL_FAKE_SESSION_ID", "session_id") or str(uuid.uuid4())
     model = a["model"] or "claude-fake-1"
     stream = a["output_format"] == "stream-json"
 
@@ -206,8 +338,8 @@ def main():
     # root. Exit 1 + EMPTY stdout + this exact stderr — byte-identical to "not logged in".
     # The engine MUST classify this as `error`, never `needs_auth`, and must never infer
     # needs_auth from the exit code alone.
-    if os.environ.get("WHEEL_FAKE_ROOT_REFUSAL") == "1" or (
-            a["permission_mode"] == "bypassPermissions" and os.environ.get("WHEEL_FAKE_UID") == "0"):
+    if fake_opt("WHEEL_FAKE_ROOT_REFUSAL", "root_refusal") == "1" or (
+            a["permission_mode"] == "bypassPermissions" and fake_opt("WHEEL_FAKE_UID", "uid") == "0"):
         die("--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons", 1)
 
     root_refusal_guard(a)
@@ -295,8 +427,40 @@ def script_turn(turn):
         return _SCRIPT[turn - 1]
     die("WHEEL_FAKE_SCRIPT exhausted: got turn %d, script has %d" % (turn, len(_SCRIPT)), 3)
 
+def run_shell(b64):
+    """`<<FAKE:SH_B64=...>>` — run a real command as this child, and report it.
+
+    This exists for the wheel-on-wheel acceptance test, where the thing being proved is
+    that a sandbox is a usable development environment: the toolchain is present, and a
+    credential the engine exported from a vault actually works. The command runs as THIS
+    process's child, so it inherits exactly the environment the engine composed — the
+    uid, the vault exports, PATH — which is the whole point. Driving it from outside with
+    `docker exec` would test a different environment than the one agents get.
+
+    Base64 because the directive grammar stops at '>', and any real command has redirects.
+
+    It runs real commands, so it must never exist outside the test image; `make
+    image-verify-prod` asserts nothing shadows `claude` in the production image, which is
+    what keeps this file out of it.
+    """
+    try:
+        cmd = base64.b64decode(b64).decode()
+    except Exception as e:
+        return "SH_B64 is not base64: %s" % e
+    try:
+        p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True,
+                           timeout=int(os.environ.get("WHEEL_FAKE_SH_TIMEOUT") or 1800))
+    except subprocess.TimeoutExpired:
+        return "exit=timeout"
+    # Tail, not head: a compiler says what went wrong at the end.
+    return "exit=%d\nSTDOUT:\n%s\nSTDERR:\n%s" % (
+        p.returncode, p.stdout[-6000:], p.stderr[-6000:])
+
+
 def respond(user_text, turn, session_id, model, stream):
     d = directives(user_text)
+    if "SH_B64" in d:
+        d["REPLY"] = run_shell(d["SH_B64"])
     canned = script_turn(turn)
     if canned:
         # Canned turns take precedence; directives still work for anything unspecified.
@@ -360,7 +524,7 @@ def respond(user_text, turn, session_id, model, stream):
               "uuid": str(uuid.uuid4())}
     if stream:
         emit(result)
-    elif os.environ.get("WHEEL_FAKE_OUTPUT", "") == "json":
+    elif (fake_opt("WHEEL_FAKE_OUTPUT", "output") or "") == "json":
         emit(result)
     else:
         sys.stdout.write(reply + "\n"); sys.stdout.flush()

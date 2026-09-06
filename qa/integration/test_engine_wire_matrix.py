@@ -24,7 +24,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MATRIX = os.path.join(ROOT, "qa", "fixtures", "wire_matrix.json")
 
 NAME = "wheel-qa-wirematrix"
-PORT = int(os.environ.get("WHEEL_WM_PORT", "17413"))
+PORT = int(os.environ.get("WHEEL_WM_PORT", "17423"))
 SECRET = "qa-wire-matrix-secret-0123456789"
 BASE = "http://127.0.0.1:%d" % PORT
 
