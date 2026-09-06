@@ -58,3 +58,22 @@ Add a test: `natsix.test`→`64:ff9b::7f00:1` and `sixfour.test`→`2002:7f00:1:
 - **merge_operations un-pin (024) holds:** `reimport` returns 409 `would_unpin` unless `allow_unpin` for a
   renamed param, a location change, a method/path change, or a removed op; `same_param` is case-insensitive
   so a case-only rename still matches. Tool routes are engine-secret realm (not agent-reachable; 025).
+
+## VERIFIED FIXED (ADVERSARY, live through the real lookup_host seam) — 2026-09-06
+Fresh image from HEAD 2a50695 (`embedded_ipv4` present). Tested via `/v1/tools/:id/call` with the target
+host in `/etc/hosts` mapping a NAME to each transition address embedding the metadata IP (169.254.169.254 =
+`a9fe:a9fe`) — the REAL `lookup_host` path, which is the seam SDK's `ip_is_denied` unit tests structurally
+cannot see (a bracketed IPv6 literal fails `lookup_host` before the guard; a name that RESOLVES to the
+transition address is the true attack, and the one I originally caught). All DENIED at the guard:
+```
+mappedmeta   -> ::ffff:169.254.169.254   -> DENIED ("resolves to ::ffff… , not reachable")
+compatmeta   -> ::169.254.169.254        -> DENIED
+sixto4meta   -> 2002:a9fe:a9fe::          -> DENIED
+nat64meta    -> 64:ff9b::a9fe:a9fe        -> DENIED
+teredosrvmeta-> 2001:0:a9fe:a9fe::        -> DENIED (Teredo server field)
+teredocltmeta-> 2001::5601:5601           -> DENIED (Teredo CLIENT field, recovered by XOR — !5601 = a9fe)
+```
+`getent` witness confirmed `lookup_host` returned exactly those transition addresses, so `ip_is_denied` →
+`embedded_ipv4` genuinely judged them. The not-over-denied case (6to4/NAT64 wrapping public 1.1.1.1 still
+resolving) is left to SDK's unit test — live-testing it would attempt a connection to a real public IP (RoE).
+PoC: `redteam/pocs/tool-exec/run_tool_allowed.sh` (section 2). 026 CLOSED.
