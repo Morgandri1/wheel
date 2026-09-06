@@ -96,7 +96,7 @@ def main():
 
         logs = sh("docker", "logs", "--tail", "6", NAME)
         said = (logs.stdout + logs.stderr)[-400:]
-        R.gated("ENG-starts-without-shm", "ENG-shm/blocked", up,
+        R.control("ENG-starts-without-shm", up,
                 "the engine never served /healthz on a filesystem that cannot host a WAL "
                 "index. A deployment that cannot provide shm must fall back to a rollback "
                 "journal and come up; crash-looping there reads as a corrupt database. "
@@ -175,8 +175,14 @@ def main():
                     pass
                 time.sleep(0.5)
             said = sh("docker", "logs", "--tail", "3", name2)
+            # Gated on the BASELINE, not merely on the fixture. While the engine cannot
+            # start on this volume at all, an override case failing says nothing about the
+            # override — it is the same defect counted again. Four duplicate failures make a
+            # report look four times worse and tell a reader nothing extra, and the one that
+            # matters (TRUNCATE collapsing the negotiation) becomes visible only once the
+            # baseline works.
             R.gated("ENG-journal-override-cannot-disable-recovery/%s" % value.lower(),
-                    "ENG-shm/blocked", ok2,
+                    "ENG-starts-without-shm", ok2,
                     "WHEEL_SQLITE_JOURNAL=%s stopped the engine starting on a volume that "
                     "cannot host a WAL index. An override on a RECOVERY path must not be "
                     "able to disable the only branch that works: %s"
