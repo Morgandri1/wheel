@@ -19,7 +19,7 @@ use wheel_core::{
 use super::{ApiError, ApiResult, AppState};
 use crate::{
     caps::{split_address, Caller, Denial},
-    db::{board, messages},
+    db::{board, messages, tables},
 };
 
 /// Map a capability denial onto HTTP, preserving the code the CLI turns into an
@@ -189,7 +189,12 @@ pub async fn ls(
         .require(&conn, target, WireType::Read)
         .map_err(|d| deny(&s, Some(&me), d))?;
     match node.node_type() {
-        NodeType::Table | NodeType::Chest => Ok(Json(serde_json::json!({ "keys": [] }))),
+        NodeType::Table => {
+            let keys = tables::list_keys(&conn, &node.name, q.prefix.as_deref(), MAX_KEYS, 0)
+                .map_err(storage_err)?;
+            Ok(Json(serde_json::json!({ "node": node.name, "keys": keys })))
+        }
+        NodeType::Chest => Ok(Json(serde_json::json!({ "keys": [] }))),
         other => Err(ApiError::invalid(format!("a {other} node has no keys"))),
     }
 }
@@ -225,8 +230,28 @@ pub async fn read(
         wheel_core::NodeConfig::Ctx(c) => Ok(Json(serde_json::json!({
             "node": node.name, "type": "ctx", "value": c.markdown
         }))),
-        // Table and chest reads land with those node types in M2; the wire
-        // check above already governs them.
+        wheel_core::NodeConfig::Table(cfg) => {
+            let (_, row) = split_address(&q.addr);
+            match row {
+                Some(key) => {
+                    let value = tables::get_row(&conn, &node.name, cfg, key)
+                        .map_err(storage_err)?
+                        .ok_or_else(|| ApiError::not_found(format!("{}/{key}", node.name)))?;
+                    Ok(Json(serde_json::json!({
+                        "node": node.name, "type": "table", "row": key, "value": value
+                    })))
+                }
+                // A bare table address is the whole keyspace, paged.
+                None => {
+                    let rows = tables::list_rows(&conn, &node.name, cfg, q.limit(), q.offset())
+                        .map_err(storage_err)?;
+                    Ok(Json(serde_json::json!({
+                        "node": node.name, "type": "table", "rows": rows,
+                        "limit": q.limit(), "offset": q.offset()
+                    })))
+                }
+            }
+        }
         other => Err(ApiError::invalid(format!(
             "reading a {} node is not implemented yet",
             other.node_type()
@@ -237,7 +262,23 @@ pub async fn read(
 #[derive(Debug, Deserialize)]
 pub struct AddrQuery {
     pub addr: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
+
+impl AddrQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(MAX_KEYS).min(MAX_KEYS)
+    }
+    fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
+/// Read ceiling for a single call (§ "Read ceilings").
+const MAX_KEYS: usize = crate::db::tables::MAX_ROWS;
 
 /// `GET /v1/cli/secret?addr=<vault>/<key>`
 ///
@@ -336,10 +377,107 @@ pub async fn write(
                 serde_json::json!({ "node": updated.name, "ok": true }),
             ))
         }
+        NodeType::Table => {
+            let (_, row) = split_address(&body.addr);
+            let key =
+                row.ok_or_else(|| ApiError::invalid("writing a table needs <table>/<row>"))?;
+            let cfg = table_config(&node)?;
+            let value: serde_json::Value = serde_json::from_str(&body.value).map_err(|e| {
+                ApiError::invalid(format!("a table row must be a JSON object: {e}"))
+            })?;
+            tables::put_row(&conn, &node.name, cfg, key, &value).map_err(storage_err)?;
+            Ok(Json(
+                serde_json::json!({ "node": node.name, "row": key, "ok": true }),
+            ))
+        }
         other => Err(ApiError::invalid(format!(
             "writing a {other} node is not implemented yet"
         ))),
     }
+}
+
+// --- tables ----------------------------------------------------------------
+
+/// The config of a node the caller has already been authorised to reach.
+fn table_config(node: &wheel_core::Node) -> ApiResult<&wheel_core::TableConfig> {
+    match &node.config {
+        wheel_core::NodeConfig::Table(c) => Ok(c),
+        other => Err(ApiError::invalid(format!(
+            "{} is a {} node, not a table",
+            node.name,
+            other.node_type()
+        ))),
+    }
+}
+
+fn storage_err(e: anyhow::Error) -> ApiError {
+    // These carry the agent's own mistake -- an unknown column, a value of the
+    // wrong type -- so they are the caller's to fix, not a 500.
+    ApiError::invalid(e.to_string())
+}
+
+/// `POST /v1/cli/rm` — delete a table row (needs `write`).
+pub async fn rm(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AddrBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let (name, row) = split_address(&body.addr);
+    let row = row.ok_or_else(|| ApiError::invalid("rm needs <node>/<row>"))?;
+
+    let node = me
+        .require(&conn, name, WireType::Write)
+        .map_err(|d| deny(&s, Some(&me), d))?;
+
+    match node.node_type() {
+        NodeType::Table => {
+            let removed = tables::delete_row(&conn, &node.name, row).map_err(storage_err)?;
+            Ok(Json(serde_json::json!({
+                "node": node.name, "row": row, "removed": removed
+            })))
+        }
+        other => Err(ApiError::invalid(format!(
+            "removing from a {other} node is not implemented yet"
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddrBody {
+    pub addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryBody {
+    pub table: String,
+    pub sql: String,
+}
+
+/// `POST /v1/cli/query` — read-only SQL scoped to ONE table.
+///
+/// `read` is enough: the query cannot write, and the authorizer confines it to
+/// the table named in the address.
+pub async fn query(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<QueryBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let table = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let node = me
+            .require(&conn, &body.table, WireType::Read)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+        table_config(&node)?;
+        tables::table_name(&node.name).map_err(storage_err)?
+    };
+    // The engine's own connection is NOT held across the query: user SQL runs
+    // on its own read-only connection, and holding the writer would let a slow
+    // query stall message delivery for everyone.
+    let rows = tables::query(&s.cfg.db_path(), &table, &body.sql).map_err(storage_err)?;
+    Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
 // --- msg / inbox -----------------------------------------------------------
