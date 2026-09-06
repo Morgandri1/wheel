@@ -223,6 +223,13 @@ impl Config {
         if cfg.auth_mode == AuthMode::Jwks && cfg.clerk_issuer.is_empty() {
             bail!("CLERK_ISSUER must not be empty: it is what pins tokens to our tenant");
         }
+        if cfg.env == Env::Prod && cfg.auth_mode == AuthMode::Jwks {
+            // ADVERSARY 017: an identity provider we do not control is a provider that can mint any
+            // `sub`. A mock issuer on loopback is the dev shortcut that must never survive a deploy:
+            // it does not fail — it authenticates everyone, as anyone.
+            reject_local_identity_provider("CLERK_JWKS_URL", &cfg.clerk_jwks_url)?;
+            reject_local_identity_provider("CLERK_ISSUER", &cfg.clerk_issuer)?;
+        }
         Ok(cfg)
     }
 
@@ -235,6 +242,84 @@ impl Config {
     pub fn host_ingress_url(&self, project_id: &uuid::Uuid) -> String {
         format!("{}/host/v1/projects/{}/ingress", self.host_url, project_id)
     }
+}
+
+/// The bare host from the part of a URL after the scheme: no userinfo, no port, and no brackets
+/// around an IPv6 literal.
+fn host_of(after_scheme: &str) -> &str {
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+
+    // An IPv6 literal is bracketed precisely because it is full of colons; stripping a "port" from
+    // it by splitting on the last colon turns [::1] into ":".
+    match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    }
+}
+
+/// True for hosts that only this machine or this private network can reach.
+///
+/// Names and literals only — see `reject_local_identity_provider` for why there is no DNS here.
+fn is_unroutable_host(host: &str) -> bool {
+    const LOCAL_SUFFIXES: [&str; 3] = [".localhost", ".local", ".internal"];
+    const LOCAL_PREFIXES: [&str; 5] = ["127.", "10.", "192.168.", "169.254.", "0."];
+
+    if host.is_empty() || host == "localhost" || host == "::1" {
+        return true;
+    }
+    if LOCAL_SUFFIXES.iter().any(|s| host.ends_with(s))
+        || LOCAL_PREFIXES.iter().any(|p| host.starts_with(p))
+    {
+        return true;
+    }
+    // Unique-local IPv6 (fc00::/7).
+    if host.starts_with("fc") || host.starts_with("fd") {
+        return true;
+    }
+    // 172.16.0.0/12 — the second octet decides, so "172.15." and "172.32." are public.
+    host.strip_prefix("172.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|octet| octet.parse::<u8>().ok())
+        .is_some_and(|octet| (16..32).contains(&octet))
+}
+
+/// Refuse an identity-provider URL that is plaintext or points somewhere only this machine can
+/// reach — the shape of a dev stub, a stand-in, or a rebinding target.
+///
+/// Checked on the literal host, without DNS: a name that resolves to loopback today may not
+/// tomorrow, and boot is not the place to trust a resolver. This is a tripwire for the obvious
+/// mistake, not a substitute for pointing at the real issuer.
+fn reject_local_identity_provider(var: &str, raw: &str) -> Result<()> {
+    let value = raw.trim();
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        bail!("{var} must be an absolute https:// URL in production, got {value:?}");
+    };
+    if value.starts_with("http://") {
+        bail!(
+            "{var} must be https:// in production, got {value:?}. Plaintext to an identity \
+             provider means anyone on the path chooses who our users are."
+        );
+    }
+
+    let bare = host_of(rest);
+    let lower = bare.to_ascii_lowercase();
+
+    if is_unroutable_host(&lower) {
+        bail!(
+            "{var} points at {bare:?}, which only this machine can reach — that is a stub issuer, \
+             and a stub issuer in production authenticates everyone as anyone (ADVERSARY 017)."
+        );
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for Config {
