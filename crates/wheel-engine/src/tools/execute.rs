@@ -1556,6 +1556,66 @@ X-Another: yes"
         );
     }
 
+    /// ADVERSARY 027 was not really "the allowlist is missing at create" — it
+    /// was two checks disagreeing about the same URL. They still parse it
+    /// separately: create-time uses `wheel_core::url_host_port`, call-time
+    /// uses `reqwest::Url`. If those ever differ on a host or a port, an
+    /// operator can configure a node the engine then refuses to call, or
+    /// worse. This pins them together.
+    #[test]
+    fn the_create_and_call_paths_read_the_same_host_and_port() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/v1/x",
+            "https://api.example.com/v1",
+            "http://example.com",
+            "https://example.com",
+            "http://[::1]:8080/",
+            "https://[::1]/",
+            "http://user:pass@example.com:8080/x",
+            "http://sub.domain.example.co.uk:3000/a/b?q=1",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("reqwest parses it");
+            let call_time = (
+                parsed.host_str().unwrap_or_default().to_string(),
+                parsed.port_or_known_default().unwrap_or_default(),
+            );
+            let create_time = wheel_core::url_host_port(url).expect("core parses it");
+            assert_eq!(
+                create_time, call_time,
+                "the two checks disagree about {url}: create saw {create_time:?}, call saw {call_time:?}"
+            );
+        }
+    }
+
+    /// ...and therefore an allowlist entry that permits creation permits the
+    /// call, which is the property an operator actually depends on.
+    #[test]
+    fn what_can_be_configured_can_also_be_called() {
+        let url = "http://127.0.0.1:8080/v1";
+        let (host, port) = wheel_core::url_host_port(url).unwrap();
+        let entry = format!("{host}:{port}");
+        let targets = vec![entry];
+
+        // Create-time says yes.
+        let cfg = wheel_core::ToolConfig {
+            kind: wheel_core::ToolKind::Http,
+            source: wheel_core::ToolSource {
+                format: wheel_core::ToolFormat::Manual,
+                raw: String::new(),
+                imported_at: wheel_core::Timestamp::now(),
+            },
+            base_url: url.into(),
+            operations: vec![],
+        };
+        assert!(
+            wheel_core::validate_config_with(&wheel_core::NodeConfig::Tool(cfg), &targets).is_ok()
+        );
+
+        // Call-time says yes about the same target.
+        assert!(Allowlist { targets: &targets }.permits(&host, port));
+    }
+
     #[test]
     fn an_empty_allowlist_permits_nothing() {
         let empty = Allowlist::default();

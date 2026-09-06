@@ -172,34 +172,15 @@ impl LoginSessions {
         // timeout and answers 504 -- an operator staring at a gateway error
         // for a sign-in that was working fine on the other side of the pipe.
         let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let mut pumps = Vec::new();
-        for stream in [
-            Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-            Box::new(stderr) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        ] {
-            let output = output.clone();
-            pumps.push(tokio::spawn(async move {
-                // read_line rather than lines(): the prompt the CLI writes
-                // before waiting for input carries no newline, so a
-                // line-oriented reader never yields it -- and it is the thing
-                // that tells us the CLI is ready for a code.
-                let mut reader = BufReader::new(stream);
-                let mut buf = Vec::new();
-                loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if let Ok(mut o) = output.lock() {
-                                o.push_str(&String::from_utf8_lossy(&buf));
-                            }
-                        }
-                    }
-                }
-            }));
-        }
+        let mut pumps = spawn_pumps(
+            vec![
+                Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box::new(stderr) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            ],
+            &output,
+        );
 
-        let url = match wait_for_url(&output, &mut child, self.url_timeout).await {
+        let url = match wait_for_url(&output, &mut child, &mut pumps, self.url_timeout).await {
             Ok(url) => url,
             Err(e) => {
                 let _ = child.kill().await;
@@ -397,6 +378,41 @@ fn tail_since(output: &std::sync::Arc<std::sync::Mutex<String>>, from: usize) ->
     clean(fresh)
 }
 
+/// Start a reader per stream, appending everything into one buffer.
+///
+/// Extracted so a test can create the exact situation the drain exists for:
+/// readers that have not yet been polled while the child is already gone.
+fn spawn_pumps(
+    streams: Vec<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+    output: &std::sync::Arc<std::sync::Mutex<String>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    streams
+        .into_iter()
+        .map(|stream| {
+            let output = output.clone();
+            tokio::spawn(async move {
+                // read_until rather than lines(): the prompt the CLI writes
+                // before waiting for input carries no newline, so a
+                // line-oriented reader never yields it -- and it is the thing
+                // that says the CLI is ready for a code.
+                let mut reader = BufReader::new(stream);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(mut o) = output.lock() {
+                                o.push_str(&String::from_utf8_lossy(&buf));
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
 /// Wait for the pipe readers to finish before reporting what the child said.
 ///
 /// `wait()` returns when the process exits, which is NOT when its output has
@@ -471,6 +487,7 @@ fn extract_url(text: &str) -> Option<String> {
 async fn wait_for_url(
     output: &std::sync::Arc<std::sync::Mutex<String>>,
     child: &mut Child,
+    pumps: &mut Vec<tokio::task::JoinHandle<()>>,
     budget: Duration,
 ) -> Result<String, LoginError> {
     let deadline = Instant::now() + budget;
@@ -480,9 +497,20 @@ async fn wait_for_url(
             return Ok(url);
         }
         if let Ok(Some(_)) = child.try_wait() {
-            // It exited without ever offering a URL. Whatever it printed is
-            // the reason, and it is far more useful than "timed out".
-            let said = clean(&text);
+            // Exit is not the same event as "its output has been read": the
+            // pumps are separate tasks and the last line can still be in
+            // flight. Without this the operator is told the login "ended
+            // before printing a URL" with NO reason attached, while the
+            // reason is microseconds behind — the same race that was fixed on
+            // the `complete` path and left here. QA's gate caught it failing
+            // under load.
+            //
+            // Demonstrated, not merely reasoned: removing this line makes
+            // `a_dead_childs_reason_is_read_before_it_is_reported` fail with
+            // the exact text QA's gate reported — "the CLI rejected it without
+            // saying why".
+            drain(std::mem::take(pumps)).await;
+            let said = clean(&output.lock().map(|o| o.clone()).unwrap_or_default());
             return Err(LoginError::Spawn(format!(
                 "the login process ended before printing a URL: {said}"
             )));
@@ -584,6 +612,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("claude-stub");
+        // One line and an immediate exit: the shape that failed in QA's gate.
+        //
+        // This test asserts the PROPERTY through the public entry point but
+        // cannot force the race — the window is a scheduling accident here.
+        // `a_dead_childs_reason_is_read_before_it_is_reported` constructs it
+        // deterministically instead.
         std::fs::write(
             &program,
             "#!/bin/sh\necho 'some unrelated failure' >&2\nexit 1\n",
@@ -847,6 +881,72 @@ mod tests {
         }
         // The child must not be left running once we have answered.
         assert_eq!(s.len().await, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The race itself, forced rather than hoped for.
+    ///
+    /// QA's gate caught `wait_for_url` reporting a dead child's output before
+    /// the readers had run, so the operator got "the CLI rejected it without
+    /// saying why" instead of the reason. Through `begin` that window is a
+    /// scheduling accident I could not reproduce. Here it is constructed: the
+    /// child is confirmed DEAD first, the readers are spawned afterwards, and
+    /// `wait_for_url` is called with no await in between — so on the
+    /// single-threaded test runtime the readers cannot have run, and the
+    /// output buffer is empty exactly as it was in the failure.
+    #[tokio::test]
+    async fn a_dead_childs_reason_is_read_before_it_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-oauth-race-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("stub");
+        std::fs::write(&program, "#!/bin/sh\necho 'the real reason' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, PermissionsExt::from_mode(0o755)).unwrap();
+
+        let mut child = tokio::process::Command::new(&program)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        // Confirm it is gone. Its output is now sitting in the pipe buffer,
+        // unread, because nothing is reading yet.
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut pumps = spawn_pumps(
+            vec![
+                Box::new(stdout) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box::new(stderr) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            ],
+            &output,
+        );
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "the readers must not have run yet, or this proves nothing"
+        );
+
+        let err = wait_for_url(&output, &mut child, &mut pumps, Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("ended before printing a URL"), "{err}");
+        assert!(
+            err.contains("the real reason"),
+            "the child's own words must be read before they are reported: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

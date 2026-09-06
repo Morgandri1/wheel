@@ -100,4 +100,12 @@ image-verify-prod: engine-image ## assert the image ships what it must, and no f
 	  test ! -e /usr/local/bin/codex  || { echo "FAIL: something shadows codex in the production image"; exit 1; }; \
 	  claude --version | grep -qi fake && { echo "FAIL: claude is a fake in the production image"; exit 1; }; \
 	  claude --version | grep -q "Claude Code" || { echo "FAIL: real claude missing"; exit 1; }; \
-	  echo "ok: image ships wheel + wheel-engine + wheel-host + python3, and the real claude ($$(claude --version))"'
+	  su agent -c "env -i PATH=$$PATH HOME=/tmp/wowcheck CARGO_HOME=/tmp/wowcheck/cargo RUSTUP_HOME=$$RUSTUP_HOME cargo --version" >/dev/null 2>&1 || \
+	    { echo "FAIL: the agent uid cannot run cargo with the environment the ENGINE actually gives it — a Wheel-on-Wheel agent clones and then cannot build"; exit 1; }; \
+	  su agent -c "env -i PATH=$$PATH HOME=/tmp/wowcheck CARGO_HOME=/tmp/wowcheck/cargo cargo --version" >/dev/null 2>&1 && \
+	    { echo "FAIL: cargo worked WITHOUT RUSTUP_HOME, so this check cannot detect the regression it exists for"; exit 1; }; \
+	  su agent -c "touch /opt/rust/rustup/POISON" >/dev/null 2>&1 && \
+	    { echo "FAIL: an agent can WRITE the shared toolchain and poison it for every other project"; exit 1; }; \
+	  su agent -c "touch /opt/rust/cargo/bin/POISON" >/dev/null 2>&1 && \
+	    { echo "FAIL: an agent can write the shared cargo bin dir"; exit 1; }; \
+	  echo "ok: image ships wheel + wheel-engine + wheel-host + python3, the real claude ($$(claude --version)), a toolchain the agent uid can RUN but not WRITE"'
