@@ -1,24 +1,77 @@
 # Deploying web/
 
-Vercel project **root directory = `web/`**. Everything else is defaults; `vercel.json` pins the
-package manager and adds the response headers.
+## Environment variables — the complete list
 
-## What the operator has to supply
+`web/.env.example` is the copy-paste version of this table. Nothing in `web/` reads an
+environment variable that is not listed here.
 
-Local email/password is the shipping provider (`AUTH_MODE=local`), so the deploy needs two
-variables and no third-party account:
+**Every `NEXT_PUBLIC_*` value is inlined into the client bundle at build time.** Two consequences
+that bite people: changing one requires a *redeploy*, not a restart; and it is readable by anyone
+who opens the bundle, so a secret must never carry that prefix.
 
-| Variable | Value | Scope | Notes |
+### Required in every deployment
+
+| Variable | Value | Where it is read | If it is wrong |
 |---|---|---|---|
-| `NEXT_PUBLIC_AUTH_MODE` | `local` | all | `mock` and `dev` are for local work only. Anything but `local` or `clerk` on a public deploy means no sign-in at all. |
-| `NEXT_PUBLIC_API_URL` | `https://wheel-api-production.up.railway.app`, later `https://api.wheel.dev` | all | No trailing slash. It is also baked into the CSP's `connect-src`, so a wrong value blocks every API call at the browser rather than failing at the API. |
+| `NEXT_PUBLIC_API_URL` | `https://wheel-api-production.up.railway.app`, later `https://api.wheel.dev`. **No trailing slash** | `src/lib/api.ts`, `src/middleware.ts` (CSP), endpoint inspector's public-URL fallback | It is baked into the CSP's `connect-src`, so the *browser* blocks every API call before it is sent. The network tab shows a CSP violation, not a failed request. |
+| `NEXT_PUBLIC_AUTH_MODE` | `local` | `src/lib/auth.ts`, `src/lib/local-auth.ts`, `src/middleware.ts`, `src/lib/csp.ts` | See the footgun below — an unrecognised value fails *silently*. |
 
-`NEXT_PUBLIC_*` values are baked into the client bundle at build time, so changing one needs a
-redeploy, not just a restart.
+Defaults if unset: `NEXT_PUBLIC_API_URL` falls back to `http://localhost:8787` (the mock) and
+`NEXT_PUBLIC_AUTH_MODE` to `mock`. Both defaults are correct for a laptop and wrong for a deploy,
+and neither announces itself — a production build with no environment at all comes up pointing at
+a mock server on localhost that isn't there.
 
-The API needs `AUTH_MODE=local` to match. The web and the API disagreeing about the mode is the
-one misconfiguration that looks like a bug rather than a setting: sign-in succeeds, and every
-call afterwards 401s.
+### `NEXT_PUBLIC_AUTH_MODE` values
+
+| Value | What it does | Needs |
+|---|---|---|
+| `mock` | Constant token against the bundled mock server (`pnpm mock`). No sign-in screen. | — |
+| `dev` | The real API with `WHEEL_ENV=dev`, using a pre-minted token. | `NEXT_PUBLIC_DEV_TOKEN` |
+| `local` | Email/password sessions issued by the API itself. **This is what we deploy.** | API on `AUTH_MODE=local` |
+| `clerk` | A real Clerk session. | the two Clerk keys below |
+
+**The footgun.** The mode is read as a plain string with no validation, so a typo — `locol`,
+`Local`, a trailing space — is not rejected anywhere. What happens instead: the sign-in page still
+renders (it falls through to the local form), the sign-in request still succeeds, and then no
+token getter is ever registered, so *every* call afterwards 401s and the app bounces you back to
+sign-in. It reads as "the API is broken" or "sign-in doesn't stick". It is a spelling mistake.
+
+The same symptom, from a different cause, is the web and the API disagreeing about the mode. If
+sign-in succeeds and everything after it 401s, check both these before anything else.
+
+### Conditional
+
+| Variable | When | Notes |
+|---|---|---|
+| `NEXT_PUBLIC_DEV_TOKEN` | `AUTH_MODE=dev` only | Mint with `infra/dev/e2e.py`'s `mint()`. It lands in the client bundle, so it is never a production credential. |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | `AUTH_MODE=clerk` only | `pk_…`. Public by design. |
+| `CLERK_SECRET_KEY` | `AUTH_MODE=clerk` only | `sk_…`. **Server only — never prefix with `NEXT_PUBLIC_`.** |
+
+### Set by the platform, not by us
+
+| Variable | Notes |
+|---|---|
+| `NODE_ENV` | Vercel sets `production`. It selects the production CSP (drops `'unsafe-eval'`, adds `'strict-dynamic'`) and it is why `vercel.json` installs with `--prod=false`: pnpm skips devDependencies when this is `production`, and without `typescript` installed Next never loads `tsconfig.json`, so the `@/*` path alias goes unregistered and the build dies on `Module not found: Can't resolve '@/lib/events'` — a path error that is really a missing dependency. |
+
+### Local development only
+
+| Variable | Default | Notes |
+|---|---|---|
+| `NEXT_DIST_DIR` | `.next` | A second dev server needs its own build directory. Two `next dev` sharing one `.next` corrupt each other's cache, and the symptom is a 500 on the server you were not touching. QA's Playwright config relies on this to run mock-mode and local-mode servers side by side. |
+
+### The mock server only (`pnpm mock`) — never set in a deployment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MOCK_PORT` | `8787` | Must match the port in `NEXT_PUBLIC_API_URL`. |
+| `MOCK_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | CORS allow-list. A browser cannot distinguish a CORS refusal from an unreachable server, so a missing origin here surfaces in the UI as "Can't reach the API" — pointing at the wrong thing. |
+| `MOCK_BULK_NODES` | `0` | Seeds N extra nodes, for testing the board at scale. |
+
+## What the operator has to do in Vercel
+
+Project **root directory = `web/`**. Everything else is defaults; `vercel.json` pins the package
+manager and adds the response headers. Set `NEXT_PUBLIC_AUTH_MODE=local` and `NEXT_PUBLIC_API_URL`
+for all environments, and redeploy after any change to either.
 
 ## What API has to do
 
@@ -62,10 +115,14 @@ Three consequences worth knowing before someone rediscovers them the hard way:
    page HTML is not CDN-cacheable; static assets still are.
 2. **Monaco is served from `/monaco`, not from jsDelivr.** `@monaco-editor/react` fetches the
    editor from a public CDN by default, which means a third party could serve executable code
-   into our origin — where it can read the session token. `scripts/copy-monaco.ts` copies the
+   into our origin — where it can read the session token. `scripts/copy-monaco.mjs` copies the
    editor into `public/` before every dev run and build (`predev` / `prebuild`); `public/monaco`
    is generated and not committed. We found this because the policy blocked Monaco's stylesheet
    while `'strict-dynamic'` was happily letting its script through.
+
+   It is `.mjs`, not `.ts`, deliberately: `prebuild` runs inside the production install, so a
+   build step that needs `tsx` needs a devDependency to build — which is the exact failure mode
+   `--prod=false` exists to prevent. Do not "modernise" this one back to TypeScript.
 3. **`style-src` keeps `'unsafe-inline'`.** Server-rendered `style` attributes are subject to
    `style-src`, CSP nonces do not apply to style attributes at all, and the exposure is CSS
    injection rather than script execution. Named here so it reads as a decision.
