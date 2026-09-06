@@ -107,13 +107,25 @@ pub async fn delete_node(State(s): State<AppState>, Path(id): Path<Uuid>) -> Api
 }
 
 /// `POST /v1/wires` — validated against the §3 matrix. Idempotent.
-pub async fn add_wire(State(s): State<AppState>, Json(w): Json<WireSpec>) -> ApiResult<StatusCode> {
-    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    board::add_wire(&conn, w.from, w.to, w.wire_type, None)?;
+///
+/// Usually `{}`; a declared-credential overlap across two vaults (028 face 5)
+/// comes back as `{"warning": "..."}` on the same 200 — the wire is created
+/// either way, since only a STORED clash is refused (409).
+pub async fn add_wire(
+    State(s): State<AppState>,
+    Json(w): Json<WireSpec>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let warning = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        board::add_wire(&conn, w.from, w.to, w.wire_type, None)?
+    };
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(match warning {
+        Some(w) => serde_json::json!({ "warning": w }),
+        None => serde_json::json!({}),
+    }))
 }
 
 /// `DELETE /v1/wires`

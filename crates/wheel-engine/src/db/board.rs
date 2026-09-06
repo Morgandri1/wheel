@@ -265,13 +265,17 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<bool> {
 }
 
 /// Create a wire after checking it against the §3 matrix.
+///
+/// `Ok(Some(warning))` is a wire that was created but deserves the operator's
+/// attention (028 face 5: two vaults declaring the same credential); it is
+/// not an error and must not be treated as one.
 pub fn add_wire(
     conn: &Connection,
     from: Uuid,
     to: Uuid,
     ty: WireType,
     granted_by: Option<Uuid>,
-) -> Result<(), BoardError> {
+) -> Result<Option<String>, BoardError> {
     let from_node = get(conn, from)
         .ok()
         .flatten()
@@ -283,18 +287,29 @@ pub fn add_wire(
 
     check_wire(from, from_node.node_type(), to, to_node.node_type(), ty)?;
 
-    // Refuse a second vault that would supply a key the agent already gets
+    let is_vault_read = from_node.node_type() == NodeType::Agent
+        && to_node.node_type() == NodeType::Vault
+        && ty == WireType::Read;
+
+    // Refuse a second vault that ACTUALLY HOLDS a key the agent already gets
     // from another one. Caught here, at the moment the operator makes the
     // wire, because the alternative is an agent that looks correctly
-    // configured and silently runs as whichever account won.
-    if from_node.node_type() == NodeType::Agent
-        && to_node.node_type() == NodeType::Vault
-        && ty == WireType::Read
-    {
+    // configured and silently runs as whichever account won. A vault that
+    // only DECLARES the key does not compete for real (028 face 5) — see the
+    // warning below instead.
+    if is_vault_read {
         if let Ok(Some(a)) = crate::vault::find_ambiguity(conn, from, Some(to)) {
             return Err(BoardError::Ambiguous(a.to_string()));
         }
     }
+    let warning = if is_vault_read {
+        crate::vault::find_declared_overlap(conn, from, Some(to))
+            .ok()
+            .flatten()
+            .map(|a| a.to_string())
+    } else {
+        None
+    };
 
     // Idempotent: re-creating an existing wire is a no-op, not an error.
     conn.execute(
@@ -309,7 +324,7 @@ pub fn add_wire(
         ],
     )
     .map_err(|e| BoardError::NotFound(e.to_string()))?;
-    Ok(())
+    Ok(warning)
 }
 
 /// Update a node's name, position and config in place. The node's TYPE is not
