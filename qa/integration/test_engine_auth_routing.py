@@ -19,12 +19,12 @@ engine's own log is not evidence here — the engine is the thing under test.
 import json, os, subprocess, sys, time, uuid, urllib.error, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results
+from wheel_client import Results, free_port
 
 SKIP = 77
 R = Results()
 
-PORT = int(os.environ.get("WHEEL_AUTH_ENGINE_PORT", "17422"))
+PORT = free_port(int(os.environ.get("WHEEL_AUTH_ENGINE_PORT", "17422")))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-authroute-secret-at-least-16"
 NAME = "qa-engine-authroute"

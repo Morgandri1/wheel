@@ -16,7 +16,7 @@ grant, reachable by whoever can create wires.
 """
 import json, os, subprocess, sys, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results, call as _http
+from wheel_client import Results, call as _http, free_port
 
 SKIP = 77
 R = Results()
@@ -24,7 +24,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MATRIX = os.path.join(ROOT, "qa", "fixtures", "wire_matrix.json")
 
 NAME = "wheel-qa-wirematrix"
-PORT = int(os.environ.get("WHEEL_WM_PORT", "17423"))
+PORT = free_port(int(os.environ.get("WHEEL_WM_PORT", "17423")))
 SECRET = "qa-wire-matrix-secret-0123456789"
 BASE = "http://127.0.0.1:%d" % PORT
 

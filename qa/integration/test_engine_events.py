@@ -19,11 +19,11 @@ empty sets are equal, and that is the failure mode of every parity test.
 """
 import json, os, subprocess, sys, threading, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results, configure_fakes
+from wheel_client import Results, configure_fakes, free_port
 
 SKIP = 77
 R = Results()
-PORT = int(os.environ.get("WHEEL_ENGINE_EVENTS_PORT", "17420"))
+PORT = free_port(int(os.environ.get("WHEEL_ENGINE_EVENTS_PORT", "17420")))
 BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-events-secret-at-least-16"
 NAME = "qa-engine-events"

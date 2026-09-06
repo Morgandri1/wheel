@@ -17,7 +17,7 @@ rule that broke rather than a filename.
 import glob, json, os, subprocess, sys, time, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results
+from wheel_client import Results, free_port
 
 SKIP = 77
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -25,7 +25,7 @@ INVALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "invalid")
 VALID = os.path.join(ROOT, "qa", "fixtures", "nodes", "valid")
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
 NAME = "qa-validation-%s" % uuid.uuid4().hex[:8]
-PORT = int(os.environ.get("WHEEL_VALIDATION_PORT", "17428"))
+PORT = free_port(int(os.environ.get("WHEEL_VALIDATION_PORT", "17428")))
 SECRET = "qa-engine-secret-at-least-16-chars"
 
 R = Results()

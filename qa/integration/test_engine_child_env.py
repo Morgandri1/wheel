@@ -29,11 +29,11 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results, pin_image  # noqa: E402
+from wheel_client import Results, pin_image  # noqa: E402, free_port
 
 R = Results()
 SKIP = 77
-PORT = int(os.environ.get("WHEEL_CHILDENV_PORT", "17429"))
+PORT = free_port(int(os.environ.get("WHEEL_CHILDENV_PORT", "17429")))
 BASE = "http://127.0.0.1:%d" % PORT
 NAME = "qa-engine-childenv"
 # Resolved once at startup; see pin_image().
