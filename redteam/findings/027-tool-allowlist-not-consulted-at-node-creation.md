@@ -51,3 +51,26 @@ create is the consistent fix.)
 ## Not affected / verified good this run
 026 (6to4/NAT64/Teredo) VERIFIED FIXED live (see finding 026). Prod-boot-refusal + boot WARN verified. The
 allowlist does not WIDEN anything reachable (the gap is over-restriction, not under-restriction).
+
+## Root cause (PM concurs this is the finding) + the fix shape red-team will accept
+The create-time base_url check lives in **`crates/wheel-core/src/validate.rs:180` and `:250`**
+(`if crate::tool::host_is_denied(&host) { bail }`, error at `:45`) — in **wheel-core**, which structurally
+cannot see the engine's `tool_allow_hosts` (engine config). The call-time check lives in the ENGINE
+(`execute::resolve_for`, which DOES consult the allowlist). Two crates, two decisions, different knowledge —
+that split is precisely why create and call disagreed. A second one-liner in the engine would re-create the
+same seam.
+**Accepted fix shape:** wheel-core's `validate` takes the host policy as a PARAMETER — a `HostPolicy` /
+predicate the engine constructs from its allowlist (`|host,port| allow.permits(host,port) || !host_is_denied(host)`) —
+so **create and call share ONE parser and ONE decision**. Test-only allowances remain refused in prod
+(standing rule 42137cd: the allowlist is boot-refused under `WHEEL_ENV=prod`). One decision function, exercised
+by both paths, is the durable fix; anything that leaves core deciding create and the engine deciding call will
+drift again.
+
+## Workaround that unblocked testing (and narrows 027's real impact)
+A base_url that is a HOSTNAME (not a loopback/private LITERAL) passes create (`host_is_denied` is literal), and
+if that hostname is in `WHEEL_TOOL_ALLOW_HOST` and resolves (via `/etc/hosts` or DNS) to the local server, the
+CALL reaches it. So the allowlist IS usable for "reach a local server" — via a hostname alias, not the `127.0.0.1`
+literal. 027's real scope is therefore: the IP-LITERAL form of an allowlist target is uncreatable, and create/call
+use different deciders. The send() allowed-path is now VERIFIED LIVE through this hostname route (see finding 022,
+"send() ALLOWED-PATH VERIFIED LIVE"). The HostPolicy fix still matters (one decider), but 027 no longer blocks
+verification.
