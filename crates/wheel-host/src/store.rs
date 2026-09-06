@@ -23,36 +23,66 @@ pub struct ProjectRecord {
     pub vault_key: String,
 }
 
-/// WAL where the filesystem can host its shared-memory index, a rollback journal where it cannot.
+/// Open `host.db` on whatever terms the filesystem allows, and prove them before trusting them.
 ///
-/// WAL keeps that index in a `-shm` file, and Railway's bind-mounted volume cannot resize one: the
-/// host crash-looped on every boot with "disk I/O error ... xShmMap". The pragma is not enough to
-/// find that out, because the mapping only happens on the first write lock -- so the mode is proven
-/// with an immediate transaction and abandoned if the proof fails. Slower, and it boots.
+/// Three attempts, narrowest change first, because each one costs something:
 ///
-/// `WHEEL_SQLITE_JOURNAL` skips the proof for a deployment already known to be hostile, so a volume
-/// that has failed once need not fail again on every boot to be believed.
-fn set_journal_mode(conn: &Connection) -> Result<()> {
-    if let Ok(forced) = std::env::var("WHEEL_SQLITE_JOURNAL") {
-        if !forced.trim().is_empty() {
-            conn.pragma_update(None, "journal_mode", forced.trim())
-                .context("WHEEL_SQLITE_JOURNAL names no usable journal mode")?;
-            return Ok(());
-        }
+/// 1. The wanted journal mode on an ordinary connection. This is every laptop, every test, and a
+///    normal volume; nothing else is given up.
+/// 2. The same mode with `locking_mode=EXCLUSIVE`. A WAL database keeps its index in a `-shm` file
+///    and Railway's bind mount cannot resize one, which crash-looped every boot on "disk I/O error
+///    ... xShmMap"; under exclusive locking sqlite keeps that index in heap memory and never opens
+///    the path at all. The cost is that nothing else may open the file while the host runs -- no
+///    second connection, no `sqlite3` on the volume -- so it is not the default. The host can pay
+///    it: one replica by contract, one connection behind a mutex. The engine could not, which is
+///    why the fix there is a fallback instead.
+/// 3. A rollback journal on that same exclusive connection. Slower, needs no shared memory, and by
+///    now the connection is one that can actually get out of WAL: switching modes has to checkpoint
+///    the WAL first, which is why plain `WHEEL_SQLITE_JOURNAL=TRUNCATE` died of the same error it
+///    was set to avoid.
+///
+/// The mode is PROVEN with an immediate transaction at each step rather than trusted, because
+/// `PRAGMA journal_mode` reports success on a filesystem where the first write then fails -- the
+/// shared memory is mapped on the first write lock, not on the pragma. That trap is the whole bug.
+///
+/// `WHEEL_SQLITE_JOURNAL` names the mode to try first, for a deployment already known to be hostile.
+fn open_configured(path: &str) -> Result<Connection> {
+    let wanted = std::env::var("WHEEL_SQLITE_JOURNAL")
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "WAL".to_string());
+
+    let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
+    if mode_holds(&conn, &wanted) {
+        return Ok(conn);
     }
-    let wal_holds = conn.pragma_update(None, "journal_mode", "WAL").is_ok()
-        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok();
-    if !wal_holds {
-        conn.pragma_update(None, "journal_mode", "TRUNCATE")
-            .context("no usable journal mode for the host database")?;
+
+    // A fresh connection: the locking mode is what sqlite consults when it first touches the file,
+    // so it cannot be imposed on one that has already tried and failed.
+    drop(conn);
+    let conn = Connection::open(path).with_context(|| format!("reopening {path}"))?;
+    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .context("taking the host database exclusively")?;
+    if mode_holds(&conn, &wanted) {
+        return Ok(conn);
     }
-    Ok(())
+
+    if mode_holds(&conn, "TRUNCATE") {
+        return Ok(conn);
+    }
+    anyhow::bail!("no journal mode this filesystem can host: tried {wanted}, then TRUNCATE")
+}
+
+/// Does the database actually work in this journal mode, or only claim to?
+fn mode_holds(conn: &Connection, mode: &str) -> bool {
+    conn.pragma_update(None, "journal_mode", mode).is_ok()
+        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok()
 }
 
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
-        set_journal_mode(&conn)?;
+        let conn = open_configured(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
                id               TEXT PRIMARY KEY,
@@ -403,6 +433,48 @@ mod tests {
 #[cfg(test)]
 mod journal_mode_tests {
     use super::*;
+
+    /// The production failure itself, reproduced: a filesystem that cannot give sqlite a `-shm`.
+    ///
+    /// A directory standing where the file belongs is QA's trick from the engine's gate, and it is
+    /// the same symptom -- WAL reports success and the first write fails. Without exclusive locking
+    /// this is the crash loop; with it sqlite never looks at the path.
+    #[tokio::test]
+    async fn a_volume_that_cannot_give_us_a_shm_file_still_boots() {
+        let dir = std::env::temp_dir().join(format!("wheel-host-noshm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.db");
+        std::fs::create_dir(dir.join("host.db-shm")).unwrap();
+
+        let store = Store::open(&path.display().to_string()).expect("the host must still open");
+        let id = Uuid::new_v4();
+        store.upsert(&id, "s", "dg").await.expect("and still write");
+        store.set_desired_running(&id, true).await.unwrap();
+        assert_eq!(store.all_desired_running().await.unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Exclusive locking is the escape hatch, not the default, and this is what it costs.
+    ///
+    /// On a filesystem that can host a `-shm` the host stays on an ordinary connection, so an
+    /// operator can still open `host.db` with sqlite3 and a test can still break it from outside.
+    /// Taking the lock everywhere would have removed both, and two host tests caught exactly that.
+    #[tokio::test]
+    async fn a_normal_volume_is_left_open_to_other_readers() {
+        let dir = std::env::temp_dir().join(format!("wheel-host-open-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.db");
+
+        let store = Store::open(&path.display().to_string()).unwrap();
+        store.upsert(&Uuid::new_v4(), "s", "dg").await.unwrap();
+
+        let second = Connection::open(&path).unwrap();
+        let n: i64 = second
+            .query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .expect("a second connection must still be able to read host.db");
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The host reconciles from this database on every boot, so a journal mode it cannot open is a
     /// crash loop, and one it cannot write to is a host that comes up having forgotten every
