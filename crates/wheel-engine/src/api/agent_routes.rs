@@ -570,6 +570,9 @@ async fn finish_paste_code(
     if code.trim().is_empty() {
         return Err(ApiError::invalid("the code is empty"));
     }
+    // Before the CLI runs, so anything it writes is newer than this and
+    // anything that was already there is not.
+    let login_started = std::time::SystemTime::now();
     s.logins
         .complete(id, session, code)
         .await
@@ -590,9 +593,14 @@ async fn finish_paste_code(
 
     let vaulted = match save_to_vault {
         Some(vault) => {
-            let found = crate::auth::oauth_token_from_store(&config_dir).map_err(|e| {
-                ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
-            })?;
+            // Only a credential this login actually produced. The child's HOME
+            // is that directory and an agent is untrusted code, so a file that
+            // was already there is not evidence of anything -- and vaulting it
+            // would hand an agent-chosen token to every peer on the board.
+            let found = crate::auth::oauth_token_from_store(&config_dir, Some(login_started))
+                .map_err(|e| {
+                    ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
+                })?;
             Some(save_credential_to_vault(
                 s, id, harness, vault, &found, vault_key,
             )?)
@@ -776,7 +784,11 @@ pub async fn auth_status(
     // knows when it lapses -- and it is the same store the child reads, so
     // this is the truth rather than a copy of it.
     let expires_at = if mode == Some(wheel_core::CredentialKind::OauthSession) {
-        crate::auth::oauth_token_from_store(&config_dir)
+        // No freshness floor here: this only REPORTS an expiry for display. An
+        // agent that lies about its own credential's expiry misleads the UI
+        // about itself and nothing else -- and at worst refuses to start,
+        // which harms only it.
+        crate::auth::oauth_token_from_store(&config_dir, None)
             .ok()
             .and_then(|t| t.expires_at)
             .and_then(millis_to_timestamp)
