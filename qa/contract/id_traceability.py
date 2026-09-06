@@ -66,11 +66,27 @@ def plan_ids(text):
     return set(re.findall(r"`([A-Za-z][A-Za-z0-9-]*(?:/[A-Za-z0-9-]+)*)`", text))
 
 
+def duplicate_plan_ids(text):
+    """An ID defined twice in the plan is two criteria wearing one name.
+
+    This gate checked one direction only — every ASSERTED id exists in the plan — which is
+    the same one-directional blindness ADVERSARY found in route_parity. Ten IDs turned out
+    to be defined twice, and two rows under one name drift: different severities, different
+    wording, and a reader resolving the ID gets whichever they happen to find first. Worse,
+    a suite asserting it satisfies this gate while testing only one of the two meanings.
+    """
+    import collections, re
+    rows = re.findall(r"^\|\s*`([A-Za-z][A-Za-z0-9/-]*)`", text, re.M)
+    return sorted(n for n, c in collections.Counter(rows).items() if c > 1)
+
+
 def main():
     if not os.path.exists(PLAN):
         print("no docs/TESTPLAN.md")
         return SKIP
-    known = plan_ids(open(PLAN).read())
+    plan_text = open(PLAN).read()
+    known = plan_ids(plan_text)
+    dupes = duplicate_plan_ids(plan_text)
 
     missing, checked, files, synthetic = {}, 0, 0, []
     for d in SUITES:
@@ -115,6 +131,15 @@ def main():
         print("\nSpell each criterion's ID out literally. An interpolated ID matches nothing "
               "in the plan, so this gate reports all clear while the criteria it names are "
               "untraced. Interpolating a sub-case after a '/' is fine.")
+        return 1
+
+    if dupes:
+        print("\n%d ID(s) defined MORE THAN ONCE in the plan:" % len(dupes))
+        for d in dupes:
+            print("  -", d)
+        print("\nTwo rows under one name drift apart, and a suite asserting the ID satisfies "
+              "this gate while testing only one of the two meanings. Merge them, or give the "
+              "second a distinct name.")
         return 1
 
     if missing:
