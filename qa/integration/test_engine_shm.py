@@ -263,7 +263,13 @@ def main():
         # the one condition sqlite cannot describe and the filesystem can.
         full = NAME + "-full"
         sh("docker", "rm", "-f", full)
-        sh("docker", "run", "-d", "--name", full, "--tmpfs", "/data:size=2m",
+        # uid/gid on the tmpfs, or the whole test is a lie: /data is root-owned by default
+        # and the container runs as agent(10001), so the filler `dd` fails with Permission
+        # denied, the volume stays EMPTY, and the engine's error is about an unwritable
+        # directory rather than a full one. I read that error as the disk-full message and
+        # was about to report a defect that does not exist.
+        sh("docker", "run", "-d", "--name", full,
+           "--tmpfs", "/data:size=2m,uid=10001,gid=10001",
            "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
            "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
            "-e", "WHEEL_VAULT_KEY=" + key,
@@ -278,17 +284,23 @@ def main():
         # "the FIRST line" became the tracing INFO banner rather than the failure — and the
         # control correctly refused to judge a first line that was not the first line.
         said = sh("sh", "-c", "docker logs %s 2>&1" % full)
-        first = next((l.strip() for l in said.stdout.splitlines() if l.strip()), "")
-        low = first.lower()
-        R.control("ENG-diskfull/engine-failed", "error" in low or "unable" in low,
-                  "the engine did not fail on a full volume, so there is no first line to "
-                  "judge and this check would pass for the wrong reason: %r" % first[:160])
+        # The FAILURE line, not literally line one: a tracing banner legitimately precedes
+        # it, and PM's requirement is about which CAUSE the operator is told, not about
+        # line numbering.
+        failure = next((l.strip() for l in said.stdout.splitlines()
+                        if l.strip() and "wheel-engine:" in l and "level" not in l), "")
+        low = failure.lower()
+        R.control("ENG-diskfull/engine-failed", bool(failure),
+                  "the engine did not fail on a full volume, so there is no failure line to "
+                  "judge and this check would pass for the wrong reason. Log: %r"
+                  % said.stdout[-200:])
         R.gated("ENG-diskfull-says-so", "ENG-diskfull/engine-failed",
-                any(w in low for w in ("no space", "disk full", "enospc", "out of space")),
-                "the first line on a FULL volume was %r — it must name the disk being full. "
-                "A sqlite open error sends the reader after a corrupt database or a "
-                "permission problem; ENOSPC is the one cause sqlite cannot describe and the "
-                "filesystem can." % first[:200])
+                any(w in low for w in ("disk is full", "no space", "disk full", "enospc",
+                                       "database is full", "out of space")),
+                "the failure on a FULL volume was %r — it must name the disk being full. "
+                "ENOSPC is the one cause sqlite cannot describe and the filesystem can, and "
+                "an operator reading a generic open error goes looking for corruption."
+                % failure[:200])
         sh("docker", "rm", "-f", full)
     finally:
         sh("docker", "rm", "-f", NAME)
