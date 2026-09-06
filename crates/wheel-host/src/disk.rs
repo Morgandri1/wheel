@@ -100,12 +100,57 @@ pub fn check_room(path: impl AsRef<Path>, floor_mb: u64) -> Result<()> {
     if space.free_mb() < floor_mb {
         anyhow::bail!("the volume is full enough to break a database: {space}, under the {floor_mb} MB a project needs to start");
     }
+    if is_filling(&space) {
+        tracing::warn!(
+            free_mb = space.free_mb(),
+            used_percent = space.used_percent(),
+            floor_mb,
+            "the volume is filling; starts are refused below the floor"
+        );
+    }
     Ok(())
+}
+
+/// How full is too full to stay quiet about.
+///
+/// The floor is where a start is refused, and by then the disk is already broken for anything that
+/// writes — the first symptom was a sqlite error about shared memory. A warning band exists so the
+/// log says "the volume is filling" while there is still room to act: production went from 141 MB
+/// to 2.5 GB in an hour on node_modules, twice, which is faster than anyone reads a dashboard.
+const WARN_PERCENT: u64 = 85;
+
+/// Separate from the logging so the threshold is testable without capturing a subscriber.
+pub fn is_filling(space: &Space) -> bool {
+    space.used_percent() >= WARN_PERCENT
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The warning has to arrive while there is still room to act on it, not at the floor.
+    #[test]
+    fn a_volume_filling_up_is_warned_about_before_it_is_refused() {
+        let comfortable = Space {
+            free_bytes: 50,
+            total_bytes: 100,
+        };
+        assert!(!is_filling(&comfortable));
+
+        let filling = Space {
+            free_bytes: 10,
+            total_bytes: 100,
+        };
+        assert!(is_filling(&filling), "90% full read as comfortable");
+
+        // And the band is above the floor, not at it: a volume that is filling still starts
+        // projects, which is the whole point of hearing about it early.
+        let dir = std::env::temp_dir();
+        assert!(
+            check_room(&dir, 1).is_ok(),
+            "warning must not become refusing"
+        );
+    }
 
     #[test]
     fn a_real_filesystem_measures() {
