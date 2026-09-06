@@ -148,8 +148,25 @@ impl DockerSandbox {
                 config,
             )
             .await
-            .context("creating project container")?;
+            .map_err(|e| self.explain_create_failure(e))?;
         Ok(())
+    }
+
+    /// Docker answers "no such image" with a bare 404, which surfaces to the user as a 500 on
+    /// project start and says nothing about what to do. Name the missing tag and the command that
+    /// builds it instead.
+    fn explain_create_failure(&self, e: bollard::errors::Error) -> anyhow::Error {
+        if let bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        } = e
+        {
+            return anyhow::anyhow!(
+                "engine image {} is not present on this docker daemon — build it with `make engine-image` \
+                 (or set ENGINE_IMAGE to an image that exists)",
+                self.cfg.engine_image
+            );
+        }
+        anyhow::Error::new(e).context("creating project container")
     }
 }
 
@@ -260,5 +277,56 @@ impl Sandbox for DockerSandbox {
 
     fn engine_base(&self, id: &Uuid) -> String {
         self.cfg.engine_url(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sandbox() -> DockerSandbox {
+        // No daemon call happens in these tests; only the error-explaining and naming logic runs.
+        DockerSandbox {
+            docker: Docker::connect_with_local_defaults().expect("client construction is offline"),
+            cfg: Config::for_tests("/tmp/wheel-docker-test"),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// BUG-014: a missing engine image surfaced as a bare 500 on project start, which told the
+    /// operator nothing. The message must name the tag and the command that builds it.
+    #[test]
+    fn a_missing_engine_image_says_which_image_and_how_to_build_it() {
+        let sb = sandbox();
+        let e = sb.explain_create_failure(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such image".into(),
+        });
+        let msg = format!("{e:#}");
+        assert!(msg.contains("wheel-engine:test"), "names the tag: {msg}");
+        assert!(msg.contains("make engine-image"), "names the fix: {msg}");
+    }
+
+    #[test]
+    fn other_docker_failures_keep_their_original_cause() {
+        let sb = sandbox();
+        let e = sb.explain_create_failure(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "container name already in use".into(),
+        });
+        let msg = format!("{e:#}");
+        assert!(msg.contains("creating project container"), "{msg}");
+        assert!(msg.contains("already in use"), "{msg}");
+        assert!(!msg.contains("make engine-image"), "{msg}");
+    }
+
+    /// Every docker object name is derived from a uuid the API generated, never from user input.
+    #[test]
+    fn object_names_are_derived_only_from_the_project_uuid() {
+        let sb = sandbox();
+        let id = Uuid::new_v4();
+        assert!(sb.cfg.container_name(&id).contains(&id.to_string()));
+        assert!(sb.cfg.volume_name(&id).contains(&id.to_string()));
+        assert_ne!(sb.cfg.container_name(&id), sb.cfg.volume_name(&id));
     }
 }

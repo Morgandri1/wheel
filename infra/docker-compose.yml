@@ -32,9 +32,10 @@ services:
     environment:
       SANDBOX_BACKEND: docker
       WHEEL_HOST_SECRET: ${WHEEL_HOST_SECRET:-dev-host-secret-at-least-16-chars}
-      # SDK's real engine owns the wheel-engine:dev tag. Until their build lands this stack runs
-      # against the stub in infra/dev/, tagged separately so the two can never be confused.
-      ENGINE_IMAGE: ${ENGINE_IMAGE:-wheel-engine:stub}
+      # The real engine image, built by `make engine-image` from docker/Dockerfile.host. Set
+      # ENGINE_IMAGE=wheel-engine:stub to run against the fake in infra/dev/ instead; the tags are
+      # kept distinct so a stub can never be mistaken for the real engine.
+      ENGINE_IMAGE: ${ENGINE_IMAGE:-wheel-engine:dev}
       DOCKER_NETWORK: wheel
       BIND_ADDR: 0.0.0.0:7100
       RUST_LOG: info,wheel_host=debug
