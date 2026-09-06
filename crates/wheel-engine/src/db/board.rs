@@ -505,7 +505,13 @@ mod tests {
         }
     }
 
-    /// W1 / WOW-table-survives-restart. The node survived, its table did not.
+    /// W1 / WOW-table-survives-restart -- and now WITHOUT one. The node
+    /// survived, its table did not; `board::ensure_tables` (boot) covers a
+    /// restart, but the wheel-dev incident this is named for happened on a
+    /// LIVE engine nobody restarted (QA's `WOW-table-survives-restart`, hit
+    /// for real on the reports table). `tables::list_rows`/`get_row`/
+    /// `put_row` now re-ensure on every access, so this must self-heal with
+    /// no `ensure_tables` call in between.
     ///
     /// QA's two assertions, and the second is the one that matters: a table
     /// rebuilt from a DEFAULT shape rather than from the node's config would
@@ -520,14 +526,11 @@ mod tests {
         // What a restore/migrate does to the file: the node row survives, the
         // user table does not.
         c.execute_batch("DROP TABLE t_reports").unwrap();
-        assert!(
-            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0).is_err(),
-            "positive control: the read must be broken before the fix runs"
-        );
 
-        ensure_tables(&c).unwrap();
-
-        // (1) The read works and is empty -- never "no such table".
+        // (1) The read works and is empty -- never "no such table" -- with NO
+        // boot/`ensure_tables` call in between. Restoring the old
+        // `list_rows`/`get_row`/`put_row` (without their own `ensure` call)
+        // makes this fail again with "no such table: t_reports": checked.
         assert!(tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
             .unwrap()
             .is_empty());
