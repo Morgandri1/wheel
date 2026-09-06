@@ -25,13 +25,17 @@ pub struct ProjectRecord {
 
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
         // Journalling is `wheel-sqlite`'s. This function used to have its own
         // copy, which is why the host kept crash-looping after the engine was
         // fixed: it handled a database that could not ENTER wal, and the
         // deployed one is already IN wal. This store opens before any engine
         // does, so it was the only thing in the logs.
-        wheel_sqlite::configure_journal(&conn)?;
+        //
+        // `true` = the host may take its database exclusively as a last
+        // resort. It can afford to: one replica by contract, one connection
+        // behind the mutex below. The engine passes `false` because
+        // `tables::query` opens the file a second time.
+        let conn = wheel_sqlite::open_configured(path, true)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
                id               TEXT PRIMARY KEY,

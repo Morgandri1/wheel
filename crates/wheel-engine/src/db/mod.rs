@@ -21,8 +21,11 @@ pub fn open(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating data dir {}", parent.display()))?;
     }
-    let conn =
-        Connection::open(path).with_context(|| format!("opening sqlite at {}", path.display()))?;
+    // `false` = never take the file exclusively. The board's own query path
+    // (`tables::query`) opens it a second time, so an exclusive engine is an
+    // engine whose agents cannot read their own tables -- a hard error naming
+    // the mode the database is stuck in is the better failure.
+    let conn = wheel_sqlite::open_configured(&path.display().to_string(), false)?;
     configure(&conn)?;
     migrate(&conn)?;
     ensure_node_tables(&conn)?;

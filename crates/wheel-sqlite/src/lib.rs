@@ -8,7 +8,7 @@
 //! copies of this would diverge again, and the second one would be the one
 //! nobody tests.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// How long to wait for a lock rather than failing instantly, in ms.
@@ -83,6 +83,72 @@ pub fn set_journal_mode(conn: &Connection, wanted: &str) -> Result<String> {
         "could not put the database into {wanted}; it is in {settled}"
     );
     Ok(settled)
+}
+
+/// Open a Wheel database on whatever terms the filesystem actually allows.
+///
+/// Both callers should use this rather than `Connection::open` + [`configure_journal`],
+/// because the last escalation needs to REPLACE the connection and so cannot be
+/// done to one it was handed.
+///
+/// Narrowest change first, since each step costs something:
+///
+/// 1. The wanted mode on an ordinary connection — every laptop, every test, a
+///    normal volume. Nothing is given up.
+/// 2. The transient exclusive drain ([`drain_under_exclusive_lock`]) for a
+///    database stuck in WAL on a volume whose `-shm` cannot be resized.
+/// 3. `allow_exclusive` only: a FRESH connection opened exclusively from the
+///    start, then converted. This is the host's escalation, written by another
+///    session on the same outage; sqlite consults the locking mode when it
+///    first touches the file, so a connection that has already failed in WAL is
+///    not necessarily the one to ask. The cost is that NOTHING else may open
+///    the file while that connection lives — no second connection, no `sqlite3`
+///    on the volume. The host can pay it: one replica by contract, one
+///    connection behind a mutex. The engine cannot, because `tables::query`
+///    opens the file again, which is why it passes `false` and takes a hard
+///    error instead of a silently unusable board.
+///
+/// Every step is judged by READING THE MODE BACK, never by the pragma's result.
+pub fn open_configured(path: &str, allow_exclusive: bool) -> Result<Connection> {
+    let wanted = target_mode();
+
+    let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
+    if let Ok(mode) = configure_journal_to(&conn, &wanted) {
+        return Ok(annotated(conn, &mode, path));
+    }
+
+    if !allow_exclusive {
+        // Report the real reason rather than a bare sqlite error: on the volume
+        // that caused this, the mode the database is stuck in IS the diagnosis.
+        let mode = current_journal_mode(&conn).unwrap_or_else(|_| "unknown".into());
+        anyhow::bail!(
+            "{path} could not be put into {wanted}; it is in {mode}, and this process cannot \
+             take the database exclusively because it opens a second connection for user queries"
+        );
+    }
+
+    drop(conn);
+    let conn = Connection::open(path).with_context(|| format!("reopening {path}"))?;
+    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .with_context(|| format!("taking {path} exclusively"))?;
+    for candidate in [wanted.as_str(), "TRUNCATE"] {
+        if let Ok(mode) = configure_journal_to(&conn, candidate) {
+            tracing::warn!(
+                path,
+                mode = %mode,
+                "database opened EXCLUSIVELY: nothing else may open this file while this process runs"
+            );
+            return Ok(conn);
+        }
+    }
+    anyhow::bail!("no journal mode {path} can host: tried {wanted}, then TRUNCATE, both exclusively")
+}
+
+fn annotated(conn: Connection, mode: &str, path: &str) -> Connection {
+    if !mode.eq_ignore_ascii_case("wal") {
+        tracing::info!(path, mode, "sqlite is using a rollback journal");
+    }
+    conn
 }
 
 /// Convert the journal mode while holding sqlite's exclusive lock, then give
