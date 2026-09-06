@@ -33,6 +33,15 @@ BASE = "http://127.0.0.1:%d" % PORT
 SECRET = "qa-wow-secret-at-least-16chars"
 IMAGE = os.environ.get("WHEEL_ENGINE_IMAGE", "wheel-engine:test")
 REPO = os.environ.get("WHEEL_WOW_REPO", "https://github.com/Morgandri1/wheel.git")
+# The agent's workspace, `Config::workspace_dir` = <data>/ws/<node name>. It matters that
+# it is THIS path and not somewhere convenient: it is the only tree the engine repairs
+# poisoned remotes in, so a fixture that clones elsewhere tests nothing and reports it as
+# a product failure.
+# A SUBDIRECTORY of the workspace, not the workspace itself: the engine sets the child's
+# cwd to the workspace, and the first version of this fixture `rm -rf`-ed it, so every
+# command after that died with "Unable to read current working directory". Still inside
+# the tree `sanitise_remotes` walks, which is what the repair leg needs.
+WS = "/data/ws/builder/repo"
 
 # What the sandbox must provide before this test means anything. Named individually so the
 # skip reason says WHICH tool is missing rather than "unsupported".
@@ -251,13 +260,22 @@ def main():
     http("POST", "/v1/agents/%s/start" % agent)
     time.sleep(3)
 
-    # `git clone` reads GH_TOKEN out of the environment via the credential helper, so
-    # the secret is never in argv (argv is world-readable across uids — contract §5b).
-    clone = ("set -e; cd /data; rm -rf wow; "
-             "git config --global credential.helper "
-             "'!f(){ echo username=x-access-token; echo password=$GH_TOKEN; };f'; "
-             "git clone --depth 1 %s wow 2>&1 | tail -3; "
-             "test -f wow/Cargo.toml && echo CLONE_OK" % REPO)
+    # NO credential helper is configured here any more, deliberately. It used to set its
+    # own `credential.helper`, which BYPASSES the engine's GIT_ASKPASS (SDK ddaa0e1) and
+    # meant this suite was exercising its own scaffolding rather than the product. The
+    # child now authenticates exactly the way a real agent does: the engine points
+    # GIT_ASKPASS at a 0700 helper that reads the token from the environment, so a plain
+    # https:// remote needs no credential in the URL.
+    #
+    # AND BE HONEST ABOUT WHAT THE CLONE PROVES: Morgandri1/wheel is PUBLIC, so cloning it
+    # needs no credential at all and this leg is not evidence that the vault token works.
+    # The PUSH is the credential test, and it has the token-removed control under it.
+    # /data/ws/<node name> — `Config::workspace_dir`. The previous fixture cloned to
+    # /data/wow, which is OUTSIDE the tree the engine repairs on start, so it reported the
+    # repair path broken when it had simply never been asked to look there.
+    clone = ("set -e; mkdir -p /data/ws/builder; rm -rf %s; "
+             "git clone --depth 1 %s %s 2>&1 | tail -3; "
+             "test -f %s/Cargo.toml && echo CLONE_OK" % (WS, REPO, WS, WS))
     out = turn(agent, clone, wait=180)
     vanished = "engine unreachable" in out
     if vanished:
@@ -300,7 +318,7 @@ def main():
         R.skip("WOW-token-not-on-disk", "nothing was cloned, so there is no workspace to "
                                         "search — an absence here would mean only that")
     else:
-        found = credential_scan("/data/wow", token)
+        found = credential_scan(WS, token)
         R.gated("WOW-token-not-on-disk", "WOW/credential-detector-works", found["clean"],
                 "the GitHub token is on disk in the workspace after clone. Files "
                 "containing it: %s. Credentialed remote URLs: %s. This is a live PAT "
@@ -330,7 +348,7 @@ def main():
     else:
         # A tracked file, not creds/ (that is A3), and content that is obviously test
         # residue if a branch ever escapes deletion.
-        edit = ("set -e; cd /data/wow; "
+        edit = ("set -e; cd %s; " % WS +
                 "git config user.email 'qa@wheel.test'; git config user.name 'Wheel QA'; "
                 "echo 'wheel-on-wheel probe %s' >> README.md; "
                 "git add README.md; "
@@ -344,12 +362,29 @@ def main():
                     "the agent could not commit in its own workspace. Git identity is the "
                     "usual cause and it must fail legibly, not silently: %s" % cout[-400:])
 
+        # Is the safe path actually wired up? SDK ddaa0e1 makes `GIT_ASKPASS` the way an
+        # agent authenticates without writing a token to disk. If it is not set, or not
+        # executable by the child, git falls back to prompting, there is no tty, and the
+        # agent sees "could not read Username" — at which point the agent reaches for the
+        # thing that does work, which is the token in the remote URL. The unsafe path
+        # returning is then a consequence of the safe one not working, so this is measured
+        # rather than assumed.
+        probe = turn(agent, "echo ASKPASS=[$GIT_ASKPASS]; "
+                            "test -x \"$GIT_ASKPASS\" && echo ASKPASS_EXECUTABLE; "
+                            "test -n \"$GH_TOKEN$GITHUB_TOKEN\" && echo TOKEN_IN_ENV",
+                     wait=60)
+        R.check("WOW-git-askpass-wired",
+                "ASKPASS_EXECUTABLE" in probe and "TOKEN_IN_ENV" in probe,
+                "the engine's out-of-band git credential is not usable by the child, so the "
+                "only way an agent can push is to put the token in the remote URL — which "
+                "is finding 036. Probe said: %s" % probe[-300:])
+
         # Control: the same push, with the token taken out of the environment.
         # `git push ... | tail -3; echo RC=$?` reports TAIL's exit code, which is always 0.
         # My first version did exactly that, and the control below caught it by "proving"
         # a push works with no credential at all. The exit code has to be taken from git
         # itself, before anything else runs.
-        push_cmd = ("cd /data/wow && %s git push origin HEAD:%s > /tmp/push.out 2>&1; "
+        push_cmd = ("cd " + WS + " && %s git push origin HEAD:%s > /tmp/push.out 2>&1; "
                     "rc=$?; tail -3 /tmp/push.out; echo RC=$rc")
         denied = turn(agent, push_cmd % ("env -u GH_TOKEN", branch), wait=120)
         pushed_without_token = "RC=0" in denied
@@ -362,7 +397,7 @@ def main():
         pout = turn(agent, push_cmd % ("", branch), wait=180)
         # "git push exited 0" and "the ref is on GitHub" are different claims, and PM was
         # explicit that only one of them is the operator's goal. Ask the REMOTE.
-        lsr = turn(agent, "cd /data/wow && git ls-remote origin %s 2>&1 | tail -2" % branch,
+        lsr = turn(agent, "cd " + WS + " && git ls-remote origin %s 2>&1 | tail -2" % branch,
                    wait=120)
         on_remote = branch in lsr
 
@@ -379,7 +414,7 @@ def main():
 
         # PM's S1, applied after the WRITE as well: pushing must not leave a credential
         # behind either, and a push is where git is most tempted to persist one.
-        after_push = credential_scan("/data/wow", token)
+        after_push = credential_scan(WS, token)
         R.gated("WOW-token-not-on-disk-after-push", "WOW/credential-detector-works",
                 after_push["clean"],
                 "the GitHub token is on disk after the push (it was not after the clone, "
@@ -387,8 +422,41 @@ def main():
                 % (after_push["literal_files"] or "none", after_push["remotes"][-160:]))
 
         # Clean up whatever we managed to create, on every path out.
-        turn(agent, "cd /data/wow && git push origin --delete %s 2>&1 | tail -2" % branch,
+        turn(agent, "cd " + WS + " && git push origin --delete %s 2>&1 | tail -2" % branch,
              wait=120)
+
+    # ---- the other half of SDK ddaa0e1: clones ALREADY poisoned ----------------------
+    #
+    # Fixing the mechanism protects clones made from now on. Every workspace on the
+    # production volume still holds a live token in its remote URL, and a clone made
+    # yesterday keeps yesterday's token forever unless something rewrites it. So the engine
+    # repairs poisoned remotes on every start, and this is that path: a remote is
+    # deliberately poisoned in the shape found in production, the agent is restarted, and
+    # the credential must be gone.
+    if "CLONE_OK" not in out:
+        R.skip("WOW-poisoned-remote-repaired", "nothing was cloned, so there is no remote "
+                                               "to poison")
+    else:
+        poison_url = "https://x-access-token:%s@github.com/Morgandri1/wheel.git" % token
+        turn(agent, "cd " + WS + " && git remote set-url origin '%s'" % poison_url, wait=60)
+        before = credential_scan(WS, token)
+        if not R.control("WOW/remote-was-poisoned", not before["clean"],
+                         "the remote could not be poisoned, so the repair path is not "
+                         "being tested and a clean result below would mean nothing"):
+            pass
+        else:
+            http("POST", "/v1/agents/%s/stop" % agent)
+            time.sleep(2)
+            http("POST", "/v1/agents/%s/start" % agent)
+            time.sleep(6)
+            turn(agent, "cd " + WS + " && git remote -v", wait=60)
+            after = credential_scan(WS, token)
+            R.gated("WOW-poisoned-remote-repaired", "WOW/remote-was-poisoned",
+                    after["clean"],
+                    "a remote poisoned with a live token was NOT repaired on restart. Every "
+                    "workspace cloned before the fix still holds its token, so fixing the "
+                    "mechanism alone leaves the exposure in place: files=%s remotes=%r"
+                    % (after["literal_files"] or "none", after["remotes"][-160:]))
 
     if os.environ.get("WHEEL_WOW_SKIP_BUILD") == "1":
         # The clone leg proves the interesting half (a vault secret reaching an agent
@@ -407,7 +475,7 @@ def main():
         #
         # Redirect, then report, then exit with the status that was actually cargo's. POSIX,
         # no pipe, no shell-specific options.
-        build = ("cd /data/wow && cargo test -p wheel-core > /tmp/wow-build.log 2>&1; "
+        build = ("cd " + WS + " && cargo test -p wheel-core > /tmp/wow-build.log 2>&1; "
                  "rc=$?; tail -15 /tmp/wow-build.log; exit $rc")
         out = turn(agent, build, wait=1800)
         if out == TURN_TIMEOUT:
