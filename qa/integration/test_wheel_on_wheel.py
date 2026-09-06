@@ -16,7 +16,7 @@ Deliberately NOT hermetic in the usual sense: it clones over the network and com
 is opt-in (`WHEEL_WOW=1`) and never runs in the default CI matrix — a 10-minute cargo build
 inside a container does not belong in a gate developers run before every merge.
 """
-import base64, json, os, subprocess, sys, time, uuid
+import base64, json, os, re, subprocess, sys, time, uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wheel_client import Results, run_suite, free_port
 
@@ -345,17 +345,21 @@ def main():
                     "usual cause and it must fail legibly, not silently: %s" % cout[-400:])
 
         # Control: the same push, with the token taken out of the environment.
-        denied = turn(agent, "cd /data/wow && env -u GH_TOKEN git push origin HEAD:%s "
-                             "2>&1 | tail -3; echo RC=$?" % branch, wait=120)
-        pushed_without_token = "RC=0" in denied and "reject" not in denied.lower()
+        # `git push ... | tail -3; echo RC=$?` reports TAIL's exit code, which is always 0.
+        # My first version did exactly that, and the control below caught it by "proving"
+        # a push works with no credential at all. The exit code has to be taken from git
+        # itself, before anything else runs.
+        push_cmd = ("cd /data/wow && %s git push origin HEAD:%s > /tmp/push.out 2>&1; "
+                    "rc=$?; tail -3 /tmp/push.out; echo RC=$rc")
+        denied = turn(agent, push_cmd % ("env -u GH_TOKEN", branch), wait=120)
+        pushed_without_token = "RC=0" in denied
         R.control("WOW-push-needs-the-token", not pushed_without_token,
                   "a push SUCCEEDED with the vault token removed. Some other credential is "
                   "authenticating — a cached helper, an ambient git config, or a token "
                   "baked into the image — so a green push leg would say nothing about "
                   "whether the vault token works. Output: %s" % denied[-300:])
 
-        pout = turn(agent, "cd /data/wow && git push origin HEAD:%s 2>&1 | tail -3; "
-                           "echo RC=$?" % branch, wait=180)
+        pout = turn(agent, push_cmd % ("", branch), wait=180)
         if pout == TURN_TIMEOUT or "engine unreachable" in pout:
             R.skip("WOW-commit-push", "the push turn did not finish — no verdict")
         else:
