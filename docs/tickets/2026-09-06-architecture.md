@@ -90,3 +90,36 @@ detector to catch it. It is waiting for the mechanism.
 
 Until this lands, every agent that clones is one improvisation away from writing the operator's
 credential to disk, and the loop that makes Wheel self-developing is the thing doing it.
+
+## A10 — Efficiency is P1: 346 crates, 79 GB of build output, and we pay for all of it · **S1** · SDK/Engine + API
+
+Operator, after the shared build directory reached 136 GB with 90 GB of dependency artifacts:
+"that's fucking ridiculous, why do we have so many dependencies? That build cache costs money too …
+the entire stack needs to be as efficient as possible otherwise we'll be burning money."
+
+Measured, not estimated. 44 direct dependencies pull **346 crates**. The subtrees:
+
+| Crate | Crates pulled | Used for |
+|---|---|---|
+| `sqlx` | **444 tree lines** | Postgres in wheel-api only — and wheeld already runs the same store on sqlite |
+| `reqwest` | 259 | tool execution and ingress proxy — `hyper` is already in the tree beneath it |
+| `axum` | 197 | the API and engine HTTP surface; the one that earns its place |
+| `rusqlite` | 31 | every project database |
+
+Three cuts, largest first:
+1. **`sqlx` for one backend is the biggest single line item.** API already wrote a sqlite store; if Postgres
+   stays, `tokio-postgres` is a fraction of the tree, and either way the dependency should be feature-gated
+   so a laptop or a `wheeld` build never compiles it at all.
+2. **`reqwest` with default features** drags in a second TLS stack. Pin `default-features = false` plus
+   exactly one TLS backend, or call `hyper` directly since it is already there.
+3. **Duplicate versions are pure waste** — `base64`, `chrono`, `crypto-common`, `digest`, `futures-*` are
+   each compiled twice today. `cargo tree -d` lists them; unify and add a CI gate so a new duplicate is a
+   failing check rather than a slow build nobody attributes.
+
+Already landed by PM while writing this: `[profile.dev]` with `debug = "line-tables-only"` and no
+incremental state (measured 1.7 GB → 738 MB, a 57 % cut), and `[profile.release]` with fat LTO, one codegen
+unit and stripped symbols for what Railway actually ships. `panic = "unwind"` stays — the delivery loop
+catches a panic to quarantine a bad message, and `abort` would undo that.
+
+The gate this needs: a CI check on total dependency count and on release binary size, so both are a number
+someone has to argue for rather than a thing that drifts.
