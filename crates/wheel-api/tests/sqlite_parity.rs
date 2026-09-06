@@ -8,6 +8,9 @@
 //! Unlike the `*_db.rs` suites this needs no TEST_DATABASE_URL — SQLite is a file — so it runs
 //! everywhere, including on a laptop with no Postgres.
 
+// Exercises the SQLite backend, so it exists only in a build that has one.
+#![cfg(feature = "sqlite")]
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;

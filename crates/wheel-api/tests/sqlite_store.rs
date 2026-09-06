@@ -3,6 +3,9 @@
 //! A migration that parses is not a migration that works: the constraints below are the ones the
 //! Postgres schema relies on, and each is load-bearing rather than decorative.
 
+// Exercises the SQLite backend, so it exists only in a build that has one.
+#![cfg(feature = "sqlite")]
+
 use wheel_api::db::{Db, Dialect};
 
 fn temp_db() -> String {
