@@ -320,6 +320,17 @@ async fn send_inner(p: &Prepared, allow: Allowlist<'_>, timeout: Duration) -> Re
 
         let mut req = client.request(p.method.parse()?, &url);
         for (k, v) in &p.headers {
+            // Checked here so the caller is told WHICH header and why.
+            // reqwest does refuse this (demonstrated: "builder error: failed
+            // to parse header value"), but that message names neither the
+            // header nor the reason, and an agent reading it cannot tell a
+            // bad value from a broken engine.
+            if v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+                bail!(
+                    "header {k:?} contains a line break or a null, which would let its value \
+                     add another header"
+                );
+            }
             req = req.header(k, v);
         }
         if !p.cookies.is_empty() {
@@ -1097,6 +1108,17 @@ mod send_tests {
         (port, seen)
     }
 
+    /// Did a real header line appear? A substring is not enough: an ENCODED
+    /// value legitimately contains the text `X-Injected%3A`, and asserting on
+    /// the substring fails on a request that is perfectly safe. The question
+    /// is whether the server parsed a header, so the test asks that.
+    fn has_header_line(head: &str, name: &str) -> bool {
+        head.lines().any(|l| {
+            l.to_ascii_lowercase()
+                .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+        })
+    }
+
     fn json_response(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1354,6 +1376,107 @@ mod send_tests {
             got.body,
             serde_json::Value::String("not json at all".into())
         );
+    }
+
+    /// The defence I claimed in a comment and had never demonstrated: a header
+    /// VALUE an agent supplies must not be able to add another header.
+    ///
+    /// Path and query are percent-encoded and cookies now are too, but a
+    /// header value goes out as given. If CRLF survived, every tool call would
+    /// carry a header-injection primitive — so this either proves reqwest
+    /// refuses it, or finds a real bug in my own code.
+    #[tokio::test]
+    async fn a_header_value_cannot_inject_another_header() {
+        let (port, seen) = fake_server(vec![json_response("200 OK", "{}")]).await;
+        let targets = allow(port);
+
+        let hostile = Prepared {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/x"),
+            headers: vec![(
+                "X-Agent".into(),
+                "a
+X-Injected: pwned
+X-Another: yes"
+                    .into(),
+            )],
+            cookies: vec![],
+            body: None,
+            secrets: vec![],
+        };
+
+        let result = send_via(&hostile, &targets).await;
+
+        // Either outcome is acceptable — refused before sending, or sent with
+        // the value inert. What is NOT acceptable is a second header arriving.
+        match result {
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    seen.lock().unwrap().is_empty(),
+                    "refused, so nothing should have been sent: {msg}"
+                );
+                // The refusal must be actionable. reqwest's own message is
+                // "builder error: failed to parse header value", which names
+                // neither the header nor the reason.
+                assert!(msg.contains("X-Agent"), "name the header: {msg}");
+                assert!(
+                    msg.contains("line break") || msg.contains("another header"),
+                    "say why: {msg}"
+                );
+            }
+            Ok(_) => {
+                let seen = seen.lock().unwrap();
+                let head = &seen[0].head;
+                eprintln!(
+                    "CRLF VERDICT: sent, wire was:
+{head}"
+                );
+                assert!(
+                    !has_header_line(head, "X-Injected"),
+                    "a header value injected a header:\n{head}"
+                );
+                assert!(
+                    !has_header_line(head, "X-Another"),
+                    "a header value injected a header:\n{head}"
+                );
+            }
+        }
+    }
+
+    /// The same through a COOKIE value. Cookies are encoded rather than
+    /// rejected, so this one must always succeed AND always be inert — the
+    /// encoding is the only thing between an agent and a forged header.
+    #[tokio::test]
+    async fn a_cookie_value_cannot_inject_a_header_either() {
+        let (port, seen) = fake_server(vec![json_response("200 OK", "{}")]).await;
+
+        // Exactly what build_request produces for an agent-supplied cookie:
+        // the value passed through `encode`.
+        let hostile_value = encode("a\r\nX-Injected: pwned");
+        let hostile = Prepared {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/x"),
+            headers: vec![],
+            cookies: vec![("sid".into(), hostile_value.clone())],
+            body: None,
+            secrets: vec![],
+        };
+        assert!(
+            !hostile_value.contains('\r'),
+            "encode left a CR: {hostile_value}"
+        );
+
+        send_via(&hostile, &allow(port)).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            !has_header_line(&seen[0].head, "X-Injected"),
+            "a cookie value injected a header:\n{}",
+            seen[0].head
+        );
+        // ...and the cookie itself did arrive, so this is not passing because
+        // nothing was sent.
+        assert!(seen[0].head.contains("sid="), "{}", seen[0].head);
     }
 
     /// EVERY address in a DNS answer is checked, not just the one that would be

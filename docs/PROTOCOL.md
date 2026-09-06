@@ -825,6 +825,12 @@ set to that property name. There are no pointers, no dotted paths, and no `body`
 and the schema stays honest about the shape the API wants. A body that is not an object (an array, a
 string) becomes a single field named `body`.
 
+**A header value containing CR, LF or a null is REFUSED** (`400 invalid`, naming the header): its value
+would otherwise be able to add another header. `reqwest` also refuses it, but its message —
+`builder error: failed to parse header value` — names neither the header nor the reason, and an agent
+reading that cannot tell a bad value from a broken engine. The explicit check is what makes the refusal
+actionable; reqwest is the backstop.
+
 **Cookie values are percent-encoded**, like path and query values. `;` is legal in a header value so
 nothing downstream rejects it, and an unencoded cookie value of `x; admin=true` would be two more cookies
 the caller never granted.
