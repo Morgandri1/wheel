@@ -126,4 +126,24 @@ describe("reading the API's error envelope", () => {
     const probe = await probeEndpoint("https://api.example/p/1/hook", f);
     expect(probe).toMatchObject({ kind: "answered", status: 501, code: "ingress_unavailable" });
   });
+
+  /**
+   * Engine-side ingress landed on main (340f318) after this file was written. Its 404 body is NOT
+   * the `{"error":{"code":...,"message":...}}` shape `wheel_core::ErrorBody` gives every other
+   * engine route (crates/wheel-engine/src/api/mod.rs:79) and API's own ingress_honesty test
+   * assumes (crates/wheel-api/tests/ingress_honesty.rs:43) — `ingress.rs`'s local `err()` helper
+   * (crates/wheel-engine/src/api/ingress.rs:169) emits a bare `{"code":"no_such_endpoint"}` with no
+   * wrapper and no `message`. Reported to SDK as a fix on their side (build a real `ErrorBody`
+   * there instead); this test documents today's real, verified behaviour rather than the intended
+   * one so CI stays honest about what a live board actually returns. Flip both assertions here
+   * (and drop this comment) the moment that lands — `errorCode` should start returning
+   * `"no_such_endpoint"` for the engine's real body, and `probeVerdict` should say "no endpoint at
+   * this path" instead of the generic bodied-404 message.
+   */
+  it("does not yet recognise the engine's real no_such_endpoint body — known SDK-side shape bug", () => {
+    expect(errorCode('{"code":"no_such_endpoint"}')).toBeNull();
+    expect(probeVerdict({ status: 404, body: '{"code":"no_such_endpoint"}' })).toMatch(
+      /real answer about this path/i,
+    );
+  });
 });
