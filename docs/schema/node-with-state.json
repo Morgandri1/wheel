@@ -718,7 +718,7 @@
       ]
     },
     "Position": {
-      "description": "Board coordinates. Floats because the canvas pans/zooms continuously.",
+      "description": "Board coordinates: a cell, not a measurement (ARCHITECTURE.md \"Position is an integer cell\", operator ruling 2026-09-06).\n\nAccepts any JSON number on the way in -- an existing client mid-drag still sends floats -- but rounds to the nearest cell and clamps to `i16::MIN..= i16::MAX` before it is ever stored, compared, or serialised back out. That clamp-on-write is why the fields are `i16` rather than `f64`: it makes \"already a valid cell\" a property of the type instead of something every reader has to re-check.",
       "type": "object",
       "required": [
         "x",
@@ -726,12 +726,12 @@
       ],
       "properties": {
         "x": {
-          "type": "number",
-          "format": "double"
+          "type": "integer",
+          "format": "int16"
         },
         "y": {
-          "type": "number",
-          "format": "double"
+          "type": "integer",
+          "format": "int16"
         }
       },
       "additionalProperties": false
