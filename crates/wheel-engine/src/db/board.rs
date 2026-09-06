@@ -146,6 +146,33 @@ pub fn create_with(
     Ok(())
 }
 
+/// Make every table node's sqlite table exist, at boot and after a reconcile.
+///
+/// `tables::create` ran from exactly one place -- node creation -- so a
+/// project whose NODES survived while its db file was recreated, migrated or
+/// restored kept the nodes and lost the tables: the board shows a table node
+/// and every read of it answers "no such table". Nothing re-established them,
+/// because creating a table was treated as part of creating a node rather
+/// than as a property of the board that has to hold on every boot.
+///
+/// [`tables::ensure`], not [`tables::create`]: create REPLACES what is at the
+/// name, which is right for a node that has just been made and would wipe
+/// every table on the board if it ran here.
+///
+/// One table's failure is logged and does not stop the engine. A board with
+/// nine good tables and one bad name is still a working board, and refusing
+/// to boot would take the other nine down with it.
+pub fn ensure_tables(conn: &Connection) -> Result<()> {
+    for node in list(conn)? {
+        if let NodeConfig::Table(cfg) = &node.config {
+            if let Err(e) = tables::ensure(conn, &node.name, cfg) {
+                tracing::error!(node = %node.name, error = %e, "could not restore this table node's storage");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Node>> {
     let mut node = conn
         .prepare("SELECT * FROM nodes WHERE id = ?1")?
@@ -475,6 +502,93 @@ mod tests {
             NodeConfig::Table(c) => c,
             _ => unreachable!(),
         }
+    }
+
+    /// W1 / WOW-table-survives-restart. The node survived, its table did not.
+    ///
+    /// QA's two assertions, and the second is the one that matters: a table
+    /// rebuilt from a DEFAULT shape rather than from the node's config would
+    /// read as empty and pass the first, then reject the columns the operator
+    /// configured. That would look like a fix.
+    #[test]
+    fn a_table_node_whose_table_vanished_gets_it_back_with_its_own_columns() {
+        let c = mem();
+        let n = table("reports", &["title"]);
+        create(&c, &n).unwrap();
+
+        // What a restore/migrate does to the file: the node row survives, the
+        // user table does not.
+        c.execute_batch("DROP TABLE t_reports").unwrap();
+        assert!(
+            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0).is_err(),
+            "positive control: the read must be broken before the fix runs"
+        );
+
+        ensure_tables(&c).unwrap();
+
+        // (1) The read works and is empty -- never "no such table".
+        assert!(
+            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        // (2) And it is THIS node's schema, not a default one.
+        tables::put_row(
+            &c,
+            &n.name,
+            table_cfg(&n),
+            "r1",
+            &serde_json::json!({ "title": "week 1" }),
+        )
+        .expect("the restored table must accept the node's configured columns");
+    }
+
+    /// A column added to a table node's config after the table was built is
+    /// present after a restart, rather than failing every write that uses it.
+    #[test]
+    fn a_column_added_to_the_config_appears_on_the_next_boot() {
+        let c = mem();
+        let mut n = table("reports", &["title"]);
+        create(&c, &n).unwrap();
+
+        tables::put_row(
+            &c,
+            &n.name,
+            table_cfg(&n),
+            "r1",
+            &serde_json::json!({ "title": "week 1" }),
+        )
+        .unwrap();
+
+        n.config = NodeConfig::Table(TableConfig {
+            columns: ["title", "author"]
+                .iter()
+                .map(|col| Column {
+                    name: Ident::new(*col).unwrap(),
+                    column_type: ColumnType::Text,
+                })
+                .collect(),
+        });
+        update(&c, &n).unwrap();
+        ensure_tables(&c).unwrap();
+
+        tables::put_row(
+            &c,
+            &n.name,
+            table_cfg(&n),
+            "r2",
+            &serde_json::json!({ "title": "week 2", "author": "pm" }),
+        )
+        .expect("a column added to the config must exist in sqlite after a boot");
+
+        // And the rows that were already there are still there. Adding a
+        // column by rebuilding the table would satisfy every assertion above
+        // and quietly discard the operator's data -- the second session of
+        // mine that fixed this bug in parallel asserted it and I had not.
+        let rows = tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0).unwrap();
+        assert_eq!(rows.len(), 2, "the pre-existing row was lost: {rows:?}");
+        assert_eq!(rows[0]["title"], "week 1");
+        assert_eq!(rows[0]["author"], serde_json::Value::Null);
     }
 
     /// A table node's rows must not outlive it, and a new node that reuses the

@@ -68,6 +68,7 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     let conn = db::open(&cfg.db_path())?;
     tracing::info!(db = %cfg.db_path().display(), "database ready");
+    db::board::ensure_tables(&conn)?;
 
     let listen = cfg.listen.clone();
     let cfg = Arc::new(cfg);

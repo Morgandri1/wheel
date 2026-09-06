@@ -67,19 +67,19 @@ fn column_names(cfg: &TableConfig) -> Vec<String> {
     cfg.columns.iter().map(|c| c.name.to_string()).collect()
 }
 
-/// `CREATE TABLE t_<name> (key TEXT PRIMARY KEY, ...)` from the node's config.
+/// Build `t_<name>` from the node's config, replacing anything at that name.
 ///
-/// Reached only when a table node row has just been inserted, so the table it
-/// backs is new by definition and starts empty. It used to be
-/// `CREATE TABLE IF NOT EXISTS`, which read as harmless idempotence and was
-/// an adoption hazard: if a `t_<name>` survived an earlier node of the same
-/// name -- a delete whose drop failed, which [`super::board::delete`] used to
-/// swallow -- the new node silently inherited the old rows AND the old
-/// columns. The operator sees data they never wrote in a node they just made,
-/// and a write of their CONFIGURED columns fails with "no such column".
+/// **Destructive, and named for the node lifecycle rather than for SQL.** Call
+/// this only where a table node has just been CREATED, so the table it backs
+/// is new by definition and starts empty. To make sure an EXISTING node's
+/// table is there -- engine boot, reconcile, restore -- call [`ensure`], which
+/// never drops anything.
 ///
-/// So the name is claimed rather than adopted: whatever is there is replaced
-/// by a table built from this config.
+/// It used to be `CREATE TABLE IF NOT EXISTS`, which read as harmless
+/// idempotence and was an adoption hazard: a `t_<name>` that survived an
+/// earlier node of the same name was silently inherited by the new one, old
+/// rows AND old columns, so the operator saw data they never wrote and a write
+/// of their configured columns failed "no such column".
 pub fn create(conn: &Connection, name: &NodeName, cfg: &TableConfig) -> Result<()> {
     let table = table_name(name)?;
     drop(conn, name)?;
@@ -92,6 +92,45 @@ pub fn create(conn: &Connection, name: &NodeName, cfg: &TableConfig) -> Result<(
     ddl.push_str("\n)");
     conn.execute_batch(&ddl)
         .with_context(|| format!("creating {table}"))?;
+    Ok(())
+}
+
+/// Make sure an existing table node's table is there, without touching a row.
+///
+/// The counterpart to [`create`]: `create` is for a node that has just been
+/// made, `ensure` is for one that already exists. Nothing re-ensured the
+/// tables on boot, so a project whose nodes survived while its db file was
+/// recreated or migrated kept its nodes and lost its tables -- the board shows
+/// a table node and every read of it says "no such table".
+///
+/// Missing columns are added; existing ones are left exactly as they are. A
+/// column dropped from the config stays in sqlite rather than being deleted,
+/// because this runs unattended at boot and a config edit is not consent to
+/// destroy a column's data.
+pub fn ensure(conn: &Connection, name: &NodeName, cfg: &TableConfig) -> Result<()> {
+    let table = table_name(name)?;
+    let mut ddl = format!("CREATE TABLE IF NOT EXISTS {table} (\n  {KEY_COLUMN} TEXT PRIMARY KEY");
+    for c in &cfg.columns {
+        ddl.push_str(&format!(",\n  {} {}", c.name, c.column_type.sqlite_type()));
+    }
+    ddl.push_str("\n)");
+    conn.execute_batch(&ddl)
+        .with_context(|| format!("ensuring {table}"))?;
+
+    let present: std::collections::HashSet<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for c in &cfg.columns {
+        if !present.contains(c.name.as_str()) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {} {}",
+                c.name,
+                c.column_type.sqlite_type()
+            ))
+            .with_context(|| format!("adding {table}.{}", c.name))?;
+        }
+    }
     Ok(())
 }
 
