@@ -180,6 +180,11 @@ step "qa:testid-parity" "$PY" qa/contract/testid_parity.py
 # instant, and it caught three suites I had already broken.
 step "qa:fake-steering" "$PY" qa/contract/fake_steering.py
 
+# The F015 boundary. ADVERSARY asked to review changes to INHERITED_ENV; this is what
+# makes that review durable rather than dependent on somebody remembering to mention
+# it. Static and instant — it reads the constant and compares it to a pinned list.
+step "qa:env-allowlist" "$PY" qa/contract/env_allowlist.py
+
 # The image must contain the binaries the contract depends on. BUG-010: the `wheel`
 # CLI was silently absent because the Dockerfile built a bin name that does not exist
 # under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.
