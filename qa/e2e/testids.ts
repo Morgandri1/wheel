@@ -92,6 +92,9 @@ export const T = {
   authChecking: "auth-checking",
   apiKeyInput: "input-api-key",
   authComplete: "btn-auth-complete",
+  // Reveals the setup-token and API-key fields. They are behind a disclosure because the
+  // account sign-in above them is the path the contract wants people on.
+  authOtherWays: "btn-auth-other-ways",
   authReplace: "btn-auth-replace",
   authOauth: "btn-auth-oauth",
   nodeAuthenticate: (name: string) => `node-${name}-authenticate`,

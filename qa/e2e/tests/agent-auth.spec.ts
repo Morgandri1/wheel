@@ -44,6 +44,12 @@ test("agent api-key auth: needs_auth -> authenticate -> authenticated, key never
     // here and then do nothing when they try.
     await expectHydrated(page.getByTestId("auth-needs-auth-callout"), "the needs_auth callout");
 
+    // The API key is deliberately NOT the first thing offered any more: signing in with an
+    // Anthropic account is the native path (contract §2 — "API keys are a hidden advanced
+    // fallback"), so the key field lives behind "Other ways to sign in". This spec tests the
+    // fallback, so it navigates to it the way a person would. The assertions below are unchanged.
+    await page.getByTestId("btn-auth-other-ways").click();
+
     const field = page.getByTestId("input-api-key");
     await expect(field).toHaveAttribute("type", "password");
     await field.fill(KEY);
