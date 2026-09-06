@@ -89,20 +89,30 @@ def main():
             print("could not start the container: %s" % run.stderr[:200])
             return SKIP
 
-        up = False
+        up, died = False, None
         for _ in range(60):
             if http("GET", "/healthz")[0] == 200:
                 up = True
+                break
+            # A container that has EXITED is a definitive answer, not something to keep
+            # waiting on. Polling the full 30s for a process that died in two seconds is
+            # slow, and worse, it reports "never became healthy" — a timeout — for what is
+            # actually a crash with an exit code. Those are different facts and the second
+            # one is the useful one.
+            state = sh("docker", "inspect", "-f",
+                       "{{.State.Status}} {{.State.ExitCode}}", NAME).stdout.strip()
+            if state.startswith("exited"):
+                died = state
                 break
             time.sleep(0.5)
 
         logs = sh("docker", "logs", "--tail", "6", NAME)
         said = (logs.stdout + logs.stderr)[-400:]
+        how = ("it EXITED (%s)" % died) if died else "it never served /healthz within 30s"
         R.control("ENG-starts-without-shm", up,
-                "the engine never served /healthz on a filesystem that cannot host a WAL "
-                "index. A deployment that cannot provide shm must fall back to a rollback "
-                "journal and come up; crash-looping there reads as a corrupt database. "
-                "Engine said: %s" % said)
+                  "%s on a filesystem that cannot host a WAL index. A deployment that cannot "
+                  "provide shm must fall back to a rollback journal and come up; crash-looping "
+                  "there reads as a corrupt database. Engine said: %s" % (how, said))
 
         if up:
             # The rollback journal has to serve SEVERAL connections: the query path opens
@@ -241,6 +251,42 @@ def main():
                 "write: %s. An exclusive lock that was never given back trades a crash loop "
                 "for an engine nothing else can open — and the query path opens this file a "
                 "second time." % (second.stderr or second.stdout)[:200])
+        # ---- a full disk must say "full" -------------------------------------------
+        #
+        # PM's ask, and the reason is the outage itself: the operator spent the first part of
+        # 80 minutes reading sqlite errors about shared memory. A cause the message does not
+        # name is a cause somebody has to guess, and the guesses were expensive.
+        #
+        # Measured on a volume with no free space, the engine's FIRST line today is
+        # "opening sqlite at /data/wheel.db: unable to open database file: Error code 14",
+        # which sends a reader after a corrupt database or a permission problem. ENOSPC is
+        # the one condition sqlite cannot describe and the filesystem can.
+        full = NAME + "-full"
+        sh("docker", "rm", "-f", full)
+        sh("docker", "run", "-d", "--name", full, "--tmpfs", "/data:size=2m",
+           "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+           "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
+           "-e", "WHEEL_VAULT_KEY=" + key,
+           "-e", "WHEEL_ROLE=engine",
+           "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+           "--entrypoint", "sh", "wheel-engine:test",
+           "-c", "dd if=/dev/zero of=/data/filler bs=1k count=1990 2>/dev/null; "
+                 "exec wheel-engine")
+        time.sleep(6)
+        said = sh("docker", "logs", full)
+        first = next((l.strip() for l in (said.stdout + said.stderr).splitlines()
+                      if l.strip()), "")
+        low = first.lower()
+        R.control("ENG-diskfull/engine-failed", "error" in low or "unable" in low,
+                  "the engine did not fail on a full volume, so there is no first line to "
+                  "judge and this check would pass for the wrong reason: %r" % first[:160])
+        R.gated("ENG-diskfull-says-so", "ENG-diskfull/engine-failed",
+                any(w in low for w in ("no space", "disk full", "enospc", "out of space")),
+                "the first line on a FULL volume was %r — it must name the disk being full. "
+                "A sqlite open error sends the reader after a corrupt database or a "
+                "permission problem; ENOSPC is the one cause sqlite cannot describe and the "
+                "filesystem can." % first[:200])
+        sh("docker", "rm", "-f", full)
     finally:
         sh("docker", "rm", "-f", NAME)
         sh("docker", "rm", "-f", NAME2)
