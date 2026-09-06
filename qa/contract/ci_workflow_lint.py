@@ -65,6 +65,24 @@ def check_relocated_gates(doc):
 
 
 
+def check_size_gate_runs(doc):
+    """DEP-binary-size is not in `make check`, so CI is the only place it runs.
+
+    Same trap as qa:image-contents one function up: a gate that needs an expensive build
+    gets moved out of the fast job for good reasons, and then nothing runs it at all. The
+    crate-count half rides in `make check` and needs no assertion here; the size half has
+    exactly one home, so this asserts that home still exists.
+    """
+    for name, job in (doc.get("jobs") or {}).items():
+        steps = job.get("steps") or []
+        runs = " \n".join(str(st.get("run") or "") for st in steps if isinstance(st, dict))
+        if "make size" in runs or "size_gate.py" in runs:
+            return []
+    return ["no CI job runs `make size`. DEP-binary-size needs a release build so it is "
+            "deliberately not in `make check`; that is only honest while something else "
+            "runs it. Either restore the job or put the gate back in check."]
+
+
 def main():
     try:
         import yaml
@@ -112,6 +130,7 @@ def main():
                 "add it below with the reason and the event that turns it back on." % n)
 
     fails.extend(check_relocated_gates(d))
+    fails.extend(check_size_gate_runs(d))
     fails.extend(check_pnpm_pinned(d))
 
     print("ci.yml: %d job(s) — %s" % (len(jobs), ", ".join(sorted(jobs))))

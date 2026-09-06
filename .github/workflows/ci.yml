@@ -107,6 +107,27 @@ jobs:
       # An area that does not exist yet (no web/) is reported, not failed.
       - run: make check-strict
 
+  # PM A10 (efficiency is P1). The crate-count half is cheap and rides in `make check`;
+  # this is the other half, and it needs a real fat-LTO release build of the workspace --
+  # minutes and gigabytes, which is why it is not in the job everyone waits for and not on
+  # a laptop with six agents resident.
+  #
+  # Only on main. A release build on every PR would itself be the kind of waste this
+  # ticket exists to stop, and the number it produces is a property of what we ship, not
+  # of a proposed change.
+  size:
+    name: release binary size
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The budget seeds itself from the first real measurement rather than from a number
+      # somebody guessed, so the first run on main records the ceiling and later runs
+      # ratchet it down.
+      - run: make size
+
   # API's crates/wheel-host/tests/sandbox_docker.rs creates and destroys real containers
   # and asserts the hardening rather than trusting it: cap_drop ALL with exactly
   # SETUID+SETGID (the COUNT is asserted, so a third capability cannot creep in),
