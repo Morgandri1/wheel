@@ -196,23 +196,28 @@ per §1 of the contract. Filed as blocking for that reason alone.
 > **`wheel-host` 76.94 %**. `wheel-core` and `wheel-api` pass. `rust:clippy` and
 > `rust:test` are GREEN, which closes 016.
 
-> **2026-09-06 — THE NUMBERS BELOW ARE SUSPECT AND ARE BEING RE-MEASURED.**
-> `make coverage` ran `cargo llvm-cov` against the shared `target-dir` that every worktree
-> uses, and summed per-crate lines with a filter that accepted any path containing
-> `/crates/` — so one crate's coverage was totalled across six checkouts of it. `validate.rs`
-> read 0% while it was actually 97%, which dragged `wheel-core` to 4.85%. Fixed in
-> `qa/tools/coverage_gate.py` (private `CARGO_TARGET_DIR`, files scoped to this worktree, and
-> an empty result is a SKIP rather than 0%). CI was never affected — one checkout, one target
-> dir. Re-publishing the table after a clean local run.
-
-Latest numbers, CI run 33961539782 (bar 90%, per crate). `wheel-api` has gone 35% -> 89.02%:
-
-| crate | lines | status | owner |
-|---|---|---|---|
-| `wheel-api` | 89.02% (1329/1493) | FAIL — within 1 point of the bar | API |
-| `wheel-core` | 69.56% (681/979) | FAIL | SDK |
-| `wheel-host` | 70.69% (521/737) | FAIL | API |
-| `wheel-engine` | 57.02% (1194/2094) | EXEMPT — scaffolding (PM ruling); expires when the engine is bootable / `wheel-engine:test` exists |
+> **2026-09-06 — RE-MEASURED. The table below it is superseded; the old numbers were wrong.**
+>
+> `make coverage` ran `cargo llvm-cov` against the shared `target-dir` every worktree uses, and
+> summed per-crate lines with a filter that accepted any path containing `/crates/` — so each
+> crate's coverage was totalled across six checkouts of it. Fixed in `qa/tools/coverage_gate.py`
+> (private `CARGO_TARGET_DIR`, files scoped to this worktree, empty result is a SKIP not 0%).
+>
+> | crate | was reported | actually | verdict |
+> |---|---|---|---|
+> | `wheel-core` | 69.56% FAIL | **96.96%** (1594/1644) | **PASSES.** SDK was carrying a failure it did not have. |
+> | `wheel-cli` | 0.00% FAIL | **86.88%** (192/221) | 3 points under. |
+> | `wheel-host` | 70.69% FAIL | **84.74%** (1133/1337) | 5 points under. |
+> | `wheel-engine` | 57.02% | 70.81% (3515/4964) | still exempt (scaffolding). |
+> | `wheel-api` | 89.02% (CI) | **not measurable locally** | see below. |
+>
+> **`wheel-api` reads 33.38% on a laptop and that number is meaningless.** Its eight
+> `tests/*_db.rs` suites self-skip when `TEST_DATABASE_URL` is unset, so locally the crate is
+> measured with most of its suite absent. Reporting that as FAIL would have sent API after a
+> 57-point gap that does not exist. The gate now marks such crates **INCONCLUSIVE** and does not
+> fail on them; CI sets `TEST_DATABASE_URL` (and `WHEEL_CI_HAS_DB=1`, which turns the skip into a
+> hard error), so the bar is enforced exactly where the measurement is complete. CI's 89.02%
+> stands as wheel-api's real number.
 
 `wheel-host` was at **0.00%** when this was filed and is now at 72.21% — that was the urgent one
 (it holds every project's engine secret, performs the setuid, and is the only process touching the
