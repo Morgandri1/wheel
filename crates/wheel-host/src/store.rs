@@ -23,66 +23,19 @@ pub struct ProjectRecord {
     pub vault_key: String,
 }
 
-/// Open `host.db` on whatever terms the filesystem allows, and prove them before trusting them.
-///
-/// Three attempts, narrowest change first, because each one costs something:
-///
-/// 1. The wanted journal mode on an ordinary connection. This is every laptop, every test, and a
-///    normal volume; nothing else is given up.
-/// 2. The same mode with `locking_mode=EXCLUSIVE`. A WAL database keeps its index in a `-shm` file
-///    and Railway's bind mount cannot resize one, which crash-looped every boot on "disk I/O error
-///    ... xShmMap"; under exclusive locking sqlite keeps that index in heap memory and never opens
-///    the path at all. The cost is that nothing else may open the file while the host runs -- no
-///    second connection, no `sqlite3` on the volume -- so it is not the default. The host can pay
-///    it: one replica by contract, one connection behind a mutex. The engine could not, which is
-///    why the fix there is a fallback instead.
-/// 3. A rollback journal on that same exclusive connection. Slower, needs no shared memory, and by
-///    now the connection is one that can actually get out of WAL: switching modes has to checkpoint
-///    the WAL first, which is why plain `WHEEL_SQLITE_JOURNAL=TRUNCATE` died of the same error it
-///    was set to avoid.
-///
-/// The mode is PROVEN with an immediate transaction at each step rather than trusted, because
-/// `PRAGMA journal_mode` reports success on a filesystem where the first write then fails -- the
-/// shared memory is mapped on the first write lock, not on the pragma. That trap is the whole bug.
-///
-/// `WHEEL_SQLITE_JOURNAL` names the mode to try first, for a deployment already known to be hostile.
-fn open_configured(path: &str) -> Result<Connection> {
-    let wanted = std::env::var("WHEEL_SQLITE_JOURNAL")
-        .ok()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| "WAL".to_string());
-
-    let conn = Connection::open(path).with_context(|| format!("opening {path}"))?;
-    if mode_holds(&conn, &wanted) {
-        return Ok(conn);
-    }
-
-    // A fresh connection: the locking mode is what sqlite consults when it first touches the file,
-    // so it cannot be imposed on one that has already tried and failed.
-    drop(conn);
-    let conn = Connection::open(path).with_context(|| format!("reopening {path}"))?;
-    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
-        .context("taking the host database exclusively")?;
-    if mode_holds(&conn, &wanted) {
-        return Ok(conn);
-    }
-
-    if mode_holds(&conn, "TRUNCATE") {
-        return Ok(conn);
-    }
-    anyhow::bail!("no journal mode this filesystem can host: tried {wanted}, then TRUNCATE")
-}
-
-/// Does the database actually work in this journal mode, or only claim to?
-fn mode_holds(conn: &Connection, mode: &str) -> bool {
-    conn.pragma_update(None, "journal_mode", mode).is_ok()
-        && conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok()
-}
-
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
-        let conn = open_configured(path)?;
+        // Journalling is `wheel-sqlite`'s. This function used to have its own
+        // copy, which is why the host kept crash-looping after the engine was
+        // fixed: it handled a database that could not ENTER wal, and the
+        // deployed one is already IN wal. This store opens before any engine
+        // does, so it was the only thing in the logs.
+        //
+        // `true` = the host may take its database exclusively as a last
+        // resort. It can afford to: one replica by contract, one connection
+        // behind the mutex below. The engine passes `false` because
+        // `tables::query` opens the file a second time.
+        let conn = wheel_sqlite::open_configured(path, true)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
                id               TEXT PRIMARY KEY,
@@ -495,6 +448,70 @@ mod journal_mode_tests {
         drop(store);
         let again = Store::open(&path).unwrap();
         assert_eq!(again.all_desired_running().await.unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The deployed shape, and the one that has actually been failing: the host database is
+    /// ALREADY in WAL and has to be converted away from it.
+    ///
+    /// `journal_mode` persists in the file header, so every boot rediscovers WAL; and LEAVING wal
+    /// needs a checkpoint, which on the deployed volume needs the `-shm` that cannot be resized.
+    /// The host's store had its own copy of this logic which handled only "wal cannot be ENTERED",
+    /// so it crash-looped after the engine was fixed -- and the store opens before any engine
+    /// does, so it was the only thing in the logs.
+    #[tokio::test]
+    async fn a_host_database_already_in_wal_is_converted_and_still_serves_a_second_connection() {
+        let dir = std::env::temp_dir().join(format!("wheel-host-wal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.db");
+
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.pragma_update(None, "journal_mode", "WAL").unwrap();
+            seed.execute_batch("CREATE TABLE keep (a TEXT); INSERT INTO keep VALUES ('x');")
+                .unwrap();
+            let mode: String = seed
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal", "premise of this test");
+        }
+
+        // SAFETY: single-threaded test; restored before returning.
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "TRUNCATE") };
+        let store = Store::open(&path.display().to_string()).unwrap();
+        unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") };
+
+        // It boots, and it works.
+        let id = Uuid::new_v4();
+        store.upsert(&id, "s", "dg").await.unwrap();
+        store.set_desired_running(&id, true).await.unwrap();
+        assert_eq!(store.all_desired_running().await.unwrap().len(), 1);
+
+        let second = Connection::open(&path).unwrap();
+        let mode: String = second
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        // Only WAL is recorded in the file header; the rollback modes are a
+        // property of the connection, so a fresh one reports its own default
+        // (`delete`) whatever the store chose. What matters -- and the whole
+        // reason the host crash-looped -- is that the file is no longer WAL,
+        // because that flag is the part that persists and is rediscovered on
+        // every boot. Asserting `truncate` here tests sqlite's defaults, not
+        // the conversion; I wrote that first and this test failed correctly.
+        assert_ne!(
+            mode, "wal",
+            "the host database is still in wal: the conversion did not stick"
+        );
+        // Rows written before the conversion survived it.
+        let n: i64 = second
+            .query_row("SELECT count(*) FROM keep", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the WAL contents were lost in the conversion");
+        // And the transient exclusive lock was given back: a second connection can WRITE.
+        second
+            .execute("INSERT INTO keep VALUES ('y')", [])
+            .expect("the host kept the exclusive lock -- nothing else can open its database");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

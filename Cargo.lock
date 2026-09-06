@@ -3187,6 +3187,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wheel-core",
+ "wheel-sqlite",
 ]
 
 [[package]]
@@ -3217,6 +3218,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wheel-sqlite",
+]
+
+[[package]]
+name = "wheel-sqlite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tracing",
 ]
 
 [[package]]
