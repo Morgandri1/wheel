@@ -275,6 +275,45 @@ def t_script_replay():
         p = run(SJ, turn("a"), env={"WHEEL_FAKE_SCRIPT": os.path.join(d, "missing.jsonl")})
         check("missing script fails loudly", p.returncode != 0)
 
+import re as _re_top
+DIRECTIVE_NAME = _re_top.compile(
+    _re_top.search(r'DIRECTIVE = re\.compile\(r"<<FAKE:\((\[[^\]]+\]\+)\)',
+                   open(CLAUDE).read()).group(1))
+
+def t_sh_directive():
+    """SH_B64 must actually RUN the command, not echo it.
+
+    t_directives covered REPLY/ERROR/SLEEP -- all names made of letters -- and passed for
+    months while <<FAKE:SH_B64=...>> was silently echoed, because the directive-name pattern
+    was [A-Z_]+ and could not match the digits in SH_B64. wheel-on-wheel is built entirely
+    on this directive and could never have passed. A test per directive NAME, not one test
+    for "directives work".
+    """
+    import base64 as _b64
+    payload = _b64.b64encode(b"echo SELFTEST_RAN; exit 0").decode()
+    p = run(SJ, turn("<<FAKE:SH_B64=%s>>" % payload))
+    res = [e for e in events(p.stdout) if e["type"] == "result"]
+    out = res[0].get("result", "") if res else ""
+    check("SH_B64 runs the command", "SELFTEST_RAN" in out, out[:120])
+    check("SH_B64 does not echo the directive", "FAKE:SH_B64" not in out, out[:120])
+    check("SH_B64 reports the exit code", "exit=0" in out, out[:120])
+
+    bad = _b64.b64encode(b"exit 7").decode()
+    p = run(SJ, turn("<<FAKE:SH_B64=%s>>" % bad))
+    res = [e for e in events(p.stdout) if e["type"] == "result"]
+    out = res[0].get("result", "") if res else ""
+    check("SH_B64 surfaces a non-zero exit", "exit=7" in out, out[:120])
+
+    # Every directive name the fakes understand must be matchable by the pattern. This is
+    # the check that would have caught SH_B64 without anyone thinking of SH_B64.
+    import re as _re
+    names = set(_re.findall(r'"([A-Z0-9_]+)" in d', open(CLAUDE).read()))
+    names |= set(_re.findall(r'd\.get\("([A-Z0-9_]+)"', open(CLAUDE).read()))
+    unmatchable = [n for n in names if not DIRECTIVE_NAME.fullmatch(n)]
+    check("every directive name the fake handles is matchable by its own pattern",
+          not unmatchable, "unmatchable: %s" % sorted(unmatchable))
+
+
 def t_robustness():
     p = run(SJ, "not json at all\n")
     check("malformed stdin rejected", p.returncode != 0)
