@@ -63,15 +63,99 @@ pub fn journal_mode() -> String {
         .unwrap_or_else(|| "WAL".into())
 }
 
+/// The journal mode the database is in right now, as sqlite reports it.
+fn current_journal_mode(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?)
+}
+
+/// Put the database into `wanted`, and return the mode actually in force.
+///
+/// `pragma_update(journal_mode, ...)` is NOT a reliable signal: sqlite answers
+/// with the RESULTING mode rather than failing, so it returns `Ok` for a mode
+/// it did not enter -- measured, `journal_mode = nonsense-mode` returns Ok and
+/// leaves the mode untouched. Reading the mode back is the only proof, which
+/// is why every decision here is made on `current_journal_mode`.
+///
+/// The stuck case this exists for: a database ALREADY in WAL on a volume whose
+/// `-shm` cannot be mapped or resized. `journal_mode` persists in the file
+/// header, so every boot rediscovers WAL; and LEAVING WAL requires
+/// checkpointing it, which requires the very wal-index that is failing. The
+/// plain pragma therefore cannot rescue the one database that most needs it,
+/// and returning its error crash-loops the host -- which is what took
+/// production down at 12:31.
+///
+/// `locking_mode = EXCLUSIVE` is sqlite's documented escape hatch: with it,
+/// WAL keeps its index in HEAP MEMORY and needs no `-shm` at all. Exclusive
+/// locking cannot be left on -- `tables::query` opens the file a second time
+/// and would be locked out (7 tests caught exactly that) -- so it is held only
+/// across the conversion and dropped again.
+fn set_journal_mode(conn: &Connection, wanted: &str) -> Result<String> {
+    let _ = conn.pragma_update(None, "journal_mode", wanted);
+    let mode = current_journal_mode(conn)?;
+    if mode.eq_ignore_ascii_case(wanted) {
+        return Ok(mode);
+    }
+    // An in-memory database has no file to journal and always reports
+    // `memory`; it cannot be WAL and is not failing to be. Every other
+    // mismatch is a database that would not go where we asked it to.
+    if mode.eq_ignore_ascii_case("memory") {
+        return Ok(mode);
+    }
+
+    drain_under_exclusive_lock(conn, wanted)?;
+
+    // Read back, for the same reason as above: the pragma's own result is not
+    // evidence. My first draft of this function returned that result here and
+    // reported success for a mode sqlite had refused -- the exact mistake this
+    // function exists to stop, made inside it.
+    let settled = current_journal_mode(conn)?;
+    anyhow::ensure!(
+        settled.eq_ignore_ascii_case(wanted),
+        "could not put the database into {wanted}; it is in {settled}"
+    );
+    Ok(settled)
+}
+
+/// Convert the journal mode while holding sqlite's exclusive lock, then give
+/// the lock back.
+///
+/// Its own function because **its call site above cannot be reached in a
+/// test**: the plain pragma only fails on a filesystem whose `-shm` cannot be
+/// mapped or resized, and nothing local reproduces that. A test that drove
+/// `set_journal_mode` on a healthy disk would take the early return, pass, and
+/// prove nothing about this code -- I checked, by deleting this body and
+/// watching the suite stay green. So the drain is tested directly instead, and
+/// the honest statement of coverage is: the conversion is gated, the decision
+/// to reach for it is not.
+fn drain_under_exclusive_lock(conn: &Connection, wanted: &str) -> Result<()> {
+    let _ = conn.pragma_update(None, "locking_mode", "EXCLUSIVE");
+    let _ = conn.pragma_update(None, "journal_mode", wanted);
+    // Back to normal locking unconditionally: leaving a connection exclusive
+    // because the conversion failed would trade a crash loop for an engine no
+    // second connection can read.
+    let _ = conn.pragma_update(None, "locking_mode", "NORMAL");
+    // sqlite holds the exclusive lock until the database is next unlocked, so
+    // dropping the pragma is not enough on its own -- a transaction has to
+    // complete for the lock to actually be released.
+    let _ = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;");
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     // A rollback journal is slower and still serves several connections, which
     // exclusive locking would not: the query path opens the file a second time.
-    let wanted = journal_mode();
-    if conn.pragma_update(None, "journal_mode", &wanted).is_err() {
-        conn.pragma_update(None, "journal_mode", "TRUNCATE")?;
-    }
+    let mode = set_journal_mode(conn, &journal_mode())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // NORMAL means a lost transaction under WAL and a CORRUPT database under a
+    // rollback journal, where there is no write-ahead log to replay. The
+    // deployed volume runs on the rollback path, so it does not get the
+    // weaker guarantee.
+    let durability = if mode.eq_ignore_ascii_case("wal") {
+        "NORMAL"
+    } else {
+        "FULL"
+    };
+    conn.pragma_update(None, "synchronous", durability)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(())
 }
@@ -325,22 +409,95 @@ mod storage_mode_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A database whose journal mode had to fall back is still writable. The
-    /// deployed volume forces this path; a fallback that cannot take writes
-    /// would trade a crash loop for a silent read-only engine.
+    /// The deployed shape: a database ALREADY in WAL that has to be converted
+    /// to a rollback journal. On the volume that took production down, the
+    /// plain pragma cannot do this -- leaving WAL needs a checkpoint, which
+    /// needs the wal-index that is failing -- so the conversion runs under a
+    /// transient exclusive lock, where sqlite keeps that index in heap memory.
+    ///
+    /// The assertions that matter are the last two. Converting is easy; giving
+    /// the exclusive lock BACK is the part that rots, and an engine that holds
+    /// it has traded a crash loop for a database no second connection can
+    /// read -- which is how `tables::query`, the agent-facing path, dies.
     #[test]
-    fn a_rollback_journal_database_still_takes_writes() {
-        let dir = std::env::temp_dir().join(format!("wheel-db-tr-{}", std::process::id()));
+    fn a_wal_database_is_converted_and_the_exclusive_lock_is_given_back() {
+        let dir = std::env::temp_dir().join(format!("wheel-db-drain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wheel.db");
-        let conn = open(&path).unwrap();
-        conn.pragma_update(None, "journal_mode", "TRUNCATE").unwrap();
-        conn.execute("CREATE TABLE t (a TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES ('y')", []).unwrap();
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.pragma_update(None, "journal_mode", "WAL").unwrap();
+            seed.execute_batch("CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('y');")
+                .unwrap();
+            assert_eq!(current_journal_mode(&seed).unwrap(), "wal");
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        // The drain directly: `set_journal_mode` would convert this with the
+        // plain pragma on a healthy disk and never reach the code under test.
+        drain_under_exclusive_lock(&conn, "TRUNCATE").unwrap();
+        let mode = current_journal_mode(&conn).unwrap();
+
+        assert_eq!(mode, "truncate", "the database was left in {mode}");
         let n: i64 = conn
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 1, "the rows in the WAL were not carried over");
+
+        // The lock is back: another connection can not only read but WRITE.
+        let second = Connection::open(&path).unwrap();
+        second
+            .execute("INSERT INTO t VALUES ('z')", [])
+            .expect("a second connection is locked out -- the exclusive lock was kept");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `pragma_update` answers with the resulting mode instead of failing, so
+    /// it returns `Ok` for a mode it did not enter. Anything that trusts that
+    /// result reports a database is in a mode it is not in.
+    #[test]
+    fn a_mode_sqlite_refuses_is_reported_as_the_mode_it_actually_kept() {
+        let dir = std::env::temp_dir().join(format!("wheel-db-bogus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT)").unwrap();
+
+        assert!(
+            conn.pragma_update(None, "journal_mode", "nonsense-mode")
+                .is_ok(),
+            "premise of this test: sqlite does not fail on a mode it refuses"
+        );
+
+        let reported = set_journal_mode(&conn, "nonsense-mode").unwrap_err();
+        assert!(
+            reported.to_string().contains("could not put the database"),
+            "a refused mode must be reported as refused, not as success: {reported}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rollback journal has no write-ahead log to replay, so `NORMAL` there
+    /// risks a CORRUPT database rather than a lost transaction. The deployed
+    /// volume runs on this path.
+    #[test]
+    fn a_rollback_journal_database_gets_the_stronger_durability_setting() {
+        let dir = std::env::temp_dir().join(format!("wheel-db-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        // SAFETY: single-threaded test process; restored before returning.
+        unsafe { std::env::set_var("WHEEL_SQLITE_JOURNAL", "TRUNCATE") };
+        let conn = open(&path).unwrap();
+        unsafe { std::env::remove_var("WHEEL_SQLITE_JOURNAL") };
+
+        assert_eq!(current_journal_mode(&conn).unwrap(), "truncate");
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "expected synchronous=FULL (2) on a rollback journal");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
