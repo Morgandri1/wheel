@@ -43,15 +43,19 @@ pub async fn put_value(
         return Err(ApiError::invalid("an empty value is not a secret"));
     }
 
-    {
+    let warning = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        store_in_vault(&s, &conn, id, &key, &body.value)?;
-    }
+        store_in_vault(&s, &conn, id, &key, &body.value)?
+    };
 
     s.events.publish(wheel_core::Event::BoardChanged {
         at: wheel_core::Timestamp::now(),
     });
-    Ok(Json(serde_json::json!({ "key": key, "stored": true })))
+    let mut out = serde_json::json!({ "key": key, "stored": true });
+    if let Some(w) = warning {
+        out["warning"] = serde_json::json!(w);
+    }
+    Ok(Json(out))
 }
 
 /// Store one value in a vault: the ambiguity check, the encrypted write, and
@@ -60,13 +64,17 @@ pub async fn put_value(
 /// Shared by `PUT /v1/vault/:id/:key` and by the paste-code login's
 /// `save_to_vault`, so a credential written by either route is written the
 /// same way rather than by two implementations that can drift.
+///
+/// `Ok(Some(warning))` is a value that was stored but deserves the operator's
+/// attention (028 face 5: another vault merely DECLARES this key) — not an
+/// error, and must not be treated as one.
 pub(crate) fn store_in_vault(
     s: &AppState,
     conn: &rusqlite::Connection,
     vault: Uuid,
     key: &str,
     value: &str,
-) -> ApiResult<()> {
+) -> ApiResult<Option<String>> {
     store_in_vault_until(s, conn, vault, key, value, None)
 }
 
@@ -82,7 +90,7 @@ pub(crate) fn store_in_vault_until(
     key: &str,
     value: &str,
     expires_at: Option<wheel_core::Timestamp>,
-) -> ApiResult<()> {
+) -> ApiResult<Option<String>> {
     let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
 
     let node = board::get(conn, vault)
@@ -95,30 +103,50 @@ pub(crate) fn store_in_vault_until(
 
     // Adding a key can create an ambiguity that did not exist when the wires
     // were made, so every agent already reading this vault is re-checked
-    // before the write, not after.
+    // before the write, not after. Only a REAL value elsewhere blocks (028
+    // face 5); a bare declaration elsewhere is a warning, collected below and
+    // returned once the write itself has succeeded.
     let known = cfg.keys.iter().any(|k| k == key);
+    let mut warning = None;
     if !known {
         for agent in crate::vault::agents_reading(conn, vault)
             .map_err(|e| ApiError::internal(e.to_string()))?
         {
-            if let Some(other) = crate::vault::supplies_key(conn, agent, key, vault)
-                .map_err(|e| ApiError::internal(e.to_string()))?
-            {
-                let what = if wheel_core::is_credential_key(key) {
-                    "credential"
-                } else {
-                    "vault key"
-                };
-                let agent_name = board::get(conn, agent)
+            let what = if wheel_core::is_credential_key(key) {
+                "credential"
+            } else {
+                "vault key"
+            };
+            let agent_name = || {
+                board::get(conn, agent)
                     .ok()
                     .flatten()
                     .map(|n| n.name.to_string())
-                    .unwrap_or_else(|| agent.to_string());
+                    .unwrap_or_else(|| agent.to_string())
+            };
+            if let Some(other) = crate::vault::supplies_key(conn, agent, key, vault)
+                .map_err(|e| ApiError::internal(e.to_string()))?
+            {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "ambiguous_credential",
-                    format!("ambiguous {what} {key}: {other} already supplies it to {agent_name}"),
+                    format!(
+                        "ambiguous {what} {key}: {other} already supplies it to {}",
+                        agent_name()
+                    ),
                 ));
+            }
+            if warning.is_none() {
+                if let Some(other) = crate::vault::declares_key(conn, agent, key, vault)
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                {
+                    warning = Some(format!(
+                        "{other} also declares {what} {key} for {} -- no value is stored there yet, \
+                         so this write is not blocked, but two vaults intending to supply the same \
+                         key to one agent is worth resolving",
+                        agent_name()
+                    ));
+                }
             }
         }
     }
@@ -135,7 +163,7 @@ pub(crate) fn store_in_vault_until(
         updated.config = wheel_core::NodeConfig::Vault(cfg);
         board::update(conn, &updated).map_err(ApiError::from)?;
     }
-    Ok(())
+    Ok(warning)
 }
 
 /// `DELETE /v1/vault/:id/:key`
