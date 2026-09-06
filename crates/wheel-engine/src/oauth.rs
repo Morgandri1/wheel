@@ -278,6 +278,20 @@ impl LoginSessions {
         }
     }
 
+    /// Kill every login in flight. Called when the engine is going away, so a
+    /// `claude auth login` child does not outlive the process that started it
+    /// and sit waiting on a stdin nobody will ever write to.
+    pub async fn shutdown(&self) {
+        let mut guard = self.inner.lock().await;
+        let ids: Vec<Uuid> = guard.keys().copied().collect();
+        for id in ids {
+            if let Some(mut p) = guard.remove(&id) {
+                let _ = p.child.kill().await;
+                let _ = p.child.wait().await;
+            }
+        }
+    }
+
     /// Drop logins that have outlived their TTL, killing their children.
     ///
     /// Called on `begin`, so an abandoned login cannot hold a process forever

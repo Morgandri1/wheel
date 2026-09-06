@@ -140,10 +140,28 @@ fn write_mcp_config(
     Ok(path)
 }
 
+/// Signal a process GROUP, by the pid of its leader.
+///
+/// `kill(-pid)` is the group form. Failures are ignored on purpose: the only
+/// interesting one is "already gone", which is the outcome we wanted.
+fn signal_group(pid: u32, sig: libc::c_int) {
+    // Safety: kill(2) with a pid we spawned. A negative pid addresses the
+    // group whose leader has that id, which is this child because
+    // `child_command` puts every child in its own group.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), sig);
+    }
+}
+
 pub(crate) fn child_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.env_clear();
     inherit_platform_env(&mut cmd);
+    // Each child leads its OWN process group, so the engine can signal it and
+    // everything it started. A harness spawns children of its own -- node,
+    // ripgrep, a language server -- and killing only the pid we know leaves
+    // those reparented to init, alive, holding the project's data dir open.
+    cmd.process_group(0);
     cmd
 }
 
@@ -458,6 +476,63 @@ impl Supervisor {
         }
         self.set_status(agent, AgentStatus::Stopped, None);
         Ok(AgentStatus::Stopped)
+    }
+
+    /// How long a child gets to exit on its own before it is killed.
+    pub const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Stop every child this engine started, and do not return until they are
+    /// gone.
+    ///
+    /// A harness process must never outlive its engine. Production showed
+    /// ppid=1 orphans running as the project's uid after a restart: still
+    /// holding the data dir, still authenticated, and answerable to nobody.
+    /// The host's uid-range reaper is a backstop for the cases this cannot
+    /// reach (an engine that was SIGKILLed), not the primary control.
+    ///
+    /// SIGTERM to each child's process GROUP first, so a harness that spawned
+    /// its own children takes them with it; then a bounded wait; then SIGKILL.
+    pub async fn shutdown(&self) {
+        let agents: Vec<Uuid> = {
+            let map = self.agents.lock().await;
+            map.keys().copied().collect()
+        };
+
+        let mut pending = Vec::new();
+        for agent in agents {
+            let slot = self.slot(agent).await;
+            let mut guard = slot.lock().await;
+            let Some(mut running) = guard.take() else {
+                continue;
+            };
+            if let Some(pid) = running.child.id() {
+                signal_group(pid, libc::SIGTERM);
+            }
+            pending.push((agent, running));
+        }
+        if pending.is_empty() {
+            return;
+        }
+        tracing::info!(children = pending.len(), "stopping agent processes");
+
+        let deadline = std::time::Instant::now() + Self::GRACE;
+        for (agent, mut running) in pending {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            // Its own words first: a child given SIGTERM usually goes quietly,
+            // and waiting is what makes "gone" true rather than "asked to go".
+            if tokio::time::timeout(left, running.child.wait()).await.is_err() {
+                if let Some(pid) = running.child.id() {
+                    tracing::warn!(agent = %agent, pid, "child ignored SIGTERM; killing");
+                    signal_group(pid, libc::SIGKILL);
+                }
+                // After SIGKILL the wait cannot block for long, but it must
+                // still happen: an unreaped child is a zombie, which is an
+                // orphan wearing a different hat.
+                let _ = running.child.wait().await;
+            }
+            self.set_status(agent, AgentStatus::Stopped, None);
+        }
+        tracing::info!("agent processes stopped");
     }
 
     /// Deliver the next queued message if the agent is idle.
@@ -1169,14 +1244,26 @@ mod tests {
         // exists to fail fast when a condition will never hold, not to assert
         // anything about speed -- and at 10s it was reporting healthy code as
         // broken whenever the machine was busy, which is worse than slow.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             if cond() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("timed out waiting for {what}");
+        // Say how long it actually waited. These tests spawn real processes,
+        // so the two failures look identical in a log and have opposite
+        // causes: a condition that is never satisfied is a bug, and a
+        // condition that had 60 seconds on a starved machine is not. Without
+        // the elapsed time the next person cannot tell which they are looking
+        // at -- I could not, and spent an hour on it.
+        panic!(
+            "timed out waiting for {what} after {:?}. These tests spawn real child \
+             processes; if the host is loaded (several cargo runs at once), this is \
+             starvation rather than a logic failure -- re-run alone before investigating.",
+            started.elapsed()
+        );
     }
 
     /// The operator's actual first session: start, discover the agent needs
@@ -1451,6 +1538,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Is this pid still alive? `kill(pid, 0)` asks without signalling.
+    fn alive(pid: u32) -> bool {
+        // Safety: signal 0 performs error checking only; it sends nothing.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// API's S2: production had ppid=1 harness processes still running as the
+    /// project's uid after the engine restarted — still holding the data dir,
+    /// still authenticated, answerable to nobody.
+    ///
+    /// A harness must never outlive its engine.
+    #[tokio::test]
+    async fn shutdown_takes_the_children_with_it() {
+        let (sup, id, dir) = shim_supervisor("reaped", ECHO_HARNESS);
+        sup.start(id).await.unwrap();
+        until("the child to start", || runs(&dir) == 1).await;
+
+        let pid = {
+            let slot = sup.slot(id).await;
+            let guard = slot.lock().await;
+            guard.as_ref().and_then(|r| r.child.id()).expect("a live pid")
+        };
+        assert!(alive(pid), "the child should be running before we stop");
+
+        let started = std::time::Instant::now();
+        sup.shutdown().await;
+
+        assert!(
+            !alive(pid),
+            "the harness outlived its engine: pid {pid} is still running"
+        );
+        assert!(
+            started.elapsed() < Supervisor::GRACE * 2,
+            "shutdown must be bounded, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(status_of(&sup, id), AgentStatus::Stopped);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A harness that ignores SIGTERM must not hold the engine open past the
+    /// grace window — §4b gives the whole shutdown 15s.
+    #[tokio::test]
+    async fn a_child_that_ignores_sigterm_is_killed_within_the_grace() {
+        const STUBBORN: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+trap '' TERM
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}"
+while true; do sleep 0.2; done
+"#;
+        let (sup, id, dir) = shim_supervisor("stubborn", STUBBORN);
+        sup.start(id).await.unwrap();
+        until("the child to start", || runs(&dir) == 1).await;
+
+        let pid = {
+            let slot = sup.slot(id).await;
+            let guard = slot.lock().await;
+            guard.as_ref().and_then(|r| r.child.id()).expect("a live pid")
+        };
+
+        let started = std::time::Instant::now();
+        sup.shutdown().await;
+        assert!(!alive(pid), "a child ignoring SIGTERM must still be killed");
+        assert!(
+            started.elapsed() < Supervisor::GRACE * 2,
+            "the grace window must bound it, took {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shutting down with nothing running must be a no-op, not a hang: it is
+    /// the normal case for an engine whose agents are all parked.
+    #[tokio::test]
+    async fn shutdown_with_no_children_returns_immediately() {
+        let (sup, _id, dir) = shim_supervisor("empty", ECHO_HARNESS);
+        let started = std::time::Instant::now();
+        sup.shutdown().await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A harness that records the environment it was actually given.

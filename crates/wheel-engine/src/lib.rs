@@ -140,6 +140,17 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         }
     }
 
+    // The server has stopped accepting; now take the children with us.
+    //
+    // Without this a harness process outlives its engine: production showed
+    // ppid=1 orphans running as the project's uid after a restart, still
+    // holding the data dir and still authenticated. §4b gives the engine 15s
+    // to shut down cleanly, and the supervisor's grace fits inside that.
+    state.supervisor.shutdown().await;
+    // A login waiting for a pasted code is a child too, and nobody is coming
+    // back to finish it.
+    state.logins.shutdown().await;
+
     tracing::info!("shutdown complete");
     Ok(())
 }
