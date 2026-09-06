@@ -48,6 +48,9 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
 pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
     Router::new()
         .route("/healthz", get(routes::health::healthz))
+        // Unauthenticated, like /healthz: a deploy gate runs before anyone has a token, and the
+        // answer is a single bit that reveals nothing.
+        .route("/v1/host/healthz", get(routes::health::host_healthz))
         // Local auth. These 404 when AUTH_MODE is not `local`, so a provider swap cannot leave a
         // second way in.
         .route("/v1/auth/signup", post(routes::auth::signup))

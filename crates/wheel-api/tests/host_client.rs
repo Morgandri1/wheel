@@ -281,3 +281,61 @@ async fn host_error_bodies_do_not_leak_into_ours() {
         "operators need the upstream status: {rendered}"
     );
 }
+
+/// The host's liveness probe goes to the unauthenticated `/healthz`, not the bearer-gated
+/// `/host/v1/healthz`.
+///
+/// The API-facing route is a deploy gate: it must answer whether the host process is serving, and
+/// it must not answer "no" merely because a bearer was rejected — that would report an outage
+/// during a secret rotation and hide one during a real failure.
+#[tokio::test]
+async fn host_liveness_probes_the_unauthenticated_route() {
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = hits.clone();
+    let app = Router::new().route(
+        "/healthz",
+        get(move || {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push("/healthz".into());
+                (StatusCode::OK, Json(json!({"ok": true})))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = HostClient::new(reqwest::Client::new(), base, Secret::new("host-secret"));
+    client.host_alive().await.expect("a serving host is alive");
+    assert_eq!(hits.lock().unwrap().as_slice(), ["/healthz"]);
+}
+
+#[tokio::test]
+async fn a_host_that_answers_an_error_is_not_alive() {
+    let app = Router::new().route(
+        "/healthz",
+        get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = HostClient::new(reqwest::Client::new(), base, Secret::new("host-secret"));
+    assert!(client.host_alive().await.is_err());
+}
+
+/// A host that is not there at all is the case the route exists for — and it must be an error
+/// rather than a hang, because the gate calling it has a timeout of its own.
+#[tokio::test]
+async fn a_host_that_is_not_listening_is_not_alive() {
+    let client = HostClient::new(
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap(),
+        "http://127.0.0.1:1".into(),
+        Secret::new("host-secret"),
+    );
+    assert!(client.host_alive().await.is_err());
+}

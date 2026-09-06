@@ -400,3 +400,38 @@ async fn ingress_rate_limit_refuses_once_the_budget_is_spent() {
     }
     assert!(saw_429, "the 60/min ingress budget was never enforced");
 }
+
+/// The host liveness gate: unauthenticated, and it says one bit and nothing more.
+///
+/// QA's post-deploy check runs before anyone has a token, and the host has no public domain, so
+/// this is the only way to ask whether it is serving. It must not become a way to learn anything
+/// about the host — the sandbox backend, how many projects are running, or upstream error text.
+#[tokio::test]
+async fn host_liveness_is_unauthenticated_and_reveals_nothing() {
+    let Some(app) = app("http://unused.invalid".into()).await else {
+        return;
+    };
+
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .uri("/v1/host/healthz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "no token should be required");
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json, serde_json::json!({"ok": true}));
+
+    let rendered = String::from_utf8_lossy(&body);
+    for leak in [
+        "sandbox", "backend", "projects", "process", "docker", "secret",
+    ] {
+        assert!(
+            !rendered.contains(leak),
+            "liveness disclosed {leak}: {rendered}"
+        );
+    }
+}

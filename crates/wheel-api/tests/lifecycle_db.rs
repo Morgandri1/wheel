@@ -47,6 +47,10 @@ impl Default for FakeOrch {
 
 #[async_trait::async_trait]
 impl Orchestrator for FakeOrch {
+    async fn host_alive(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn provision(&self, _: &Uuid, _: &EngineSecrets) -> anyhow::Result<()> {
         Ok(())
     }
