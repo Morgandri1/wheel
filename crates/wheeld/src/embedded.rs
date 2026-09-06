@@ -82,6 +82,10 @@ impl Sandbox for EmbeddedSandbox {
             data_dir: self.project_dir(id),
             listen: wheel_core::ListenAddr::Unix(socket.clone()),
             json_logs: false,
+            // Empty, deliberately. This is the SSRF escape hatch for red-team probes, and a local
+            // install has no reason to hold one open — the engine refuses it in production for the
+            // same reason.
+            tool_allow_hosts: Vec::new(),
         };
 
         let project = *id;
