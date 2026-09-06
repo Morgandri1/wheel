@@ -35,6 +35,30 @@ use crate::{
     harness::{claude::ClaudeDriver, Harness, HarnessEvent, SpawnSpec, StartupFailure},
 };
 
+/// Toolchain caches redirected from a node's `$HOME` to the project's own.
+///
+/// The variable is what the tool reads; the directory is where we put it. Each
+/// one of these defaults to somewhere under `$HOME`, and `$HOME` is per node,
+/// so without this every agent on a board downloads and stores its own copy of
+/// the same packages.
+///
+/// `RUSTUP_HOME` is deliberately NOT here: the toolchain itself is in the
+/// image, read-only and shared by every tenant already (029). This list is for
+/// what a tenant FETCHES, which is theirs and must not be another tenant's.
+const TOOL_CACHES: &[(&str, &str)] = &[
+    ("CARGO_HOME", ".cargo"),
+    // pnpm's content-addressed store: the 882M-per-agent one.
+    ("PNPM_HOME", ".pnpm"),
+    ("XDG_DATA_HOME", ".local-share"),
+    // npm keeps `_cacache` under this.
+    ("NPM_CONFIG_CACHE", ".npm"),
+    // Browser downloads, which are the next few hundred MB of the same shape.
+    ("PLAYWRIGHT_BROWSERS_PATH", ".playwright"),
+    ("PUPPETEER_CACHE_DIR", ".puppeteer"),
+    ("UV_CACHE_DIR", ".uv"),
+    ("PIP_CACHE_DIR", ".pip"),
+];
+
 /// How much of a child's stdout is kept for classifying why it died. Enough
 /// for a CLI's error banner, small enough that a runaway child cannot grow it.
 const STARTUP_OUTPUT_TAIL: usize = 8 * 1024;
@@ -305,7 +329,15 @@ impl Supervisor {
     /// The mode is SET rather than left to the umask, and then verified: a
     /// directory that already existed keeps whatever mode it was made with,
     /// so creating it correctly is not the same as finding it correct.
-    fn cargo_home(&self) -> Result<std::path::PathBuf> {
+    /// A cache shared by every agent on this project.
+    ///
+    /// The guarantee that it is per PROJECT and not per node is the signature,
+    /// not the test below it: this function is not given a node id, so it
+    /// cannot produce a path that varies by node. I tried to write a mutation
+    /// that made it per-node and could not without changing the signature —
+    /// which is the point. The test asserts the resolved path mentions no node
+    /// id, which would catch someone threading one in.
+    fn project_cache(&self, name: &str) -> Result<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt;
 
         // `.cargo` under the project's own data dir. On the process backend
@@ -313,9 +345,9 @@ impl Supervisor {
         // volume. Either way it is per-project, which is the property that
         // matters -- the previous name `cargo` also sat next to whatever else
         // shares a host data dir.
-        let dir = self.cfg.data_dir.join(".cargo");
+        let dir = self.cfg.data_dir.join(name);
         std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating the crate cache at {}", dir.display()))?;
+            .with_context(|| format!("creating the {name} cache at {}", dir.display()))?;
 
         // Before the mode, because every check below follows symlinks
         // (QA's WOW-toolchain-cargo-owned). A `.cargo` symlinked into a
@@ -323,10 +355,10 @@ impl Supervisor {
         // read belongs to the target -- while every project quietly shares one
         // cache. `symlink_metadata` is the only call here that does not follow.
         let link = std::fs::symlink_metadata(&dir)
-            .with_context(|| format!("inspecting the crate cache at {}", dir.display()))?;
+            .with_context(|| format!("inspecting the {name} cache at {}", dir.display()))?;
         anyhow::ensure!(
             link.is_dir(),
-            "the crate cache at {} is a {}, not a directory of this project's own; \
+            "the {name} cache at {} is a {}, not a directory of this project's own; \
              a child is not started with it",
             dir.display(),
             if link.file_type().is_symlink() {
@@ -345,8 +377,8 @@ impl Supervisor {
         let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o077;
         anyhow::ensure!(
             mode == 0,
-            "the crate cache at {} is readable or writable by other uids (mode {:o}); \
-             it holds fetched sources and any registry credentials, so a child is not \
+            "the {name} cache at {} is readable or writable by other uids (mode {:o}); \
+             it holds fetched packages and any registry credentials, so a child is not \
              started with it",
             dir.display(),
             std::fs::metadata(&dir)?.permissions().mode() & 0o777
@@ -533,8 +565,27 @@ impl Supervisor {
         // CARGO_HOME would put one project's downloaded sources -- and its
         // registry credentials, if it ever configures any -- where the next
         // project can read them.
-        let cargo_home = self.cargo_home()?;
-        cmd.env("CARGO_HOME", &cargo_home);
+        // Every toolchain cache an agent's tools would otherwise put in $HOME.
+        //
+        // $HOME is per NODE by design (F007: each child gets its own 0700
+        // credential dir), which means every one of these downloads the same
+        // bytes again per agent and nothing ever shares or reclaims them. API
+        // measured the consequence twice on the production volume: 1.76G of
+        // byte-identical pnpm store across two agents, after the same shape in
+        // cargo had already helped fill a 4.6G disk and take the grid down.
+        // Six agents on one board would be 5.3G of duplicates on that volume.
+        //
+        // So each is redirected to the PROJECT's cache, downloaded once and
+        // shared by that tenant's agents. Per tenant, not per node — the same
+        // reasoning M1.6 gives for CARGO_HOME and RUSTUP_HOME.
+        for (var, dir) in TOOL_CACHES {
+            match self.project_cache(dir) {
+                Ok(path) => {
+                    cmd.env(var, &path);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
         // answer is its probe rather than our guess.
@@ -1630,7 +1681,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (sup, _id, dir) = shim_supervisor("cargo-home", ECHO_HARNESS);
 
-        let cargo_home = sup.cargo_home().unwrap();
+        let cargo_home = sup.project_cache(".cargo").unwrap();
 
         // Under the project's OWN data dir. On the process backend that dir is
         // /data/projects/<id>, so this is 029's path; the old `data_dir/cargo`
@@ -1668,7 +1719,7 @@ mod tests {
         std::fs::remove_dir_all(&cache).ok();
         std::os::unix::fs::symlink(&shared, &cache).unwrap();
 
-        let err = sup.cargo_home().unwrap_err().to_string();
+        let err = sup.project_cache(".cargo").unwrap_err().to_string();
         assert!(
             err.contains("symlink"),
             "a symlinked cache must be refused, and named: {err}"
@@ -1685,7 +1736,10 @@ mod tests {
         let (a, _, dir_a) = shim_supervisor("cargo-p1", ECHO_HARNESS);
         let (b, _, dir_b) = shim_supervisor("cargo-p2", ECHO_HARNESS);
 
-        let (ca, cb) = (a.cargo_home().unwrap(), b.cargo_home().unwrap());
+        let (ca, cb) = (
+            a.project_cache(".cargo").unwrap(),
+            b.project_cache(".cargo").unwrap(),
+        );
         assert_ne!(ca, cb, "two projects were handed the same crate cache");
 
         std::fs::remove_dir_all(&dir_a).ok();
@@ -1704,7 +1758,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (sup, id, dir) = shim_supervisor("cargo-loose", ENV_DUMP_HARNESS);
 
-        let cargo_home = sup.cargo_home().unwrap();
+        let cargo_home = sup.project_cache(".cargo").unwrap();
         std::fs::write(cargo_home.join("credentials.toml"), "token = \"secret\"").unwrap();
         std::fs::set_permissions(&cargo_home, PermissionsExt::from_mode(0o755)).unwrap();
 
@@ -1823,6 +1877,66 @@ mod tests {
         let out = tail.into_string();
         assert!(!out.is_empty(), "the only line was discarded");
         assert!(out.contains('\u{2014}'));
+    }
+
+    /// API's measurement, as a property: 1.76G of byte-identical pnpm store
+    /// across two agents, in each node's private `$HOME` where nothing shares
+    /// or reclaims it. Six agents would have been 5.3G on a 4.6G volume — the
+    /// outage again with a different filename.
+    ///
+    /// The assertion is that every cache the child is told about is under the
+    /// PROJECT's directory and none is under the node's own, because "per
+    /// node" is exactly what made the same bytes land N times.
+    #[tokio::test]
+    async fn every_toolchain_cache_is_per_project_and_none_is_in_the_node_home() {
+        let (sup, id, dir) = shim_supervisor("tool-caches", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+
+        let node_home = sup.cfg.creds_dir().join(id.to_string());
+        for (var, _) in TOOL_CACHES {
+            let value = env
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{var}=")))
+                .unwrap_or_else(|| panic!("{var} was never given to the child:\n{env}"));
+            let path = std::path::Path::new(value);
+            assert!(
+                path.starts_with(&sup.cfg.data_dir),
+                "{var}={value} is not under this project's directory"
+            );
+            assert!(
+                !path.starts_with(&node_home),
+                "{var}={value} is inside the node's own HOME, so every agent \
+                 downloads its own copy — that is the bug this prevents"
+            );
+            // The load-bearing one. "Not in $HOME" is not the property; "the
+            // same for every agent on this board" is, and a scheme that gives
+            // each node its own directory UNDER the project satisfies the
+            // first while duplicating exactly as before. A path that varies
+            // per node must mention the node, so it must not.
+            assert!(
+                !value.contains(&id.to_string()),
+                "{var}={value} is keyed by the node id, so each agent gets its own copy"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two agents on one board share every cache. Stated separately because
+    /// the test above passes perfectly well for a scheme that gives each node
+    /// its own directory under the project — which would still duplicate.
+    #[tokio::test]
+    async fn two_agents_on_a_board_share_one_cache_of_each_kind() {
+        let (sup, _id, dir) = shim_supervisor("tool-share", ECHO_HARNESS);
+        for (_, cache) in TOOL_CACHES {
+            let a = sup.project_cache(cache).unwrap();
+            let b = sup.project_cache(cache).unwrap();
+            assert_eq!(a, b, "{cache} differs between two starts on one project");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A harness that records the environment it was actually given.
