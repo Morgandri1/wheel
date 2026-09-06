@@ -60,9 +60,22 @@ pub enum LoginError {
     Spawn(String),
 }
 
-#[derive(Default)]
+type Sessions = std::sync::Arc<Mutex<HashMap<Uuid, Pending>>>;
+
 pub struct LoginSessions {
-    inner: Mutex<HashMap<Uuid, Pending>>,
+    inner: Sessions,
+    /// A field rather than a constant so the expiry path can be tested at
+    /// speed. Production always uses `SESSION_TTL`.
+    ttl: Duration,
+}
+
+impl Default for LoginSessions {
+    fn default() -> Self {
+        Self {
+            inner: Sessions::default(),
+            ttl: SESSION_TTL,
+        }
+    }
 }
 
 impl LoginSessions {
@@ -81,6 +94,11 @@ impl LoginSessions {
 
         std::fs::create_dir_all(config_dir).ok();
         let mut cmd = tokio::process::Command::new(program);
+        // Same hygiene as an agent child (ADVERSARY F015): this is the same
+        // harness binary, and the engine's own secrets have no business in
+        // the environment of anything it spawns.
+        cmd.env_clear();
+        crate::supervisor::inherit_platform_env(&mut cmd);
         cmd.args(["auth", "login", "--claudeai"])
             // The node's own config dir, so this login belongs to this agent
             // and not to every agent in the sandbox.
@@ -152,6 +170,7 @@ impl LoginSessions {
                 output,
             },
         );
+        self.arm_expiry(node, session);
         Ok((session, url))
     }
 
@@ -167,7 +186,7 @@ impl LoginSessions {
             guard.remove(&node).ok_or(LoginError::NoSession)?
         };
 
-        if pending.started.elapsed() > SESSION_TTL {
+        if pending.started.elapsed() > self.ttl {
             let _ = pending.child.kill().await;
             return Err(LoginError::Expired);
         }
@@ -200,6 +219,29 @@ impl LoginSessions {
         }
     }
 
+    /// Collect this login once its TTL is up, so `SESSION_TTL` is a fact
+    /// rather than a comment.
+    ///
+    /// A timer per login rather than one sweep loop over all of them: the
+    /// engine is required to idle at ~0 CPU, and a sandbox where nobody is
+    /// signing in should not be waking up to discover that. `begin` also
+    /// evicts, but a user who starts one login and walks away never calls
+    /// `begin` again — so without this, nothing would ever reap that child.
+    fn arm_expiry(&self, node: Uuid, session: Uuid) {
+        let sessions = self.inner.clone();
+        let ttl = self.ttl;
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let mut guard = sessions.lock().await;
+            // Only if it is still THIS login: a retry replaces the entry, and
+            // the new child must outlive the old one's timer.
+            if guard.get(&node).is_some_and(|p| p.session == session) {
+                // Dropping the Pending kills the child: `kill_on_drop`.
+                guard.remove(&node);
+            }
+        });
+    }
+
     /// Kill any login in flight for a node. Safe to call when there is none.
     pub async fn cancel(&self, node: Uuid) {
         if let Some(mut p) = self.inner.lock().await.remove(&node) {
@@ -215,13 +257,21 @@ impl LoginSessions {
         let mut guard = self.inner.lock().await;
         let stale: Vec<Uuid> = guard
             .iter()
-            .filter(|(_, p)| p.started.elapsed() > SESSION_TTL)
+            .filter(|(_, p)| p.started.elapsed() > self.ttl)
             .map(|(id, _)| *id)
             .collect();
         for id in stale {
             if let Some(mut p) = guard.remove(&id) {
                 let _ = p.child.kill().await;
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: Sessions::default(),
+            ttl,
         }
     }
 
@@ -464,6 +514,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LoginError::Expired), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The leak this exists to prevent: a user who signs in halfway and
+    /// closes the tab. Nothing else ever calls `begin` again for that node,
+    /// so without an armed timer the `claude auth login` child would sit in
+    /// the sandbox forever.
+    #[tokio::test]
+    async fn an_abandoned_login_is_collected_when_its_ttl_runs_out() {
+        let (program, dir) = stub_cli("abandoned", true);
+        let creds = dir.join("creds");
+        let s = LoginSessions::with_ttl(Duration::from_millis(150));
+        let node = Uuid::new_v4();
+
+        let (session, _) = s.begin(node, &program, &creds).await.unwrap();
+        assert_eq!(s.len().await, 1);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            s.len().await,
+            0,
+            "an abandoned login must not hold a child process forever"
+        );
+        // And the handle is genuinely gone, not merely unreachable.
+        assert!(matches!(
+            s.complete(node, Some(session), "good#abc123")
+                .await
+                .unwrap_err(),
+            LoginError::NoSession
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The timer is armed per login, so a retry inherits an older login's
+    /// pending timer. That timer must not reap the replacement.
+    #[tokio::test]
+    async fn an_expiring_timer_does_not_kill_the_login_that_replaced_it() {
+        let (program, dir) = stub_cli("replaced", true);
+        let creds = dir.join("creds");
+        let s = LoginSessions::with_ttl(Duration::from_millis(300));
+        let node = Uuid::new_v4();
+
+        s.begin(node, &program, &creds).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Retry: the first login's timer is still pending and fires at ~300ms.
+        let (second, _) = s.begin(node, &program, &creds).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            s.len().await,
+            1,
+            "the first login's timer reaped the retry that replaced it"
+        );
+        s.complete(node, Some(second), "good#abc123").await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

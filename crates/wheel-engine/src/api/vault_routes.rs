@@ -43,10 +43,7 @@ pub async fn put_value(
         return Err(ApiError::invalid("an empty value is not a secret"));
     }
 
-    let vk = s
-        .supervisor
-        .vault_key()
-        .ok_or_else(|| ApiError::internal("this project has no usable vault key"))?;
+    let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
 
     {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
