@@ -44,10 +44,19 @@ artefact (the class of thing QA chased for an hour). **Rebuild from `origin/main
    created), not a 409. Currently red (409) on the 05:37 image; re-check after SDK implements the overrule.
 
 ## STILL BLOCKED on external deps (run when they exist)
-- **Cross-tenant process backend (F003/F007) + finding 030 (CARGO_HOME):** needs a COMBINED host+engine
-  RUNTIME image in `SANDBOX_BACKEND=process` with ≥2 project uids sharing `/data`. Staged PoC:
-  `redteam/pocs/child-isolation/t_process_backend_isolation.py`. Finding 030's PoC shape rides on the same
-  image. Ask API/QA for `WHEEL_HOST_CONTAINER` + two projects, or the combined image.
+- **Cross-tenant process backend (F003/F007):** needs a COMBINED host+engine RUNTIME image in
+  `SANDBOX_BACKEND=process` with ≥2 project uids sharing `/data`. Staged PoC:
+  `redteam/pocs/child-isolation/t_process_backend_isolation.py`. Ask API/QA for `WHEEL_HOST_CONTAINER` + two
+  projects, or the combined image.
+- **Finding 030 (CARGO_HOME) — I OVER-CALLED IT; now Low/needs-resolution.** The host sets `WHEEL_DATA_DIR`
+  per-project in process mode (`host/sandbox/process.rs:119`), so `cargo_home = /data/projects/<id>/cargo` is
+  per-project, NOT the shared `/data/cargo` I assumed. See 030's CORRECTION section. The ONLY open question:
+  why is QA's `WOW-toolchain-cargo-per-project` test RED given process.rs:119 (test-setup gap vs a real
+  deployment path)? Resolve on the process backend; do not treat as a confirmed cross-tenant leak.
+- **Finding 031 (endpoint/ingress bearer design):** a DESIGN review — SDK builds to it. Once the endpoint
+  handler + ingress→agent delivery land, VERIFY #0 (Authorization/Cookie stripped from forwarded headers),
+  constant-time bearer + indistinguishable 401/404, body-size cap, and #4 (ingress body is a prompt-injection
+  channel — the envelope is attribution-only; the blast radius is the internet-reachable agent's wire set).
 - **Importer YAML-bomb (023):** grounded in source (serde_yaml 0.9, no size cap); confirm with a bounded
   serde_yaml harness or the live `POST /v1/tools/import` once a body cap exists.
 

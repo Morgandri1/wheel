@@ -1,12 +1,13 @@
-# 030 — CARGO_HOME lands one level too high: one cargo dir (registry, git checkouts, credentials.toml) shared across every tenant uid
+# 030 — CARGO_HOME location: over-called as cross-tenant; the host sets WHEEL_DATA_DIR per-project (see CORRECTION)
 
-- **Severity:** High on the **process backend** (multi-tenant prod / Wheel-on-Wheel target): a shared,
-  world-readable-and-writable cargo dir across tenant uids is a cross-tenant build-poisoning (code-execution
-  in a victim tenant's build) and credential-exposure surface. Low on the docker/M1 backend (single uid).
-  Owner: **SDK/Engine** (`crates/wheel-engine/src/supervisor/mod.rs:390`).
-- **Status:** CONFIRMED IN SOURCE (I verified the code, not the relay). Could NOT run live — needs a
-  multi-tenant `process`-backend host image with ≥2 project uids sharing `/data` (the same combined
-  host+engine runtime image that has blocked the F003/F007 cross-tenant probe all along). PoC shape below.
+- **Severity:** DOWNGRADED to Low / NEEDS-RESOLUTION. Originally filed High/cross-tenant; that was MY ERROR —
+  the host overrides `WHEEL_DATA_DIR` to the per-project dir in process mode (`process.rs:119`), so
+  `cargo_home` is per-project, NOT the shared `/data/cargo` my premise assumed. **Read the CORRECTION section
+  at the bottom first — it supersedes the High framing above.** Owner: SDK/Engine
+  (`crates/wheel-engine/src/supervisor/mod.rs:390`).
+- **Status:** RETRACTED-as-cross-tenant; open only as "why is QA's `WOW-toolchain-cargo-per-project` test red
+  given process.rs:119?" — resolve on the process backend. The High text below is preserved for the record but
+  is corrected at the end.
 - **Boundary:** multi-tenant host (process backend), TB "all tenants share one kernel". Realises decision 029's
   CARGO_HOME warning as a concrete bug.
 
@@ -52,3 +53,27 @@ Two projects A, B on a `process`-backend host (per-project uids sharing `/data`)
 3. Separately: as A, `cargo login <token>` → as B, read `/data/cargo/credentials.toml` (0755 → readable).
 Expected after fix: `/data/projects/<A>/cargo` and `/data/projects/<B>/cargo` are distinct, 0700, and B cannot
 read or influence A's. Ties into the staged `redteam/pocs/child-isolation/t_process_backend_isolation.py`.
+
+## CORRECTION (2026-09-06) — I OVER-CALLED THIS; downgrade to NEEDS-RESOLUTION
+I filed the "shared across tenants" premise from `supervisor/mod.rs:390` (`data_dir.join("cargo")`) plus
+`config.rs:87` (data_dir DEFAULT `/data`) WITHOUT checking what `WHEEL_DATA_DIR` the host actually sets per
+engine. It does override it per-project:
+- `crates/wheel-host/src/sandbox/process.rs:119`: `("WHEEL_DATA_DIR", self.project_dir(id)...)` → in PROCESS
+  mode each engine gets `WHEEL_DATA_DIR=/data/projects/<id>`, so `cargo_home = /data/projects/<id>/cargo` —
+  **PER-PROJECT**, not `/data/cargo`.
+- `docker.rs:141`: `WHEEL_DATA_DIR=/data`, but the docker backend is one container per project (single uid),
+  so `/data/cargo` is that container's own — also effectively per-project.
+So the cross-tenant "shared cargo dir" claim is WRONG for both backends as the host actually spawns them. The
+twin's note in finding 029 (cargo is per-project in process mode) was correct; this finding's High severity
+was my error — I asserted from a partial read (the engine default) instead of tracing the host's per-engine
+`WHEEL_DATA_DIR`. Lesson: trace the value that actually reaches the engine, not the default.
+
+**BUT unresolved:** QA left `WOW-toolchain-cargo-per-project` RED, which contradicts "per-project." Two
+possibilities the successor must settle: (a) QA's test observes `/data/cargo` because in its harness the host
+does NOT set `WHEEL_DATA_DIR` per-project (or runs a single-engine mode), i.e. a TEST-setup gap, not a product
+bug; or (b) a real deployment path where the per-project override doesn't apply. Also confirm the isolation
+does not rely on the cargo SUBDIR perms: `create_dir_all(&cargo_home).ok()` leaves 0755, so cross-tenant
+safety depends on the PARENT `/data/projects/<id>` being `0700` (per §5b) — verify that parent mode on the
+process backend (same probe as F003/F007). **Net:** downgrade from High/cross-tenant to Low/needs-resolution;
+the operative question is why QA's test is red given process.rs:119. Do not treat as a confirmed cross-tenant
+leak until that is resolved.
