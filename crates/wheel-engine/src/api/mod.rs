@@ -95,6 +95,10 @@ impl From<db::board::BoardError> for ApiError {
             // BOARD is the thing that cannot accept it.
             B::Ambiguous(m) => ApiError::new(StatusCode::CONFLICT, "ambiguous_credential", m),
             B::Config(c) => ApiError::invalid(c.to_string()),
+            // The request named something the storage layer cannot represent
+            // (a table node whose name is not a sqlite identifier), which the
+            // caller can fix by choosing a different name.
+            B::Storage(m) => ApiError::invalid(m),
         }
     }
 }
