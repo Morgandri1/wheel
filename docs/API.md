@@ -228,7 +228,12 @@ Header hygiene, both directions:
 
 - `404` if the project does not exist.
 - `403` if `capabilities.http` is false (the default, and also the result of a malformed
-  capabilities blob — this fails closed).
+  capabilities blob — this fails closed). The toggle is `capabilities.http` on `PATCH
+  /v1/projects/{id}`.
+- `501 ingress_unavailable` if the engine answers with a **bodiless** 404 — it has no `/ingress/*`
+  route at all, so the path is not the problem and saying "not found" invites the reader to hunt for
+  a typo. A 404 the engine actually wrote (its `no_such_endpoint`, or an endpoint script's own)
+  passes through unchanged.
 - Rate limited per project, default 60 req/min, `429` when exceeded.
 - Body capped at 5 MiB, `413` when exceeded.
 - Every `x-wheel-*` header from the caller is stripped before we add `x-wheel-ingress: 1`, so a
@@ -340,6 +345,18 @@ trust a resolver, and a name that resolves publicly today may not tomorrow.
 Explicit origin allowlist from `CORS_ALLOWED_ORIGINS`. Never wildcard-with-credentials: the web app
 authenticates with a header rather than cookies, so `allow_credentials` is never needed, and an
 explicit list keeps a hostile page from scripting the API with a user's token.
+
+**Methods and headers are mirrored from the preflight, not listed.** The origin allowlist is the
+boundary; a hand-kept method list is a second copy of what the router serves, and it drifted — the
+vault write is a `PUT`, `PUT` was missing, and the operator saw "Can't reach the API" rather than
+anything naming a method or a route. A method the router does not serve now gets a `405` with a
+body, which is readable; a preflight failure is not. `crates/wheel-api/tests/cors.rs`
+(**API-cors-covers-every-served-method**) reads the routes out of the router's own source and holds
+the preflight to every method each one accepts, so a return to a static list fails CI.
+
+`ANY /p/{project_id}/{*rest}` carries its own permissive CORS (`Access-Control-Allow-Origin: *`, no
+credentials): an ingress URL is public by definition, so restricting which page may read the reply
+protects nothing and only stops the board's own "test this endpoint" button from showing it.
 
 ## Running the API natively (no Docker) — for the web team
 

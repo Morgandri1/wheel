@@ -13,12 +13,19 @@ pub mod state;
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use state::AppState;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 /// CORS for the browser app.
 ///
+/// The origin allowlist is the boundary, and it is the only one here. Methods and headers are
+/// mirrored from the preflight rather than listed, because a hand-kept list is a second copy of
+/// what the router serves and it drifted: the vault write is a PUT, PUT was missing, and the
+/// operator saw "Can't reach the API" instead of a 405 anyone could have read. Mirroring cannot
+/// drift — a method the router does not serve gets a 405 with a body, which is the honest answer,
+/// and nothing is granted that a non-browser client did not already have.
+///
 /// Note what this is *not*: `Any` origin combined with credentials. The web app authenticates with
-/// an `x-auth-token` header rather than cookies, so we never need `allow_credentials`, and an
+/// an `x-auth-token` header rather than cookies, so we never need `allow_credentials`, and the
 /// explicit origin allowlist keeps a hostile page from scripting the API with a user's token.
 pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
     let origins: Vec<axum::http::HeaderValue> = allowed_origins
@@ -28,22 +35,22 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PUT,
-            axum::http::Method::PATCH,
-            axum::http::Method::DELETE,
-            axum::http::Method::HEAD,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            http::hop::header_name("x-auth-token"),
-            http::hop::header_name("x-project-id"),
-            http::hop::header_name("x-request-id"),
-        ])
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
+        .max_age(std::time::Duration::from_secs(600))
+}
+
+/// CORS for the public ingress route.
+///
+/// `/p/<project>/<path>` is a public URL by definition — an endpoint node's whole purpose is that
+/// anyone can call it — so restricting which page may *read* the reply protects nothing and only
+/// stops the board's own "test this endpoint" button from showing what came back. No credentials
+/// are allowed with it, so a browser cannot use a visitor's session to reach one.
+pub fn public_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
         .max_age(std::time::Duration::from_secs(600))
 }
 
@@ -81,11 +88,16 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             "/v1/projects/{id}/engine/{*rest}",
             axum::routing::any(routes::proxy::engine_proxy),
         )
-        // Public ingress. No auth by design; gated on the project's `http` capability.
-        .route(
-            "/p/{project_id}/{*rest}",
-            axum::routing::any(routes::ingress::ingress),
-        )
         .layer(cors_layer(allowed_origins))
+        // Public ingress. No auth by design; gated on the project's `http` capability. Merged after
+        // the layer above so it carries its own, permissive, CORS instead of the app allowlist.
+        .merge(
+            Router::new()
+                .route(
+                    "/p/{project_id}/{*rest}",
+                    axum::routing::any(routes::ingress::ingress),
+                )
+                .layer(public_cors_layer()),
+        )
         .with_state(state)
 }
