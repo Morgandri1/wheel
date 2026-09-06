@@ -1,4 +1,10 @@
-# 036 — Blast radius of the single-uid gap: one compromised agent ⇒ full project compromise + every linked account
+# 037 — Blast radius of the single-uid gap: one compromised agent ⇒ full project compromise + every linked account
+
+> Companion to **036** (my cloud twin's LIVE incident: the actual PAT observed on the wheel-dev board — uid
+> **21088** confirmed shared across all six agents via `id`, creds dirs `0755`). 036 = the observation; 037 =
+> the full radius PM asked for. The twin's live facts UPGRADE items below from REASONED to VERIFIED-LIVE: the
+> shared uid is measured (21088), and item 5 (sibling creds dirs) is the incident itself. Note the dirs are
+> `0755`, not `0700` — worse than the code intends; item 5's `.git/config` PAT sat in an ordinary-perms file.
 
 - **Severity:** Critical (on the `process`/Railway backend, where it is live). This is the concrete blast-radius
   enumeration PM asked for around the plaintext-PAT exposure (a vault token embedded in a workspace
