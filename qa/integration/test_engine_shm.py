@@ -108,11 +108,11 @@ def main():
 
         logs = sh("docker", "logs", "--tail", "6", NAME)
         said = (logs.stdout + logs.stderr)[-400:]
+        how = ("it EXITED (%s)" % died) if died else "it never served /healthz within 30s"
         R.control("ENG-starts-without-shm", up,
-                "the engine never served /healthz on a filesystem that cannot host a WAL "
-                "index. A deployment that cannot provide shm must fall back to a rollback "
-                "journal and come up; crash-looping there reads as a corrupt database. "
-                "Engine said: %s" % said)
+                  "%s on a filesystem that cannot host a WAL index. A deployment that cannot "
+                  "provide shm must fall back to a rollback journal and come up; crash-looping "
+                  "there reads as a corrupt database. Engine said: %s" % (how, said))
 
         if up:
             # The rollback journal has to serve SEVERAL connections: the query path opens
