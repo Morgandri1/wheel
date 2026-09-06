@@ -71,6 +71,14 @@ kept merging on top of it. None of those merges was ever seen green end-to-end.
   into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
   *next*, not eventually.
 - Whoever notices red `main` first says so. Silence is how five commits happen.
+- **Merging is blocked; committing is not** (API amendment, accepted 2026-09-06). Lane branches keep moving
+  and land the moment `main` greens. Read without this carve-out the rule quietly stops all work, which is
+  worse than the disease.
+- **A P0 production fix is the one exception.** If the board is down and the fix is not the fix for the red,
+  waiting on another lane to green is the wrong trade.
+- The cost this rule buys back is *reconstruction*, not review (API's reasoning, better than my own): six
+  commits went in unseen and it took twenty minutes to work out whether that mattered. Reconstruction is
+  dearer than review.
 
 ### A red signal that is not a defect must be removed, not tolerated (PM ruling, 2026-09-06)
 
@@ -426,6 +434,21 @@ Turn-complete and status are inferred ONLY from top-level harness events on the 
 run by the agent which prints a well-formed `{"type":"result"}` (or any harness event) line to ITS stdout cannot reach the engine's parser as a
 top-level event (the CLI nests tool output inside JSON strings; the agent-sdk bridge makes this structural). Events must also carry the
 `session_id` the engine started; mismatches are logged and ignored.
+
+### The gate is the uid, not the path (ADVERSARY 037, accepted 2026-09-06)
+
+Six repo clones live under `creds/<agent-uuid>/wheel`, two carrying 827 MB of `node_modules`. Moving them to
+`ws/` is **hygiene, not a fix**, and shipping only that move must not be called closing 037/038.
+
+A malicious npm `postinstall` or `build.rs` runs as uid 21088 and can `open()` any path that uid can read —
+every other agent's `creds/`, and `/proc/<engine-pid>/environ` (`WHEEL_ENGINE_SECRET` = wire-matrix bypass,
+`WHEEL_VAULT_KEY` = decrypt every vault) — *regardless of which directory the clone sits in*. The move
+changes where unreviewed executables live, not what they can read once they run.
+
+- Do the move anyway: thousands of unreviewed files should not sit beside credential files. It is
+  defense-in-depth, and it is worth doing.
+- But the exposure closes only with **per-node uids** (§3e, M2/M3). Until then, the layout is cosmetic with
+  respect to it, and any claim that 037/038 is addressed by relocation is a fix that looks like one.
 
 ### Credential-distribution rule (binding; two S1-class bugs found on this path in one day)
 `save_to_vault` — anything that takes a credential from one node and hands it to many — is the most dangerous surface in Wheel. No change
