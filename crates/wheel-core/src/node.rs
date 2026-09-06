@@ -471,3 +471,236 @@ impl Node {
             .any(|w| w.to == target && w.wire_type.satisfies(required, target_type))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical JSON of ARCHITECTURE.md §3, byte for byte. Every other
+    /// crate and the Web client are generated from this shape, so a silent
+    /// change here breaks them at runtime rather than at compile time.
+    #[test]
+    fn a_node_serializes_to_the_contracts_canonical_shape() {
+        let node = Node::new(
+            Uuid::nil(),
+            "researcher".parse().unwrap(),
+            Position::new(120.0, 340.0),
+            NodeConfig::Ctx(CtxConfig {
+                markdown: "hello".into(),
+            }),
+        );
+        let v = serde_json::to_value(&node).unwrap();
+
+        assert_eq!(v["name"], "researcher");
+        assert_eq!(v["type"], "ctx", "the tag must be a sibling of config");
+        assert_eq!(v["config"]["markdown"], "hello");
+        assert_eq!(v["position"]["x"], 120.0);
+        assert_eq!(v["position"]["y"], 340.0);
+        assert_eq!(v["wires"], serde_json::json!([]));
+
+        // No stray keys and none missing. (Order is not asserted: serde_json's
+        // Value sorts them, so an order assertion here would be testing
+        // serde_json rather than the contract.)
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["config", "id", "name", "position", "type", "wires"]);
+
+        let back: Node = serde_json::from_value(v).unwrap();
+        assert_eq!(back, node);
+    }
+
+    /// `type` is the discriminant the API and the UI switch on, so each
+    /// spelling is pinned and each must agree with `node_type()`.
+    #[test]
+    fn every_node_type_has_one_spelling_used_everywhere() {
+        let cases: Vec<(NodeConfig, NodeType, &str)> = vec![
+            (
+                NodeConfig::Agent(AgentConfig::default()),
+                NodeType::Agent,
+                "agent",
+            ),
+            (
+                NodeConfig::Ctx(CtxConfig {
+                    markdown: String::new(),
+                }),
+                NodeType::Ctx,
+                "ctx",
+            ),
+            (
+                NodeConfig::Table(TableConfig { columns: vec![] }),
+                NodeType::Table,
+                "table",
+            ),
+            (
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+                NodeType::Vault,
+                "vault",
+            ),
+            (NodeConfig::Chest(ChestConfig {}), NodeType::Chest, "chest"),
+        ];
+        for (config, want_type, want_str) in cases {
+            assert_eq!(config.node_type(), want_type);
+            assert_eq!(want_type.as_str(), want_str);
+            assert_eq!(want_type.to_string(), want_str);
+            assert_eq!(
+                serde_json::to_value(&config).unwrap()["type"],
+                want_str,
+                "the serde tag and node_type() must not drift apart"
+            );
+            assert_eq!(
+                serde_json::to_value(want_type).unwrap(),
+                serde_json::Value::String(want_str.into())
+            );
+        }
+    }
+
+    #[test]
+    fn as_agent_answers_only_for_agents() {
+        let agent = NodeConfig::Agent(AgentConfig {
+            system_prompt: "be useful".into(),
+            ..Default::default()
+        });
+        assert_eq!(agent.as_agent().unwrap().system_prompt, "be useful");
+        assert!(NodeConfig::Chest(ChestConfig {}).as_agent().is_none());
+    }
+
+    /// §3c#14: idle parking is what stops one process per agent living
+    /// forever. An agent that omits the field must still park.
+    #[test]
+    fn an_agent_parks_after_the_default_idle_timeout_unless_it_says_otherwise() {
+        let c: AgentConfig =
+            serde_json::from_str(r#"{"harness":"claude","system_prompt":""}"#).unwrap();
+        assert_eq!(c.idle_timeout_secs(), DEFAULT_IDLE_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 300, "the contract says 300");
+        assert!(!c.run_on_startup);
+        assert!(!c.ephemeral_context);
+        assert!(c.budget.is_none());
+
+        let explicit = AgentConfig {
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(explicit.idle_timeout_secs(), 30);
+        // 0 is "never park", NOT "park immediately", and must survive as 0.
+        let never = AgentConfig {
+            idle_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(never.idle_timeout_secs(), 0);
+    }
+
+    /// A misspelled key must fail loudly. Silently ignoring it would leave an
+    /// operator looking at a board that does not do what they configured.
+    #[test]
+    fn an_unknown_config_field_is_refused_rather_than_ignored() {
+        assert!(serde_json::from_str::<AgentConfig>(
+            r#"{"harness":"claude","system_prompt":"","ephemeral_contex":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<CtxConfig>(r#"{"markdown":"x","extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_script_has_a_default_timeout_and_a_file_per_language() {
+        let s: ScriptConfig =
+            serde_json::from_str(r#"{"language":"python","source":"print(1)"}"#).unwrap();
+        assert_eq!(s.timeout_secs(), 60, "the contract's default");
+        assert_eq!(ScriptLanguage::Python.main_file(), "main.py");
+        assert_eq!(ScriptLanguage::Ts.main_file(), "main.ts");
+        assert_eq!(ScriptLanguage::Js.main_file(), "main.js");
+    }
+
+    /// These strings are interpolated into CREATE TABLE.
+    #[test]
+    fn column_types_map_onto_sqlite_storage_classes() {
+        assert_eq!(ColumnType::Text.sqlite_type(), "TEXT");
+        assert_eq!(ColumnType::Integer.sqlite_type(), "INTEGER");
+        assert_eq!(ColumnType::Real.sqlite_type(), "REAL");
+        assert_eq!(ColumnType::Blob.sqlite_type(), "BLOB");
+        // json is stored as TEXT and validated on write.
+        assert_eq!(ColumnType::Json.sqlite_type(), "TEXT");
+        assert_eq!(serde_json::to_value(ColumnType::Json).unwrap(), "json");
+    }
+
+    #[test]
+    fn harnesses_and_methods_keep_their_wire_spellings() {
+        assert_eq!(Harness::Claude.as_str(), "claude");
+        assert_eq!(Harness::Codex.as_str(), "codex");
+        assert_eq!(Harness::Claude.to_string(), "claude");
+        assert_eq!(Harness::default(), Harness::Claude);
+        for (m, s) in [
+            (HttpMethod::Get, "GET"),
+            (HttpMethod::Post, "POST"),
+            (HttpMethod::Put, "PUT"),
+            (HttpMethod::Delete, "DELETE"),
+        ] {
+            assert_eq!(m.as_str(), s);
+        }
+    }
+
+    /// The article is used to build error sentences ("not an agent node").
+    #[test]
+    fn node_types_carry_the_article_that_reads_correctly() {
+        assert_eq!(NodeType::Agent.article(), "an");
+        assert_eq!(NodeType::Endpoint.article(), "an");
+        assert_eq!(NodeType::Table.article(), "a");
+        assert_eq!(NodeType::Vault.article(), "a");
+    }
+
+    /// `has_wire` is the check the engine runs on EVERY /v1/cli/* call, and
+    /// the default answer must be no.
+    #[test]
+    fn a_node_without_the_wire_is_denied_by_default() {
+        use crate::wire::{Wire, WireType};
+        let target = Uuid::from_u128(7);
+        let other = Uuid::from_u128(8);
+
+        let mut node = Node::new(
+            Uuid::nil(),
+            "worker".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        // No wires at all: nothing is permitted.
+        assert!(!node.has_wire(target, WireType::Read, NodeType::Ctx));
+
+        node.wires.push(Wire {
+            to: target,
+            wire_type: WireType::Write,
+        });
+        assert!(node.has_wire(target, WireType::Write, NodeType::Table));
+        // write implies read on a keyspace you can enumerate (§3: table and
+        // chest say so explicitly)...
+        assert!(node.has_wire(target, WireType::Read, NodeType::Table));
+        assert!(node.has_wire(target, WireType::Read, NodeType::Chest));
+        // ...but NOT on a ctx node: `wheel write <ctx>` replaces the markdown
+        // whole, so being able to write one is not being able to read it.
+        assert!(!node.has_wire(target, WireType::Read, NodeType::Ctx));
+        // ...and never for a node it was not granted on.
+        assert!(!node.has_wire(other, WireType::Read, NodeType::Table));
+        // A `send` wire is not a data wire, whatever the target.
+        assert!(!node.has_wire(target, WireType::Send, NodeType::Table));
+    }
+
+    #[test]
+    fn a_position_is_a_plain_pair_and_defaults_to_the_origin() {
+        let p = Position::new(1.5, -2.5);
+        assert_eq!(p.x, 1.5);
+        assert_eq!(p.y, -2.5);
+        assert_eq!(Position::default(), Position::new(0.0, 0.0));
+        assert_eq!(
+            serde_json::to_value(p).unwrap(),
+            serde_json::json!({"x": 1.5, "y": -2.5})
+        );
+    }
+
+    #[test]
+    fn an_mcp_node_reports_the_transport_it_is_configured_for() {
+        let stdio: McpConfig =
+            serde_json::from_str(r#"{"transport":"stdio","command":"srv"}"#).unwrap();
+        assert_eq!(stdio.transport(), McpTransport::Stdio);
+        let http: McpConfig =
+            serde_json::from_str(r#"{"transport":"http","url":"https://e.example"}"#).unwrap();
+        assert_eq!(http.transport(), McpTransport::Http);
+    }
+}

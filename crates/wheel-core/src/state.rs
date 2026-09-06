@@ -237,3 +237,245 @@ pub struct AuthBegin {
     /// Opaque handle tying `auth/complete` to this `auth/begin`.
     pub session: Uuid,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{AgentConfig, ChestConfig, Node, NodeConfig, Position};
+
+    fn node(config: NodeConfig) -> Node {
+        Node::new(
+            Uuid::nil(),
+            "n".parse().unwrap(),
+            Position::default(),
+            config,
+        )
+    }
+
+    /// Every spelling the UI switches on. `needs_auth` and `budget_exhausted`
+    /// are the two that snake_case actually changes, so they matter most.
+    #[test]
+    fn agent_statuses_keep_their_wire_spellings() {
+        for (s, want) in [
+            (AgentStatus::Stopped, "stopped"),
+            (AgentStatus::Starting, "starting"),
+            (AgentStatus::NeedsAuth, "needs_auth"),
+            (AgentStatus::Running, "running"),
+            (AgentStatus::Idle, "idle"),
+            (AgentStatus::Parked, "parked"),
+            (AgentStatus::BudgetExhausted, "budget_exhausted"),
+            (AgentStatus::Error, "error"),
+        ] {
+            assert_eq!(s.as_str(), want);
+            assert_eq!(s.to_string(), want);
+            // as_str() and serde must not drift apart: the engine writes one
+            // and the UI reads the other.
+            assert_eq!(serde_json::to_value(s).unwrap(), want);
+            assert_eq!(
+                serde_json::from_str::<AgentStatus>(&format!("\"{want}\"")).unwrap(),
+                s
+            );
+        }
+    }
+
+    /// `is_live` decides whether a message is written to stdin now or queued.
+    /// Getting `parked` wrong here would write to a process that isn't there.
+    #[test]
+    fn only_a_status_with_a_real_process_is_live() {
+        for live in [
+            AgentStatus::Starting,
+            AgentStatus::Running,
+            AgentStatus::Idle,
+        ] {
+            assert!(live.is_live(), "{live} should be live");
+        }
+        for dead in [
+            AgentStatus::Stopped,
+            AgentStatus::NeedsAuth,
+            AgentStatus::Parked,
+            AgentStatus::BudgetExhausted,
+            AgentStatus::Error,
+        ] {
+            assert!(!dead.is_live(), "{dead} has no child process");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_has_never_run_is_stopped_with_nothing_queued() {
+        let s = AgentState::default();
+        assert_eq!(s.status, AgentStatus::Stopped);
+        assert_eq!(s.queued_messages, 0);
+        assert!(s.session_id.is_none());
+        assert!(s.hosted_on.is_none(), "unhosted until something hosts it");
+        assert!(s.spend.is_none());
+    }
+
+    /// §3e: an agent nobody can run is a broken agent, and the UI has to be
+    /// able to say so. That requires `hosted_on: null` to survive the wire
+    /// rather than being dropped as an absent Option.
+    #[test]
+    fn an_unhosted_agent_reports_hosted_on_null_rather_than_omitting_it() {
+        let v = serde_json::to_value(AgentState::default()).unwrap();
+        assert!(
+            v.get("hosted_on").is_some(),
+            "unhosted must be visible: {v}"
+        );
+        assert!(v["hosted_on"].is_null());
+        assert_eq!(v["queued_messages"], 0);
+        // Fields that are genuinely absent stay absent.
+        assert!(v.get("session_id").is_none());
+        assert!(v.get("last_error").is_none());
+    }
+
+    /// The reason `Serialize` is hand-written: serde's `flatten` DROPS a None
+    /// field instead of writing null, so a ctx node would come back with no
+    /// `state` key and Web could not tell "no state" from "not loaded yet".
+    #[test]
+    fn a_node_without_state_still_carries_an_explicit_null_state() {
+        let nws = NodeWithState {
+            node: node(NodeConfig::Chest(ChestConfig {})),
+            state: None,
+        };
+        let v = serde_json::to_value(&nws).unwrap();
+        assert!(
+            v.as_object().unwrap().contains_key("state"),
+            "the state key must always be present: {v}"
+        );
+        assert!(v["state"].is_null());
+        // ...and the node's own fields are still flattened alongside it.
+        assert_eq!(v["type"], "chest");
+        assert_eq!(v["name"], "n");
+
+        let back: NodeWithState = serde_json::from_value(v).unwrap();
+        assert_eq!(back, nws);
+    }
+
+    #[test]
+    fn an_agents_state_is_tagged_and_round_trips() {
+        let nws = NodeWithState {
+            node: node(NodeConfig::Agent(AgentConfig::default())),
+            state: Some(NodeState::Agent(AgentState {
+                status: AgentStatus::Parked,
+                session_id: Some("sess-1".into()),
+                queued_messages: 2,
+                hosted_on: Some("cloud".into()),
+                ..Default::default()
+            })),
+        };
+        let v = serde_json::to_value(&nws).unwrap();
+        assert_eq!(v["state"]["kind"], "agent");
+        assert_eq!(v["state"]["status"], "parked");
+        assert_eq!(v["state"]["queued_messages"], 2);
+        assert_eq!(v["state"]["hosted_on"], "cloud");
+        assert_eq!(v["type"], "agent");
+
+        let back: NodeWithState = serde_json::from_value(v).unwrap();
+        assert_eq!(back, nws);
+    }
+
+    #[test]
+    fn credential_kinds_keep_their_wire_spellings() {
+        for (k, want) in [
+            (CredentialKind::ApiKey, "api_key"),
+            (CredentialKind::OauthToken, "oauth_token"),
+            (CredentialKind::OauthSession, "oauth_session"),
+            (CredentialKind::Env, "env"),
+        ] {
+            assert_eq!(k.as_str(), want);
+            assert_eq!(serde_json::to_value(k).unwrap(), want);
+        }
+    }
+
+    /// `mode` is a union including null, and the UI renders each arm. An
+    /// unauthenticated agent must serialize `mode: null`, not omit it.
+    #[test]
+    fn auth_status_reports_no_credential_as_an_explicit_null_mode() {
+        let none = AuthStatus {
+            authenticated: false,
+            mode: None,
+            source: None,
+            account: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert_eq!(v["authenticated"], false);
+        assert!(v.get("mode").is_some() && v["mode"].is_null(), "{v}");
+        assert!(v.get("source").is_none());
+        assert!(v.get("account").is_none());
+
+        // A vault-supplied credential names the vault, never the value.
+        let from_vault = AuthStatus {
+            authenticated: true,
+            mode: Some(CredentialKind::Env),
+            source: Some("anthropic-personal".into()),
+            account: None,
+        };
+        let v = serde_json::to_value(&from_vault).unwrap();
+        assert_eq!(v["mode"], "env");
+        assert_eq!(v["source"], "anthropic-personal");
+    }
+
+    /// These three names decide what counts as a credential, and therefore
+    /// which vault pairs are refused as ambiguous.
+    #[test]
+    fn the_credential_keys_are_exactly_the_three_the_harnesses_read() {
+        assert_eq!(
+            CREDENTIAL_KEYS,
+            [
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "CODEX_API_KEY"
+            ]
+        );
+        for k in CREDENTIAL_KEYS {
+            assert!(is_credential_key(k));
+        }
+        // Case-sensitive, and near-misses are ordinary secrets.
+        assert!(!is_credential_key("anthropic_api_key"));
+        assert!(!is_credential_key("OPENAI_API_KEY"));
+        assert!(!is_credential_key("ANTHROPIC_API_KEY_2"));
+        assert!(!is_credential_key(""));
+    }
+
+    /// The two auth shapes stay distinct: claude submits a code, codex polls.
+    #[test]
+    fn auth_begin_keeps_the_two_flows_apart() {
+        assert_eq!(
+            serde_json::to_value(AuthMode::PasteCode).unwrap(),
+            "paste_code"
+        );
+        assert_eq!(
+            serde_json::to_value(AuthMode::DeviceCode).unwrap(),
+            "device_code"
+        );
+        assert_eq!(serde_json::to_value(AuthMode::ApiKey).unwrap(), "api_key");
+
+        let begin = AuthBegin {
+            mode: AuthMode::PasteCode,
+            url: Some("https://claude.com/cai/oauth/authorize?x=1".into()),
+            user_code: None,
+            instructions: "Open the link".into(),
+            session: Uuid::nil(),
+        };
+        let v = serde_json::to_value(&begin).unwrap();
+        assert_eq!(v["mode"], "paste_code");
+        assert!(
+            v.get("user_code").is_none(),
+            "paste-code has no user_code to show: {v}"
+        );
+        assert_eq!(serde_json::from_value::<AuthBegin>(v).unwrap(), begin);
+    }
+
+    #[test]
+    fn spend_accumulates_from_zero() {
+        let s = Spend::default();
+        assert_eq!(s.turns, 0);
+        assert_eq!(s.usd, 0.0);
+        let v = serde_json::to_value(Spend {
+            turns: 3,
+            usd: 0.25,
+        })
+        .unwrap();
+        assert_eq!(v["turns"], 3);
+        assert_eq!(v["usd"], 0.25);
+    }
+}
