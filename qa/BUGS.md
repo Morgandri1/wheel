@@ -1412,7 +1412,22 @@ first five each made a failure quieter; this one makes a permanent wedge invisib
 Tests: `RESTART-inflight-message-survives`, `RESTART-wedged-agent-is-not-healthy`. Both fail
 today, so both land as PENDING and go red demanding promotion when SDK's fix lands.
 
-### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **open**)
+### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **STILL OPEN**)
+
+> **2026-09-07, first wake: the SUSPICION is refuted, the GAP is not.** The woken adversary
+> agent ran 8 turns and `agent_state.turns` went 0 → 8 with `usd $1.66`. Accounting works;
+> `turns=0` was "nothing to populate", exactly as SDK suspected but could not settle. That is
+> good news and it closes the *question*.
+>
+> **It does not close this entry, and there is nothing to promote.** What I filed was the
+> absence of a TEST, and I never wrote one — `SPEND-completed-turn-increments-turns` is
+> registered in TESTPLAN and asserted by no suite. A one-off observation in production is
+> evidence that the behaviour worked once, on one board, under a human watching. It is not a
+> gate: if accounting regresses tomorrow, nothing goes red.
+>
+> The wake did make it cheaper to write. It supplies the expected shape (turns increments per
+> completed turn, usd accrues, no "could not record spend"), and SDK's caution stands —
+> assert on a turn the test CAUSES, never on rows that already exist.
 
 Raised by SDK. Every agent on the cloud board reads `turns=0` while the cloud QA agent's Claude
 transcript is 2011 lines with 754 assistant messages and 366 tool calls from Sep 6, and no
@@ -1463,3 +1478,31 @@ honest. SDK's answer is that there is already a seam and no race to lose:
 
 SDK has offered a purpose-built test-only seam in the engine if the stub-on-PATH proves
 awkward. Take them up on it rather than fighting the supervisor.
+
+### 039 — the public-API drive path is unverified (S2, API, **verification owed**, operator-gated)
+
+Not a defect — a claim nobody has tested. Filed so "proven" and "untested" stay separate in
+the record rather than in a message that truncates.
+
+The first wake proved the full clone→edit→commit→push loop on the cloud board. PM drove it
+**via the host proxy**, which bypasses the public API, so the auth boundary we actually ship
+was not exercised once.
+
+**Already covered, and it is not this:** `API-auth-*` asserts the boundary's LOGIC thoroughly
+— owner-check ordering, 404-not-403 indistinguishability across five verbs, `alg=none`,
+expired/nbf/issuer/garbage tokens — against a LOCAL compose API. `deploy_healthcheck.py`
+reaches the deployed API but only asks `/healthz`.
+
+**The gap:** that boundary in front of the deployed Railway API, with a real owner session
+token, proxying to a real engine. Correct logic and a working deployed path are different
+claims. §5's ordering (verify JWT → load project → assert `owner_id == jwt.sub` → act) can be
+right in the source and wrong in the deployment — a misconfigured env, a proxy that strips a
+header, a route that never reaches the host.
+
+**Acceptance (PM):** drive node/wire/agent operations against
+`https://wheel-api-production.up.railway.app` with an owner session token — the operator's, or
+a throwaway project's owner — and confirm owner check, project scoping and engine proxy all
+pass end to end. `API-public-drive-end-to-end`.
+
+**Operator-gated**, the same way the wake was: it needs a token nobody here holds. That is why
+it is filed rather than done.

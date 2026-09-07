@@ -849,6 +849,18 @@ Deliberately NOT asserted: that the status never touches `starting`. Restarting 
 
 **Sequencing (ARCHITECTURE.md):** this gate is RED today, because the drift is real and Web is regenerating. It therefore lands WITH that regeneration, not before it — a deliberately-red gate merged ahead of its fix is what froze four lanes on 2026-09-06.
 
+### API-public-drive-end-to-end — the auth boundary we SHIP, not the one we compose
+
+The first wake (2026-09-07) proved the clone→edit→commit→push loop on the cloud board, and PM flagged honestly that it was driven **via the host proxy** — which bypasses the public API entirely. So the loop is proven and the drive path is not, and those are easy to conflate a week later when someone remembers "the wake passed".
+
+**What is already covered, and it is not this:** `API-auth-*` asserts the boundary's LOGIC thoroughly — owner check ordering, 404-not-403 indistinguishability across GET/PATCH/DELETE/start/stop, alg=none, expired/nbf/issuer/garbage tokens. All of it against a LOCAL compose API. `deploy_healthcheck.py` reaches the deployed API but only asks `/healthz`.
+
+**What nothing covers:** that same boundary in front of the *deployed* Railway API, with a real owner session token, proxying to a real engine. Correct logic and a working deployed path are different claims; §5's ordering (verify JWT → load project → assert owner → act) can be right in the code and wrong in the deployment.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `API-public-drive-end-to-end` | Node/wire/agent operations against `https://wheel-api-production.up.railway.app` with an OWNER session token succeed, and the owner check, project scoping and engine proxy all hold end to end. Operator-gated (needs a token), owner API. | **S2** |
+
 ### RESTART-* and SPEND-* — gaps SDK found in engine behaviour (2026-09-07)
 
 Raised by SDK from `docs/proposals/restart-robustness-current-behaviour.md` (96f9f08). Fixes are theirs and sequenced after the first wake; the tests are written to **PENDING** so they document the defect without freezing main, and go RED demanding promotion the moment each fix lands.
@@ -859,6 +871,21 @@ Raised by SDK from `docs/proposals/restart-robustness-current-behaviour.md` (96f
 | `RESTART-wedged-agent-is-not-healthy` | `/healthz` must NOT report ok while an agent is wedged on such a message. The stall detector excludes `delivered` rows, so today it reports HEALTHY. **This is `HEALTH-implies-*` exactly** — a capability that has stopped, denied by the health signal — and it is the sixth instance of that class. | **S1** |
 | `SPEND-completed-turn-increments-turns` | A turn the TEST CAUSES increments `agent_state.turns`. **Must not read existing rows**: SDK's caution, and it is right — the cloud QA agent's transcript is 2011 lines with 754 assistant messages while every agent reads `turns=0`, so a test that merely observes `turns=0` would pass for the wrong reason today and keep passing after a fix. Cause the turn, then assert the delta. | **S2** |
 | `CLI-chest-arms-answer-honestly` | The CLI plane's chest arms (`ad5c1c5` fixed `ls` to answer honestly). Ties to the success-shape invariant: an unimplemented arm must not answer with a success shape. | S3 |
+
+### The STALE-REFERENT family — the thing you depend on may not be the thing you looked at
+
+Named so the fourth instance is recognised as one rather than solved from scratch. Every member has the same shape: **a name is resolved at one time and depended on at another, and nothing checks that the two agree.** None of the checks is clever; each exists because the cheap assumption is wrong often enough to cost a day.
+
+| instance | the name | resolved when | depended on when | the check |
+|---|---|---|---|---|
+| mutable image tag | `wheel-engine:test` | at `docker run` | throughout a suite | `pin_image` — resolve to an immutable sha |
+| image vs code | the image | at build | when a suite reports on "the engine" | `image_freshness` — refuse if it predates the code |
+| run vs branch | `main` | when CI started | when someone acts on "main is green" | `green_describes_head` — compare `headSha` to `origin/main` |
+| **(unbuilt)** CI step vs branch | a script path | when the step is written | when the step runs on main | *assertion not yet specified* |
+
+**Why the fourth is not built.** The narrow version — "a CI step that invokes a path asserts the path exists on the branch it will run on" — is cheap and obviously right for the case that produced it. What is *not* clear is what it should assert in general: a step may invoke a path that is created earlier in the same job, or an action rather than a file, or a command resolved from `PATH`. A check that cannot state precisely what it asserts becomes another green-about-nothing, which is the thing this whole family exists to prevent. Build it when the assertion is clear, not before.
+
+**How each was actually found**, because none was found by looking for it: a suite reported a fix unfixed against an image another agent had replaced; a green run turned out to describe a commit `main` had left, four times in one day; and a CI step's missing script was noticed while checking that file's executable bit for an unrelated reason. The family is worth naming precisely because *adjacency to some other question* is not a discovery process anyone can rely on.
 
 ### HEALTH-implies-* — /healthz answering 200 must mean something
 
