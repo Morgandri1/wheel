@@ -231,7 +231,44 @@ pub fn get_by_name(conn: &Connection, name: &str) -> Result<Option<Node>> {
 /// Every node on the board, each with its outgoing wires attached.
 pub fn list(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare("SELECT * FROM nodes ORDER BY name")?;
-    let mut nodes: Vec<Node> = stmt.query_map([], row_to_node)?.collect::<Result<_, _>>()?;
+    // Per row, not whole (BUG-031). `collect::<Result<_, _>>()` gave up the
+    // entire board on the first row it could not read, so a single node whose
+    // `id` is not a uuid turned `GET /v1/board` into a 500 and made every OTHER
+    // node unreachable — the operator loses the board, and the board is the
+    // thing that would have shown them which node was wrong.
+    //
+    // Skipping the unreadable row is not a silent loss: it is logged with the
+    // id as stored, which is the only handle anyone has for repairing it. One
+    // node missing and named beats every node missing and unexplained.
+    let mut unreadable = 0usize;
+    let mut nodes: Vec<Node> = Vec::new();
+    for row in stmt.query_map([], |r| {
+        let id: String = r.get("id").unwrap_or_default();
+        Ok((id, row_to_node(r)))
+    })? {
+        let Ok((stored_id, parsed)) = row else {
+            unreadable += 1;
+            continue;
+        };
+        match parsed {
+            Ok(n) => nodes.push(n),
+            Err(e) => {
+                unreadable += 1;
+                tracing::error!(
+                    stored_id = %stored_id,
+                    error = %e,
+                    "this node row cannot be read and is being left off the board; every other \
+                     node is still served"
+                );
+            }
+        }
+    }
+    if unreadable > 0 {
+        tracing::error!(
+            unreadable,
+            "the board is being served WITHOUT rows that could not be read"
+        );
+    }
     for n in &mut nodes {
         n.wires = wires_from(conn, n.id)?;
     }
@@ -487,6 +524,36 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// BUG-031: one unparseable node id turned `GET /v1/board` into a 500.
+    ///
+    /// The follow-on to the boot fix, and quieter than the bug it replaced
+    /// rather than smaller: the engine now BOOTS and /healthz answers 200, so
+    /// the system looks healthy while the operator's board is a 500. Before,
+    /// the engine refused to start — impossible to mistake for health.
+    ///
+    /// The board is also the thing that would have told them WHICH node was
+    /// wrong, so failing whole removes the evidence along with the board.
+    #[test]
+    fn one_unreadable_row_does_not_take_the_whole_board_with_it() {
+        let conn = mem();
+        create(&conn, &ctx("before")).unwrap();
+        create(&conn, &ctx("after")).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, name, type, config, x, y, created_at, updated_at)
+             VALUES ('not-a-uuid', 'middle', 'ctx', '{\"markdown\":\"\"}', 0, 0, '', '')",
+            [],
+        )
+        .unwrap();
+
+        let nodes = list(&conn).expect("one bad row must not fail the whole board read");
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["after", "before"],
+            "every readable node must still be served; only the unreadable row is left out"
+        );
+    }
+
     /// PM's reviewers flagged this and it is the dangerous half of the i16
     /// change: a row already outside +/-32767 must CLAMP on the way out, not
     /// fail to load.
