@@ -42,3 +42,11 @@ personal, single-user, own-token setup — that is the lowest-risk end of the gr
 non-commercial single-user use; does NOT block the cloud-board work. The flag RE-ARMS if Wheel ever becomes
 commercial or stores other users' tokens — at that point the API auth-model recommendation applies and must be
 verified with Anthropic before shipping.
+
+## FINAL (operator, 2026-09-07): risk consciously accepted, proceed on OAuth for the dogfood
+Operator: "if my personal account gets banned it's not the end of the world, i'll make another." This is an
+informed acceptance of the residual risk INCLUDING the account-ban consequence, for the non-commercial
+single-user dogfood. Decision: PROCEED with the subscription-OAuth auth model for the personal dogfood; PM
+stops flagging it. The API-auth recommendation and the re-arm condition (commercial / multi-user / storing
+others' tokens) still stand for any future productization — this acceptance is scoped to the operator's own
+account and own use.
