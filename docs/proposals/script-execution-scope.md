@@ -118,3 +118,41 @@ worth re-checking against this scope specifically.
 unimplemented error, so a chest reads as a real empty chest. Read/write/rm on the same node type all return an
 honest 400 "not implemented yet" (`cli_routes.rs:256,393,441`). The `ls` arm is inconsistent with its three
 siblings and is the kind of thing that costs someone an afternoon. One line.
+
+## Acceptance conditions — gates before script execution is turned ON
+
+PM's ruling (2026-09-07, recorded in `first-wake-runbook.md`): per-node isolation is a **precondition of this
+work, not later hardening**. Accepted, and it is the right reading — the danger is not either half alone but the
+combination. An agent that can run arbitrary code on a board where it can present as `pm` can drive all six
+agents. Script execution is exactly what supplies the first half.
+
+These are gates on *enabling* execution, not on writing the runtime. The runtime can be built and tested behind
+them.
+
+1. **Per-node isolation (037 / F007).** No script execution on a board where one node can present as another.
+2. **ADVERSARY egress PoC.** A script is the first place user-authored code runs on our host, and the SSRF
+   policy (`validate.rs` `host_is_denied`) governs `tool`/`mcp` URLs only — it constrains a Python script not at
+   all. Confirmed reachable from the host container today: `postgres.railway.internal:5432` and
+   `wheel-api.railway.internal:8080` both accept TCP, because `wheel-host` is deployed in the same Railway
+   project as Postgres rather than its own (§5b / F003).
+3. **Concurrency cap** on running scripts, with the per-host running-agent cap as precedent.
+4. **Shared store**: reuse the A9/A8 materialisation, not a second mechanism.
+5. **QA ≥90%** per crate.
+6. **`wheel-engine/src/mcp.rs:309` flipped in the same commit** that adds the `run` tool — it currently asserts
+   `run` is absent, and correctly so.
+
+### A precision on 037/038 that changes which work closes it
+
+The runbook and the finding both describe the token as "SHARED across all agents". The consequence stated there
+is exactly right, but the mechanism is not quite that, and the difference decides what fixing it means.
+
+Tokens are **already per-node and distinct**: `db/tokens.rs:33` mints 32 fresh random bytes per node id, stores
+only the sha256, and rotates on every start. There is no shared token.
+
+What is shared is the **uid**. All six agents run as 21088, so each node's own 0600 token *file* under
+`run/<node>/token` is readable by every other node. Distinct secrets, cross-readable storage.
+
+This matters because "the token is shared" invites the fix "give each node its own token" — which is already
+done, and would close nothing. The gate is satisfied only by isolating the *storage*: a uid per node (§2, the
+`base+1+n` design) so the files stop being cross-readable, or moving the token out of the shared-readable
+filesystem entirely. I would rather we spend that work once, on the mechanism that actually holds.
