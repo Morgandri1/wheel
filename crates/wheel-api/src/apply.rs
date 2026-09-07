@@ -908,6 +908,78 @@ mod tests {
         assert_eq!(plan.create_wires.len(), 1);
     }
 
+    /// ADVERSARY's ask: a divergence between this layer's pre-validation and the matrix the ENGINE
+    /// enforces should be a red build, not a runtime surprise.
+    ///
+    /// Exhaustive over every (from-type, to-type, wire-type) triple — 9 x 9 x 3 = 243 — asserting
+    /// that this module's verdict is exactly `check_wire`'s. Both read wheel-core today, so they
+    /// cannot disagree; this test is what makes that a FACT rather than a habit. The day someone
+    /// special-cases a pair here, or stops calling wheel-core, this goes red naming the triple.
+    ///
+    /// It pins the direction that matters: the engine is the authority, and this layer exists only
+    /// to refuse early. Accepting something the engine would refuse is the failure; refusing
+    /// something it would accept is also caught, because the two verdicts must be equal.
+    #[test]
+    fn this_layer_agrees_with_the_engines_matrix_on_every_possible_wire() {
+        fn config_for(t: NodeType) -> serde_json::Value {
+            match t {
+                NodeType::Agent => {
+                    serde_json::json!({"harness": "claude", "system_prompt": "s"})
+                }
+                NodeType::Ctx => serde_json::json!({"markdown": "m"}),
+                NodeType::Table => serde_json::json!({"columns": []}),
+                NodeType::Endpoint => {
+                    serde_json::json!({"method": "GET", "path": "/p",
+                                       "response_mode": "ack", "auth": {"mode": "none"}})
+                }
+                NodeType::Script => serde_json::json!({"language": "python", "source": "x"}),
+                NodeType::Mcp => serde_json::json!({"transport": "stdio", "command": "c"}),
+                NodeType::Vault => serde_json::json!({"keys": []}),
+                NodeType::Chest => serde_json::json!({}),
+                NodeType::Tool => serde_json::json!({
+                    "kind": "http",
+                    "source": {"format": "manual", "raw": "{}", "imported_at": "2026-01-01T00:00:00Z"},
+                    "base_url": "https://example.test", "operations": []
+                }),
+            }
+        }
+
+        let mut checked = 0usize;
+        for from in NodeType::ALL {
+            for to in NodeType::ALL {
+                for wire_type in [WireType::Read, WireType::Write, WireType::Send] {
+                    let b = board(serde_json::json!({
+                        "nodes": [
+                            {"name": "src", "type": from.as_str(), "config": config_for(from)},
+                            {"name": "dst", "type": to.as_str(), "config": config_for(to)},
+                        ],
+                        "wires": [{"from": "src", "to": "dst", "type": wire_type}],
+                    }));
+
+                    let mine =
+                        validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).is_ok();
+                    // The engine's own gate. Distinct ids, so SelfWire is never the reason.
+                    let engine =
+                        wheel_core::check_wire(Uuid::new_v4(), from, Uuid::new_v4(), to, wire_type)
+                            .is_ok();
+
+                    assert_eq!(
+                        mine,
+                        engine,
+                        "divergence on {} -> {} ({}): this layer says {}, the engine says {}",
+                        from.as_str(),
+                        to.as_str(),
+                        wire_type.as_str(),
+                        if mine { "allow" } else { "refuse" },
+                        if engine { "allow" } else { "refuse" },
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 9 * 9 * 3, "the matrix stopped being exhaustive");
+    }
+
     #[test]
     fn a_legal_board_plans_every_node_and_wire() {
         let b = board(serde_json::json!({
