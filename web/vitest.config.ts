@@ -35,6 +35,7 @@ export default defineConfig({
         "src/lib/password.ts",
         "src/components/board/sidebar-rail.tsx",
         "src/lib/endpoint-probe.ts",
+        "src/lib/workflow-proposal.ts",
         "src/lib/wired-vaults.ts",
         "src/lib/endpoint-reach.ts",
       ],
