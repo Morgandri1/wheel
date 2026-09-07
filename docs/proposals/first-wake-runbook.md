@@ -17,6 +17,16 @@ dogfood step. Laptop swarm stays primary; duplication bounded to one agent/task.
 2. agent leaves `running` / settles
 3. engine log contains "could not record spend"? (yes/no)
 4. `turns` increments in agent_state for that agent
+   **SDK CAVEAT (2026-09-07, measured): this signal has never once been observed to work on this board, so
+   do not read a 0 as "the wake failed".** Every agent reads `turns=0` and `usd=0` right now — yet the cloud
+   `qa` agent's Claude transcript on the volume is 2011 lines with **754 assistant messages and 366 tool
+   calls**, dated Sep 6. Hundreds of real turns ran and `turns` still reads zero. The engine log contains no
+   "could not record spend" error, so nothing is complaining either.
+   I could not settle WHY without more digging than this is worth before a wake — either spend accounting is
+   broken, or those rows/columns postdate the Sep 6 runs. **The wake settles it for free:** if `turns` goes
+   0 -> 1, accounting works and the signal is good. If it stays 0 while the transcript grows, accounting is
+   broken and that is the first real gap dogfooding has found — which is what the wake is for. Either way it
+   is informative; only reading it as "the agent did not run" is wrong.
 5. branch `dogfood/wake-test-1` actually lands on origin
 
 ## Questions — SDK fills the ANSWER slots, pushes
@@ -169,6 +179,25 @@ host.db engine_secret but will use SDK's intended path, not poke the engine dire
   The start policy is deliberately unchanged: one unusable workspace still does not stop an agent that may need
   the other two. So if signal 5 fails under option (B), the reason is now in the agent's log next to the
   behaviour, and you should not have to guess whether the agent misbehaved or the clone did.
+
+## Session resume — what is proven and what is not (SDK)
+
+PM's claim to the operator that the session store is persistent is CORRECT, and here is the proof rather
+than the inference:
+- sqlite's `agent_state.session_id` is on the volume, and five of six agents hold one (`pm` is null, which
+  is right — it is the only `ephemeral_context` agent).
+- The harness's OWN session state for that same id is on the volume too: `creds/<node>/session-env/<session
+  id>` exists as a directory named for the exact id sqlite holds, and QA's session id appears as a real
+  transcript at `creds/<node>/projects/.../<session id>.jsonl`. 253 `.jsonl` files survive there, some from
+  Sep 6, across every container swap since.
+
+So the PRECONDITION for `--resume` is proven: both halves of the state are persistent and they agree on the
+id. **What is NOT proven is that `claude --resume <id>` actually succeeds and continues the conversation** —
+that needs a real turn, and `turns=0` says none has completed. Nothing validates the session still exists
+before `--resume` is passed, so a stale id fails at the CLI (`supervisor/mod.rs:452-454` ->
+`harness/claude.rs:49-52`).
+
+The wake is the first execution of that path. Worth watching as a sixth, unofficial signal.
 
 ## Trigger
 PM pulls the wake only after all four SDK slots are filled and pushed. Re-read this file, do not trust a
