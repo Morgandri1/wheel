@@ -1151,3 +1151,34 @@ drops every message while pm is warm, `/healthz` at 200 throughout.
    a run; it does nothing across runs**, and comparing two runs of a suite silently
    compares two engines. Any claim that rests on "it passed this time" must name the image
    sha, not the tag.
+
+---
+
+### 029 — an out-of-range position clamps SILENTLY on migration (S2, SDK, **open**)
+
+`POS-migration-clamp-is-reported`. A stored position outside ±32767 is clamped to the bound
+on read (`cff5fa4`), which is correct — but nothing says so. Measured: a node at
+`(99999, -99999)` lands on `(32767, -32768)`, a move of 67,232 cells = **121,018 px** at the
+board's max zoom of 1.8. The node teleports across the screen and the boot log's only line
+is `snapped stored positions to whole cells`.
+
+Rounding cannot move a node visibly (0.5 cells/axis = 1.27 px worst case). Clamping is the
+only unbounded case, so it is the only one an operator can see, and it is the one that
+happens without a word. The fix is a log line naming the node and both positions.
+
+### 030 — the engine will not BOOT if any node id is not a UUID (S1, SDK, fix reported, gate red pending image)
+
+`POS-migration-boots-past-unparseable-id`. `board::list` parses every row's id and fails
+whole on the first unparseable one, so a single bad row takes down the entire board — and
+the board is what would tell you which row is bad. A partial restore, a hand-edited row, or
+an older schema all produce it.
+
+Found by accident. My migration fixture seeded readable ids (`mig-0000`) and the engine
+refused to boot. I initially "fixed" my fixture to use UUIDs, which would have thrown the
+finding away; SDK caught that and asked for the awkward id to stay, because the unrealistic
+id is what made the intolerance visible. Both are now in the suite: UUIDs for the migration
+arithmetic, one non-UUID row as its own regression case.
+
+SDK reports `ensure_tables` now reads only the names and configs it needs and skips what it
+cannot parse, loudly. Still red against `bb20275`, which predates that fix — re-verify on
+the next image.

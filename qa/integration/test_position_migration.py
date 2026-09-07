@@ -141,25 +141,42 @@ def in_db(script):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+# Ids are real UUIDs. The engine parses `nodes.id` as a Uuid on load, so a readable
+# fixture id like "mig-0000" makes the engine refuse to boot with
+# `Conversion error from type Text at index: 0, invalid character: found 'm'` -- which
+# looks exactly like "the migration cannot read its own data" and is entirely the test's
+# own doing. Caught on the first real run; the migration had in fact worked.
 SEED = r'''
 import sqlite3, json, datetime
 rows = json.loads(%r)
 db = sqlite3.connect("/data/wheel.db")
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-for i, (x, y, _c, _w) in enumerate(rows):
+for nid, name, x, y in rows:
     db.execute("INSERT INTO nodes (id,name,type,config,x,y,created_at,updated_at) "
                "VALUES (?,?,?,?,?,?,?,?)",
-               ("mig-%%04d" %% i, "mig-node-%%04d" %% i, "ctx",
+               (nid, name, "ctx",
                 json.dumps({"markdown": "seeded by POS-migration"}), x, y, now, now))
 db.commit()
 print("seeded", len(rows))
+'''
+
+BAD_ID_SEED = r'''
+import sqlite3, json, datetime
+db = sqlite3.connect("/data/wheel.db")
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+db.execute("INSERT INTO nodes (id,name,type,config,x,y,created_at,updated_at) "
+           "VALUES (?,?,?,?,?,?,?,?)",
+           ("mig-0000-not-a-uuid", "mig-legacy-row", "ctx",
+            json.dumps({"markdown": "id is not a uuid"}), 5.5, 5.5, now, now))
+db.commit()
+print("seeded 1")
 '''
 
 READ = r'''
 import sqlite3, json
 db = sqlite3.connect("/data/wheel.db")
 out = {}
-for nid, x, y in db.execute("SELECT id,x,y FROM nodes WHERE id LIKE 'mig-%'"):
+for nid, x, y in db.execute("SELECT id,x,y FROM nodes WHERE name LIKE 'mig-node-%'"):
     out[nid] = [x, y, type(x).__name__, type(y).__name__]
 print(json.dumps(out))
 '''
@@ -187,6 +204,9 @@ def main():
     VAULT_KEY = sh("openssl", "rand", "-base64", "32").stdout.strip()
     print("image: %s -> %s" % (IMAGE_TAG, (IMAGE or "?")[:19]))
 
+    global IDS
+    IDS = [str(uuid.uuid4()) for _ in ROWS]
+
     try:
         # 1. A board that exists, so the schema is real rather than hand-built.
         if not R.control("POS-migration/engine-up", run_engine(),
@@ -196,7 +216,9 @@ def main():
         stop_engine()
 
         # 2. Rows exactly as a pre-#22 engine left them: floats, straight into sqlite.
-        rc, out = in_db(SEED % json.dumps(ROWS))
+        seed_rows = [[IDS[i], "mig-node-%04d" % i, x, y]
+                     for i, (x, y, _c, _w) in enumerate(ROWS)]
+        rc, out = in_db(SEED % json.dumps(seed_rows))
         if not R.control("POS-migration/rows-seeded", rc == 0 and "seeded" in out,
                          "could not write float rows into the database, so the migration "
                          "has nothing to act on: %s" % out.strip()[-300:]):
@@ -218,13 +240,20 @@ def main():
         by_id = {n["id"]: n for n in (board or {}).get("nodes", [])}
 
         # 4. THE CONTROL. Everything after this is vacuous while positions are floats.
-        ints = [v for v in stored.values() if v[2] == "int" and v[3] == "int"]
-        integer_typed = bool(stored) and len(ints) == len(stored)
-        R.control("POS-migration/is-integer", integer_typed,
-                  "positions are still REAL on disk, so #22 has not landed and the "
-                  "migration has not run. The checks below would all pass by doing "
-                  "nothing, so they are SKIPPED rather than reported green. "
-                  "Types seen: %s" % sorted({tuple(v[2:]) for v in stored.values()}))
+        # WHOLE VALUES, not integer STORAGE. sqlite keeps the column's REAL affinity and
+        # the migration snaps the values inside it, so a correctly migrated 341 reads back
+        # from python as 341.0 -- type `float`. Asserting the python type failed here
+        # against an engine that had done exactly the right thing, and the boot log said so
+        # in the same run: "snapped stored positions to whole cells, nodes: 6". The Rust
+        # type is i16 either way; what the migration owes us is that no fraction survives.
+        def whole(v):
+            return isinstance(v, (int, float)) and float(v).is_integer()
+        all_whole = bool(stored) and all(whole(v[0]) and whole(v[1])
+                                         for v in stored.values())
+        R.control("POS-migration/is-integer", all_whole,
+                  "stored positions still carry fractions, so the migration has not run "
+                  "and every check below would pass by doing nothing. Values seen: %s"
+                  % sorted({(v[0], v[1]) for v in stored.values()})[:6])
 
         # 5. No row may vanish. A rebuild that drops rows is the worst outcome and the
         #    easiest to miss, because a board with 19 of 20 nodes still looks like a board.
@@ -237,9 +266,9 @@ def main():
         # 6. Rounding, not truncation. The 120.6 and -120.6 rows are the ones that tell
         #    these two apart; the rest agree under either rule.
         for i, (x, y, want_clamp, why) in enumerate(ROWS):
-            nid = "mig-%04d" % i
+            nid = IDS[i]
             got = stored.get(nid)
-            tag = "%s/%g,%g" % (nid, x, y)
+            tag = "mig-node-%04d/%g,%g" % (i, x, y)
             if not got:
                 R.gated("POS-migration-loses-no-node", "POS-migration/is-integer", False,
                         "row %s (%s) is gone after migration" % (tag, why))
@@ -294,6 +323,34 @@ def main():
                 "a second boot changed the positions again. A migration that runs on every "
                 "start drifts a board one cell per restart. First boot: %s. Second: %s"
                 % (json.dumps(stored)[:300], json.dumps(second)[:300]))
+
+        # A ROW WHOSE ID IS NOT A UUID. This started as a mistake in my fixture -- I seeded
+        # ids like `mig-0000` for readability -- and it stopped the engine booting at all:
+        # board::list parsed every row's id and failed WHOLE on the first unparseable one.
+        # SDK fixed the intolerance and asked me NOT to quietly switch to uuids, because
+        # the unrealistic id is what made it visible, and a partial restore or a hand-edited
+        # row would produce exactly this shape without a test around it. So the uuids stay
+        # for the arithmetic above, and the awkward id comes back here as its own case.
+        stop_engine()
+        rc, out = in_db(BAD_ID_SEED)
+        if R.control("POS-migration/bad-id-seeded", rc == 0 and "seeded" in out,
+                     "could not write a row with an unparseable id: %s"
+                     % out.strip()[-200:]):
+            booted_bad = run_engine()
+            log2 = boot_log()
+            R.check("POS-migration-boots-past-unparseable-id", booted_bad,
+                    "the engine refuses to BOOT because one row's id is not a uuid. One "
+                    "bad row takes the whole board down, and the board is the thing that "
+                    "tells you which row is bad. A partial restore, a hand-edited row or "
+                    "an older schema all produce this. Boot log tail:\n%s" % log2[-800:])
+            st2, board2 = http("GET", "/v1/board")
+            names = {n.get("name") for n in ((board2 or {}).get("nodes") or [])}
+            R.gated("POS-migration-bad-id-does-not-hide-good-nodes",
+                    "POS-migration-boots-past-unparseable-id",
+                    st2 == 200 and any(n and n.startswith("mig-node-") for n in names),
+                    "the engine booted but /v1/board no longer lists the well-formed "
+                    "nodes (%s). Skipping the unreadable row must not skip its neighbours."
+                    % sorted(names)[:8])
 
         return R.report("position-migration")
     finally:

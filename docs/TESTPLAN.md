@@ -807,6 +807,8 @@ be seconds.
 | `POS-migration-no-visible-jump` | Rounding moves a node ≤0.5 cells/axis. One cell renders as one CSS px and the board caps zoom at 1.8 (`canvas.tsx`), so the worst a human can be shown is 1.27 px. Asserted rather than assumed, because it is the claim PM is relying on. | S3 |
 | `POS-migration-clamp-is-reported` | The ONLY unbounded case: a row already outside ±32767 lands on the bound from wherever it was, which is a node teleporting across the screen. Clamping is correct; doing it silently is not. | **S2** |
 | `POS-migration-is-idempotent` | A migration that re-applies its transform on every boot walks the board one cell per restart — invisible until it isn't. | **S2** |
+| `POS-migration-boots-past-unparseable-id` | A row whose `id` is not a UUID must not stop the engine BOOTING. `board::list` parsed every row and failed whole on the first bad one, so one unreadable row took the entire board down — and the board is the thing that would tell you which row is bad. A partial restore, a hand-edited row or an older schema all produce this. Found by accident: a readable fixture id (`mig-0000`) refused to boot the engine, and SDK asked that the awkward id stay rather than be quietly swapped for a UUID. | **S1** |
+| `POS-migration-bad-id-does-not-hide-good-nodes` | Skipping an unreadable row must not skip its neighbours — `/v1/board` still lists the well-formed nodes. | **S2** |
 
 ### API-postgres-arm-is-still-built
 
