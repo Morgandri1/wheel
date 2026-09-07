@@ -108,6 +108,23 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// the only writer binds an `i16` -- so the column's width buys nothing worth
 /// that risk.
 fn snap_positions_to_cells(conn: &Connection) -> Result<()> {
+    // Name the ones that CLAMP, before changing them (BUG-029).
+    //
+    // Rounding cannot move a node anywhere an operator can see: half a cell per
+    // axis is 1.27 px at the board's maximum zoom. Clamping is the only
+    // unbounded case — a node stored at (99999, -99999) lands on the bound,
+    // which is a move of 67,232 cells, about 121,000 px. It teleports across
+    // the screen, and the only line in the log used to be a count.
+    for c in positions_that_will_clamp(conn)? {
+        tracing::warn!(
+            node = %c.name,
+            from_x = c.from_x, from_y = c.from_y, to_x = c.to_x, to_y = c.to_y,
+            moved_cells = c.moved_cells(),
+            "position was outside the board's bounds and has been clamped; this node MOVED, \
+             and it is the only migration case an operator can see"
+        );
+    }
+
     let snapped = conn
         .execute(
             "UPDATE nodes
@@ -122,6 +139,54 @@ fn snap_positions_to_cells(conn: &Connection) -> Result<()> {
         tracing::info!(nodes = snapped, "snapped stored positions to whole cells");
     }
     Ok(())
+}
+
+/// A node whose stored position is outside the board's bounds, and where it
+/// will land.
+///
+/// Separated from the logging so the thing worth asserting — WHICH nodes, and
+/// from where to where — is a value a test can hold, rather than a line a test
+/// has to scrape out of a subscriber.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ClampReport {
+    pub name: String,
+    pub from_x: f64,
+    pub from_y: f64,
+    pub to_x: i64,
+    pub to_y: i64,
+}
+
+impl ClampReport {
+    /// The larger of the two axis moves, in cells — what an operator sees.
+    pub fn moved_cells(&self) -> f64 {
+        (self.from_x - self.to_x as f64)
+            .abs()
+            .max((self.from_y - self.to_y as f64).abs())
+    }
+}
+
+/// Read BEFORE the update: afterwards the old position is gone, and a report
+/// could only name the destination — which is the half an operator can already
+/// see on the board.
+pub(crate) fn positions_that_will_clamp(conn: &Connection) -> Result<Vec<ClampReport>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, x, y FROM nodes
+          WHERE round(x) < -32768 OR round(x) > 32767
+             OR round(y) < -32768 OR round(y) > 32767
+          ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let x: f64 = r.get("x")?;
+        let y: f64 = r.get("y")?;
+        Ok(ClampReport {
+            name: r.get("name")?,
+            from_x: x,
+            from_y: y,
+            to_x: x.round().clamp(-32768.0, 32767.0) as i64,
+            to_y: y.round().clamp(-32768.0, 32767.0) as i64,
+        })
+    })?;
+    Ok(rows.flatten().collect())
 }
 
 /// Add a column that may already be there.
@@ -140,6 +205,54 @@ fn add_column(conn: &Connection, table: &str, decl: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-029: clamping is the ONLY migration case an operator can see, and it
+    /// happened without a word.
+    ///
+    /// Rounding moves a node at most half a cell per axis — 1.27 px at the
+    /// board's max zoom of 1.8, which nobody notices and which therefore needs
+    /// no report. A stored (99999, -99999) lands on the bound: 67,232 cells,
+    /// about 121,000 px. The node teleports across the screen and the boot log
+    /// said only "snapped stored positions to whole cells".
+    ///
+    /// Asserted on the reported VALUE rather than on the log line, so what is
+    /// pinned is which nodes are named and where they came from — the part a
+    /// operator needs — instead of the formatting.
+    #[test]
+    fn a_migration_names_every_node_it_moves_visibly_and_no_others() {
+        let conn = open_memory().unwrap();
+        let place = |name: &str, x: f64, y: f64| {
+            conn.execute(
+                "INSERT INTO nodes (id, name, type, config, x, y, created_at, updated_at)
+                 VALUES (?1, ?2, 'ctx', '{\"markdown\":\"\"}', ?3, ?4, '', '')",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), name, x, y],
+            )
+            .unwrap();
+        };
+        place("rounds-only", 10.6, -10.6);
+        place("on-the-bound", 32767.0, -32768.0);
+        place("way-off", 99999.0, -99999.4);
+
+        let reported = positions_that_will_clamp(&conn).unwrap();
+
+        assert_eq!(
+            reported.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["way-off"],
+            "only a node that actually leaves the bounds may be reported: rounding is \
+             invisible and a node already ON the bound does not move"
+        );
+        let c = &reported[0];
+        assert_eq!((c.to_x, c.to_y), (32767, -32768));
+        assert_eq!(
+            c.from_x, 99999.0,
+            "the report must carry where it came FROM"
+        );
+        assert!(
+            c.moved_cells() > 67_000.0,
+            "the distance is the point — {} cells is what the operator sees",
+            c.moved_cells()
+        );
+    }
 
     /// CI, POS-migration/engine-restarts: the engine did not come back up after
     /// float rows were seeded, and said only
