@@ -205,6 +205,11 @@ kept merging on top of it. None of those merges was ever seen green end-to-end.
   into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
   *next*, not eventually.
 - Whoever notices red `main` first says so. Silence is how five commits happen.
+- **A deliberately-red gate lands WITH its fix, not before it.** Writing a gate red ahead of the fix is
+  correct and stays correct (§0b) — but *merging* it to `main` converts one lane's known debt into a
+  repo-wide freeze for every other lane. Hold it on the lane branch and land both together, or land it in the
+  same merge as the fix. `POS-migration-clamp-is-reported` was merged red while `main` was being greened, and
+  became the thing blocking four lanes with eleven, six and two commits held behind it.
 - **A docs-only commit that corrects a FALSE STATEMENT in a decision document may merge during a freeze** —
   for anyone, not just PM. A retracted claim that stays in the repo gets re-read as fact by the next person,
   and decision documents are read by reviewers and rulers who were not in the conversation where it was
