@@ -278,7 +278,9 @@ it declines to name a commit rather than naming the wrong one — but it means *
 confirm a Railway deploy**. Confirm those by checking that the deploy actually rebuilt.
 
 Making it exact in production requires passing `GIT_SHA` as a Railway build arg. Whether Railway
-supports that is **not yet verified** — see `infra/railway/README.md`.
+supports that has now been **verified: it does not**, by two mechanisms — see
+`infra/railway/README.md`. So `build` reading `"unknown"` in production is the honest end state
+rather than a gap awaiting a fix.
 
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
