@@ -209,7 +209,7 @@ EXACT SEQUENCE (once 3 and 4 clear), via https://wheel-api-production.up.railway
 Caveat (SDK): materialise errors are swallowed in spawn; if signal 5 fails under (B), read the engine log
 before blaming the agent.
 
-## F007 (ADVERSARY, measured 2026-09-07) — shared per-project token; bears on the wake AND gates script-exec
+## F007 (SDK measured; ADVERSARY filed 048 for the co-located-network half) 2026-09-07 — shared per-project token; bears on the wake AND gates script-exec
 Within a project the auth token is SHARED across all agents (the one-uid-per-project gap, 037/F007). The
 wire matrix is enforced correctly against the token, but any agent can present as another — so any agent
 can impersonate pm, who holds send to all six. Measured, not assumed. NOT cross-tenant (host root env not
@@ -223,7 +223,7 @@ wire bound against a hostile agent — we are waking a cooperative one and watch
 
 Bearing on SCRIPT EXECUTION: this is now a stated PRECONDITION, not later hardening. Script-exec on a
 shared-token board means an agent running arbitrary code can impersonate pm and drive the whole board.
-Per-node uids/tokens (037/038) must be in SDK's Script-exec scope as a gate, not deferred to M2.
+Per-node-UID storage isolation (037/038) — NOT per-node tokens, which are already done and close nothing (see CORRECTION below) — must be in SDK's Script-exec scope as a gate, not deferred to M2.
 
 ## F007 CORRECTION (SDK, 2026-09-07) — the fix is UID-per-node (storage), NOT token-per-node
 My "per-node uids/tokens (037/038)" wording invites the trap fix. SDK's correction: giving each node its
