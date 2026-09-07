@@ -4,8 +4,10 @@
   Owner: SDK/Engine. Boundary TB4 (engine ↔ child). Written to answer PM's question — "is `starting` a
   state an agent should be ABANDONED in at all, or is the real defect the absence of a timeout out of it?" —
   at the CLASS level, because SDK is fixing the one call site that hung and we must not fix only the instance.
-- **Status:** CONFIRMED by source trace (all line refs below at origin/main a3c9656). Not yet live-repro'd; the
-  defect is structural (an unbounded `await` on an event the engine cannot force) and provable from code.
+- **Status:** CONFIRMED by source trace (all line refs below at origin/main a3c9656). **See the CORRECTION at
+  the bottom: PM caught, live, that the deadline must key on an in-flight/delivered turn (`running`), NOT on
+  time-in-`starting` — a `starting` wall-clock would kill healthy agents idle on an empty stdin. Read the
+  correction before acting; the trigger stated in the middle of this finding is superseded by it.**
 
 ## The answer to the question, stated first
 `starting` is legitimately a state an agent CAN be abandoned in, and you cannot design that away — so the real
@@ -79,8 +81,40 @@ When the run cap lands: the above plus a per-host permit leak.
    when idle"). Alternatively the watchdog must clear a stuck `in_flight` on kill. Delivering-from-idle-only is
    the cleaner rule and removes the status-masking in item 3.
 
+## CORRECTION (PM caught this live — the original trigger was wrong and would kill healthy agents)
+PM observed a real, HEALTHY agent sitting in `starting`: "correctly idle with an empty stdin, waiting for a
+message nobody sent," and noted a 60s deadline on `starting` would have killed it. PM is right, and it exposes
+an error in the fix I proposed above. Tracing it with the harness in hand:
+
+- Claude runs `--print --input-format stream-json` (headless streaming): it emits `system/init`/`result` around
+  PROCESSING A TURN, and the ONLY `Starting → Idle` transition is `HarnessEvent::Init` (mod.rs:770). So a child
+  with nothing written to its stdin never emits `Init` and legitimately STAYS in `starting`.
+- `run_on_startup` agents come up **Parked**, and `deliver` (mod.rs:1120) calls `start()` only when a message is
+  queued; `pump_queue` then writes the turn and sets **Running** (mod.rs:726) immediately. So a *delivered* turn
+  leaves `starting` at once — which means an agent LINGERING in `starting` almost always has an EMPTY queue and
+  nothing in-flight. That is healthy-waiting (or a startup-wedge, and the two are indistinguishable from
+  outside, because the harness emits nothing until it is given a turn).
+- Therefore the genuine hang this finding is about — a turn delivered, no result — actually lives in **`running`
+  with `in_flight` set**, NOT in `starting`. I attached the deadline to the wrong state. A wall-clock on
+  "entering `starting`" measures the wrong thing and converts a DELIVERY bug (a message that should have been
+  enqueued but was not — the real defect in PM's incident, a §3c#15 dropped-message) into an agent-killing bug:
+  it would kill the healthy victim and mask the upstream bug.
+
+**Corrected fix — the deadline keys on UNRESPONSIVENESS-TO-WORK, never on time-in-state:**
+1. Arm a deadline only while the child OWES a response: a turn has been written (`in_flight` is `Some`, i.e.
+   status `running`) OR work is queued and `pump_queue`'s `write_all` is not making progress. No queued work and
+   nothing in-flight ⇒ NO deadline. This is PM's empty-queue carve-out, stated as the precise trigger.
+2. On expiry of an in-flight turn with no `result`: interrupt/kill and settle VISIBLY (`error`,
+   "no result within Ns"), revoke token, release the slot — as before, but scoped to a delivered turn.
+3. `starting` itself needs no wall-clock. A started, unmessaged agent waiting on empty stdin is healthy and must
+   be left alone (or, cosmetically, surfaced as `idle`/`waiting` rather than a bare `starting` that reads as
+   "coming up" — but that is presentation, not a kill condition).
+
+The queue-stall in item 3 above stands and is the same defect seen from the other side: a turn delivered to a
+child that never produces a `result` sets `in_flight` forever with no bound. The fix is the in-flight deadline
+(corrected trigger), not a `starting` timer.
+
 ## Note
-I received only the tail of PM's message (the question), not the incident that prompted it, so this answers the
-class from the state machine; if the specific hang PM saw has a cause outside `starting` (e.g. it hung in
-`needs_auth` or mid-`running`), that is a distinct instance — but the class fix above (a supervisor deadline on
-any live transient whose exit depends on the child) is the right frame regardless.
+I received only the tail of PM's messages here; this correction is the important content. The real bug in PM's
+incident is the DELIVERY bug (a message nobody sent) — §3c#15 — and my original framing would have hidden it by
+killing the agent. Credit to PM for the live catch.
