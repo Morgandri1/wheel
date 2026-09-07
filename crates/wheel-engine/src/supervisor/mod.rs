@@ -300,6 +300,10 @@ impl Supervisor {
         }
     }
 
+    fn startup_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.cfg.startup_deadline_secs)
+    }
+
     /// The project's vault key, if it has a usable one.
     pub fn vault_key(&self) -> Option<&crate::vault::VaultKey> {
         self.vault_key.as_ref()
@@ -636,7 +640,76 @@ impl Supervisor {
         self.clone()
             .pump_stdout(agent, stdout, slot.clone(), stderr_done, run_id, secrets);
 
+        self.clone().watch_for_a_wedged_start(agent, run_id);
+
         Ok(AgentStatus::Starting)
+    }
+
+    /// Settle an agent that is still `starting` with work it cannot reach.
+    ///
+    /// ADVERSARY 041, with the correction that matters: the predicate is NOT
+    /// "time in `starting`". Measured on production, the `pm` agent sat in
+    /// `starting` for 52 minutes emitting nothing and went to `idle` the
+    /// instant a message arrived — it was waiting correctly, and a flat
+    /// deadline would have killed a healthy agent every minute forever. So an
+    /// EMPTY QUEUE means there is nothing to be late for and this declines to
+    /// judge, which is the same predicate QA's PROGRESS-deadline-outcome
+    /// asserts: *an agent with work queued does not stay transitional past the
+    /// deadline*.
+    ///
+    /// What it does when it fires is the other half, and PM's objection to a
+    /// weaker version of this: killing and respawning the child would satisfy
+    /// "resolves within 60s" while making the hang PERIODIC, which is worse
+    /// than the bug. So this settles the agent into an answer — `error`, with a
+    /// reason an operator can read — and spawns nothing. §3c#13 is not bent to
+    /// meet a deadline.
+    ///
+    /// One timer per start, not a poll: it sleeps once, checks once, and is
+    /// gone. `run_id` makes it inert against the run it was started for having
+    /// already been replaced.
+    fn watch_for_a_wedged_start(self: Arc<Self>, agent: Uuid, run_id: Uuid) {
+        tokio::spawn(async move {
+            tokio::time::sleep(self.startup_deadline()).await;
+
+            let still_this_run = {
+                let slot = self.slot(agent).await;
+                let guard = slot.lock().await;
+                guard.as_ref().map(|r| r.run_id) == Some(run_id)
+            };
+            if !still_this_run {
+                return;
+            }
+
+            let (status, waiting) = {
+                let conn = self.db.lock().unwrap();
+                let status = board::agent_state(&conn, agent).unwrap_or_default().status;
+                // A failed lookup must not read as "nothing queued": that would
+                // silently decline to judge exactly when the board is unwell.
+                let waiting = messages::has_queued(&conn, agent).unwrap_or(true);
+                (status, waiting)
+            };
+
+            if status != AgentStatus::Starting || !waiting {
+                return;
+            }
+
+            let secs = self.cfg.startup_deadline_secs;
+            self.set_status(
+                agent,
+                AgentStatus::Error,
+                Some(format!(
+                    "the agent had messages queued but never finished starting within {secs}s, \
+                     so nothing was delivered. Its process was left alone rather than replaced — \
+                     restarting it here would hide the problem and spawn a second process for one \
+                     agent. Check the agent's log for what the harness was doing."
+                )),
+            );
+            tracing::error!(
+                agent = %agent,
+                deadline_secs = secs,
+                "an agent with queued work never left `starting`; settled to error"
+            );
+        });
     }
 
     /// Stop an agent's child. Keeps the session id so a later start resumes.
@@ -1070,9 +1143,37 @@ impl Supervisor {
             let conn = self.db.lock().unwrap();
             clear_session(&conn, agent);
         }
-        let status = self.start(agent).await?;
-        let _ = self.pump_queue(agent).await;
-        Ok(status)
+        // PARKED, not a fresh start. This used to spawn a replacement child
+        // immediately, and for an ephemeral agent that restart happens after
+        // EVERY turn -- into a queue the turn just emptied.
+        //
+        // Nothing was then written to that child's stdin, and `claude` emits
+        // its `system/init` only when it processes a turn, so no init arrived;
+        // the only Starting -> Idle transition is the Init arm, so the agent
+        // sat in `starting` until the next message. That is where the
+        // operator's own agent LIVED between turns -- the only ephemeral one on
+        // the board, and the only one stuck (PM's discriminator, ADVERSARY 041).
+        //
+        // The cost was the expensive half: idle parking keys on `idle` (§3c#14),
+        // so an agent that never reached it held a live harness process 24/7
+        // doing nothing. That is precisely the "one live process forever" this
+        // project exists to avoid.
+        //
+        // Parking deletes the special case instead of adding one: an ephemeral
+        // agent now uses the same parked -> resume path as every other agent,
+        // and the session is already cleared, so the resume starts fresh rather
+        // than reviving what was discarded.
+        self.set_status(agent, AgentStatus::Parked, None);
+
+        // A turn may have queued work behind it. `deliver` resumes a parked
+        // agent that has something waiting, and does nothing when it does not
+        // -- so an empty queue costs no process, and a full one does not sit
+        // waiting for some LATER message to trigger it. That second half is the
+        // bug this engine already had once, from the other direction.
+        self.deliver(agent).await?;
+
+        let conn = self.db.lock().unwrap();
+        Ok(board::agent_state(&conn, agent).unwrap_or_default().status)
     }
 
     /// Bring the board up. Agents configured `run_on_startup` come up
@@ -1330,6 +1431,17 @@ mod tests {
         script: &str,
         tweak: impl FnOnce(&mut wheel_core::AgentConfig),
     ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        shim_supervisor_full(name, script, tweak, crate::config::DEFAULT_STARTUP_DEADLINE_SECS)
+    }
+
+    /// Per-engine deadline, so a test that needs a short one does not have to
+    /// mutate a process-wide variable every other test is also reading.
+    fn shim_supervisor_full(
+        name: &str,
+        script: &str,
+        tweak: impl FnOnce(&mut wheel_core::AgentConfig),
+        deadline_secs: u64,
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!(
@@ -1369,6 +1481,7 @@ mod tests {
             listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
             json_logs: false,
             tool_allow_hosts: Vec::new(),
+            startup_deadline_secs: deadline_secs,
         });
         let sup = Arc::new(Supervisor::with_harness(
             cfg,
@@ -2028,6 +2141,37 @@ done
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Announces itself only AFTER its first input, then answers normally.
+    ///
+    /// This is the hypothesis about the real `claude` CLI that PM could not
+    /// discriminate from the logs: "the init event never comes" and "it comes
+    /// and we drop it" look identical from outside, and a harness that simply
+    /// has nothing to say until it is spoken to produces the first without any
+    /// bug in the engine.
+    const LATE_INIT_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+session=$(cat "$dir/session" 2>/dev/null || echo s1)
+announced=no
+while IFS= read -r line; do
+  if [ "$announced" = "no" ]; then
+    echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+    announced=yes
+  fi
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"$session\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    /// Comes up and never emits `init`: the child is alive, its pipes are
+    /// open, and it will answer nothing. This is what production looked like —
+    /// `pm` in `starting`, /healthz at 200, three messages queued.
+    const SILENT_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+while IFS= read -r line; do :; done
+sleep 300
+"#;
+
     const ECHO_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 echo run >> "$dir/runs"
@@ -2076,6 +2220,197 @@ done
             None,
         )
         .unwrap();
+    }
+
+    /// The mechanism behind PM's finding, demonstrated without touching the
+    /// operator's credentials: a harness that says nothing until it is spoken
+    /// to leaves the agent in `starting` for as long as its queue is empty —
+    /// which, for an ephemeral agent, is where it LIVES between turns.
+    ///
+    /// Nothing here is broken in the engine: `starting` is being used to mean
+    /// two different things — "we are spawning it" and "it is up but has not
+    /// announced itself" — and only the first is transitional. Delivery keeps
+    /// working underneath, exactly as PM observed, because `pump_queue` needs a
+    /// live process and not a status.
+    #[tokio::test]
+    async fn a_harness_that_announces_itself_late_leaves_the_agent_looking_transitional() {
+        let (sup, id, dir) = shim_supervisor("late-init", LATE_INIT_HARNESS);
+
+        sup.start(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(
+            status_of(&sup, id),
+            AgentStatus::Starting,
+            "with nothing queued and no init yet, the agent reads as transitional"
+        );
+
+        // Speak to it, and everything resolves — which is why this is invisible
+        // on a busy board and permanent on a quiet one.
+        enqueue(&sup, id, "say something");
+        sup.deliver(id).await.unwrap();
+        until("the agent to settle once it has been spoken to", || {
+            matches!(status_of(&sup, id), AgentStatus::Idle)
+        })
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PM's discriminator, measured on production: `pm` is the ONLY agent on
+    /// the board with `ephemeral_context = true`, and it is the only one stuck
+    /// in `starting`. Its status went transitional TWO SECONDS AFTER a turn
+    /// completed successfully — a restart following turn completion, which is
+    /// what clearing an ephemeral context does. The other five agents, same
+    /// engine, same deploy, settle normally.
+    ///
+    /// The existing ephemeral test asserts a second PROCESS spawns and that it
+    /// does not resume. Neither of those notices an agent that respawns and
+    /// then never leaves `starting`, which is where the operator's own agent
+    /// LIVES between turns.
+    #[tokio::test]
+    async fn an_ephemeral_agent_settles_after_its_context_is_cleared() {
+        let (sup, id, dir) = shim_supervisor_cfg("ephemeral-settles", ECHO_HARNESS, |c| {
+            c.ephemeral_context = true;
+        });
+
+        enqueue(&sup, id, "one turn, then throw the context away");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the ephemeral agent to settle after its turn", || {
+            !matches!(
+                status_of(&sup, id),
+                AgentStatus::Starting | AgentStatus::Running
+            )
+        })
+        .await;
+
+        assert_eq!(
+            status_of(&sup, id),
+            AgentStatus::Parked,
+            "an ephemeral agent must settle into a state idle-parking recognises. It used to sit \
+             in `starting` for ever, because the respawn wrote nothing to the fresh child and the \
+             harness announces itself only when it processes a turn — so no init ever arrived, and \
+             the only Starting -> Idle transition is the Init arm."
+        );
+        assert_eq!(
+            count(&dir.join("runs")),
+            1,
+            "and it holds no process between turns: idle parking keys on the settled state, so an \
+             agent that never reached one kept a live harness 24/7 (§3c#14)"
+        );
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The half that parking could plausibly break: work queued BEHIND the turn
+    /// must not wait for some later message to trigger it.
+    ///
+    /// This engine has already had that bug from the other direction — a
+    /// message with no event left to deliver it — so parking without this
+    /// assertion would be trading one silent queue for another.
+    #[tokio::test]
+    async fn an_ephemeral_agent_that_parks_still_drains_what_queued_behind_the_turn() {
+        let (sup, id, dir) = shim_supervisor_cfg("ephemeral-drains", ECHO_HARNESS, |c| {
+            c.ephemeral_context = true;
+        });
+
+        enqueue(&sup, id, "first");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+        enqueue(&sup, id, "queued behind the first turn");
+
+        until(
+            "both messages to be consumed without a new message arriving",
+            || {
+                let conn = sup.db.lock().unwrap();
+                !messages::has_queued(&conn, id).unwrap_or(true)
+            },
+        )
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADVERSARY 041 / QA's PROGRESS-deadline-outcome: an agent with WORK
+    /// QUEUED must not sit transitional for ever.
+    ///
+    /// The three assertions are QA's, and each exists because a weaker fix
+    /// passes without them: the status afterwards is an ANSWER, it carries a
+    /// readable reason, and NO SECOND PROCESS was spawned. That last one is
+    /// what separates a fix from a respawn loop — at any single instant a
+    /// respawn loop is indistinguishable from an agent that is starting.
+    #[tokio::test]
+    async fn an_agent_wedged_in_starting_with_work_queued_settles_with_a_reason() {
+        let (sup, id, dir) = shim_supervisor_full("wedged-start", SILENT_HARNESS, |_| {}, 2);
+
+        enqueue_from_endpoint(&sup, id, "a message that cannot be delivered");
+        sup.start(id).await.unwrap();
+
+        // Wait for the child to actually exist before judging how many there
+        // are. Asserting the count straight after `start` races the shim's own
+        // exec: under a loaded suite it read 0 processes and called that a
+        // violation of "never a second process", which is the opposite of what
+        // it measures. The deadline may well fire while this is waiting — that
+        // is fine, and the point: it does not kill the child.
+        until("the child to spawn at all", || count(&dir.join("runs")) >= 1).await;
+
+        until("the wedged agent to settle into an answer", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+
+        let state = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap_or_default()
+        };
+        assert_eq!(
+            state.status,
+            AgentStatus::Error,
+            "a deadline that returns the agent to a transitional state has made the hang \
+             periodic rather than resolved it"
+        );
+        assert!(
+            state.last_error.as_deref().unwrap_or("").trim().len() > 20,
+            "an operator watching the board needs to know WHY; got {:?}",
+            state.last_error
+        );
+        assert_eq!(
+            count(&dir.join("runs")),
+            1,
+            "the deadline must not replace the child: one agent node, one process (§3c#13). \
+             Killing and respawning would satisfy `resolves within 60s` while making the hang \
+             periodic, which is worse than the bug."
+        );
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the predicate, and the reason it is not "time in
+    /// `starting`": an agent with an EMPTY queue that is slow to come up is
+    /// WAITING, not wedged. Production's `pm` sat in `starting` 52 minutes with
+    /// nothing queued and was healthy. A flat deadline would have killed it
+    /// every minute forever.
+    #[tokio::test]
+    async fn an_agent_with_nothing_queued_is_left_alone_however_long_it_takes() {
+        let (sup, id, dir) = shim_supervisor_full("slow-but-idle", SILENT_HARNESS, |_| {}, 1);
+
+        sup.start(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        assert_eq!(
+            status_of(&sup, id),
+            AgentStatus::Starting,
+            "nothing was queued, so there was nothing to be late for; the deadline must \
+             decline to judge rather than invent a failure"
+        );
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// QA's S1, reproduced: the message arrives while the agent is STARTING.
@@ -2260,13 +2595,28 @@ done
         sup.start(id).await.unwrap();
         sup.deliver(id).await.unwrap();
 
-        // One turn, then the restart: a second child for the same agent.
-        until("the ephemeral restart to spawn a fresh child", || {
+        // The turn ends and the agent PARKS. It used to respawn here, into a
+        // queue the turn had just emptied; see `clear_context` for what that
+        // cost.
+        until("the ephemeral agent to park after its turn", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+        assert_eq!(
+            count(&dir.join("runs")),
+            1,
+            "parking must not spawn a replacement child for a queue that is empty"
+        );
+
+        // The next message resumes it — into a FRESH session, which is the
+        // property this test has always been about.
+        enqueue(&sup, id, "second");
+        sup.deliver(id).await.unwrap();
+        until("the next message to start a new child", || {
             count(&dir.join("runs")) == 2
         })
         .await;
 
-        // ...and it did NOT resume: both children started clean.
         let resumes = std::fs::read_to_string(dir.join("resumes")).unwrap();
         assert!(
             resumes.lines().all(|l| l == "no"),
