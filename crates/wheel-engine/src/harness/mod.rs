@@ -48,6 +48,30 @@ pub enum HarnessEvent {
         session_id: Option<String>,
         is_error: bool,
         text: Option<String>,
+        /// The harness's own count of turns in THIS session, cumulative — the
+        /// second turn of a session reports 2, not 1. Recorded as a running
+        /// total per session so a board's `turns` is not the sum of a
+        /// triangular series.
+        turns: Option<u64>,
+        /// Session cost so far, cumulative in the same way.
+        cost_usd: Option<f64>,
+    },
+    /// The platform telling us how close the account is to a limit.
+    ///
+    /// The harness hands this to us unasked and it used to parse as an
+    /// uninteresting event and get logged as text. An operator paying for this
+    /// is the person who most needs it, and the seven-day window it reports is
+    /// long enough that noticing late is expensive.
+    RateLimit {
+        session_id: Option<String>,
+        /// e.g. `allowed`, `allowed_warning`, `rejected`.
+        status: String,
+        /// e.g. `seven_day`. Which window this is about.
+        window: Option<String>,
+        /// 0.0-1.0 of the window consumed.
+        utilization: Option<f64>,
+        /// Unix seconds at which the window resets.
+        resets_at: Option<i64>,
     },
     /// A recognised-but-uninteresting event, or an unparseable line. Logged
     /// verbatim, never fatal.

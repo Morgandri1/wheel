@@ -162,6 +162,70 @@ pub fn create_with(
 /// One table's failure is logged and does not stop the engine. A board with
 /// nine good tables and one bad name is still a working board, and refusing
 /// to boot would take the other nine down with it.
+/// Add a completed turn and its cost to an agent's running totals.
+///
+/// Called with DELTAS. The harness reports both figures cumulatively for a
+/// session, so the supervisor keeps the per-session baseline and hands the
+/// difference here — otherwise a board's `turns` would be the sum of a
+/// triangular series rather than a count.
+pub fn add_spend(conn: &Connection, agent: Uuid, turns: u64, usd: f64) -> Result<()> {
+    if turns == 0 && usd == 0.0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO agent_state (node_id, status, turns, usd)
+              VALUES (?1, 'running', ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE
+            SET turns = turns + ?2,
+                usd   = usd + ?3",
+        rusqlite::params![agent.to_string(), turns as i64, usd],
+    )?;
+    Ok(())
+}
+
+/// Has this agent spent past its configured ceiling?
+///
+/// Returns the reason to show the operator, or `None`. Read after every
+/// recorded turn: §3e's `budget` existed as a config field that nothing
+/// consulted, so an agent in a loop burned tokens with nothing to stop it —
+/// which is the same root as the discarded usage events, since a budget cannot
+/// be enforced against a total nobody counts.
+pub fn budget_exceeded(conn: &Connection, agent: Uuid) -> Result<Option<String>> {
+    let Some(node) = get(conn, agent)? else {
+        return Ok(None);
+    };
+    let Some(cfg) = node.config.as_agent() else {
+        return Ok(None);
+    };
+    let Some(budget) = cfg.budget else {
+        return Ok(None);
+    };
+    let spend = agent_state(conn, agent)
+        .unwrap_or_default()
+        .spend
+        .unwrap_or_default();
+
+    if let Some(max) = budget.max_turns {
+        if spend.turns >= max {
+            return Ok(Some(format!(
+                "budget reached: {} turns of the {max} allowed. The agent is stopped; \
+                 raise `budget.max_turns` or clear it to continue.",
+                spend.turns
+            )));
+        }
+    }
+    if let Some(max) = budget.max_usd {
+        if spend.usd >= max {
+            return Ok(Some(format!(
+                "budget reached: ${:.4} of the ${max:.4} allowed. The agent is stopped; \
+                 raise `budget.max_usd` or clear it to continue.",
+                spend.usd
+            )));
+        }
+    }
+    Ok(None)
+}
+
 pub fn ensure_tables(conn: &Connection) -> Result<()> {
     // Deliberately NOT `list(conn)?`. This runs on the boot path, and `list`
     // fails WHOLE rather than per row: one node whose `id` is not a uuid — a
@@ -487,6 +551,20 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spend_accumulates_across_calls() {
+        let conn = mem();
+        let a = agent("counted");
+        create(&conn, &a).unwrap();
+
+        add_spend(&conn, a.id, 1, 0.25).unwrap();
+        add_spend(&conn, a.id, 1, 0.25).unwrap();
+
+        let s = agent_state(&conn, a.id).unwrap().spend.unwrap_or_default();
+        assert_eq!(s.turns, 2);
+        assert!((s.usd - 0.5).abs() < 1e-9, "got {}", s.usd);
+    }
+
     /// PM's reviewers flagged this and it is the dangerous half of the i16
     /// change: a row already outside +/-32767 must CLAMP on the way out, not
     /// fail to load.
