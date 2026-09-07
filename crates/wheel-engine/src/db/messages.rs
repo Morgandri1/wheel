@@ -141,9 +141,18 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Message>> {
 /// must idle at ~0 CPU (§2), so this must never become a background poll.
 pub fn agents_with_work_older_than(conn: &Connection, secs: i64) -> Result<Vec<(Uuid, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT to_id, COUNT(*) AS n FROM messages
-          WHERE state = 'queued'
-            AND (julianday('now') - julianday(created_at)) * 86400.0 > ?1
+        "SELECT to_id, COUNT(*) AS n FROM messages m
+          WHERE m.state = 'queued'
+            AND (julianday('now') - julianday(m.created_at)) * 86400.0 > ?1
+            -- An agent MID-TURN is making progress, not stalled. `delivered`
+            -- means the bytes reached the child's stdin and the turn has not
+            -- reported complete (§3c#4), so a message behind a long turn is
+            -- waiting its turn rather than abandoned. Reporting it would cry
+            -- wolf on the commonest healthy state there is.
+            AND NOT EXISTS (
+                SELECT 1 FROM messages d
+                 WHERE d.to_id = m.to_id AND d.state = 'delivered'
+            )
           GROUP BY to_id",
     )?;
     let rows = stmt.query_map([secs], |r| {
@@ -429,6 +438,23 @@ pub(crate) mod tests {
             stalled,
             vec![(agent, 1)],
             "a message older than the deadline with nothing delivering it is the whole point"
+        );
+
+        // PM's third not-stalled case: MID-TURN. A turn already written to the
+        // child holds the queue behind it legitimately, and a long turn is the
+        // commonest healthy state there is — reporting it would be the wolf.
+        let inflight = enqueue(
+            &conn,
+            wheel_core::MessageSender::User,
+            agent,
+            "the turn currently running".into(),
+            None,
+        )
+        .unwrap();
+        advance(&conn, inflight.id, wheel_core::MessageState::Delivered).unwrap();
+        assert!(
+            agents_with_work_older_than(&conn, 60).unwrap().is_empty(),
+            "an agent mid-turn is making progress; the message behind it is waiting, not stranded"
         );
     }
     use super::*;
