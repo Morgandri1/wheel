@@ -32,12 +32,23 @@ person reaching for a restart.
 """
 import json
 import os
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from wheel_client import Results  # noqa: E402
+from wheel_client import Results, configure_fakes, free_port, pin_image  # noqa: E402
+
+PORT = free_port(int(os.environ.get("WHEEL_PROGRESS_PORT", "0")))
+BASE = "http://127.0.0.1:%d" % PORT
+NAME = "qa-engine-progress-%s" % uuid.uuid4().hex[:8]
+SECRET = "qa-progress-secret-at-least-16chars"
+IMAGE_TAG = os.environ.get("WHEEL_PROGRESS_IMAGE", "wheel-engine:test")
+IMAGE = None
+AGENT_ID = None
 
 SKIP = 77
 R = Results()
@@ -79,7 +90,7 @@ PRODUCERS = []          # wired as each path lands
 # is a result nobody reads, and nothing forces the wiring, so it stays SKIP for weeks.
 # The moment the FIRST producer is wired this must be bumped to 1, and from then on a
 # producer count BELOW the floor is a FAILURE, not a skip. 1 -> 0 is a red build.
-WIRED_FLOOR = 0
+WIRED_FLOOR = 2
 
 
 def poll(fn, want, timeout):
@@ -188,39 +199,188 @@ def check_no_stuck_status(agent_status, healthz):
             % (last, waited, "200" if healthz() else "down"))
 
 
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True)
+
+
+def http(method, path, body=None, timeout=30):
+    req = urllib.request.Request(BASE + path, method=method)
+    req.add_header("Authorization", "Bearer " + SECRET)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        req.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data, timeout=timeout) as r:
+            txt = r.read().decode(errors="replace")
+            return r.status, (json.loads(txt) if txt.strip() else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return 0, None
+
+
+def healthz():
+    return http("GET", "/healthz")[0] == 200
+
+
+def inbox_ids():
+    st, r = http("GET", "/v1/agents/%s/inbox?limit=200" % AGENT_ID)
+    return {m["id"] for m in ((r or {}).get("messages") or [])}
+
+
+def message_state(mid):
+    st, r = http("GET", "/v1/agents/%s/inbox?limit=200" % AGENT_ID)
+    for m in ((r or {}).get("messages") or []):
+        if m.get("id") == mid:
+            return m.get("state")
+    return None
+
+
+def agent_state():
+    st, board = http("GET", "/v1/board")
+    for n in ((board or {}).get("nodes") or []):
+        if n.get("id") == AGENT_ID:
+            return n.get("state") or {}
+    return {}
+
+
+def agent_status():
+    return agent_state().get("status")
+
+
+def new_message_from(action, timeout=30):
+    """Run `action`, then return the id of the message it caused.
+
+    Producers do not agree on what they hand back -- `send` returns a receipt, an ingress
+    hit returns an HTTP response with no message id at all -- so the id is recovered by
+    DIFFING the inbox instead. That keeps every producer on one code path, which is the
+    point of parametrising them: the entry points differ, the assertion must not.
+    """
+    before = inbox_ids()
+    action()
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        new = inbox_ids() - before
+        if new:
+            return sorted(new)[0]
+        time.sleep(0.5)
+    return None
+
+
+def start_engine():
+    key = sh("openssl", "rand", "-base64", "32").stdout.strip()
+    sh("docker", "run", "-d", "--name", NAME,
+       "-e", "WHEEL_PROJECT_ID=" + str(uuid.uuid4()),
+       "-e", "WHEEL_ENGINE_SECRET=" + SECRET,
+       "-e", "WHEEL_VAULT_KEY=" + key,
+       "-e", "WHEEL_ROLE=engine",
+       "-e", "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+       "-p", "%d:7000" % PORT, IMAGE or IMAGE_TAG)
+    for _ in range(60):
+        if healthz():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def build_board():
+    """agent + endpoint wired endpoint->agent(send). Returns (agent_id, endpoint_path)."""
+    st, agent = http("POST", "/v1/nodes",
+                     {"name": "worker", "type": "agent", "position": {"x": 0, "y": 0},
+                      "config": {"harness": "claude", "system_prompt": "progress gate",
+                                 "run_on_startup": False, "ephemeral_context": False}})
+    if not (200 <= st < 300 and agent):
+        return None, None
+    path = "/hook"
+    st2, ep = http("POST", "/v1/nodes",
+                   {"name": "hook", "type": "endpoint", "position": {"x": 200, "y": 0},
+                    "config": {"method": "POST", "path": path, "response_mode": "ack",
+                               "auth": {"mode": "none"}}})
+    if 200 <= st2 < 300 and ep:
+        http("POST", "/v1/wires", {"from": ep["id"], "to": agent["id"], "type": "send"})
+    return agent["id"], (path if (200 <= st2 < 300 and ep) else None)
+
+
+def ingress_hit(path, body):
+    req = urllib.request.Request(BASE + "/ingress" + path, method="POST",
+                                 data=json.dumps(body).encode())
+    req.add_header("content-type", "application/json")
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+
+
 def main():
-    print(__doc__.strip().splitlines()[0])
+    global IMAGE, AGENT_ID
+    if sh("docker", "info").returncode != 0:
+        print("docker not running")
+        return SKIP
+    if sh("docker", "image", "inspect", IMAGE_TAG).returncode != 0:
+        print("%s not built — run `make engine-image-test`" % IMAGE_TAG)
+        return SKIP
+    IMAGE = pin_image(IMAGE_TAG)
+    print("image: %s -> %s" % (IMAGE_TAG, (IMAGE or "?")[:19]))
 
-    # PM's rule: a producer count below the floor is a FAILURE. Once anything has been
-    # wired, "zero producers" stops meaning "too early" and starts meaning "someone
-    # deleted the coverage", and those must not report the same colour.
-    if len(PRODUCERS) < WIRED_FLOOR:
-        R.check("PROGRESS-producers-stay-wired", False,
-                "this suite has %d producers wired but the floor is %d. A producer was "
-                "REMOVED. The path it covered is exactly the kind that broke in "
-                "production while a neighbouring path stayed green, so losing one is a "
-                "red build, not a skip. Restore it, or lower WIRED_FLOOR deliberately "
-                "and say why in the commit." % (len(PRODUCERS), WIRED_FLOOR))
-        return R.report("progress-not-liveness")
+    try:
+        if not R.control("PROGRESS/engine-up", start_engine(),
+                         "the engine never started, so nothing below is evidence"):
+            return R.report("progress-not-liveness")
+        if err := configure_fakes(NAME, transcript="/data/qa-progress-transcript.jsonl"):
+            R.skip("PROGRESS/fakes", err)
+            return R.report("progress-not-liveness")
 
-    if not PRODUCERS:
-        # SKIP HERE MEANS "NOT WIRED YET", NOT "NOT APPLICABLE". The distinction is the
-        # point: not-applicable is a permanent, acceptable state; not-wired-yet is a debt
-        # with an owner and a deadline. Spelled out in the ID so nobody has to infer it.
-        R.skip("PROGRESS/not-wired-yet--no-producers-defined",
-               "no producer is wired in this suite yet, so it has asserted NOTHING. This "
-               "is a DEBT, not a not-applicable: the paths exist, the coverage does not. "
-               "Wire user-send first (it works today), then endpoint-ingress the moment "
-               "SDK's P0 lands, since that is the path that actually broke. Bump "
-               "WIRED_FLOOR to 1 in the same commit — from then on, dropping back to "
-               "zero is a failing build rather than this message.")
-        return R.report("progress-not-liveness")
+        AGENT_ID, ep_path = build_board()
+        if not R.control("PROGRESS/board-built", bool(AGENT_ID),
+                         "could not create the agent node, so no producer has a target"):
+            return R.report("progress-not-liveness")
+        http("POST", "/v1/agents/%s/start" % AGENT_ID)
 
-    for name, send, message_state, agent_status, agent_state, healthz in PRODUCERS:
-        check_producer(name, send, message_state, agent_status, healthz)
+        producers = [("user-send",
+                      lambda: http("POST", "/v1/agents/%s/send" % AGENT_ID,
+                                   {"body": "progress-probe-user"}))]
+        if ep_path:
+            producers.append(("endpoint-ingress",
+                              lambda: ingress_hit(ep_path, {"probe": "progress"})))
+        else:
+            # Named, not silently dropped: a producer that could not be built is missing
+            # coverage, and PM's rule is that missing coverage must not look like a pass.
+            R.skip("PROGRESS-message-reaches-consumed/endpoint-ingress",
+                   "the endpoint node or its wire could not be created, so the ingress "
+                   "path -- the one that broke in production -- was NOT exercised")
+
+        if len(producers) < WIRED_FLOOR:
+            R.check("PROGRESS-producers-stay-wired", False,
+                    "%d producers wired, floor is %d. A producer was REMOVED; the path it "
+                    "covered is exactly the kind that broke while a neighbour stayed "
+                    "green." % (len(producers), WIRED_FLOOR))
+            return R.report("progress-not-liveness")
+
+        for name, action in producers:
+            mid = new_message_from(action)
+            if not R.control("PROGRESS/%s-accepted" % name, bool(mid),
+                             "the producer did not create a message at all, so there is "
+                             "nothing to watch move and no claim to make about draining"):
+                continue
+            ok, last, waited = poll(lambda: message_state(mid),
+                                    lambda st: st == "consumed", CONSUME_SECS)
+            alive, status = healthz(), agent_status()
+            R.check("PROGRESS-message-reaches-consumed/%s" % name, ok,
+                    "a message accepted by %s never reached `consumed`: it sat in %r for "
+                    "%.0fs. The engine was %s and the agent reported %r that whole time "
+                    "-- which is the signature of this bug, not a defence against it. "
+                    "Enqueuing and waking the agent is not the same as pumping the queue; "
+                    "the P0 was ingress calling start() instead of deliver()."
+                    % (name, last, waited,
+                       "still answering /healthz" if alive else "not responding", status))
+
+        # Status assertions are about the AGENT, not a producer, so they run once.
         check_no_stuck_status(agent_status, healthz)
         check_deadline_outcome(agent_state, healthz)
-    return R.report("progress-not-liveness")
+        return R.report("progress-not-liveness")
+    finally:
+        sh("docker", "rm", "-f", NAME)
 
 
 if __name__ == "__main__":
