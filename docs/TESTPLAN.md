@@ -872,6 +872,21 @@ Raised by SDK from `docs/proposals/restart-robustness-current-behaviour.md` (96f
 | `SPEND-completed-turn-increments-turns` | A turn the TEST CAUSES increments `agent_state.turns`. **Must not read existing rows**: SDK's caution, and it is right — the cloud QA agent's transcript is 2011 lines with 754 assistant messages while every agent reads `turns=0`, so a test that merely observes `turns=0` would pass for the wrong reason today and keep passing after a fix. Cause the turn, then assert the delta. | **S2** |
 | `CLI-chest-arms-answer-honestly` | The CLI plane's chest arms (`ad5c1c5` fixed `ls` to answer honestly). Ties to the success-shape invariant: an unimplemented arm must not answer with a success shape. | S3 |
 
+### The STALE-REFERENT family — the thing you depend on may not be the thing you looked at
+
+Named so the fourth instance is recognised as one rather than solved from scratch. Every member has the same shape: **a name is resolved at one time and depended on at another, and nothing checks that the two agree.** None of the checks is clever; each exists because the cheap assumption is wrong often enough to cost a day.
+
+| instance | the name | resolved when | depended on when | the check |
+|---|---|---|---|---|
+| mutable image tag | `wheel-engine:test` | at `docker run` | throughout a suite | `pin_image` — resolve to an immutable sha |
+| image vs code | the image | at build | when a suite reports on "the engine" | `image_freshness` — refuse if it predates the code |
+| run vs branch | `main` | when CI started | when someone acts on "main is green" | `green_describes_head` — compare `headSha` to `origin/main` |
+| **(unbuilt)** CI step vs branch | a script path | when the step is written | when the step runs on main | *assertion not yet specified* |
+
+**Why the fourth is not built.** The narrow version — "a CI step that invokes a path asserts the path exists on the branch it will run on" — is cheap and obviously right for the case that produced it. What is *not* clear is what it should assert in general: a step may invoke a path that is created earlier in the same job, or an action rather than a file, or a command resolved from `PATH`. A check that cannot state precisely what it asserts becomes another green-about-nothing, which is the thing this whole family exists to prevent. Build it when the assertion is clear, not before.
+
+**How each was actually found**, because none was found by looking for it: a suite reported a fix unfixed against an image another agent had replaced; a green run turned out to describe a commit `main` had left, four times in one day; and a CI step's missing script was noticed while checking that file's executable bit for an unrelated reason. The family is worth naming precisely because *adjacency to some other question* is not a discovery process anyone can rely on.
+
 ### HEALTH-implies-* — /healthz answering 200 must mean something
 
 Named for the shape, not the bugs, because the point is the sixth instance. Five in one day, every one a system that was up, answering, and not doing its job:
