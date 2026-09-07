@@ -6,6 +6,7 @@ import { Button, Field, Input, Select, Textarea } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
 import type { Fill, FillMode, ToolNode, ToolOperation, ToolParam, WheelNode } from "@/lib/schema";
+import { wiredVaults as vaultsReadableBy } from "@/lib/wired-vaults";
 
 /**
  * §3d. The thing this panel exists to make obvious is WHO SUPPLIES WHAT: every header, path,
@@ -87,13 +88,7 @@ function Operations({
   const [open, setOpen] = useState<string | null>(null);
 
   /** §3d: a vault fill needs a tool → vault read wire, so only wired vaults can be picked. */
-  const wiredVaults = useMemo(() => {
-    const byId = new Map(nodes.map((n) => [n.id, n]));
-    return (node.wires ?? [])
-      .filter((w) => w.type === "read")
-      .map((w) => byId.get(w.to))
-      .filter((n): n is Extract<WheelNode, { type: "vault" }> => n?.type === "vault");
-  }, [node.wires, nodes]);
+  const wiredVaults = useMemo(() => vaultsReadableBy(node, nodes), [node, nodes]);
 
   const save = async (next: ToolOperation[]) => {
     try {
