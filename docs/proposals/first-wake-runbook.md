@@ -81,6 +81,21 @@ NeedsAuth, that IS the first gap and we surface it rather than fight it.
   lands on origin) fails, and that failure is a stale credential rather than a product gap — worth knowing which
   one we are looking at before we spend a wake on it.
 
+  **UPDATE — GITHUB_TOKEN IS populated, and that is the thing to check before you trigger.** `GET /v1/vault/<id>`
+  reads stored values rather than declared config (`vault.rs:229` selects from `vault_values`), so it is a
+  non-disclosing way to ask which credentials actually exist. All four come back:
+  `CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`.
+
+  So the question is no longer "is it set" but "is it the REVOKED one". You told the operator not to store a
+  replacement until the clone fix landed. The fix has now landed and deployed — which means the value sitting in
+  the vault is most likely the PAT that was revoked yesterday. If so, `materialise` fails auth, the agent starts
+  anyway with a bare cwd (see the swallow caveat under the agent pick), and signal 5 fails for a stale-credential
+  reason that will look like a product gap.
+
+  **Cheapest pre-flight: have the operator re-store `secrets/GITHUB_TOKEN` now.** It is write-only, so neither of
+  us can check its validity — only the operator can. One `PUT /v1/vault/<id>/GITHUB_TOKEN` before the wake
+  removes the most likely cause of a false negative.
+
   **Good news on the S1:** the volume is clean right now. No `.git/config` survives under `creds/`, and the one
   clone that does exist (`ws/pm/wheel`) has ZERO credential matches in its remote (I counted matches without
   printing values). The exposure is not currently on disk. Option (B) above is what keeps it that way.
