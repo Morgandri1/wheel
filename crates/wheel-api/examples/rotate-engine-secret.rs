@@ -24,9 +24,9 @@
 //! ROTATE ONLY AFTER THE CARRIER IS CLOSED (043: after #17 scrubs the secret from the engine's
 //! environ). Rotating into a still-open exposure re-exposes the new secret immediately.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use wheel_api::crypto;
+use wheel_api::admin::{rotate_engine_secret, Rotation};
 use wheel_api::db::Db;
 
 fn master_key() -> Result<[u8; 32]> {
@@ -37,6 +37,14 @@ fn master_key() -> Result<[u8; 32]> {
     let len = bytes.len();
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| anyhow!("API_MASTER_KEY must decode to exactly 32 bytes, got {len}"))
+}
+
+/// The scheme only, so a connection string with a password never reaches the terminal.
+fn scheme_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((s, _)) => s,
+        None => "unknown",
+    }
 }
 
 #[tokio::main]
@@ -55,61 +63,22 @@ async fn main() -> Result<()> {
     let key = master_key()?;
     let db = Db::connect(&url).await.context("connecting to the store")?;
 
-    // Read the CURRENT value first and decrypt it. Nothing is written until this succeeds: if the
-    // master key in this environment is not the one the row was sealed with, the honest outcome is
-    // to stop here, not to overwrite a good row with a value the API will never be able to open.
-    let existing: Option<(Vec<u8>,)> = wheel_api::db_fetch_optional!(
-        &db,
-        "SELECT engine_secret_enc FROM project_secrets WHERE project_id = $1",
-        id
-    )?;
-    let Some((sealed,)) = existing else {
-        bail!(
-            "no project_secrets row for {id} — is that the right project, and the right database?"
-        );
-    };
-    crypto::open(&key, &sealed).context(
-        "this API_MASTER_KEY cannot decrypt the existing secret; refusing to overwrite it",
-    )?;
-
     println!("project      {id}");
     println!("store        {}", scheme_of(&url));
-    println!("current row  present, and decrypts with this API_MASTER_KEY");
 
-    if !apply {
-        println!();
-        println!("DRY RUN — nothing written. Re-run with --apply to rotate.");
-        println!(
-            "After applying, restart the project so the host and the engine take the new value:"
-        );
-        println!("  POST /v1/projects/{id}/restart");
-        return Ok(());
+    match rotate_engine_secret(&db, &key, id, apply).await? {
+        Rotation::DryRun => {
+            println!("current row  present, and decrypts with this API_MASTER_KEY");
+            println!();
+            println!("DRY RUN — nothing written. Re-run with --apply to rotate.");
+        }
+        Rotation::Rotated => {
+            println!();
+            println!("ROTATED. The new secret is not printed and is not needed by a human.");
+        }
     }
-
-    let fresh = crypto::generate_secret();
-    let resealed = crypto::seal(&key, &fresh).context("sealing the new secret")?;
-    let n = wheel_api::db_execute!(
-        &db,
-        "UPDATE project_secrets SET engine_secret_enc = $1 WHERE project_id = $2",
-        resealed,
-        id
-    )?;
-    if n != 1 {
-        bail!("expected to update exactly one row, updated {n} — investigate before restarting");
-    }
-
-    println!();
-    println!("ROTATED. The new secret is not printed and is not needed by a human.");
-    println!("The engine is still running with the OLD value until you restart it:");
+    println!("The engine keeps the OLD value until the project is restarted:");
     println!("  POST /v1/projects/{id}/restart");
     println!("Then confirm the board answers 200 — a 502 means host and engine disagree.");
     Ok(())
-}
-
-/// The scheme only, so a connection string with a password never reaches the terminal.
-fn scheme_of(url: &str) -> &str {
-    match url.split_once("://") {
-        Some((s, _)) => s,
-        None => "unknown",
-    }
 }
