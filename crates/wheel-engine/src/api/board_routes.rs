@@ -69,9 +69,35 @@ pub async fn patch_node(
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found(id.to_string()))?;
 
-    if let Some(name) = body.name {
-        node.name = name;
-    }
+    let renamed_from = if let Some(name) = body.name {
+        let was = node.name.clone();
+        if was == name {
+            None
+        } else {
+            // §4 and PROTOCOL.md's `agent_running`, which both DOCUMENTED this
+            // and neither enforced. An agent's name is embedded in every peer's
+            // preamble and in its own running session, so renaming a live one
+            // leaves peers addressing a name that no longer exists and an agent
+            // introduced as something it is not.
+            //
+            // Documented-but-absent is worse than missing: everything
+            // downstream was written believing this held.
+            let status = board::agent_state(&conn, id).unwrap_or_default().status;
+            if rename_is_refused(node.node_type(), status) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "agent_running",
+                    format!(
+                        "{was} is {status}, and its name is in every peer's preamble and in its own session. Stop or park it first."
+                    ),
+                ));
+            }
+            node.name = name;
+            Some(was)
+        }
+    } else {
+        None
+    };
     if let Some(pos) = body.position {
         node.position = pos;
     }
@@ -85,10 +111,46 @@ pub async fn patch_node(
     }
 
     board::update_with(&conn, &node, &s.cfg.tool_allow_hosts)?;
+
+    // A workspace is keyed by the agent's name (§3e `ws/<name>`), so a rename
+    // that left it behind would orphan the tree the agent has been working in:
+    // the next start materialises a fresh one and the old checkout, with any
+    // uncommitted work in it, is simply somewhere the engine no longer looks.
+    // Disk grows and the agent's files "vanish", which is a bad thing to
+    // discover months later.
+    if let Some(was) = renamed_from {
+        let from = s.cfg.workspace_dir(was.as_str());
+        let to = s.cfg.workspace_dir(node.name.as_str());
+        if from.exists() && !to.exists() {
+            if let Err(e) = std::fs::rename(&from, &to) {
+                // Not fatal: the rename itself succeeded and the board is
+                // consistent. Say so loudly rather than fail a completed
+                // operation.
+                tracing::error!(
+                    from = %from.display(), to = %to.display(), error = %e,
+                    "renamed the node but could not move its workspace; the old checkout is orphaned"
+                );
+            }
+        }
+    }
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });
     Ok(Json(node))
+}
+
+/// May this node be renamed in the state it is in?
+///
+/// §4 and PROTOCOL.md both specify a 409 `agent_running` here, and neither the
+/// engine nor any test enforced it — documented-but-absent, which is worse than
+/// missing, because everything downstream was written believing it held.
+///
+/// A live agent is any holding a process: running, starting, or idle. `idle` is
+/// included deliberately — it is where an agent spends most of its life, and a
+/// guard omitting it would be true on paper and never fire.
+fn rename_is_refused(node_type: NodeType, status: wheel_core::AgentStatus) -> bool {
+    use wheel_core::AgentStatus::*;
+    node_type == NodeType::Agent && matches!(status, Running | Starting | Idle)
 }
 
 /// `DELETE /v1/nodes/:id` — cascades wires in both directions, plus the node's
@@ -131,5 +193,37 @@ pub async fn remove_wire(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("no such wire"))
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use wheel_core::AgentStatus::*;
+
+    /// The states holding a process are exactly the states a rename must be
+    /// refused in, and `idle` is the one that matters: it is where an agent
+    /// spends most of its life, so a guard omitting it would never fire.
+    #[test]
+    fn a_rename_is_refused_for_every_agent_state_that_holds_a_process() {
+        for live in [Running, Starting, Idle] {
+            assert!(
+                rename_is_refused(NodeType::Agent, live),
+                "{live} holds a process and a session; renaming strands every peer addressing it"
+            );
+        }
+        for settled in [Stopped, Parked, NeedsAuth, BudgetExhausted, Error] {
+            assert!(
+                !rename_is_refused(NodeType::Agent, settled),
+                "{settled} has no live session; refusing here would make the board unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn only_agents_are_guarded() {
+        for t in [NodeType::Ctx, NodeType::Table, NodeType::Endpoint] {
+            assert!(!rename_is_refused(t, Running));
+        }
     }
 }
