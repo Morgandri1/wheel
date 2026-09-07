@@ -40,6 +40,14 @@ pub struct ApplyRequest {
     /// anyone opts in.
     #[serde(default)]
     pub allow_patch: bool,
+    /// Allow the board to WIRE nodes that already exist. Off unless asked for.
+    ///
+    /// Separate consent from `allow_patch`: a wire IS a capability, so attaching one to an existing
+    /// node changes what it can do or what can reach it without editing it. Left off, such a board
+    /// is refused with `wire_touches_existing_node`, naming the wire and which endpoint already
+    /// exists — which is what the confirm step shows as "this will wire these existing nodes".
+    #[serde(default)]
+    pub allow_wire: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +231,7 @@ pub async fn apply_board(
 
     let policy = ApplyPolicy {
         allow_patch: req.allow_patch,
+        allow_wire: req.allow_wire,
     };
     let plan = match validate(&req.board, &existing, policy) {
         Ok(plan) => plan,

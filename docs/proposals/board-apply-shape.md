@@ -16,7 +16,8 @@ x-auth-token: …   x-project-id: …
 {
   "board": { "nodes": [ … ], "wires": [ … ] },   // exactly what the builder emitted
   "dry_run": false,                               // true = plan only, change nothing
-  "allow_patch": false                            // true = may MODIFY existing nodes
+  "allow_patch": false,                           // true = may MODIFY an existing node's config
+  "allow_wire": false                             // true = may WIRE existing nodes
 }
 ```
 
@@ -27,8 +28,27 @@ such a board is refused with `patch_not_permitted`, one refusal per node it woul
 the confirm step can show the user exactly what they are being asked to allow before they allow it.
 "The builder named it" is not consent.
 
-Wiring TO an existing node is still fine without the flag — wiring to something is not changing it.
-Only changing a node's own config needs `allow_patch: true`.
+### `allow_wire` — wiring an existing node is also a change
+
+**Corrected, ADVERSARY 050.** This section previously said wiring to an existing node was fine
+without a flag, on the reasoning that "wiring to something is not changing it". That was wrong.
+
+**A wire IS the capability.** Attaching one to a node that already exists changes what it can do, or
+what can reach it, without editing a byte of its config: `ctx -> agent (send)` injects into that
+agent's prompt permanently; `agent -> vault (read)` hands it secrets it did not have; an `auth:none`
+endpoint wired to an agent puts the public internet on its inbox. None of those touch the node, so
+`allow_patch` never saw them.
+
+So a wire with EITHER endpoint already on the board needs `allow_wire: true`. Both directions count —
+inbound adds a channel into the node, outbound grants it new reach. Only a wire between two nodes
+**this same board is creating** is consent-free.
+
+The two flags are separate deliberately: "you may rewrite this agent's prompt" and "you may put a
+public endpoint on its inbox" are different risks, and granting one must not grant the other.
+`allow_patch: true` alone still refuses rewiring.
+
+Re-applying an unchanged board does NOT re-ask: the check runs after existing wires are filtered
+out, so a no-op stays a no-op.
 
 For the improve flow this means two round trips by design: apply with the flag off, show the user
 the `patch_not_permitted` list, then re-apply with `allow_patch: true` if they agree. A dry run
@@ -97,7 +117,7 @@ A failure is addressable, not just described:
 ```
 
 Codes: `wire_not_allowed`, `unknown_node`, `self_wire`, `duplicate_node_name`,
-`node_type_mismatch`, `board_too_large`, `patch_not_permitted`. **Render `message`**; branch on `code` only if you need to.
+`node_type_mismatch`, `board_too_large`, `patch_not_permitted`, `wire_touches_existing_node`. **Render `message`**; branch on `code` only if you need to.
 Every refusal is returned, not just the first — one bad wire from a builder usually means several.
 
 ## Guarantees Web can rely on
