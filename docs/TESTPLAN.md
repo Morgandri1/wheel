@@ -807,6 +807,8 @@ be seconds.
 | `POS-migration-no-visible-jump` | Rounding moves a node ≤0.5 cells/axis. One cell renders as one CSS px and the board caps zoom at 1.8 (`canvas.tsx`), so the worst a human can be shown is 1.27 px. Asserted rather than assumed, because it is the claim PM is relying on. | S3 |
 | `POS-migration-clamp-is-reported` | The ONLY unbounded case: a row already outside ±32767 lands on the bound from wherever it was, which is a node teleporting across the screen. Clamping is correct; doing it silently is not. | **S2** |
 | `POS-migration-is-idempotent` | A migration that re-applies its transform on every boot walks the board one cell per restart — invisible until it isn't. | **S2** |
+| `POS-migration-boots-past-unparseable-id` | A row whose `id` is not a UUID must not stop the engine BOOTING. `board::list` parsed every row and failed whole on the first bad one, so one unreadable row took the entire board down — and the board is the thing that would tell you which row is bad. A partial restore, a hand-edited row or an older schema all produce this. Found by accident: a readable fixture id (`mig-0000`) refused to boot the engine, and SDK asked that the awkward id stay rather than be quietly swapped for a UUID. | **S1** |
+| `POS-migration-bad-id-does-not-hide-good-nodes` | Skipping an unreadable row must not skip its neighbours — `/v1/board` still lists the well-formed nodes. | **S2** |
 
 ### API-postgres-arm-is-still-built
 
@@ -821,6 +823,19 @@ This is the case ADVERSARY pre-committed to watching for: efficiency work is whe
 | `API-postgres-arm-is-still-built` | `rust:clippy-pg` and `rust:test-pg` compile and test wheel-api with `--features postgres`. After the default changes these are the only things in CI that build the Postgres arm at all, so the predicate is that the arm is built and its 5 tests run. | **S1** |
 | `INFRA-budget-update-only-lowers` | `deps_gate.py --update` REFUSES to raise a ceiling without `--allow-regression`, naming every number that grew. Writing whichever value the tree happens to hold makes the budget a mirror rather than a ceiling, and A10's "a number someone has to argue for" becomes a number that silently follows the drift. Raised by API, twice. | **S2** |
 
+### EPH-* — an ephemeral agent must settle like any other
+
+PM measured this on the live deployment and the discriminator is one flag: `pm` is the only agent with `ephemeral_context = true`, and the only one stuck. Five others on the same engine and deploy settle normally. The timing is the tell — the turn COMPLETED (the operator got his reply) and status went to `starting` two seconds later. That is the restart that follows an ephemeral clear, and the agent then LIVES in `starting` between every turn rather than passing through it. It is also the operator's own agent: the only ephemeral one on the board is the one he talks to.
+
+Deliberately NOT asserted: that the status never touches `starting`. Restarting is what the flag is *for*, and forbidding the transition would forbid the feature. The defect is failing to leave it — which is why ADVERSARY's `in_flight`-keyed deadline is right and a time-in-`starting` deadline would kill this agent every turn, forever.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `EPH/plain-settles` | **CONTROL.** An identical non-ephemeral agent completes a turn and settles, in the same engine and the same run. If it does not, the fault is not the flag and attributing it to `ephemeral_context` would be wrong. | |
+| `EPH/context-was-cleared` | **NON-VACUITY CONTROL.** The session id changes across the turn. If the flag were silently ignored the agent would settle perfectly and the assertion below would pass while testing nothing — BUG-024's shape. | |
+| `EPH-settles-after-turn` | An agent with `ephemeral_context: true` reaches a settled status after a completed turn. | **S1** |
+| `EPH-second-turn-still-works` | It completes a SECOND turn. One turn proves the first clear survived; the operator's agent does this every turn. | **S1** |
+
 ### PROGRESS-* — liveness is not progress
 
 Two production failures in one evening shared a shape: the process was alive, answered `/healthz` with 200, and was doing no work. The escaper panic killed the delivery task while tokio kept the process up; endpoint ingress enqueued and woke the agent but never pumped the queue. Both systems were asked *are you up*, both truthfully said yes, and up was read as working. **This suite contains no liveness assertion at all.** Liveness is recorded in failure text only — because "healthy and stuck" is the signature of the class, and naming it is what stops the next person reaching for a restart.
@@ -828,6 +843,7 @@ Two production failures in one evening shared a shape: the process was alive, an
 | ID | Asserts | Sev |
 |---|---|---|
 | `PROGRESS-message-reaches-consumed/<producer>` | A message accepted by a producer reaches `consumed`. Parametrised over all four entry points (user-send, agent-msg, endpoint-ingress, script-msg): they share a drain but not an entry, and tonight's P0 was the ingress entry while agent-to-agent worked perfectly. A gate written against the path that broke last time cannot miss the one that breaks next. | **S1** |
+| `PROGRESS/endpoint-ingress` | **BUG-028 (S1, open).** Ingress does not drain to a RUNNING agent on main: 6/6 failures when idle, while interleaved user messages to the same agent are consumed instantly. `168430f` fixed the PARKED path only, which is the one every verification exercised. |  |
 | `PROGRESS-transitional-status-resolves` | `starting`/`queued` resolve **within a bounded deadline** (60s). ADVERSARY 041: a child can spawn cleanly then block forever on an init line that never comes, so an unbounded "eventually" is precisely the test production passes today. The bound is argued both ways — 6× the engine's own 10s health budget so a slow start has room, and far inside the 45 minutes an operator actually waited before calling it broken. | **S1** |
 | `PROGRESS-deadline-settles` | After the deadline fires, the status is an ANSWER, not another transitional state. A deadline that returns the agent to `starting` has not resolved the hang, it has made it periodic. | **S1** |
 | `PROGRESS-deadline-reason-readable` | The agent leaves the transitional state with a non-empty `last_error`. A status change with no reason sends the operator to the logs to reconstruct it, which is the 45 minutes this class costs. | **S2** |

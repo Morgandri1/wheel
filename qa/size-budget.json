@@ -1,7 +1,11 @@
 {
-  "wheel": 916944,
-  "wheel-api": 7897376,
-  "wheel-engine": 7319200,
-  "wheel-host": 6806096,
-  "wheeld": 10747248
+  "platforms": {
+    "aarch64-apple-darwin": {
+      "wheel": 916944,
+      "wheel-api": 7897376,
+      "wheel-engine": 7319200,
+      "wheel-host": 6806096,
+      "wheeld": 10747248
+    }
+  }
 }
