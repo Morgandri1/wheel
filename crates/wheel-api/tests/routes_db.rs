@@ -7,6 +7,12 @@
 //! holds credentials the caller does not, so anything the caller can smuggle through it inherits
 //! that authority.
 
+// Runs against Postgres, which only a build with the `postgres` feature can open. Without the
+// gate these suites still COMPILE in a default build and then panic at `Db::connect`, which is how
+// they took main red: the driver stopped being a default feature and the tests kept trying to use
+// it. `boot_db.rs` was already gated this way.
+#![cfg(feature = "postgres")]
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
