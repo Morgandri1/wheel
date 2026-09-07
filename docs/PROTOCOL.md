@@ -11,10 +11,27 @@ shapes**; this document is normative for routes, semantics, ordering and errors.
 
 ## 0. Status of this version
 
-Implemented in `wheel-core` and pinned by tests: the data model, the wire matrix, the `<AgentPrompt>` envelope,
-the agent preamble, delivery states, limits, the engine spawn contract.
-Not yet implemented (documented here so API/Web/QA can build against a fixed target): the routes themselves,
-which land with the engine in M1/M2 per the milestone column in each table.
+**Implemented and pinned by tests:** the data model and wire matrix, the `<AgentPrompt>` envelope, the agent
+preamble, delivery states and limits, the engine spawn contract, the control plane and CLI plane routes, agent
+supervision (start/stop/park/resume, budgets, ephemeral context), ctx and table nodes, vaults, endpoints and
+ingress, tool nodes, workspace materialisation, and the built-in MCP server.
+
+**Documented here but NOT built yet.** This list exists because the failure we keep catching is a capability
+that *reads* as present: a doc in the present tense, or a route that answers with a success shape, is
+indistinguishable from a working feature until someone depends on it. Each of these is marked at its own entry
+too — this is the index, not the only warning.
+
+| Capability | State today | Milestone |
+|---|---|---|
+| `script` nodes — execution | Types, validation, wire matrix and the capability gate are all done. There is no runtime, no `POST /v1/cli/run`, and **no `wheel run` subcommand** (it exits 1, "unknown command"). The agent preamble already advertises it, so agents will try it and fail. | M2 |
+| `chest` nodes — blob storage | Types, key normalisation and the sqlite index table exist; no blob I/O, no `/v1/chests/*` routes. All four CLI verbs answer an honest 400. | M2 |
+| `mcp` nodes — per-node servers | `McpConfig` is validated and stored, but wiring `agent → mcp` attaches nothing to the harness. It is accepted and silently does nothing. The `--mcp-config` the engine passes is the built-in `wheel mcp-serve` server, unrelated to these nodes. | M2 |
+| Size ceilings for the two above | `MAX_BLOB_BYTES` and `MAX_SCRIPT_OUTPUT_BYTES` are constants with no call sites. | with the above |
+
+**Isolation gap, stated because it is load-bearing for everything above.** One uid per project, not per node
+(§2's `base+1+n` is not built). Each node's token is distinct and its file is 0600, but a shared uid makes every
+sibling's token file readable, so any node can present as any other. Measured in production 2026-09-07. This
+gates script execution — see `docs/proposals/script-execution-scope.md`.
 
 ---
 
@@ -134,11 +151,13 @@ not silent.
 **Vault values are never included** — a vault node returns only its `config.keys`.
 
 Node creation validates, in order: name charset + reserved names (`user`, `wheel`, `system`, `engine`) + uniqueness;
-config against its type; then side effects (create `t_<name>` for a table, `chest/<id>/` for a chest).
+config against its type; then side effects (create `t_<name>` for a table). *(The `chest/<id>/` directory is
+NOT created — chest storage is M2.)*
 A rename of a table node renames its sqlite table in the same transaction.
 
-`DELETE /v1/nodes/:id` cascades: removes wires in **both** directions, drops `t_<name>`, deletes the chest
-directory and script directory, stops a running agent, and deletes that node's queued messages.
+`DELETE /v1/nodes/:id` cascades: removes wires in **both** directions, drops `t_<name>`, stops a running
+agent, and deletes that node's queued messages. *(Chest and script directories are NOT deleted — neither is
+created yet; M2.)*
 
 Wire creation is checked against the §3 matrix by `wheel_core::check_wire` — **the same function the API calls**,
 so the two cannot disagree. Self-wires are rejected. Creating a wire that already exists is idempotent (`204`).
@@ -188,8 +207,8 @@ GET    /v1/cli/whoami                      → {name, id, type, position, wires}
 GET    /v1/cli/connections                 → {wires: [{peer, type, outgoing, semantics}]}
 GET    /v1/cli/list                        → {agents: [{name, status, session_id, hosted_on}]}
 GET    /v1/cli/ls[?node=<n>&prefix=<p>]    → {keyspaces} with no node, else {keys}
-GET    /v1/cli/read?addr=<node>[/<row>]    → ctx markdown / table row / chest blob
-POST   /v1/cli/write   {addr, value}       → upsert; ctx replace, table row, chest blob
+GET    /v1/cli/read?addr=<node>[/<row>]    → ctx markdown / table row  (chest blob: M2, returns 400)
+POST   /v1/cli/write   {addr, value}       → upsert; ctx replace, table row  (chest blob: M2, returns 400)
 POST   /v1/cli/rm      {addr}              → {node, row, removed}
 POST   /v1/cli/query   {table, sql}        → {rows}   read-only, one table
 POST   /v1/cli/msg     {to, body, reply_to?} → {id, sha256, bytes, state}
@@ -580,7 +599,10 @@ claude --print
        --permission-mode bypassPermissions
        --append-system-prompt-file <path>
        [--model <model>]        # omitted entirely when config.model is null
-       [--mcp-config <path>]    # only when >=1 mcp node is wired
+       --mcp-config <path>      # ALWAYS passed: it carries the built-in `wheel mcp-serve`
+                                # server (§3c#1). Per-node `mcp` nodes are NOT yet attached to
+                                # the harness — wiring one is accepted and silently does
+                                # nothing until M2.
        [--resume <session_id>]  # resume only; never on a fresh start
 ```
 
@@ -632,13 +654,16 @@ pinned with QA before M2 rather than guessed.
 ## 5. The `wheel` CLI
 
 Yoke-shaped by PM decision (§3): every node is a keyspace, identity comes from the token and is never passed,
-denial is **exit 3**. Reaches the engine at `WHEEL_ENGINE_URL` with `WHEEL_TOKEN`.
+denial is **exit 3**. Reaches the engine at `WHEEL_ENGINE_URL` with the token read from the file named by
+`WHEEL_TOKEN_FILE`. **Not `WHEEL_TOKEN`**: an env var is readable through `/proc` by any process of the same
+uid, so the CLI refuses it outright rather than falling back (F007). This page said `WHEEL_TOKEN` until
+2026-09-07 and was contradicting the fix described elsewhere in it.
 
 ```
 wheel whoami                          identity: name, id, type, position, wires both directions
 wheel connections                     my wires, in plain language
 wheel ls                              every keyspace I'm wired to, with wire type   (§3c#7)
-wheel ls    <node> [prefix]           table row keys / chest paths
+wheel ls    <node> [prefix]           table row keys  (chest paths: M2, returns 400)
 wheel msg   <agent> "<text>"|--stdin|--file <p>   → {id, sha256, bytes, state}      (§3c#3)
 wheel read  <node>                    ctx markdown / table rows / chest listing
 wheel read  <node>/<row>              table row JSON / chest blob (--out <file>)
@@ -647,7 +672,9 @@ wheel write <node>/<row> "<v>"|--stdin|--file     table: upsert by key; chest: p
 wheel rm    <node>/<row>              table row / chest blob (needs write)
 wheel query <table> "<SELECT …>"      read-only SQL, scoped to that one table
 wheel secret get <vault>/<key>        vault value
-wheel run   <script> [args…]          invoke a script node; stdout returned
+wheel run   <script> [args…]          M2 — NOT IMPLEMENTED. There is no `run` subcommand today: it exits 1
+                                      with "unknown command". Note the agent preamble already advertises it
+                                      (wheel-core/src/preamble.rs), so an agent WILL try it and fail.
 wheel inbox [--since <ts>] [--limit n] | wheel inbox <id>    re-read my messages    (§3c#2)
 wheel ctx clear                       clear my own context
 ```
@@ -698,8 +725,8 @@ and re-checked by the engine, which never trusts a child.
 |---|---|---|
 | Message body | 256 KiB | `too_large`, refused at send |
 | ctx markdown / table row value | 1 MiB | `too_large` |
-| Chest blob | 50 MiB | `too_large` |
-| Script output captured | 1 MiB | truncated **in the captured output only**, flagged in the result |
+| Chest blob | 50 MiB | `too_large` — *constant only, NOT enforced; no chest storage yet (M2)* |
+| Script output captured | 1 MiB | *constant only, NOT enforced; no script runtime yet (M2)* |
 | Script runtime | `timeout_secs`, default 60, max 300 | `timeout`, process killed |
 | Table query | 5 s | `timeout` |
 
