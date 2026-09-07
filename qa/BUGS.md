@@ -1397,3 +1397,32 @@ Both halves already exist: `cargo run -p wheel-core --bin export-schema` and `pn
 
 **Lands WITH Web's regeneration, not before** — it is red today, and a deliberately-red gate on main
 freezes every other lane.
+
+### 036 — a restart silently loses an in-flight message, and `/healthz` calls it healthy (S1, SDK, **open**)
+
+Found by SDK (`docs/proposals/restart-robustness-current-behaviour.md`, 96f9f08). If the engine
+dies while a message is in state `delivered`, no boot path requeues it. It stays `delivered`
+forever and the agent is permanently wedged.
+
+**The second half is the worse half:** the stall detector excludes `delivered` rows, so
+`/healthz` reports that agent HEALTHY. That is the sixth instance of the class
+`HEALTH-implies-*` was built for — the work has stopped and the health signal denies it. The
+first five each made a failure quieter; this one makes a permanent wedge invisible.
+
+Tests: `RESTART-inflight-message-survives`, `RESTART-wedged-agent-is-not-healthy`. Both fail
+today, so both land as PENDING and go red demanding promotion when SDK's fix lands.
+
+### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **open**)
+
+Raised by SDK. Every agent on the cloud board reads `turns=0` while the cloud QA agent's Claude
+transcript is 2011 lines with 754 assistant messages and 366 tool calls from Sep 6, and no
+"could not record spend" error was logged. Whether accounting is broken or those rows postdate
+the runs is unsettled and the first wake will settle it empirically.
+
+**The gap is ours regardless of which it is:** nothing asserts that a completed turn increments
+the counter.
+
+**SDK's caution is the whole design of this test and it is correct:** assert on a turn the test
+CAUSES, not on existing rows. A test that merely reads `turns=0` passes today for the wrong
+reason — and would keep passing after the bug is fixed, since it never caused a turn to count.
+Cause it, then assert the delta. Same shape as the 12 skips that looked like 12 passes.
