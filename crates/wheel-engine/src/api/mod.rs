@@ -303,10 +303,14 @@ mod tests {
             head.contains("ApiResult<Json<Node>>"),
             "patch_node must answer with the full node; Web reads `position` off this reply.\n{head}"
         );
-        let body: String = src.lines().skip(sig).take(40).collect::<Vec<_>>().join("\n");
+        let body: String = src
+            .lines()
+            .skip(sig)
+            .take(40)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            body.contains("board::update_with(&conn, &node")
-                && body.contains("Ok(Json(node))"),
+            body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
             "patch_node must return the SAME node value it stored, so the reply carries the \
              clamped position rather than an echo of the request"
         );
