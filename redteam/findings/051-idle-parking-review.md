@@ -34,7 +34,7 @@ This is the right design.
    041's class (start-not-advancing), not new here.
 5. **timer/message race:** sound (above).
 
-## Tighten #1 (Low-Medium) — swallowed kill failure claims a release that may not have happened
+## Tighten #1 — FIXED & CONFIRMED (d44f8fd) — swallowed kill failure claims a release that may not have happened
 `park` (mod.rs:829): `let _ = r.child.kill().await;` — the kill Result is discarded, then the token is revoked
 and status set Parked UNCONDITIONALLY. If kill errored, park claims Parked (a saving) while the process may
 still be alive (the ~162MB not released) — the exact "park that doesn't release" vector (2). It contradicts the
@@ -44,6 +44,12 @@ is a real backstop (it drops at park's end → kill retried by the tokio driver)
 Fix: check the kill result; on failure, log and do not claim Parked (leave a state that reflects a still-running
 process), or verify the release before revoking/parking. Worth doing before a restart-all-host deploy on a
 compute-critical fix; otherwise it is backstopped and a fast-follow.
+
+**CONFIRMED FIXED (d44f8fd, all three sites — park:835, stop:887, clear_context:1370):** each now
+`if let Err(e) = r.child.kill().await { tracing::warn!(%agent, error=%e, ...) }` — the kill failure is LOGGED
+(visible), no `let _ =` swallow remains, and kill_on_drop stays the backstop for the actual release. That is the
+agreed one-liner (remove the SILENT part; rely on kill_on_drop for the kill). Verified against the branch @
+d44f8fd, which builds on the reviewed 47486f8. This was the last merge-gate review item — GREEN from red-team.
 
 ## Tighten #2 — CORRECTED: `arm_park_timer` stacks a timer per turn → PREMATURE PARK (QA BUG-040), not harmless
 `arm_park_timer` (mod.rs:848) spawns a NEW `tokio::spawn(sleep→park)` each time it is armed (after every turn,
