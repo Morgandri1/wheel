@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 use wheel_core::{spawn::*, ListenAddr};
 
+/// Matches QA's `WHEEL_PROGRESS_RESOLVE_SECS` default so the CI gate and the
+/// runtime backstop watch the same signal rather than inventing two
+/// definitions of "stuck" (PM, contract b1f76bc).
+pub const DEFAULT_STARTUP_DEADLINE_SECS: u64 = 60;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub project_id: uuid::Uuid,
@@ -21,6 +26,14 @@ pub struct Config {
     /// For testing and red-team probes ONLY: the engine refuses to boot with
     /// this set in production. See [`ENV_TOOL_ALLOW_HOST`].
     pub tool_allow_hosts: Vec<String>,
+    /// How long an agent may stay in `starting` WITH WORK QUEUED before the
+    /// engine calls it wedged (ADVERSARY 041).
+    ///
+    /// Config rather than a global env read so a test can set it per engine:
+    /// two tests mutating one process-wide variable race each other, which is
+    /// exactly how the first version of this failed — green alone, red in the
+    /// suite.
+    pub startup_deadline_secs: u64,
 }
 
 /// Exact `host:port` targets a tool call may reach despite the SSRF policy.
@@ -107,6 +120,10 @@ impl Config {
             listen,
             json_logs: std::env::var(ENV_LOG).map(|v| v == "json").unwrap_or(false),
             tool_allow_hosts: tool_allow_hosts()?,
+            startup_deadline_secs: std::env::var("WHEEL_STARTUP_DEADLINE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_STARTUP_DEADLINE_SECS),
         })
     }
 
