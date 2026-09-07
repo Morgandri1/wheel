@@ -93,7 +93,9 @@ facts: ## PM ticket A7 — measure disk, memory and toolchain from INSIDE runnin
 	@python3 qa/tools/sandbox_facts.py
 
 engine-image: ## build wheel-engine:dev (production layout)
-	docker build -f docker/Dockerfile.host -t wheel-engine:dev .
+	docker build -f docker/Dockerfile.host \
+		--build-arg GIT_SHA=$$(git rev-parse HEAD) \
+		-t wheel-engine:dev .
 
 engine-image-test: engine-image ## build wheel-engine:test (QA fake harnesses)
 	docker build -f docker/Dockerfile.test --build-arg BASE=wheel-engine:dev -t wheel-engine:test .

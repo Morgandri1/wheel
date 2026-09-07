@@ -101,7 +101,14 @@ RUN mkdir -p /data && chown agent:agent /data
 # volume at /data explicitly, and Railway attaches its own — so the declaration only ever created
 # an anonymous volume when someone forgot to mount one.
 
-ENV WHEEL_ROLE=engine \
+# The commit this image was built from, so a RUNNING engine can say what code it
+# is rather than leaving an operator to infer it from behaviour. Defaults to
+# `unknown` deliberately: an unstamped build must not be mistaken for a stamped
+# one, and `make engine-image` passes --build-arg GIT_SHA=$(git rev-parse HEAD).
+ARG GIT_SHA=unknown
+
+ENV WHEEL_BUILD_SHA=$GIT_SHA \
+    WHEEL_ROLE=engine \
     WHEEL_DATA_DIR=/data \
     WHEEL_LISTEN=tcp://0.0.0.0:7000 \
     WHEEL_LOG=json

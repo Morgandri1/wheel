@@ -287,7 +287,34 @@ async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
             "agents are holding messages nothing is delivering"
         );
     }
-    Json(serde_json::json!({ "ok": true, "stalled": stalled }))
+    Json(serde_json::json!({
+        "ok": true,
+        "stalled": stalled,
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": build_id(),
+    }))
+}
+
+/// What code this RUNNING engine actually is.
+///
+/// Four times in one night someone had to answer "is the thing running the
+/// thing we merged?" and could only infer it: a stale `wheel-engine:test` tag
+/// gave a PASS describing a different binary, a CI run described whoever pushed
+/// last rather than the commit in question, and a `make check` described a
+/// working tree rather than HEAD. Every one of those is the same question —
+/// which input produced this result — and the engine could not answer it about
+/// itself.
+///
+/// Stamped by the image at build time. `unknown` when it was not, which is
+/// honest: an unstamped build is exactly the case where an operator must not
+/// conclude anything from a number.
+fn build_id() -> &'static str {
+    // Read once: this is called on a probe the host polls, and it cannot change
+    // while the process lives.
+    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD
+        .get_or_init(|| std::env::var("WHEEL_BUILD_SHA").unwrap_or_else(|_| "unknown".into()))
+        .as_str()
 }
 
 // --- request bodies --------------------------------------------------------
@@ -367,6 +394,36 @@ mod tests {
             body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
             "patch_node must return the SAME node value it stored, so the reply carries the \
              clamped position rather than an echo of the request"
+        );
+    }
+
+    /// The engine must be able to say what code it IS.
+    ///
+    /// Four times in one night someone had to answer "is the thing running the
+    /// thing we merged?" and could only infer it — a stale image tag, a CI run
+    /// describing a later push, a `make check` describing a working tree. The
+    /// engine could not answer it about itself, so every answer was an
+    /// inference from behaviour.
+    ///
+    /// The assertion that carries this is the UNSTAMPED case. A build with no
+    /// commit stamped must say `unknown`, not a version number that reads as an
+    /// answer — an operator who is told something specific will believe it, and
+    /// the whole point is to stop people concluding from the wrong input.
+    #[test]
+    fn an_unstamped_build_says_so_rather_than_offering_a_number() {
+        // The image sets WHEEL_BUILD_SHA; a cargo build does not, which is
+        // exactly the case under test.
+        if std::env::var("WHEEL_BUILD_SHA").is_err() {
+            assert_eq!(
+                build_id(),
+                "unknown",
+                "an unstamped build must not present a number an operator would trust"
+            );
+        }
+        // And the crate version is compile-time, so it is always truthful.
+        assert!(
+            !env!("CARGO_PKG_VERSION").is_empty(),
+            "the version is stamped at compile time and cannot be missing"
         );
     }
 
