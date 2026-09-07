@@ -149,3 +149,38 @@ host.db engine_secret but will use SDK's intended path, not poke the engine dire
 ## Trigger
 PM pulls the wake only after all four SDK slots are filled and pushed. Re-read this file, do not trust a
 message summary of it.
+
+## PM DECISIONS (2026-09-07) + prerequisite status
+
+Adopting all of SDK's recommendations:
+- Option (B): PATCH `workspaces` onto adversary first (routes clone through the A9 fix, no PAT on disk;
+  validates merge-PATCH for real), then start+send.
+- Cascade bound: DELETE adversary's `pm:send` wire for the duration (structural; reversible; costs no
+  signal — all five are engine-side). Restore it after.
+- Agent: adversary (0be41bbb) — smallest blast radius, empty workspace, ephemeral_context:false.
+- Drive via the PUBLIC API (SDK's intended path; tests the auth boundary we ship), NOT the engine proxy.
+
+PREREQ STATUS:
+1. merge-PATCH deployed: SATISFIED. wheel-host is on commit 330deed (RFC-7386 merge PATCH), status
+   SUCCESS, deployed 11:27Z; later docs-only commits correctly did not rebuild.
+2. claude auth: SATISFIED (SDK measured authenticated=true, env mode, CLAUDE_CODE_OAUTH_TOKEN on vault).
+3. GITHUB_TOKEN: OPERATOR must confirm a CURRENT token is in secrets/GITHUB_TOKEN. Vault values are
+   write-only, so neither SDK nor PM can read it. Clone fix has landed, so storing one is now safe. If it
+   is empty/revoked, signal 5 (branch lands on origin) fails as a stale credential, not a product gap.
+4. owner auth for 6906cadb: OPERATOR-gated. The wake drives via the public API as an OWNER of the
+   operator's project; PM must not authenticate as the operator (standing constraint). So the operator
+   either issues a session token for PM to drive the ~5 calls, or runs the calls himself with PM's exact
+   sequence. Engine-proxy drive is rejected: SDK's guidance is it bypasses the auth boundary we ship.
+
+EXACT SEQUENCE (once 3 and 4 clear), via https://wheel-api-production.up.railway.app, headers
+`x-auth-token: <owner jwt>` + `x-project-id: 6906cadb-...`:
+  a. DELETE adversary's pm:send wire (cascade bound)
+  b. GET adversary node (baseline config)
+  c. PATCH adversary {"config":{"workspaces":[{"path":"wheel","git":{"url":".../wheel.git","ref":"main"}}]}}
+  d. GET adversary node again, diff -> proves merge kept harness/system_prompt/run_on_startup
+  e. POST agents/adversary/start ; POST agents/adversary/send {"body": append-line-to-dogfood-wake-log,
+     commit, push to branch dogfood/wake-test-1, do NOT message anyone}
+  f. observe 5 signals (read-only, via host proxy is fine for observation)
+  g. restore: re-add adversary pm:send wire; delete test branch
+Caveat (SDK): materialise errors are swallowed in spawn; if signal 5 fails under (B), read the engine log
+before blaming the agent.
