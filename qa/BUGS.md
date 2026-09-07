@@ -1112,3 +1112,42 @@ error a second time. `qa:image-contents` ran whenever an engine image EXISTED, s
 reported a verdict about a six-hour-old image — the exact trap that made an afternoon of
 suites describe a pre-fix engine. It now asserts `image_freshness()` and SKIPS a stale one.
 It fired on the first run: `wheel-engine:test` was 88 minutes behind `crates/`.
+
+---
+
+### 028 — ingress does not drain to a RUNNING agent (S1, SDK, **open**)
+
+`PROGRESS-message-reaches-consumed/endpoint-ingress`. Found on the gate's first ever run.
+
+An endpoint node wired `endpoint→agent (send)`, agent started and idle. The ingress hit
+creates a message in the agent's inbox and it stays `queued` forever. User messages to the
+same agent, in the same session, interleaved between the ingress hits, are consumed
+instantly throughout — which is what rules out a wedged harness or a slow host.
+
+| condition | main's engine (`0ea5`, sha `74b8981f`) | a worktree engine (`b8df`, sha `2e89046c`) |
+|---|---|---|
+| agent IDLE | **6/6 failed to drain** | 0/6 |
+| agent BUSY | 3/6 failed | 0/6 |
+
+`168430f` fixes the PARKED path: the hit starts the agent and the queue drains on start.
+Every verification anyone ran — including PM's end-to-end webhook to a parked cloud PM —
+exercised that path. Nothing covered an agent that was already warm.
+
+**The fix for the running path exists in someone's worktree and is not on main.** The two
+images' engine binaries differ and `git log` shows no engine commit after `168430f` on
+origin/main.
+
+Operator impact: the Telegram bridge delivers the first message after a park and silently
+drops every message while pm is warm, `/healthz` at 200 throughout.
+
+**Two method notes, because both nearly produced a wrong report:**
+
+1. My suite fired user-send first and ingress second, which is equally explained by "the
+   second message never drains, whatever produced it" — a fake-harness artifact that would
+   have sent SDK to the wrong file. Re-running with ingress FIRST and user messages
+   interleaved is what made it a producer finding rather than a sequence one.
+2. My second run PASSED and I was composing a retraction. The mutable tag
+   `wheel-engine:test` had been rebuilt under me between runs. **`pin_image()` pins within
+   a run; it does nothing across runs**, and comparing two runs of a suite silently
+   compares two engines. Any claim that rests on "it passed this time" must name the image
+   sha, not the tag.
