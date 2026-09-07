@@ -62,6 +62,16 @@ Two consequences worth stating:
   the carrier for its whole environ. Trade-off: it also blocks core dumps/debugging of the engine. #17 +
   per-node uids is the cleaner path; noting the option because it is one line and closes the general carrier.
 
+## SEQUENCING (PM ruling): 037/038 GATE script execution (M2), not the reverse
+The sharpest realization of this blast radius: once script execution ships (M2), a `script` node runs as the
+project uid and can read a SIBLING node's 0600 token file (item 3 below) — including pm's — and then act AS
+that node: send messages as pm, write pm's ctx/plans, drain pm's queue. Same for reading a sibling's exported
+vault credentials (item 2). So script-exec on the single-uid board = any script can impersonate any node,
+pm included. PM's ruling, recorded here so the M2 script-execution ticket carries it: **per-node uids (037) and
+the creds-in-creds-dir cleanup (038) must land BEFORE script execution is enabled** — "a board where a script
+can impersonate pm is not a board you turn script-exec on." The wheel-on-wheel dogfood surfaced this before it
+bit. (Cross-refs: 046/047 capability-boundary; 048 network layer; the egress PoC is likewise gated to M2.)
+
 ## The single fact that makes everything below true
 `§2`/F007: per-node uids are not implemented. On the **process backend (production, Railway)** the host
 `setuid`s to the project uid and execs the engine as that uid (§4b: "the engine runs as the project uid the

@@ -195,7 +195,14 @@ pub async fn ls(
                 .map_err(storage_err)?;
             Ok(Json(serde_json::json!({ "node": node.name, "keys": keys })))
         }
-        NodeType::Chest => Ok(Json(serde_json::json!({ "keys": [] }))),
+        // Not `{"keys": []}`. Chest storage is M2, and an empty list is
+        // indistinguishable from a chest that really is empty — so an agent
+        // asking what is in there would be told "nothing" rather than "ask
+        // again after M2". Its read/write/rm siblings all answer honestly;
+        // this arm was the one that lied.
+        NodeType::Chest => Err(ApiError::invalid(
+            "listing a chest node is not implemented yet",
+        )),
         other => Err(ApiError::invalid(format!("a {other} node has no keys"))),
     }
 }
@@ -856,6 +863,28 @@ mod toctou_tests {
             "these handlers release the db lock, act, and disclose the result without re-checking \
              the caller's wire, so a capability revoked mid-action still yields its data: \
              {unguarded:?}. Re-acquire the lock and `require(..)` again before returning."
+        );
+    }
+
+    /// A chest must never be answered with success while its storage is
+    /// unimplemented. `ls` used to return `{"keys": []}`, which an agent cannot
+    /// tell apart from a chest that is genuinely empty — so it was told
+    /// "nothing is in there" when the truth was "nobody has built this yet".
+    /// Its `read`, `write` and `rm` siblings all say so plainly.
+    ///
+    /// When chest storage lands, this test is the thing that should fail, and
+    /// deleting it is the right fix at that point.
+    #[test]
+    fn no_chest_arm_answers_with_success_while_storage_is_unimplemented() {
+        let src = include_str!("cli_routes.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+        let offenders: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains("NodeType::Chest =>") && l.contains("Ok("))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a chest is being answered with a success while its storage is not implemented, so an              agent cannot tell 'empty' from 'not built yet': {offenders:?}"
         );
     }
 }

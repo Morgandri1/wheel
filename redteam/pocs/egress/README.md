@@ -18,3 +18,12 @@ infra/prune-probe-projects.railway.sh states this directly ("resolve only inside
 network, and no container there has both a database client and an HTTP client"). The host's own
 :7100 is bearer-gated. The tool-executor SSRF policy (host_is_denied) also blocks *.railway.internal.
 Fill TOK with a throwaway session token to run once script execution exists.
+
+## Why this is gate 2 for script execution (PM, b7a764c)
+A raw Python script's sockets are constrained by NOTHING: the SSRF denylist (host_is_denied / resolve-and-pin /
+ip_is_denied — verified sound in 045 and the SSRF verdict) guards ONLY tool-node and mcp URLs; it does not sit
+in the path of a script's `socket.connect`. So on the co-located deployment (finding 048) a script would have
+unconstrained raw reachability to postgres:5432 and wheel-api:8080 — guarded by neither the (tool/mcp-only)
+SSRF policy nor the (absent, 048) network segmentation. Hence: this probe must go GREEN (raw agent/script
+egress to the internal targets denied on the real topology) before script execution ships. 037/038
+(impersonation) are gate 1; this is gate 2.
