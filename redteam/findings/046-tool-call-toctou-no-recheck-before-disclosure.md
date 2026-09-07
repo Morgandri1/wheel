@@ -1,8 +1,10 @@
 # 046 — `tool_call` is a SECOND lock-releasing handler and lacks `query`'s re-check: a revoked tool wire still completes and discloses a call
 
-- **Severity:** Low (capability-boundary TOCTOU; narrow window — a revoke must land during the specific call —
-  and tool nodes are M2). Raised because it is on the capability boundary, which PM named as the class to be
-  least wrong about, and because it is a side-effecting path. Owner: SDK/Engine. Boundary TB4 (agent → tool).
+- **Severity:** Medium (PM ruling; I initially rated Low). My Low rested on the narrow window (a revoke must
+  land during the specific call) and tool nodes being M2. PM elevated it to Medium because it sits on the
+  capability boundary — "the premise the entire product rests on" — and is a side-effecting path (an external
+  call with vault credentials disclosed to a de-authorized agent). Both rationales are recorded; the accepted
+  severity is Medium. Owner: SDK/Engine. Boundary TB4 (agent → tool).
 - **Status:** CONFIRMED by source (origin/main). Found by probing SDK's own TOCTOU description — SDK invited it
   ("if it doesn't match, I want to know"). It does not match: SDK's "every cli handler EXCEPT query holds the
   lock across check AND action" omits `tool_call`, which releases the lock like `query` but does NOT re-check.
