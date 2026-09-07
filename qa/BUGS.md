@@ -1506,3 +1506,37 @@ pass end to end. `API-public-drive-end-to-end`.
 
 **Operator-gated**, the same way the wake was: it needs a token nobody here holds. That is why
 it is filed rather than done.
+
+### 040 — a stale park timer parks an agent before its configured idle timeout (S3, SDK, **open**)
+
+`arm_park_timer` (supervisor/mod.rs) spawns a detached `tokio::spawn(sleep -> park)` at EVERY
+turn end and nothing cancels the previous one. A timer armed by an earlier turn fires later,
+finds the agent idle with an empty queue, and parks it — timed from that older turn, not from
+the last one.
+
+Measured, not argued:
+
+```
+idle_timeout_secs = 20, second turn 8s after the first
+PARKED 11.7s after the last turn        20 - 8 = 12
+```
+
+So the implemented behaviour is "parks at least one timeout after SOME turn, whenever it next
+happens to be idle", not "parks after `idle_timeout_secs` of idleness". The config key does
+not mean what it says.
+
+**Amber, not red, and the reasons are worth keeping:** `park()` re-checks `status == Idle` and
+an empty queue under the slot lock, so it never parks a busy agent or one with work waiting;
+session and resume are intact (`ENG-park-*` is 10/10 on the same code); and it fails in the
+CHEAP direction — early parking saves more compute, not less.
+
+**The cost is churn.** An agent messaged every minute with a 300s timeout accumulates timers
+and can park shortly after most turns, paying a process spawn on nearly every message — the
+opposite of what a long `idle_timeout_secs` is set to buy.
+
+**Fix (PM's call, and it closes ADVERSARY's stale-timer M2 too):** have `park()` compare
+`last_activity` against now and re-arm for the remainder rather than parking. Less state than
+tracking JoinHandles, and self-correcting.
+
+**Found by reading the code before running anything, then measuring.** SDK's two unit tests
+are both correct and neither covers it; re-running them would never have shown it.
