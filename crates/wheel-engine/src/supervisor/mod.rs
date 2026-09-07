@@ -826,7 +826,19 @@ impl Supervisor {
         }
 
         if let Some(mut r) = guard.take() {
-            let _ = r.child.kill().await;
+            // NOT `let _ =`. A kill that fails leaves a live process while the
+            // board says Parked — the saving is claimed and not made, and it is
+            // invisible. `kill_on_drop(true)` still reaps `r` at the end of this
+            // scope, so the process does die; what was missing was anyone ever
+            // hearing that the direct kill did not work. (ADVERSARY, on the
+            // risk I flagged as #2 in the review request.)
+            if let Err(e) = r.child.kill().await {
+                tracing::warn!(
+                    %agent,
+                    error = %e,
+                    "killing a parked agent's process failed; kill_on_drop is the backstop"
+                );
+            }
         } else {
             // No process to stop: nothing to park, and marking it Parked would
             // claim a saving that was never made.
@@ -870,7 +882,11 @@ impl Supervisor {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {
-            let _ = r.child.kill().await;
+            // Same reasoning as `park`: kill_on_drop reaps it either way, but a
+            // failure that nobody hears is a process the board thinks is gone.
+            if let Err(e) = r.child.kill().await {
+                tracing::warn!(%agent, error = %e, "killing a stopped agent's process failed");
+            }
         }
         {
             // Revoke on stop: a token left live after the process is gone is a
@@ -1351,7 +1367,9 @@ impl Supervisor {
             let slot = self.slot(agent).await;
             let mut guard = slot.lock().await;
             if let Some(mut r) = guard.take() {
-                let _ = r.child.kill().await;
+                if let Err(e) = r.child.kill().await {
+                    tracing::warn!(%agent, error = %e, "killing a cleared agent's process failed");
+                }
             }
         }
         {
