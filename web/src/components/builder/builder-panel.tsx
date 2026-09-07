@@ -3,8 +3,8 @@
 import { useState } from "react";
 import { Button, Field, Textarea } from "@/components/ui";
 import { NODE_META, WIRE_META } from "@/lib/node-meta";
-import { applyProposal, type ApplyApi, type ApplyResult } from "@/lib/workflow-apply";
-import { START, parseProposal, type Proposal } from "@/lib/workflow-proposal";
+import { planSummary, type ApplyOutcome } from "@/lib/board-apply";
+import { START, extractBlock, parseProposal, type Proposal } from "@/lib/workflow-proposal";
 
 export interface BuilderTurn {
   role: "user" | "builder";
@@ -17,6 +17,9 @@ export interface BuilderTurn {
  */
 export type BuilderRunner = (turns: BuilderTurn[]) => AsyncIterable<string>;
 
+/** `dry_run` returns the plan to confirm; a second call with dryRun=false performs it. */
+export type BoardApplier = (board: unknown, dryRun: boolean) => Promise<ApplyOutcome>;
+
 /**
  * The proposed board is shown BEFORE it is applied, and applying is a separate, deliberate click.
  *
@@ -26,23 +29,27 @@ export type BuilderRunner = (turns: BuilderTurn[]) => AsyncIterable<string>;
  */
 export function BuilderPanel({
   runner,
-  api,
+  applyBoard,
   onApplied,
 }: {
   runner: BuilderRunner | null;
-  api: ApplyApi;
-  onApplied?: (result: ApplyResult) => void;
+  applyBoard: BoardApplier;
+  onApplied?: (outcome: ApplyOutcome) => void;
 }) {
   const [turns, setTurns] = useState<BuilderTurn[]>([]);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [result, setResult] = useState<ApplyResult | null>(null);
+  const [outcome, setOutcome] = useState<ApplyOutcome | null>(null);
+  const [planning, setPlanning] = useState(false);
 
   const last = [...turns].reverse().find((t) => t.role === "builder");
   const parsed = parseProposal(last?.text ?? "");
   const proposal = parsed.status === "ok" ? parsed.proposal : null;
+  // The board as the builder emitted it, sent verbatim: the server validates it again and its plan
+  // is what the user confirms. The client parse above is a fast local refusal, not the authority.
+  const rawBoard = proposal ? rawBlock(last?.text ?? "") : null;
 
   const send = async () => {
     const text = draft.trim();
@@ -51,7 +58,7 @@ export function BuilderPanel({
     setTurns(next);
     setDraft("");
     setBusy(true);
-    setResult(null);
+    setOutcome(null);
     let acc = "";
     try {
       for await (const chunk of runner(next)) {
@@ -67,13 +74,26 @@ export function BuilderPanel({
     }
   };
 
+  // Two calls, deliberately: dry_run asks the SERVER what it would do, and only then does the user
+  // confirm. The client's own validation is a fast refusal, not the authority — the plan the user
+  // approves is the server's, so what they confirm is what will happen.
+  const preview = async () => {
+    if (!rawBoard) return;
+    setPlanning(true);
+    try {
+      setOutcome(await applyBoard(rawBoard, true));
+    } finally {
+      setPlanning(false);
+    }
+  };
+
   const apply = async () => {
-    if (!proposal) return;
+    if (!rawBoard) return;
     setApplying(true);
     try {
-      const r = await applyProposal(api, proposal);
-      setResult(r);
-      onApplied?.(r);
+      const o = await applyBoard(rawBoard, false);
+      setOutcome(o);
+      onApplied?.(o);
     } finally {
       setApplying(false);
     }
@@ -123,23 +143,7 @@ export function BuilderPanel({
         <ProposalPreview proposal={proposal} warnings={parsed.status === "ok" ? parsed.warnings : []} />
       ) : null}
 
-      {result ? (
-        <div
-          className={`border-l-2 px-2.5 py-2 ${result.complete ? "border-[var(--live)]" : "border-[var(--danger)]"}`}
-          data-testid="builder-apply-result"
-        >
-          <p className="text-micro text-ink">
-            {result.complete
-              ? `Applied: ${result.createdNodes.length} nodes, ${result.createdWires.length} wires.`
-              : `Partly applied: ${result.createdNodes.length} nodes and ${result.createdWires.length} wires landed, ${result.failures.length} did not.`}
-          </p>
-          {result.failures.map((f) => (
-            <p key={f.what} className="text-micro text-ink-faint">
-              {f.what}: {f.reason}
-            </p>
-          ))}
-        </div>
-      ) : null}
+      {outcome ? <Outcome outcome={outcome} /> : null}
 
       <Field label="Message the builder">
         <Textarea
@@ -160,12 +164,21 @@ export function BuilderPanel({
         </Button>
         <Button
           size="sm"
-          onClick={apply}
-          disabled={!proposal || applying}
-          data-testid="btn-builder-apply"
-          title={proposal ? undefined : "The builder has not proposed a board yet."}
+          onClick={preview}
+          disabled={!rawBoard || planning}
+          data-testid="btn-builder-preview"
+          title={rawBoard ? undefined : "The builder has not proposed a board yet."}
         >
-          {applying ? "Applying…" : "Apply this board"}
+          {planning ? "Checking…" : "Check what this would do"}
+        </Button>
+        <Button
+          size="sm"
+          onClick={apply}
+          disabled={!rawBoard || applying || outcome?.kind !== "plan"}
+          data-testid="btn-builder-apply"
+          title={outcome?.kind === "plan" ? undefined : "Check the plan first — apply confirms it."}
+        >
+          {applying ? "Applying…" : "Apply"}
         </Button>
         {!runner ? (
           <span className="text-micro text-ink-faint" data-testid="builder-unavailable">
@@ -175,6 +188,16 @@ export function BuilderPanel({
       </div>
     </div>
   );
+}
+
+function rawBlock(text: string): unknown {
+  const b = extractBlock(text);
+  if (b.status !== "ok") return null;
+  try {
+    return JSON.parse(b.json);
+  } catch {
+    return null;
+  }
 }
 
 /** The delimited JSON is machinery, not conversation: the preview renders it, the transcript hides it. */
@@ -212,6 +235,71 @@ function ProposalPreview({ proposal, warnings }: { proposal: Proposal; warnings:
           {w}
         </p>
       ))}
+    </div>
+  );
+}
+
+/**
+ * All four outcomes get their own shape, because they need four different reactions:
+ *   plan     — nothing has happened yet; this is what Apply will do
+ *   applied  — everything landed
+ *   partial  — SOME of it landed, and the board is now half-built. Not an error to swallow: the
+ *              user has to know which half, and re-applying is how they finish it.
+ *   refused  — nothing was created, so the board is untouched and safe to re-emit
+ */
+function Outcome({ outcome }: { outcome: ApplyOutcome }) {
+  if (outcome.kind === "plan") {
+    return (
+      <div className="border-l-2 border-[var(--wire-read)] px-2.5 py-2" data-testid="builder-plan">
+        <p className="text-micro text-ink">This will {planSummary(outcome.plan)}.</p>
+        {outcome.plan.patch_nodes.length ? (
+          <p className="text-micro text-ink-faint">
+            Changes existing nodes: {outcome.plan.patch_nodes.join(", ")}
+          </p>
+        ) : null}
+        <p className="text-micro text-ink-faint">Nothing has been created yet.</p>
+      </div>
+    );
+  }
+
+  if (outcome.kind === "refused") {
+    return (
+      <div className="border-l-2 border-[var(--danger)] px-2.5 py-2" data-testid="builder-refused">
+        <p className="text-micro text-ink">{outcome.message}</p>
+        {outcome.refusals.map((r) => (
+          <p key={`${r.code}-${r.message}`} className="text-micro text-ink-faint">
+            {r.message}
+          </p>
+        ))}
+        <p className="text-micro text-ink-faint">
+          Your board is untouched — ask the builder to fix these and try again.
+        </p>
+      </div>
+    );
+  }
+
+  const { report } = outcome;
+  const partial = outcome.kind === "partial";
+  return (
+    <div
+      className={`border-l-2 px-2.5 py-2 ${partial ? "border-[var(--danger)]" : "border-[var(--live)]"}`}
+      data-testid={partial ? "builder-partial" : "builder-applied"}
+    >
+      <p className="text-micro text-ink">
+        {partial
+          ? `Partly applied. ${report.created_nodes.length} nodes and ${report.created_wires.length} wires landed; ${report.failures.length} did not.`
+          : `Applied: ${report.created_nodes.length} nodes, ${report.created_wires.length} wires.`}
+      </p>
+      {report.failures.map((f) => (
+        <p key={f.step} className="text-micro text-ink-faint" data-testid="builder-failure">
+          {f.wire ? `${f.wire.from} → ${f.wire.to} (${f.wire.type})` : (f.node ?? f.step)}: {f.error}
+        </p>
+      ))}
+      {partial ? (
+        <p className="text-micro text-ink-faint">
+          The board is half-built. Applying again creates only what is still missing.
+        </p>
+      ) : null}
     </div>
   );
 }

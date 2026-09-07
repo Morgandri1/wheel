@@ -10,6 +10,7 @@
 import { ApiError, getAuthToken, notifyUnauthorized } from "@/lib/auth";
 import type { LogStreamName } from "@/lib/schema";
 import { apiBaseUrl } from "@/lib/runtime-config";
+import { readOutcome, type ApplyOutcome } from "@/lib/board-apply";
 import type {
   AuthBegin,
   AuthStatus,
@@ -120,6 +121,35 @@ export const projects = {
 };
 
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
+
+/**
+ * Apply a builder-emitted board. `dryRun` returns the PLAN the user confirms.
+ *
+ * Deliberately NOT routed through `request`: that throws on any non-2xx, and a 422 here is a real
+ * outcome the user must read (refused, nothing created) rather than an error to surface as a toast.
+ * 207 is likewise a 2xx that means PARTIAL, so the caller branches on the body's `applied`, never on
+ * the status. See docs/proposals/board-apply-shape.md.
+ */
+export async function applyBoard(
+  projectId: string,
+  board: unknown,
+  dryRun: boolean,
+): Promise<ApplyOutcome> {
+  const token = await getAuthToken();
+  const res = await fetch(`${apiBaseUrl()}/v1/projects/${projectId}/board/apply`, {
+    method: "POST",
+    headers: { "x-auth-token": token, "x-project-id": projectId, "content-type": "application/json" },
+    body: JSON.stringify({ board, dry_run: dryRun }),
+  });
+  if (res.status === 401) notifyUnauthorized();
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* readOutcome copes with an empty body: it reports not-applied rather than inventing success */
+  }
+  return readOutcome(res.status, body);
+}
 
 const engine = (projectId: string, path: string) => `/v1/projects/${projectId}/engine/v1${path}`;
 
