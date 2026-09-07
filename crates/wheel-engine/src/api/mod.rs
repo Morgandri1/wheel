@@ -301,20 +301,24 @@ async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
 /// thing we merged?" and could only infer it: a stale `wheel-engine:test` tag
 /// gave a PASS describing a different binary, a CI run described whoever pushed
 /// last rather than the commit in question, and a `make check` described a
-/// working tree rather than HEAD. Every one of those is the same question —
-/// which input produced this result — and the engine could not answer it about
-/// itself.
+/// working tree rather than HEAD. Every one is the same question — which input
+/// produced this result — and the engine could not answer it about itself.
 ///
-/// Stamped by the image at build time. `unknown` when it was not, which is
-/// honest: an unstamped build is exactly the case where an operator must not
-/// conclude anything from a number.
+/// COMPILE-TIME, not an environment variable, and that is not a preference. The
+/// `process` backend — which is what production runs on Railway — spawns the
+/// engine with `env_clear()` plus a deliberate allowlist, so a runtime env
+/// stamp arrives empty and the engine reports `unknown` on exactly the
+/// deployment where the answer matters. I shipped the env version, then watched
+/// a live process-backend engine report `unknown` from a correctly stamped
+/// image, which is the failure this whole field exists to prevent — a confirm
+/// that quietly tells you nothing.
+///
+/// Baked into the binary it survives `env_clear`, cannot be set by whatever
+/// spawned the process, and travels with the artefact rather than beside it.
+/// `unknown` when nothing stamped the build, which is honest: an unstamped
+/// build is exactly where an operator must conclude nothing.
 fn build_id() -> &'static str {
-    // Read once: this is called on a probe the host polls, and it cannot change
-    // while the process lives.
-    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BUILD
-        .get_or_init(|| std::env::var("WHEEL_BUILD_SHA").unwrap_or_else(|_| "unknown".into()))
-        .as_str()
+    option_env!("WHEEL_BUILD_SHA").unwrap_or("unknown")
 }
 
 // --- request bodies --------------------------------------------------------
