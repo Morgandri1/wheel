@@ -1154,7 +1154,7 @@ drops every message while pm is warm, `/healthz` at 200 throughout.
 
 ---
 
-### 029 — an out-of-range position clamps SILENTLY on migration (S2, SDK, **open**)
+### 029 — an out-of-range position clamps SILENTLY on migration (S2, SDK, ~~closed~~)
 
 `POS-migration-clamp-is-reported`. A stored position outside ±32767 is clamped to the bound
 on read (`cff5fa4`), which is correct — but nothing says so. Measured: a node at
@@ -1183,7 +1183,7 @@ SDK reports `ensure_tables` now reads only the names and configs it needs and sk
 cannot parse, loudly. Still red against `bb20275`, which predates that fix — re-verify on
 the next image.
 
-### 031 — one unparseable node id turns `/v1/board` into a 500 (S1, SDK, **open**)
+### 031 — one unparseable node id turns `/v1/board` into a 500 (S1, SDK, ~~closed~~)
 
 `POS-migration-bad-id-does-not-hide-good-nodes`. Follow-on from BUG-030, on current main
 including `02dd2b5`.
@@ -1215,3 +1215,23 @@ control registered with `check()` rather than `control()`, so it SKIPPED with th
 "the control did not pass" — about a control that had passed. A skip whose stated reason is
 false. Fixed in `wheel_client.gated`, which now distinguishes "never registered" from "ran
 and failed"; the real finding appeared the moment it could.
+
+
+---
+
+## Closed tonight, with the measurement that closed each
+
+A bug is closed when its TESTPLAN ID goes green, not when someone says it is fixed. All
+three were re-measured on an image built from the commit carrying the fix, and the image's
+freshness was asserted before each run — twice tonight a stale or clobbered tag made a
+result describe a different engine, once nearly costing a true S1 a retraction.
+
+| bug | closed by | measurement |
+|---|---|---|
+| 028 ingress never drains to a warm agent | SDK, pump-on-init + deliver | 12/12 consumed on a fresh image (IDLE 0/6 failed, BUSY 0/6). It was IDLE 6/6 and BUSY 3/6 failing when filed. |
+| 029 clamp is silent | `6852068` | the log names the node and both coordinate pairs; asserted on all five substrings rather than the word "clamp", which would have passed on the count line the bug was filed against |
+| 031 one bad row turns `/v1/board` into a 500 | `0417a5e` | `/v1/board` → 200 with the malformed row present, every well-formed node still listed, and the skipped row named in the log with its id as stored |
+
+The third assertion in each row is the one worth keeping. A fix that made the board serve
+while the skipped node vanished unexplained would pass "returns 200" and would be the same
+quiet-failure trade the whole `HEALTH-implies-*` suite exists to catch.
