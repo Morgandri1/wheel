@@ -39,7 +39,8 @@ secret immediately and costs a rotation for nothing.
 > blob. Writing a plaintext secret into that column produces a project whose secrets cannot be
 > decrypted, and `load_secrets` fails on every start.
 
-A tool is required. See "The gap" below — **as of writing, that tool does not exist.**
+A tool is required, and it now exists: `cargo run -p wheel-api --example rotate-engine-secret`.
+See step 2.
 
 ## The mechanism, which is simpler than expected
 
@@ -60,8 +61,19 @@ that is the thing to re-check before trusting it.
 
 1. **Confirm #17 has landed.** If it has not, stop.
 
-2. **Reseal a new secret** into `project_secrets` for the project. Requires `API_MASTER_KEY` and the
-   API's own crypto — see "The gap".
+2. **Reseal a new secret** into `project_secrets`. Dry run first — it writes nothing without
+   `--apply`, and it verifies it can decrypt the CURRENT value before it writes anything, so a
+   master key that is wrong for this database stops here instead of destroying a good row.
+
+   ```
+   DATABASE_URL=… API_MASTER_KEY=… \
+     cargo run -p wheel-api --example rotate-engine-secret -- <project-uuid>
+   #   … then, once the dry run reports the row present and decryptable:
+   DATABASE_URL=… API_MASTER_KEY=… \
+     cargo run -p wheel-api --example rotate-engine-secret -- <project-uuid> --apply
+   ```
+
+   It prints no secret in either mode, touches only `engine_secret_enc`, and restarts nothing.
 
 3. **Restart the project**, which re-provisions the host and respawns the engine with the new value:
 
@@ -95,26 +107,27 @@ The unrecoverable mistake is writing an **unsealed** value into `engine_secret_e
 then fails and `start` returns `500` for that project until the column holds a valid sealed blob
 again. Never write that column by hand.
 
-## The gap — and what I recommend
+## The tool, and what still gates its use
 
-**There is no rotation path in the API today.** Secrets are generated exactly once, at project create
-(`routes/projects.rs:55`), and nothing else ever writes `project_secrets`. Step 2 above has no
-supported way to be performed.
+`crates/wheel-api/examples/rotate-engine-secret.rs` is a thin main over
+`wheel_api::admin::rotate_engine_secret`. The logic lives in the library so it can be tested as a
+function; the example only parses arguments and prints.
 
-Options, cheapest first:
+Guarantees, each with a test that fails when the guard is removed:
 
-1. **A one-shot admin binary** in `wheel-api` (`examples/` or a `src/bin`) that reads `DATABASE_URL`
-   and `API_MASTER_KEY` from the environment, generates a secret with `crypto::generate_secret`,
-   seals it, and `UPDATE`s the one row. ~40 lines, reuses the crypto that already exists, and is not
-   reachable from the running API.
-2. **An owner-only endpoint**, `POST /v1/projects/:id/rotate-engine-secret`, which does steps 2 and 3
-   in one call and cannot leave the two out of step. Better ergonomics; a larger surface, and it
-   creates an authenticated way to disrupt a project.
+- **A dry run does not write.** `--apply` is the only path that touches the row.
+- **A wrong `API_MASTER_KEY` refuses.** The current value is decrypted first, and a key that cannot
+  open it is rejected rather than used to overwrite a good row with a value the API could never
+  decrypt — the unrecoverable mistake named above.
+- **An unknown project is an error naming it**, not a silent no-op.
 
-I recommend **(1)**, and I have not built it. It mutates production secrets, which puts it in the
-same class as the probe-prune script — a tool whose failure mode is an outage — and that class got
-ADVERSARY review before its first `--apply`. I would rather it be reviewed than exist at 3am.
+Both guards are proven by mutation rather than by reading: remove the early return or the decrypt
+check, and the corresponding test goes red.
 
-**PM: say the word and I will build (1) with a dry-run default.** Until then this runbook documents a
-procedure whose step 2 is blocked, and it is better for that to be written down and visible than
-discovered during an incident.
+**What still gates its use.** PM holds the ruling on running it against a real project, and
+ADVERSARY reviews before the first `--apply` — the same bar the probe-prune script cleared, because
+this is the same class: a tool whose failure mode is an outage. It has never been run against
+anything but a throwaway SQLite database.
+
+And the rotation it enables is itself gated on #17 closing the environ carrier first (see
+"Precondition"). Having the tool does not move that.
