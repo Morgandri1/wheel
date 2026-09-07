@@ -114,7 +114,18 @@ The queue-stall in item 3 above stands and is the same defect seen from the othe
 child that never produces a `result` sets `in_flight` forever with no bound. The fix is the in-flight deadline
 (corrected trigger), not a `starting` timer.
 
+## CONFIRMED ROOT CAUSE (P0, already fixed by SDK) — validates the correction
+PM confirmed the incident's actual bug: **ingress called `start()` (which spawns but never pumps) instead of
+`deliver()`** (start + pump_queue). So the message WAS enqueued by ingress, but because `pump_queue` was never
+invoked, the queued turn was never written to the child's stdin — the agent spawned, sat in `starting` on an
+empty stdin with an undelivered queued message, and looked idle-but-wedged. Exactly the shape this finding is
+about, and exactly why a `starting` wall-clock would have been the wrong instrument: it would have killed the
+healthy child and masked the delivery-path bug (§3c#15). The P0 fix — call `deliver()`, not `start()`, on the
+ingress path — is the root fix; an in-flight/queued-not-progressing deadline (corrected trigger above) is the
+backstop that would have made such a stall VISIBLE (a queued message not draining) instead of a silent wait.
+Production is verified healthy end to end (public webhook → parked agent → reply over Telegram, nothing left
+queued).
+
 ## Note
-I received only the tail of PM's messages here; this correction is the important content. The real bug in PM's
-incident is the DELIVERY bug (a message nobody sent) — §3c#15 — and my original framing would have hidden it by
-killing the agent. Credit to PM for the live catch.
+This correction and the confirmed root cause are the important content. Credit to PM for the live catch; my
+original trigger would have converted a delivery bug into an agent-killing bug.
