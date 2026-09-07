@@ -1182,3 +1182,36 @@ arithmetic, one non-UUID row as its own regression case.
 SDK reports `ensure_tables` now reads only the names and configs it needs and skips what it
 cannot parse, loudly. Still red against `bb20275`, which predates that fix — re-verify on
 the next image.
+
+### 031 — one unparseable node id turns `/v1/board` into a 500 (S1, SDK, **open**)
+
+`POS-migration-bad-id-does-not-hide-good-nodes`. Follow-on from BUG-030, on current main
+including `02dd2b5`.
+
+Measured on one engine, same volume, before and after inserting a single row whose `id` is
+not a UUID:
+
+```
+BEFORE:  /v1/board -> 200, 2 nodes
+AFTER:   /v1/board -> 500
+         {"error":{"code":"internal","message":"Conversion error from type Text
+          at index: 0, invalid character: found `n` at 0"}}
+```
+
+The engine BOOTS (BUG-030 is genuinely fixed) and `/healthz` answers 200 throughout. But
+the board read still fails whole, so one bad row makes every other node unreachable and the
+UI shows an operator a 500 where their board used to be.
+
+**This is quieter than the bug it replaced, not smaller.** Before `02dd2b5` the engine
+refused to start — loud, obvious, and impossible to mistake for a healthy system. Now it
+starts, reports healthy, and the board is gone. Same class as the escaper panic (`/healthz`
+green, delivery dead) and the ingress drain (agent `idle`, queue not moving): a failure that
+has learned to look like health.
+
+The boot path now skips what it cannot parse. `board::list` still does not.
+
+**How it was nearly missed:** the gate that finds it was written as `R.gated(...)` against a
+control registered with `check()` rather than `control()`, so it SKIPPED with the message
+"the control did not pass" — about a control that had passed. A skip whose stated reason is
+false. Fixed in `wheel_client.gated`, which now distinguishes "never registered" from "ran
+and failed"; the real finding appeared the moment it could.
