@@ -118,6 +118,22 @@ worth building to deliberately:
 When a class of failure is worth a runtime backstop, the same definition usually makes the better test; when
 it is worth a test, ask whether production deserves the same alarm.
 
+### Gate the commit, not the working tree (QA finding, accepted 2026-09-07)
+
+A gate was run locally, passed honestly, and was **meaningless**: it measured the working tree while the
+commit lacked the file the fix lived in. A `git revert -n` staged a set that did not include a still-unstaged
+`TESTPLAN.md` edit, so the merged commit asserted a test ID the plan did not name — the exact failure that
+gate exists to produce, shipped past the gate that had just caught it.
+
+This is the size-gate bug in a second costume — **measuring one artefact and gating another** — reproduced
+within the hour by the person who had just fixed the first one.
+
+- A local pass proves your working tree. It proves nothing about what you are about to merge.
+- Verify against the commit: `git stash -u` then re-run, or run the gate in a clean checkout of the SHA, or
+  let CI be the thing you believe.
+- "The gate caught my mistake" is only evidence of rigour if the fix is *in the commit*. Catching and then
+  shipping past it is worse than not catching it, because it is reported as diligence.
+
 ### Check the instrument before you believe the result (PM ruling, 2026-09-07)
 
 The single most repeated failure of 2026-09-06, in both directions:
