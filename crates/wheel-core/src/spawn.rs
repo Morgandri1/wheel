@@ -44,6 +44,15 @@ pub const ENV_ENGINE_URL: &str = "WHEEL_ENGINE_URL";
 /// The child's own node name, for display.
 pub const ENV_NODE: &str = "WHEEL_NODE";
 
+/// Absolute path of the agent's first workspace — the directory the child is
+/// started in.
+///
+/// The cwd already IS this path, so the variable is a convenience rather than
+/// the source of truth: a script that needs to name the worktree can say
+/// `$WHEEL_WORKSPACE` instead of depending on never having `cd`-ed. Absent when
+/// the agent declares no `workspaces`.
+pub const ENV_WORKSPACE: &str = "WHEEL_WORKSPACE";
+
 /// The engine must answer `/healthz` within this long of being spawned, or the
 /// host declares the sandbox failed.
 pub const HEALTHZ_DEADLINE_SECS: u64 = 10;

@@ -549,6 +549,9 @@ impl Supervisor {
                 log_line_bus(&self.events, &conn, agent, "engine", failure);
             }
         }
+        // Kept before the move: WHEEL_WORKSPACE is set only when a workspace was
+        // really materialised, so it never names the fallback directory.
+        let materialised_ws = materialised.cwd.clone();
         let cwd = materialised.cwd.unwrap_or_else(|| workspace.clone());
         let config_dir = self.cfg.creds_dir().join(agent.to_string());
         std::fs::create_dir_all(&config_dir)?;
@@ -610,6 +613,13 @@ impl Supervisor {
             self.cfg.listen.client_url(),
         );
         cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
+        // The cwd is already this path; the variable exists so an agent or a
+        // script can NAME it without relying on not having moved. Set only when
+        // a workspace was actually materialised — an empty value would read as
+        // "there is one, it is nowhere".
+        if let Some(ws) = materialised_ws.as_ref() {
+            cmd.env(wheel_core::spawn::ENV_WORKSPACE, ws);
+        }
 
         // Git authenticates from the ENVIRONMENT, so an agent never needs to
         // put a token in a remote URL — where it is written to disk — or on a
@@ -782,6 +792,78 @@ impl Supervisor {
     /// needs both to tell a turn in progress from a wedge.
     pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
         self.agents.lock().await.keys().copied().collect()
+    }
+
+    /// Stop an idle agent's process, keeping its session so the next message
+    /// resumes it (§3c#14).
+    ///
+    /// This is the difference between Wheel and YOKE on compute. Measured on
+    /// the production board before this existed: an agent an hour past its last
+    /// turn still held a 162 MB `claude` process, because nothing ever stopped
+    /// it. Six agents is a gigabyte of doing nothing.
+    ///
+    /// Parking is `stop` that keeps `session_id`: `deliver` resumes a parked
+    /// agent when work arrives, and `--resume` continues the same session —
+    /// proven in production, the first wake came back on the id it went to
+    /// sleep with.
+    async fn park(self: &Arc<Self>, agent: Uuid) {
+        let slot = self.slot(agent).await;
+        let mut guard = slot.lock().await;
+
+        // Re-checked under the slot lock, because the timer and an arriving
+        // message race by construction. Whichever takes the lock first wins and
+        // the other sees the world it made: park first and `deliver` restarts
+        // it; deliver first and this finds work queued and leaves it alone.
+        {
+            let conn = self.db.lock().unwrap();
+            let state = board::agent_state(&conn, agent).unwrap_or_default();
+            if !matches!(state.status, AgentStatus::Idle) {
+                return;
+            }
+            if messages::has_queued(&conn, agent).unwrap_or(true) {
+                return;
+            }
+        }
+
+        if let Some(mut r) = guard.take() {
+            let _ = r.child.kill().await;
+        } else {
+            // No process to stop: nothing to park, and marking it Parked would
+            // claim a saving that was never made.
+            return;
+        }
+        {
+            // Same reasoning as `stop`: a token outliving its process is a
+            // credential with no owner. `start` mints a fresh one.
+            let conn = self.db.lock().unwrap();
+            let _ = crate::db::tokens::revoke(&conn, agent);
+        }
+        self.set_status(agent, AgentStatus::Parked, None);
+        tracing::info!(%agent, "parked after idle timeout");
+    }
+
+    /// Arm the idle timer for an agent that has just finished a turn.
+    ///
+    /// `idle_timeout_secs == 0` means never park — an agent that must stay hot.
+    fn arm_park_timer(self: &Arc<Self>, agent: Uuid) {
+        let secs = {
+            let conn = self.db.lock().unwrap();
+            match board::get(&conn, agent) {
+                Ok(Some(node)) => match &node.config {
+                    wheel_core::NodeConfig::Agent(a) => a.idle_timeout_secs(),
+                    _ => return,
+                },
+                _ => return,
+            }
+        };
+        if secs == 0 {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+            me.park(agent).await;
+        });
     }
 
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
@@ -1075,6 +1157,10 @@ impl Supervisor {
                             }
                         } else {
                             let _ = self.pump_queue(agent).await;
+                            // Nothing left to do: start counting down. If the
+                            // pump delivered something, the timer's re-check
+                            // finds the agent busy and does nothing.
+                            self.arm_park_timer(agent);
                         }
                     }
                     HarnessEvent::RateLimit {
@@ -1811,6 +1897,198 @@ mod tests {
             last.unwrap_or_default().contains("codex"),
             "the operator must be told which harness was refused"
         );
+    }
+
+    /// (a) The agent is STARTED in its worktree, so cwd was always right; what
+    /// was missing was a way to NAME it. A script that has `cd`-ed cannot
+    /// recover the path from `pwd`, and there was no variable to ask.
+    #[tokio::test]
+    async fn a_materialised_workspace_is_named_by_wheel_workspace() {
+        // No git needed: a workspace without a git source still materialises a
+        // directory, and the directory is the thing under test.
+        let (sup, id, dir) = shim_supervisor_cfg("wsenv", ENV_DUMP_HARNESS, |cfg| {
+            cfg.workspaces = vec![wheel_core::Workspace {
+                path: "wheel".into(),
+                git: None,
+            }];
+        });
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+
+        let ws = env
+            .lines()
+            .find_map(|l| l.strip_prefix("WHEEL_WORKSPACE="))
+            .expect("WHEEL_WORKSPACE was not exported for an agent that HAS a workspace");
+        let pwd = env
+            .lines()
+            .find_map(|l| l.strip_prefix("PWD="))
+            .expect("no working directory");
+        let real =
+            |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        assert_eq!(
+            real(ws),
+            real(pwd),
+            "WHEEL_WORKSPACE must name the directory the child is actually in"
+        );
+        assert!(
+            ws.ends_with("/wheel"),
+            "it must be the WORKTREE, not the bare object store: {ws}"
+        );
+    }
+
+    /// An agent with no workspace must not get an empty or invented value: an
+    /// empty WHEEL_WORKSPACE reads as "there is one, and it is nowhere".
+    #[tokio::test]
+    async fn an_agent_without_a_workspace_gets_no_wheel_workspace_at_all() {
+        let (sup, id, dir) = shim_supervisor("nows", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+        assert!(
+            !env.lines().any(|l| l.starts_with("WHEEL_WORKSPACE=")),
+            "WHEEL_WORKSPACE must be ABSENT, not empty, when no workspace was materialised"
+        );
+    }
+
+    /// (b) §3c#14, and the reason this project exists rather than YOKE.
+    /// Measured before it existed: an agent an hour past its turn still held a
+    /// 162 MB claude process.
+    #[tokio::test]
+    async fn an_idle_agent_parks_and_releases_its_process() {
+        let (sup, id, dir) = shim_supervisor_cfg("parks", ECHO_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(1);
+        });
+        sup.start(id).await.unwrap();
+        until("the agent to be running", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        enqueue(&sup, id, "do a turn");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park after its idle timeout", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+
+        assert_eq!(
+            runs(&dir),
+            1,
+            "parking must stop the process it already had, not spawn another"
+        );
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_some(),
+            "parking must KEEP the session — resume is what makes it free"
+        );
+    }
+
+    /// An agent with work queued must not be parked out from under it.
+    #[tokio::test]
+    async fn an_agent_with_queued_work_is_not_parked() {
+        let (sup, id, _dir) = shim_supervisor_cfg("busy", SILENT_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(1);
+        });
+        sup.start(id).await.unwrap();
+        enqueue(&sup, id, "one");
+        enqueue(&sup, id, "two");
+        let _ = sup.deliver(id).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !matches!(status_of(&sup, id), AgentStatus::Parked),
+            "an agent mid-turn with more queued must never be parked"
+        );
+    }
+
+    /// The sender must be a REAL node: `row_to_message` resolves a `node`
+    /// sender to its CURRENT name and type by id, and falls back to `system`
+    /// when the node is gone — deliberately, so a deleted node cannot break an
+    /// inbox. A fabricated uuid therefore reads back as `system`, which is what
+    /// this helper existing separately is meant to stop anyone rediscovering.
+    fn enqueue_from_agent(sup: &Supervisor, from: &str, to: Uuid, body: &str) {
+        let conn = sup.db.lock().unwrap();
+        let sender = wheel_core::Node::new(
+            Uuid::new_v4(),
+            from.parse().unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+        );
+        board::create(&conn, &sender).unwrap();
+        messages::enqueue(
+            &conn,
+            wheel_core::MessageSender::Node {
+                id: sender.id,
+                name: sender.name.clone(),
+                node_type: NodeType::Agent,
+            },
+            to,
+            body.to_string(),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// (c) The producer a multi-agent board actually runs on.
+    ///
+    /// Agent→agent was covered at the CLI plane, and envelope rendering was
+    /// covered as a wheel-core unit test, but nothing asserted the two TOGETHER
+    /// — every test that watched bytes reach a child's stdin used a `user`
+    /// sender. So the lane the swarm lives on was proven in halves.
+    #[tokio::test]
+    async fn a_message_from_an_agent_reaches_the_child_as_an_agent() {
+        let (sup, id, _dir) = shim_supervisor("recipient", ECHO_HARNESS);
+        sup.start(id).await.unwrap();
+        until("the agent to come up", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+
+        enqueue_from_agent(&sup, "researcher", id, "findings attached");
+        sup.deliver(id).await.unwrap();
+
+        until("the message to be consumed", || {
+            let conn = sup.db.lock().unwrap();
+            messages::has_queued(&conn, id).map(|q| !q).unwrap_or(false)
+        })
+        .await;
+
+        let lines = transcript(&sup, id);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("from=\"researcher\""),
+            "the child must be told WHICH agent sent it; got: {joined}"
+        );
+        assert!(
+            joined.contains("type=\"agent\""),
+            "an agent-sent message must be framed as type=agent, not user — attribution is the \
+             whole point of the envelope; got: {joined}"
+        );
+        assert!(
+            joined.contains("findings attached"),
+            "the body must reach the child intact; got: {joined}"
+        );
+    }
+
+    fn transcript(sup: &Supervisor, id: Uuid) -> Vec<String> {
+        let conn = sup.db.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT text FROM logs WHERE node_id = ?1 AND stream = 'transcript' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![id.to_string()], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
     }
 
     fn status_of(sup: &Supervisor, id: Uuid) -> AgentStatus {

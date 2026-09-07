@@ -31,6 +31,7 @@ wheel — talk to your Wheel board
   wheel tool call <tool> <op> '<json>' [--curl]   invoke one; --curl prints it instead
   wheel msg   <agent> <text>|--file <path>|--stdin
   wheel inbox [<message-id>]        re-read what I was sent
+  wheel ctx clear                   discard my context and start a fresh session
 
 Values: prefer --file or --stdin. A body passed as an argument goes through
 your shell first, where backticks and $(...) are substituted before wheel ever
@@ -246,6 +247,25 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
             }
         }
 
+        // The engine route has existed since M1 and the preamble promises the
+        // verb to every agent at startup; only the CLI arm was missing, so
+        // `wheel ctx clear` answered "unknown command" to a command we told
+        // them to use.
+        "ctx" => match rest.first().map(String::as_str) {
+            Some("clear") => show(
+                engine.post("/v1/cli/ctx/clear", serde_json::json!({}))?,
+                json_out,
+                render_ok,
+            ),
+            Some(other) => {
+                eprintln!("wheel: unknown ctx subcommand {other:?} (did you mean `ctx clear`?)");
+                Ok(1)
+            }
+            None => {
+                eprintln!("wheel: `ctx` needs a subcommand (`wheel ctx clear`)");
+                Ok(1)
+            }
+        },
         "inbox" => {
             let path = match rest.first() {
                 Some(id) => format!("/v1/cli/inbox?id={}", urlencode(id)),
@@ -985,5 +1005,53 @@ mod tests {
             body: serde_json::json!({"node":"notes"}),
         };
         assert_eq!(show(ok, true, render_ok).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    /// Every verb the usage text advertises must have a dispatch arm.
+    ///
+    /// `wheel ctx clear` was in the usage text's sibling documents and in the
+    /// agent preamble for months while the dispatch had no `"ctx"` arm, so the
+    /// command we told every agent to use answered "unknown command". The
+    /// engine route had existed the whole time. A promise with no arm behind it
+    /// is worse than an absent feature: the agent believes it.
+    #[test]
+    fn every_verb_in_usage_has_a_dispatch_arm() {
+        let src = include_str!("main.rs");
+        // Production dispatch only: test fixtures and error strings mention verb
+        // names too, and matching those made an earlier version of this test
+        // pass with the arm deliberately removed.
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let dispatch = production
+            .split_once("match cmd")
+            .map(|(_, rest)| rest)
+            .unwrap_or(production);
+
+        let verbs: Vec<&str> = super::USAGE
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("wheel "))
+            .filter_map(|l| l.split_whitespace().next())
+            // Verbs only: the usage header is "wheel — talk to your Wheel board",
+            // whose first token is an em dash.
+            .filter(|v| v.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            .collect();
+        assert!(
+            verbs.len() > 5,
+            "usage parsing found almost nothing: {verbs:?}"
+        );
+
+        let missing: Vec<&str> = verbs
+            .iter()
+            // An ARM, not a mention: `"ctx" =>`, not the word in a message.
+            .filter(|v| !dispatch.contains(&format!("\"{v}\" =>")))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the usage text advertises verbs with no dispatch arm, so they answer \
+             \"unknown command\" to anyone who believes the help: {missing:?}"
+        );
     }
 }
