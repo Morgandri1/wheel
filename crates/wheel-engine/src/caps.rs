@@ -101,9 +101,35 @@ impl Caller {
                 name: target.to_string(),
             })?;
 
-        if !self.node.has_wire(to.id, required, to.node_type()) {
+        // The caller's wires are re-read from the DATABASE, never taken from
+        // the snapshot `authenticate` captured (ADVERSARY 047).
+        //
+        // `Caller` holds the node it resolved at request start, wires included.
+        // Checking `self.node.has_wire(..)` therefore answers a question about
+        // request-START, not about now — and two shipped fixes depended on it
+        // answering about now. `query` and `tool_call` release the db lock for
+        // their slow action and re-`require` before disclosing, precisely so a
+        // wire revoked mid-request withholds the result. Re-running a check
+        // against the same snapshot cannot see that revoke: the code READ as
+        // though the window were closed while the window was fully open.
+        // ADVERSARY proved it — a wire deleted 1.2s before a query returned,
+        // and the rows were disclosed anyway.
+        //
+        // Making the ONE capability entry point live by construction fixes both
+        // call sites and, more importantly, means a future lock-releasing
+        // handler cannot reintroduce this by doing the obvious thing. The cost
+        // is one row read per check, which is the correct price for the
+        // difference between "had permission" and "has permission".
+        let me = board::get(conn, self.node.id)
+            .ok()
+            .flatten()
+            // The caller's own node is gone: deleted mid-request. A node that
+            // no longer exists holds no capabilities.
+            .ok_or(Denial::UnknownToken)?;
+
+        if !me.has_wire(to.id, required, to.node_type()) {
             return Err(Denial::NoWire {
-                from: self.node.name.to_string(),
+                from: me.name.to_string(),
                 to: to.name.to_string(),
                 required,
             });
@@ -200,6 +226,98 @@ mod tests {
         board::add_wire(&c, caller.id, peer.id, WireType::Send, None).unwrap();
         let caller = board::get(&c, caller.id).unwrap().unwrap();
         (c, caller, peer, notes)
+    }
+
+    /// ADVERSARY 047, and the test whose ABSENCE let two shipped fixes be
+    /// no-ops: revoke a wire BETWEEN two `require()` calls on the SAME Caller.
+    ///
+    /// Every other capability test re-checks through a FRESH request, which
+    /// re-authenticates and therefore refreshes the caller snapshot — so they
+    /// all passed while the thing they appeared to prove was false. `query` and
+    /// `tool_call` release the db lock for their slow action and re-`require`
+    /// before disclosing, precisely so a mid-request revoke withholds the
+    /// result. Against a snapshot that re-check could never fail, and the code
+    /// read as though the window were closed while it was fully open.
+    ///
+    /// ADVERSARY measured it: a wire deleted 1.2 seconds before a 1.45s query
+    /// returned, rows disclosed anyway.
+    #[test]
+    fn a_wire_revoked_between_two_checks_on_one_caller_denies_the_second() {
+        let (c, caller, _peer, notes) = fixture();
+        let t = tokens::mint(&c, caller.id).unwrap();
+        let who = Caller::authenticate(&c, &t.plaintext).unwrap();
+
+        // Request start: the capability holds.
+        who.require(&c, "notes", WireType::Read)
+            .expect("the wire exists at request start");
+
+        // The operator revokes it while the slow action is in flight. Note the
+        // SAME `who` — that is the whole point. A fresh Caller would pick this
+        // up trivially and prove nothing.
+        assert!(board::remove_wire(&c, caller.id, notes.id, WireType::Read).unwrap());
+
+        let after = who.require(&c, "notes", WireType::Read);
+        assert!(
+            matches!(after, Err(Denial::NoWire { .. })),
+            "a capability revoked mid-request must not survive in a Caller captured before it; \
+             got {after:?}"
+        );
+    }
+
+    /// Keeps the two tests above from decaying into what every OTHER capability
+    /// test already is.
+    ///
+    /// Their whole value is that they revoke against ONE Caller — the snapshot
+    /// captured before the revoke. A future edit that re-authenticates between
+    /// the checks would still pass, and would silently be testing the thing
+    /// that was already true: a fresh request obviously sees a fresh board.
+    /// That decay is exactly how 047 hid — a suite full of green tests, none of
+    /// which could fail for the reason that mattered.
+    ///
+    /// So the shape is asserted, not just intended: one `authenticate` per test,
+    /// and a `require` called at least twice on it.
+    #[test]
+    fn the_mid_request_tests_reuse_one_caller_rather_than_re_authenticating() {
+        let src = include_str!("caps.rs");
+        for name in [
+            "a_wire_revoked_between_two_checks_on_one_caller_denies_the_second",
+            "a_caller_whose_node_was_deleted_mid_request_can_do_nothing",
+        ] {
+            let body = src
+                .split(&format!("fn {name}()"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n    #[test]").next())
+                .unwrap_or_else(|| panic!("{name} exists"));
+            assert_eq!(
+                body.matches("Caller::authenticate").count(),
+                1,
+                "{name} must authenticate ONCE. Re-authenticating turns it back into a \
+                 fresh-request test, which passes whether or not the capability check is live — \
+                 which is precisely how 047 survived a green suite."
+            );
+            assert!(
+                body.matches(".require(").count() >= 2,
+                "{name} must call require twice on the same Caller: the first establishes the \
+                 capability held, the second is the one that must deny after the revoke"
+            );
+        }
+    }
+
+    /// The caller's own node deleted mid-request holds no capabilities either —
+    /// the same staleness, one step further.
+    #[test]
+    fn a_caller_whose_node_was_deleted_mid_request_can_do_nothing() {
+        let (c, caller, _peer, _notes) = fixture();
+        let t = tokens::mint(&c, caller.id).unwrap();
+        let who = Caller::authenticate(&c, &t.plaintext).unwrap();
+        who.require(&c, "notes", WireType::Read).unwrap();
+
+        board::delete(&c, caller.id).unwrap();
+
+        assert!(
+            who.require(&c, "notes", WireType::Read).is_err(),
+            "a node that no longer exists must not keep acting through a captured snapshot"
+        );
     }
 
     #[test]
