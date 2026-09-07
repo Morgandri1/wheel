@@ -317,6 +317,29 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
 
+### Running `AUTH_MODE=jwks` without a provider account
+
+`cargo run -p wheel-api --example stub-issuer` serves a JWKS on `127.0.0.1:9911` and prints a ready
+token, so `jwks` mode can be exercised with no Clerk account:
+
+```
+AUTH_MODE=jwks
+CLERK_JWKS_URL=http://127.0.0.1:9911/jwks
+CLERK_ISSUER=https://clerk.example.test
+```
+
+`GET /token?sub=<id>` mints more. `PORT` and `SUB` override the defaults.
+
+It signs with the fixture key in `crates/wheel-api/tests/fixtures/`, so a token it mints and a token
+the test suite mints are signed by the same key. On startup it puts a token through
+`auth::claims::verify` — the real verifier, not a copy — and refuses to serve if that fails, so a
+drift between the JWKS document and what the API accepts is caught here rather than somewhere less
+obvious.
+
+**Never in production.** It is an `examples/` target, so it is in no shipped binary and unreachable
+from the library, and its signing key is committed to this repository in plain text — anyone can mint
+any `sub`.
+
 ### The dev-bypass interlock
 
 `AUTH_DEV_SECRET` accepts HS256 tokens, which anyone holding the secret can mint for any `sub`. It
