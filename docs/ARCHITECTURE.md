@@ -57,6 +57,20 @@ answer 202 and both write the row — that argues for a better observation point
 Move the assertion to where a fake harness can watch the child's stdin: *an ingress hit against a parked agent
 results in the bytes reaching that child, with no other event occurring.*
 
+### The gate and the runtime backstop should watch the same signal (ADVERSARY, accepted 2026-09-06)
+
+The behavioural test for the ingress P0 asserts on *"a message that should be draining is stuck in `queued` /
+`in_flight`"*. The corrected 041 deadline arms on **the same signal**. That is not a coincidence and it is
+worth building to deliberately:
+
+- CI asserts the property against a wedged fixture; the runtime arms a deadline on the property in production.
+- One predicate, two consumers. If they drift, one of them is watching something that no longer matters.
+- Had the behavioural test existed, the P0 would have been **red in CI instead of found in production** — by
+  the operator, 52 minutes in, on his own board.
+
+When a class of failure is worth a runtime backstop, the same definition usually makes the better test; when
+it is worth a test, ask whether production deserves the same alarm.
+
 ### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
 
 Run it or grep it before you assert it. Three instances in one day:
