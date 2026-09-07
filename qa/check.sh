@@ -237,6 +237,10 @@ step "qa:deps-budget" "$PY" qa/tools/deps_gate.py
 # The size gate itself only runs in CI (it needs a release build), but its RATCHET
 # decides here, and a ratchet pointing the wrong way is silently green forever.
 step "qa:size-ratchet" "$PY" qa/contract/size_ratchet.py
+# Proves POS-migration-* can still FAIL. Its row set is what gives it detection power, and
+# a tidy-up that dropped the awkward rows would leave a suite that runs, passes, and
+# proves nothing — BUG-024's shape. No docker, no #22, runs today.
+step "qa:posmig-selftest" "$PY" qa/contract/selftest_position_migration.py
 
 # THE SAME CLASS AS web:install ABOVE, which is why it is worth stating twice: asking
 # whether an image EXISTS answers "has anyone ever built one here", and the question is

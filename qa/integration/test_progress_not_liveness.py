@@ -42,11 +42,43 @@ from wheel_client import Results  # noqa: E402
 SKIP = 77
 R = Results()
 
-# A transitional status is a promise that something is happening. If it is still true a
-# minute later, the promise is broken whatever the process is doing.
+# A transitional status is a promise that something is in flight.
 TRANSITIONAL = {"starting", "queued"}
+
+# THE BOUND, AND WHY IT IS THIS NUMBER (ADVERSARY 041). Asserting that `starting`
+# "eventually" resolves is exactly the test production would pass right now: a child can
+# spawn cleanly and then block forever on an init line that never comes, and an unbounded
+# wait simply waits. So the assertion has to be a DEADLINE, and the deadline has to be
+# defensible in both directions:
+#
+#   Not shorter, or it fires on a merely slow start. The engine spawn contract gives the
+#   ENGINE 10s to answer /healthz and 15s to shut down; an agent child is heavier than
+#   that -- a harness cold start, config load and auth probe on a host running six agents.
+#   60s is 6x the engine's health budget and 4x its shutdown budget, so a start that is
+#   simply slow has room.
+#
+#   Not longer, because the number that matters is how long an operator stares at a board
+#   before concluding it is broken. Tonight that was 45 minutes with three messages queued
+#   and zero delivered. Any bound in minutes is indistinguishable from hung to the person
+#   watching, which makes it useless as a gate however correct it looks.
+#
+# 60s is therefore the largest value that is still shorter than human patience, and the
+# smallest that cannot fire on a healthy slow start.
 RESOLVE_SECS = float(os.environ.get("WHEEL_PROGRESS_RESOLVE_SECS", "60"))
 CONSUME_SECS = float(os.environ.get("WHEEL_PROGRESS_CONSUME_SECS", "90"))
+
+# The four ways a message enters an agent's queue. They share a drain but not an entry,
+# which is the whole reason this is a list: tonight's P0 was the ingress entry while the
+# agent-to-agent entry worked perfectly, and a gate covering only the latter would have
+# been green straight through it.
+PRODUCERS = []          # (name, send, ...) — wired as each path lands
+
+# PM's rule, and it is the reason this constant exists rather than a bare len() check:
+# SKIP is honest today and dishonest tomorrow. A suite reporting SKIP with zero producers
+# is a result nobody reads, and nothing forces the wiring, so it stays SKIP for weeks.
+# The moment the FIRST producer is wired this must be bumped to 1, and from then on a
+# producer count BELOW the floor is a FAILURE, not a skip. 1 -> 0 is a red build.
+WIRED_FLOOR = 0
 
 
 def poll(fn, want, timeout):
@@ -91,24 +123,45 @@ def check_no_stuck_status(agent_status, healthz):
     R.check("PROGRESS-transitional-status-resolves", ok,
             "the agent was still %r after %.0fs. A transitional status is a claim that "
             "something is in flight; if it never resolves, the claim is false no matter "
-            "how alive the process is (/healthz: %s). `starting` forever is how production "
-            "sat with three undelivered messages while every dashboard looked fine."
+            "how alive the process is (/healthz: %s). ADVERSARY 041: a child can spawn "
+            "cleanly and then block forever waiting on an init line that never comes, so "
+            "the process is genuinely healthy and genuinely doing nothing. This is a "
+            "DEADLINE, not an eventually — an unbounded wait is the test production "
+            "passes while sitting at 45 minutes and three undelivered messages."
             % (last, waited, "200" if healthz() else "down"))
 
 
 def main():
     print(__doc__.strip().splitlines()[0])
-    print("\nThis suite asserts PROGRESS, never liveness. It needs a running engine and a\n"
-          "fresh wheel-engine:test image; wire it into the M2 ingress run alongside ING-*.\n"
-          "Producers to walk: user-send, agent-msg, endpoint-ingress, script-msg.")
-    # The four producers are wired up as ING-*/MSG-* land. Until then this reports
-    # honestly that it has not run, rather than defining zero producers and passing.
-    R.skip("PROGRESS-message-reaches-consumed",
-           "no producer is wired up in this suite yet — a suite with zero cases is not a "
-           "passing suite. Wire user-send first (it exists today), then endpoint-ingress "
-           "when SDK lands the P0 fix, which is the path that actually broke.")
-    R.skip("PROGRESS-transitional-status-resolves",
-           "needs a live agent; lands with the same wiring")
+
+    # PM's rule: a producer count below the floor is a FAILURE. Once anything has been
+    # wired, "zero producers" stops meaning "too early" and starts meaning "someone
+    # deleted the coverage", and those must not report the same colour.
+    if len(PRODUCERS) < WIRED_FLOOR:
+        R.check("PROGRESS-producers-stay-wired", False,
+                "this suite has %d producers wired but the floor is %d. A producer was "
+                "REMOVED. The path it covered is exactly the kind that broke in "
+                "production while a neighbouring path stayed green, so losing one is a "
+                "red build, not a skip. Restore it, or lower WIRED_FLOOR deliberately "
+                "and say why in the commit." % (len(PRODUCERS), WIRED_FLOOR))
+        return R.report("progress-not-liveness")
+
+    if not PRODUCERS:
+        # SKIP HERE MEANS "NOT WIRED YET", NOT "NOT APPLICABLE". The distinction is the
+        # point: not-applicable is a permanent, acceptable state; not-wired-yet is a debt
+        # with an owner and a deadline. Spelled out in the ID so nobody has to infer it.
+        R.skip("PROGRESS/not-wired-yet--no-producers-defined",
+               "no producer is wired in this suite yet, so it has asserted NOTHING. This "
+               "is a DEBT, not a not-applicable: the paths exist, the coverage does not. "
+               "Wire user-send first (it works today), then endpoint-ingress the moment "
+               "SDK's P0 lands, since that is the path that actually broke. Bump "
+               "WIRED_FLOOR to 1 in the same commit — from then on, dropping back to "
+               "zero is a failing build rather than this message.")
+        return R.report("progress-not-liveness")
+
+    for name, send, message_state, agent_status, healthz in PRODUCERS:
+        check_producer(name, send, message_state, agent_status, healthz)
+        check_no_stuck_status(agent_status, healthz)
     return R.report("progress-not-liveness")
 
 
