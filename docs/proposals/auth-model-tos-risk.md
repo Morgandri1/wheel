@@ -33,3 +33,12 @@ commercial terms, metered billing), not subscription OAuth.
 ## Status
 OPEN — product/legal decision, operator's. Not an engineering fix. Blocks shipping OAuth-token storage as a
 product until verified. Does not block the current single-user proof work.
+
+## UPDATE (operator, 2026-09-07): non-commercial, single-user — risk DOWNGRADED to low/accepted
+Operator: "this isn't supposed to be a commercial product, i'm not that worried about TOS violations."
+The high-risk patterns (hosted product, storing OTHERS' tokens, reselling capacity) do not apply to a
+personal, single-user, own-token setup — that is the lowest-risk end of the gradient above. Residual is only
+"automated always-on use of one's own subscription," which is minor for personal use. Status: ACCEPTED for
+non-commercial single-user use; does NOT block the cloud-board work. The flag RE-ARMS if Wheel ever becomes
+commercial or stores other users' tokens — at that point the API auth-model recommendation applies and must be
+verified with Anthropic before shipping.
