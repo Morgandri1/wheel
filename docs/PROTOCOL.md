@@ -654,8 +654,13 @@ stderr is captured as `stream=stderr` and never parsed as JSON.
 > problem, or behaves as a Claude agent, and the operator is never told their harness choice was ignored.
 > The auth flows described above for codex are real code, which is what makes this shape convincing — the
 > credential half exists, the execution half does not.
-> **Fix is a guard** (refuse `Harness::Codex` at create and start with "codex is M2") — deliberately not
-> landed yet because engine changes redeploy the host and a wake is pending. SDK, 2026-09-07.
+> **A guard was written and then REVERTED (SDK, 2026-09-07), and the reason is worth recording.** Refusing to
+> start a codex node broke `AUTH-cred-codex-var`, which verifies that a codex node exports `CODEX_API_KEY` —
+> and it verifies it *by spawning the node*. That test can only pass because spawning a codex node runs
+> claude: it is asserting credential SELECTION through a mechanism that only works because of this defect.
+> So the guard and the test cannot both stand as written. The guard is the correct behaviour; the test needs
+> to assert credential selection without spawning (`auth.rs` already unit-tests exactly that). Reverted to
+> keep `main` green rather than break QA's suite unilaterally; to be re-landed with QA.
 
 Deferred. The auth spike established that `codex exec` is not a safe auth probe (it proceeds unauthenticated and
 dies at request time with a 401) and that the API-key env var is **`CODEX_API_KEY`** — `OPENAI_API_KEY` is noticed
