@@ -417,6 +417,11 @@ wheel/
   the CLI/MCP bridge reads it (env is readable via `/proc/<pid>/environ` only by the same uid — belt and braces). Docker backend: engine is container
   root (cap-dropped to SETUID/SETGID) → trivial. Process backend: host spawns the engine with those two ambient caps. Milestone: M2 (docker), M3 (process).
   Until M2 the docker backend uses one uid and the contract states "project is the boundary" as a KNOWN GAP in PROTOCOL.md.
+  **M2/M3 gotcha, flagged forward by SDK (2026-09-07), do NOT fix before the uid work exists:** A8's shared
+  clone store in `repos/` is owned by one uid; once per-node uids land, worktrees running as *other* uids will
+  hit git's `safe.directory` ownership check and it will present as "clone works, worktree refuses." Whoever
+  implements per-node uids handles it with `safe.directory` config or per-uid stores. Recorded here rather than
+  fixed now because a fix without the uid work is untestable — same rule as the chest born-safe checklist.
 - **One sandbox per project, one `wheel-engine` process per sandbox.** Sandboxes are created by `wheel-host` through a
   `Sandbox` trait with two backends: `docker` (local dev / any VM with a docker daemon: container `wheel-p-<id>`, volume `wheel-p-<id>-data`)
   and `process` (production on Railway, where no docker daemon exists: a dedicated unix uid per project, data dir `/data/projects/<id>` mode 0700,
