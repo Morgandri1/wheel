@@ -184,3 +184,19 @@ EXACT SEQUENCE (once 3 and 4 clear), via https://wheel-api-production.up.railway
   g. restore: re-add adversary pm:send wire; delete test branch
 Caveat (SDK): materialise errors are swallowed in spawn; if signal 5 fails under (B), read the engine log
 before blaming the agent.
+
+## F007 (ADVERSARY, measured 2026-09-07) — shared per-project token; bears on the wake AND gates script-exec
+Within a project the auth token is SHARED across all agents (the one-uid-per-project gap, 037/F007). The
+wire matrix is enforced correctly against the token, but any agent can present as another — so any agent
+can impersonate pm, who holds send to all six. Measured, not assumed. NOT cross-tenant (host root env not
+exposed; tenant isolation unaffected); not a regression; not urgent as a standalone.
+
+Bearing on THIS wake: the cascade bound (delete adversary's pm:send wire) stops adversary SENDING to pm,
+but does NOT stop it IMPERSONATING pm via the shared token. Honest limit. Wake stays GO because the risk
+does not materialise for our case: adversary is our own benign agent, instructed not to message, observed,
+and its blast radius is the board's own agents (not cross-tenant, not host). We are not relying on the
+wire bound against a hostile agent — we are waking a cooperative one and watching.
+
+Bearing on SCRIPT EXECUTION: this is now a stated PRECONDITION, not later hardening. Script-exec on a
+shared-token board means an agent running arbitrary code can impersonate pm and drive the whole board.
+Per-node uids/tokens (037/038) must be in SDK's Script-exec scope as a gate, not deferred to M2.
