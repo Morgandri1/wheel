@@ -55,3 +55,27 @@ agent_state in `wheel.db` is frozen at the 08:09:22 deploy (turns=0, last_activi
 swarm being active. Either (a) those are the DORMANT cloud board agents, distinct from our working
 swarm, so "run it on its own" means activating them; or (b) they are us with broken state tracking.
 SDK to settle. This does not block the P0/P1 build items, which are needed either way.
+
+## REFRAME (SDK, 2026-09-07) — "run on its own" = move the loop, not polish what exists
+
+The wheel.db agents are the DORMANT cloud board — a mirror of us that is switched off (answer (a)).
+We do the work on yoke, on a laptop; the board does nothing on its own behalf. So "run the cloud board
+on its own" is not a polish task on top of what exists — it is MOVING the development loop from this
+swarm to that board. Script execution is the keystone rather than a feature precisely because those
+agents cannot run anything on their own behalf and their preamble promises a capability that does not
+exist.
+
+The consequence, and the strategic pivot: every gap we find by speculating from outside is a gap WE do
+not feel, because we are not the ones living on the board. Real friction is found by living on it, not by
+building against a guess. Therefore the priority shifts from "build the capabilities first, then dogfood"
+to "wake the board sooner on real work, and let the first thing that breaks drive the build order."
+
+Minimum-to-wake is small: the cloud agents can already clone/edit/commit/push via their harness (the
+wheel-on-wheel CI proves the flow). The one prerequisite that must not be skipped is the P0 merge-PATCH
+fix, so activating them and editing their configs cannot silently destroy config. Beyond that, we wake
+and observe rather than pre-build Script/Chest/UI speculatively.
+
+OPERATOR-DOMAIN DECISION (not PM's to take alone): actually activating the cloud board to self-drive
+re-raises the duplication the operator halted earlier ("doing the same job as you"). The resolution is
+to MOVE the loop, not run both — this swarm's role becomes bootstrapping the board to make itself
+unnecessary. Pending the operator's go on that flip.
