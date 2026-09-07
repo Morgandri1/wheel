@@ -379,21 +379,21 @@ mod tests {
     #[test]
     fn patch_answers_with_the_node_it_stored_not_an_empty_body() {
         let src = include_str!("board_routes.rs");
-        let sig = src
-            .lines()
-            .position(|l| l.contains("pub async fn patch_node"))
+        // The WHOLE function, not a fixed line window. The first version of
+        // this read 6 lines for the signature and 40 for the body, and broke
+        // the moment the handler grew — flagging a contract that still held.
+        // A gate that fails when the code merely MOVES teaches people to edit
+        // the gate, which is how a gate stops meaning anything.
+        let body = src
+            .split("pub async fn patch_node")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub ").next())
             .expect("patch_node exists");
-        let head: String = src.lines().skip(sig).take(6).collect::<Vec<_>>().join("\n");
+
         assert!(
-            head.contains("ApiResult<Json<Node>>"),
-            "patch_node must answer with the full node; Web reads `position` off this reply.\n{head}"
+            body.contains("ApiResult<Json<Node>>"),
+            "patch_node must answer with the full node; Web reads `position` off this reply"
         );
-        let body: String = src
-            .lines()
-            .skip(sig)
-            .take(40)
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
             body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
             "patch_node must return the SAME node value it stored, so the reply carries the \
