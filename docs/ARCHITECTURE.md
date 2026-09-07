@@ -38,6 +38,22 @@ ownership area. Ship small, commit often, keep main green.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
 3. **≥ 90 % test coverage** per crate and per package. Enforced in **CI** (`make check-strict` on every push to origin: `cargo llvm-cov --fail-under-lines 90` per crate; web `vitest --coverage` with `lines: 90`) — coverage below the bar is a failing check, not a warning. Locally `make check` runs everything except coverage (it OOMs with six agents resident) and `make coverage` runs it deliberately. A red CI on `origin/main` is the owner's to fix within the hour; PM pushes `main` after merges so CI sees every merge. **No exemption without a machine-checkable expiry; an exemption from a bar is never an exemption from regressing.** Exemptions are predicates the gate executes (crate + a floor that never decreases, in `qa/coverage-floors.json` + an expiry the gate evaluates); an expired exemption fails the gate and names the choice. wheel-engine: ratchet from 71.24% (2026-09-06), joins the 90% bar when M2 is complete. **Web's 90% bar is scoped, not universal**: it applies to the `src/lib` modules that encode rules — wire matrix, limits, auth/session, CSP, message states, validation, endpoint-probe verdicts — enumerated in `web/vitest.config.ts`'s coverage `include` (PM ruling 2026-09-06, on Web's own recommendation). UI components are exercised by QA's Playwright suite instead of this gate; that split stands because a component test that mocks everything proves less than an E2E click, while an untested branch in wire-matrix/validate fails silently and lands on the operator. The include list is a live obligation, not a fixed inventory: any new `src/lib` module whose wrong branch would be silently wrong (permission/wire checks, auth, security headers, state machines, anything §3c calls out) must be added to it on the PR that introduces it; pure glue/IO (API client plumbing, env resolution) stays out unless it grows that kind of logic.
 
+### A number must record what it is a measurement OF (QA finding, accepted 2026-09-06)
+
+`qa/size-budget.json` was a flat object with no platform key. Its five ceilings were measured on
+`aarch64-apple-darwin`; CI measures `x86_64-unknown-linux-gnu`. The same source built for two targets differs
+by ~17%, so **the gate was red from the moment it was seeded** and no code had regressed at all.
+
+`qa/deps-budget.json` had been platform-keyed from the start, for exactly this reason. The lesson existed in
+the repo and the second file did not apply it.
+
+- A stored measurement carries its conditions — platform, feature set, profile — or it is not a measurement,
+  it is a number.
+- **Leave the shipped platform's ceiling UNSEEDED so CI seeds it from a CI run.** Otherwise the next person to
+  run the gate on a laptop sets the ceiling for what production ships, which is the same bug wearing a
+  different hat. A local run then checks the local ceiling, CI checks the shipped one, and neither can fail on
+  the other's number.
+
 ### A size gate measures what you ship; a test gate covers what you keep (PM ruling, 2026-09-06)
 
 These are two questions and they take different feature sets. Forcing them to match either under-tests the
