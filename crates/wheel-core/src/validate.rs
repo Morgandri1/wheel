@@ -38,6 +38,12 @@ pub enum ConfigError {
     DuplicateVaultKey(String),
     #[error("vault key {0:?} is not a valid environment variable name")]
     BadVaultKey(String),
+    #[error("workspace path must be relative, with no '..' or absolute segments")]
+    BadWorkspacePath,
+    #[error("workspace git url must be http(s):// or file:// — an ssh URL cannot authenticate from the credential helper and would hang on a key prompt")]
+    BadWorkspaceUrl,
+    #[error("workspace git url must not contain credentials: put the token in a vault, never in a URL that is written to .git/config")]
+    CredentialInWorkspaceUrl,
     #[error("agent system_prompt is too long (max {max} bytes)")]
     SystemPromptTooLong { max: usize },
     #[error("tool base_url must be an absolute http:// or https:// URL")]
@@ -159,6 +165,9 @@ pub fn validate_config_with(cfg: &NodeConfig, allow_hosts: &[String]) -> Result<
                 return Err(ConfigError::SystemPromptTooLong {
                     max: MAX_SYSTEM_PROMPT,
                 });
+            }
+            for ws in &a.workspaces {
+                validate_workspace(ws)?;
             }
             Ok(())
         }
@@ -332,6 +341,45 @@ fn validate_tool(cfg: &ToolConfig, allow_hosts: &[String]) -> Result<(), ConfigE
         for p in &op.params {
             validate_fill(&format!("{}.{}", op.id, p.name), &p.fill)?;
         }
+    }
+    Ok(())
+}
+
+/// A workspace is a directory the engine creates and a repository it clones, so
+/// both halves are attacker-reachable in the way §2 means: an agent that can
+/// place or update a node writes this config, and an agent is untrusted code.
+pub fn validate_workspace(ws: &crate::node::Workspace) -> Result<(), ConfigError> {
+    // Same rules as a chest key: relative, no traversal, no absolute paths.
+    normalize_chest_key(&ws.path).map_err(|_| ConfigError::BadWorkspacePath)?;
+
+    let Some(git) = &ws.git else {
+        return Ok(());
+    };
+
+    // A URL carrying `user:password@` is the exact shape that put a live PAT
+    // in a `.git/config` on the production volume (finding 036). Accepting one
+    // here would write it to disk again by a different route, so it is refused
+    // rather than stripped: silently rewriting a credential the user supplied
+    // teaches them it was fine to supply.
+    let after_scheme = git
+        .url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    if let Some((userinfo, _)) = after_scheme.split_once('@') {
+        if !userinfo.contains('/') {
+            return Err(ConfigError::CredentialInWorkspaceUrl);
+        }
+    }
+
+    // `ssh://` and `git@host:path` cannot authenticate through the askpass
+    // helper — git would prompt for a key and hang on a tty that is not there,
+    // which reads to an operator as a stuck clone rather than a refused one.
+    if !(git.url.starts_with("https://")
+        || git.url.starts_with("http://")
+        || git.url.starts_with("file://"))
+    {
+        return Err(ConfigError::BadWorkspaceUrl);
     }
     Ok(())
 }

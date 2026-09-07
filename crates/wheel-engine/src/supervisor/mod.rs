@@ -110,6 +110,7 @@ impl StartupTail {
 
 pub mod git_creds;
 mod prompt;
+pub mod workspace;
 pub use prompt::compose_prompt;
 
 /// What the supervisor knows about one running agent.
@@ -490,6 +491,34 @@ impl Supervisor {
                 workspace.display()
             )
         })?;
+
+        // §3e `workspaces`, tickets A9/A8. Until this ran, agents improvised
+        // their own clones — which is how a live PAT reached `.git/config`, and
+        // how three agents' full copies of one repository filled a 4.6 GB
+        // volume. The credential goes through the askpass helper's environment
+        // and every agent on a repo shares one object store.
+        let git_token = {
+            let conn = self.db.lock().unwrap();
+            self.vault_key().and_then(|vk| {
+                crate::vault::env_for_agent(&conn, vk, agent)
+                    .ok()
+                    .and_then(|env| {
+                        env.into_iter()
+                            .find(|(k, _)| k == "GITHUB_TOKEN" || k == "GH_TOKEN")
+                            .map(|(_, v)| v)
+                    })
+            })
+        };
+        let cwd = workspace::materialise(
+            &self.cfg.data_dir,
+            &workspace,
+            &run_dir,
+            &agent_cfg.workspaces,
+            git_token.as_deref(),
+        )
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| workspace.clone());
         let config_dir = self.cfg.creds_dir().join(agent.to_string());
         std::fs::create_dir_all(&config_dir)?;
 
@@ -526,7 +555,7 @@ impl Supervisor {
             mcp_config: Some(mcp_config),
             resume,
             config_dir,
-            cwd: workspace,
+            cwd,
         };
 
         self.set_status(agent, AgentStatus::Starting, None);

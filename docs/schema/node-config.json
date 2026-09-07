@@ -217,6 +217,13 @@
         "system_prompt": {
           "description": "Appended to the harness's own system prompt, then followed by the markdown of every `ctx` node wired `send` into this agent.",
           "type": "string"
+        },
+        "workspaces": {
+          "description": "Working copies the engine materialises before the child starts (§3e). The child's cwd is the first one.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Workspace"
+          }
         }
       },
       "additionalProperties": false
@@ -433,6 +440,34 @@
           ]
         }
       ]
+    },
+    "GitSource": {
+      "description": "A git repository to materialise a [`Workspace`] from.",
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "ref": {
+          "description": "Branch, tag or commit to check out. `None` = the remote's HEAD.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Clone URL, with NO credentials in it. A URL carrying `user:password@` is refused: that is the shape that leaked, and accepting it here would write it to `.git/config` exactly as before.",
+          "type": "string"
+        },
+        "vault_ref": {
+          "description": "`<vault>/<key>` naming the credential to authenticate with. `None` = any git token the agent's wired vaults already export.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "Harness": {
       "description": "Which CLI backs an agent node.",
@@ -805,6 +840,31 @@
           "items": {
             "type": "string"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Workspace": {
+      "description": "One working copy for an agent, materialised by the engine.\n\nThis exists because agents were doing it themselves. Every agent that needed a repository ran its own `git clone`, each in its own way, and the shortest form that works — `https://<token>@github.com/...` — wrote a live credential into `.git/config` on the production volume (finding 036). It also cost a full copy of the repository per agent, which is how three agents filled a 4.6 GB volume.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "git": {
+          "description": "Where the contents come from. Absent = an empty directory.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GitSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "description": "Directory under the agent's workspace root. Relative, no `..`.",
+          "type": "string"
         }
       },
       "additionalProperties": false
