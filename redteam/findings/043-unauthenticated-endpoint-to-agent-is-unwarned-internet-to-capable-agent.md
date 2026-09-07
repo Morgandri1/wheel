@@ -63,6 +63,25 @@ The SYSTEMIC fix (this finding): don't change the `none` default; WARN at the da
 - API/Engine: surface the same as a board-state flag at wire creation / on `GET /board`, so the warning exists
   even for boards built via the API or `wheel.toml`, not only the UI.
 
+## Post-close remediation — ROTATE, and rotate the right things (order matters)
+Closing the chain (Bearer / #17 / per-node uids) stops FUTURE reads; it does not un-leak what the open window
+already exposed. So after the carrier is closed, rotate — but rotate the VALUES, not just the keys:
+- **The vault VALUES (account credentials) are compromised, not merely the vault_key.** 037 item 2: vault values
+  are exported into each child's env (mod.rs:531-533), so a same-uid sibling could read another child's environ
+  and get the plaintext credential DIRECTLY; and `WHEEL_VAULT_KEY` decrypts the at-rest ciphertext. A new
+  vault_key does NOT help a credential whose plaintext already leaked. So regenerate the actual account tokens
+  (Anthropic OAuth, OpenAI/Codex key, any others). The GitHub PAT was already revoked — do the same for the rest.
+- **`WHEEL_ENGINE_SECRET`: cheap** — change the value in the API's `project_secrets` and restart the engine; no
+  data migration.
+- **`WHEEL_VAULT_KEY`: expensive, as suspected** — it encrypts vault values at rest, so a true rotation is a
+  decrypt-all-old / re-encrypt-all-new migration (both keys present, transactional) that likely does not exist
+  yet. Pragmatic path for a small board: generate a new key, discard old ciphertext, operator re-PUTs each
+  credential (values are write-only and operator-held anyway) — which COMBINES with rotating the values above
+  into one operation and needs no migration code.
+- **Order:** rotate AFTER the carrier is closed (specifically after #17 scrubs the two from environ), never
+  before — rotating into a still-open exposure re-exposes the new secret immediately. Gate rotation on #17, not
+  on per-node uids (which is far off and must not hold up rotation).
+
 ## Note
 Credit to PM: insisting on CONFIRMING the endpoint's auth mode rather than assuming Bearer is what turned a
 false "latent" rating into the true "live" one. The conditional was right; the fact was the other way.
