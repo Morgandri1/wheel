@@ -156,12 +156,18 @@ starting" is consistent with it, and the code rules out a drop; either way the f
   agent (the only ephemeral one), and it is precisely the "one live process forever" cost the project exists to
   avoid — sharpened by the 70%-of-seven-day rate-limit warning the harness is already emitting.
 
-**Fix (SDK):** do not eager-restart into an empty queue. After an ephemeral turn, `clear_session` + settle to
-**`Parked`** (kill the child, keep no process), and let `deliver()`'s existing parked→resume path start a FRESH
-session (no `--resume`, since the session was cleared) on the NEXT message. That reuses the same parked path
-every other agent uses, settles the status honestly, and restores idle-parking for ephemeral agents — fixing
-both the display bug and the never-parks cost bug at once. `wheel ctx clear` on demand can settle to Idle/Parked
-the same way.
+**Fix (SDK) — settle the restart, do NOT eliminate it.** Restarting into a fresh session is what
+`ephemeral_context` is FOR, so the fix keeps the restart and only fixes where it LANDS. Make it CONDITIONAL on
+the queue, because the bug is exactly the empty-queue case:
+- **Queue non-empty after an ephemeral turn:** restart-and-drain AS NOW — `clear_context`→`start()`→`pump_queue`
+  writes the next message, so it reaches `running` and processes in a fresh session. This path already works;
+  do not touch it. (Unconditionally parking here would STRAND the already-queued messages, since only a new
+  enqueue re-triggers `deliver()` — a new bug in place of the old one.)
+- **Queue empty after an ephemeral turn:** do NOT spawn a fresh child that sits in `starting`. `clear_session` +
+  settle to **`Parked`** (no live process), and let `deliver()`'s existing parked→resume path start a FRESH
+  session (no `--resume`, session cleared) on the NEXT message. This settles the status honestly and restores
+  idle-parking for ephemeral agents — fixing both the display bug and the never-parks cost bug.
+`wheel ctx clear` on demand settles the same way (park if idle/empty; drain if work remains).
 
 ## Note
 This correction and the measured root cause are the important content. Credit to PM for the live catch and the
