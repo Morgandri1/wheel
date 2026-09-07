@@ -48,11 +48,21 @@ SKIP = 77
 # never opens a sqlite store, and dropping the sqlite feature drops libsqlite3-sys -- an
 # actual compiled C library, which is why API measured 2.14 MiB (28.4%) for a 5-crate delta.
 #
-# The declaration and docker/Dockerfile.api must land in the same window. API is holding
-# their Dockerfile change until this can express the shape, because a gate measuring
-# default+postgres while Railway ships no-default+postgres is LOOSE rather than red -- the
-# silent-hole direction, and the exact failure we have each caught once tonight.
-DEPLOY_FEATURES = {"wheel-api": {"features": ["postgres"], "no_default": False}}
+# The declaration and docker/Dockerfile.api must land in the same window, and THE ORDER IS
+# NOT ARBITRARY -- the two windows fail in opposite directions:
+#
+#   gate flipped FIRST (this commit):  gate measures no-default (5.39 MiB), Dockerfile still
+#     ships default+postgres (7.53). The gate is measuring something STRICTER than what
+#     ships. Wrong, but it cannot hide growth in the real artifact -- worst case it fails on
+#     a binary smaller than the deployed one.
+#   Dockerfile flipped first:  gate measures 7.53 while Railway ships 5.39. The gate is
+#     LOOSE -- 2.14 MiB of headroom in which the shipped binary can grow unmeasured, and it
+#     stays green throughout. That is the silent direction.
+#
+# So the gate goes first and the Dockerfile follows. Same reasoning as landing the coverage
+# feature flag before API's default change rather than after: when two halves must agree,
+# sequence them so the intermediate state is over-strict rather than over-permissive.
+DEPLOY_FEATURES = {"wheel-api": {"features": ["postgres"], "no_default": True}}
 
 
 def deploy_build(member, spec):

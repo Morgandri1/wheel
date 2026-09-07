@@ -26,7 +26,7 @@ RUN set -eu; \
         echo 'fn main() {}' > "$d/src/main.rs"; \
         echo 'fn main() {}' > "$d/src/bin/export_schema.rs"; \
     done; \
-    cargo build --release --locked -p wheel-api --features postgres; \
+    cargo build --release --locked -p wheel-api --no-default-features --features postgres; \
     rm -rf crates
 
 # --locked, here and above: a deploy must build the versions CI tested, not whatever resolves today.
@@ -35,10 +35,15 @@ COPY crates ./crates
 # mtimes from the build context, which are older than the stub build above. Without this the real
 # build finishes in 0.2s having done nothing and the image ships the stub. It did, once, here.
 #
-# The size check is the guard for next time: a wheel-api that links axum, sqlx and rustls is tens of
-# megabytes, and `fn main() {}` is a third of one.
+# The size check is the guard for next time: a wheel-api that links axum, sqlx and rustls is
+# millions of bytes, and `fn main() {}` is a third of one megabyte.
+#
+# The floor is well under the real binary deliberately. Dropping the SQLite driver took this from
+# 7.90 MB to 5.65 MB measured on macOS (Linux differs), so a floor tuned tight to yesterday's build
+# would fail on a legitimate shrink and read as "the stub" — a guard that cries wolf at the exact
+# moment someone made the binary smaller on purpose. 5 MB still catches a stub by a wide margin.
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked -p wheel-api --features postgres \
+    && cargo build --release --locked -p wheel-api --no-default-features --features postgres \
     && size=$(stat -c %s target/release/wheel-api) \
     && if [ "$size" -lt 5000000 ]; then \
          echo "wheel-api is $size bytes: that is the stub, not the API" >&2; exit 1; \

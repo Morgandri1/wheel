@@ -392,8 +392,21 @@ async fn ingress_rate_limit_refuses_once_the_budget_is_spent() {
     let id = make_project(&app, &tok).await;
     open_ingress(&app, &tok, &id).await;
 
+    // 130, not 70, and the number is the whole point.
+    //
+    // The limiter is a FIXED window aligned to the wall-clock minute (`date_trunc('minute', now())`),
+    // so a run that straddles a boundary splits its requests between two windows. 70 can land as
+    // 35 + 35 — under the 60 budget in both — and no 429 ever comes. That is not a bug in the
+    // limiter: `http/ratelimit.rs` documents the boundary burst as an accepted v1 tradeoff, and
+    // API.md says up to 2x the limit across two adjacent windows. The test was asserting a
+    // guarantee the design deliberately does not make, and failed the first time CI ran it across
+    // a minute boundary.
+    //
+    // The worst case is an even split, so N requests put ceil(N/2) into some window. To exceed 60
+    // there we need ceil(N/2) > 60, i.e. N >= 122. 130 clears it with margin and still costs
+    // milliseconds — these are in-process router calls, not sockets.
     let mut saw_429 = false;
-    for _ in 0..70 {
+    for _ in 0..130 {
         let req = Request::builder()
             .method("GET")
             .uri(format!("/p/{id}/hook"))
