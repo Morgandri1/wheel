@@ -424,6 +424,21 @@ Per-type `config`:
 - `mcp`:      `{ transport: "stdio" | "http", command?: string, args?: string[], url?: string, env?: {k: v} }`
 - `vault`:    `{ keys: string[] }` — values are WRITE-ONLY through the API (`PUT /vault/<node>/<key>`), never returned to the UI; stored encrypted at rest with a per-project key.
 - `chest`:    `{}` — blob store; keys are relative paths, no `..`, no absolute paths, max 50 MiB per blob (v1).
+
+  **Chest is UNBUILT (M2). When it is implemented it must be BORN SAFE, not audited-and-patched** (ADVERSARY
+  campaign, 2026-09-07 — verified by source that no key→path code exists today, so this is sound-by-absence).
+  The path-safety checklist, in the order the checks must run:
+    1. Decode percent/unicode encodings FIRST — the attacker picks the encoding the validator does not decode
+       (same lesson as SSRF IP-encodings and the em-dash byte-slice).
+    2. Split into components and reject `..` as a COMPONENT — never a substring check.
+    3. Reject absolute paths (leading `/`) and NUL bytes (truncation).
+    4. Canonicalize the base once; after joining, verify the result is still UNDER it, and do NOT follow
+       symlinks out (the `symlink_metadata` skip discipline from `git_creds`).
+    5. Key the base on `node_id`, not name — names rename, id is stable, so one chest cannot reach another's.
+    6. 50 MiB per-blob cap.
+  And it is a NEW instance of 037's blast radius the day it ships: chest blobs on disk are readable by any
+  same-uid sibling until per-node uids land. Path-safety and the uid exposure are independent — closing one
+  does not close the other.
 - `tool`:     `{ kind: "http", source: { format: "openapi"|"swagger2"|"postman"|"insomnia"|"manual", raw: string, imported_at }, base_url: string,
                operations: [ { id: string /* slug, unique in node */, method, path /* may contain {param} */, summary?: string, enabled: bool,
                  params: [ { name, location: "path"|"query"|"header"|"cookie"|"body", schema: <json-schema subset>, required: bool, fill: Fill } ], /* `location`, not `in` — matches wheel-core ToolParam; body params are the flat top-level properties */
