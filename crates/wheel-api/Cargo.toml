@@ -5,9 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Which stores this build can talk to. Both by default, because the deployed API is pointed at
-# either; `wheeld` takes sqlite alone and never compiles the Postgres driver or its TLS stack.
-default = ["postgres", "sqlite"]
+# Which stores this build can talk to.
+#
+# SQLite alone by default, because the default is what a laptop, `wheeld` and `cargo build
+# --workspace` compile, and none of them talk to Postgres. Cargo unifies features across a
+# workspace build, so leaving `postgres` on by default put a Postgres driver and a second TLS stack
+# into wheeld's binary no matter what wheeld itself asked for.
+#
+# The deployed API opts in: `--features postgres`. docker/Dockerfile.api does, and so must anything
+# that builds the API for a Postgres deployment. A build without it refuses a `postgres://` STORE at
+# boot with that instruction, rather than misreading the URL.
+default = ["sqlite"]
 postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring"]
 sqlite = ["sqlx/sqlite"]
 
