@@ -96,6 +96,12 @@ export function probeVerdict({
     }
     return "The endpoint answered.";
   }
+  if (code === "not_found") {
+    // Verified against production: the API answers this when no project has that id, BEFORE it
+    // looks at the path or the capability. Sending the operator to check their path here would be
+    // the same wrong turn the 501 copy exists to prevent.
+    return "The API has no project with this id — it may have been deleted. This is not about the path.";
+  }
   if (status === 404) {
     // Retires itself: API turns a BODILESS 404 into 501, so once every engine is current this arm
     // is unreachable. A 404 the engine WROTE is a real answer about the path and must not be

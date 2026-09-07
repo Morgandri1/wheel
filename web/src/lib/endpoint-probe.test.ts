@@ -105,6 +105,14 @@ describe("what a status code is allowed to claim", () => {
     expect(new Set(verdicts).size).toBe(4);
   });
 
+  it("blames the project, not the path, when the API has no such project", () => {
+    // The exact body production returns for an unknown project id, captured from the deployment.
+    const body = '{"error":{"code":"not_found","message":"The requested resource does not exist."}}';
+    const verdict = probeVerdict({ status: 404, code: "not_found", body });
+    expect(verdict).toMatch(/no project with this id/i);
+    expect(verdict).not.toMatch(/check the path/i);
+  });
+
   it("reads the count from an engine that predates the queued rename", () => {
     // 168430f renamed the 202 field delivered -> queued. Both mean rows written, and a project
     // whose engine has not been restarted still sends the old name.
