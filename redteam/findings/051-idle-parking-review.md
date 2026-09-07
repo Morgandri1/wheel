@@ -1,6 +1,7 @@
-# 051 — Idle-parking (§3c#14) adversarial review: SOUND on all five vectors, three low tightenings
+# 051 — Idle-parking (§3c#14) adversarial review: SOUND on all five vectors; one measured bug (QA BUG-040, premature park) + two low tightenings
 
-- **Severity:** Low overall (the compute fix is sound; one Low-Medium tighten). Owner: SDK/Engine. Boundary TB4
+- **Severity:** Low overall for the vectors (the compute fix is sound); ONE tightening turned out to be a real
+  correctness bug on measurement — QA BUG-040, premature park (see Tighten #2, corrected). Owner: SDK/Engine. Boundary TB4
   (supervisor lifecycle). Reviewed at minutes-priority against the deploy target: **origin/sdk/query-function-denylist
   @ 47486f8** (park `supervisor/mod.rs:809`, `arm_park_timer:848`, call site `:1163`), read directly from the
   branch. High-stakes because it deploys to a restart-all host + broaden-wake.
@@ -44,12 +45,19 @@ Fix: check the kill result; on failure, log and do not claim Parked (leave a sta
 process), or verify the release before revoking/parking. Worth doing before a restart-all-host deploy on a
 compute-critical fix; otherwise it is backstopped and a fast-follow.
 
-## Tighten #2 (Low) — `arm_park_timer` stacks a timer per turn, no cancellation
+## Tighten #2 — CORRECTED: `arm_park_timer` stacks a timer per turn → PREMATURE PARK (QA BUG-040), not harmless
 `arm_park_timer` (mod.rs:848) spawns a NEW `tokio::spawn(sleep→park)` each time it is armed (after every turn,
-call site :1163). Nothing cancels a prior timer, so a chatty agent accumulates one sleeping task per turn for
-the timeout window. They are HARMLESS (a stale timer's `park` re-check finds the agent busy/queued and no-ops,
-or parks it if it is genuinely idle — correct either way), so this is a task-resource leak, not a correctness
-bug. Cleaner: a single re-armable timer, or a generation token so only the latest arming can park.
+call site :1163), with no cancellation. I first rated the stacking HARMLESS — "a stale timer's `park` re-check
+finds the agent busy and no-ops, or parks it if genuinely idle, correct either way." **That was wrong, and QA
+MEASURED it (BUG-040): a stale timer parks an agent BEFORE its idle_timeout has elapsed.** My error: the
+re-check (`status==Idle && !has_queued`) verifies "idle NOW," not "idle LONG ENOUGH since last activity." So a
+timer armed after turn 1 fires `idle_timeout` after turn 1 — but if the agent did turn 2 in between, that is
+BEFORE the correct park time (idle_timeout after turn 2), and the agent, being idle-now, is parked early. My
+reasoning held for the mid-task case (the slot lock, which is right) and missed the premature-park case
+entirely. Measurement beat the reading — logged as calibration, and the reason this class of claim must be run,
+not reasoned. Fix: QA's option 2 — on fire, check elapsed-since-last-activity and RE-ARM for the remainder
+rather than park; a single re-arming timer also closes the task-leak I flagged. Severity is a real correctness
+bug (an agent parked early = a needless resume + latency on the next message), not the "leak only" I first said.
 
 ## Tighten #3 (Low) — resume trusts the session_id blindly
 Nothing validates the kept `session_id` before `--resume`. If the harness session is stale/expired, `--resume`
@@ -58,7 +66,9 @@ job (done); confirm the FAILED-resume path falls back to a fresh session rather 
 (041's class). Harness/resume semantics — cross-ref 041.
 
 ## Note
-The three tightens are all Low(-Medium); none is a lost-message, silent-context-loss, or escalation. The
+Correction: Tighten #2 is NOT low — QA measured it as BUG-040 (premature park); I had reasoned it harmless.
+Tighten #1 (swallowed kill) is Low-Medium and #3 (stale resume) is Low; none of the three is a lost-message,
+silent-context-loss, or escalation. The
 slot-lock serialization + under-lock re-check is the correct spine, and the enqueue→deliver invariant (now
 load-bearing because parking makes "agent already running" false) is held across every production path today.
 Recommend a test that pins "any enqueue path resumes a parked target," so a future enqueue-without-deliver
