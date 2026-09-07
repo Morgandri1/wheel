@@ -906,6 +906,19 @@ because the reasoning next to it reads correctly.
 
 ## 022 — The engine's journal check reads the mode back instead of proving it · **S1** · SDK
 
+> **CLOSED 2026-09-07, and the two halves were verified by different people at different times.**
+> The rescued b969c042 session closed the mechanism (`1163cc9`): `try_mode` now proves the mode
+> with `mode_holds` (`BEGIN IMMEDIATE; COMMIT;`) before the fast path returns, for both callers,
+> reproduced at the crate level against `wheel-sqlite::open_configured(path, false)` with a
+> directory blocking `-shm`. That session recorded, correctly, that it could NOT verify through
+> the docker fixture because its sandbox had no `docker` binary — an honest gap, written down
+> rather than glossed.
+>
+> That gap is now closed from the other side: `ENG-starts-without-shm` runs GREEN through
+> `qa/fixtures/wal_blocked_shm.py` (engine-shm 12/12, image built from current main). Crate-level
+> proof plus fixture-level proof, and neither session could have produced both.
+
+
 `ENG-starts-without-shm` is RED against an image built from current main, i.e. **after** the fix
 that recovered production. The engine dies on a shm-less volume with:
 
@@ -1063,7 +1076,13 @@ about my build; the lesson that was actually needed is this one — the gate has
 exactly when it is right.
 
 
-## 026 — "Position is an integer cell" is ruled but not implemented · S2 · SDK · OPEN
+## 026 — "Position is an integer cell" is ruled but not implemented · S2 · SDK · ~~CLOSED~~
+
+> **CLOSED 2026-09-07 by measurement.** SDK's #22 landed. `POS-*` is **34/34 green** against an
+> image built from `bb20275`: rounding, clamping, symmetry about zero, write/refetch agreement on
+> both create and PATCH, and integer round-trip. The "17 red" below was true when filed and is no
+> longer true.
+
 
 **TESTPLAN:** `POS-is-an-integer/*`, `POS-rounds-and-clamps/*`, `POS-move-clamps` — 17 red on
 `main`.
@@ -1330,3 +1349,35 @@ demanded before reverting — and I have spent this entire session insisting on 
 for other people's findings. Two runs, one variable. I had one run and two variables.
 
 Flag restored. The rotate_tool fix and the flag are independent and both are needed.
+
+
+---
+
+### 034 — table self-heal: the `columns` half (S2, SDK, ~~closed~~) — rescued from b969c042
+
+**Numbered 034, not 026.** The b969c042 session filed this as BUG-026; `main` had already given
+026 to the position ruling. Different bugs, same number — this is the collision that held the
+reclaim. Renumbering here is the resolution; nothing about either finding changes.
+
+**The arc matters more than the finding**, so all three states are kept:
+
+1. **Claimed CONFIRMED.** That session cited CI run `34047133420` (SDK's PR #12) showing
+   `WOW-table-survives-restart/columns` failing — "the table came back but would not accept its
+   own configured columns (404)".
+2. **Retracted, by its own author, in the uncommitted file that was nearly lost.** PR #12
+   predates PR #20 and still carried the old `test_engine_validation.py` — a bare
+   `PUT /v1/tables/:id/rows/:row` with no `wheel()`-token helper, a route that 404s
+   unconditionally on the engine-secret realm, before self-heal or column shape enter into it.
+   So neither run was evidence about columns; both re-hit a dead route. Correct status at that
+   point: existence-half confirmed, **columns-half UNVERIFIED — not "owed", not "failing"**.
+3. **Settled 2026-09-07 by measurement.** With both PRs on `main`, the suite writes through a
+   real wheel-token'd agent: `WOW-table-survives-restart` and
+   `WOW-table-survives-restart/columns` are both **ok**, engine-validation 27/27, on a fresh
+   image. The columns half is verified, not merely unrefuted.
+
+**Why this entry exists at all**, given the outcome is "it works": the retraction in step 2 is
+the only part that was irreplaceable. A session concluded a bug was confirmed, re-read its own
+evidence, found the route it had tested was dead, and wrote the correction down — and that
+correction sat uncommitted on a volume scheduled for deletion. Without it, `main` would have
+carried a CONFIRMED claim its own author had already withdrawn, and the next person would have
+hunted a columns bug that the evidence never supported.
