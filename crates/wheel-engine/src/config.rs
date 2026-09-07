@@ -80,10 +80,29 @@ impl Config {
             _ => ListenAddr::default_tcp(),
         };
 
+        let vault_key = std::env::var(ENV_VAULT_KEY).ok().filter(|v| !v.is_empty());
+
+        // ADVERSARY 036/037: until per-node uids land (§3e, M2/M3), every
+        // child of this engine shares ITS uid, so anything left in the
+        // engine's own environ sits in /proc/<engine-pid>/environ, readable
+        // by any of them for the engine's entire lifetime. These two are the
+        // whole story: the control-plane bearer (bypasses the wire matrix
+        // outright) and the key that decrypts every vault in the project. A
+        // stopgap independent of the uid work -- scrub the moment they are
+        // read, not "when M2 lands".
+        //
+        // SAFETY: single-threaded here -- this runs once, synchronously, at
+        // the top of `main`, before any child is spawned or any other thread
+        // that could be reading the environment concurrently exists.
+        unsafe {
+            std::env::remove_var(ENV_ENGINE_SECRET);
+            std::env::remove_var(ENV_VAULT_KEY);
+        }
+
         Ok(Self {
             project_id,
             engine_secret,
-            vault_key: std::env::var(ENV_VAULT_KEY).ok().filter(|v| !v.is_empty()),
+            vault_key,
             data_dir: PathBuf::from(var(ENV_DATA_DIR).unwrap_or_else(|_| "/data".into())),
             listen,
             json_logs: std::env::var(ENV_LOG).map(|v| v == "json").unwrap_or(false),
@@ -160,6 +179,87 @@ fn tool_allow_hosts() -> Result<Vec<String>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `unsafe remove_var` in `from_env` is sound for ONE reason: it runs
+    /// at the top of `wheel-engine`'s `main`, before the tokio runtime exists
+    /// and before any child is spawned, so nothing can be reading the
+    /// environment concurrently. `std::env::remove_var` is undefined behaviour
+    /// the moment a second thread is live.
+    ///
+    /// That safety argument is about the CALL SITE, not about this function,
+    /// so nothing in the type system protects it. A future caller inside a
+    /// running runtime — `wheeld` builds its runtime first and calls the host
+    /// and api configs from inside it — would make this UB silently, with
+    /// every test still green.
+    ///
+    /// So the invariant is asserted where it actually lives: the whole
+    /// workspace is scanned, and `Config::from_env` may be named only by this
+    /// crate's `main.rs` and by tests.
+    #[test]
+    fn the_engine_config_is_only_read_before_a_runtime_exists() {
+        // Outside this crate the engine's config is only reachable as
+        // `wheel_engine::Config`; inside it, unqualified. Checking both
+        // spellings by location avoids matching `wheel-host`'s and
+        // `wheel-api`'s own `Config::from_env`, which are different types with
+        // no `remove_var` in them.
+        fn scan(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    scan(&path, out);
+                    continue;
+                }
+                if !path.extension().is_some_and(|x| x == "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let shown = path.display().to_string();
+                let ours = shown.contains("wheel-engine/");
+                let hit = text.lines().any(|l| {
+                    if ours {
+                        l.contains("Config::from_env")
+                    } else {
+                        l.contains("wheel_engine::Config::from_env")
+                    }
+                });
+                if hit {
+                    out.push(shown);
+                }
+            }
+        }
+
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/ is the parent of this crate")
+            .to_path_buf();
+        let mut callers = Vec::new();
+        scan(&crates, &mut callers);
+
+        let unexpected: Vec<_> = callers
+            .iter()
+            .filter(|p| {
+                // The engine's own entry point, which runs it before building
+                // a runtime, and this file's tests.
+                !p.ends_with("wheel-engine/src/main.rs")
+                    && !p.ends_with("wheel-engine/src/config.rs")
+            })
+            .collect();
+
+        assert!(
+            unexpected.is_empty(),
+            "Config::from_env calls `unsafe std::env::remove_var`, which is UB unless it runs \
+             single-threaded before any runtime. New caller(s) found: {unexpected:?} — if one of \
+             these runs inside a tokio runtime, the unsafe block is no longer sound."
+        );
+    }
     use super::*;
 
     /// Env is process-global, so these run one at a time.
@@ -265,5 +365,46 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// ADVERSARY 036/037: until per-node uids land, every child of this
+    /// engine shares its uid, so anything `from_env` leaves behind sits in
+    /// `/proc/<engine-pid>/environ` for any of them to read for the engine's
+    /// whole lifetime. The two that matter are the control-plane bearer and
+    /// the vault-decryption key — both must be gone from the process
+    /// environment the moment `Config` has its own copy, not merely absent
+    /// from the returned struct.
+    #[test]
+    fn the_engine_secret_and_vault_key_do_not_survive_in_the_process_environment() {
+        with_env(
+            &[
+                (ENV_PROJECT_ID, Some("2b1f6b0e-6b0a-4c1a-9c1a-000000000000")),
+                (ENV_ENGINE_SECRET, Some("at-least-sixteen-characters")),
+                (ENV_VAULT_KEY, Some("some-vault-key")),
+                (ENV_LISTEN, None),
+                (ENV_DATA_DIR, None),
+                (ENV_LOG, None),
+                (ENV_TOOL_ALLOW_HOST, None),
+                (ENV_ENV, None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("a fully-specified env must configure");
+
+                // The struct still has them -- this is a scrub, not a loss.
+                assert_eq!(cfg.engine_secret, "at-least-sixteen-characters");
+                assert_eq!(cfg.vault_key.as_deref(), Some("some-vault-key"));
+
+                // The process environment -- what a same-uid child's
+                // /proc/<engine-pid>/environ would show -- must not.
+                assert!(
+                    std::env::var(ENV_ENGINE_SECRET).is_err(),
+                    "the engine secret is still in this process's environment"
+                );
+                assert!(
+                    std::env::var(ENV_VAULT_KEY).is_err(),
+                    "the vault key is still in this process's environment"
+                );
+            },
+        );
     }
 }

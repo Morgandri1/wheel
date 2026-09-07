@@ -454,6 +454,38 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// PM's reviewers flagged this and it is the dangerous half of the i16
+    /// change: a row already outside +/-32767 must CLAMP on the way out, not
+    /// fail to load.
+    ///
+    /// The contract says out of range "clamps and returns what it stored". A
+    /// read that errors instead turns one legacy row into a board that will not
+    /// load at all — the opposite of the ruling, and a far worse failure than
+    /// the one the change was meant to prevent. The boot migration normally
+    /// snaps these rows first; this asserts the read path is safe on its own,
+    /// because a migration that has not run yet (a restore, a copied volume, a
+    /// future code path that opens without migrating) must not be load-bearing
+    /// for whether the engine can read its own board.
+    #[test]
+    fn a_row_outside_the_bounds_clamps_on_read_rather_than_failing_to_load() {
+        let conn = mem();
+        let node = ctx("legacy");
+        create(&conn, &node).unwrap();
+        // Written straight past `Position`, which is the only thing that would
+        // otherwise have clamped it.
+        conn.execute(
+            "UPDATE nodes SET x = ?2, y = ?3 WHERE id = ?1",
+            rusqlite::params![node.id.to_string(), 99999.4_f64, -99999.6_f64],
+        )
+        .unwrap();
+
+        let got = get(&conn, node.id)
+            .expect("an out-of-range row must load")
+            .expect("the node is still there");
+        assert_eq!(got.position.x, i16::MAX);
+        assert_eq!(got.position.y, i16::MIN);
+    }
+
     use super::*;
     use wheel_core::*;
 
@@ -505,7 +537,13 @@ mod tests {
         }
     }
 
-    /// W1 / WOW-table-survives-restart. The node survived, its table did not.
+    /// W1 / WOW-table-survives-restart -- and now WITHOUT one. The node
+    /// survived, its table did not; `board::ensure_tables` (boot) covers a
+    /// restart, but the wheel-dev incident this is named for happened on a
+    /// LIVE engine nobody restarted (QA's `WOW-table-survives-restart`, hit
+    /// for real on the reports table). `tables::list_rows`/`get_row`/
+    /// `put_row` now re-ensure on every access, so this must self-heal with
+    /// no `ensure_tables` call in between.
     ///
     /// QA's two assertions, and the second is the one that matters: a table
     /// rebuilt from a DEFAULT shape rather than from the node's config would
@@ -520,14 +558,11 @@ mod tests {
         // What a restore/migrate does to the file: the node row survives, the
         // user table does not.
         c.execute_batch("DROP TABLE t_reports").unwrap();
-        assert!(
-            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0).is_err(),
-            "positive control: the read must be broken before the fix runs"
-        );
 
-        ensure_tables(&c).unwrap();
-
-        // (1) The read works and is empty -- never "no such table".
+        // (1) The read works and is empty -- never "no such table" -- with NO
+        // boot/`ensure_tables` call in between. Restoring the old
+        // `list_rows`/`get_row`/`put_row` (without their own `ensure` call)
+        // makes this fail again with "no such table: t_reports": checked.
         assert!(tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
             .unwrap()
             .is_empty());

@@ -25,8 +25,21 @@ pub fn open(path: &Path) -> Result<Connection> {
     // (`tables::query`) opens it a second time, so an exclusive engine is an
     // engine whose agents cannot read their own tables -- a hard error naming
     // the mode the database is stuck in is the better failure.
+    //
+    // `open_configured` already negotiates the journal mode -- including the
+    // slow escalation path on a volume that cannot host WAL (BEGIN IMMEDIATE
+    // write-proofs, an exclusive drain, a retry, all real I/O). Running
+    // `configure`'s `configure_journal` a SECOND time here, on the connection
+    // it just returned, repeated every one of those slow attempts for no
+    // reason: this connection is already in a working mode. On a hostile
+    // volume that doubled the boot's worst-case latency, which is what pushed
+    // it past the CI fixture's patience (`ENG-journal-override-cannot-
+    // disable-recovery`, which timed the container out rather than seeing it
+    // stay unhealthy -- the engine's own log shows it reaching "listening"
+    // every time, just too late). `foreign_keys` still needs setting; it does
+    // not need the journal negotiated a second time to get it.
     let conn = wheel_sqlite::open_configured(&path.display().to_string(), false)?;
-    configure(&conn)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     migrate(&conn)?;
     ensure_node_tables(&conn)?;
     Ok(conn)
@@ -73,6 +86,41 @@ fn migrate(conn: &Connection) -> Result<()> {
     // statements are CREATE ... IF NOT EXISTS and never touch a table that
     // already exists.
     add_column(conn, "vault_values", "expires_at TEXT")?;
+    snap_positions_to_cells(conn)?;
+    Ok(())
+}
+
+/// Round and clamp stored positions to whole cells (ARCHITECTURE.md "Position
+/// is an integer cell").
+///
+/// `Position` became `i16` in the type, and the read path rounds whatever it
+/// finds, so the board already answers with integers. This is about the bytes
+/// at rest: without it, rows written before the ruling keep `10.4` for ever and
+/// anything that reads the column without going through `Position` -- an
+/// export, a backup, a hand-written query -- still sees a float. Rounding once,
+/// on boot, is what makes the stored value and the served value the same value.
+///
+/// The `x`/`y` columns stay `REAL` deliberately. Seven tables reference
+/// `nodes(id)` with `ON DELETE CASCADE`, and sqlite cannot change a column type
+/// in place: the rebuild is rename-create-copy-drop, during which those foreign
+/// keys follow the rename onto the old table and the drop cascades away every
+/// wire, message, and vault row in the project. Nothing writes a fraction --
+/// the only writer binds an `i16` -- so the column's width buys nothing worth
+/// that risk.
+fn snap_positions_to_cells(conn: &Connection) -> Result<()> {
+    let snapped = conn
+        .execute(
+            "UPDATE nodes
+                SET x = MAX(-32768, MIN(32767, CAST(round(x) AS INTEGER))),
+                    y = MAX(-32768, MIN(32767, CAST(round(y) AS INTEGER)))
+              WHERE x <> MAX(-32768, MIN(32767, CAST(round(x) AS INTEGER)))
+                 OR y <> MAX(-32768, MIN(32767, CAST(round(y) AS INTEGER)))",
+            [],
+        )
+        .context("snapping stored positions to whole cells")?;
+    if snapped > 0 {
+        tracing::info!(nodes = snapped, "snapped stored positions to whole cells");
+    }
     Ok(())
 }
 
@@ -92,6 +140,46 @@ fn add_column(conn: &Connection, table: &str, decl: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The operator's board carried 20 nodes with fractional positions when
+    /// the ruling landed. Reading rounds them, so the API looked correct while
+    /// the bytes on the volume stayed fractional for ever -- which is the half
+    /// an export, a backup or a hand-written query would still have seen.
+    ///
+    /// Written against the STORED value on purpose: asserting through
+    /// `board::get` would pass with no migration at all, because the read path
+    /// rounds.
+    #[test]
+    fn positions_stored_before_the_ruling_are_whole_cells_after_a_boot() {
+        let dir = std::env::temp_dir().join(format!("wheel-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        let _ = std::fs::remove_file(&path);
+
+        let id = uuid::Uuid::new_v4().to_string();
+        {
+            let conn = open(&path).unwrap();
+            // Bound as f64 to get past `Position` entirely: this is the shape a
+            // row written before the type change has.
+            conn.execute(
+                "INSERT INTO nodes (id, name, type, config, x, y, created_at, updated_at)
+                 VALUES (?1, 'legacy', 'ctx', '{\"markdown\":\"\"}', ?2, ?3, '', '')",
+                rusqlite::params![id, -10.6_f64, 99999.4_f64],
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let (x, y): (f64, f64) = conn
+            .query_row("SELECT x, y FROM nodes WHERE id = ?1", [&id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(x, -11.0, "-10.6 rounds away from zero, in the stored value");
+        assert_eq!(y, 32767.0, "past the bound it clamps rather than wrapping");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn table_node(name: &str, columns: &[&str]) -> wheel_core::Node {
         wheel_core::Node::new(
