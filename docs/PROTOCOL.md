@@ -644,6 +644,19 @@ stderr is captured as `stream=stderr` and never parsed as JSON.
 
 ### Codex (`harness: "codex"`) — M2
 
+> **WARNING — a `codex` node is accepted today and SILENTLY RUNS CLAUDE. Do not create one.**
+> There is no codex driver: `Supervisor::new` hardcodes `ClaudeDriver` (`supervisor/mod.rs:267`) and
+> `ClaudeDriver::program()` returns `"claude"` (`harness/claude.rs:19-20`). `agent_cfg.harness` is consulted
+> **only** to pick which credential env vars to export (`supervisor/mod.rs:468`, `:643`) — never to choose the
+> binary. Nothing rejects the node at creation or at start (no `Harness::Codex` guard in `validate.rs` or
+> `board_routes.rs`).
+> So the node is created, handed `CODEX_API_KEY`, and then `claude` is spawned with it. It fails as an auth
+> problem, or behaves as a Claude agent, and the operator is never told their harness choice was ignored.
+> The auth flows described above for codex are real code, which is what makes this shape convincing — the
+> credential half exists, the execution half does not.
+> **Fix is a guard** (refuse `Harness::Codex` at create and start with "codex is M2") — deliberately not
+> landed yet because engine changes redeploy the host and a wake is pending. SDK, 2026-09-07.
+
 Deferred. The auth spike established that `codex exec` is not a safe auth probe (it proceeds unauthenticated and
 dies at request time with a 401) and that the API-key env var is **`CODEX_API_KEY`** — `OPENAI_API_KEY` is noticed
 but is *not* in the auth resolution chain. Exact event names for `codex exec --json` are unverified; they will be
