@@ -298,13 +298,26 @@ def main():
             # 8. The only case an operator can actually see.
             moved = max(abs(gx - x), abs(gy - y)) if isinstance(gx, (int, float)) else 0
             if want_clamp:
-                # PENDING, not red: BUG-029 is filed and open, and a deliberately-red
-                # gate on main freezes every other lane (ARCHITECTURE.md). This one was
-                # the single failing assertion across nineteen integration suites. It
-                # flips to FAIL the moment SDK adds the log line, demanding promotion.
-                R.pending("POS-migration-clamp-is-reported",
-                          ("mig-node-%04d" % i) in log or "clamp" in log.lower(),
-                          "BUG-029",
+                # PROMOTED from PENDING. BUG-029 is fixed (6852068: the migration names
+                # every node it clamps, and where it moved from). The marker did exactly
+                # what it was built to do -- it went RED the moment the fix landed and
+                # demanded this promotion, rather than staying quietly green on a gate
+                # that had stopped gating.
+                # ASSERT WHAT THE LINE CARRIES, not that the word appears. The pending
+                # marker used `name in log or "clamp" in log.lower()`. The second disjunct
+                # was fine for DETECTING the bug -- it only had to notice nothing specific
+                # was logged -- but as a check it passes on the old COUNT line, i.e. on
+                # exactly the output BUG-029 was filed against. An assertion that cannot
+                # fail for the thing it names is the shape 0b refuses, and PM caught it.
+                #
+                # SDK emits node=<name> from_x/from_y/to_x/to_y moved_cells, so the
+                # specific assertion is available: the node, where it was, where it went.
+                name_i = "mig-node-%04d" % i
+                logged = (name_i in log
+                          and str(expected_cell(x)) in log and str(expected_cell(y)) in log
+                          and str(int(x)) in log and str(int(y)) in log)
+                R.gated("POS-migration-clamp-is-reported", "POS-migration/is-integer",
+                        logged,
                         "%s was outside the bound and moved %.0f cells (%.0f px at the "
                         "board's max zoom of %.1f). That is a node teleporting across the "
                         "screen, and the boot log never mentions it. Clamping is correct; "
