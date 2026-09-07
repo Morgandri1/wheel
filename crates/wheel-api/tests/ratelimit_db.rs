@@ -11,6 +11,12 @@
 //! Postgres says nothing about the local install a contributor actually runs. SQLite needs nothing
 //! and always runs; Postgres joins it wherever TEST_DATABASE_URL is set.
 
+// Runs against Postgres, which only a build with the `postgres` feature can open. Without the
+// gate these suites still COMPILE in a default build and then panic at `Db::connect`, which is how
+// they took main red: the driver stopped being a default feature and the tests kept trying to use
+// it. `boot_db.rs` was already gated this way.
+#![cfg(feature = "postgres")]
+
 use uuid::Uuid;
 use wheel_api::http::ratelimit::{sweep, RateLimiter};
 
