@@ -38,6 +38,20 @@ the uid (21088), not root. PM's outside-root denial is explained by the ssh cont
 over pid 11 (a namespace/cap artefact), NOT by the engine being protected. **037's crown jewel holds as written;
 PM can stop asking.** TEST 2 (different uid → denied) is the proof that per-node uids (§2/F007) is the real fix.
 
+**WHY same-uid IS the live case today (the load-bearing fact, source-verified — do not conflate the three
+contexts):** the engine's agent-spawn path (`supervisor/mod.rs` `child_command`:220, used at `start`:569) has
+NO `setuid`/`pre_exec` — an agent INHERITS the engine's uid. The host drops the engine to the project uid;
+agents then run as that SAME uid. So there are THREE distinct contexts, and only the first is 037's actor:
+  1. **Same-uid sibling agent, inside the sandbox (TODAY):** READS the environ. My PoC confirms. This is 037.
+  2. **A different uid** (a future per-node-uid agent, or a cross-tenant one): DENIED (PoC TEST 2). This is what
+     per-node uids would ACHIEVE — i.e. the fix, not the current state.
+  3. **Root from OUTSIDE via Railway ssh (PM's test):** DENIED — a third context (privileged external session
+     lacking `CAP_SYS_PTRACE`/in a different namespace over the pid). Neither confirms nor refutes #1.
+"Same-uid vs cross-uid differ" is exactly right and STRENGTHENS 037: they differ (read vs denied), which is why
+037 is a same-uid Critical NOW (agents inherit the engine uid — no per-node setuid exists) and per-node uids is
+the fix. A reading that treats #2 or #3 as 037's premise, and so calls the premise "measured false", is placing
+the wrong context under the finding — #1 is the premise, and #1 is TRUE by run.
+
 Two consequences worth stating:
 - **PR #17 (scrub the two secrets from the engine's environ) DOES close THIS carrier for the crown jewels** —
   the sibling can still read `/proc/engine/environ`, but after #17 those two variables are no longer in it. #17
