@@ -182,16 +182,48 @@ impl Store {
             ))
         })?;
         let mut out = Vec::new();
+        let mut skipped = 0usize;
         for row in rows {
-            let (id, engine_secret, vault_key) = row?;
-            if let Ok(id) = Uuid::parse_str(&id) {
-                out.push(ProjectRecord {
+            // One unreadable row must not cost every other tenant their restore. This used to be
+            // `row?`, which aborted the whole list -- and the caller treats an error here by
+            // skipping reconcile entirely, so a single malformed row left EVERY project stopped
+            // after a host restart, with nothing naming the row. Same shape as the engine's
+            // board::list, and the same fix: skip the row, keep the set, say which one and why.
+            let (id, engine_secret, vault_key) = match row {
+                Ok(t) => t,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::error!(
+                        error = %e,
+                        "unreadable row in projects; that project will NOT be restored"
+                    );
+                    continue;
+                }
+            };
+            match Uuid::parse_str(&id) {
+                Ok(id) => out.push(ProjectRecord {
                     id,
                     uid_base: None,
                     engine_secret,
                     vault_key,
-                });
+                }),
+                Err(e) => {
+                    skipped += 1;
+                    // The id is safe to log; the other two columns are the crown jewels.
+                    tracing::error!(
+                        id = %id,
+                        error = %e,
+                        "project row has an unparseable id; that project will NOT be restored"
+                    );
+                }
             }
+        }
+        if skipped > 0 {
+            tracing::error!(
+                skipped,
+                restored = out.len(),
+                "some projects were skipped and will stay stopped until their rows are repaired"
+            );
         }
         Ok(out)
     }
@@ -214,6 +246,89 @@ mod tests {
         let id = Uuid::new_v4();
         s.upsert(&id, "engine-secret", "vault-key").await.unwrap();
         id
+    }
+
+    /// One bad row must not cost every other tenant their restore.
+    ///
+    /// The engine hit this exact shape on 2026-09-07: `board::list` parsed every row's id and
+    /// failed whole on the first bad one, so one unreadable row took the board down — and the board
+    /// was the thing that would have told you which row was bad. This function had the same
+    /// structure, and its caller is worse: `reconcile_on_boot` treats an error here by skipping
+    /// reconcile ENTIRELY, so a single malformed id left every project on the host stopped after a
+    /// restart, with nothing naming the cause.
+    ///
+    /// A partial restore, a hand-edited row, or an older schema all produce this.
+    #[tokio::test]
+    async fn one_unreadable_row_does_not_cost_the_others_their_restore() {
+        let (s, path) = store();
+        let good = project(&s).await;
+        s.set_desired_running(&good, true).await.unwrap();
+
+        // The row has to be genuinely UNREADABLE, not merely wrong, or it exercises the uuid
+        // branch (already safe) instead of the per-row read error (the dangerous one).
+        //
+        // It took two tries to get a fixture that is actually unreadable. "not-a-uuid" reads back
+        // fine and only fails to PARSE. An integer does not work either: the column is declared
+        // TEXT, so sqlite's type affinity quietly converts 12345 to '12345' on the way in and it
+        // reads back as a String. A BLOB of invalid UTF-8 is the one thing affinity leaves alone,
+        // so `get::<String>` genuinely fails on it.
+        let side = rusqlite::Connection::open(&path).unwrap();
+        side.execute(
+            "INSERT INTO projects (id, engine_secret, vault_key, desired_running) \
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                vec![0xffu8, 0xfe, 0xfd],
+                "vault-key"
+            ],
+        )
+        .unwrap();
+        drop(side);
+
+        let restored = s
+            .all_desired_running()
+            .await
+            .expect("a malformed row must not fail the whole read");
+
+        let ids: Vec<Uuid> = restored.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![good],
+            "the good project was lost because a neighbouring row was bad"
+        );
+    }
+
+    /// Skipping the bad row must not hide the good ones behind it — order is not a defence.
+    #[tokio::test]
+    async fn a_bad_row_does_not_hide_well_formed_rows_after_it() {
+        let (s, path) = store();
+        let side = rusqlite::Connection::open(&path).unwrap();
+        side.execute(
+            "INSERT INTO projects (id, engine_secret, vault_key, desired_running) \
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                vec![0xffu8, 0xfe, 0xfd],
+                "vault-key"
+            ],
+        )
+        .unwrap();
+        drop(side);
+
+        let a = project(&s).await;
+        let b = project(&s).await;
+        s.set_desired_running(&a, true).await.unwrap();
+        s.set_desired_running(&b, true).await.unwrap();
+
+        let restored = s
+            .all_desired_running()
+            .await
+            .expect("read past the bad row");
+        let mut ids: Vec<Uuid> = restored.iter().map(|r| r.id).collect();
+        ids.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(ids, want, "rows after the malformed one were dropped");
     }
 
     #[tokio::test]
