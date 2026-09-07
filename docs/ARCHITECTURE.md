@@ -151,6 +151,11 @@ kept merging on top of it. None of those merges was ever seen green end-to-end.
   into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
   *next*, not eventually.
 - Whoever notices red `main` first says so. Silence is how five commits happen.
+- **A docs-only commit that corrects a FALSE STATEMENT in a decision document may merge during a freeze** —
+  for anyone, not just PM. A retracted claim that stays in the repo gets re-read as fact by the next person,
+  and decision documents are read by reviewers and rulers who were not in the conversation where it was
+  withdrawn. This is written down because PM had been landing contract commits throughout the freeze while
+  telling lanes to hold: either the exemption is general and stated, or it should not exist.
 - **Merging is blocked; committing is not** (API amendment, accepted 2026-09-06). Lane branches keep moving
   and land the moment `main` greens. Read without this carve-out the rule quietly stops all work, which is
   worse than the disease.
