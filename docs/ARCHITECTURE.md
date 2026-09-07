@@ -621,6 +621,23 @@ conditions missing, or a proposal arrives with its subject missing and only its 
 - Git has not truncated on us once. Use the transport that works for the payload that matters, and keep
   messages for the pointer.
 
+### Credit the invitation to falsify, not the claim; agreement is not a cross-check (SDK+API, accepted 2026-09-07)
+
+047 (High, capability boundary) was not *found*. SDK made a confident claim — "nothing is returned unless
+the capability still holds at the moment of disclosure" — and handed it to ADVERSARY with "probe it, and if
+it does not match I want to know." The claim was wrong; both shipped re-checks re-validated a request-start
+snapshot and a mid-request revoke still disclosed. The invitation was the useful act, not the claim, and it
+cost nothing. Nearly every real defect this project caught came the same way: someone measuring against a
+hypothesis that was not theirs. So state claims as **falsifiable**, and hand them to whoever can test them —
+the confident-and-wrong claim that invites a probe is worth more than the cautious one that invites none.
+
+The companion trap, API's: **agreement is not a cross-check.** Two people independently ran the right
+procedure on the rate-limit flake and agreed — and were probably both reading the wrong clock. Controls
+catch instruments; they do not catch an assumption both instruments *share*. Only a differently-shaped
+signal does — the database's own `now()` against a limiter that reads wall-clock. Treat agreement as the
+prompt to go find the independent signal, never as the proof. (This is why the rate-limit deflake asserts
+against the DB clock, not the app's.)
+
 ### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
 
 We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in the first hours of this project.
