@@ -73,3 +73,22 @@ checkout side — is now gone; it does not disprove the pre-delete sharing.)
 The remaining 2.2G in `creds/` is agent homes; two `.local/share/pnpm` stores (~882M each,
 ~1.76G) dominate. These are re-fetchable caches inside LIVE homes — a separate, more careful
 decision than orphaned-checkout cleanup, and not taken here. Volume at 58% is healthy; no urgency.
+
+## TICKET (M2, not tonight — engine env work, under deploy freeze): per-project pnpm store-dir
+
+SDK cross-checked the hardlink finding against A8's own premise and both survived:
+- A8's git saving is REAL and structural, not hardlink-luck. Measured with `git clone --no-hardlinks`
+  (which is what cloning from GitHub over https actually is — a remote cannot hardlink):
+  A8 (1 bare store + 2 worktrees) 58840 KB vs old (2 independent clones) 75344 KB.
+  A8 collapses the `.git` objects (8.1M of an 18M clone), NOT the checked-out working files (10M each).
+  SDK's FIRST control was confounded by exactly our effect — local `git clone` hardlinks objects by
+  default, so "two independent clones" shared blocks and was artificially cheap. The control was not a
+  control until `--no-hardlinks`. (This is the reclaim's lesson restated: a control that shares blocks
+  measures nothing.)
+- The same shape answers the pnpm 1.76G: six agents each with their own `.local/share/pnpm` store is the
+  duplication A8 removed for git objects. One `store-dir` (via `PNPM_HOME`/`store-dir`) per PROJECT rather
+  than per agent collapses ~1.76G toward one copy. The engine already sets per-project `CARGO_HOME` for
+  exactly this reason, so the mechanism exists. Unlike deleting a cache it loses nothing: the store is
+  re-fetchable by definition and shared by design.
+- NOT now: engine env work under the deploy freeze, and it wants measuring before building. Recorded so
+  the second (bigger) half of the finding is not lost. Volume at 58% is a fine place to stop.
