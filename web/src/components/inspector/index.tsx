@@ -8,7 +8,7 @@ import {
   IDLE_TIMEOUT_DEFAULT,
   buildBudget,
   buildWorkspace,
-  parseOptionalNumber,
+  buildIdleTimeout,
   validateWorkspacePath,
 } from "@/lib/agent-config";
 import { AuthFlow } from "@/components/inspector/auth-flow";
@@ -142,21 +142,21 @@ function AgentRuntimeFields({
   const workspaces = node.config.workspaces ?? [];
 
   const saveBudget = async () => {
-    const budget = buildBudget(turns, usd);
-    if (budget === null) {
-      toast("Budget must be a number, or empty for no cap.", "error");
+    const parsed = buildBudget(turns, usd);
+    if (!parsed.ok) {
+      toast(parsed.message, "error");
       return;
     }
-    await patchConfig({ budget });
+    await patchConfig({ budget: parsed.budget });
   };
 
   const saveIdle = async () => {
-    const secs = parseOptionalNumber(idle);
-    if (secs === null) {
-      toast("Idle timeout must be a number of seconds, or empty for the default.", "error");
+    const parsed = buildIdleTimeout(idle);
+    if (!parsed.ok) {
+      toast(parsed.message, "error");
       return;
     }
-    await patchConfig({ idle_timeout_secs: secs === undefined ? undefined : Math.floor(secs) });
+    await patchConfig({ idle_timeout_secs: parsed.secs });
   };
 
   const addWorkspace = async () => {

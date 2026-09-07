@@ -20,16 +20,36 @@ export function parseOptionalNumber(raw: string): number | null | undefined {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-/** `undefined` drops the whole budget; `null` means the input was rejected. */
-export function buildBudget(turns: string, usd: string): Budget | null | undefined {
+/**
+ * Clearing a field must send an explicit `null`, never `undefined`.
+ *
+ * `JSON.stringify` DROPS undefined keys, so `{...config, budget: undefined}` goes out as a body
+ * with no `budget` at all. Under replace semantics that clears it; under merge semantics an absent
+ * key means "leave unchanged", so the cap silently survives a user clearing the box. `null` means
+ * the same thing under both: unset it. The schema types both fields as `| null` for exactly this.
+ */
+export type ParsedBudget = { ok: true; budget: Budget | null } | { ok: false; message: string };
+
+export function buildBudget(turns: string, usd: string): ParsedBudget {
   const t = parseOptionalNumber(turns);
   const u = parseOptionalNumber(usd);
-  if (t === null || u === null) return null;
-  if (t === undefined && u === undefined) return undefined;
+  if (t === null || u === null) {
+    return { ok: false, message: "Budget must be a number, or empty for no cap." };
+  }
+  if (t === undefined && u === undefined) return { ok: true, budget: null };
   const budget: Budget = {};
   if (t !== undefined) budget.max_turns = Math.floor(t);
   if (u !== undefined) budget.max_usd = u;
-  return budget;
+  return { ok: true, budget };
+}
+
+/** Same rule as the budget: empty clears with an explicit null, not a missing key. */
+export function buildIdleTimeout(raw: string): { ok: true; secs: number | null } | { ok: false; message: string } {
+  const n = parseOptionalNumber(raw);
+  if (n === null) {
+    return { ok: false, message: "Idle timeout must be a number of seconds, or empty for the default." };
+  }
+  return { ok: true, secs: n === undefined ? null : Math.floor(n) };
 }
 
 /**

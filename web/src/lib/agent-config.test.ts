@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildBudget, buildWorkspace, parseOptionalNumber, validateWorkspacePath } from "./agent-config";
+import {
+  buildBudget,
+  buildIdleTimeout,
+  buildWorkspace,
+  parseOptionalNumber,
+  validateWorkspacePath,
+} from "./agent-config";
 
 describe("parseOptionalNumber — empty is unset, not zero", () => {
   it("treats an empty field as unset", () => {
@@ -20,20 +26,20 @@ describe("parseOptionalNumber — empty is unset, not zero", () => {
 
 describe("buildBudget", () => {
   it("drops the budget entirely when both fields are blank", () => {
-    expect(buildBudget("", "")).toBeUndefined();
+    expect(buildBudget("", "")).toEqual({ ok: true, budget: null });
   });
 
   it("keeps only the field that was filled", () => {
-    expect(buildBudget("40", "")).toEqual({ max_turns: 40 });
-    expect(buildBudget("", "2.50")).toEqual({ max_usd: 2.5 });
+    expect(buildBudget("40", "")).toEqual({ ok: true, budget: { max_turns: 40 } });
+    expect(buildBudget("", "2.50")).toEqual({ ok: true, budget: { max_usd: 2.5 } });
   });
 
   it("floors turns, which are whole, and leaves dollars fractional", () => {
-    expect(buildBudget("40.7", "2.55")).toEqual({ max_turns: 40, max_usd: 2.55 });
+    expect(buildBudget("40.7", "2.55")).toEqual({ ok: true, budget: { max_turns: 40, max_usd: 2.55 } });
   });
 
   it("reports rejection instead of saving a partial budget", () => {
-    expect(buildBudget("abc", "1")).toBeNull();
+    expect(buildBudget("abc", "1")).toEqual({ ok: false, message: expect.stringContaining("number") });
   });
 });
 
@@ -83,7 +89,8 @@ describe("the write must carry the whole config", () => {
       run_on_startup: true,
       workspaces: [{ path: "repos/wheel" }],
     };
-    const sent = { ...config, budget: buildBudget("40", "") };
+    const parsed = buildBudget("40", "");
+    const sent = { ...config, budget: parsed.ok ? parsed.budget : undefined };
     expect(sent.system_prompt).toBe("you are a researcher");
     expect(sent.harness).toBe("claude");
     expect(sent.workspaces).toEqual([{ path: "repos/wheel" }]);
@@ -93,5 +100,36 @@ describe("the write must carry the whole config", () => {
   it("removing a workspace keeps the others and changes nothing else", () => {
     const workspaces = [{ path: "a" }, { path: "b" }, { path: "c" }];
     expect(workspaces.filter((_, i) => i !== 1)).toEqual([{ path: "a" }, { path: "c" }]);
+  });
+});
+
+
+describe("clearing a field survives JSON, under merge OR replace semantics", () => {
+  /**
+   * JSON.stringify DROPS undefined keys. `{...config, budget: undefined}` serialises with no
+   * `budget` at all — which clears it under replace semantics and, under merge, means "leave it
+   * alone", so a user clearing the box would keep their cap and be told it saved. An explicit null
+   * means unset under both. This asserts the SERIALISED body, because that is where undefined
+   * disappears and an object-level assertion would not notice.
+   */
+  it("sends an explicit null for a cleared budget", () => {
+    const parsed = buildBudget("", "");
+    expect(parsed).toEqual({ ok: true, budget: null });
+    const body = JSON.stringify({ config: { harness: "claude", budget: parsed.ok ? parsed.budget : undefined } });
+    expect(body).toContain('"budget":null');
+    expect(JSON.parse(body).config).toHaveProperty("budget");
+  });
+
+  it("sends an explicit null for a cleared idle timeout", () => {
+    const parsed = buildIdleTimeout("  ");
+    expect(parsed).toEqual({ ok: true, secs: null });
+    const body = JSON.stringify({ config: { idle_timeout_secs: parsed.ok ? parsed.secs : undefined } });
+    expect(body).toContain('"idle_timeout_secs":null');
+  });
+
+  it("still keeps a real value, and floors the seconds", () => {
+    expect(buildIdleTimeout("90.7")).toEqual({ ok: true, secs: 90 });
+    expect(buildIdleTimeout("0")).toEqual({ ok: true, secs: 0 });
+    expect(buildIdleTimeout("nope")).toEqual({ ok: false, message: expect.stringContaining("seconds") });
   });
 });
