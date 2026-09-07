@@ -65,6 +65,18 @@ lands on it. This is why the swarm catches what a careful individual cannot, and
 should deliberately cross hypotheses rather than have each lane grade itself: the owner is the worst-placed to
 see their own blind spot, and the best-placed to fix it once someone else's instrument names it.
 
+**Turn that check on your own quick conclusions, too (PM, 2026-09-07 — the same discipline, before someone
+else has to).** The cross-check above catches your blind spot with another's instrument; this catches it
+before you assert, by refusing three things: a doc specifying X as proof that X exists (ADVERSARY's phantom
+per-project cap — §3e specifies one, none is implemented); a throwaway or first-pass check as a result (SDK's
+`.gitkeep` false-DRIFT and the `ghp_`-in-the-workspace near-leak — both quick greps that lie precisely because
+they feel too small to double-check, while the consequential checks get the scrutiny); and any result you
+cannot EXPLAIN (`git status`/`remote -v` returning empty with rc=128 reads as clean but is refused-not-clean;
+a schema diff with no schema in it; a node count you cannot account for — the tell is that you cannot explain
+it, and demanding the explanation is what exposes it). Verify from implementation and measurement, not from
+the doc or the first output. This fired three times on its own authors in one session (SDK twice, ADVERSARY
+once), each catching themselves before it shipped — the rule working, not failing.
+
 
 1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
