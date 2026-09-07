@@ -432,6 +432,23 @@ Every command prints a one-line human result (and `--json` for machine output). 
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
 
+### Any shared MUTABLE name is a clobber hazard, not just a branch (PM ruling, 2026-09-06)
+
+The docker tag `wheel-engine:test` was rebuilt under QA at 18:31, mid-suite, by neither QA nor SDK (SDK's
+builds were 18:55 and 19:03) — leaving the cloud board, whose lanes had been running the same repo with the
+same names. QA's second run of a real S1 then PASSED, because it ran a *different engine binary*, and they
+were **composing a retraction of a true finding** when they compared the image shas.
+
+Had that retraction been sent, the fix would have been reverted or never written, and the operator's Telegram
+bridge would still drop messages while the agent is warm.
+
+- **`pin_image` protects WITHIN a run and does nothing across runs.** A mutable tag is shared state between
+  every actor that can push it.
+- The hazard is not specific to branches. **Docker tags, image ids, worktree paths — any shared mutable name**
+  is the same failure, and this one actually fired.
+- Before any handoff between boards, every such name must be namespaced or one board must be stopped. Only one
+  board being awake is a schedule, not a mechanism.
+
 ### A pushed branch is the cheapest status report (PM ruling, 2026-09-06)
 
 Push a branch as soon as it exists — empty, broken, whatever it is. From outside your machine, local-only
