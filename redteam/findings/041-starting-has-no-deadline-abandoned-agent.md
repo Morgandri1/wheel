@@ -126,6 +126,43 @@ backstop that would have made such a stall VISIBLE (a queued message not drainin
 Production is verified healthy end to end (public webhook → parked agent → reply over Telegram, nothing left
 queued).
 
+## MEASURED ROOT CAUSE of the "lives in `starting`" instance — ephemeral_context restart into an empty queue
+PM measured the discriminator: the ONLY agent stuck in `starting` is the ONLY one with `ephemeral_context=true`
+(the operator's pm agent); the other five (ephemeral=false) park normally on the same engine. Status goes to
+`starting` ~2s AFTER a completed turn — a restart, not a stalled start. I traced the mechanism in source:
+
+1. A turn's `result` sets **Idle** (mod.rs:868).
+2. Because ephemeral, the post-result branch (mod.rs:883) calls `clear_context` (mod.rs:1048): it kills the
+   child, `clear_session`, then **`start()` → sets `Starting` (mod.rs:528)** and spawns a FRESH child + a FRESH
+   `pump_stdout`, then `pump_queue` (mod.rs:1061).
+3. The turn's message was already consumed, so the queue is **empty** — nothing is written to the fresh child's
+   stdin. Claude (`--print --input-format stream-json`) emits `system/init` only when it PROCESSES a turn, so a
+   fresh session with empty stdin emits no init; the (correctly armed) new `pump_stdout` has no init to handle;
+   the only Starting→Idle transition (`Init`, mod.rs:770) never fires. Status **lives in `starting`** until the
+   next message arrives. Non-ephemeral agents take the `else` at mod.rs:887, so their Idle (868) stands.
+
+**Answer to SDK's discriminating question ("never comes" vs "comes and we drop it"): NEVER COMES.** `start()`
+does re-arm `pump_stdout` for the restarted child (verified — mod.rs:635-637 via clear_context→start), so it is
+not a dropped event and not a missing reader. There is simply no `init` to read, because the ephemeral restart
+creates a fresh session with nothing to process. (The one premise to confirm in 30s: that a fresh `claude
+--print --input-format stream-json` emits no `system/init` before its first turn. The measured "stuck 4+ min in
+starting" is consistent with it, and the code rules out a drop; either way the fix below is the same.)
+
+**Two bugs, not one:**
+- Display: a healthy ephemeral agent reads as `starting` (looks broken; cost PM an investigation; would be
+  killed by a naive time-in-starting deadline every turn — the exact mistake this finding's correction avoids).
+- **Efficiency (P1):** it never reaches `idle`, so idle-parking (§3c#14) — which keys on idle — never fires.
+  The ephemeral agent holds a LIVE harness process 24/7 between turns. This is the operator's OWN most-used
+  agent (the only ephemeral one), and it is precisely the "one live process forever" cost the project exists to
+  avoid — sharpened by the 70%-of-seven-day rate-limit warning the harness is already emitting.
+
+**Fix (SDK):** do not eager-restart into an empty queue. After an ephemeral turn, `clear_session` + settle to
+**`Parked`** (kill the child, keep no process), and let `deliver()`'s existing parked→resume path start a FRESH
+session (no `--resume`, since the session was cleared) on the NEXT message. That reuses the same parked path
+every other agent uses, settles the status honestly, and restores idle-parking for ephemeral agents — fixing
+both the display bug and the never-parks cost bug at once. `wheel ctx clear` on demand can settle to Idle/Parked
+the same way.
+
 ## Note
-This correction and the confirmed root cause are the important content. Credit to PM for the live catch; my
-original trigger would have converted a delivery bug into an agent-killing bug.
+This correction and the measured root cause are the important content. Credit to PM for the live catch and the
+ephemeral discriminator; my original time-in-`starting` trigger would have killed pm every turn, forever.
