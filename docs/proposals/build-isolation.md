@@ -28,3 +28,19 @@ Source-dev is isolated (separate checkout, push-not-in-place, build off-board). 
 - "Build off-board" is an invariant: CI builds, the container does not. If a dev flow needs an in-container
   build, it gets an explicit resource bound first.
 - Resource-coupling filed here; uid-coupling is F007/037/038. Both are runtime-isolation hardening, post-wake.
+
+## Workspace data is PERSISTENT, not ephemeral (operator requirement, verified 2026-09-07)
+Requirement: project workspace data (git repos, worktrees, etc.) must not be ephemeral. VERIFIED met:
+- `/data` is a real ext4 volume mount (`/dev/zd10400`), a Railway persistent volume — NOT the container's
+  ephemeral overlay fs.
+- All workspace data is on it: the shared git object store (`repos/wheel-<hash>`), the agent worktrees
+  (`ws/<agent>`), the session store (`creds/<uuid>/session-env/<session-id>`). Survives every container swap
+  (253 session transcripts persist across every deploy this session).
+- So uncommitted edits in a worktree are files on `/data` and survive a redeploy.
+
+DISTINCTION from the deploy-drain gate: a redeploy kills the in-flight PROCESS/turn, NOT the data. The agent
+resumes its session (--resume, proven) and re-runs the killed turn; its worktree files are intact. No data
+loss on redeploy; only turn-progress loss (which deploy-drain additionally prevents).
+
+GUIDANCE: `/tmp` IS container-ephemeral (not on `/data`). Agents keep working data in their workspace
+(`ws/`, on `/data`), never in `/tmp` expecting persistence.
