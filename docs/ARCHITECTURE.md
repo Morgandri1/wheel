@@ -53,6 +53,18 @@ not only correctness rules — they PRESERVE the slack that lets the careful che
 The false-clean that cost nothing to catch at 62% would have cost a night's work at 95%, because at 95% you do
 not look three times.
 
+**Cross-check across hypotheses, because self-checking is blind where your own assumption sits (SDK,
+2026-09-07 — the mechanism behind "keep retractions free").** Nearly every real defect this session was found
+by someone measuring against a hypothesis that was NOT their own: QA re-ran the warm-agent case after SDK said
+their fix might not close it; ADVERSARY probed an invariant SDK stated confidently and found the tool_call
+TOCTOU (046); PM named the not-stalled states and caught the mid-turn case (041); API checked SDK's Dockerfile
+and SDK checked API's premise; and PM's two worst moments — a gate green about an artefact not shipped — were
+caught by someone else's instrument, not PM's own care. Care fails exactly where you do not think to look, and
+that is precisely your own assumption's blind spot. A second person measuring against a different hypothesis
+lands on it. This is why the swarm catches what a careful individual cannot, and why "who reviews whose work"
+should deliberately cross hypotheses rather than have each lane grade itself: the owner is the worst-placed to
+see their own blind spot, and the best-placed to fix it once someone else's instrument names it.
+
 
 1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
