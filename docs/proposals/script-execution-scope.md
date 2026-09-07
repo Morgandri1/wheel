@@ -69,10 +69,32 @@ script's capabilities are live rather than snapshotted at spawn.
 wheel-engine, and `config.rs:98-105` records this as the known §2 gap. Every child on a project runs as one uid
 today.
 
-A 0600 token file protects against other uids. It does not protect against a same-uid sibling. So the moment
-scripts execute, a script can read any other node's token file under `run/<uuid>/token` and act as that node.
-Today the same-uid population is agents we placed; scripts widen it to arbitrary user-authored code, which is a
-different risk even though the uid gap is unchanged.
+A 0600 token file protects against other uids. It does not protect against a same-uid sibling.
+
+**This is no longer a prediction — I measured it in production on 2026-09-07.** Dropping to the project uid
+(21088) inside the deployed host container, every agent's capability token is readable:
+
+```
+setpriv --reuid=21088 --regid=21088 --clear-groups sh -c 'head -c1 /data/projects/<p>/run/<node>/token'
+TOKEN READABLE: .../run/0be41bbb.../token   (adversary)
+TOKEN READABLE: .../run/3dfb551a.../token   (sdk)
+TOKEN READABLE: .../run/456f630e.../token   (pm)
+TOKEN READABLE: .../run/b969c042.../token   (qa)
+TOKEN READABLE: .../run/d7c37993.../token   (api)
+```
+(I read one byte per file to prove access and never printed a value.)
+
+So today, before any script exists, any agent can read any other agent's token and act as that node — including
+`pm`, which holds `send` to all six. The wire matrix is enforced perfectly against the *token*, and the token is
+shared. This is F007 / the §2 uid gap, unmitigated in production.
+
+What DOES hold: the host's own environment (`RAILWAY_API_TOKEN`, `GH_TOKEN`, `WHEEL_HOST_SECRET`) is root-owned
+and uid 21088 is denied `/proc/1/environ`. So the platform credentials are not exposed by this. Each project
+gets its own uid, so the cross-tenant boundary is unaffected; it is the per-NODE boundary that is absent.
+
+Scripts do not create this problem, but they change its character: the same-uid population today is agents we
+placed, and scripts widen it to arbitrary user-authored code. That is why the uid drop should be a stated
+precondition of this work rather than a later hardening item.
 
 I am not claiming this blocks the work. I am claiming it should be a stated, accepted precondition rather than
 something discovered later — either per-node uid drop lands first (§2, M3), or we ship scripts knowing the
