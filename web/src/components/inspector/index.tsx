@@ -4,6 +4,13 @@ import { useEffect, useMemo, useState } from "react";
 import { AGENT_STATUS_META, NODE_META } from "@/lib/node-meta";
 import { Button, Field, Glyph, Input, Select, Textarea, Toggle } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
+import {
+  IDLE_TIMEOUT_DEFAULT,
+  buildBudget,
+  buildWorkspace,
+  buildIdleTimeout,
+  validateWorkspacePath,
+} from "@/lib/agent-config";
 import { AuthFlow } from "@/components/inspector/auth-flow";
 import { PanelBoundary } from "@/components/inspector/panel-boundary";
 import { CtxPanel } from "@/components/inspector/ctx-panel";
@@ -99,6 +106,164 @@ export function Inspector({
         </PanelBoundary>
       </div>
     </aside>
+  );
+}
+
+/**
+ * The three agent fields that had no control at all: workspaces, budget and idle timeout.
+ * Without them an agent can be edited in the UI but not CREATED there — a wheel-dev agent needs a
+ * working directory and a spend cap, and both were hand-edit-only.
+ *
+ * Every save goes through `patchConfig`, which read-modify-writes the whole config. A partial
+ * config write here would silently delete the fields it does not mention.
+ */
+function AgentRuntimeFields({
+  node,
+  patchConfig,
+}: {
+  node: AgentNode;
+  patchConfig: (patch: Partial<AgentNode["config"]>) => Promise<void>;
+}) {
+  const [idle, setIdle] = useState(String(node.config.idle_timeout_secs ?? ""));
+  const [turns, setTurns] = useState(String(node.config.budget?.max_turns ?? ""));
+  const [usd, setUsd] = useState(String(node.config.budget?.max_usd ?? ""));
+  const [wsPath, setWsPath] = useState("");
+  const [wsUrl, setWsUrl] = useState("");
+  const [wsRef, setWsRef] = useState("");
+  const [wsError, setWsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setIdle(String(node.config.idle_timeout_secs ?? ""));
+    setTurns(String(node.config.budget?.max_turns ?? ""));
+    setUsd(String(node.config.budget?.max_usd ?? ""));
+    setWsError(null);
+  }, [node.id, node.config.idle_timeout_secs, node.config.budget]);
+
+  const workspaces = node.config.workspaces ?? [];
+
+  const saveBudget = async () => {
+    const parsed = buildBudget(turns, usd);
+    if (!parsed.ok) {
+      toast(parsed.message, "error");
+      return;
+    }
+    await patchConfig({ budget: parsed.budget });
+  };
+
+  const saveIdle = async () => {
+    const parsed = buildIdleTimeout(idle);
+    if (!parsed.ok) {
+      toast(parsed.message, "error");
+      return;
+    }
+    await patchConfig({ idle_timeout_secs: parsed.secs });
+  };
+
+  const addWorkspace = async () => {
+    const problem = validateWorkspacePath(wsPath);
+    setWsError(problem);
+    if (problem) return;
+    await patchConfig({ workspaces: [...workspaces, buildWorkspace(wsPath, wsUrl, wsRef)] });
+    setWsPath("");
+    setWsUrl("");
+    setWsRef("");
+  };
+
+  const removeWorkspace = async (index: number) =>
+    patchConfig({ workspaces: workspaces.filter((_, i) => i !== index) });
+
+  return (
+    <div className="flex flex-col gap-3 border-t border-rule pt-4">
+      <Field
+        label="Workspaces"
+        hint="Directories the engine materialises under the project, cloned on first start. The first is the agent's working directory."
+      >
+        <div className="flex flex-col gap-1.5">
+          {workspaces.map((ws, i) => (
+            <div
+              key={`${ws.path}-${i}`}
+              className="flex items-center justify-between gap-2 border border-rule px-2 py-1.5 text-micro"
+              data-testid="agent-workspace-row"
+            >
+              <span className="truncate font-mono">
+                {ws.path}
+                {ws.git ? <span className="text-ink-faint"> ← {ws.git.url}{ws.git.ref ? `#${ws.git.ref}` : ""}</span> : null}
+              </span>
+              <button
+                type="button"
+                className="shrink-0 text-ink-faint hover:text-[var(--danger)]"
+                data-testid="btn-agent-workspace-remove"
+                onClick={() => removeWorkspace(i)}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          {workspaces.length === 0 ? (
+            <p className="text-micro text-ink-faint">
+              No workspace: the agent starts with no repository and no working directory of its own.
+            </p>
+          ) : null}
+          <div className="flex flex-wrap gap-1.5">
+            <Input
+              value={wsPath}
+              onChange={(e) => setWsPath(e.target.value)}
+              placeholder="repos/wheel"
+              data-testid="input-agent-workspace-path"
+            />
+            <Input
+              value={wsUrl}
+              onChange={(e) => setWsUrl(e.target.value)}
+              placeholder="git url (optional)"
+              data-testid="input-agent-workspace-url"
+            />
+            <Input
+              value={wsRef}
+              onChange={(e) => setWsRef(e.target.value)}
+              placeholder="ref (optional)"
+              data-testid="input-agent-workspace-ref"
+            />
+            <Button size="sm" data-testid="btn-agent-workspace-add" onClick={addWorkspace}>
+              Add
+            </Button>
+          </div>
+          {wsError ? (
+            <p className="text-micro text-[var(--danger)]" data-testid="agent-workspace-error">
+              {wsError}
+            </p>
+          ) : null}
+        </div>
+      </Field>
+
+      <Field label="Budget" hint="Empty means no cap. The engine stops the agent at the limit with budget_exhausted.">
+        <div className="flex gap-1.5">
+          <Input
+            value={turns}
+            onChange={(e) => setTurns(e.target.value)}
+            onBlur={saveBudget}
+            placeholder="max turns"
+            data-testid="input-agent-max-turns"
+          />
+          <Input
+            value={usd}
+            onChange={(e) => setUsd(e.target.value)}
+            onBlur={saveBudget}
+            placeholder="max USD"
+            data-testid="input-agent-max-usd"
+          />
+        </div>
+      </Field>
+
+      <Field label="Idle timeout" hint={`Seconds before the process is parked and resumed on the next message. Empty uses the default of ${IDLE_TIMEOUT_DEFAULT}.`}>
+        <Input
+          value={idle}
+          onChange={(e) => setIdle(e.target.value)}
+          onBlur={saveIdle}
+          placeholder={String(IDLE_TIMEOUT_DEFAULT)}
+          data-testid="input-agent-idle-timeout"
+        />
+      </Field>
+    </div>
   );
 }
 
@@ -278,6 +443,8 @@ function AgentPanel({
           testId="inspector-agent-ephemeral-context"
         />
       </div>
+
+      <AgentRuntimeFields node={node} patchConfig={patchConfig} />
 
       <Button size="sm" data-testid="btn-open-log" onClick={() => openTab(node.id)}>
         Open log and chat

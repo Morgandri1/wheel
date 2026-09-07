@@ -262,7 +262,7 @@ export type NodeType =
  * Delivery state (§3c#4). Strictly forward-moving.
  */
 
-export type MessageState = "queued" | "delivered" | "consumed";
+export type MessageState = "queued" | "delivered" | "consumed" | "undeliverable";
 
 /**
  * Where a log line came from.
@@ -552,6 +552,10 @@ export interface AgentConfig {
    * Appended to the harness's own system prompt, then followed by the markdown of every `ctx` node wired `send` into this agent.
    */
   system_prompt: string;
+  /**
+   * Working copies the engine materialises before the child starts (§3e). The child's cwd is the first one.
+   */
+  workspaces?: Workspace[];
 }
 
 /**
@@ -561,6 +565,42 @@ export interface AgentConfig {
 export interface Budget {
   max_turns?: number | null;
   max_usd?: number | null;
+}
+
+/**
+ * One working copy for an agent, materialised by the engine.
+ *
+ * This exists because agents were doing it themselves. Every agent that needed a repository ran its own `git clone`, each in its own way, and the shortest form that works — `https://<token>@github.com/...` — wrote a live credential into `.git/config` on the production volume (finding 036). It also cost a full copy of the repository per agent, which is how three agents filled a 4.6 GB volume.
+ */
+
+export interface Workspace {
+  /**
+   * Where the contents come from. Absent = an empty directory.
+   */
+  git?: GitSource | null;
+  /**
+   * Directory under the agent's workspace root. Relative, no `..`.
+   */
+  path: string;
+}
+
+/**
+ * A git repository to materialise a [`Workspace`] from.
+ */
+
+export interface GitSource {
+  /**
+   * Branch, tag or commit to check out. `None` = the remote's HEAD.
+   */
+  ref?: string | null;
+  /**
+   * Clone URL, with NO credentials in it. A URL carrying `user:password@` is refused: that is the shape that leaked, and accepting it here would write it to `.git/config` exactly as before.
+   */
+  url: string;
+  /**
+   * `<vault>/<key>` naming the credential to authenticate with. `None` = any git token the agent's wired vaults already export.
+   */
+  vault_ref?: string | null;
 }
 
 export interface CtxConfig {
@@ -823,7 +863,9 @@ export type NodeWithState = {
  */
 
 /**
- * Board coordinates. Floats because the canvas pans/zooms continuously.
+ * Board coordinates: a cell, not a measurement (ARCHITECTURE.md "Position is an integer cell", operator ruling 2026-09-06).
+ *
+ * Accepts any JSON number on the way in -- an existing client mid-drag still sends floats -- but rounds to the nearest cell and clamps to `i16::MIN..= i16::MAX` before it is ever stored, compared, or serialised back out. That clamp-on-write is why the fields are `i16` rather than `f64`: it makes "already a valid cell" a property of the type instead of something every reader has to re-check.
  */
 
 export interface Position {
@@ -849,6 +891,16 @@ export interface Wire {
 
 /**
  * Per-agent spend ceiling (§3e). Either field may be set independently.
+ */
+
+/**
+ * One working copy for an agent, materialised by the engine.
+ *
+ * This exists because agents were doing it themselves. Every agent that needed a repository ran its own `git clone`, each in its own way, and the shortest form that works — `https://<token>@github.com/...` — wrote a live credential into `.git/config` on the production volume (finding 036). It also cost a full copy of the repository per agent, which is how three agents filled a 4.6 GB volume.
+ */
+
+/**
+ * A git repository to materialise a [`Workspace`] from.
  */
 
 /**
@@ -987,7 +1039,9 @@ export type Node = {
  */
 
 /**
- * Board coordinates. Floats because the canvas pans/zooms continuously.
+ * Board coordinates: a cell, not a measurement (ARCHITECTURE.md "Position is an integer cell", operator ruling 2026-09-06).
+ *
+ * Accepts any JSON number on the way in -- an existing client mid-drag still sends floats -- but rounds to the nearest cell and clamps to `i16::MIN..= i16::MAX` before it is ever stored, compared, or serialised back out. That clamp-on-write is why the fields are `i16` rather than `f64`: it makes "already a valid cell" a property of the type instead of something every reader has to re-check.
  */
 
 /**
@@ -996,6 +1050,16 @@ export type Node = {
 
 /**
  * Per-agent spend ceiling (§3e). Either field may be set independently.
+ */
+
+/**
+ * One working copy for an agent, materialised by the engine.
+ *
+ * This exists because agents were doing it themselves. Every agent that needed a repository ran its own `git clone`, each in its own way, and the shortest form that works — `https://<token>@github.com/...` — wrote a live credential into `.git/config` on the production volume (finding 036). It also cost a full copy of the repository per agent, which is how three agents filled a 4.6 GB volume.
+ */
+
+/**
+ * A git repository to materialise a [`Workspace`] from.
  */
 
 /**
@@ -1021,7 +1085,9 @@ export type Node = {
  */
 
 /**
- * Board coordinates. Floats because the canvas pans/zooms continuously.
+ * Board coordinates: a cell, not a measurement (ARCHITECTURE.md "Position is an integer cell", operator ruling 2026-09-06).
+ *
+ * Accepts any JSON number on the way in -- an existing client mid-drag still sends floats -- but rounds to the nearest cell and clamps to `i16::MIN..= i16::MAX` before it is ever stored, compared, or serialised back out. That clamp-on-write is why the fields are `i16` rather than `f64`: it makes "already a valid cell" a property of the type instead of something every reader has to re-check.
  */
 
 /**

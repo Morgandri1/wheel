@@ -30,6 +30,8 @@ export default defineConfig({
         // operator: a bare 404 read as "your path is wrong" cost an hour on /tg.
         "src/lib/drag-overrides.ts",
         "src/lib/auth-mode-check.ts",
+        "src/lib/agent-config.ts",
+        "src/lib/edge-geometry.ts",
         "src/lib/endpoint-probe.ts",
         "src/lib/wired-vaults.ts",
         "src/lib/endpoint-reach.ts",

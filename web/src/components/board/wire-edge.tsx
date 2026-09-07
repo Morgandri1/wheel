@@ -1,9 +1,17 @@
 "use client";
 
-import { BaseEdge, EdgeLabelRenderer, getBezierPath, type EdgeProps } from "@xyflow/react";
+import {
+  BaseEdge,
+  EdgeLabelRenderer,
+  Position,
+  getBezierPath,
+  useInternalNode,
+  type EdgeProps,
+} from "@xyflow/react";
 import { memo } from "react";
 import { WIRE_META } from "@/lib/node-meta";
 import type { WireType } from "@/lib/schema";
+import { floatingEndpoints, type Side } from "@/lib/edge-geometry";
 
 export interface WireData extends Record<string, unknown> {
   wireType: WireType;
@@ -21,16 +29,60 @@ export interface WireData extends Record<string, unknown> {
  *   send       dashed
  *   injection  doubled line with ticks (ctx → agent: prepended, not delivered)
  */
-function WireEdgeInner({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, selected }: EdgeProps) {
+const SIDE_TO_POSITION: Record<Side, Position> = {
+  top: Position.Top,
+  right: Position.Right,
+  bottom: Position.Bottom,
+  left: Position.Left,
+};
+
+function WireEdgeInner({
+  id,
+  source,
+  target,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  data,
+  selected,
+}: EdgeProps) {
   const { wireType, injection, fromName, toName, onRemove } = data as WireData;
   const meta = WIRE_META[wireType];
+
+  // Anchor each end to the side facing the other node, rather than always right-to-left. A node
+  // dragged to the left of its source used to get a wire that looped around both plates.
+  const sourceNode = useInternalNode(source);
+  const targetNode = useInternalNode(target);
+  const floating =
+    sourceNode?.measured?.width && targetNode?.measured?.width
+      ? floatingEndpoints(
+          {
+            x: sourceNode.internals.positionAbsolute.x,
+            y: sourceNode.internals.positionAbsolute.y,
+            width: sourceNode.measured.width,
+            height: sourceNode.measured.height ?? 0,
+          },
+          {
+            x: targetNode.internals.positionAbsolute.x,
+            y: targetNode.internals.positionAbsolute.y,
+            width: targetNode.measured.width,
+            height: targetNode.measured.height ?? 0,
+          },
+        )
+      : null;
+
+  // Falls back to xyflow's own handle coordinates while a node is still unmeasured, so a wire
+  // never vanishes waiting for geometry.
   const [path, labelX, labelY] = getBezierPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
+    sourceX: floating?.source.x ?? sourceX,
+    sourceY: floating?.source.y ?? sourceY,
+    sourcePosition: floating ? SIDE_TO_POSITION[floating.sourceSide] : sourcePosition,
+    targetX: floating?.target.x ?? targetX,
+    targetY: floating?.target.y ?? targetY,
+    targetPosition: floating ? SIDE_TO_POSITION[floating.targetSide] : targetPosition,
     curvature: 0.32,
   });
 
