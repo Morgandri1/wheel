@@ -1,8 +1,10 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useState } from "react";
-import { SafeMarkdown } from "@/components/safe-markdown";
+import { Suspense, lazy, useEffect, useState } from "react";
+const SafeMarkdown = lazy(() =>
+  import("@/components/safe-markdown").then((m) => ({ default: m.SafeMarkdown })),
+);
 import { Button, Field } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
 import type { EngineApi } from "@/lib/api";
@@ -90,7 +92,9 @@ export function CtxPanel({
           className="prose-sm max-h-[320px] overflow-y-auto border border-rule p-3 text-meta [&_code]:font-mono [&_h1]:mb-2 [&_h1]:text-lead [&_h1]:font-semibold [&_h2]:mb-1.5 [&_h2]:mt-3 [&_h2]:font-semibold [&_li]:ml-4 [&_li]:list-disc [&_p]:mb-2"
         >
           {markdown.trim() ? (
-            <SafeMarkdown>{markdown}</SafeMarkdown>
+            <Suspense fallback={null}>
+              <SafeMarkdown>{markdown}</SafeMarkdown>
+            </Suspense>
           ) : (
             <p className="text-ink-faint">Nothing here yet. Whatever you write gets injected verbatim.</p>
           )}
