@@ -30,10 +30,18 @@ export function unreadableReason(error: unknown): string {
 }
 
 /** The API's `error.code`, if the body is its envelope. Anything else is not an error envelope. */
+/**
+ * Two shapes reach this parser and both are real.
+ *
+ * The API wraps errors in `wheel_core::ErrorBody` — `{"error":{"code","message"}}`. The engine's
+ * ingress does not: its local `err()` helper (wheel-engine/src/api/ingress.rs) emits a bare
+ * `{"code":"no_such_endpoint"}`. Reading only the wrapped form made the "check your path" verdict
+ * unreachable on a live board, which is the one state an operator most needs named.
+ */
 export function errorCode(body: string): string | null {
   try {
-    const parsed: unknown = JSON.parse(body);
-    const code = (parsed as { error?: { code?: unknown } })?.error?.code;
+    const parsed = JSON.parse(body) as { error?: { code?: unknown }; code?: unknown };
+    const code = parsed?.error?.code ?? parsed?.code;
     return typeof code === "string" && code ? code : null;
   } catch {
     return null;
