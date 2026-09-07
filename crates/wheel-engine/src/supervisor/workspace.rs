@@ -238,6 +238,18 @@ async fn materialise_one(
     Ok(dest)
 }
 
+/// The outcome of materialising an agent's workspaces.
+///
+/// `failures` is carried out rather than only logged because the engine log is
+/// not where anyone looks. A workspace that failed to clone leaves the agent
+/// running with a missing directory, which presents as "the agent did something
+/// odd" — the caller puts these on the agent's own log stream so the reason is
+/// visible next to the behaviour it explains.
+pub struct Materialised {
+    pub cwd: Option<PathBuf>,
+    pub failures: Vec<String>,
+}
+
 /// Materialise every workspace an agent declares. Returns the child's cwd —
 /// the first workspace, per §3e.
 pub async fn materialise(
@@ -246,26 +258,30 @@ pub async fn materialise(
     run_dir: &Path,
     workspaces: &[Workspace],
     token: Option<&str>,
-) -> Result<Option<PathBuf>> {
-    let mut first = None;
+) -> Result<Materialised> {
+    let mut cwd = None;
+    let mut failures = Vec::new();
     for ws in workspaces {
         match materialise_one(data_dir, ws_root, run_dir, ws, token).await {
             Ok(dir) => {
-                if first.is_none() {
-                    first = Some(dir);
+                if cwd.is_none() {
+                    cwd = Some(dir);
                 }
             }
             // One unusable workspace must not stop the agent: it may have three
             // and need two. The agent finds the directory missing and can say
             // so, which is more useful than a start that never happens.
-            Err(e) => tracing::error!(
-                path = %ws.path,
-                error = %e,
-                "could not materialise this workspace; the agent starts without it"
-            ),
+            Err(e) => {
+                tracing::error!(
+                    path = %ws.path,
+                    error = %e,
+                    "could not materialise this workspace; the agent starts without it"
+                );
+                failures.push(format!("workspace {:?}: {e}", ws.path));
+            }
         }
     }
-    Ok(first)
+    Ok(Materialised { cwd, failures })
 }
 
 #[cfg(test)]
@@ -343,10 +359,12 @@ mod tests {
         let a = materialise(&data, &data.join("ws/alice"), &run_a, &ws, None)
             .await
             .unwrap()
+            .cwd
             .unwrap();
         let b = materialise(&data, &data.join("ws/bob"), &run_b, &ws, None)
             .await
             .unwrap()
+            .cwd
             .unwrap();
 
         assert!(a.join("README").exists(), "alice got a real checkout");
@@ -445,7 +463,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            second.map(|d| d.join("README").exists()).unwrap_or(false),
+            second
+                .cwd
+                .map(|d| d.join("README").exists())
+                .unwrap_or(false),
             "a second agent on the same ref must still get a checkout"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -475,6 +496,7 @@ mod tests {
         let dir = materialise(&data, &ws_root, &run, &ws, None)
             .await
             .unwrap()
+            .cwd
             .unwrap();
         std::fs::write(dir.join("WIP"), "half-finished work").unwrap();
 
@@ -538,5 +560,39 @@ mod tests {
             "the child ran to completion after we gave up on it — it was abandoned, not killed"
         );
         std::fs::remove_file(&marker).ok();
+    }
+
+    #[tokio::test]
+    async fn a_workspace_that_cannot_be_cloned_is_reported_not_just_logged() {
+        let root = std::env::temp_dir().join(format!("wheel-badws-{}", std::process::id()));
+        let data = root.join("data");
+        let run = data.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        let ws = vec![Workspace {
+            path: "r".into(),
+            // A local path that does not exist: git fails immediately, so the
+            // test neither reaches the network nor waits on a timeout.
+            git: Some(GitSource {
+                url: format!("file://{}", root.join("no-such-repo.git").display()),
+                git_ref: None,
+                vault_ref: None,
+            }),
+        }];
+
+        let out = materialise(&data, &data.join("ws/a"), &run, &ws, None)
+            .await
+            .expect("a failed workspace is a reported outcome, not an error");
+
+        assert!(
+            out.cwd.is_none(),
+            "nothing was materialised, so there is no cwd"
+        );
+        assert_eq!(out.failures.len(), 1, "the one failure must be carried out");
+        assert!(
+            out.failures[0].contains("\"r\""),
+            "the failure must name which workspace it was, got: {}",
+            out.failures[0]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

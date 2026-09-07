@@ -515,7 +515,7 @@ impl Supervisor {
                     })
             })
         };
-        let cwd = workspace::materialise(
+        let materialised = workspace::materialise(
             &self.cfg.data_dir,
             &workspace,
             &run_dir,
@@ -523,8 +523,20 @@ impl Supervisor {
             git_token.as_deref(),
         )
         .await
-        .unwrap_or(None)
-        .unwrap_or_else(|| workspace.clone());
+        .unwrap_or(workspace::Materialised {
+            cwd: None,
+            failures: Vec::new(),
+        });
+        // The agent still starts without a workspace it could not have — but on
+        // its own log stream, next to whatever it does next, rather than only in
+        // an engine log nobody is reading during a wake.
+        if !materialised.failures.is_empty() {
+            let conn = self.db.lock().unwrap();
+            for failure in &materialised.failures {
+                log_line_bus(&self.events, &conn, agent, "engine", failure);
+            }
+        }
+        let cwd = materialised.cwd.unwrap_or_else(|| workspace.clone());
         let config_dir = self.cfg.creds_dir().join(agent.to_string());
         std::fs::create_dir_all(&config_dir)?;
 
@@ -1703,6 +1715,48 @@ mod tests {
             .spend
             .unwrap_or_default();
         (s.turns, s.usd)
+    }
+
+    fn engine_log(sup: &Supervisor, id: Uuid) -> Vec<String> {
+        let conn = sup.db.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT text FROM logs WHERE node_id = ?1 AND stream = 'engine' ORDER BY seq")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![id.to_string()], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// A workspace that cannot be cloned leaves the agent running with a
+    /// directory that is not there. Logged only to the engine's own log, that
+    /// reads later as "the agent did something odd"; the reason has to sit on
+    /// the agent's stream, next to the behaviour it explains.
+    #[tokio::test]
+    async fn a_failed_workspace_is_visible_on_the_agents_own_log() {
+        let (sup, id, _dir) = shim_supervisor_cfg("wsfail", ECHO_HARNESS, |cfg| {
+            cfg.workspaces = vec![wheel_core::Workspace {
+                path: "r".into(),
+                git: Some(wheel_core::GitSource {
+                    // Nonexistent local path: fails at once, no network.
+                    url: "file:///nonexistent/wheel-test-repo.git".into(),
+                    git_ref: None,
+                    vault_ref: None,
+                }),
+            }];
+        });
+
+        sup.start(id).await.expect("the agent must still start");
+
+        let lines = engine_log(&sup, id);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("workspace") && l.contains("\"r\"")),
+            "the operator must be able to see WHICH workspace failed, got: {lines:?}"
+        );
     }
 
     fn status_of(sup: &Supervisor, id: Uuid) -> AgentStatus {
