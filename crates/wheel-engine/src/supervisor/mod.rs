@@ -460,6 +460,19 @@ impl Supervisor {
             .ok_or_else(|| anyhow::anyhow!("not an agent config"))?
             .clone();
 
+        // The harness field picks credentials, never the binary: the driver is
+        // a hardcoded ClaudeDriver. Starting a codex node would therefore spawn
+        // `claude` with codex credentials and never say so — a silent harness
+        // substitution the operator cannot see. Refuse instead, and say why.
+        if agent_cfg.harness == wheel_core::Harness::Codex {
+            let reason =
+                "harness \"codex\" is not supported by this build (M2): there is no codex \
+                          driver, so starting this node would silently run claude instead"
+                    .to_string();
+            self.set_status(agent, AgentStatus::Error, Some(reason));
+            return Ok(AgentStatus::Error);
+        }
+
         // A credential that has already lapsed fails on the child's first
         // request, and the harness reports that as its own confusing error --
         // so the operator sees a broken agent rather than one that needs a
@@ -762,6 +775,15 @@ impl Supervisor {
     }
 
     /// Stop an agent's child. Keeps the session id so a later start resumes.
+    /// The agents this supervisor currently holds a live process for.
+    ///
+    /// Liveness lives here and nowhere else: the database records what was
+    /// intended, this map records what is actually running. The stall report
+    /// needs both to tell a turn in progress from a wedge.
+    pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
+        self.agents.lock().await.keys().copied().collect()
+    }
+
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
@@ -1756,6 +1778,38 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("workspace") && l.contains("\"r\"")),
             "the operator must be able to see WHICH workspace failed, got: {lines:?}"
+        );
+    }
+
+    /// The harness field picks credentials, not the binary. Before the guard,
+    /// starting a codex node spawned `claude` with codex credentials and told
+    /// nobody — the operator's choice silently substituted.
+    #[tokio::test]
+    async fn a_codex_agent_refuses_to_start_rather_than_silently_running_claude() {
+        let (sup, id, dir) = shim_supervisor_cfg("codexnode", ECHO_HARNESS, |cfg| {
+            cfg.harness = wheel_core::Harness::Codex;
+        });
+
+        let status = sup
+            .start(id)
+            .await
+            .expect("start must report, not error out");
+
+        assert_eq!(
+            status,
+            AgentStatus::Error,
+            "a harness this build cannot run must refuse, not start"
+        );
+        assert_eq!(
+            runs(&dir),
+            0,
+            "NOTHING may be spawned for a codex node — a process here is the silent substitution itself"
+        );
+        let conn = sup.db.lock().unwrap();
+        let last = board::agent_state(&conn, id).unwrap_or_default().last_error;
+        assert!(
+            last.unwrap_or_default().contains("codex"),
+            "the operator must be told which harness was refused"
         );
     }
 

@@ -156,3 +156,48 @@ This matters because "the token is shared" invites the fix "give each node its o
 done, and would close nothing. The gate is satisfied only by isolating the *storage*: a uid per node (§2, the
 `base+1+n` design) so the files stop being cross-readable, or moving the token out of the shared-readable
 filesystem entirely. I would rather we spend that work once, on the mechanism that actually holds.
+
+## Sizing, for PM's ETA (SDK, 2026-09-07)
+
+PM asked for an honest ETA input rather than a number, and confirmed F007 is a gate **inside** this scope,
+not a follow-on. That confirmation is the single biggest thing driving the answer, so it goes first.
+
+### The runtime is the small half. The gate is the big one.
+
+**Script runtime itself: modest, and mostly assembly rather than invention.** Nearly every piece it needs
+already exists and is node-generic — `mint` + `write_secret_file` + `node_run_dir` for a scoped token,
+`child_command` for the spawn, `may_use_cli` already admitting `NodeType::Script`, `normalize_chest_key`
+already used for paths, and now `run_capped` for the timeout and kill (`workspace.rs`, landed today for git).
+What is genuinely new is: write source to `scripts_dir()`, pick the interpreter, cap output at
+`MAX_SCRIPT_OUTPUT_BYTES` (a constant with no reader today), one control-plane route, one CLI verb, and the
+MCP tool — plus flipping the test at `mcp.rs:309` that currently pins `run` as absent.
+
+**F007 (per-node uid isolation) is the large, uncertain half, and it is NOT in my crates alone.** Today one
+uid per project means every node's 0600 token file is readable by every sibling — so "a script gets its own
+capability token" is decorative until the storage is isolated. Closing it means the `base+1+n` design in §2:
+a uid per node, per-node 0700 config dirs, setgid shared workspaces, and the engine holding only ambient
+`CAP_SETUID`/`CAP_SETGID` to drop each child.
+
+**The dependency that will otherwise make any ETA wrong: the uid drop lives in `wheel-host`, which is API's
+crate, not mine.** `child_command` clears the environment and drops no uid; there is no `setuid`/`pre_exec`
+anywhere in `wheel-engine`. So this gate needs API's work and ADVERSARY's review, and it cannot be scheduled
+as if it were mine to finish alone. Sequencing it as "SDK builds scripts, then someone hardens uids" gets the
+order exactly backwards — the gate is what makes the feature safe to turn on, so it lands first or alongside.
+
+### Honest uncertainty
+
+The runtime I would estimate with reasonable confidence. The uid work I would not, until API has said what
+the Railway container actually grants — the capability spike in §5b (`capsh --print`, `unshare -rn`) was
+never reported as run, and whether we get per-node uids cheaply or have to fight the platform is exactly
+what that spike answers. **An ETA quoted before that spike would be a guess wearing a number.**
+
+Suggested shape for the ETA you give: runtime sized and committable; gate sized only after API's capability
+spike; the feature does not turn on until both are done and ADVERSARY's egress PoC passes (the SSRF policy
+governs `tool`/`mcp` URLs and constrains a Python script not at all).
+
+### Already pre-satisfied, so it does not need re-estimating
+
+A8 (one bare object store per repository, `git worktree` per agent) landed today and is not a follow-on to
+this work — it is the shared-store requirement in this scope, already met. It also pre-satisfies a Phase-2
+disk lever: six agents on one repo share one object database rather than six copies. Note the honest limit
+recorded in the directive — it collapses git *objects*, not working files.
