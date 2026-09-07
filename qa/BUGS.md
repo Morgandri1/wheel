@@ -1086,3 +1086,29 @@ one, so the two views disagree by construction for any value outside the bounds.
 
 The gate deliberately asserts **agreement** (write response == later board refetch) rather than
 the arithmetic, so it will go green on any implementation that is internally consistent.
+
+---
+
+### 027 — `make check` reported a stale install as a code failure (S3, QA, **closed**)
+
+Filed by Web, seconded by API and PM. `main`'s `web:typecheck` was red on
+`TS7016: Could not find a declaration file for module 'jsdom'`, and no code change could fix
+it: `@types/jsdom` is declared in `web/package.json`, the main worktree's `node_modules`
+simply predated that line.
+
+Cause, and it is mine: `qa/check.sh` installed only when the directory was ABSENT.
+**Existence is not freshness.** A presence check answers "has anyone ever installed here";
+the question is "does what is installed match what is declared". Any dependency added after
+a tree's first install stays invisible to that tree forever, and the error it produces wears
+a type error's clothes and points at somebody's diff.
+
+Fixed by always running `pnpm -C web install --frozen-lockfile` — a ~1s no-op when current,
+and the same command CI runs, which is the point. A FAILED install now SKIPS the web gates
+with the install error rather than reporting three red Xs, because an environment problem is
+"could not check", not "the code is wrong". That distinction is the actual bug.
+
+**The class, per PM's f897af8:** audited every presence test in the file and found the same
+error a second time. `qa:image-contents` ran whenever an engine image EXISTED, so it happily
+reported a verdict about a six-hour-old image — the exact trap that made an afternoon of
+suites describe a pre-fix engine. It now asserts `image_freshness()` and SKIPS a stale one.
+It fired on the first run: `wheel-engine:test` was 88 minutes behind `crates/`.

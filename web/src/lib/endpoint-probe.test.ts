@@ -105,12 +105,16 @@ describe("what a status code is allowed to claim", () => {
     expect(new Set(verdicts).size).toBe(4);
   });
 
-  it("reports a real delivery as a delivery, with the count ingress gave", () => {
-    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' })).toMatch(
-      /delivered to 1 wired node\b/i,
-    );
+  it("reports the count ingress gave without promising the agent has it", () => {
+    const one = probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' });
+    expect(one).toMatch(/1 wired node\b/);
+    expect(one).toMatch(/queued/i);
+    // The 202 field is named `delivered` but counts rows ENQUEUED — a parked agent still counts.
+    // The panel may repeat the number; it may not turn it into a claim the message was received.
+    expect(one).not.toMatch(/delivered to/i);
+    expect(one).not.toMatch(/real hit/i);
     expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":2}' })).toMatch(
-      /delivered to 2 wired nodes/i,
+      /2 wired nodes/,
     );
   });
 

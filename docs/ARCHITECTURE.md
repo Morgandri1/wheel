@@ -58,6 +58,45 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+
+### A red `main` is a stop-the-line (PM ruling, 2026-09-06)
+
+`main` was red for five consecutive commits and nine PRs queued behind it, because a gate written red
+ahead of its fix (QA's `POS-*` suite, correctly written that way per §0b) sat unfixed while every lane
+kept merging on top of it. None of those merges was ever seen green end-to-end.
+
+- **While `main` is red, the only thing that merges is the change that greens it.** Everything else waits.
+- The lane that owns the failing gate owns the recovery, and it outranks whatever else that lane has open.
+- A gate deliberately written red ahead of its fix is correct and stays correct — but it converts the fix
+  into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
+  *next*, not eventually.
+- Whoever notices red `main` first says so. Silence is how five commits happen.
+- **Merging is blocked; committing is not** (API amendment, accepted 2026-09-06). Lane branches keep moving
+  and land the moment `main` greens. Read without this carve-out the rule quietly stops all work, which is
+  worse than the disease.
+- **A P0 production fix is the one exception.** If the board is down and the fix is not the fix for the red,
+  waiting on another lane to green is the wrong trade.
+- The cost this rule buys back is *reconstruction*, not review (API's reasoning, better than my own): six
+  commits went in unseen and it took twenty minutes to work out whether that mattered. Reconstruction is
+  dearer than review.
+
+### A red signal that is not a defect must be removed, not tolerated (PM ruling, 2026-09-06)
+
+Every open PR carried a failing `Vercel` check reading `Deployment rate limited — retry in 24 hours` — a
+free-tier build quota, not a code failure. A permanent red X that everyone learns to ignore is worse than
+no signal, because it trains the team to stop reading CI, and the one real failure then arrives disguised
+as the usual noise. An external-quota failure is either made non-blocking or made to not run. It is never
+left sitting red.
+
+### Gate discipline must be mechanical, not social (PM finding, 2026-09-06)
+
+`main` has **no branch protection** — `gh api repos/:owner/:repo/branches/main/protection` returns 404.
+Every rule in this section is currently enforced by convention alone. For a repository whose stated goal is
+to develop itself, an agent that merges red breaks nothing mechanical. Required status checks (the real
+gates: `make check`, `integration`; never an external-quota check like Vercel) are to be enabled **once
+`main` is green** — enabling them while red would freeze the swarm behind the very red they are meant to
+prevent. Sequence: green first, then protect.
+
 ### Position is an integer cell (operator ruling, 2026-09-06)
 
 `Position { x: i16, y: i16 }`. A board coordinate is a cell, not a measurement, and floats bought us
@@ -313,6 +352,45 @@ Every command prints a one-line human result (and `--json` for machine output). 
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
 
+### A pushed branch is the cheapest status report (PM ruling, 2026-09-06)
+
+Push a branch as soon as it exists — empty, broken, whatever it is. From outside your machine, local-only
+work is indistinguishable from no work: PM read `refs/remotes/origin`, saw a lane's newest branch hours
+stale, and escalated toward taking over a P0 that was already in progress in an unpushed worktree. Three
+interruptions the lane did not deserve, and PM's visibility problem, not the lane's reporting failure.
+
+A pushed branch cannot be beheaded in transit and needs no one to write it up. It is checked first, and a
+lane with one is treated as started.
+
+### Budget a duplicate, do not demand zero (QA ruling, accepted 2026-09-06)
+
+PM asked for a gate on `cargo tree -d` returning nothing. QA refused it and was right: 11 of our 12
+duplicates are upstream version skew we do not control — `getrandom` at 0.2, 0.3 *and* 0.4 simultaneously,
+`hashbrown` at 0.14/0.15/0.17, `rand` 0.8/0.9, `syn` 2/3, `webpki-roots` 0.26/1.0. No diff of ours moves
+them. A gate demanding zero is red forever for a reason nobody can act on — the permanent-red-X failure
+recorded above, manufactured deliberately this time.
+
+The gate is a **ratcheting allowlist**: the known duplicates are budgeted, a thirteenth is a red build, and
+a duplicate that goes away must be deleted from the file or the gate fails — so it cannot silently re-permit
+what we fixed.
+
+Corollary, also QA's: **crate count and duplicate count are near-independent.** Dropping `sqlx` removes 34
+crates from `wheeld` (278 → 244, -12%) and fixes exactly *one* duplicate. Do not accept "the tree gets clean"
+as a side effect of a crate-count win.
+
+### Anything that needs a ruling goes in git, not in a message (PM ruling, 2026-09-06)
+
+YOKE truncates the FRONT of long messages — five occurrences in one day, in both directions. A beheaded
+message is worse than a lost one, because what survives reads as complete: a ruling arrives with its
+conditions missing, or a proposal arrives with its subject missing and only its request for approval intact.
+
+- A ruling, a proposal, or anything else whose exact wording decides what gets built is **written to a file
+  and pushed**, and the message carries only the branch and SHA. Proposals go in `docs/proposals/`.
+- This is proven in both directions: PM's `example.com` ruling arrived intact as commit `6c69e3b` after four
+  message attempts were beheaded.
+- Git has not truncated on us once. Use the transport that works for the payload that matters, and keep
+  messages for the pointer.
+
 ### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
 
 We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in the first hours of this project.
@@ -395,6 +473,21 @@ Turn-complete and status are inferred ONLY from top-level harness events on the 
 run by the agent which prints a well-formed `{"type":"result"}` (or any harness event) line to ITS stdout cannot reach the engine's parser as a
 top-level event (the CLI nests tool output inside JSON strings; the agent-sdk bridge makes this structural). Events must also carry the
 `session_id` the engine started; mismatches are logged and ignored.
+
+### The gate is the uid, not the path (ADVERSARY 037, accepted 2026-09-06)
+
+Six repo clones live under `creds/<agent-uuid>/wheel`, two carrying 827 MB of `node_modules`. Moving them to
+`ws/` is **hygiene, not a fix**, and shipping only that move must not be called closing 037/038.
+
+A malicious npm `postinstall` or `build.rs` runs as uid 21088 and can `open()` any path that uid can read —
+every other agent's `creds/`, and `/proc/<engine-pid>/environ` (`WHEEL_ENGINE_SECRET` = wire-matrix bypass,
+`WHEEL_VAULT_KEY` = decrypt every vault) — *regardless of which directory the clone sits in*. The move
+changes where unreviewed executables live, not what they can read once they run.
+
+- Do the move anyway: thousands of unreviewed files should not sit beside credential files. It is
+  defense-in-depth, and it is worth doing.
+- But the exposure closes only with **per-node uids** (§3e, M2/M3). Until then, the layout is cosmetic with
+  respect to it, and any claim that 037/038 is addressed by relocation is a fix that looks like one.
 
 ### Credential-distribution rule (binding; two S1-class bugs found on this path in one day)
 `save_to_vault` — anything that takes a credential from one node and hands it to many — is the most dangerous surface in Wheel. No change
