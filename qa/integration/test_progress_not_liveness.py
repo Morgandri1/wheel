@@ -135,29 +135,41 @@ def check_producer(name, send, message_state, agent_status, healthz):
 SETTLED = {"error", "stopped", "parked", "budget_exhausted", "needs_auth", "running", "idle"}
 
 
-def check_deadline_outcome(agent_state, healthz):
-    """What the deadline DOES, not just that it fires. PM's objection, and it is correct:
+def check_deadline_outcome(agent_state, healthz, queued_count):
+    """What the deadline DOES, not just that it fires — and WHEN it is allowed to fire.
 
-    a fix that satisfies `resolves within 60s` by killing and respawning the child every
-    60s PASSES a bare deadline assertion while being worse than the bug it fixes. The
-    agent would leave `starting` on schedule, forever, burning a process spawn a minute
-    and never delivering anything. Production is currently 49 minutes into exactly this
-    failure with a live child, three queued messages and /healthz at 200 throughout -- a
-    respawn loop would look identical from the outside and cost more.
+    PM's first objection: a fix that satisfies `resolves within 60s` by killing and
+    respawning the child every 60s PASSES a bare deadline assertion while being worse than
+    the bug. So the outcome is asserted on three axes: the status afterwards is an ANSWER,
+    there is a READABLE reason, and NO SECOND PROCESS was spawned (§3c #13). The third is
+    what separates a real fix from a respawn loop, and it has to be counted over time --
+    at any single instant a respawn loop looks exactly like an agent that is starting.
 
-    So the deadline is asserted on three axes, and all three are needed:
-      SETTLED   -- the status afterwards is an answer, not another transitional state;
-      READABLE  -- there is a reason a human can act on, not a bare status change;
-      ONE PROC  -- no second process was spawned (contract 3c #13: exactly one harness
-                   process per agent node, ever). This is the axis that tells a real fix
-                   apart from a respawn loop, and it is the one a status-only gate misses.
+    PM's second objection, measured on production tonight and the reason this function
+    takes `queued_count`: the pm agent sat in `starting` for 52 MINUTES emitting nothing
+    and went to `idle` the instant a message arrived. It was waiting correctly, not wedged.
+    A flat deadline would have killed a healthy agent, which is a worse gate than none --
+    it would have manufactured exactly the restart-loop this file exists to forbid.
+
+    So the predicate is NOT "a transitional status resolves within 60s". It is:
+
+        an agent WITH WORK QUEUED does not stay transitional past the deadline.
+
+    An empty queue means there is nothing to be late for, and the check declines to have
+    an opinion rather than inventing a failure.
     """
-    seen_pids, last = set(), None
-    ok, last, waited = poll(agent_state,
-                            lambda st: (st or {}).get("status") not in TRANSITIONAL,
-                            RESOLVE_SECS)
-    # Watch a further window: a respawn loop only shows itself over time, because at any
-    # single instant it looks like an agent that is simply starting.
+    if queued_count() == 0:
+        R.skip("PROGRESS-deadline-outcome",
+               "the agent's queue is empty, so a transitional status is an agent WAITING, "
+               "not an agent wedged — measured on production tonight, pm sat in `starting` "
+               "52 minutes with nothing queued and went to `idle` the moment a message "
+               "arrived. There is nothing to be late for, so this declines to judge.")
+        return
+
+    ok, _last, _waited = poll(agent_state,
+                              lambda st: (st or {}).get("status") not in TRANSITIONAL,
+                              RESOLVE_SECS)
+    seen_pids = set()
     for _ in range(int(RESOLVE_SECS)):
         st = agent_state() or {}
         if st.get("pid"):
@@ -166,16 +178,21 @@ def check_deadline_outcome(agent_state, healthz):
     final = agent_state() or {}
 
     R.check("PROGRESS-deadline-settles", ok and final.get("status") in SETTLED,
-            "after the %.0fs deadline the agent is %r. A deadline that fires and returns "
-            "the agent to a transitional state has not resolved anything -- it has made "
-            "the hang periodic. The status afterwards must be an answer."
-            % (RESOLVE_SECS, final.get("status")))
+            "the agent had work QUEUED and is %r after %.0fs. A deadline that fires and "
+            "returns the agent to a transitional state has not resolved anything -- it has "
+            "made the hang periodic. The status afterwards must be an answer."
+            % (final.get("status"), RESOLVE_SECS))
 
-    R.check("PROGRESS-deadline-reason-readable", bool((final.get("last_error") or "").strip()),
-            "the agent left the transitional state with no `last_error`. An operator "
-            "watching a board needs to know WHY it stopped waiting; a status change with "
-            "no reason sends them to the logs to reconstruct it, which is the 45 minutes "
-            "this whole class costs. last_error was %r." % final.get("last_error"))
+    # A reason is owed only when the deadline actually FIRED. An agent that resolved
+    # normally has nothing to explain, and demanding last_error there is a false positive
+    # -- which is exactly what this check did on its first run, against a healthy engine.
+    if not ok:
+        R.check("PROGRESS-deadline-reason-readable",
+                bool((final.get("last_error") or "").strip()),
+                "the agent stayed transitional past the deadline with work queued and set "
+                "no `last_error`. An operator watching a board needs to know WHY; a status "
+                "with no reason sends them to the logs to reconstruct it, which is the 45 "
+                "minutes this class costs. last_error was %r." % final.get("last_error"))
 
     R.check("PROGRESS-deadline-spawns-no-second-process", len(seen_pids) <= 1,
             "%d distinct pids for one agent node across %.0fs: %s. This is the respawn "
@@ -184,19 +201,6 @@ def check_deadline_outcome(agent_state, healthz):
             "while the system burns a process a minute and still delivers nothing. "
             "Contract 3c #13: exactly one harness process per agent node, ever."
             % (len(seen_pids), RESOLVE_SECS, sorted(seen_pids)))
-
-
-def check_no_stuck_status(agent_status, healthz):
-    ok, last, waited = poll(agent_status, lambda s: s not in TRANSITIONAL, RESOLVE_SECS)
-    R.check("PROGRESS-transitional-status-resolves", ok,
-            "the agent was still %r after %.0fs. A transitional status is a claim that "
-            "something is in flight; if it never resolves, the claim is false no matter "
-            "how alive the process is (/healthz: %s). ADVERSARY 041: a child can spawn "
-            "cleanly and then block forever waiting on an init line that never comes, so "
-            "the process is genuinely healthy and genuinely doing nothing. This is a "
-            "DEADLINE, not an eventually — an unbounded wait is the test production "
-            "passes while sitting at 45 minutes and three undelivered messages."
-            % (last, waited, "200" if healthz() else "down"))
 
 
 def sh(*a):
@@ -243,6 +247,12 @@ def agent_state():
         if n.get("id") == AGENT_ID:
             return n.get("state") or {}
     return {}
+
+
+def queued_count():
+    st, r = http("GET", "/v1/agents/%s/inbox?limit=200" % AGENT_ID)
+    return sum(1 for m in ((r or {}).get("messages") or [])
+               if m.get("state") == "queued")
 
 
 def agent_status():
@@ -376,8 +386,7 @@ def main():
                        "still answering /healthz" if alive else "not responding", status))
 
         # Status assertions are about the AGENT, not a producer, so they run once.
-        check_no_stuck_status(agent_status, healthz)
-        check_deadline_outcome(agent_state, healthz)
+        check_deadline_outcome(agent_state, healthz, queued_count)
         return R.report("progress-not-liveness")
     finally:
         sh("docker", "rm", "-f", NAME)
