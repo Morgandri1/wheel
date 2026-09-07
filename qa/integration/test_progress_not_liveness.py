@@ -71,7 +71,8 @@ CONSUME_SECS = float(os.environ.get("WHEEL_PROGRESS_CONSUME_SECS", "90"))
 # which is the whole reason this is a list: tonight's P0 was the ingress entry while the
 # agent-to-agent entry worked perfectly, and a gate covering only the latter would have
 # been green straight through it.
-PRODUCERS = []          # (name, send, ...) — wired as each path lands
+# (name, send, message_state, agent_status, agent_state, healthz)
+PRODUCERS = []          # wired as each path lands
 
 # PM's rule, and it is the reason this constant exists rather than a bare len() check:
 # SKIP is honest today and dishonest tomorrow. A suite reporting SKIP with zero producers
@@ -118,6 +119,62 @@ def check_producer(name, send, message_state, agent_status, healthz):
                status))
 
 
+# States that are an ANSWER. A deadline that fires must leave the agent in one of these,
+# with a reason -- not back in `starting`.
+SETTLED = {"error", "stopped", "parked", "budget_exhausted", "needs_auth", "running", "idle"}
+
+
+def check_deadline_outcome(agent_state, healthz):
+    """What the deadline DOES, not just that it fires. PM's objection, and it is correct:
+
+    a fix that satisfies `resolves within 60s` by killing and respawning the child every
+    60s PASSES a bare deadline assertion while being worse than the bug it fixes. The
+    agent would leave `starting` on schedule, forever, burning a process spawn a minute
+    and never delivering anything. Production is currently 49 minutes into exactly this
+    failure with a live child, three queued messages and /healthz at 200 throughout -- a
+    respawn loop would look identical from the outside and cost more.
+
+    So the deadline is asserted on three axes, and all three are needed:
+      SETTLED   -- the status afterwards is an answer, not another transitional state;
+      READABLE  -- there is a reason a human can act on, not a bare status change;
+      ONE PROC  -- no second process was spawned (contract 3c #13: exactly one harness
+                   process per agent node, ever). This is the axis that tells a real fix
+                   apart from a respawn loop, and it is the one a status-only gate misses.
+    """
+    seen_pids, last = set(), None
+    ok, last, waited = poll(agent_state,
+                            lambda st: (st or {}).get("status") not in TRANSITIONAL,
+                            RESOLVE_SECS)
+    # Watch a further window: a respawn loop only shows itself over time, because at any
+    # single instant it looks like an agent that is simply starting.
+    for _ in range(int(RESOLVE_SECS)):
+        st = agent_state() or {}
+        if st.get("pid"):
+            seen_pids.add(st["pid"])
+        time.sleep(1.0)
+    final = agent_state() or {}
+
+    R.check("PROGRESS-deadline-settles", ok and final.get("status") in SETTLED,
+            "after the %.0fs deadline the agent is %r. A deadline that fires and returns "
+            "the agent to a transitional state has not resolved anything -- it has made "
+            "the hang periodic. The status afterwards must be an answer."
+            % (RESOLVE_SECS, final.get("status")))
+
+    R.check("PROGRESS-deadline-reason-readable", bool((final.get("last_error") or "").strip()),
+            "the agent left the transitional state with no `last_error`. An operator "
+            "watching a board needs to know WHY it stopped waiting; a status change with "
+            "no reason sends them to the logs to reconstruct it, which is the 45 minutes "
+            "this whole class costs. last_error was %r." % final.get("last_error"))
+
+    R.check("PROGRESS-deadline-spawns-no-second-process", len(seen_pids) <= 1,
+            "%d distinct pids for one agent node across %.0fs: %s. This is the respawn "
+            "loop -- the deadline fires, the child is replaced, the status leaves and "
+            "re-enters `starting`, and a status-only assertion would call that a pass "
+            "while the system burns a process a minute and still delivers nothing. "
+            "Contract 3c #13: exactly one harness process per agent node, ever."
+            % (len(seen_pids), RESOLVE_SECS, sorted(seen_pids)))
+
+
 def check_no_stuck_status(agent_status, healthz):
     ok, last, waited = poll(agent_status, lambda s: s not in TRANSITIONAL, RESOLVE_SECS)
     R.check("PROGRESS-transitional-status-resolves", ok,
@@ -159,9 +216,10 @@ def main():
                "zero is a failing build rather than this message.")
         return R.report("progress-not-liveness")
 
-    for name, send, message_state, agent_status, healthz in PRODUCERS:
+    for name, send, message_state, agent_status, agent_state, healthz in PRODUCERS:
         check_producer(name, send, message_state, agent_status, healthz)
         check_no_stuck_status(agent_status, healthz)
+        check_deadline_outcome(agent_state, healthz)
     return R.report("progress-not-liveness")
 
 
