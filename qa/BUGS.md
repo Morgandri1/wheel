@@ -1266,7 +1266,7 @@ database fails. It is red on this bug right now, which is how I know it works.
 removing the guard again makes it fail with the diagnosis. It discovers all seven suites
 rather than naming them, so an eighth is covered without anyone remembering it exists.
 
-### 033 — the Postgres arm is not measured by coverage (S3, QA — mine, **open**)
+### 033 — the Postgres arm is not measured by coverage (S3, QA — mine, ~~closed~~)
 
 `rust:coverage`. When `postgres` left wheel-api's defaults, `tests/boot_db.rs`
 (`#![cfg(feature = "postgres")]`) stopped being compiled by the coverage run, so the code
@@ -1299,3 +1299,34 @@ collide; or measure the arm in a second, separate coverage invocation.
 
 **I reverted rather than pursued it** because main was red at 04:06 on a change of mine,
 and greening main beats being right about coverage at four in the morning.
+
+
+---
+
+### 033, closed — and I got the diagnosis wrong in the middle of it
+
+Recorded in full because the wrong turn is the useful part.
+
+`rust:coverage` went red. The failing test was `rotate_tool`, and the command carried
+`--features wheel-api/postgres`, a flag I had added. I concluded the flag was the cause,
+reverted it, told PM it was mine, and merged the revert.
+
+**It was not the cause.** The next run failed identically with the flag gone — same test,
+command visibly without `--features`. `rotate_tool` shells out to `cargo build` from inside
+the test, which cannot work under llvm-cov's instrumented target-dir: the nested build
+writes to `target-cov/debug/examples` while the test looks in
+`target-cov/llvm-cov-target/debug/examples`. It had never passed under coverage; it was
+added in `46791c3`, after the last all-green run, so nothing had ever exercised it there.
+API fixed it separately in `bf7107d` by testing the rotation as a function.
+
+**What my revert did cost:** wheel-api fell to **72.55%** against ~89%, and failed the 90
+bar. Not a regression — a measurement of a narrower thing, reading as an under-bar crate to
+anyone who did not know why. Exactly the harm API predicted when they asked me to check
+this before their merge.
+
+**Why I got it wrong:** the flag and the failure appeared in the same command line, and I
+took correlation from a single observation. The second run was the control I should have
+demanded before reverting — and I have spent this entire session insisting on exactly that
+for other people's findings. Two runs, one variable. I had one run and two variables.
+
+Flag restored. The rotate_tool fix and the flag are independent and both are needed.

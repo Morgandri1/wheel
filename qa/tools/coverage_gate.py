@@ -167,8 +167,23 @@ def main():
     env = dict(os.environ, CARGO_TARGET_DIR=cov_target)
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
-         # NO `--features wheel-api/postgres` HERE, AND THIS IS A KNOWN GAP, NOT AN
-         # OVERSIGHT -- see BUG-033.
+         # COVER THE FEATURE SET CI ACTUALLY TESTS, not just the default one.
+         # `postgres` is not in wheel-api's default features, and its `*_db.rs` suites are
+         # `#![cfg(feature = "postgres")]`, so a default-features coverage run does not
+         # compile the code that talks to production's database and does not count the
+         # tests covering it. The code it covers is NOT postgres-gated, so it stays in the
+         # denominator and loses its numerator. Measured: wheel-api reads 72.55% without
+         # this flag against ~89% with it -- a 16-point drop that is measurement, not
+         # regression, and that reads as an under-bar crate to anyone who did not know.
+         #
+         # I removed this flag once, wrongly, believing it caused a rotate_tool failure
+         # under llvm-cov. It did not: rotate_tool shelled out to `cargo build` from inside
+         # the test, which cannot work under an instrumented target-dir, and API fixed that
+         # separately in bf7107d. Removing the flag cost 16 points of wheel-api coverage
+         # and fixed nothing. See BUG-033.
+         #
+         # Package-qualified because the run is `--workspace`, where a bare `--features`
+         # is not valid for a member's feature.
          #
          # I added that flag so the Postgres arm would keep being counted once `postgres`
          # left wheel-api's defaults (tests/boot_db.rs is `#![cfg(feature = "postgres")]`,
@@ -176,20 +191,12 @@ def main():
          # production's database and stops counting the 5 tests covering it). The reasoning
          # still holds. The flag does not.
          #
-         # It turns main red on `rotate_tool`, which SHELLS OUT to `cargo build` from
-         # inside the test. Under llvm-cov that nested build runs against an instrumented
-         # target dir, and changing the feature set makes it rebuild the world underneath
-         # the outer run. Measured: rotate_tool passes with `-p wheel-api --features
-         # postgres` (16s) and with `cargo test --workspace --features wheel-api/postgres`
-         # (150s -- the nested rebuild), and fails only inside llvm-cov.
-         #
-         # So the coverage number for the Postgres arm is currently NOT measured. That is
-         # worse than it sounds and it is written down rather than quietly accepted.
          # PM-approved, requested by API, owned here rather than in their crates so the
          # team that benefits is not the team that widens it. Scoped to main.rs and
          # nothing wider: those files are pure wiring (config load, pool, router assembly,
          # serve). If logic lands in one, the fix is to move the logic into a covered
          # module — NOT to widen this regex.
+         "--features", "wheel-api/postgres",
          "--ignore-filename-regex", r"(^|/)main\.rs$"],
         cwd=ROOT, env=env, capture_output=True, text=True)
     if r.returncode in (137, -9):
