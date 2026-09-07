@@ -169,6 +169,20 @@ the queue, because the bug is exactly the empty-queue case:
   idle-parking for ephemeral agents — fixing both the display bug and the never-parks cost bug.
 `wheel ctx clear` on demand settles the same way (park if idle/empty; drain if work remains).
 
+## FIX LANDED & VERIFIED (origin/main 83fe6c4)
+SDK's `clear_context` (mod.rs) now: kill child → `clear_session` → `set_status(Parked)` → `self.deliver(agent)`.
+I verified it in the merged source against the corrected spec, both directions:
+- **Empty queue** → park, `deliver()` finds nothing, no process. Verified LIVE by PM (pm now `parked`, zero
+  claude processes on the box) — the never-parks cost bug is closed.
+- **Non-empty queue** → `deliver()` sees queued work and resumes (fresh session, since the session was cleared)
+  and drains it. This is the half my correction added, and it is the half PM's live "pm parked" test does NOT
+  exercise — I confirmed it in code: it does NOT strand queued messages. The comment names it exactly ("a full
+  one does not sit waiting for some LATER message to trigger it").
+So both the display bug and the never-parks cost bug are fixed, and the stranding regression the naive fix would
+have introduced was avoided. **041's ephemeral instance is RESOLVED.** (The general in-flight-keyed deadline
+backstop — a delivered turn that never produces a `result` — remains a separate, still-open item; this fix
+addresses the ephemeral-restart instance, not the generic no-progress-in-`running` hang.)
+
 ## Note
 This correction and the measured root cause are the important content. Credit to PM for the live catch and the
 ephemeral discriminator; my original time-in-`starting` trigger would have killed pm every turn, forever.
