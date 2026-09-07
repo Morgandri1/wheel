@@ -93,3 +93,12 @@ agent on one small real task, observe what breaks, let that drive the build orde
 The laptop swarm stays primary meanwhile, so duplication is bounded to one agent/task and the step is
 reversible. The first wake doubles as SDK's turn-completion discriminator (consumed? left running? "could
 not record spend" in log? turns increment?), so it settles the frozen-state question with a live turn.
+
+## PRIORITY (operator, 2026-09-07): CODEX IS NOT A LAUNCH GATE
+Launch and dogfood are Claude-only. Codex completeness does not gate anything.
+- The codex GUARD (honest refusal of a codex node, live + behaviour-verified) is the CORRECT launch state —
+  it requires codex to not silently run, not to work. Keep it.
+- Building the codex DRIVER is M2/post-launch, deprioritised, never a launch gate. No engine effort on a
+  codex driver before launch.
+- Nothing about codex blocks the wake, the dogfood, or launch. The real not-yet-proven items remain
+  BUG-037 (turn/spend accounting), --resume success, and BUG-036 redelivery — codex is not among them.
