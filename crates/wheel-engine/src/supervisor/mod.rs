@@ -2600,11 +2600,19 @@ done
         sup.start(id).await.unwrap();
         sup.deliver(id).await.unwrap();
 
-        until("the ephemeral agent to settle after its turn", || {
-            !matches!(
-                status_of(&sup, id),
-                AgentStatus::Starting | AgentStatus::Running
-            )
+        // Wait for the DESTINATION, not for "no longer transitional". The
+        // agent passes THROUGH `idle` on its way — start sets `starting`, the
+        // harness's init sets `idle`, writing the turn sets `running`, and only
+        // then does the ephemeral clear park it. "Not starting and not running"
+        // is TRUE at idle, so this returned early whenever the poll landed in
+        // that window and then asserted `parked` against an agent that was
+        // merely idle. Green most of the time, red about one run in three.
+        //
+        // Waiting on the state the test is actually about removes the window
+        // entirely: if it never parks, `until` times out and says so, which is
+        // a real failure rather than a coin toss.
+        until("the ephemeral agent to park after its turn", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
         })
         .await;
 

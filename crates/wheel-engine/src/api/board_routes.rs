@@ -119,24 +119,43 @@ pub async fn patch_node(
     // Disk grows and the agent's files "vanish", which is a bad thing to
     // discover months later.
     if let Some(was) = renamed_from {
-        let from = s.cfg.workspace_dir(was.as_str());
-        let to = s.cfg.workspace_dir(node.name.as_str());
-        if from.exists() && !to.exists() {
-            if let Err(e) = std::fs::rename(&from, &to) {
-                // Not fatal: the rename itself succeeded and the board is
-                // consistent. Say so loudly rather than fail a completed
-                // operation.
-                tracing::error!(
-                    from = %from.display(), to = %to.display(), error = %e,
-                    "renamed the node but could not move its workspace; the old checkout is orphaned"
-                );
-            }
-        }
+        move_workspace(
+            &s.cfg.workspace_dir(was.as_str()),
+            &s.cfg.workspace_dir(node.name.as_str()),
+        );
     }
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });
     Ok(Json(node))
+}
+
+/// Carry an agent's working copy across a rename.
+///
+/// A workspace is keyed by the agent's NAME (§3e `ws/<name>`), so a rename that
+/// left it behind would orphan the tree the agent has been working in: the next
+/// start materialises a fresh one and the old checkout — with any uncommitted
+/// work in it — is simply somewhere the engine no longer looks. Disk grows and
+/// the agent's files "vanish", which is a bad thing to discover months later.
+///
+/// Never overwrites. If something already occupies the destination it is left
+/// alone and the source is left alone: two trees an operator can inspect beat
+/// one the engine chose between.
+///
+/// A failure here is logged, not returned. The rename itself already succeeded
+/// and the board is consistent; failing the whole operation afterwards would
+/// leave the caller thinking nothing happened when the node has in fact been
+/// renamed.
+fn move_workspace(from: &std::path::Path, to: &std::path::Path) {
+    if !from.exists() || to.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(from, to) {
+        tracing::error!(
+            from = %from.display(), to = %to.display(), error = %e,
+            "renamed the node but could not move its workspace; the old checkout is orphaned"
+        );
+    }
 }
 
 /// May this node be renamed in the state it is in?
@@ -218,6 +237,73 @@ mod rename_tests {
                 "{settled} has no live session; refusing here would make the board unusable"
             );
         }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wheel-mv-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The uncommitted work is the whole point: a rename must carry the tree,
+    /// not leave the agent looking at an empty new one while its files sit
+    /// under the old name.
+    #[test]
+    fn a_workspace_follows_its_agent_across_a_rename() {
+        let root = scratch("moves");
+        let from = root.join("ws/old-name");
+        let to = root.join("ws/new-name");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("WIP"), "half-finished work").unwrap();
+
+        move_workspace(&from, &to);
+
+        assert!(!from.exists(), "the old path must not be left behind");
+        assert_eq!(
+            std::fs::read_to_string(to.join("WIP")).unwrap(),
+            "half-finished work",
+            "the agent's uncommitted work must arrive intact"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Never overwrite. Two trees an operator can look at beat one the engine
+    /// silently chose between.
+    #[test]
+    fn a_move_never_overwrites_an_occupied_destination() {
+        let root = scratch("occupied");
+        let from = root.join("ws/a");
+        let to = root.join("ws/b");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("mine"), "source").unwrap();
+        std::fs::write(to.join("theirs"), "destination").unwrap();
+
+        move_workspace(&from, &to);
+
+        assert!(from.join("mine").exists(), "the source must survive");
+        assert!(
+            to.join("theirs").exists(),
+            "the destination must be untouched"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An agent that never had a workspace is the ordinary case, and it must
+    /// not be an error.
+    #[test]
+    fn a_move_with_nothing_to_move_is_a_no_op() {
+        let root = scratch("absent");
+        move_workspace(&root.join("ws/nope"), &root.join("ws/also-nope"));
+        assert!(!root.join("ws/also-nope").exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

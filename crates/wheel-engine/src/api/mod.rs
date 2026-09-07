@@ -250,35 +250,10 @@ pub fn router(state: AppState) -> Router {
 /// Computed on demand rather than watched: the engine must idle at ~0 CPU (§2),
 /// so there is no background poll here.
 async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
-    let stalled = {
-        match s.db.lock() {
-            Ok(conn) => crate::db::messages::agents_with_work_older_than(
-                &conn,
-                s.cfg.startup_deadline_secs as i64,
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(agent, _)| {
-                // Transitional agents are not stalled: they are on their way,
-                // and 041's deadline is what judges those. An agent that is
-                // running or idle with old work is the one nothing is coming
-                // for.
-                !matches!(
-                    crate::db::board::agent_state(&conn, *agent)
-                        .unwrap_or_default()
-                        .status,
-                    wheel_core::AgentStatus::Starting
-                        | wheel_core::AgentStatus::Parked
-                        | wheel_core::AgentStatus::Stopped
-                        | wheel_core::AgentStatus::NeedsAuth
-                        | wheel_core::AgentStatus::BudgetExhausted
-                )
-            })
-            .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
-            .collect::<Vec<_>>(),
-            // A poisoned lock is worth saying so rather than reporting health.
-            Err(_) => Vec::new(),
-        }
+    let stalled = match s.db.lock() {
+        Ok(conn) => stalled_agents(&conn, s.cfg.startup_deadline_secs as i64),
+        // A poisoned lock is worth saying nothing about rather than guessing.
+        Err(_) => Vec::new(),
     };
 
     if !stalled.is_empty() {
@@ -293,6 +268,36 @@ async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "build": build_id(),
     }))
+}
+
+/// Agents holding work that nothing is coming for.
+///
+/// Split out of the handler so the DECISION is testable without an HTTP
+/// harness: which agents are named, and — the part that matters more — which
+/// are not. A stall report that names healthy agents is one an operator learns
+/// to scroll past, which is the failure it exists to prevent.
+fn stalled_agents(conn: &rusqlite::Connection, deadline_secs: i64) -> Vec<serde_json::Value> {
+    crate::db::messages::agents_with_work_older_than(conn, deadline_secs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(agent, _)| {
+            // Transitional agents are 041's business, and an agent that is
+            // parked, stopped, unauthenticated or out of budget is not FAILING
+            // to deliver — it is not delivering, which is a different thing and
+            // not a fault to report.
+            !matches!(
+                crate::db::board::agent_state(conn, *agent)
+                    .unwrap_or_default()
+                    .status,
+                wheel_core::AgentStatus::Starting
+                    | wheel_core::AgentStatus::Parked
+                    | wheel_core::AgentStatus::Stopped
+                    | wheel_core::AgentStatus::NeedsAuth
+                    | wheel_core::AgentStatus::BudgetExhausted
+            )
+        })
+        .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
+        .collect()
 }
 
 /// What code this RUNNING engine actually is.
@@ -398,6 +403,73 @@ mod tests {
             body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
             "patch_node must return the SAME node value it stored, so the reply carries the \
              clamped position rather than an echo of the request"
+        );
+    }
+
+    /// The stall report's value is in what it does NOT say. Every state below
+    /// is a healthy agent that a naive "has old queued work" check would name,
+    /// and each false positive is a step toward an operator ignoring the field.
+    #[test]
+    fn a_stall_report_names_only_agents_nothing_is_coming_for() {
+        use wheel_core::AgentStatus;
+        let conn = crate::db::open_memory().unwrap();
+
+        let agent = |name: &str| {
+            let n = wheel_core::Node::new(
+                uuid::Uuid::new_v4(),
+                name.parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            );
+            crate::db::board::create(&conn, &n).unwrap();
+            n.id
+        };
+        let age = |id: uuid::Uuid| {
+            conn.execute(
+                "UPDATE messages SET created_at = datetime('now', '-600 seconds') WHERE to_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        };
+        let queue = |id: uuid::Uuid| {
+            crate::db::messages::enqueue(
+                &conn,
+                wheel_core::MessageSender::User,
+                id,
+                "work".into(),
+                None,
+            )
+            .unwrap()
+        };
+
+        // The one that SHOULD be named: old work, agent alive and not busy.
+        let stuck = agent("stuck");
+        queue(stuck);
+        age(stuck);
+        crate::db::board::set_status(&conn, stuck, AgentStatus::Idle, None);
+
+        // Fresh work is in flight, not stranded.
+        let fresh = agent("fresh");
+        queue(fresh);
+        crate::db::board::set_status(&conn, fresh, AgentStatus::Idle, None);
+
+        // Parked with old work is 041's business and the resume path's, not a
+        // stall: nothing is wrong, nothing is running.
+        let parked = agent("parked");
+        queue(parked);
+        age(parked);
+        crate::db::board::set_status(&conn, parked, AgentStatus::Parked, None);
+
+        let named: Vec<String> = stalled_agents(&conn, 60)
+            .into_iter()
+            .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            named,
+            vec![stuck.to_string()],
+            "only the agent with old work and a live, unbusy session may be named; naming a fresh \
+             or parked one teaches the operator to ignore the field"
         );
     }
 
