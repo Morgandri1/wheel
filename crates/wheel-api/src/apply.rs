@@ -14,8 +14,16 @@
 //! with no transaction across them, so a refusal discovered on wire 7 of 9 would otherwise leave 6
 //! wires and every node behind. Pre-validating against the same matrix the engine enforces turns
 //! the expected failure — the builder emitting an illegal pair — into a refusal before anything
-//! exists. It does not cover engine-side failures (name collision, per-project caps), which is why
-//! the apply result reports what landed rather than promising atomicity we cannot deliver here.
+//! exists. It does not cover engine-side failures — a name collision, or anything else the engine
+//! decides at creation time — which is why the apply result reports what landed rather than
+//! promising atomicity we cannot deliver here.
+//!
+//! **There is no per-project node cap at any layer today.** An earlier version of this comment said
+//! this step "does not cover per-project caps", which implied a backstop that does not exist:
+//! nothing in the engine counts a project's nodes, and §3e's default-50 is unimplemented and queued
+//! with SDK. `MAX_NODES`/`MAX_WIRES` below bound ONE REQUEST, not a project total, so a caller can
+//! still grow a board without limit an apply at a time. Corrected because a comment promising a
+//! guard that is not there is worse than no comment — it tells the next reader to stop looking.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -182,10 +190,19 @@ pub struct ApplyPolicy {
 
 /// The most this step will attempt in one apply.
 ///
-/// Not a security boundary — the authoritative per-project limit is engine-side — but a bound on
-/// what one builder turn can ask for. Realising a board is one engine call per node and per wire,
-/// so an unbounded board is an unbounded burst against a single project's engine, and the failure
-/// would arrive as a slow partial apply rather than a refusal anyone can read.
+/// A bound on ONE REQUEST, and — measured, not assumed — the only bound that exists anywhere.
+///
+/// This used to claim "the authoritative per-project limit is engine-side". There is no such limit:
+/// SDK and ADVERSARY both grepped and nothing counts a project's nodes, so §3e's default-50 is
+/// documented rather than implemented. That makes these numbers load-bearing in a way they were not
+/// written to be, and it is worth being plain about what they do NOT do: they cap a single apply,
+/// so a caller may still grow a board indefinitely one apply at a time.
+///
+/// What they do buy: realising a board is one engine call per node and per wire, so an unbounded
+/// board is an unbounded burst at a single project's engine, arriving as a slow partial apply
+/// rather than a refusal anyone can read.
+///
+/// The values are a judgement — generous but bounded — not a measurement.
 pub const MAX_NODES: usize = 200;
 pub const MAX_WIRES: usize = 1000;
 
