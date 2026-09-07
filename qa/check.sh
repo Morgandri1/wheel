@@ -121,12 +121,13 @@ else
   # UNSET, but the new failure is URL SET and driver ABSENT — a combination that could not
   # exist while postgres was a default, so the guard was right until the day it wasn't.
   #
-  # This reproduces CI's environment locally: default features, with a URL set. A file on
-  # the wrong axis fails here instead of after merge. The URL points at a closed port on
-  # purpose — nothing should reach it, and if a test does, that is the finding.
-  step "rust:test-nopg" env TEST_DATABASE_URL="postgres://qa:qa@127.0.0.1:1/nonexistent" \
-    "$PY" qa/tools/with_lock.py "$CARGO_LOCK" \
-    "$PY" qa/tools/cargo_test_gate.py cargo test -p wheel-api
+  # Reproduces CI's environment locally: default features, with a URL set at a closed port.
+  # A file on the wrong axis fails here instead of after merge. It DISCOVERS the *_db
+  # suites rather than listing them — the property is one assertion, and it was being
+  # satisfied by hand seven times, so the seventh was always going to be found the way the
+  # sixth was. Running only those targets is also what keeps it free: with the guards in
+  # place they compile to nothing, so it costs 0s against 160s for all of wheel-api.
+  step "rust:test-nopg" "$PY" qa/tools/nopg_gate.py
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.

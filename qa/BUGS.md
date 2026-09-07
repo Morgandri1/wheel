@@ -1236,7 +1236,7 @@ The third assertion in each row is the one worth keeping. A fix that made the bo
 while the skipped node vanished unexplained would pass "returns 200" and would be the same
 quiet-failure trade the whole `HEALTH-implies-*` suite exists to catch.
 
-### 032 — `ws_bridge_db.rs` is the seventh Postgres suite and was not guarded (S2, API, **open**)
+### 032 — `ws_bridge_db.rs` is the seventh Postgres suite and was not guarded (S2, API, ~~closed~~)
 
 `rust:test-nopg`. `7a8c4f5` guarded six of the seven `wheel-api` suites that need a Postgres
 driver. `crates/wheel-api/tests/ws_bridge_db.rs` has no `#![cfg(feature = "postgres")]`, and
@@ -1261,5 +1261,7 @@ build does not have", and that is one assertion, not seven. `rust:test-nopg` ass
 default features, a URL pointed at a closed port, and anything that tries to reach a
 database fails. It is red on this bug right now, which is how I know it works.
 
-**Held, not merged.** A deliberately-red gate lands WITH its fix (ARCHITECTURE.md), and I
-am the one that rule was written about. It lands the moment `ws_bridge_db.rs` is guarded.
+**Closed** by `268f8ee` ("gate the sixth Postgres suite — the one the grep could not see").
+`rust:test-nopg` verified green against that commit on a clean tree, and mutation-checked:
+removing the guard again makes it fail with the diagnosis. It discovers all seven suites
+rather than naming them, so an eighth is covered without anyone remembering it exists.
