@@ -806,7 +806,7 @@ impl Supervisor {
     /// agent when work arrives, and `--resume` continues the same session —
     /// proven in production, the first wake came back on the id it went to
     /// sleep with.
-    async fn park(self: &Arc<Self>, agent: Uuid) {
+    async fn park(self: &Arc<Self>, agent: Uuid) -> Option<u64> {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
 
@@ -814,18 +814,45 @@ impl Supervisor {
         // message race by construction. Whichever takes the lock first wins and
         // the other sees the world it made: park first and `deliver` restarts
         // it; deliver first and this finds work queued and leaves it alone.
-        {
+        let remaining = {
             let conn = self.db.lock().unwrap();
             let state = board::agent_state(&conn, agent).unwrap_or_default();
             if !matches!(state.status, AgentStatus::Idle) {
-                return;
+                return None;
             }
             if messages::has_queued(&conn, agent).unwrap_or(true) {
-                return;
+                return None;
             }
+
+            // A timer is armed per turn and none is cancelled, so an OLD timer
+            // outlives the turn that armed it: two turns 250s apart under a 300s
+            // timeout leaves the first firing 50s after the second, parking an
+            // agent that was active moments ago. Parking early is safe — it
+            // resumes — but it silently shortens the hot window the operator
+            // configured, so `idle_timeout_secs` would not mean what it says.
+            //
+            // Comparing against last_activity rather than cancelling timers is
+            // QA's suggestion (BUG-040) and the better one: no extra state, and
+            // it self-corrects however many stale timers are in flight.
+            let idle_secs = Self::idle_timeout_for(&conn, agent);
+            match Self::seconds_since_activity(&conn, agent) {
+                Some(since) if since < idle_secs => Some(idle_secs - since),
+                _ => None,
+            }
+        };
+        // Reported, not re-armed here: re-arming by calling `park` again would
+        // make it recursive, and a recursive async fn's future cannot be proven
+        // Send. The caller's loop does the waiting instead.
+        if let Some(left) = remaining {
+            return Some(left);
         }
 
-        if let Some(mut r) = guard.take() {
+        let Some(mut r) = guard.take() else {
+            // No process to stop: nothing to park, and marking it Parked would
+            // claim a saving that was never made.
+            return None;
+        };
+        {
             // NOT `let _ =`. A kill that fails leaves a live process while the
             // board says Parked — the saving is claimed and not made, and it is
             // invisible. `kill_on_drop(true)` still reaps `r` at the end of this
@@ -839,10 +866,6 @@ impl Supervisor {
                     "killing a parked agent's process failed; kill_on_drop is the backstop"
                 );
             }
-        } else {
-            // No process to stop: nothing to park, and marking it Parked would
-            // claim a saving that was never made.
-            return;
         }
         {
             // Same reasoning as `stop`: a token outliving its process is a
@@ -852,6 +875,35 @@ impl Supervisor {
         }
         self.set_status(agent, AgentStatus::Parked, None);
         tracing::info!(%agent, "parked after idle timeout");
+        None
+    }
+
+    /// The agent's configured idle timeout, or the default.
+    fn idle_timeout_for(conn: &rusqlite::Connection, agent: Uuid) -> u64 {
+        match board::get(conn, agent) {
+            Ok(Some(node)) => match &node.config {
+                wheel_core::NodeConfig::Agent(a) => a.idle_timeout_secs() as u64,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Seconds since the agent's `last_activity`, computed by sqlite.
+    ///
+    /// In SQL rather than in Rust because the timestamp is already stored as
+    /// RFC3339 text and `julianday` is how every other age in this engine is
+    /// measured — the stall report does the same. It also avoids adding a date
+    /// library to a crate that has managed without one.
+    fn seconds_since_activity(conn: &rusqlite::Connection, agent: Uuid) -> Option<u64> {
+        conn.query_row(
+            "SELECT CAST((julianday('now') - julianday(last_activity)) * 86400.0 AS INTEGER)
+               FROM agent_state WHERE node_id = ?1 AND last_activity IS NOT NULL",
+            rusqlite::params![agent.to_string()],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|s| s.max(0) as u64)
     }
 
     /// Arm the idle timer for an agent that has just finished a turn.
@@ -873,8 +925,16 @@ impl Supervisor {
         }
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
-            me.park(agent).await;
+            let mut wait = secs as u64;
+            // Loops rather than recurses, and re-waits whatever `park` reports
+            // is left — so a stale timer from an earlier turn corrects itself
+            // instead of parking an agent that was active moments ago.
+            while let Some(left) = {
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                me.park(agent).await
+            } {
+                wait = left.max(1);
+            }
         });
     }
 
@@ -1320,6 +1380,31 @@ impl Supervisor {
             }
             // A token outliving its process is a credential with no owner.
             let _ = crate::db::tokens::revoke(&conn, agent);
+
+            // A start that passed `--resume` and never reached `init` is the
+            // signature of an unusable session. Nothing else cleared it, so
+            // every later start re-passed the same dead id and failed the same
+            // way — an agent that could never recover without a manual clear.
+            //
+            // Parking makes this matter: resume used to be rare and is now the
+            // normal path back from idle.
+            //
+            // Dropping a session we might have kept costs the agent its context
+            // once; keeping a dead one costs it every start from now on. The
+            // recoverable failure is the better one.
+            if !initialised {
+                let had_session = board::agent_state(&conn, agent)
+                    .unwrap_or_default()
+                    .session_id
+                    .is_some();
+                if had_session {
+                    clear_session(&conn, agent);
+                    tracing::warn!(
+                        %agent,
+                        "a resumed session never initialised; cleared it so the next start is fresh"
+                    );
+                }
+            }
             if !already_diagnosed {
                 set_status_db(&conn, agent, status, detail);
             }
@@ -2107,6 +2192,198 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         rows
+    }
+
+    /// Records the `resume` the ENGINE put in each spawn spec.
+    ///
+    /// The shim driver deliberately passes no argv, so an argv-based assertion
+    /// measures the stub rather than the engine — my first attempt at this test
+    /// did exactly that and failed for its own reasons. What matters is what the
+    /// engine hands the driver; `ClaudeDriver::argv` turning `resume` into
+    /// `--resume` is its own test.
+    struct ResumeRecordingDriver {
+        program: String,
+        log: std::path::PathBuf,
+    }
+
+    impl Harness for ResumeRecordingDriver {
+        fn program(&self) -> &str {
+            &self.program
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<std::ffi::OsString> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log)
+                .unwrap();
+            writeln!(f, "{}", spec.resume.as_deref().unwrap_or("<none>")).unwrap();
+            Vec::new()
+        }
+        fn env(&self, _spec: &SpawnSpec) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            format!("{envelope}\n")
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            ClaudeDriver.parse_line(line)
+        }
+        fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(None, stderr)
+        }
+    }
+
+    const SESSION_HARNESS: &str = r#"#!/bin/sh
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-abc\"}"
+while IFS= read -r line; do
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"sess-abc\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    /// The question parking lives or dies on: after a park, is the next child
+    /// handed the SAME session, or a fresh one — which would be a silent
+    /// context wipe.
+    #[tokio::test]
+    async fn a_resumed_agent_is_handed_the_same_session_it_parked_with() {
+        let root = std::env::temp_dir().join(format!("wheel-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("resumes");
+        std::fs::remove_file(&log).ok();
+
+        let log_for_driver = log.clone();
+        let (sup, id, _dir) = shim_supervisor_inner(
+            "resumes",
+            SESSION_HARNESS,
+            |cfg| cfg.idle_timeout_secs = Some(1),
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            Some(Box::new(move |program| {
+                Arc::new(ResumeRecordingDriver {
+                    program,
+                    log: log_for_driver,
+                }) as Arc<dyn crate::harness::Harness>
+            })),
+        );
+
+        sup.start(id).await.unwrap();
+        until("the agent to initialise", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        enqueue(&sup, id, "first turn");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+
+        enqueue(&sup, id, "second turn");
+        sup.deliver(id).await.unwrap();
+        until("the agent to be respawned", || {
+            std::fs::read_to_string(&log)
+                .map(|a| a.lines().count() >= 2)
+                .unwrap_or(false)
+        })
+        .await;
+
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        let mut lines = recorded.lines();
+        assert_eq!(
+            lines.next(),
+            Some("<none>"),
+            "the FIRST spawn has nothing to resume"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("sess-abc"),
+            "the resumed child must be handed the session it parked with; a fresh one is a \
+             silent context wipe. Recorded: {recorded:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// BUG-040 (QA): a timer is armed per turn and none is cancelled, so an
+    /// OLD timer outlives the turn that armed it. Two turns 250s apart under a
+    /// 300s timeout leaves the first firing 50s after the second — parking an
+    /// agent that was active moments ago and silently shortening the hot window
+    /// the operator asked for.
+    ///
+    /// Asserted by calling `park` directly with a RECENT last_activity: it must
+    /// decline and report the remainder rather than park.
+    #[tokio::test]
+    async fn a_stale_timer_does_not_park_an_agent_that_was_just_active() {
+        let (sup, id, _dir) = shim_supervisor_cfg("stale-timer", ECHO_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(300);
+        });
+        sup.start(id).await.unwrap();
+        until("the agent to initialise", || {
+            matches!(status_of(&sup, id), AgentStatus::Idle)
+        })
+        .await;
+
+        // last_activity is set by the init that just happened, so "now".
+        let left = sup.park(id).await;
+
+        assert!(
+            left.is_some(),
+            "park must DECLINE for an agent active moments ago, and report what is left"
+        );
+        let left = left.unwrap();
+        assert!(
+            left > 250 && left <= 300,
+            "the remainder must be measured from last_activity, not restarted from zero: {left}"
+        );
+        assert!(
+            matches!(status_of(&sup, id), AgentStatus::Idle),
+            "declining to park must leave the agent exactly as it was"
+        );
+    }
+
+    /// A start that resumed a session and never reached `init` must not leave
+    /// that session in place: nothing else cleared it, so every later start
+    /// re-passed the same dead id and failed identically — an agent that could
+    /// never recover on its own.
+    #[tokio::test]
+    async fn a_session_that_never_initialises_is_cleared_so_the_next_start_is_fresh() {
+        // Exits immediately without ever printing an init line.
+        const NEVER_INITS: &str = "#!/bin/sh\nexit 1\n";
+        let (sup, id, _dir) = shim_supervisor("dead-session", NEVER_INITS);
+
+        // Give it a session as though a previous run had established one.
+        {
+            let conn = sup.db.lock().unwrap();
+            set_session(&conn, id, "sess-dead");
+        }
+        assert!(
+            {
+                let conn = sup.db.lock().unwrap();
+                board::agent_state(&conn, id)
+                    .unwrap_or_default()
+                    .session_id
+                    .is_some()
+            },
+            "precondition: the agent starts with a session to lose"
+        );
+
+        let _ = sup.start(id).await;
+        until("the failed start to be reaped", || {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_none()
+        })
+        .await;
+
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_none(),
+            "a session that never initialised must be cleared, or the agent retries it forever"
+        );
     }
 
     fn status_of(sup: &Supervisor, id: Uuid) -> AgentStatus {
