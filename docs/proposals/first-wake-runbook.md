@@ -200,3 +200,15 @@ wire bound against a hostile agent — we are waking a cooperative one and watch
 Bearing on SCRIPT EXECUTION: this is now a stated PRECONDITION, not later hardening. Script-exec on a
 shared-token board means an agent running arbitrary code can impersonate pm and drive the whole board.
 Per-node uids/tokens (037/038) must be in SDK's Script-exec scope as a gate, not deferred to M2.
+
+## F007 CORRECTION (SDK, 2026-09-07) — the fix is UID-per-node (storage), NOT token-per-node
+My "per-node uids/tokens (037/038)" wording invites the trap fix. SDK's correction: giving each node its
+own TOKEN is ALREADY DONE and closes nothing — it looks like a fix and is a no-op. The vulnerability is
+STORAGE: every agent runs as the same uid, so the token FILES are cross-readable, and separate tokens on a
+shared-readable filesystem are still readable by every co-located agent. The gate is satisfied ONLY by
+isolating storage: a UID PER NODE (§2 base+1+n) so the files stop being cross-readable, OR moving the token
+off the shared-readable filesystem. So the script-exec precondition is per-node-UID (037/038 storage
+isolation), and explicitly NOT per-node-token. Spend the effort once on the mechanism that holds.
+
+ATTRIBUTION FIX: SDK measured F007 (I earlier credited ADVERSARY). ADVERSARY filed 048 for the
+co-located-network half. Follow-up on F007 -> SDK; on 048 -> ADVERSARY.
