@@ -250,35 +250,10 @@ pub fn router(state: AppState) -> Router {
 /// Computed on demand rather than watched: the engine must idle at ~0 CPU (§2),
 /// so there is no background poll here.
 async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
-    let stalled = {
-        match s.db.lock() {
-            Ok(conn) => crate::db::messages::agents_with_work_older_than(
-                &conn,
-                s.cfg.startup_deadline_secs as i64,
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(agent, _)| {
-                // Transitional agents are not stalled: they are on their way,
-                // and 041's deadline is what judges those. An agent that is
-                // running or idle with old work is the one nothing is coming
-                // for.
-                !matches!(
-                    crate::db::board::agent_state(&conn, *agent)
-                        .unwrap_or_default()
-                        .status,
-                    wheel_core::AgentStatus::Starting
-                        | wheel_core::AgentStatus::Parked
-                        | wheel_core::AgentStatus::Stopped
-                        | wheel_core::AgentStatus::NeedsAuth
-                        | wheel_core::AgentStatus::BudgetExhausted
-                )
-            })
-            .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
-            .collect::<Vec<_>>(),
-            // A poisoned lock is worth saying so rather than reporting health.
-            Err(_) => Vec::new(),
-        }
+    let stalled = match s.db.lock() {
+        Ok(conn) => stalled_agents(&conn, s.cfg.startup_deadline_secs as i64),
+        // A poisoned lock is worth saying nothing about rather than guessing.
+        Err(_) => Vec::new(),
     };
 
     if !stalled.is_empty() {
@@ -295,26 +270,60 @@ async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Agents holding work that nothing is coming for.
+///
+/// Split out of the handler so the DECISION is testable without an HTTP
+/// harness: which agents are named, and — the part that matters more — which
+/// are not. A stall report that names healthy agents is one an operator learns
+/// to scroll past, which is the failure it exists to prevent.
+fn stalled_agents(conn: &rusqlite::Connection, deadline_secs: i64) -> Vec<serde_json::Value> {
+    crate::db::messages::agents_with_work_older_than(conn, deadline_secs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(agent, _)| {
+            // Transitional agents are 041's business, and an agent that is
+            // parked, stopped, unauthenticated or out of budget is not FAILING
+            // to deliver — it is not delivering, which is a different thing and
+            // not a fault to report.
+            !matches!(
+                crate::db::board::agent_state(conn, *agent)
+                    .unwrap_or_default()
+                    .status,
+                wheel_core::AgentStatus::Starting
+                    | wheel_core::AgentStatus::Parked
+                    | wheel_core::AgentStatus::Stopped
+                    | wheel_core::AgentStatus::NeedsAuth
+                    | wheel_core::AgentStatus::BudgetExhausted
+            )
+        })
+        .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
+        .collect()
+}
+
 /// What code this RUNNING engine actually is.
 ///
 /// Four times in one night someone had to answer "is the thing running the
 /// thing we merged?" and could only infer it: a stale `wheel-engine:test` tag
 /// gave a PASS describing a different binary, a CI run described whoever pushed
 /// last rather than the commit in question, and a `make check` described a
-/// working tree rather than HEAD. Every one of those is the same question —
-/// which input produced this result — and the engine could not answer it about
-/// itself.
+/// working tree rather than HEAD. Every one is the same question — which input
+/// produced this result — and the engine could not answer it about itself.
 ///
-/// Stamped by the image at build time. `unknown` when it was not, which is
-/// honest: an unstamped build is exactly the case where an operator must not
-/// conclude anything from a number.
+/// COMPILE-TIME, not an environment variable, and that is not a preference. The
+/// `process` backend — which is what production runs on Railway — spawns the
+/// engine with `env_clear()` plus a deliberate allowlist, so a runtime env
+/// stamp arrives empty and the engine reports `unknown` on exactly the
+/// deployment where the answer matters. I shipped the env version, then watched
+/// a live process-backend engine report `unknown` from a correctly stamped
+/// image, which is the failure this whole field exists to prevent — a confirm
+/// that quietly tells you nothing.
+///
+/// Baked into the binary it survives `env_clear`, cannot be set by whatever
+/// spawned the process, and travels with the artefact rather than beside it.
+/// `unknown` when nothing stamped the build, which is honest: an unstamped
+/// build is exactly where an operator must conclude nothing.
 fn build_id() -> &'static str {
-    // Read once: this is called on a probe the host polls, and it cannot change
-    // while the process lives.
-    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    BUILD
-        .get_or_init(|| std::env::var("WHEEL_BUILD_SHA").unwrap_or_else(|_| "unknown".into()))
-        .as_str()
+    option_env!("WHEEL_BUILD_SHA").unwrap_or("unknown")
 }
 
 // --- request bodies --------------------------------------------------------
@@ -375,25 +384,92 @@ mod tests {
     #[test]
     fn patch_answers_with_the_node_it_stored_not_an_empty_body() {
         let src = include_str!("board_routes.rs");
-        let sig = src
-            .lines()
-            .position(|l| l.contains("pub async fn patch_node"))
+        // The WHOLE function, not a fixed line window. The first version of
+        // this read 6 lines for the signature and 40 for the body, and broke
+        // the moment the handler grew — flagging a contract that still held.
+        // A gate that fails when the code merely MOVES teaches people to edit
+        // the gate, which is how a gate stops meaning anything.
+        let body = src
+            .split("pub async fn patch_node")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub ").next())
             .expect("patch_node exists");
-        let head: String = src.lines().skip(sig).take(6).collect::<Vec<_>>().join("\n");
+
         assert!(
-            head.contains("ApiResult<Json<Node>>"),
-            "patch_node must answer with the full node; Web reads `position` off this reply.\n{head}"
+            body.contains("ApiResult<Json<Node>>"),
+            "patch_node must answer with the full node; Web reads `position` off this reply"
         );
-        let body: String = src
-            .lines()
-            .skip(sig)
-            .take(40)
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
             body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
             "patch_node must return the SAME node value it stored, so the reply carries the \
              clamped position rather than an echo of the request"
+        );
+    }
+
+    /// The stall report's value is in what it does NOT say. Every state below
+    /// is a healthy agent that a naive "has old queued work" check would name,
+    /// and each false positive is a step toward an operator ignoring the field.
+    #[test]
+    fn a_stall_report_names_only_agents_nothing_is_coming_for() {
+        use wheel_core::AgentStatus;
+        let conn = crate::db::open_memory().unwrap();
+
+        let agent = |name: &str| {
+            let n = wheel_core::Node::new(
+                uuid::Uuid::new_v4(),
+                name.parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            );
+            crate::db::board::create(&conn, &n).unwrap();
+            n.id
+        };
+        let age = |id: uuid::Uuid| {
+            conn.execute(
+                "UPDATE messages SET created_at = datetime('now', '-600 seconds') WHERE to_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        };
+        let queue = |id: uuid::Uuid| {
+            crate::db::messages::enqueue(
+                &conn,
+                wheel_core::MessageSender::User,
+                id,
+                "work".into(),
+                None,
+            )
+            .unwrap()
+        };
+
+        // The one that SHOULD be named: old work, agent alive and not busy.
+        let stuck = agent("stuck");
+        queue(stuck);
+        age(stuck);
+        crate::db::board::set_status(&conn, stuck, AgentStatus::Idle, None);
+
+        // Fresh work is in flight, not stranded.
+        let fresh = agent("fresh");
+        queue(fresh);
+        crate::db::board::set_status(&conn, fresh, AgentStatus::Idle, None);
+
+        // Parked with old work is 041's business and the resume path's, not a
+        // stall: nothing is wrong, nothing is running.
+        let parked = agent("parked");
+        queue(parked);
+        age(parked);
+        crate::db::board::set_status(&conn, parked, AgentStatus::Parked, None);
+
+        let named: Vec<String> = stalled_agents(&conn, 60)
+            .into_iter()
+            .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            named,
+            vec![stuck.to_string()],
+            "only the agent with old work and a live, unbusy session may be named; naming a fresh \
+             or parked one teaches the operator to ignore the field"
         );
     }
 

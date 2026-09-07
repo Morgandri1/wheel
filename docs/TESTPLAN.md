@@ -836,6 +836,18 @@ Deliberately NOT asserted: that the status never touches `starting`. Restarting 
 | `EPH-settles-after-turn` | An agent with `ephemeral_context: true` reaches a settled status after a completed turn. | **S1** |
 | `EPH-second-turn-still-works` | It completes a SECOND turn. One turn proves the first clear survived; the operator's agent does this every turn. | **S1** |
 
+### SCHEMA-generated-ts-matches-core — the client cannot silently deny a field the engine has
+
+**Verified drift, 2026-09-07:** `workspaces` (`crates/wheel-core/src/node.rs:196`) appears once in core and three times in `docs/schema/*.json`, and **zero times** in `web/src/lib/schema/generated.ts`. That file was last written 2026-09-05 23:54 while its sibling `index.ts` is 2026-09-06 21:38 — a day stale, and nothing said so.
+
+**Why it belongs with `HEALTH-implies-*` rather than beside it:** a client type that denies a field the engine actually serves is the same shape as a green gate describing something not shipped. The board is correct, the engine is correct, the schema is correct, and the one artifact the UI compiles against quietly disagrees with all three. Nothing is broken loudly.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `SCHEMA-generated-ts-matches-core` | Regenerating from source produces no diff: `cargo run -p wheel-core --bin export-schema` then `pnpm -C web gen:types`, then `git diff --exit-code` over `docs/schema/` and `web/src/lib/schema/generated.ts`. Drift is red. | **S2** |
+
+**Sequencing (ARCHITECTURE.md):** this gate is RED today, because the drift is real and Web is regenerating. It therefore lands WITH that regeneration, not before it — a deliberately-red gate merged ahead of its fix is what froze four lanes on 2026-09-06.
+
 ### HEALTH-implies-* — /healthz answering 200 must mean something
 
 Named for the shape, not the bugs, because the point is the sixth instance. Five in one day, every one a system that was up, answering, and not doing its job:

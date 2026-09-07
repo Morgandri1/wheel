@@ -392,8 +392,37 @@ async fn ingress_rate_limit_refuses_once_the_budget_is_spent() {
     let id = make_project(&app, &tok).await;
     open_ingress(&app, &tok, &id).await;
 
+    // 130, not 70, and the number is the whole point.
+    //
+    // The limiter is a FIXED window aligned to the wall-clock minute (`date_trunc('minute', now())`),
+    // so a run that straddles a boundary splits its requests between two windows. 70 can land as
+    // 35 + 35 — under the 60 budget in both — and no 429 ever comes. That is not a bug in the
+    // limiter: `http/ratelimit.rs` documents the boundary burst as an accepted v1 tradeoff, and
+    // API.md says up to 2x the limit across two adjacent windows. The test was asserting a
+    // guarantee the design deliberately does not make, and failed the first time CI ran it across
+    // a minute boundary.
+    //
+    // The worst case is an even split, so N requests put ceil(N/2) into some window. To exceed 60
+    // there we need ceil(N/2) > 60, i.e. N >= 122. 130 clears it with margin and still costs
+    // milliseconds — these are in-process router calls, not sockets.
+    // IF YOU COME HERE TO PROVE THE FLAKE IS GONE, READ THIS FIRST.
+    //
+    // The obvious check is to force a straddle: sleep until just before the minute rolls, then run.
+    // That harness is BLIND, measured rather than supposed. Timed to start at :59.66, the boundary
+    // lands inside this test's SETUP (create project, open ingress), so by the time the loop fires
+    // every request is in one window. The control proves it: mutated back to 70 — which must fail —
+    // it passed 4 for 4 at 08:21:59.664 through 08:24:59.668. Eight "forced straddles" at 130 passed
+    // for the same empty reason.
+    //
+    // So a green run from that harness says nothing, and the honest evidence for the fix is the
+    // arithmetic below plus accumulated CI. The accidental straddles WERE real: at 70, two failures
+    // at 07:58:00 and 07:59:00, both on the rollover second, out of 185 runs.
+    //
+    // The deflake, when someone does it: assert against the DATABASE clock (`now()`), not the same
+    // wall clock the limiter reads. A signal shaped differently from the thing under test is the
+    // only kind that can contradict it.
     let mut saw_429 = false;
-    for _ in 0..70 {
+    for _ in 0..130 {
         let req = Request::builder()
             .method("GET")
             .uri(format!("/p/{id}/hook"))

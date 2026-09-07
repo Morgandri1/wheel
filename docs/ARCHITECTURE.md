@@ -43,6 +43,28 @@ it, *because surfacing it cost them nothing and hiding it would have cost the sw
 demands rigor without making honesty cheap produces hidden mistakes, not fewer mistakes. Keep retractions
 free.
 
+**Slack is what makes the irreversible check affordable (SDK, 2026-09-07).** The per-tree `git status` check
+before the disk reclaim caught a tree holding an agent's uncommitted, unreconstructable work — affordable only
+because the volume was at 62% and not filling. SDK's line: *"if it were at 95% I would be arguing the opposite,
+and we would both be more likely to be wrong."* Urgency degrades the exact judgment the irreversible step
+needs. The disk ceiling, "reclaim only when not urgent," and the refusal to green a red main by re-running are
+not only correctness rules — they PRESERVE the slack that lets the careful check happen. Protect the headroom
+(time, disk, a green main) so that when an irreversible step arrives you are not doing it at 95% in a hurry.
+The false-clean that cost nothing to catch at 62% would have cost a night's work at 95%, because at 95% you do
+not look three times.
+
+**Cross-check across hypotheses, because self-checking is blind where your own assumption sits (SDK,
+2026-09-07 — the mechanism behind "keep retractions free").** Nearly every real defect this session was found
+by someone measuring against a hypothesis that was NOT their own: QA re-ran the warm-agent case after SDK said
+their fix might not close it; ADVERSARY probed an invariant SDK stated confidently and found the tool_call
+TOCTOU (046); PM named the not-stalled states and caught the mid-turn case (041); API checked SDK's Dockerfile
+and SDK checked API's premise; and PM's two worst moments — a gate green about an artefact not shipped — were
+caught by someone else's instrument, not PM's own care. Care fails exactly where you do not think to look, and
+that is precisely your own assumption's blind spot. A second person measuring against a different hypothesis
+lands on it. This is why the swarm catches what a careful individual cannot, and why "who reviews whose work"
+should deliberately cross hypotheses rather than have each lane grade itself: the owner is the worst-placed to
+see their own blind spot, and the best-placed to fix it once someone else's instrument names it.
+
 
 1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
@@ -417,6 +439,11 @@ wheel/
   the CLI/MCP bridge reads it (env is readable via `/proc/<pid>/environ` only by the same uid — belt and braces). Docker backend: engine is container
   root (cap-dropped to SETUID/SETGID) → trivial. Process backend: host spawns the engine with those two ambient caps. Milestone: M2 (docker), M3 (process).
   Until M2 the docker backend uses one uid and the contract states "project is the boundary" as a KNOWN GAP in PROTOCOL.md.
+  **M2/M3 gotcha, flagged forward by SDK (2026-09-07), do NOT fix before the uid work exists:** A8's shared
+  clone store in `repos/` is owned by one uid; once per-node uids land, worktrees running as *other* uids will
+  hit git's `safe.directory` ownership check and it will present as "clone works, worktree refuses." Whoever
+  implements per-node uids handles it with `safe.directory` config or per-uid stores. Recorded here rather than
+  fixed now because a fix without the uid work is untestable — same rule as the chest born-safe checklist.
 - **One sandbox per project, one `wheel-engine` process per sandbox.** Sandboxes are created by `wheel-host` through a
   `Sandbox` trait with two backends: `docker` (local dev / any VM with a docker daemon: container `wheel-p-<id>`, volume `wheel-p-<id>-data`)
   and `process` (production on Railway, where no docker daemon exists: a dedicated unix uid per project, data dir `/data/projects/<id>` mode 0700,
@@ -593,6 +620,23 @@ conditions missing, or a proposal arrives with its subject missing and only its 
   message attempts were beheaded.
 - Git has not truncated on us once. Use the transport that works for the payload that matters, and keep
   messages for the pointer.
+
+### Credit the invitation to falsify, not the claim; agreement is not a cross-check (SDK+API, accepted 2026-09-07)
+
+047 (High, capability boundary) was not *found*. SDK made a confident claim — "nothing is returned unless
+the capability still holds at the moment of disclosure" — and handed it to ADVERSARY with "probe it, and if
+it does not match I want to know." The claim was wrong; both shipped re-checks re-validated a request-start
+snapshot and a mid-request revoke still disclosed. The invitation was the useful act, not the claim, and it
+cost nothing. Nearly every real defect this project caught came the same way: someone measuring against a
+hypothesis that was not theirs. So state claims as **falsifiable**, and hand them to whoever can test them —
+the confident-and-wrong claim that invites a probe is worth more than the cautious one that invites none.
+
+The companion trap, API's: **agreement is not a cross-check.** Two people independently ran the right
+procedure on the rate-limit flake and agreed — and were probably both reading the wrong clock. Controls
+catch instruments; they do not catch an assumption both instruments *share*. Only a differently-shaped
+signal does — the database's own `now()` against a limiter that reads wall-clock. Treat agreement as the
+prompt to go find the independent signal, never as the proof. (This is why the rate-limit deflake asserts
+against the DB clock, not the app's.)
 
 ### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
 

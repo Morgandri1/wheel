@@ -247,6 +247,41 @@ Header hygiene, both directions:
   API, not the end user; relaying a user credential downstream is how replay bugs begin.
 - `WHEEL_HOST_SECRET` is attached upstream and never appears in a response.
 
+### Confirming which code a project's engine is running
+
+`GET /v1/projects/{id}/engine/v1/healthz` (through the proxy above) returns the engine's own health,
+including a `build` field:
+
+```json
+{"build":"4af95c8f0ba604c72481e98e7abc0d7725a2e0d4","ok":true,"stalled":[],"version":"0.1.0"}
+```
+
+**It is an owner-readable fact, not a public one.** The API's own `/healthz` and `/v1/host/healthz`
+do not carry it — the latter deliberately, since it is liveness-only for an unauthenticated caller.
+Reading `build` requires the project owner's token.
+
+**What the number means depends on how the image was built**, and the difference matters at exactly
+the moment you are relying on it:
+
+| image built by | `build` reports |
+|---|---|
+| `make engine-image`, or any build passing `--build-arg GIT_SHA` (this is what CI does) | the exact commit the binaries were **compiled from** |
+| Railway | `"unknown"` — it builds `docker/Dockerfile.host` directly and passes no build args, so `ARG GIT_SHA` keeps its default |
+
+The value is baked at **compile** time (`option_env!` reading the build stage's `ENV`), so nothing at
+runtime can change it. Verified by running the real image: with `--build-arg` the field matched
+`git rev-parse HEAD` exactly, while the container's own `WHEEL_BUILD_SHA` was unset — the field is
+right *because* it was compiled in, not because the environment supplied it.
+
+So on today's production deploys `build` reads `"unknown"`. That is honest rather than misleading —
+it declines to name a commit rather than naming the wrong one — but it means **`build` cannot yet
+confirm a Railway deploy**. Confirm those by checking that the deploy actually rebuilt.
+
+Making it exact in production requires passing `GIT_SHA` as a Railway build arg. Whether Railway
+supports that has now been **verified: it does not**, by two mechanisms — see
+`infra/railway/README.md`. So `build` reading `"unknown"` in production is the honest end state
+rather than a gap awaiting a fix.
+
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
 
