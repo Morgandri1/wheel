@@ -59,6 +59,22 @@ lock-releasing handler cannot reintroduce this. Add a test that revokes the wire
 the same `Caller` and asserts the second denies — the property no current test exercises (they all re-check
 via a fresh request, which refreshes the snapshot and hides this).
 
+## CLOSED — fix verified by run + CI regression, build 0b81bc0
+The fix (bac0bc3, my recommended Option 2): `require()` now re-reads the caller's node LIVE
+(`board::get(conn, self.node.id)`) every call and checks `has_wire` against fresh wires; a caller whose node
+was deleted mid-request → `UnknownToken`. Belt-and-braces `fe8bdcf`/`698cbe8` kept (redundant, harmless). Both
+closure halves confirmed:
+1. **Re-verify (run):** wire-race PoC against a build with `/healthz` build=**0b81bc0** (bac0bc3 is its ancestor,
+   verified) — mid-request revoke of BOTH wires now returns **rc=3 DENIED** (was rc=0 rows on d47c4a4). The
+   disclose→deny flip. (A test-harness note: revoking only the read wire leaves read via write-implies-read and
+   correctly still passes; the true test revokes all capability. Caught before it became a false "fix failed".)
+2. **CI regression (run):** `cargo test -p wheel-engine --lib caps` → 13 passed, incl.
+   `a_wire_revoked_between_two_checks_on_one_caller_denies_the_second`, plus
+   `the_mid_request_tests_reuse_one_caller_rather_than_re_authenticating` (guards the test from being hidden by
+   re-auth) and `a_caller_whose_node_was_deleted_mid_request_can_do_nothing`. So the property is enforced by a
+   test that fails if `require` ever reverts to the snapshot.
+**047 is CLOSED.**
+
 ## Note
 Caught only by revoking MID-request and observing disclosure — a fresh-request-after-revoke test passes (the
 snapshot refreshes per request) and hides it. Recorded against build d47c4a4 rather than a presumed tag,

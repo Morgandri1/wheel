@@ -78,7 +78,7 @@ def main():
     assert wait_token(A), "no token file"
 
     r = wheel(A,"write","probe/1",'{"v":"a"}'); print("write:", r.returncode, r.stdout.strip(), r.stderr.strip())
-    for i in range(120): wheel(A,"write","probe/%d"%i, '{"v":"x"}')
+    for i in range(100): wheel(A,"write","probe/%d"%i, '{"v":"x"}')
     base = wheel(A,"query","probe","SELECT count(*) AS n FROM t_probe")
     print("baseline query:", base.returncode, base.stdout.strip()[:120], base.stderr.strip()[:120])
 
@@ -98,8 +98,10 @@ def main():
         r = wheel(A,"query","probe",slow); out["rc"]=r.returncode; out["so"]=r.stdout.strip()[:80]; out["se"]=r.stderr.strip()[:120]
     th = threading.Thread(target=run_slow);
     t0=time.time(); th.start()
-    time.sleep(0.15)                      # let the query pass its initial require() and start scanning
-    du = unwire(A,T,"read")               # revoke mid-query
+    time.sleep(0.25)                      # let the query pass its initial require() and start scanning
+    # revoke BOTH wires: write implies read, so a partial revoke leaves read capability and the
+    # re-check (correctly) still passes. unwire_all removes all agent0->probe capability.
+    du = (unwire(A,T,"read"), unwire(A,T,"write"))[0]
     th.join(timeout=40)
     dt=time.time()-t0
     print("mid-query unwire rc=%s; slow query rc=%s in %.2fs %s %s"%(du[0],out.get("rc"),dt,out.get("so"),out.get("se")))
