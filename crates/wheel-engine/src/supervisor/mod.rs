@@ -1431,7 +1431,12 @@ mod tests {
         script: &str,
         tweak: impl FnOnce(&mut wheel_core::AgentConfig),
     ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
-        shim_supervisor_full(name, script, tweak, crate::config::DEFAULT_STARTUP_DEADLINE_SECS)
+        shim_supervisor_full(
+            name,
+            script,
+            tweak,
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+        )
     }
 
     /// Per-engine deadline, so a test that needs a short one does not have to
@@ -2356,7 +2361,10 @@ done
         // violation of "never a second process", which is the opposite of what
         // it measures. The deadline may well fire while this is waiting — that
         // is fine, and the point: it does not kill the child.
-        until("the child to spawn at all", || count(&dir.join("runs")) >= 1).await;
+        until("the child to spawn at all", || {
+            count(&dir.join("runs")) >= 1
+        })
+        .await;
 
         until("the wedged agent to settle into an answer", || {
             !matches!(status_of(&sup, id), AgentStatus::Starting)
