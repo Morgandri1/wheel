@@ -30,3 +30,19 @@ effects — a re-run turn can double-commit, re-push, or re-apply an edit. So:
 CODEX_HOME appears only in comments; there is exactly one harness driver, Claude, hardcoded in
 Supervisor::new. If the pitch or any doc implies Codex agents work today, that is inaccurate — Codex is M2.
 Flag wherever "claude code or codex" is stated as present tense.
+
+## Sweep-ruling SCOPE clarification (SDK asked, PM ruled 2026-09-07) — BUG-036 is two bugs
+SDK correctly checked the scope of the ruling above rather than assuming it. BUG-036 separates:
+- (a) REDELIVERY of a stuck `delivered` message — BLOCKED by the effectively-once ruling above (blind
+  re-run = silent double-apply). Held; part of drain work.
+- (b) THE HEALTH SIGNAL LYING about it — NOT blocked. Pure observability: the engine already knows whether
+  it holds a live process, so a `delivered` row with no live process is a wedge, not a live turn. Reporting
+  it changes NO delivery behaviour, re-runs nothing, cannot double-apply. It is the only one of the six
+  silent-failure defects where /healthz denies a state the system can never leave on its own — a liveness
+  lie, not a quiet failure.
+
+RULING: prepare (b) now on SDK's branch, gated and held like the codex guard; it lands after the wake with
+the guard (engine code, redeploys the host). (b) does NOT land before the wake — the wake is watched by
+explicit signals plus direct DB observation, so a delivered-wedge shows as signal 1 failing + a `delivered`
+row with no live process (PM checks that directly during the wake); landing (b) pre-wake would cost a
+deploy and re-open the gate for marginal benefit. The sweep ruling blocks (a) only; it never blocked (b).

@@ -1397,3 +1397,69 @@ Both halves already exist: `cargo run -p wheel-core --bin export-schema` and `pn
 
 **Lands WITH Web's regeneration, not before** — it is red today, and a deliberately-red gate on main
 freezes every other lane.
+
+### 036 — a restart silently loses an in-flight message, and `/healthz` calls it healthy (S1, SDK, **open**)
+
+Found by SDK (`docs/proposals/restart-robustness-current-behaviour.md`, 96f9f08). If the engine
+dies while a message is in state `delivered`, no boot path requeues it. It stays `delivered`
+forever and the agent is permanently wedged.
+
+**The second half is the worse half:** the stall detector excludes `delivered` rows, so
+`/healthz` reports that agent HEALTHY. That is the sixth instance of the class
+`HEALTH-implies-*` was built for — the work has stopped and the health signal denies it. The
+first five each made a failure quieter; this one makes a permanent wedge invisible.
+
+Tests: `RESTART-inflight-message-survives`, `RESTART-wedged-agent-is-not-healthy`. Both fail
+today, so both land as PENDING and go red demanding promotion when SDK's fix lands.
+
+### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **open**)
+
+Raised by SDK. Every agent on the cloud board reads `turns=0` while the cloud QA agent's Claude
+transcript is 2011 lines with 754 assistant messages and 366 tool calls from Sep 6, and no
+"could not record spend" error was logged. Whether accounting is broken or those rows postdate
+the runs is unsettled and the first wake will settle it empirically.
+
+**The gap is ours regardless of which it is:** nothing asserts that a completed turn increments
+the counter.
+
+**SDK's caution is the whole design of this test and it is correct:** assert on a turn the test
+CAUSES, not on existing rows. A test that merely reads `turns=0` passes today for the wrong
+reason — and would keep passing after the bug is fixed, since it never caused a turn to count.
+Cause it, then assert the delta. Same shape as the 12 skips that looked like 12 passes.
+
+
+### 038 — the engine discards SIGTERM, so graceful shutdown never runs (S2, SDK, **open**)
+
+**Numbered 038 here, and SDK has been calling it "BUG-037" — 037 is already the
+turn-accounting gap above.** Same collision shape as 026 two hours ago: a finding written up
+in a proposal doc and referred to by a number nobody allocated in the system of record.
+`docs/proposals/restart-robustness-current-behaviour.md:23` is the write-up; this is its
+number. Cite 038.
+
+The handler does not get default-killed, so the kernel discards the signal and the host's
+SIGTERM is ignored. ARCHITECTURE.md §4b requires a clean shutdown within 15s on SIGTERM
+(stop children, flush sqlite); today there is none.
+
+**It also has a test-design consequence, which is how it surfaced:** any restart test must
+use SIGKILL, not SIGTERM. A SIGTERM-based test would appear to exercise a restart while
+actually exercising a discarded signal — passing for the wrong reason, and continuing to pass
+after 038 is fixed.
+
+### BUG-036's deterministic recipe (SDK, and it removes the race I was worried about)
+
+Recorded here so whoever builds it does not re-derive it. My concern was that killing an
+engine at the exact instant a message sits in `delivered` is easy to write and hard to make
+honest. SDK's answer is that there is already a seam and no race to lose:
+
+- `SILENT_HARNESS` (`crates/wheel-engine/src/supervisor/mod.rs`) consumes stdin and never
+  emits. Integration analogue: a stub `claude` on PATH that reads stdin to EOF and sleeps.
+  The bytes reach the child so the row becomes `delivered`, and no result event ever arrives
+  so the turn cannot complete. **There is no window to hit.**
+- POLL until `state='delivered'` is OBSERVED. Never sleep a fixed interval — that is the
+  dishonest version and it is the one that flakes.
+- SIGKILL, per 038 above.
+- Restart on the same data dir; assert redelivery-or-visible-failure AND that `/healthz` does
+  not say ok.
+
+SDK has offered a purpose-built test-only seam in the engine if the stub-on-PATH proves
+awkward. Take them up on it rather than fighting the supervisor.

@@ -155,7 +155,19 @@ OK, LIE, UNCLAIMED = "ok", "lie", "unclaimed"
 
 def verdict(status, detail):
     """404 on a route whose NODE WE JUST CREATED means the route is absent, not the node.
-    5xx, a hang, or a refused connection is the lie this suite hunts."""
+    5xx, a hang, or a refused connection is the lie this suite hunts.
+
+    KNOWN GAP, deliberately left rather than papered over (PM, 2026-09-07): this judges the
+    STATUS, not the SHAPE. A capability that is only half-implemented and answers `200 {}`
+    is reported OK here, and that is the exact failure mode the invariant forbids — an
+    unimplemented capability must never answer with a success shape, because the honest 404
+    is detectable and the stub 200 is not.
+
+    The `board` probe already does the right thing (200 with zero nodes on a board we just
+    populated is a LIE, not OK). The others do not, because I do not yet know the response
+    shape of a capability that has not landed — chest is M2 and currently, correctly, 404s.
+    When it lands, each probe gets a shape assertion and this comment goes away. Writing it
+    down beats a gate that silently accepts a stub."""
     if status == 200:
         return OK, detail
     if status == 404:

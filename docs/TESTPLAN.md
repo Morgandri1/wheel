@@ -848,6 +848,17 @@ Deliberately NOT asserted: that the status never touches `starting`. Restarting 
 
 **Sequencing (ARCHITECTURE.md):** this gate is RED today, because the drift is real and Web is regenerating. It therefore lands WITH that regeneration, not before it — a deliberately-red gate merged ahead of its fix is what froze four lanes on 2026-09-06.
 
+### RESTART-* and SPEND-* — gaps SDK found in engine behaviour (2026-09-07)
+
+Raised by SDK from `docs/proposals/restart-robustness-current-behaviour.md` (96f9f08). Fixes are theirs and sequenced after the first wake; the tests are written to **PENDING** so they document the defect without freezing main, and go RED demanding promotion the moment each fix lands.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `RESTART-inflight-message-survives` | Kill the engine while a message is in `delivered`, restart, and the message is either redelivered or visibly failed. Today no boot path requeues it: it stays `delivered` forever and the agent is permanently wedged. | **S1** |
+| `RESTART-wedged-agent-is-not-healthy` | `/healthz` must NOT report ok while an agent is wedged on such a message. The stall detector excludes `delivered` rows, so today it reports HEALTHY. **This is `HEALTH-implies-*` exactly** — a capability that has stopped, denied by the health signal — and it is the sixth instance of that class. | **S1** |
+| `SPEND-completed-turn-increments-turns` | A turn the TEST CAUSES increments `agent_state.turns`. **Must not read existing rows**: SDK's caution, and it is right — the cloud QA agent's transcript is 2011 lines with 754 assistant messages while every agent reads `turns=0`, so a test that merely observes `turns=0` would pass for the wrong reason today and keep passing after a fix. Cause the turn, then assert the delta. | **S2** |
+| `CLI-chest-arms-answer-honestly` | The CLI plane's chest arms (`ad5c1c5` fixed `ls` to answer honestly). Ties to the success-shape invariant: an unimplemented arm must not answer with a success shape. | S3 |
+
 ### HEALTH-implies-* — /healthz answering 200 must mean something
 
 Named for the shape, not the bugs, because the point is the sixth instance. Five in one day, every one a system that was up, answering, and not doing its job:
@@ -873,6 +884,7 @@ Each *fix* made the failure quieter rather than absent. `PROGRESS-*` gates this 
 | `HEALTH-implies-<capability>/clean` | Every claimed capability works on a clean engine while healthz is green. | **S1** |
 | `HEALTH-implies-<capability>/one-bad-row` | The same, with one malformed row present. This is where the class shows itself. | **S1** |
 | `HEALTH/healthz-green-<state>` | **CONTROL.** healthz really is 200 in that state — an implication with a false antecedent asserts nothing, and an engine that is honestly down is not this suite's bug. | |
+| `HEALTH-implies-<capability>` — **shape, not status** | A capability counts as working only if it returns a WELL-FORMED response, not merely a 200. **An unimplemented capability must never answer with a success shape** (PM, 2026-09-07): a partial implementation that looks like it works is worse than one that says it is missing, because the honest 404 is *detectable* and the stub 200 is not. |  |
 
 A capability that cannot be probed **fails**; "could not check the board" and "the board is fine" read identically, which is this suite's own failure mode one level up. A route returning 404 is *not claimed* (chest is M2) and is skipped naming the milestone — self-arming, since the day it is implemented it stops returning 404 and asserts for real.
 
