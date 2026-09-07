@@ -19,7 +19,8 @@
     "prebuild": "node scripts/copy-monaco.mjs",
     "predev": "node scripts/copy-monaco.mjs",
     "build:pkg": "WHEEL_STANDALONE=1 NEXT_PUBLIC_AUTH_MODE=local NEXT_DIST_DIR=.next-pkg next build",
-    "pack:pkg": "NEXT_DIST_DIR=.next-pkg node scripts/pack-standalone.mjs"
+    "pack:pkg": "NEXT_DIST_DIR=.next-pkg node scripts/pack-standalone.mjs",
+    "check:auth-mode": "node --experimental-strip-types scripts/check-auth-mode.mjs"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.9.6",

@@ -71,6 +71,7 @@ export const T = {
   // "Reachable" is a measurement, not an inference from a config flag. Ingress does not exist
   // engine-side yet, so today this legitimately reports a failure on every board — the verdict
   // says "not built yet", never "your path is wrong", which is the confusion it exists to end.
+  endpointPublicReach: "endpoint-public-reach",
   endpointTest: "btn-endpoint-test",
   endpointProbe: "endpoint-probe",
   endpointProbeStatus: "endpoint-probe-status",

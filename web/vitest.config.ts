@@ -29,7 +29,10 @@ export default defineConfig({
         // What a status code is allowed to claim. Being wrong here is silent and lands on the
         // operator: a bare 404 read as "your path is wrong" cost an hour on /tg.
         "src/lib/drag-overrides.ts",
+        "src/lib/auth-mode-check.ts",
         "src/lib/endpoint-probe.ts",
+        "src/lib/wired-vaults.ts",
+        "src/lib/endpoint-reach.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },

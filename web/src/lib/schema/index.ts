@@ -21,6 +21,7 @@ export type {
   Column,
   ColumnType,
   CtxConfig,
+  EndpointAuth,
   EndpointConfig,
   ErrorBody,
   ErrorDetail,
