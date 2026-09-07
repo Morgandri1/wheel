@@ -49,7 +49,8 @@ engine backstop that DOES NOT EXIST. SDK grepped and I re-checked: nothing count
 and §3e's default-50 per-project cap is UNIMPLEMENTED (like `wheel place`). A doc specifying a cap is not the
 cap existing — the same false-clean/quick-check error this campaign keeps catching, here in my own finding.
 Owned. Note apply.rs:17's own comment repeats it ("does not cover engine-side failures (name collision,
-per-project caps)") — SDK should fix that comment too, so it does not imply a per-project cap that is not there.
+per-project caps)") — API should fix that comment too (apply.rs is API's file), so it does not imply a
+per-project cap that is not there.
 
 Accurate statement:
 - The ONLY size bound that exists is the API's board-apply REQUEST cap — `MAX_NODES=200` / `MAX_WIRES=1000`
