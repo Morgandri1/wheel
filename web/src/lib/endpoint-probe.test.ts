@@ -100,26 +100,37 @@ describe("what a status code is allowed to claim", () => {
       probeVerdict({ status: 403 }),
       probeVerdict({ status: 501, code: "ingress_unavailable" }),
       probeVerdict({ status: 404, body: "no such route" }),
-      probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' }),
+      probeVerdict({ status: 202, body: '{"accepted":true,"queued":1}' }),
     ];
     expect(new Set(verdicts).size).toBe(4);
   });
 
+  it("reads the count from an engine that predates the queued rename", () => {
+    // 168430f renamed the 202 field delivered -> queued. Both mean rows written, and a project
+    // whose engine has not been restarted still sends the old name.
+    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":2}' })).toMatch(
+      /2 wired nodes/,
+    );
+    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":0}' })).toMatch(
+      /nothing is wired/i,
+    );
+  });
+
   it("reports the count ingress gave without promising the agent has it", () => {
-    const one = probeVerdict({ status: 202, body: '{"accepted":true,"delivered":1}' });
+    const one = probeVerdict({ status: 202, body: '{"accepted":true,"queued":1}' });
     expect(one).toMatch(/1 wired node\b/);
     expect(one).toMatch(/queued/i);
     // The 202 field is named `delivered` but counts rows ENQUEUED — a parked agent still counts.
     // The panel may repeat the number; it may not turn it into a claim the message was received.
     expect(one).not.toMatch(/delivered to/i);
     expect(one).not.toMatch(/real hit/i);
-    expect(probeVerdict({ status: 202, body: '{"accepted":true,"delivered":2}' })).toMatch(
+    expect(probeVerdict({ status: 202, body: '{"accepted":true,"queued":2}' })).toMatch(
       /2 wired nodes/,
     );
   });
 
   it("does not call an accepted-but-undelivered hit a delivery", () => {
-    const verdict = probeVerdict({ status: 202, body: '{"accepted":true,"delivered":0}' });
+    const verdict = probeVerdict({ status: 202, body: '{"accepted":true,"queued":0}' });
     expect(verdict).toMatch(/nothing is wired/i);
     expect(verdict).not.toMatch(/delivered to/i);
   });

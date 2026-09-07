@@ -38,6 +38,70 @@ ownership area. Ship small, commit often, keep main green.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
 3. **≥ 90 % test coverage** per crate and per package. Enforced in **CI** (`make check-strict` on every push to origin: `cargo llvm-cov --fail-under-lines 90` per crate; web `vitest --coverage` with `lines: 90`) — coverage below the bar is a failing check, not a warning. Locally `make check` runs everything except coverage (it OOMs with six agents resident) and `make coverage` runs it deliberately. A red CI on `origin/main` is the owner's to fix within the hour; PM pushes `main` after merges so CI sees every merge. **No exemption without a machine-checkable expiry; an exemption from a bar is never an exemption from regressing.** Exemptions are predicates the gate executes (crate + a floor that never decreases, in `qa/coverage-floors.json` + an expiry the gate evaluates); an expired exemption fails the gate and names the choice. wheel-engine: ratchet from 71.24% (2026-09-06), joins the 90% bar when M2 is complete. **Web's 90% bar is scoped, not universal**: it applies to the `src/lib` modules that encode rules — wire matrix, limits, auth/session, CSP, message states, validation, endpoint-probe verdicts — enumerated in `web/vitest.config.ts`'s coverage `include` (PM ruling 2026-09-06, on Web's own recommendation). UI components are exercised by QA's Playwright suite instead of this gate; that split stands because a component test that mocks everything proves less than an E2E click, while an untested branch in wire-matrix/validate fails silently and lands on the operator. The include list is a live obligation, not a fixed inventory: any new `src/lib` module whose wrong branch would be silently wrong (permission/wire checks, auth, security headers, state machines, anything §3c calls out) must be added to it on the PR that introduces it; pure glue/IO (API client plumbing, env resolution) stays out unless it grows that kind of logic.
 
+### A size gate measures what you ship; a test gate covers what you keep (PM ruling, 2026-09-06)
+
+These are two questions and they take different feature sets. Forcing them to match either under-tests the
+code or mis-measures the artifact.
+
+    tests + clippy : --features postgres                        (superset — nothing stops being built or run)
+    size gate      : --no-default-features --features postgres  (exactly what Railway runs)
+
+The failure this prevents is concrete: measured with default features, the "before" figure was a binary
+containing **both** database drivers — a binary we ship nowhere. A size number for a configuration that does
+not exist flatters or maligns the change at random.
+
+So: *does all our code still build and pass* is answered over the superset; *how big is the thing we ship* is
+answered over the shipped configuration, and neither answer is allowed to stand in for the other.
+
+### A source-grep is a tripwire, not a gate (PM ruling, 2026-09-06)
+
+The endpoint P0 shipped with `include_str!("ingress.rs")` + `contains("supervisor.deliver(")`. Keep such a
+test — it catches a careless revert cheaply — but it may never be the only thing standing between us and a
+repeat, because it cannot do three things:
+
+- **It cannot see reachability.** The text being present passes even if the call sits behind a condition that
+  is never true. The P0 *was* a call that was never made; a test asking only whether the text exists cannot
+  tell "called" from "present".
+- **It goes red for the wrong reason.** Extract the call into a helper and it fails while the behaviour is
+  correct — a red that is not a defect, which we removed twice in one evening.
+- **"There is no harness in this module" is an argument about test infrastructure, not about the code.** That
+  shape of argument is refused for a coverage bar; it is refused here too.
+
+When a defect is a WRONG CALL that produces an observably identical response — `start()` and `deliver()` both
+answer 202 and both write the row — that argues for a better observation point, not for abandoning behaviour.
+Move the assertion to where a fake harness can watch the child's stdin: *an ingress hit against a parked agent
+results in the bytes reaching that child, with no other event occurring.*
+
+### The gate and the runtime backstop should watch the same signal (ADVERSARY, accepted 2026-09-06)
+
+The behavioural test for the ingress P0 asserts on *"a message that should be draining is stuck in `queued` /
+`in_flight`"*. The corrected 041 deadline arms on **the same signal**. That is not a coincidence and it is
+worth building to deliberately:
+
+- CI asserts the property against a wedged fixture; the runtime arms a deadline on the property in production.
+- One predicate, two consumers. If they drift, one of them is watching something that no longer matters.
+- Had the behavioural test existed, the P0 would have been **red in CI instead of found in production** — by
+  the operator, 52 minutes in, on his own board.
+
+When a class of failure is worth a runtime backstop, the same definition usually makes the better test; when
+it is worth a test, ask whether production deserves the same alarm.
+
+### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
+
+Run it or grep it before you assert it. Three instances in one day:
+
+- API twice asserted a coverage gap from memory. The second — "nothing exercises `AUTH_MODE=jwks`" — was
+  false: `crates/wheel-api/tests/support.rs` already stands up an RSA keypair, a real JWKS server and RS256
+  minting, and five test files run the full router against it in `cargo test --workspace`. They retracted it
+  themselves, before it was acted on, and in doing so gave up the strongest argument for work they wanted.
+- PM quoted "346 crates" to four agents all evening as the headline efficiency number. QA measured 281; the
+  larger figure was an unfiltered resolve including 62 Windows-only crates that compile nowhere we own.
+- ADVERSARY credited the `catch_unwind` belt as a verified defense in 035, then ran the suites and found zero
+  tests reach it (040).
+
+A claimed gap justifies work; a claimed cover justifies skipping it. Both are load-bearing, and neither
+survives being remembered rather than checked.
+
 ## 1. Repository & workflow
 
 - Monorepo at `/Users/metatron/wheel` (git, branch `main`), origin `https://github.com/Morgandri1/wheel.git`. Never rewrite history on `main`.
