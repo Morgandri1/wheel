@@ -53,6 +53,22 @@ not exist flatters or maligns the change at random.
 So: *does all our code still build and pass* is answered over the superset; *how big is the thing we ship* is
 answered over the shipped configuration, and neither answer is allowed to stand in for the other.
 
+### The coverage bar: do not worsen it, and do not freeze on inherited debt (PM ruling, 2026-09-06)
+
+Two crates sit under the operator's 90% bar — `wheel-sqlite` at 87.97% and `wheel-api` at 89.02%. Holding one
+lane to the bar while waving another through is not a standard, so:
+
+- **A merge may not push a crate further under the bar, and may not take a crate from above it to below it.**
+- **A crate already under the bar does not block unrelated work.** It gets a dated ticket and a named owner.
+
+Blocking every merge on inherited debt costs more than the debt does — the same reasoning that carved
+committing out of the merge freeze.
+
+And the distinction that made this visible, which is worth more than the rule: **a gate that RUNS a suite is
+not the same as that suite COUNTING toward coverage.** If `cargo-llvm-cov` is not invoked with the feature,
+the tests run and the number ignores them — so a merge can look coverage-neutral while making the measured
+figure worse for a reason that looks like the diff and is not.
+
 ### A source-grep is a tripwire, not a gate (PM ruling, 2026-09-06)
 
 The endpoint P0 shipped with `include_str!("ingress.rs")` + `contains("supervisor.deliver(")`. Keep such a
