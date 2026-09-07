@@ -190,6 +190,45 @@ pub struct AgentConfig {
     /// `status: budget_exhausted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
+    /// Working copies the engine materialises before the child starts (§3e).
+    /// The child's cwd is the first one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<Workspace>,
+}
+
+/// One working copy for an agent, materialised by the engine.
+///
+/// This exists because agents were doing it themselves. Every agent that
+/// needed a repository ran its own `git clone`, each in its own way, and the
+/// shortest form that works — `https://<token>@github.com/...` — wrote a live
+/// credential into `.git/config` on the production volume (finding 036). It
+/// also cost a full copy of the repository per agent, which is how three
+/// agents filled a 4.6 GB volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    /// Directory under the agent's workspace root. Relative, no `..`.
+    pub path: String,
+    /// Where the contents come from. Absent = an empty directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSource>,
+}
+
+/// A git repository to materialise a [`Workspace`] from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitSource {
+    /// Clone URL, with NO credentials in it. A URL carrying `user:password@`
+    /// is refused: that is the shape that leaked, and accepting it here would
+    /// write it to `.git/config` exactly as before.
+    pub url: String,
+    /// Branch, tag or commit to check out. `None` = the remote's HEAD.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// `<vault>/<key>` naming the credential to authenticate with. `None` =
+    /// any git token the agent's wired vaults already export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_ref: Option<String>,
 }
 
 /// Per-agent spend ceiling (§3e). Either field may be set independently.
