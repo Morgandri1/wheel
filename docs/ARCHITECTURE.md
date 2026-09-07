@@ -352,6 +352,32 @@ Every command prints a one-line human result (and `--json` for machine output). 
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
 
+### A pushed branch is the cheapest status report (PM ruling, 2026-09-06)
+
+Push a branch as soon as it exists — empty, broken, whatever it is. From outside your machine, local-only
+work is indistinguishable from no work: PM read `refs/remotes/origin`, saw a lane's newest branch hours
+stale, and escalated toward taking over a P0 that was already in progress in an unpushed worktree. Three
+interruptions the lane did not deserve, and PM's visibility problem, not the lane's reporting failure.
+
+A pushed branch cannot be beheaded in transit and needs no one to write it up. It is checked first, and a
+lane with one is treated as started.
+
+### Budget a duplicate, do not demand zero (QA ruling, accepted 2026-09-06)
+
+PM asked for a gate on `cargo tree -d` returning nothing. QA refused it and was right: 11 of our 12
+duplicates are upstream version skew we do not control — `getrandom` at 0.2, 0.3 *and* 0.4 simultaneously,
+`hashbrown` at 0.14/0.15/0.17, `rand` 0.8/0.9, `syn` 2/3, `webpki-roots` 0.26/1.0. No diff of ours moves
+them. A gate demanding zero is red forever for a reason nobody can act on — the permanent-red-X failure
+recorded above, manufactured deliberately this time.
+
+The gate is a **ratcheting allowlist**: the known duplicates are budgeted, a thirteenth is a red build, and
+a duplicate that goes away must be deleted from the file or the gate fails — so it cannot silently re-permit
+what we fixed.
+
+Corollary, also QA's: **crate count and duplicate count are near-independent.** Dropping `sqlx` removes 34
+crates from `wheeld` (278 → 244, -12%) and fixes exactly *one* duplicate. Do not accept "the tree gets clean"
+as a side effect of a crate-count win.
+
 ### Anything that needs a ruling goes in git, not in a message (PM ruling, 2026-09-06)
 
 YOKE truncates the FRONT of long messages — five occurrences in one day, in both directions. A beheaded
