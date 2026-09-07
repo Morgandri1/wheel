@@ -81,6 +81,21 @@ NeedsAuth, that IS the first gap and we surface it rather than fight it.
   lands on origin) fails, and that failure is a stale credential rather than a product gap — worth knowing which
   one we are looking at before we spend a wake on it.
 
+  **UPDATE — GITHUB_TOKEN IS populated, and that is the thing to check before you trigger.** `GET /v1/vault/<id>`
+  reads stored values rather than declared config (`vault.rs:229` selects from `vault_values`), so it is a
+  non-disclosing way to ask which credentials actually exist. All four come back:
+  `CLAUDE_CODE_OAUTH_TOKEN, GITHUB_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID`.
+
+  So the question is no longer "is it set" but "is it the REVOKED one". You told the operator not to store a
+  replacement until the clone fix landed. The fix has now landed and deployed — which means the value sitting in
+  the vault is most likely the PAT that was revoked yesterday. If so, `materialise` fails auth, the agent starts
+  anyway with a bare cwd (see the swallow caveat under the agent pick), and signal 5 fails for a stale-credential
+  reason that will look like a product gap.
+
+  **Cheapest pre-flight: have the operator re-store `secrets/GITHUB_TOKEN` now.** It is write-only, so neither of
+  us can check its validity — only the operator can. One `PUT /v1/vault/<id>/GITHUB_TOKEN` before the wake
+  removes the most likely cause of a false negative.
+
   **Good news on the S1:** the volume is clean right now. No `.git/config` survives under `creds/`, and the one
   clone that does exist (`ws/pm/wheel`) has ZERO credential matches in its remote (I counted matches without
   printing values). The exposure is not currently on disk. Option (B) above is what keeps it that way.
@@ -200,3 +215,15 @@ wire bound against a hostile agent — we are waking a cooperative one and watch
 Bearing on SCRIPT EXECUTION: this is now a stated PRECONDITION, not later hardening. Script-exec on a
 shared-token board means an agent running arbitrary code can impersonate pm and drive the whole board.
 Per-node uids/tokens (037/038) must be in SDK's Script-exec scope as a gate, not deferred to M2.
+
+## F007 CORRECTION (SDK, 2026-09-07) — the fix is UID-per-node (storage), NOT token-per-node
+My "per-node uids/tokens (037/038)" wording invites the trap fix. SDK's correction: giving each node its
+own TOKEN is ALREADY DONE and closes nothing — it looks like a fix and is a no-op. The vulnerability is
+STORAGE: every agent runs as the same uid, so the token FILES are cross-readable, and separate tokens on a
+shared-readable filesystem are still readable by every co-located agent. The gate is satisfied ONLY by
+isolating storage: a UID PER NODE (§2 base+1+n) so the files stop being cross-readable, OR moving the token
+off the shared-readable filesystem. So the script-exec precondition is per-node-UID (037/038 storage
+isolation), and explicitly NOT per-node-token. Spend the effort once on the mechanism that holds.
+
+ATTRIBUTION FIX: SDK measured F007 (I earlier credited ADVERSARY). ADVERSARY filed 048 for the
+co-located-network half. Follow-up on F007 -> SDK; on 048 -> ADVERSARY.
