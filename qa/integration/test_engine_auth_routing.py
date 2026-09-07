@@ -218,9 +218,34 @@ def main():
                 bool(r.get("config", {}).get("CLAUDE_CONFIG_DIR")),
                 "CLAUDE_CONFIG_DIR is unset — per-node credential isolation depends on it")
 
-        codex_id = place_agent("cred-probe-codex", harness="codex")
+        # THE ENGINE NOW REFUSES A CODEX NODE (08b3492), and that is correct: Codex is M2,
+        # and a node accepted-then-silently-run-as-claude is precisely the success shape an
+        # unimplemented capability must never answer with. This assertion used to place one
+        # and it turned main red when the refusal landed — the test encoded an assumption
+        # the engine had stopped making.
+        #
+        # So the refusal is now what is asserted, and the credential-routing claim it used
+        # to make is PENDING against Codex landing. Deleting the routing assertion would
+        # lose it; leaving it red would freeze every lane.
+        st_codex, body_codex = req("POST", "/v1/nodes", {
+            "name": "cred-probe-codex", "type": "agent", "position": {"x": 0, "y": 0},
+            "config": {"harness": "codex", "system_prompt": "cred routing probe",
+                       "run_on_startup": False, "ephemeral_context": False}})
+        refused = st_codex not in (200, 201)
+        said_why = "codex" in json.dumps(body_codex or {}).lower()
+        R.check("AUTH-codex-node-refused-honestly", refused and said_why,
+                "placing a codex node returned %s %r. Codex is M2: the engine must REFUSE "
+                "it and say so, not accept it and silently run claude. An unimplemented "
+                "capability answering with a success shape is undetectable; an honest "
+                "refusal is not." % (st_codex, body_codex))
+
+        codex_id = body_codex.get("id") if (not refused and isinstance(body_codex, dict)) else None
         if codex_id is None:
-            R.check("AUTH-cred-codex-var", False, "could not place a codex agent node")
+            R.pending("AUTH-cred-codex-var", False, "Codex is M2",
+                      "cannot be exercised while the engine refuses codex nodes. The claim "
+                      "is that codex authenticates with CODEX_API_KEY and NOT OPENAI_API_KEY "
+                      "(which `codex doctor` notices and which authenticates nothing). It "
+                      "re-arms the moment a codex node can be placed.")
         else:
             recs, err = spawn_with(codex_id, CODEX_KEY)
             if err:

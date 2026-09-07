@@ -199,6 +199,54 @@ before `--resume` is passed, so a stale id fails at the CLI (`supervisor/mod.rs:
 
 The wake is the first execution of that path. Worth watching as a sixth, unofficial signal.
 
+## Reading the six signals in one shot (SDK, tested against production)
+
+Improvised commands under time pressure is how a readout gets misread, so these are run-and-verified against
+the live engine, not written from memory. All read-only. From `railway ssh --service wheel-host`:
+
+```sh
+P=6906cadb-45cd-4f27-8151-952b9d9bfb15
+B="Authorization: Bearer $WHEEL_HOST_SECRET"
+U=http://127.0.0.1:7100/host/v1/projects/$P/engine
+A=0be41bbb-10e2-4400-a519-6e63a3986866      # adversary
+
+# signals 2 and 4 — status settles, turns increments
+curl -s -H "$B" $U/v1/board > /tmp/board.json
+python3 - <<'EOF'
+import json
+d=json.load(open("/tmp/board.json"))
+for n in sorted(d["nodes"], key=lambda x: x["name"]):
+    if n["type"] != "agent": continue
+    s = n["state"]
+    # session_id is OMITTED, not null, when absent — .get(), or this raises on pm
+    sid = (s.get("session_id") or "none")[:8]
+    print("%-10s %-8s turns=%-3s usd=%-7s queued=%-3s session=%s"
+          % (n["name"], s["status"], s["spend"]["turns"], s["spend"]["usd"],
+             s["queued_messages"], sid))
+EOF
+
+# signal 1 — message reaches consumed
+curl -s -H "$B" $U/v1/agents/$A/inbox | head -c 600
+
+# signal 3 — "could not record spend", and now also workspace failures
+curl -s -H "$B" "$U/v1/agents/$A/log?since=0" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+    [print(l["stream"], l["text"][:160]) for l in d.get("lines",[]) if l["stream"]=="engine"]'
+
+# the wedge safety net (036b): a delivered row with no live process now shows here
+curl -s -H "$B" $U/healthz
+```
+Signal 5 (the branch lands) is read from GitHub, not the engine:
+`git ls-remote origin dogfood/wake-test-1`.
+
+Baseline taken just before the wake, so a change is legible: all six agents `parked`, `queued=0`, `turns=0`,
+sessions present on five (`pm` has none — correct, it is the only `ephemeral_context` agent), `stalled: []`,
+18 nodes.
+
+**Two things that will otherwise read wrong.** `turns=0` is the headline signal and has never been observed to
+increment on this board (see the signal-4 caveat above) — a 0 is a finding, not a failed wake. And an `engine`
+log line naming a workspace is the failure surfacing correctly, not the agent misbehaving.
+
 ## Trigger
 PM pulls the wake only after all four SDK slots are filled and pushed. Re-read this file, do not trust a
 message summary of it.

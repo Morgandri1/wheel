@@ -139,6 +139,33 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Message>> {
 /// The question `/healthz` needs answered: is anything that SHOULD be being
 /// delivered sitting still? Computed on demand, at request time — the engine
 /// must idle at ~0 CPU (§2), so this must never become a background poll.
+/// Agents holding a `delivered` message, with how much is queued behind it.
+///
+/// A `delivered` row means the bytes reached the child and no `result` has come
+/// back. While a process is alive that is a turn in progress — the healthy,
+/// commonest state, and why [`agents_with_work_older_than`] excludes it. With
+/// NO process alive it is a headstone: nothing on boot returns the row to
+/// `queued`, so the agent can never move again on its own, and everything
+/// queued behind it is stuck too.
+///
+/// This function cannot tell those apart — liveness is the supervisor's, not
+/// the database's. It reports the candidates; the caller supplies the running
+/// set.
+pub fn agents_holding_delivered(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.to_id AS to_id,
+                (SELECT COUNT(*) FROM messages q
+                  WHERE q.to_id = d.to_id AND q.state = 'queued') AS behind
+           FROM messages d
+          WHERE d.state = 'delivered'
+          GROUP BY d.to_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>("to_id")?, r.get::<_, i64>("behind")?))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub fn agents_with_work_older_than(conn: &Connection, secs: i64) -> Result<Vec<(Uuid, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT to_id, COUNT(*) AS n FROM messages m
