@@ -1,8 +1,10 @@
 # 049 — Board apply (`apply.rs`): name-collision is a SILENT PATCH of existing nodes; validate uses emitted type; no board-size cap
 
 - **Severity:** Medium (integrity/privilege via untrusted-board import; the wire-escalation half is contained by
-  the engine, see below). Owner: SDK/Engine (`crates/wheel-api/src/apply.rs`) + whoever wires the route.
-  Reviewed BEFORE it has a URL, at SDK's request — the right time. Boundary TB1 (import) → board state.
+  the engine, see below). Owner: **API** (`crates/wheel-api/src/apply.rs` — API's apply-step v1, 2455871) +
+  whoever wires the route; the engine backstops it relies on (add_wire / patch_node re-validation) are
+  SDK/Engine's. (I first mis-attributed apply.rs to SDK and mis-routed the review there — it is API's file.)
+  Reviewed BEFORE it has a URL — the right time. Boundary TB1 (import) → board state.
 - **Status:** Source review of `apply.rs` (validate/execute) + the engine backstops it relies on. Not yet
   route-wired; no live exploit. Three issues, ranked.
 
