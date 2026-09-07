@@ -34,6 +34,8 @@ export default defineConfig({
         "src/lib/edge-geometry.ts",
         "src/lib/password.ts",
         "src/components/board/sidebar-rail.tsx",
+        "src/lib/workflow-apply.ts",
+        "src/components/builder/builder-panel.tsx",
         "src/lib/endpoint-probe.ts",
         "src/lib/workflow-proposal.ts",
         "src/lib/wired-vaults.ts",

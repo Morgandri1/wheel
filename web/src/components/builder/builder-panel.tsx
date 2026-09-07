@@ -1,0 +1,217 @@
+"use client";
+
+import { useState } from "react";
+import { Button, Field, Textarea } from "@/components/ui";
+import { NODE_META, WIRE_META } from "@/lib/node-meta";
+import { applyProposal, type ApplyApi, type ApplyResult } from "@/lib/workflow-apply";
+import { START, parseProposal, type Proposal } from "@/lib/workflow-proposal";
+
+export interface BuilderTurn {
+  role: "user" | "builder";
+  text: string;
+}
+
+/**
+ * Sends the conversation and streams the builder's reply. SDK owns the run; this is the seam it
+ * plugs into, so the panel is buildable and testable before any backend exists.
+ */
+export type BuilderRunner = (turns: BuilderTurn[]) => AsyncIterable<string>;
+
+/**
+ * The proposed board is shown BEFORE it is applied, and applying is a separate, deliberate click.
+ *
+ * The builder is an LLM writing a board that becomes real nodes, wires and agents. Auto-applying
+ * would let a model's output take effect with nobody having read it, so the preview is not a
+ * nicety — it is the review step.
+ */
+export function BuilderPanel({
+  runner,
+  api,
+  onApplied,
+}: {
+  runner: BuilderRunner | null;
+  api: ApplyApi;
+  onApplied?: (result: ApplyResult) => void;
+}) {
+  const [turns, setTurns] = useState<BuilderTurn[]>([]);
+  const [draft, setDraft] = useState("");
+  const [streaming, setStreaming] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [result, setResult] = useState<ApplyResult | null>(null);
+
+  const last = [...turns].reverse().find((t) => t.role === "builder");
+  const parsed = parseProposal(last?.text ?? "");
+  const proposal = parsed.status === "ok" ? parsed.proposal : null;
+
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || !runner || busy) return;
+    const next: BuilderTurn[] = [...turns, { role: "user", text }];
+    setTurns(next);
+    setDraft("");
+    setBusy(true);
+    setResult(null);
+    let acc = "";
+    try {
+      for await (const chunk of runner(next)) {
+        acc += chunk;
+        setStreaming(acc);
+      }
+      setTurns([...next, { role: "builder", text: acc }]);
+    } catch (e) {
+      setTurns([...next, { role: "builder", text: `The builder stopped: ${(e as Error).message}` }]);
+    } finally {
+      setStreaming("");
+      setBusy(false);
+    }
+  };
+
+  const apply = async () => {
+    if (!proposal) return;
+    setApplying(true);
+    try {
+      const r = await applyProposal(api, proposal);
+      setResult(r);
+      onApplied?.(r);
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <div className="flex h-full flex-col gap-3 p-4" data-testid="builder-panel">
+      <div className="flex-1 space-y-3 overflow-y-auto">
+        {turns.length === 0 && !streaming ? (
+          <p className="text-meta text-ink-dim" data-testid="builder-empty">
+            Describe what you want this workflow to do. The builder proposes a board; nothing is
+            created until you apply it.
+          </p>
+        ) : null}
+        {turns.map((t, i) => (
+          <p
+            key={i}
+            className={t.role === "user" ? "text-meta text-ink" : "text-meta text-ink-dim"}
+            data-testid={t.role === "user" ? "builder-turn-user" : "builder-turn-builder"}
+          >
+            {visibleText(t.text)}
+          </p>
+        ))}
+        {streaming ? (
+          <p className="text-meta text-ink-dim" data-testid="builder-streaming">
+            {visibleText(streaming)}
+          </p>
+        ) : null}
+      </div>
+
+      {parsed.status === "invalid" ? (
+        <div className="border-l-2 border-[var(--danger)] px-2.5 py-2" data-testid="builder-invalid">
+          <p className="text-micro text-ink-dim">
+            The builder proposed a board that cannot be applied as written:
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {parsed.problems.map((p) => (
+              <li key={p} className="text-micro text-ink-faint">
+                {p}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {proposal ? (
+        <ProposalPreview proposal={proposal} warnings={parsed.status === "ok" ? parsed.warnings : []} />
+      ) : null}
+
+      {result ? (
+        <div
+          className={`border-l-2 px-2.5 py-2 ${result.complete ? "border-[var(--live)]" : "border-[var(--danger)]"}`}
+          data-testid="builder-apply-result"
+        >
+          <p className="text-micro text-ink">
+            {result.complete
+              ? `Applied: ${result.createdNodes.length} nodes, ${result.createdWires.length} wires.`
+              : `Partly applied: ${result.createdNodes.length} nodes and ${result.createdWires.length} wires landed, ${result.failures.length} did not.`}
+          </p>
+          {result.failures.map((f) => (
+            <p key={f.what} className="text-micro text-ink-faint">
+              {f.what}: {f.reason}
+            </p>
+          ))}
+        </div>
+      ) : null}
+
+      <Field label="Message the builder">
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={3}
+          placeholder={
+            runner ? "A researcher that reads a brief and reports daily…" : "The builder is not connected yet."
+          }
+          disabled={!runner || busy}
+          data-testid="builder-input"
+        />
+      </Field>
+
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={send} disabled={!runner || busy || !draft.trim()} data-testid="btn-builder-send">
+          {busy ? "Thinking…" : "Send"}
+        </Button>
+        <Button
+          size="sm"
+          onClick={apply}
+          disabled={!proposal || applying}
+          data-testid="btn-builder-apply"
+          title={proposal ? undefined : "The builder has not proposed a board yet."}
+        >
+          {applying ? "Applying…" : "Apply this board"}
+        </Button>
+        {!runner ? (
+          <span className="text-micro text-ink-faint" data-testid="builder-unavailable">
+            The builder run is not wired up yet, so this panel cannot talk to it.
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** The delimited JSON is machinery, not conversation: the preview renders it, the transcript hides it. */
+function visibleText(text: string): string {
+  const start = text.indexOf(START);
+  return (start === -1 ? text : text.slice(0, start)).trim() || "(proposed a board)";
+}
+
+function ProposalPreview({ proposal, warnings }: { proposal: Proposal; warnings: string[] }) {
+  return (
+    <div className="border border-rule p-2.5" data-testid="builder-preview">
+      <p className="mb-1.5 text-micro text-ink-faint">
+        Proposed: {proposal.nodes.length} nodes, {proposal.wires.length} wires. Nothing exists until
+        you apply it.
+      </p>
+      <ul className="space-y-0.5">
+        {proposal.nodes.map((n) => (
+          <li key={n.id} className="text-micro text-ink-dim" data-testid="builder-preview-node">
+            <span style={{ color: NODE_META[n.type].tint }}>{NODE_META[n.type].label}</span>{" "}
+            <span className="ident text-ink">{n.name}</span>
+          </li>
+        ))}
+        {proposal.wires.map((w, i) => {
+          const from = proposal.nodes.find((n) => n.id === w.from)?.name ?? w.from;
+          const to = proposal.nodes.find((n) => n.id === w.to)?.name ?? w.to;
+          return (
+            <li key={`${w.from}-${w.to}-${i}`} className="text-micro text-ink-faint" data-testid="builder-preview-wire">
+              {from} → {to} <span style={{ color: WIRE_META[w.type].color }}>{w.type}</span>
+            </li>
+          );
+        })}
+      </ul>
+      {warnings.map((w) => (
+        <p key={w} className="mt-1 text-micro text-[var(--danger)]" data-testid="builder-warning">
+          {w}
+        </p>
+      ))}
+    </div>
+  );
+}
