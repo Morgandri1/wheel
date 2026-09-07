@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { planSummary, readOutcome } from "./board-apply";
+import { boardSizeWarning, planSummary, readOutcome, resultingNodeCount } from "./board-apply";
 
 const wire = { from: "notes", to: "researcher", type: "send" as const };
 
@@ -78,5 +78,27 @@ describe("planSummary", () => {
   it("says plainly when a re-apply would change nothing", () => {
     expect(planSummary({ create_nodes: [], patch_nodes: [], create_wires: [] }))
       .toMatch(/already matches/);
+  });
+});
+
+describe("the plan shows the TOTAL, because the API's cap is per-request", () => {
+  /**
+   * API's 200-node cap bounds one request, not the project, and §3e's per-project cap is documented
+   * but unimplemented — so a board grows without limit an apply at a time. A user approving
+   * "create 40 nodes" cannot see they are going from 180 to 220. The delta is what they approve;
+   * the total is what they live with.
+   */
+  const plan = { create_nodes: Array.from({ length: 40 }, (_, i) => `n${i}`), patch_nodes: [], create_wires: [] };
+
+  it("adds the plan to what is already there", () => {
+    expect(resultingNodeCount(180, plan)).toBe(220);
+    expect(resultingNodeCount(0, plan)).toBe(40);
+  });
+
+  it("warns only when the RESULT crosses the board's own limit, not the request's", () => {
+    // 40 nodes is far inside API's 200-per-request cap and would be accepted without comment.
+    expect(boardSizeWarning(0, plan)).toBeNull();
+    expect(boardSizeWarning(180, plan)).toMatch(/220 nodes/);
+    expect(boardSizeWarning(180, plan)).toMatch(/nothing on the server stops it/i);
   });
 });

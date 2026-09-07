@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { Button, Field, Textarea } from "@/components/ui";
 import { NODE_META, WIRE_META } from "@/lib/node-meta";
-import { planSummary, type ApplyOutcome } from "@/lib/board-apply";
+import { boardSizeWarning, planSummary, resultingNodeCount, type ApplyOutcome } from "@/lib/board-apply";
 import { START, extractBlock, parseProposal, type Proposal } from "@/lib/workflow-proposal";
 
 export interface BuilderTurn {
@@ -30,10 +30,13 @@ export type BoardApplier = (board: unknown, dryRun: boolean) => Promise<ApplyOut
 export function BuilderPanel({
   runner,
   applyBoard,
+  currentNodes = 0,
   onApplied,
 }: {
   runner: BuilderRunner | null;
   applyBoard: BoardApplier;
+  /** Nodes already on the board, so the plan can show the TOTAL and not only the delta. */
+  currentNodes?: number;
   onApplied?: (outcome: ApplyOutcome) => void;
 }) {
   const [turns, setTurns] = useState<BuilderTurn[]>([]);
@@ -143,7 +146,7 @@ export function BuilderPanel({
         <ProposalPreview proposal={proposal} warnings={parsed.status === "ok" ? parsed.warnings : []} />
       ) : null}
 
-      {outcome ? <Outcome outcome={outcome} /> : null}
+      {outcome ? <Outcome outcome={outcome} currentNodes={currentNodes} /> : null}
 
       <Field label="Message the builder">
         <Textarea
@@ -247,7 +250,7 @@ function ProposalPreview({ proposal, warnings }: { proposal: Proposal; warnings:
  *              user has to know which half, and re-applying is how they finish it.
  *   refused  — nothing was created, so the board is untouched and safe to re-emit
  */
-function Outcome({ outcome }: { outcome: ApplyOutcome }) {
+function Outcome({ outcome, currentNodes }: { outcome: ApplyOutcome; currentNodes: number }) {
   if (outcome.kind === "plan") {
     return (
       <div className="border-l-2 border-[var(--wire-read)] px-2.5 py-2" data-testid="builder-plan">
@@ -255,6 +258,14 @@ function Outcome({ outcome }: { outcome: ApplyOutcome }) {
         {outcome.plan.patch_nodes.length ? (
           <p className="text-micro text-ink-faint">
             Changes existing nodes: {outcome.plan.patch_nodes.join(", ")}
+          </p>
+        ) : null}
+        <p className="text-micro text-ink-faint" data-testid="builder-plan-total">
+          Board goes from {currentNodes} to {resultingNodeCount(currentNodes, outcome.plan)} nodes.
+        </p>
+        {boardSizeWarning(currentNodes, outcome.plan) ? (
+          <p className="text-micro text-[var(--danger)]" data-testid="builder-plan-size-warning">
+            {boardSizeWarning(currentNodes, outcome.plan)}
           </p>
         ) : null}
         <p className="text-micro text-ink-faint">Nothing has been created yet.</p>

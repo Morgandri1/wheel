@@ -107,3 +107,24 @@ export function planSummary(plan: ApplyPlan): string {
 }
 
 const s = (n: number) => (n === 1 ? "" : "s");
+
+/** The board's own limit: past this the canvas is the bottleneck, not the API. */
+export const BOARD_NODE_SOFT_CAP = 200;
+
+/**
+ * What the board will hold AFTER this plan, not just what the plan adds.
+ *
+ * The API's 200-node cap bounds ONE REQUEST, not the project (API, 2026-09-07; §3e's per-project
+ * cap is documented but unimplemented). So a board grows without limit an apply at a time, and a
+ * user confirming "create 40 nodes" has no way to see they are going from 180 to 220. The delta is
+ * what they are approving; the total is what they have to live with.
+ */
+export function resultingNodeCount(currentNodes: number, plan: ApplyPlan): number {
+  return currentNodes + plan.create_nodes.length;
+}
+
+export function boardSizeWarning(currentNodes: number, plan: ApplyPlan): string | null {
+  const after = resultingNodeCount(currentNodes, plan);
+  if (after <= BOARD_NODE_SOFT_CAP) return null;
+  return `This takes the board to ${after} nodes. Past ${BOARD_NODE_SOFT_CAP} the canvas gets slow, and nothing on the server stops it growing further.`;
+}
