@@ -692,9 +692,28 @@ pub async fn tool_call(
         (node, cfg)
     };
 
-    crate::api::tool_routes::run_operation(&s, &node, &cfg, &body.op, &body.args, body.curl)
-        .await
-        .map(Json)
+    // Lock released above, deliberately: the action is an external HTTP call of
+    // up to 30s and holding the single writer across it would stall message
+    // delivery for every agent — the same reason `query` releases it.
+    //
+    // Which makes this the SECOND lock-releasing handler, and ADVERSARY 046 is
+    // that I claimed there was only one. `query` re-checked before disclosure
+    // and this did not, so an operator who revoked an agent's read wire to a
+    // tool mid-call still had the response handed to the agent they had just
+    // deauthorized.
+    //
+    // `run_operation` takes no caller identity — its own `Read` check is the
+    // tool -> vault fill edge, a different wire — so the re-check has to happen
+    // here, where the caller is known.
+    let out =
+        crate::api::tool_routes::run_operation(&s, &node, &cfg, &body.op, &body.args, body.curl)
+            .await?;
+    {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        me.require(&conn, &body.node, WireType::Read)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+    }
+    Ok(Json(out))
 }
 
 /// `GET /v1/cli/mcp/tools` — the MCP tool list for the calling node.
@@ -736,4 +755,107 @@ pub async fn ctx_clear(
         "cleared": true,
         "status": status.as_str(),
     })))
+}
+
+#[cfg(test)]
+mod toctou_tests {
+    /// ADVERSARY 046, generalised so the NEXT one is caught rather than filed.
+    ///
+    /// Most cli handlers hold the single writer connection across both the
+    /// capability check and the action, so a concurrent `DELETE /v1/wires`
+    /// cannot land between them — the window is closed by the single-writer
+    /// design. Two handlers deliberately RELEASE the lock before acting,
+    /// because their action is slow and holding the writer would stall message
+    /// delivery for every agent: `query` runs user SQL, `tool_call` makes an
+    /// external HTTP request of up to 30s.
+    ///
+    /// Those two must re-check the caller's wire before DISCLOSING the result.
+    /// I claimed there was only one such handler and there were two; `query`
+    /// re-checked and `tool_call` did not, so a revoke landing mid-call still
+    /// handed the response to the agent it had just deauthorized.
+    ///
+    /// Asserted on the SHAPE rather than on the two names, because the fix for
+    /// one instance does not protect the next: `wheel run <script>` is the same
+    /// pattern and is not written yet.
+    /// Handlers that release the db lock before acting, and what each owes.
+    ///
+    /// `true` = it discloses a result produced AFTER the lock was released, so
+    /// it must re-check the caller's wire before returning that result.
+    /// `false` = it releases the lock but discloses nothing derived from the
+    /// post-lock work, so there is nothing to withhold.
+    ///
+    /// A handler that is not in this list fails the test. That is the point:
+    /// the next one to do async I/O outside the lock has to be classified by a
+    /// person rather than inherit whichever answer the code happened to give.
+    const LOCK_RELEASING: &[(&str, bool)] = &[
+        // runs user SQL on its own read-only connection, then returns rows
+        ("query", true),
+        // makes an external HTTP call of up to 30s, then returns the response
+        ("tool_call", true),
+        // enqueues UNDER the lock; the post-lock await is delivery, which
+        // returns nothing to the caller but a receipt for work already
+        // authorised. Nothing to withhold.
+        ("msg", false),
+    ];
+
+    /// ADVERSARY 046, generalised so the NEXT one is caught rather than filed.
+    ///
+    /// Most cli handlers hold the single writer connection across both the
+    /// capability check and the action, so a concurrent `DELETE /v1/wires`
+    /// cannot land between them — the window is closed by the single-writer
+    /// design. A few must release it, because their action is slow and holding
+    /// the writer would stall message delivery for every agent.
+    ///
+    /// Those must re-check before DISCLOSING. I claimed there was one such
+    /// handler and there were two: `query` re-checked, `tool_call` did not, so
+    /// a revoke landing mid-call still handed the response to the agent it had
+    /// just deauthorized.
+    ///
+    /// Asserted on the SHAPE, not on the two names, because fixing one instance
+    /// does not protect the next — `wheel run <script>` is the same pattern and
+    /// is not written yet.
+    #[test]
+    fn a_handler_that_releases_the_lock_re_checks_before_it_discloses() {
+        let src = include_str!("cli_routes.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or_default();
+
+        let mut unclassified = Vec::new();
+        let mut unguarded = Vec::new();
+        for chunk in code.split("pub async fn ").skip(1) {
+            let name = chunk.split('(').next().unwrap_or_default().trim();
+            // A lock taken at block depth (8 spaces) rather than at the top of
+            // the handler (4) is one that is released before the action.
+            if !chunk
+                .lines()
+                .any(|l| l.starts_with("        let conn = s.db.lock()"))
+            {
+                continue;
+            }
+            match LOCK_RELEASING.iter().find(|(n, _)| *n == name) {
+                None => unclassified.push(name.to_string()),
+                Some((_, must_recheck)) => {
+                    // Counted as `.require(` because the first check is written
+                    // `me\n.require(..)`; matching `me.require(` missed it and
+                    // made this test read as failing when it was not.
+                    if *must_recheck && chunk.matches(".require(").count() < 2 {
+                        unguarded.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unclassified.is_empty(),
+            "these handlers release the db lock before acting and nobody has decided whether they \
+             disclose a result produced after the release: {unclassified:?}. Add them to \
+             LOCK_RELEASING with true (re-check before returning) or false (nothing to withhold), \
+             and say which in a comment."
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these handlers release the db lock, act, and disclose the result without re-checking \
+             the caller's wire, so a capability revoked mid-action still yields its data: \
+             {unguarded:?}. Re-acquire the lock and `require(..)` again before returning."
+        );
+    }
 }
