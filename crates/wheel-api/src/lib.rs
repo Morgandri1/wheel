@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod apply;
 pub mod auth;
 pub mod boot;
 pub mod config;

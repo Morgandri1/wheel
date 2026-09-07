@@ -20,6 +20,9 @@ postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring"]
 sqlite = ["sqlx/sqlite"]
 
 [dependencies]
+# The wire matrix and node types. The apply step validates a builder-emitted board against the
+# SAME matrix the engine enforces; a second copy of a security table would drift.
+wheel-core = { path = "../wheel-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
