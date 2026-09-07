@@ -629,7 +629,8 @@ mod tests {
 
         let s = agent_state(&conn, a.id).unwrap().spend.unwrap_or_default();
         assert_eq!(s.turns, 2);
-        assert!((s.usd - 0.5).abs() < 1e-9, "got {}", s.usd);    }
+        assert!((s.usd - 0.5).abs() < 1e-9, "got {}", s.usd);
+    }
 
     /// PM's reviewers flagged this and it is the dangerous half of the i16
     /// change: a row already outside +/-32767 must CLAMP on the way out, not
