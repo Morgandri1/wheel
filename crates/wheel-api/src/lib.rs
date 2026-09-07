@@ -78,6 +78,12 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/projects/{id}/stop", post(routes::projects::stop))
         .route("/v1/projects/{id}/restart", post(routes::projects::restart))
         .route("/v1/projects/{id}/ws-ticket", post(routes::ws_ticket::mint))
+        // Realise a builder-emitted board. Validated against the wire matrix before anything is
+        // created; 207 rather than 200 when only part of it landed.
+        .route(
+            "/v1/projects/{id}/board/apply",
+            post(routes::board_apply::apply_board),
+        )
         // Registered before the engine wildcard: this one route also accepts a single-use ticket
         // in the query string, because browsers cannot set headers on a WebSocket handshake.
         .route(
