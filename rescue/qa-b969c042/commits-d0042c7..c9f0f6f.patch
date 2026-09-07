@@ -1,0 +1,330 @@
+From d0042c7a83a2f3a990ab6ca929b6c431fca392ae Mon Sep 17 00:00:00 2001
+From: qa-agent <qa@wheel.dev>
+Date: Sun, 6 Sep 2026 16:50:48 +0000
+Subject: [PATCH 1/3] qa: file BUG-025 and BUG-026 (renumbered from 023/024 on
+ rebase collision), and update the handoff
+
+BUG-025 (was 023): ENG-journal-override-cannot-disable-recovery is red on a
+live engine (PM, verified fresh on 9c793c3) but I could not reproduce it at
+the crate level even mimicking wheel-engine::db::open()'s exact
+double-configure sequence against wheel-sqlite directly -- TRUNCATE/WAL/DELETE
+all succeed with a real write. That rules out wheel-sqlite as the site and
+points at migrate()/ensure_node_tables/tables::query's second connection as
+the next place to look with real docker access, which this sandbox does not
+have. Cross-referenced against a concurrent QA session's 023 (free_port(0)
+returning literal 0, a harness bug that made the same test fail against a
+healthy engine) -- both were real, compounding: the harness bug hid the
+actual product-side timing issue (PR #12) underneath it.
+
+BUG-026 (was 024): a table node's sqlite table is only re-ensured at engine
+BOOT (W1, 0692797) -- a table dropped out of band while the engine keeps
+running stays missing until the next restart. Distinct failure mode, same
+underlying principle (a node's table must survive anything the board itself
+does not agree to).
+
+Renumbered 023/024 -> 025/026 on rebase: a concurrent QA session had already
+landed unrelated 023 (free_port(0)) and 024 (panic gates) on main first.
+
+docs/handoff/qa.md updated: BUG-022 closed (crate-level verification, docker
+fixture still owed), make check confirmed green on current main modulo the
+two sandbox-specific gates fixed in the prior commit, and a note that CI on
+main is churning too fast right now for a single red run to be evidence
+without naming the job and SHA.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ docs/handoff/qa.md |  26 +++++++---
+ qa/BUGS.md         | 119 ++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 136 insertions(+), 9 deletions(-)
+
+diff --git a/docs/handoff/qa.md b/docs/handoff/qa.md
+index b766bf2..e2dacc5 100644
+--- a/docs/handoff/qa.md
++++ b/docs/handoff/qa.md
+@@ -18,19 +18,31 @@ does not name, and it reads Playwright specs as well as Python.
+ 
+ ## IN FLIGHT
+ 
+-- **BUG-022 (S1, SDK)** — `ENG-starts-without-shm` is RED. `wheel_sqlite::set_journal_mode`
+-  takes its fast path on a **read-back**, so on a volume that cannot map a `-shm` the engine
+-  exits 1 in `migrate()`. The host is safe (`open_configured(path, true)` falls through to an
+-  EXCLUSIVE escape); the engine passes `false`, because `tables::query` opens the file a second
+-  time, so the read-back is its *entire* protection. Fixture: `qa/fixtures/wal_blocked_shm.py`.
++- **BUG-022 — CLOSED** (`1163cc9`). `try_mode` now proves the mode with `mode_holds`
++  (`BEGIN IMMEDIATE; COMMIT;`) before the fast path returns, for both callers. Verified by
++  reproducing the exact scenario (a directory blocking `-shm`) at the crate level against
++  `wheel-sqlite::open_configured(path, false)` — falls back to `truncate`, write succeeds.
++  **Not verified through the docker fixture** (`qa/fixtures/wal_blocked_shm.py`,
++  `ENG-starts-without-shm`) — this session's sandbox has no `docker` binary at all. Whoever
++  next has docker access should run that fixture before treating the image-level gate as
++  proven rather than "consistent with the fix from two independent crate-level checks" (mine
++  and SDK's).
+ - `WOW-table-survives-restart` — RED by design, reproduces a real S1. Goes green when the table
+   is re-ensured. Its companion asserts the rebuilt table takes the node's **configured columns**;
+   a table rebuilt from a default schema passes the first and fails the second.
+-- `make check` — `cargo fmt` (11 diffs in wheel-engine + wheel-sqlite, SDK's) and `wheeld` at
+-  89.61%, a third of a point under.
++- `make check` on `origin/main` (`1aa77ac`, then re-checked after rebasing to `340f318`) is
++  green modulo `rust:coverage` and `qa:image-contents`, both `n/a` locally by design (opt-in /
++  needs a built image) — **when the environment is configured correctly** (see TRAPS below for
++  what "correctly" meant here). `cargo fmt` is clean on both SHAs I checked; the 11-diff state
++  this doc listed earlier is not reproducible on current main.
+ - **GREEN as of today, and verified not-vacuous**: `wheel-on-wheel` 7 passed / **0 skipped** —
+   an agent cloned this repo with a vault-held token and compiled `wheel-core` inside its own
+   sandbox, with ADVERSARY 029's toolchain constraints asserted at runtime.
++- CI itself is noisy right now: `gh run list --branch main` is a mix of `in_progress` and
++  `failure` almost continuously, because merges are landing every few minutes. A single red
++  run on `main` is not evidence by itself — read which job failed and on which SHA before
++  reporting it; `integration (docker)` and `wheel-on-wheel` were red for reasons already
++  tracked here, independent of whatever landed most recently.
+ 
+ ## NEXT (in order, each with its gate)
+ 
+diff --git a/qa/BUGS.md b/qa/BUGS.md
+index 2f82409..058da82 100644
+--- a/qa/BUGS.md
++++ b/qa/BUGS.md
+@@ -995,7 +995,6 @@ a second line of defence; the engine calls it with `false` — it cannot take th
+ because `tables::query` opens it a second time — so for the engine the read-back is the *entire*
+ protection, and on a database that does report `wal` there is none.
+ 
+-
+ ## 023 — `free_port(0)` handed back port 0, and four gates failed against a healthy engine · S2 · QA (mine) · CLOSED
+ 
+ **TESTPLAN:** `ENG-journal-override-cannot-disable-recovery/*`
+@@ -1056,7 +1055,6 @@ conditions I will ever have, and mine was wrong twice over in ways that both rea
+ new gate is not finished when it is green. It is finished when I have watched it go red against
+ the defect it names.
+ 
+-
+ ## 025 — `make check` reported `main` red on a run that never happened · S2 · QA (mine) · CLOSED
+ 
+ **TESTPLAN:** the merge gate itself
+@@ -1112,3 +1110,120 @@ one, so the two views disagree by construction for any value outside the bounds.
+ 
+ The gate deliberately asserts **agreement** (write response == later board refetch) rather than
+ the arithmetic, so it will go green on any implementation that is internally consistent.
++
++---
++
++## 027 — `ENG-journal-override-cannot-disable-recovery` red on a live engine, not reproducible at the crate level · **S2** · SDK · OPEN, root cause not yet located
++
++**Renumbered from 023 to 025 to 027** — a concurrent QA session filed 023 (`free_port(0)`) and
++024 (the panic gates) first; both landed on `main` before this branch first rebased onto it,
++forcing 023→025. A second rebase then collided with `main`'s own real 025 (`make check` gate)
++and 026 (Position-integer-cell), both filed by concurrent sessions in the time this branch sat
++unmerged — forcing 025→027. See 023 for
++a directly relevant finding: `free_port(0)` returning literal port `0` made the SAME
++`ENG-journal-override-cannot-disable-recovery/*` submodes fail this test's own harness bug
++(probing `http://127.0.0.1:0/healthz`) rather than the engine — fixed there. This entry is
++about what remained true once a real port was probed: see PM's follow-up (PR #12, `sdk`) for
++the actual root cause SDK found once the harness bug was out of the way — a redundant journal
++renegotiation in `db::open()` that doubles the slow-escalation attempts past this fixture's
++timeout budget, not a correctness defect in the escalation logic itself. That matches this
++entry's own finding below (every value succeeds at the crate level — this was never a logic
++bug reachable without measuring elapsed time against a real timeout).
++
++PM: main's integration job is red on `9c793c3` (fresh, not stale) — all four
++`ENG-journal-override-cannot-disable-recovery/*` submodes (`qa/integration/test_engine_shm.py`,
++added by `94072d8`) fail against a real `wheel-engine:test` container on the shm-blocked
++volume: `WHEEL_SQLITE_JOURNAL` set to `TRUNCATE`, `WAL` or `DELETE` still stops the engine
++starting; `not-a-mode` is presumably rejected outright (see note below on whether that one is
++actually a bug).
++
++**I could not run the docker fixture myself to see the live failure** — this sandbox has no
++`docker` binary — so I cannot name the exact line yet. What I *could* do is the same
++crate-level technique that closed BUG-022: reproduce the engine's exact call sequence against
++`wheel-sqlite` directly, on a directory blocking `-shm`, with `WHEEL_SQLITE_JOURNAL` forced to
++each value. `crates/wheel-engine/src/db/mod.rs::open()` does two things in order that matter
++here — `wheel_sqlite::open_configured(path, false)` (line 28), then `configure(&conn)` which
++calls `wheel_sqlite::configure_journal(&conn)` **again on the same, already-configured
++connection** (line 58) — a second negotiation the crate-level check for BUG-022 never
++exercised. Reproducing exactly that two-step sequence:
++
++```
++WHEEL_SQLITE_JOURNAL=TRUNCATE  -> configure_journal (2nd call) ok, mode=truncate, write_ok=true
++WHEEL_SQLITE_JOURNAL=WAL       -> configure_journal (2nd call) ok, mode=truncate, write_ok=true
++WHEEL_SQLITE_JOURNAL=DELETE    -> configure_journal (2nd call) ok, mode=delete,   write_ok=true
++```
++
++All three succeed, including a real write, on current `origin/main`. So **`wheel-sqlite`'s own
++logic — `open_configured`, `configure_journal`, the double-call pattern `db::open()` uses — is
++not where this fails.** The live failure PM/SDK are seeing must come from further down
++`db::open()`'s sequence than I can reach without a real engine binary: `migrate()`'s
++`schema.sql` batch, `ensure_node_tables`/`board::ensure_tables`, or the SECOND connection
++`tables::query` opens (which does not go through `open_configured` at all, per the comment at
++`db/mod.rs:24-26`, and so gets none of the escalation). That second connection is my leading
++suspect and the next thing I'd check with docker access: does it open plainly
++(`Connection::open`) without ever negotiating a journal mode, and if so, does *its* first
++write or read hit the "attempt to write a readonly database" error BUG-022 originally
++reported, now one layer further in?
++
++**Separately, worth a ruling before this closes:** the test's own docstring says "whatever
++this is set to, the database must still end up in a mode the filesystem can host — every
++value, including nonsense." But `wheel_sqlite::validate_mode_name` deliberately hard-fails a
++name sqlite has never heard of, immediately, by design (its own doc comment: "loud and
++immediate for a name that cannot work anywhere, patient escalation for a name that cannot work
++here") — precisely so a typo in `WHEEL_SQLITE_JOURNAL` cannot silently settle on the wrong mode.
++If `not-a-mode` refusing to start is the observed failure for that submode specifically, that
++may be the validator working as designed, not a bug, and the test's expectation for that one
++value may need to change rather than the code. I have not seen the live output for this
++submode and am flagging it rather than asserting either way.
++
++**Next step:** whoever has docker access should rebuild `wheel-engine:test` from current main
++and get `docker logs` for the TRUNCATE case specifically (the simplest of the three, and the
++one the original outage was about) — that error message will say which write is failing where
++my crate-level reach stops.
++
++---
++
++## 028 — A table node's sqlite table is not re-ensured on a LIVE read, only at boot · **S1** · SDK
++
++**Renumbered from 024 to 026 to 028** — first collided with a concurrent QA session's unrelated
++023/024 (free_port(0), the panic gates), both already on `main` by the time this branch first
++rebased (024→026); a second rebase then collided with `main`'s own real 026
++(Position-integer-cell), filed by a concurrent session while this branch sat unmerged
++(026→028).
++
++Distinct from the W1 fix (`0692797`, `board::ensure_tables` wired into engine boot) — this is
++the same defect's live half, and boot-time healing does not cover it.
++
++**Repro** (`qa/integration/test_engine_validation.py`, `WOW-table-survives-restart`, no engine
++restart involved): create a `table` node, write a row through the normal API, then — with the
++engine **still running** — drop the underlying `t_<name>` sqlite table out of band (`docker
++exec` + `python3 -c "sqlite3...DROP TABLE"`, since the image carries no `sqlite3` binary).
++Immediately `GET /v1/tables/:id/rows` on the still-running engine.
++
++**Expected:** the node is still on the board, so the engine re-ensures its table the way it
++does at boot, and the read returns empty (or the table is silently rebuilt) rather than
++surfacing a database implementation detail about a node the API is still showing the user.
++
++**Actual (per PM, main red on `9c793c3`):** the read fails — `board::ensure_tables` only runs
++at `db::open()` (engine boot), so a table dropped while the process is already up stays
++missing until the next restart. The companion assertion,
++`WOW-table-survives-restart/columns`, additionally requires that whatever table comes back
++accepts the node's **configured** columns, not a default schema — the same distinction W1's
++gate made, so a fix that merely `CREATE TABLE IF NOT EXISTS`s a bare table without columns
++would pass the first half and fail the second.
++
++**Why S1 and why this is not "the same bug, already fixed":** a restart is one way a project's
++tables can vanish under a node that still exists; an out-of-band drop, a bad migration, or
++disk corruption caught mid-write are others, and none of them wait for a restart to be
++noticed. §3's contract is that a node's wire set is its capability set and the board is
++authoritative for what exists — an agent (or the UI) reading a table node that is still on the
++board must not be told `no such table` about it.
++
++**Likely fix shape:** the read path (`tables::list_rows` / whatever backs `GET
++/v1/tables/:id/rows`, and the CLI's `wheel read <table>`) calls `tables::ensure` (the
++non-destructive one — `tables::create` is destructive, per SDK's own trap note on W1) before
++querying, the same way boot does, rather than assuming a table that exists at boot still
++exists now. I have not located the exact call site — this needs docker to reproduce and a
++debugger or targeted logging to confirm the read path never re-ensures — filing so the gate
++(already written, already red) is tracked as the system of record rather than only visible in
++a CI run someone has to go find.
+-- 
+2.39.5
+
+
+From 4aa9b92edfc6b723c4567021da266460b302aeeb Mon Sep 17 00:00:00 2001
+From: qa-agent <qa@wheel.dev>
+Date: Sun, 6 Sep 2026 16:50:48 +0000
+Subject: [PATCH 2/3] qa: stop coverage_gate's own error print from hiding the
+ actual failure
+
+r.stderr[-2000:] or r.stdout[-2000:] showed only stderr whenever it was
+non-empty, sliced to its last 2000 chars from the END -- cargo lists
+every OTHER crate's test binaries after the one that actually failed, so
+the slice reliably kept that trailing noise and cut the failing test's
+name and panic, which sit earlier in the stream. Confirmed on PR #12's
+CI run: the printed excerpt jumped from "cargo llvm-cov failed" straight
+into a mid-word fragment of a later "Running tests/..." line, with the
+real failure nowhere in what got logged (PM, diagnosing a wheel-engine
+coverage failure with no way to see what failed).
+
+Now finds the last "failures:" block (or "panicked at" if the run aborted
+before cargo could print one) and prints from there, combining stdout AND
+stderr rather than only whichever one the previous version picked.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ qa/tools/coverage_gate.py | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/qa/tools/coverage_gate.py b/qa/tools/coverage_gate.py
+index 2371919..a0566e0 100644
+--- a/qa/tools/coverage_gate.py
++++ b/qa/tools/coverage_gate.py
+@@ -206,7 +206,20 @@ def main():
+               % "\n  ".join(killed[:3]))
+         return SKIP
+     if r.returncode != 0 or not os.path.exists(out):
+-        print("cargo llvm-cov failed (exit %d):\n%s" % (r.returncode, r.stderr[-2000:] or r.stdout[-2000:]))
++        # `r.stderr[-2000:] or r.stdout[-2000:]` (the previous version) showed ONLY stderr
++        # whenever stderr was non-empty, and only its last 2000 chars -- cargo puts the
++        # actual failing test's name and panic in the MIDDLE of a long stream (test binaries
++        # for crates alphabetically after the one that failed still get listed afterwards),
++        # so the slice reliably cut the one thing worth reading and kept the noise after it.
++        # A CI run diagnosed from exactly this cut a bug's real cause off (PM, PR #12).
++        #
++        # Find where the actual failure starts instead of guessing a byte offset from the
++        # end: the last "failures:" summary block if cargo printed one, else the last
++        # "panicked at" if it did not (a hard panic/abort can end the run before cargo gets
++        # to print its own summary).
++        marker = max(combined.rfind("\nfailures:"), combined.rfind("panicked at"))
++        excerpt = combined[marker:] if marker != -1 else combined
++        print("cargo llvm-cov failed (exit %d):\n%s" % (r.returncode, excerpt[-4000:]))
+         return 1
+ 
+     with open(out) as f:
+-- 
+2.39.5
+
+
+From c9f0f6fc5f98dba262eb7abfb6808ffac4f16d47 Mon Sep 17 00:00:00 2001
+From: qa-agent <qa@wheel.dev>
+Date: Sun, 6 Sep 2026 17:28:46 +0000
+Subject: [PATCH 3/3] qa: BUG-026 confirmed live on PR #12's CI, not
+ theoretical
+
+PM pulled CI run 34047133420 (SDK's PR #12): WOW-table-survives-restart/columns
+fails for real -- "the table came back but would not accept its own configured
+columns (404) -- it was recreated from something other than the node config".
+Exactly the failure mode predicted when filing this: a self-heal that re-ensures
+existence without the node's real TableConfig columns passes the first half and
+fails the second. PM is holding #12 out of main until SDK rebuilds from the real
+columns rather than a bare CREATE TABLE.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ qa/BUGS.md | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/qa/BUGS.md b/qa/BUGS.md
+index 058da82..4337267 100644
+--- a/qa/BUGS.md
++++ b/qa/BUGS.md
+@@ -1227,3 +1227,21 @@ exists now. I have not located the exact call site — this needs docker to repr
+ debugger or targeted logging to confirm the read path never re-ensures — filing so the gate
+ (already written, already red) is tracked as the system of record rather than only visible in
+ a CI run someone has to go find.
++
++**CONFIRMED, no longer theoretical** — PM pulled CI run `34047133420` (SDK's PR #12, which
++attempts a self-heal fix for this bug) and the `columns` half fails for real, exactly as
++predicted above:
++
++```
++FAIL WOW-table-survives-restart/columns "the table came back but would not accept its own
++configured columns (404) — it was recreated from something other than the node config"
++```
++
++So PR #12's self-heal does re-ensure a table on a live read (the first half, `/026` itself,
++presumably now green — PM has not said otherwise), but rebuilds it from something other than
++the node's `TableConfig` — a bare `CREATE TABLE` or a default schema, not the configured
++columns. PM is holding #12 out of `main` until SDK rebuilds from the real `TableConfig`
++columns rather than fixing the read path's existence and stopping there. Still needs a
++docker-capable session to locate the exact call site; the CI log now says precisely what
++that session should look for (a table recreated with the wrong shape, not merely a missing
++one).
+-- 
+2.39.5
+

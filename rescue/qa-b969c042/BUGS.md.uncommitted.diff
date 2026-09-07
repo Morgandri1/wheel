@@ -1,0 +1,23 @@
+diff --git a/qa/BUGS.md b/qa/BUGS.md
+index 4337267..2d893d4 100644
+--- a/qa/BUGS.md
++++ b/qa/BUGS.md
+@@ -1245,3 +1245,18 @@ columns rather than fixing the read path's existence and stopping there. Still n
+ docker-capable session to locate the exact call site; the CI log now says precisely what
+ that session should look for (a table recreated with the wrong shape, not merely a missing
+ one).
++
++**CORRECTION, 2026-09-06 — the columns half was never actually tested.** I re-ran this against
++PR #12's branch after PR #20 merged and got the same `columns` 404 again, and read it as
++confirmation the columns fix was still owed. PM caught it: PR #12 (`f80f4c9`) predates PR #20 and
++still carries the *old* `test_engine_validation.py` (bare `PUT /v1/tables/:id/rows/:row`, no
++`wheel()`-token helper) — the exact route that has never existed on the engine-secret realm (PM's
++ruling `20260906T174600Z`, the same bug PR #20 fixed for this suite elsewhere). That route 404s
++unconditionally, before self-heal or column shape ever enters into it, so neither run of mine was
++evidence about whether columns are preserved — both just re-hit the dead route.
++
++**Actual status: existence-half confirmed (self-heal triggers, no restart needed), columns-half
++UNVERIFIED, not "owed" or "failing."** A real read on columns needs PR #12 rebased past PR #20 (or
++both merged to `main`) so the test writes through a real wheel-token'd agent the way #20 now does.
++If it still fails at that point, *that* is the first real evidence of a columns bug — re-open with
++that CI run cited, not this one.
