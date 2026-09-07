@@ -306,7 +306,10 @@ pub async fn healthz(State(state): State<HostState>) -> Json<serde_json::Value> 
     // presented as a sqlite error about shared memory, and the platform's dashboard disagreed with
     // `df` by a factor of thirty. Whoever looks here next gets the number that was missing.
     let (disk_free_mb, disk_used_percent) = match disk::space(&state.cfg.data_dir) {
-        Ok(s) => (Some(s.free_mb()), Some(s.used_percent())),
+        Ok(s) => {
+            disk::warn_if_filling(&s, state.cfg.disk_floor_mb);
+            (Some(s.free_mb()), Some(s.used_percent()))
+        }
         Err(e) => {
             tracing::warn!(error = %format_args!("{e:#}"), "could not measure free space");
             (None, None)

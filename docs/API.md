@@ -148,7 +148,18 @@ Every error, on every route:
 ## Routes
 
 ### `GET /healthz`
-Unauthenticated. `200 {"status":"ok"}`.
+Unauthenticated. `200 {"status":"ok","auth_mode":"local"|"jwks"}`.
+
+`auth_mode` is the mode this API is actually running, and it is published so a client can assert it
+agrees. If the web build ships `clerk` while the API runs `local`, the user gets a login widget whose
+token we reject, or a form talking to a verifier that is not running — two correct halves, a
+deploy-time disagreement, and nothing either side tests alone can see. The web smoke path compares
+this against `NEXT_PUBLIC_AUTH_MODE` and goes red on a mismatch.
+
+**The mode and nothing further.** Not the issuer, not the JWKS URL, not key material. Publishing the
+mode reveals nothing that `POST /v1/auth/login` answering `401` rather than `404` does not already
+reveal, and that argument covers the mode exactly. `tests/healthz_auth_mode.rs` holds the response to
+those two keys, so a future field cannot be added to an unauthenticated probe by accident.
 
 ### `GET /v1/host/healthz`
 
@@ -239,6 +250,26 @@ Header hygiene, both directions:
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
 
+On success the engine's own response is returned unchanged — status, headers and bytes. For a hit on
+an `endpoint` node whose wires deliver to agents, that is:
+
+```json
+202 {"accepted": true, "queued": 1}
+```
+
+`queued` is the number of messages **enqueued**, which is what has happened at the moment the
+response is written. Nothing has been delivered yet: the pump is asynchronous, and the target agent
+may be parked, unauthenticated or mid-turn. The field is deliberately not called `delivered` — it was
+once, and production answered `delivered: 1` for a message that never reached a child, which a
+webhook provider reads as success and never retries.
+
+The `202` is not a promise that an agent acted on the hit, only that the hit is durably queued. To
+observe real delivery, watch the `message` event on the events WebSocket, where the state machine is
+`queued → delivered → consumed` (§3c#4). An endpoint with `response_mode: script` returns the
+script's own output instead of this envelope.
+
+Failure cases:
+
 - `404` if the project does not exist.
 - `403` if `capabilities.http` is false (the default, and also the result of a malformed
   capabilities blob — this fails closed). The toggle is `capabilities.http` on `PATCH
@@ -285,6 +316,29 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
+
+### Running `AUTH_MODE=jwks` without a provider account
+
+`cargo run -p wheel-api --example stub-issuer` serves a JWKS on `127.0.0.1:9911` and prints a ready
+token, so `jwks` mode can be exercised with no Clerk account:
+
+```
+AUTH_MODE=jwks
+CLERK_JWKS_URL=http://127.0.0.1:9911/jwks
+CLERK_ISSUER=https://clerk.example.test
+```
+
+`GET /token?sub=<id>` mints more. `PORT` and `SUB` override the defaults.
+
+It signs with the fixture key in `crates/wheel-api/tests/fixtures/`, so a token it mints and a token
+the test suite mints are signed by the same key. On startup it puts a token through
+`auth::claims::verify` — the real verifier, not a copy — and refuses to serve if that fails, so a
+drift between the JWKS document and what the API accepts is caught here rather than somewhere less
+obvious.
+
+**Never in production.** It is an `examples/` target, so it is in no shipped binary and unreachable
+from the library, and its signing key is committed to this repository in plain text — anyone can mint
+any `sub`.
 
 ### The dev-bypass interlock
 

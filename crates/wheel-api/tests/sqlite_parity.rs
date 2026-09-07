@@ -402,3 +402,80 @@ async fn a_created_project_is_running_on_sqlite_too() {
     let (_, listed) = call(&app, "GET", "/v1/projects", Some(&token), None).await;
     assert_eq!(listed[0]["status"], "running");
 }
+
+/// ADVERSARY 042's one residual: nothing pinned the EXPIRED direction of session expiry on SQLite.
+///
+/// Postgres judges expiry with `expires_at > now()`. SQLite has no such function, so the query is
+/// hand-written as a STRING comparison against `strftime('%Y-%m-%dT%H:%M:%fZ','now')`. That is only
+/// correct while sqlx encodes a bound `DateTime<Utc>` into a string that is lexically ordered
+/// against that exact format — a space instead of the `T`, or `+00:00` instead of `Z`, and lexical
+/// monotonicity is gone.
+///
+/// Both failure directions are bad and only one is loud. If every comparison fails, login is dead on
+/// SQLite and someone notices in a minute. If it fails the other way, EXPIRED SESSIONS NEVER EXPIRE,
+/// and nothing tells you. The suite already covered the loud direction — a fresh session being
+/// accepted — which is why this one was the gap.
+///
+/// It backdates through the same bound-parameter path production inserts through, so the encoding
+/// under test is the encoding that ships rather than a string this test chose.
+///
+/// IT BACKDATES BY ONE MINUTE, AND THAT IS THE WHOLE TEST. My first version used a day, passed, and
+/// was worthless: with a day's gap the DATE characters decide the comparison before the separator is
+/// ever reached, so it stayed green against a deliberately broken format. Only a gap INSIDE the same
+/// day forces the comparison through the `T`, which is where the encoding can actually diverge.
+/// Verified by mutation both ways — see the note on the sibling test.
+///
+/// This also guards the store rewrite that is coming: swapping sqlx for rusqlite changes exactly the
+/// encoding this depends on, and this assertion is what would go red if the swap made expired
+/// sessions valid.
+#[tokio::test]
+async fn an_expired_session_is_refused_on_sqlite() {
+    let (app, db) = app().await;
+    let token = signup(&app, "grace@example.com").await;
+
+    let (status, _) = call(&app, "GET", "/v1/auth/me", Some(&token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the session was not usable to begin with"
+    );
+
+    let pool = db.as_sqlite().expect("this suite runs on sqlite");
+    let rows = sqlx::query("UPDATE sessions SET expires_at = $1")
+        .bind(chrono::Utc::now() - chrono::Duration::minutes(1))
+        .execute(pool)
+        .await
+        .expect("backdating the session")
+        .rows_affected();
+    assert_eq!(rows, 1, "expected exactly one session to backdate");
+
+    let (status, _) = call(&app, "GET", "/v1/auth/me", Some(&token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an expired session was still honoured — the SQLite expiry comparison is not ordering \
+         correctly against the stored format, so sessions never expire on this backend"
+    );
+}
+
+/// The other direction of the same comparison, so a change that breaks ordering cannot pass by
+/// making everything expired.
+#[tokio::test]
+async fn a_session_expiring_soon_is_still_honoured_on_sqlite() {
+    let (app, db) = app().await;
+    let token = signup(&app, "heidi@example.com").await;
+
+    let pool = db.as_sqlite().expect("this suite runs on sqlite");
+    sqlx::query("UPDATE sessions SET expires_at = $1")
+        .bind(chrono::Utc::now() + chrono::Duration::minutes(1))
+        .execute(pool)
+        .await
+        .expect("shortening the session");
+
+    let (status, _) = call(&app, "GET", "/v1/auth/me", Some(&token), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a session with a minute left was treated as expired"
+    );
+}

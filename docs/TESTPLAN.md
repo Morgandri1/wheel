@@ -836,6 +836,34 @@ Deliberately NOT asserted: that the status never touches `starting`. Restarting 
 | `EPH-settles-after-turn` | An agent with `ephemeral_context: true` reaches a settled status after a completed turn. | **S1** |
 | `EPH-second-turn-still-works` | It completes a SECOND turn. One turn proves the first clear survived; the operator's agent does this every turn. | **S1** |
 
+### HEALTH-implies-* — /healthz answering 200 must mean something
+
+Named for the shape, not the bugs, because the point is the sixth instance. Five in one day, every one a system that was up, answering, and not doing its job:
+
+| instance | looked like |
+|---|---|
+| escaper panic | `/healthz` 200, delivery task dead (tokio unwinds the task, not the process) |
+| ingress drain | agent `idle`, queue not moving |
+| ephemeral restart | status `starting`, turns completing underneath |
+| BUG-031 | engine boots, `/healthz` 200, `/v1/board` returns 500 |
+| Web auth default | `NEXT_PUBLIC_AUTH_MODE` unset → `mock`; builds, renders, looks deployed, 401s on first real request |
+
+Each *fix* made the failure quieter rather than absent. `PROGRESS-*` gates this for message delivery; this gates it for reads.
+
+**Predicate:** for each capability the engine CLAIMS to serve, `/healthz` answering 200 must imply that capability works.
+
+**What this must not cause.** The obvious conclusion is "healthz should check more things" and it is wrong: the host restarts a sandbox whose healthz fails (§4b, 10s), so a healthz touching the board would turn one slow read or one bad row into a **restart loop** — and a poison message already took a board down through repeated reboots. `/healthz` stays cheap and stays a liveness claim; the *suite* asserts the implication its greenness carries. The lie is caught in CI, where a false negative costs a rerun, not in production, where it costs a restart loop.
+
+**Non-vacuity.** On a clean engine everything works, so each capability is probed in two states: clean, and after the perturbation that has actually produced this lie (one node row with an unparseable id). `/healthz` stays 200 in both.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `HEALTH-implies-<capability>/clean` | Every claimed capability works on a clean engine while healthz is green. | **S1** |
+| `HEALTH-implies-<capability>/one-bad-row` | The same, with one malformed row present. This is where the class shows itself. | **S1** |
+| `HEALTH/healthz-green-<state>` | **CONTROL.** healthz really is 200 in that state — an implication with a false antecedent asserts nothing, and an engine that is honestly down is not this suite's bug. | |
+
+A capability that cannot be probed **fails**; "could not check the board" and "the board is fine" read identically, which is this suite's own failure mode one level up. A route returning 404 is *not claimed* (chest is M2) and is skipped naming the milestone — self-arming, since the day it is implemented it stops returning 404 and asserts for real.
+
 ### PROGRESS-* — liveness is not progress
 
 Two production failures in one evening shared a shape: the process was alive, answered `/healthz` with 200, and was doing no work. The escaper panic killed the delivery task while tokio kept the process up; endpoint ingress enqueued and woke the agent but never pumped the queue. Both systems were asked *are you up*, both truthfully said yes, and up was read as working. **This suite contains no liveness assertion at all.** Liveness is recorded in failure text only — because "healthy and stuck" is the signature of the class, and naming it is what stops the next person reaching for a restart.

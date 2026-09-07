@@ -170,6 +170,16 @@ caught it was reading the error text — *Chai property*, not *element not found
 - Prefer an assertion on **content** over one on structure. A lazy component that never resolves leaves an
   empty container behind, and every structural assertion still passes.
 
+**By end of 2026-09-06 the count was seven, all one body** (API's tally, adopted): a `git rm` that removed
+nothing; a fixture sqlite value coerced on read; a stale hardlink; a byte count that lost its platform; a test
+that could not fail; a mutation that never applied because `cargo fmt` had reflowed the line being matched; and
+a `clippy | grep` in a `&&` chain that continued on **grep's** exit code and never read clippy's — a whole
+class of verifications that gated nothing. In every case the subject was fine and the measurement lied.
+
+API's rule, better than the one above and now the canonical form: **"I ran it and it looked right" is not
+evidence. Exit codes, and watch it fail once.** A gate consumed through a pipe reports the pipe's exit, not the
+gate's — check `$?` of the thing you care about, not of the `grep` that reads its output.
+
 ### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
 
 Run it or grep it before you assert it. Three instances in one day:

@@ -20,6 +20,16 @@ pub enum AuthMode {
     Jwks,
 }
 
+impl AuthMode {
+    /// The wire name, as `/healthz` publishes it and `AUTH_MODE` accepts it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Local => "local",
+            AuthMode::Jwks => "jwks",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Env {
     Dev,

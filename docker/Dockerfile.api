@@ -26,7 +26,7 @@ RUN set -eu; \
         echo 'fn main() {}' > "$d/src/main.rs"; \
         echo 'fn main() {}' > "$d/src/bin/export_schema.rs"; \
     done; \
-    cargo build --release --locked -p wheel-api; \
+    cargo build --release --locked -p wheel-api --features postgres; \
     rm -rf crates
 
 # --locked, here and above: a deploy must build the versions CI tested, not whatever resolves today.
@@ -38,7 +38,7 @@ COPY crates ./crates
 # The size check is the guard for next time: a wheel-api that links axum, sqlx and rustls is tens of
 # megabytes, and `fn main() {}` is a third of one.
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked -p wheel-api \
+    && cargo build --release --locked -p wheel-api --features postgres \
     && size=$(stat -c %s target/release/wheel-api) \
     && if [ "$size" -lt 5000000 ]; then \
          echo "wheel-api is $size bytes: that is the stub, not the API" >&2; exit 1; \

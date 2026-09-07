@@ -30,10 +30,18 @@ export function unreadableReason(error: unknown): string {
 }
 
 /** The API's `error.code`, if the body is its envelope. Anything else is not an error envelope. */
+/**
+ * Two shapes reach this parser and both are real.
+ *
+ * The API wraps errors in `wheel_core::ErrorBody` — `{"error":{"code","message"}}`. The engine's
+ * ingress does not: its local `err()` helper (wheel-engine/src/api/ingress.rs) emits a bare
+ * `{"code":"no_such_endpoint"}`. Reading only the wrapped form made the "check your path" verdict
+ * unreachable on a live board, which is the one state an operator most needs named.
+ */
 export function errorCode(body: string): string | null {
   try {
-    const parsed: unknown = JSON.parse(body);
-    const code = (parsed as { error?: { code?: unknown } })?.error?.code;
+    const parsed = JSON.parse(body) as { error?: { code?: unknown }; code?: unknown };
+    const code = parsed?.error?.code ?? parsed?.code;
     return typeof code === "string" && code ? code : null;
   } catch {
     return null;
@@ -95,6 +103,12 @@ export function probeVerdict({
       return `Ingress accepted it and queued it for ${nodes}. Queued is not read: a parked or stopped agent picks it up when it next runs.`;
     }
     return "The endpoint answered.";
+  }
+  if (code === "not_found") {
+    // Verified against production: the API answers this when no project has that id, BEFORE it
+    // looks at the path or the capability. Sending the operator to check their path here would be
+    // the same wrong turn the 501 copy exists to prevent.
+    return "The API has no project with this id — it may have been deleted. This is not about the path.";
   }
   if (status === 404) {
     // Retires itself: API turns a BODILESS 404 into 501, so once every engine is current this arm

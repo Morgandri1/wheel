@@ -370,12 +370,24 @@ def main():
             # PENDING for the same reason as the clamp above: BUG-031 is filed and open,
             # and this gate has never reached main. Landing it red would repeat exactly
             # the violation that froze four lanes an hour ago, with my own name on both.
-            R.pending("POS-migration-bad-id-does-not-hide-good-nodes",
-                      st2 == 200 and any(n and n.startswith("mig-node-") for n in names),
-                      "BUG-031",
-                    "the engine booted but /v1/board no longer lists the well-formed "
-                    "nodes (%s). Skipping the unreadable row must not skip its neighbours."
-                    % sorted(names)[:8])
+            # PROMOTED. BUG-031 is fixed (0417a5e: board::list is per-row and logs the
+            # id as stored). Asserting all three halves, not just the 200: the board
+            # SERVES, the good nodes are STILL THERE, and the skipped row is NAMED —
+            # because skipping quietly would trade "board is a 500" for "a node vanished
+            # and nothing says why", which is the same quiet-failure trade this whole
+            # class is about. SDK's log line is what makes the third assertable.
+            R.gated("POS-migration-bad-id-does-not-hide-good-nodes",
+                    "POS-migration-boots-past-unparseable-id",
+                    st2 == 200
+                    and any(n and n.startswith("mig-node-") for n in names)
+                    and "mig-0000-not-a-uuid" in log2,
+                    "expected /v1/board -> 200 listing the well-formed nodes AND the "
+                    "skipped row named in the log. Got status %s, nodes %s, and the "
+                    "stored id %s in the log. One node missing and NAMED beats every node "
+                    "missing and unexplained; a silent skip trades a 500 for a vanished "
+                    "node, which is the same bad trade one step quieter."
+                    % (st2, sorted(names)[:8],
+                       "present" if "mig-0000-not-a-uuid" in log2 else "ABSENT"))
 
         return R.report("position-migration")
     finally:
