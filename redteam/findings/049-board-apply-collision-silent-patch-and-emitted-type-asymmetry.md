@@ -1,8 +1,10 @@
 # 049 — Board apply (`apply.rs`): name-collision is a SILENT PATCH of existing nodes; validate uses emitted type; no board-size cap
 
 - **Severity:** Medium (integrity/privilege via untrusted-board import; the wire-escalation half is contained by
-  the engine, see below). Owner: SDK/Engine (`crates/wheel-api/src/apply.rs`) + whoever wires the route.
-  Reviewed BEFORE it has a URL, at SDK's request — the right time. Boundary TB1 (import) → board state.
+  the engine, see below). Owner: **API** (`crates/wheel-api/src/apply.rs` — API's apply-step v1, 2455871) +
+  whoever wires the route; the engine backstops it relies on (add_wire / patch_node re-validation) are
+  SDK/Engine's. (I first mis-attributed apply.rs to SDK and mis-routed the review there — it is API's file.)
+  Reviewed BEFORE it has a URL — the right time. Boundary TB1 (import) → board state.
 - **Status:** Source review of `apply.rs` (validate/execute) + the engine backstops it relies on. Not yet
   route-wired; no live exploit. Three issues, ranked.
 
@@ -43,12 +45,25 @@ a confusing PARTIAL apply (some nodes/wires land, the colliding ones fail) that 
 composes with #1 — refuse a collision outright when the emitted type differs from the existing type. Either
 makes `validate` agree with what the engine will do and restores the "nothing illegal attempted" guarantee.
 
-## 3. No board-size cap (SDK's note)
-`validate`/`execute` do not bound the emitted board; the per-project node cap is engine-side only, so a board of
-10,000 nodes is 10,000 engine calls (the cap rejects after N, but the CALL VOLUME and the O(N) HashMap/scan work
-in `validate` are unbounded) — a cheap amplification once the route exists, especially if the route is
-agent-reachable rather than owner-only. **Fix:** cap emitted `nodes` + `wires` count in `validate` (reject
-oversized boards before any call), sized to the per-project node cap.
+## 3. Board/project size bounds — CORRECTED (there is NO per-project node cap at any layer)
+My first draft said "the per-project node cap is engine-side only … the cap rejects after N." That implied an
+engine backstop that DOES NOT EXIST. SDK grepped and I re-checked: nothing counts nodes anywhere in the engine,
+and §3e's default-50 per-project cap is UNIMPLEMENTED (like `wheel place`). A doc specifying a cap is not the
+cap existing — the same false-clean/quick-check error this campaign keeps catching, here in my own finding.
+Owned. Note apply.rs:17's own comment repeats it ("does not cover engine-side failures (name collision,
+per-project caps)") — API should fix that comment too (apply.rs is API's file), so it does not imply a
+per-project cap that is not there.
+
+Accurate statement:
+- The ONLY size bound that exists is the API's board-apply REQUEST cap — `MAX_NODES=200` / `MAX_WIRES=1000`
+  (apply.rs:167-184, checked at :179; commit 2455871). It bounds ONE apply REQUEST, not the board and not the
+  project total. Good and correct as far as it goes.
+- There is NO per-project node cap at ANY layer today (engine: none; §3e's 50: unimplemented). So repeated
+  applies (each ≤200 nodes) grow the board without limit, and nothing counts total nodes — the DoS is the
+  unbounded TOTAL, not a single oversized request (which the API cap now catches).
+**Fix:** land the §3e per-project node cap engine-side (SDK, queued post-wake) — it is the only place a total
+bound can be enforced across many applies and other node-creating paths (`wheel place`, the UI). Until it
+exists, the request-cap is a per-call bound only; do not describe or rely on it as a per-project bound.
 
 ## Note (what is SOUND, so the fix stays scoped)
 The engine is the real gate and holds: wire matrix re-validated on real types at creation; type immutable across
