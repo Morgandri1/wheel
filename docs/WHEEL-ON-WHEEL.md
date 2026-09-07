@@ -31,8 +31,11 @@ operator through the vault inspector — never in this repo.
 
 ## Working rules (the `workflow` ctx)
 
-1. Repo: `github.com/Morgandri1/wheel`. `gh auth` uses `GITHUB_TOKEN` from the environment. Clone into `$HOME/wheel`
-   (per-project data dir), one branch per task named `<role>/<slug>`, never push to `main`.
+1. Repo: `github.com/Morgandri1/wheel`. The engine gives every agent its own git worktree of the repo, already checked
+   out and authenticated — the path is in your environment (`WHEEL_WORKSPACE`) and is your working directory. Work there;
+   do not clone. (The worktrees share one object store off `/data`, so a clone would waste disk and put a credential on
+   disk that the worktree setup deliberately keeps out — see A8/A9 in `docs/ARCHITECTURE.md`.) `gh auth` uses
+   `GITHUB_TOKEN` from the environment. One branch per task named `<role>/<slug>`, never push to `main`.
 2. Every change is a PR with `make check` green locally first; GitHub CI is the merge gate. The PM merges.
 3. Status goes to the PM with `wheel msg pm --file …` AND to the `reports` table with `wheel write reports/<ts>-<role> …`.
 4. Budget: one turn, one task. Ephemeral context is off for developers (they keep repo state in context);
