@@ -1412,7 +1412,22 @@ first five each made a failure quieter; this one makes a permanent wedge invisib
 Tests: `RESTART-inflight-message-survives`, `RESTART-wedged-agent-is-not-healthy`. Both fail
 today, so both land as PENDING and go red demanding promotion when SDK's fix lands.
 
-### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **open**)
+### 037 — no test asserts that a completed turn increments `agent_state.turns` (S2, QA gate owed, **STILL OPEN**)
+
+> **2026-09-07, first wake: the SUSPICION is refuted, the GAP is not.** The woken adversary
+> agent ran 8 turns and `agent_state.turns` went 0 → 8 with `usd $1.66`. Accounting works;
+> `turns=0` was "nothing to populate", exactly as SDK suspected but could not settle. That is
+> good news and it closes the *question*.
+>
+> **It does not close this entry, and there is nothing to promote.** What I filed was the
+> absence of a TEST, and I never wrote one — `SPEND-completed-turn-increments-turns` is
+> registered in TESTPLAN and asserted by no suite. A one-off observation in production is
+> evidence that the behaviour worked once, on one board, under a human watching. It is not a
+> gate: if accounting regresses tomorrow, nothing goes red.
+>
+> The wake did make it cheaper to write. It supplies the expected shape (turns increments per
+> completed turn, usd accrues, no "could not record spend"), and SDK's caution stands —
+> assert on a turn the test CAUSES, never on rows that already exist.
 
 Raised by SDK. Every agent on the cloud board reads `turns=0` while the cloud QA agent's Claude
 transcript is 2011 lines with 754 assistant messages and 366 tool calls from Sep 6, and no
