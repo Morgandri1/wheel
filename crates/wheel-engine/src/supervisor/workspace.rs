@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use std::time::Duration;
 use wheel_core::{GitSource, Workspace};
 
 use super::git_creds;
@@ -52,6 +53,37 @@ fn store_dir(data_dir: &Path, url: &str) -> PathBuf {
     data_dir.join("repos").join(format!("{readable}-{hex}"))
 }
 
+/// A clone of a large repository over a slow link is legitimately slow, so this
+/// is generous. It exists to bound a HANG, not to police duration.
+const GIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Local, no network: if these take a minute something is wrong.
+const GIT_QUICK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run a child to completion, or kill it and fail.
+///
+/// `Command::output` waits forever. A `git clone` that never returns — an
+/// unreachable host, a credential prompt we did not suppress, a half-open
+/// connection — would hang the agent's spawn with no error and no timeout, and
+/// the agent would sit in `starting` looking like the wedged-start bug rather
+/// than like a stuck clone.
+async fn run_capped(
+    mut cmd: tokio::process::Command,
+    limit: Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Dropping the future on timeout must actually kill the child; without
+        // this the process outlives us and keeps holding the repository lock.
+        .kill_on_drop(true);
+    let child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Ok(out) => out.with_context(|| format!("running {what}")),
+        Err(_) => bail!("{what} exceeded {}s and was killed", limit.as_secs()),
+    }
+}
+
 /// Run a git command with credentials supplied OUT OF BAND.
 ///
 /// The token reaches git through the askpass helper's environment. Never in the
@@ -73,10 +105,8 @@ async fn git(run_dir: &Path, token: Option<&str>, args: &[&str], cwd: Option<&Pa
         cmd.env("GIT_ASKPASS", &askpass);
         cmd.env("GITHUB_TOKEN", token);
     }
-    let out = cmd
-        .output()
-        .await
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let what = format!("git {}", args.join(" "));
+    let out = run_capped(cmd, GIT_TIMEOUT, &what).await?;
     if !out.status.success() {
         // The token is never in argv or the URL, so this is safe to surface —
         // but the message is the agent's to read, so it gets the reason and not
@@ -100,17 +130,15 @@ async fn ensure_store(
         // hold — but if it ever did not, the agent would silently get somebody
         // else's repository, which is worse than a failed clone. Cheap to check
         // and the failure it prevents is unreadable.
-        if let Ok(out) = super::child_command("git")
-            .args([
-                "-C",
-                &store.to_string_lossy(),
-                "remote",
-                "get-url",
-                "origin",
-            ])
-            .output()
-            .await
-        {
+        let mut probe = super::child_command("git");
+        probe.args([
+            "-C",
+            &store.to_string_lossy(),
+            "remote",
+            "get-url",
+            "origin",
+        ]);
+        if let Ok(out) = run_capped(probe, GIT_QUICK_TIMEOUT, "git remote get-url origin").await {
             let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !found.is_empty() && found != src.url {
                 bail!(
@@ -456,5 +484,59 @@ mod tests {
             "re-materialising must not discard an agent's uncommitted work"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_child_that_outlives_its_limit_is_killed_and_reported() {
+        let mut cmd = super::super::child_command("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_capped(cmd, Duration::from_millis(300), "sleep 30")
+            .await
+            .expect_err("a child past its limit must fail, not block");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "run_capped waited {:?} — it returned only when the child did, so nothing is bounded",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sleep 30") && msg.contains("exceeded"),
+            "the error must name the command and why it stopped, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_inside_its_limit_returns_its_output() {
+        let mut cmd = super::super::child_command("echo");
+        cmd.arg("hello");
+        let out = run_capped(cmd, Duration::from_secs(30), "echo")
+            .await
+            .expect("a fast child must succeed");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    /// `kill_on_drop` is the whole reason a timeout is safe: without it the
+    /// child outlives the future that gave up on it and keeps holding the
+    /// repository lock, so the NEXT clone fails for a reason that names the
+    /// wrong thing.
+    #[tokio::test]
+    async fn the_killed_child_is_actually_dead_not_merely_abandoned() {
+        let marker = std::env::temp_dir().join(format!("wheel-capped-{}", std::process::id()));
+        std::fs::remove_file(&marker).ok();
+
+        let mut cmd = super::super::child_command("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 2; touch {}", marker.display()));
+        let _ = run_capped(cmd, Duration::from_millis(200), "sh").await;
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "the child ran to completion after we gave up on it — it was abandoned, not killed"
+        );
+        std::fs::remove_file(&marker).ok();
     }
 }
