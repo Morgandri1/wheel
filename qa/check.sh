@@ -94,6 +94,23 @@ else
   step "rust:fmt"    cargo_locked cargo fmt --all -- --check
   step "rust:clippy" cargo_locked cargo clippy --workspace --all-targets -- -D warnings
   step "rust:test"   cargo_locked "$PY" qa/tools/cargo_test_gate.py cargo test --workspace
+  # API-postgres-arm-is-still-built. `postgres` is becoming a NON-DEFAULT feature of
+  # wheel-api (docs/decisions/2026-09-06-sqlx.md) because cargo unifies features across a
+  # workspace build, so leaving it on put a Postgres driver and a second TLS stack into
+  # wheeld's binary however wheeld itself asked.
+  #
+  # The hole that opens, measured by API rather than predicted: every gate above uses
+  # DEFAULT features, tests/boot_db.rs is `#![cfg(feature = "postgres")]`, and CI builds no
+  # API image. So after that change nothing in CI would compile the code that talks to
+  # production's database — a compile error there would reach Railway before it reached a
+  # red build. These two steps are the only thing that keeps the Postgres arm built and its
+  # 5 tests running, which is the whole predicate of the ID.
+  #
+  # This is the shape ADVERSARY pre-committed to watching for: efficiency work is where
+  # correctness quietly dies. The efficiency win is real and worth taking — it is the gate
+  # that has to arrive with it, not instead of it.
+  step "rust:clippy-pg" cargo_locked cargo clippy -p wheel-api --features postgres --all-targets -- -D warnings
+  step "rust:test-pg"   cargo_locked "$PY" qa/tools/cargo_test_gate.py cargo test -p wheel-api --features postgres
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.

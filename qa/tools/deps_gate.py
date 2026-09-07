@@ -18,8 +18,9 @@ measured and the gate asks you to commit it; above it, the build is red. Efficie
 therefore locks itself in, and a regression has to be argued for in a diff rather than
 noticed six months later on a bill.
 
-  python3 qa/tools/deps_gate.py            # check
-  python3 qa/tools/deps_gate.py --update   # ratchet the budget file down to what is measured
+  python3 qa/tools/deps_gate.py                          # check
+  python3 qa/tools/deps_gate.py --update                 # ratchet ceilings DOWN
+  python3 qa/tools/deps_gate.py --update --allow-regression   # raise one, deliberately
 """
 import json
 import os
@@ -143,6 +144,32 @@ def main():
                                 % (member, crate))
 
     if update:
+        # --update ONLY LOWERS. API flagged this twice and was right both times: writing
+        # whichever number the tree happens to hold makes the budget a mirror rather than
+        # a ceiling, and "a number someone has to argue for" (A10) becomes a number that
+        # silently follows whatever drifted. A regression now has to be typed out.
+        raises = []
+        for platform, got in measured.items():
+            was = budget.get("platforms", {}).get(platform, {})
+            if was.get("total") is not None and got["total"] > was["total"]:
+                raises.append("%s total %d -> %d (+%d)"
+                              % (platform, was["total"], got["total"],
+                                 got["total"] - was["total"]))
+            for name, count in got["crates"].items():
+                prev = was.get("crates", {}).get(name)
+                if prev is not None and count > prev:
+                    raises.append("%s/%s %d -> %d (+%d)"
+                                  % (platform, name, prev, count, count - prev))
+        if raises and "--allow-regression" not in sys.argv:
+            print("REFUSING to raise a ceiling. --update lowers; a regression is a "
+                  "decision, so it has to be stated:")
+            for r in raises:
+                print("  - %s" % r)
+            print("\nRe-run with --allow-regression if the increase is intended, and say "
+                  "in the commit message which dependency bought it. Otherwise the number "
+                  "quietly follows the drift and the gate stops meaning anything.")
+            return 1
+
         budget.setdefault("platforms", {})
         for platform, got in measured.items():
             budget["platforms"][platform] = {"total": got["total"],
@@ -151,7 +178,8 @@ def main():
         with open(BUDGET, "w") as fh:
             json.dump(budget, fh, indent=2, sort_keys=True)
             fh.write("\n")
-        print("budget written to %s" % os.path.relpath(BUDGET, ROOT))
+        print("budget written to %s%s" % (os.path.relpath(BUDGET, ROOT),
+              " (ceilings RAISED by explicit --allow-regression)" if raises else ""))
         return 0
 
     for n in notes:
