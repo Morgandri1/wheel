@@ -321,3 +321,41 @@ jobs:
 
   # NOTE: there is deliberately NO job that runs `make test-live`. Live runs hit the
   # real claude/codex CLIs, cost money and are non-deterministic. Humans only.
+
+  # Web 0.4.1 reached main and was never deployed. Vercel's ignoreCommand can only inspect the
+  # commit it is deploying, and on a shared main the release commit is usually no longer HEAD by
+  # the time Vercel looks — another lane lands on top, that commit's version equals its parent's,
+  # and the release is skipped. It then sits on main deployed to nobody, with no signal at all.
+  #
+  # A push RANGE has no such blind spot: "did the version change between what main WAS and what
+  # main IS" is answerable regardless of which commit ended up on top. That is why this belongs
+  # here and not in vercel.json. Script and rationale are Web's (web/DEPLOY.md).
+  #
+  # NEEDS THE WEB GATES, which Web's proposed step did not: deploying a release off a red main is
+  # worse than not deploying it. The engine-side suites are deliberately NOT required — a web
+  # release does not depend on them, and coupling them would mean an unrelated engine failure
+  # silently withholds a shipped version, which is this bug again from the other end.
+  deploy-web:
+    name: deploy web when the version changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+    needs: [check, e2e, packaged-web]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The script diffs two commits, so a shallow clone would make every push look like a
+          # first push and deploy every time.
+          fetch-depth: 0
+      # Verified on all three paths before wiring: version unchanged -> exit 0 (so an ordinary
+      # push is green with no secret at all); version changed with DRY_RUN -> exit 0; version
+      # changed with no hook -> exit 1 and a loud ::error::. That last one is deliberate and is
+      # Web's call — a release that silently does not ship is the bug being fixed, so a missing
+      # hook must break the build rather than pass quietly.
+      #
+      # OPERATOR: the VERCEL_DEPLOY_HOOK secret must exist BEFORE the next web version bump.
+      # Until it does, this job is green on every ordinary push and red on the first release.
+      - name: Deploy web when the version changed
+        env:
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: web/scripts/deploy-if-released.sh "${{ github.event.before }}" "${{ github.sha }}"
