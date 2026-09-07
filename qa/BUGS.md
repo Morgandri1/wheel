@@ -1478,3 +1478,31 @@ honest. SDK's answer is that there is already a seam and no race to lose:
 
 SDK has offered a purpose-built test-only seam in the engine if the stub-on-PATH proves
 awkward. Take them up on it rather than fighting the supervisor.
+
+### 039 — the public-API drive path is unverified (S2, API, **verification owed**, operator-gated)
+
+Not a defect — a claim nobody has tested. Filed so "proven" and "untested" stay separate in
+the record rather than in a message that truncates.
+
+The first wake proved the full clone→edit→commit→push loop on the cloud board. PM drove it
+**via the host proxy**, which bypasses the public API, so the auth boundary we actually ship
+was not exercised once.
+
+**Already covered, and it is not this:** `API-auth-*` asserts the boundary's LOGIC thoroughly
+— owner-check ordering, 404-not-403 indistinguishability across five verbs, `alg=none`,
+expired/nbf/issuer/garbage tokens — against a LOCAL compose API. `deploy_healthcheck.py`
+reaches the deployed API but only asks `/healthz`.
+
+**The gap:** that boundary in front of the deployed Railway API, with a real owner session
+token, proxying to a real engine. Correct logic and a working deployed path are different
+claims. §5's ordering (verify JWT → load project → assert `owner_id == jwt.sub` → act) can be
+right in the source and wrong in the deployment — a misconfigured env, a proxy that strips a
+header, a route that never reaches the host.
+
+**Acceptance (PM):** drive node/wire/agent operations against
+`https://wheel-api-production.up.railway.app` with an owner session token — the operator's, or
+a throwaway project's owner — and confirm owner check, project scoping and engine proxy all
+pass end to end. `API-public-drive-end-to-end`.
+
+**Operator-gated**, the same way the wake was: it needs a token nobody here holds. That is why
+it is filed rather than done.

@@ -849,6 +849,18 @@ Deliberately NOT asserted: that the status never touches `starting`. Restarting 
 
 **Sequencing (ARCHITECTURE.md):** this gate is RED today, because the drift is real and Web is regenerating. It therefore lands WITH that regeneration, not before it — a deliberately-red gate merged ahead of its fix is what froze four lanes on 2026-09-06.
 
+### API-public-drive-end-to-end — the auth boundary we SHIP, not the one we compose
+
+The first wake (2026-09-07) proved the clone→edit→commit→push loop on the cloud board, and PM flagged honestly that it was driven **via the host proxy** — which bypasses the public API entirely. So the loop is proven and the drive path is not, and those are easy to conflate a week later when someone remembers "the wake passed".
+
+**What is already covered, and it is not this:** `API-auth-*` asserts the boundary's LOGIC thoroughly — owner check ordering, 404-not-403 indistinguishability across GET/PATCH/DELETE/start/stop, alg=none, expired/nbf/issuer/garbage tokens. All of it against a LOCAL compose API. `deploy_healthcheck.py` reaches the deployed API but only asks `/healthz`.
+
+**What nothing covers:** that same boundary in front of the *deployed* Railway API, with a real owner session token, proxying to a real engine. Correct logic and a working deployed path are different claims; §5's ordering (verify JWT → load project → assert owner → act) can be right in the code and wrong in the deployment.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `API-public-drive-end-to-end` | Node/wire/agent operations against `https://wheel-api-production.up.railway.app` with an OWNER session token succeed, and the owner check, project scoping and engine proxy all hold end to end. Operator-gated (needs a token), owner API. | **S2** |
+
 ### RESTART-* and SPEND-* — gaps SDK found in engine behaviour (2026-09-07)
 
 Raised by SDK from `docs/proposals/restart-robustness-current-behaviour.md` (96f9f08). Fixes are theirs and sequenced after the first wake; the tests are written to **PENDING** so they document the defect without freezing main, and go RED demanding promotion the moment each fix lands.
