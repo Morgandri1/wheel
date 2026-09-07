@@ -821,6 +821,19 @@ This is the case ADVERSARY pre-committed to watching for: efficiency work is whe
 | `API-postgres-arm-is-still-built` | `rust:clippy-pg` and `rust:test-pg` compile and test wheel-api with `--features postgres`. After the default changes these are the only things in CI that build the Postgres arm at all, so the predicate is that the arm is built and its 5 tests run. | **S1** |
 | `INFRA-budget-update-only-lowers` | `deps_gate.py --update` REFUSES to raise a ceiling without `--allow-regression`, naming every number that grew. Writing whichever value the tree happens to hold makes the budget a mirror rather than a ceiling, and A10's "a number someone has to argue for" becomes a number that silently follows the drift. Raised by API, twice. | **S2** |
 
+### EPH-* — an ephemeral agent must settle like any other
+
+PM measured this on the live deployment and the discriminator is one flag: `pm` is the only agent with `ephemeral_context = true`, and the only one stuck. Five others on the same engine and deploy settle normally. The timing is the tell — the turn COMPLETED (the operator got his reply) and status went to `starting` two seconds later. That is the restart that follows an ephemeral clear, and the agent then LIVES in `starting` between every turn rather than passing through it. It is also the operator's own agent: the only ephemeral one on the board is the one he talks to.
+
+Deliberately NOT asserted: that the status never touches `starting`. Restarting is what the flag is *for*, and forbidding the transition would forbid the feature. The defect is failing to leave it — which is why ADVERSARY's `in_flight`-keyed deadline is right and a time-in-`starting` deadline would kill this agent every turn, forever.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `EPH/plain-settles` | **CONTROL.** An identical non-ephemeral agent completes a turn and settles, in the same engine and the same run. If it does not, the fault is not the flag and attributing it to `ephemeral_context` would be wrong. | |
+| `EPH/context-was-cleared` | **NON-VACUITY CONTROL.** The session id changes across the turn. If the flag were silently ignored the agent would settle perfectly and the assertion below would pass while testing nothing — BUG-024's shape. | |
+| `EPH-settles-after-turn` | An agent with `ephemeral_context: true` reaches a settled status after a completed turn. | **S1** |
+| `EPH-second-turn-still-works` | It completes a SECOND turn. One turn proves the first clear survived; the operator's agent does this every turn. | **S1** |
+
 ### PROGRESS-* — liveness is not progress
 
 Two production failures in one evening shared a shape: the process was alive, answered `/healthz` with 200, and was doing no work. The escaper panic killed the delivery task while tokio kept the process up; endpoint ingress enqueued and woke the agent but never pumped the queue. Both systems were asked *are you up*, both truthfully said yes, and up was read as working. **This suite contains no liveness assertion at all.** Liveness is recorded in failure text only — because "healthy and stuck" is the signature of the class, and naming it is what stops the next person reaching for a restart.
