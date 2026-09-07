@@ -232,8 +232,62 @@ pub fn router(state: AppState) -> Router {
 
 /// Unauthenticated readiness probe. The host waits for this before reporting a
 /// sandbox `running`, so it must answer as soon as the database is usable.
-async fn healthz() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true }))
+///
+/// It also reports STALLED agents — ones holding messages queued longer than
+/// the startup deadline while not being transitional. Three times in one night
+/// this engine was up, answering 200, with delivery not happening underneath:
+/// a delivery task that unwound and vanished, an ingress path that enqueued and
+/// never pumped, and an ephemeral agent parked in `starting` for ever. In every
+/// case /healthz said the same word it says when everything works.
+///
+/// `ok` STAYS TRUE when agents are stalled, deliberately. The docker
+/// healthcheck restarts the container on failure, so reporting a stalled agent
+/// as unhealthy would restart the whole engine — killing every OTHER tenant's
+/// agents because one of them is stuck. That is the same isolation argument
+/// that made a poison message quarantine rather than take the process down.
+/// This makes the condition VISIBLE; it does not make it fatal.
+///
+/// Computed on demand rather than watched: the engine must idle at ~0 CPU (§2),
+/// so there is no background poll here.
+async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
+    let stalled = {
+        match s.db.lock() {
+            Ok(conn) => crate::db::messages::agents_with_work_older_than(
+                &conn,
+                s.cfg.startup_deadline_secs as i64,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(agent, _)| {
+                // Transitional agents are not stalled: they are on their way,
+                // and 041's deadline is what judges those. An agent that is
+                // running or idle with old work is the one nothing is coming
+                // for.
+                !matches!(
+                    crate::db::board::agent_state(&conn, *agent)
+                        .unwrap_or_default()
+                        .status,
+                    wheel_core::AgentStatus::Starting
+                        | wheel_core::AgentStatus::Parked
+                        | wheel_core::AgentStatus::Stopped
+                        | wheel_core::AgentStatus::NeedsAuth
+                        | wheel_core::AgentStatus::BudgetExhausted
+                )
+            })
+            .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
+            .collect::<Vec<_>>(),
+            // A poisoned lock is worth saying so rather than reporting health.
+            Err(_) => Vec::new(),
+        }
+    };
+
+    if !stalled.is_empty() {
+        tracing::warn!(
+            stalled = stalled.len(),
+            "agents are holding messages nothing is delivering"
+        );
+    }
+    Json(serde_json::json!({ "ok": true, "stalled": stalled }))
 }
 
 // --- request bodies --------------------------------------------------------

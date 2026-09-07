@@ -134,6 +134,27 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Message>> {
 /// row so that after [`USER_LANE_BURST`] one normal-lane message is let through.
 /// Is anything waiting for this agent? Cheaper than fetching the next message
 /// and used to decide whether resuming a parked agent is worth a process.
+/// Agents holding a message that has been queued longer than `secs`.
+///
+/// The question `/healthz` needs answered: is anything that SHOULD be being
+/// delivered sitting still? Computed on demand, at request time — the engine
+/// must idle at ~0 CPU (§2), so this must never become a background poll.
+pub fn agents_with_work_older_than(conn: &Connection, secs: i64) -> Result<Vec<(Uuid, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT to_id, COUNT(*) AS n FROM messages
+          WHERE state = 'queued'
+            AND (julianday('now') - julianday(created_at)) * 86400.0 > ?1
+          GROUP BY to_id",
+    )?;
+    let rows = stmt.query_map([secs], |r| {
+        Ok((r.get::<_, String>("to_id")?, r.get::<_, i64>("n")?))
+    })?;
+    Ok(rows
+        .flatten()
+        .filter_map(|(id, n)| id.parse().ok().map(|id| (id, n)))
+        .collect())
+}
+
 pub fn has_queued(conn: &Connection, agent: Uuid) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE to_id = ?1 AND state = 'queued'",
@@ -356,6 +377,60 @@ pub fn node_sender(id: Uuid, name: NodeName, node_type: NodeType) -> MessageSend
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// ADVERSARY 035's remaining half, and the shape that bit this engine three
+    /// times in one night: the process is up, /healthz answers 200, and nothing
+    /// is being delivered underneath.
+    ///
+    /// The assertion that matters is the NEGATIVE one. A stall report that
+    /// names healthy agents is noise, and noise is what an operator learns to
+    /// scroll past — so a freshly queued message must NOT be reported, however
+    /// many there are.
+    #[test]
+    fn only_work_older_than_the_deadline_counts_as_stalled() {
+        let conn = crate::db::open_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        crate::db::board::create(
+            &conn,
+            &wheel_core::Node::new(
+                agent,
+                "worker".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            ),
+        )
+        .unwrap();
+
+        enqueue(
+            &conn,
+            wheel_core::MessageSender::User,
+            agent,
+            "just arrived".into(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            agents_with_work_older_than(&conn, 60).unwrap().is_empty(),
+            "a message queued a moment ago is in flight, not stalled; reporting it would train \
+             an operator to ignore the report"
+        );
+
+        // Age it past the deadline, which is what "nothing is coming for this"
+        // actually looks like.
+        conn.execute(
+            "UPDATE messages SET created_at = datetime('now', '-600 seconds') WHERE to_id = ?1",
+            [agent.to_string()],
+        )
+        .unwrap();
+
+        let stalled = agents_with_work_older_than(&conn, 60).unwrap();
+        assert_eq!(
+            stalled,
+            vec![(agent, 1)],
+            "a message older than the deadline with nothing delivering it is the whole point"
+        );
+    }
     use super::*;
     use crate::db::board;
     use wheel_core::{AgentConfig, Node, NodeConfig, Position};
