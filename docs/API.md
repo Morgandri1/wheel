@@ -148,7 +148,18 @@ Every error, on every route:
 ## Routes
 
 ### `GET /healthz`
-Unauthenticated. `200 {"status":"ok"}`.
+Unauthenticated. `200 {"status":"ok","auth_mode":"local"|"jwks"}`.
+
+`auth_mode` is the mode this API is actually running, and it is published so a client can assert it
+agrees. If the web build ships `clerk` while the API runs `local`, the user gets a login widget whose
+token we reject, or a form talking to a verifier that is not running — two correct halves, a
+deploy-time disagreement, and nothing either side tests alone can see. The web smoke path compares
+this against `NEXT_PUBLIC_AUTH_MODE` and goes red on a mismatch.
+
+**The mode and nothing further.** Not the issuer, not the JWKS URL, not key material. Publishing the
+mode reveals nothing that `POST /v1/auth/login` answering `401` rather than `404` does not already
+reveal, and that argument covers the mode exactly. `tests/healthz_auth_mode.rs` holds the response to
+those two keys, so a future field cannot be added to an unauthenticated probe by accident.
 
 ### `GET /v1/host/healthz`
 
@@ -238,6 +249,26 @@ Header hygiene, both directions:
 
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
+
+On success the engine's own response is returned unchanged — status, headers and bytes. For a hit on
+an `endpoint` node whose wires deliver to agents, that is:
+
+```json
+202 {"accepted": true, "queued": 1}
+```
+
+`queued` is the number of messages **enqueued**, which is what has happened at the moment the
+response is written. Nothing has been delivered yet: the pump is asynchronous, and the target agent
+may be parked, unauthenticated or mid-turn. The field is deliberately not called `delivered` — it was
+once, and production answered `delivered: 1` for a message that never reached a child, which a
+webhook provider reads as success and never retries.
+
+The `202` is not a promise that an agent acted on the hit, only that the hit is durably queued. To
+observe real delivery, watch the `message` event on the events WebSocket, where the state machine is
+`queued → delivered → consumed` (§3c#4). An endpoint with `response_mode: script` returns the
+script's own output instead of this envelope.
+
+Failure cases:
 
 - `404` if the project does not exist.
 - `403` if `capabilities.http` is false (the default, and also the result of a malformed

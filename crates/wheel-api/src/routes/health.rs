@@ -6,9 +6,22 @@ use serde_json::json;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Unauthenticated liveness probe. Deliberately reveals nothing about internals.
-pub async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+/// Unauthenticated liveness probe, plus the one fact a client must agree with us about.
+///
+/// `auth_mode` is here so a client/server mismatch is something a machine checks rather than
+/// something a user discovers by failing to log in. If the web build ships `clerk` while this API
+/// runs `local`, the user gets a login widget whose token we reject, or a form talking to a
+/// verifier that is not running — and no test on either side can see it alone, because each half is
+/// correct. It is a deploy-time disagreement, so it needs a fact both halves can read.
+///
+/// THE MODE AND NOTHING FURTHER. Not the issuer, not the JWKS URL, not key material. Publishing the
+/// mode gives away nothing that `POST /v1/auth/login` answering 401 rather than 404 does not
+/// already reveal — that argument covers the mode exactly, so it is all the mode gets to cover.
+pub async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "status": "ok",
+        "auth_mode": state.cfg.auth_mode.as_str(),
+    }))
 }
 
 /// How long a host liveness answer is reused.
