@@ -49,8 +49,21 @@ merge-PATCH handler must land+deploy first)?
 
   **merge-PATCH deploy status: already handled.** 330deed touches `crates/wheel-engine/**`, which is in
   wheel-host's watchPatterns (infra/railway/settings.json:27), so Railway started host deployment a4ebc41d at
-  05:27 automatically. The two docs-only commits either side of it were correctly SKIPPED. Confirm it reached
-  SUCCESS before choosing (B).
+  05:27 automatically. The two docs-only commits either side of it were correctly SKIPPED.
+
+  **VERIFIED LIVE IN PRODUCTION — deployment a4ebc41d reached SUCCESS, and I proved the behaviour rather than
+  inferring it from the deploy status.** I created a throwaway agent node, PATCHed it with ONLY
+  `{"config":{"ephemeral_context":true}}`, and read it back:
+
+  ```
+  before: harness=claude system_prompt="PROBE-DO-NOT-RUN" run_on_startup=false ephemeral_context=false
+  after:  harness=claude system_prompt="PROBE-DO-NOT-RUN" run_on_startup=false ephemeral_context=true
+  ```
+  The three untouched fields survived; before 330deed that same request would have destroyed all three. Probe
+  node deleted (204), board back to 18 nodes, no residue. Positions also came back as `int`, so the i16 contract
+  change is live on this deploy too.
+
+  So option (B) has no remaining blocker.
 
 ### Q2 — auth state
 Are the cloud agents currently authenticated to run (claude/codex), or will a wake hit NeedsAuth? If
