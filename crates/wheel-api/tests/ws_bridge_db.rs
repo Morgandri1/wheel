@@ -10,6 +10,11 @@
 //! place a ticket substitutes for the session token. That makes it worth proving that the ticket is
 //! genuinely single-use and genuinely bound to its project.
 
+// Reaches Postgres through `mod ws_support`, so it needs the driver the same way the other
+// database suites do. The connection string lives in the SHARED MODULE, not in this file — which is
+// why grepping the *_db.rs files for TEST_DATABASE_URL missed it and it took main red a second time.
+#![cfg(feature = "postgres")]
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
