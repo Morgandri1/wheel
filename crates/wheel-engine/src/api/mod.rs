@@ -250,8 +250,12 @@ pub fn router(state: AppState) -> Router {
 /// Computed on demand rather than watched: the engine must idle at ~0 CPU (§2),
 /// so there is no background poll here.
 async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
+    // Taken BEFORE the db lock and awaited outside it: the agents map is behind
+    // an async mutex and the db lock is a std one, so holding the second across
+    // an await on the first is how a deadlock gets written.
+    let live = s.supervisor.live_agents().await;
     let stalled = match s.db.lock() {
-        Ok(conn) => stalled_agents(&conn, s.cfg.startup_deadline_secs as i64),
+        Ok(conn) => stalled_agents(&conn, s.cfg.startup_deadline_secs as i64, &live),
         // A poisoned lock is worth saying nothing about rather than guessing.
         Err(_) => Vec::new(),
     };
@@ -276,8 +280,39 @@ async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
 /// harness: which agents are named, and — the part that matters more — which
 /// are not. A stall report that names healthy agents is one an operator learns
 /// to scroll past, which is the failure it exists to prevent.
-fn stalled_agents(conn: &rusqlite::Connection, deadline_secs: i64) -> Vec<serde_json::Value> {
-    crate::db::messages::agents_with_work_older_than(conn, deadline_secs)
+fn stalled_agents(
+    conn: &rusqlite::Connection,
+    deadline_secs: i64,
+    live: &std::collections::HashSet<uuid::Uuid>,
+) -> Vec<serde_json::Value> {
+    // A `delivered` row with no live process is a WEDGE, not a turn. Nothing on
+    // boot returns it to `queued`, so the agent can never move again on its own
+    // -- and the age-based report below deliberately excludes `delivered` rows,
+    // which is right for a live turn and hides this completely. Of the silent
+    // failures we have found, this is the only one where the health signal
+    // denies a state the system cannot leave on its own (QA's framing).
+    let mut out: Vec<serde_json::Value> = crate::db::messages::agents_holding_delivered(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(agent, behind)| {
+            let id = uuid::Uuid::parse_str(&agent).ok()?;
+            if live.contains(&id) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "agent": id,
+                "queued": behind,
+                "reason": "wedged: a message was delivered and no process is running it"
+            }))
+        })
+        .collect();
+    let wedged: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(String::from))
+        .collect();
+
+    out.extend(
+        crate::db::messages::agents_with_work_older_than(conn, deadline_secs)
         .unwrap_or_default()
         .into_iter()
         .filter(|(agent, _)| {
@@ -296,8 +331,12 @@ fn stalled_agents(conn: &rusqlite::Connection, deadline_secs: i64) -> Vec<serde_
                     | wheel_core::AgentStatus::BudgetExhausted
             )
         })
-        .map(|(agent, n)| serde_json::json!({ "agent": agent, "queued": n }))
-        .collect()
+        .filter(|(agent, _)| !wedged.contains(&agent.to_string()))
+        .map(|(agent, n)| {
+            serde_json::json!({ "agent": agent, "queued": n, "reason": "queued longer than the deadline" })
+        }),
+    );
+    out
 }
 
 /// What code this RUNNING engine actually is.
@@ -460,7 +499,7 @@ mod tests {
         age(parked);
         crate::db::board::set_status(&conn, parked, AgentStatus::Parked, None);
 
-        let named: Vec<String> = stalled_agents(&conn, 60)
+        let named: Vec<String> = stalled_agents(&conn, 60, &Default::default())
             .into_iter()
             .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
             .collect();
@@ -470,6 +509,50 @@ mod tests {
             vec![stuck.to_string()],
             "only the agent with old work and a live, unbusy session may be named; naming a fresh \
              or parked one teaches the operator to ignore the field"
+        );
+
+        // A `delivered` row with NO live process is a wedge: nothing on boot
+        // requeues it, so the agent can never move again on its own. Before
+        // this, the age report excluded `delivered` rows and /healthz said
+        // nothing at all.
+        let wedged = agent("wedged");
+        queue(wedged);
+        crate::db::board::set_status(&conn, wedged, AgentStatus::Running, None);
+        conn.execute(
+            "UPDATE messages SET state = 'delivered' WHERE to_id = ?1",
+            rusqlite::params![wedged.to_string()],
+        )
+        .unwrap();
+
+        let dead: Vec<serde_json::Value> = stalled_agents(&conn, 60, &Default::default());
+        let named_dead: Vec<String> = dead
+            .iter()
+            .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            named_dead.contains(&wedged.to_string()),
+            "an agent holding a delivered message with no process is permanently stuck and MUST be \
+             reported; got {named_dead:?}"
+        );
+        assert!(
+            dead.iter().any(|v| v
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| r.contains("wedged"))),
+            "the report must say WHY, or the operator cannot tell a wedge from a slow queue"
+        );
+
+        // ...and with a live process it is an ordinary turn in progress, which
+        // is the commonest healthy state on the board. Reporting that would cry
+        // wolf and teach everyone to ignore the field.
+        let live: std::collections::HashSet<uuid::Uuid> = [wedged].into_iter().collect();
+        let alive: Vec<String> = stalled_agents(&conn, 60, &live)
+            .into_iter()
+            .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !alive.contains(&wedged.to_string()),
+            "a delivered message on a LIVE agent is a turn in progress, not a wedge"
         );
     }
 

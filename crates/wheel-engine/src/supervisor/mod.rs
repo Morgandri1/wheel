@@ -775,6 +775,15 @@ impl Supervisor {
     }
 
     /// Stop an agent's child. Keeps the session id so a later start resumes.
+    /// The agents this supervisor currently holds a live process for.
+    ///
+    /// Liveness lives here and nowhere else: the database records what was
+    /// intended, this map records what is actually running. The stall report
+    /// needs both to tell a turn in progress from a wedge.
+    pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
+        self.agents.lock().await.keys().copied().collect()
+    }
+
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
