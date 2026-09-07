@@ -306,7 +306,7 @@ fn resolve_secret(state: &AppState, endpoint: Uuid, vault_ref: &str) -> Option<S
 /// anyone else's payload shape — the agent reads it. That is what keeps an
 /// endpoint node provider-agnostic, which is the whole point of having one
 /// node type rather than a node type per webhook vendor.
-fn deliver(
+pub(crate) fn deliver(
     state: &AppState,
     matched: &MatchedEndpoint,
     method: &Method,

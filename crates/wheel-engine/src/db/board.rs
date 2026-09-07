@@ -454,6 +454,38 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// PM's reviewers flagged this and it is the dangerous half of the i16
+    /// change: a row already outside +/-32767 must CLAMP on the way out, not
+    /// fail to load.
+    ///
+    /// The contract says out of range "clamps and returns what it stored". A
+    /// read that errors instead turns one legacy row into a board that will not
+    /// load at all — the opposite of the ruling, and a far worse failure than
+    /// the one the change was meant to prevent. The boot migration normally
+    /// snaps these rows first; this asserts the read path is safe on its own,
+    /// because a migration that has not run yet (a restore, a copied volume, a
+    /// future code path that opens without migrating) must not be load-bearing
+    /// for whether the engine can read its own board.
+    #[test]
+    fn a_row_outside_the_bounds_clamps_on_read_rather_than_failing_to_load() {
+        let conn = mem();
+        let node = ctx("legacy");
+        create(&conn, &node).unwrap();
+        // Written straight past `Position`, which is the only thing that would
+        // otherwise have clamped it.
+        conn.execute(
+            "UPDATE nodes SET x = ?2, y = ?3 WHERE id = ?1",
+            rusqlite::params![node.id.to_string(), 99999.4_f64, -99999.6_f64],
+        )
+        .unwrap();
+
+        let got = get(&conn, node.id)
+            .expect("an out-of-range row must load")
+            .expect("the node is still there");
+        assert_eq!(got.position.x, i16::MAX);
+        assert_eq!(got.position.y, i16::MIN);
+    }
+
     use super::*;
     use wheel_core::*;
 
