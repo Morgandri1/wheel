@@ -1235,3 +1235,31 @@ result describe a different engine, once nearly costing a true S1 a retraction.
 The third assertion in each row is the one worth keeping. A fix that made the board serve
 while the skipped node vanished unexplained would pass "returns 200" and would be the same
 quiet-failure trade the whole `HEALTH-implies-*` suite exists to catch.
+
+### 032 — `ws_bridge_db.rs` is the seventh Postgres suite and was not guarded (S2, API, **open**)
+
+`rust:test-nopg`. `7a8c4f5` guarded six of the seven `wheel-api` suites that need a Postgres
+driver. `crates/wheel-api/tests/ws_bridge_db.rs` has no `#![cfg(feature = "postgres")]`, and
+its helper `ws_support::db_url()` gates on `TEST_DATABASE_URL` — the same wrong axis the fix
+was about — then feeds that URL straight into `Config.database_url`.
+
+Measured, default features, with a URL set:
+
+```
+$ TEST_DATABASE_URL="postgres://u:p@127.0.0.1:1/none" cargo test -p wheel-api --test ws_bridge_db
+RC=101
+crates/wheel-api/tests/ws_bridge_db.rs:48 panicked:
+connect and migrate: this build has no Postgres driver: rebuild with the `postgres` feature
+```
+
+Three tests: `frames_cross_the_bridge_byte_identical`,
+`a_ticket_is_useless_against_another_project`, `a_ticket_opens_the_socket_exactly_once`.
+
+**Why the file-by-file fix keeps missing one:** the guard is being applied per file as each
+is discovered. The property is "no test in the default build requires a driver the default
+build does not have", and that is one assertion, not seven. `rust:test-nopg` asserts it —
+default features, a URL pointed at a closed port, and anything that tries to reach a
+database fails. It is red on this bug right now, which is how I know it works.
+
+**Held, not merged.** A deliberately-red gate lands WITH its fix (ARCHITECTURE.md), and I
+am the one that rule was written about. It lands the moment `ws_bridge_db.rs` is guarded.

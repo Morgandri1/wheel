@@ -111,6 +111,22 @@ else
   # that has to arrive with it, not instead of it.
   step "rust:clippy-pg" cargo_locked cargo clippy -p wheel-api --features postgres --all-targets -- -D warnings
   step "rust:test-pg"   cargo_locked "$PY" qa/tools/cargo_test_gate.py cargo test -p wheel-api --features postgres
+  # THE OTHER HALF, and the one that was missing. rust:test-pg proves the Postgres arm
+  # BUILDS and PASSES. Nothing asserted that the DEFAULT build does not run tests which
+  # need a driver it no longer has -- and when `postgres` left wheel-api's defaults, six
+  # test files kept compiling, saw TEST_DATABASE_URL set in CI, tried to connect, and
+  # panicked with "this build has no Postgres driver". Twelve failures, main red.
+  #
+  # The skip in those files guards the WRONG AXIS: they self-skip when TEST_DATABASE_URL is
+  # UNSET, but the new failure is URL SET and driver ABSENT — a combination that could not
+  # exist while postgres was a default, so the guard was right until the day it wasn't.
+  #
+  # This reproduces CI's environment locally: default features, with a URL set. A file on
+  # the wrong axis fails here instead of after merge. The URL points at a closed port on
+  # purpose — nothing should reach it, and if a test does, that is the finding.
+  step "rust:test-nopg" env TEST_DATABASE_URL="postgres://qa:qa@127.0.0.1:1/nonexistent" \
+    "$PY" qa/tools/with_lock.py "$CARGO_LOCK" \
+    "$PY" qa/tools/cargo_test_gate.py cargo test -p wheel-api
   # ARCHITECTURE.md §0b: >=90% lines PER CRATE (PM ruling 2026-09-05 — a workspace
   # average hides a 0%-covered crate behind a well-tested one). Exemptions are declared
   # in qa/tools/coverage_gate.py, each naming its crate, reason and expiry event.
