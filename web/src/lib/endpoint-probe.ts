@@ -41,17 +41,17 @@ export function errorCode(body: string): string | null {
 }
 
 /**
- * The `delivered` field of ingress's 202 envelope, read literally.
+ * How many rows ingress wrote for this hit.
  *
- * The name is the wire's, not ours, and it overstates: the engine increments it once per row it
- * ENQUEUES, so a stopped or parked agent still counts. Under the message states (§3c #4)
- * `delivered` means the bytes reached the child's stdin, which this number cannot know. Callers
- * must phrase it as queued.
+ * The engine now sends `queued`; engines before 168430f sent `delivered` for the same number.
+ * Both count rows ENQUEUED — a stopped or parked agent still counts — so both read identically.
+ * `delivered` is a defined state in the protocol (§3c #4: the bytes reached the child's stdin) and
+ * the 202 is written before any child is touched, which is why the engine stopped claiming it.
  */
-export function deliveredCount(body: string): number | null {
+export function queuedCount(body: string): number | null {
   try {
-    const parsed: unknown = JSON.parse(body);
-    const n = (parsed as { delivered?: unknown })?.delivered;
+    const parsed = JSON.parse(body) as { queued?: unknown; delivered?: unknown };
+    const n = parsed?.queued ?? parsed?.delivered;
     return typeof n === "number" ? n : null;
   } catch {
     return null;
@@ -86,12 +86,12 @@ export function probeVerdict({
   }
   if (status === 403) return "Reached the API, which refused it — public HTTP is off for this project.";
   if (status === 202 || (status >= 200 && status < 300)) {
-    const delivered = deliveredCount(body);
-    if (delivered === 0) {
+    const queued = queuedCount(body);
+    if (queued === 0) {
       return "Ingress accepted it, but nothing is wired to this endpoint, so it was dropped.";
     }
-    if (delivered !== null) {
-      const nodes = `${delivered} wired node${delivered === 1 ? "" : "s"}`;
+    if (queued !== null) {
+      const nodes = `${queued} wired node${queued === 1 ? "" : "s"}`;
       return `Ingress accepted it and queued it for ${nodes}. Queued is not read: a parked or stopped agent picks it up when it next runs.`;
     }
     return "The endpoint answered.";
