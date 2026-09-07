@@ -41,7 +41,44 @@ without leaving a trace in either transcript.
 the whole basis of that node's authority: the engine resolves token → node → wire set on every call. Tokens are
 32 random bytes, stored in sqlite as a SHA-256 hash, and invalidated when the agent stops.
 
-`GET /healthz` needs no auth and returns `200 {"ok":true}` — the host's readiness probe (§7).
+`GET /healthz` needs no auth and returns `200` — the host's readiness probe (§7).
+
+```jsonc
+{
+  "ok": true,                  // ALWAYS true while the process serves. See below.
+  "stalled": [                 // always present; [] when there is nothing to say
+    { "agent": "<uuid>", "queued": 3 }
+  ],
+  "version": "0.1.0",          // CARGO_PKG_VERSION, compile-time
+  "build": "a1b2c3d…"          // the commit this image was built from, or "unknown"
+}
+```
+
+**`ok` is a liveness claim and nothing else, and it never goes false because an
+agent is stalled.** The host restarts a sandbox whose `/healthz` fails (§4b), so
+a stalled agent reported as unhealthy would restart the whole engine — killing
+every OTHER tenant's agents because one is wedged, and re-queueing the same
+stuck work on the way back up. The stall is therefore a separate field with a
+different consumer: visible to anything that reads the body, fatal to nothing
+that acts on the status code (PM ruling, 2026-09-07).
+
+**`stalled` lists agents holding work nothing is coming for**: a message queued
+longer than the startup deadline (`WHEEL_STARTUP_DEADLINE_SECS`, default 60),
+while the agent is neither transitional nor mid-turn. Three states report NOT
+stalled and each is a healthy one that a naive check would flag:
+  - **freshly queued** — in flight, not stranded;
+  - **mid-turn** — the agent holds a `delivered` message, so the queue behind it
+    is waiting its turn;
+  - **starting / parked / stopped / needs_auth / budget_exhausted** — not failing
+    to deliver, just not delivering. `starting` is judged by the startup deadline
+    instead, so the two do not disagree.
+A stall report that names healthy agents is one an operator learns to ignore,
+which is the failure it exists to prevent.
+
+**`build` is how you confirm a deploy.** Read it off the RUNNING engine rather
+than inferring from an image tag, a merge, or a CI run — each of those describes
+an input that may not be the one serving traffic. `unknown` means nothing
+stamped this build, and must not be read as anything else.
 
 ### Error body
 
