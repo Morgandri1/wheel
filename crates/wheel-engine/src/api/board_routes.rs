@@ -39,10 +39,30 @@ pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::
 }
 
 /// `POST /v1/nodes` → the created `Node`.
+/// Refuse a harness this build cannot actually run.
+///
+/// `agent_cfg.harness` selects which credentials are exported, never which
+/// binary is spawned — the driver is a hardcoded `ClaudeDriver`. So without
+/// this, a `codex` node is created, handed `CODEX_API_KEY`, and then `claude`
+/// is spawned with it: the operator's harness choice is silently substituted
+/// and nothing says so. Refusing beats running the wrong thing quietly.
+fn reject_unsupported_harness(config: &wheel_core::NodeConfig) -> Result<(), ApiError> {
+    if let wheel_core::NodeConfig::Agent(a) = config {
+        if a.harness == wheel_core::Harness::Codex {
+            return Err(ApiError::invalid(
+                "harness \"codex\" is not supported by this build (M2): there is no codex driver, \
+                 and running the node would silently spawn claude instead",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_node(
     State(s): State<AppState>,
     Json(body): Json<CreateNode>,
 ) -> ApiResult<(StatusCode, Json<Node>)> {
+    reject_unsupported_harness(&body.config)?;
     let node = Node {
         id: Uuid::new_v4(),
         name: body.name,
@@ -134,6 +154,7 @@ pub async fn patch_node(
             .map_err(|e| ApiError::invalid(format!("config does not match node type: {e}")))?;
     }
 
+    reject_unsupported_harness(&node.config)?;
     board::update_with(&conn, &node, &s.cfg.tool_allow_hosts)?;
 
     // A workspace is keyed by the agent's name (§3e `ws/<name>`), so a rename
@@ -439,5 +460,34 @@ mod rename_tests {
         for t in [NodeType::Ctx, NodeType::Table, NodeType::Endpoint] {
             assert!(!rename_is_refused(t, Running));
         }
+    }
+
+    #[test]
+    fn a_codex_agent_config_is_refused_and_a_claude_one_is_not() {
+        let codex = wheel_core::NodeConfig::Agent(wheel_core::AgentConfig {
+            harness: wheel_core::Harness::Codex,
+            ..Default::default()
+        });
+        let err = super::reject_unsupported_harness(&codex)
+            .expect_err("a harness this build cannot run must be refused");
+        let msg = err.2.clone();
+        assert!(
+            msg.contains("codex"),
+            "the refusal must name the harness so the operator knows what to change, got: {msg}"
+        );
+        assert_eq!(
+            err.0,
+            StatusCode::BAD_REQUEST,
+            "a bad config is the caller's error"
+        );
+
+        let claude = wheel_core::NodeConfig::Agent(wheel_core::AgentConfig {
+            harness: wheel_core::Harness::Claude,
+            ..Default::default()
+        });
+        assert!(
+            super::reject_unsupported_harness(&claude).is_ok(),
+            "the supported harness must still be accepted"
+        );
     }
 }
