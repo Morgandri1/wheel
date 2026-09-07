@@ -141,6 +141,59 @@ fn add_column(conn: &Connection, table: &str, decl: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// CI, POS-migration/engine-restarts: the engine did not come back up after
+    /// float rows were seeded, and said only
+    /// "Conversion error from type Text at index: 0, invalid character: found `m` at 0".
+    ///
+    /// The seeded rows carried ids like `mig-0000` rather than uuids. Boot calls
+    /// `board::ensure_tables`, which used `board::list`, which parses every
+    /// row's id and fails WHOLE on the first one it cannot read — so one
+    /// malformed row stopped the engine from starting, with an error naming
+    /// neither the row nor the column.
+    ///
+    /// A fixture is the friendly version of this. A partial restore, or a row
+    /// written by a tool that did not know better, is the unfriendly one, and
+    /// an engine that refuses to boot is a much worse outcome than the row.
+    #[test]
+    fn one_unreadable_node_row_does_not_stop_the_engine_from_starting() {
+        let dir = std::env::temp_dir().join(format!("wheel-badrow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wheel.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = open(&path).unwrap();
+            let good = table_node("reports", &["title"]);
+            crate::db::board::create(&conn, &good).unwrap();
+            conn.execute(
+                "INSERT INTO nodes (id, name, type, config, x, y, created_at, updated_at)
+                 VALUES ('mig-0000', 'mig-node-0000', 'ctx', '{\"markdown\":\"seeded\"}', 1.0, 2.0, '', '')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE t_reports").unwrap();
+        }
+
+        // The boot that CI could not complete.
+        let conn = open(&path).expect("one unreadable row must not stop the engine booting");
+
+        // And the repair still ran for the rows it COULD read: skipping the bad
+        // row must not mean skipping the rest.
+        let restored: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='t_reports'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored, 1,
+            "the good table node's storage must still be re-ensured past the bad row"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The operator's board carried 20 nodes with fractional positions when
     /// the ruling landed. Reading rounds them, so the API looked correct while
     /// the bytes on the volume stayed fractional for ever -- which is the half

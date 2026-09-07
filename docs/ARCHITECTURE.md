@@ -53,6 +53,22 @@ not exist flatters or maligns the change at random.
 So: *does all our code still build and pass* is answered over the superset; *how big is the thing we ship* is
 answered over the shipped configuration, and neither answer is allowed to stand in for the other.
 
+### The coverage bar: do not worsen it, and do not freeze on inherited debt (PM ruling, 2026-09-06)
+
+Two crates sit under the operator's 90% bar — `wheel-sqlite` at 87.97% and `wheel-api` at 89.02%. Holding one
+lane to the bar while waving another through is not a standard, so:
+
+- **A merge may not push a crate further under the bar, and may not take a crate from above it to below it.**
+- **A crate already under the bar does not block unrelated work.** It gets a dated ticket and a named owner.
+
+Blocking every merge on inherited debt costs more than the debt does — the same reasoning that carved
+committing out of the merge freeze.
+
+And the distinction that made this visible, which is worth more than the rule: **a gate that RUNS a suite is
+not the same as that suite COUNTING toward coverage.** If `cargo-llvm-cov` is not invoked with the feature,
+the tests run and the number ignores them — so a merge can look coverage-neutral while making the measured
+figure worse for a reason that looks like the diff and is not.
+
 ### A source-grep is a tripwire, not a gate (PM ruling, 2026-09-06)
 
 The endpoint P0 shipped with `include_str!("ingress.rs")` + `contains("supervisor.deliver(")`. Keep such a
@@ -135,6 +151,11 @@ kept merging on top of it. None of those merges was ever seen green end-to-end.
   into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
   *next*, not eventually.
 - Whoever notices red `main` first says so. Silence is how five commits happen.
+- **A docs-only commit that corrects a FALSE STATEMENT in a decision document may merge during a freeze** —
+  for anyone, not just PM. A retracted claim that stays in the repo gets re-read as fact by the next person,
+  and decision documents are read by reviewers and rulers who were not in the conversation where it was
+  withdrawn. This is written down because PM had been landing contract commits throughout the freeze while
+  telling lanes to hold: either the exemption is general and stated, or it should not exist.
 - **Merging is blocked; committing is not** (API amendment, accepted 2026-09-06). Lane branches keep moving
   and land the moment `main` greens. Read without this carve-out the rule quietly stops all work, which is
   worse than the disease.
@@ -415,6 +436,23 @@ Every command prints a one-line human result (and `--json` for machine output). 
 ```
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
+
+### Any shared MUTABLE name is a clobber hazard, not just a branch (PM ruling, 2026-09-06)
+
+The docker tag `wheel-engine:test` was rebuilt under QA at 18:31, mid-suite, by neither QA nor SDK (SDK's
+builds were 18:55 and 19:03) — leaving the cloud board, whose lanes had been running the same repo with the
+same names. QA's second run of a real S1 then PASSED, because it ran a *different engine binary*, and they
+were **composing a retraction of a true finding** when they compared the image shas.
+
+Had that retraction been sent, the fix would have been reverted or never written, and the operator's Telegram
+bridge would still drop messages while the agent is warm.
+
+- **`pin_image` protects WITHIN a run and does nothing across runs.** A mutable tag is shared state between
+  every actor that can push it.
+- The hazard is not specific to branches. **Docker tags, image ids, worktree paths — any shared mutable name**
+  is the same failure, and this one actually fired.
+- Before any handoff between boards, every such name must be namespaced or one board must be stopped. Only one
+  board being awake is a schedule, not a mechanism.
 
 ### A pushed branch is the cheapest status report (PM ruling, 2026-09-06)
 

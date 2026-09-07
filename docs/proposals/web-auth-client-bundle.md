@@ -9,24 +9,59 @@ neither.
 
 ## What is actually in the bundle
 
-Measured from a completed production build of `web/` (BUILD_ID and app-build-manifest.json present,
-so this is real output and not a partial):
+**CORRECTED 2026-09-07. The first version of this section claimed Clerk cost ~200 kB on every route.
+That was wrong, and it was wrong because of HOW it was measured, not by how much.** It read
+`.next/app-build-manifest.json` and treated a `/layout` entry as "what the browser downloads for
+every route". It is not. The claim is retracted in full; what follows replaces it.
+
+### Measured by removal, three builds
+
+Every client-side `@clerk/nextjs` import (`clerk-bridge.tsx`, `clerk-screen.tsx`) was stubbed so the
+package is genuinely absent from the client module graph; built; restored; rebuilt. `middleware.ts`
+keeps its real import — it is server-only and cannot appear in a client chunk, so stubbing it would
+have measured nothing while adding a stub that could lie.
+
+Each build was confirmed finished by `EXIT=0` **and** the presence of `.next/BUILD_ID`
+(baseline `qDC-iW_yJY8bA_1wYIeIY`, removal `hPFGnugWMGQHO_WGbnxwz`, restore `4A-zT1SjjOQ-E9eF7TKbx`).
+This is not ceremony: one build in the same batch exited 1 with no `BUILD_ID`, and read carelessly it
+would have passed as a clean "no change" result.
+
+**First Load JS — identical, route for route, with Clerk and without:**
 
 ```
-chunks containing Clerk code        4          210,596 B raw
-  loaded by /layout                 2          200,556 B raw   <- the ROOT layout
-  loaded by /sign-in, /sign-up      1            7,658 B raw
-board route (/app/[projectId])     12          868,137 B raw   (~258 kB first-load, gzipped)
+                     with      without
+shared by all       102 kB     102 kB
+/                   106 kB     106 kB
+/app                125 kB     125 kB
+/app/[projectId]    259 kB     259 kB
+/sign-in            113 kB     113 kB
 ```
 
-The root layout is loaded by every route in the app. So the board — which cannot present a Clerk
-widget, cannot mint a Clerk token, and today talks to an API running `AUTH_MODE=local` that has no
-JWKS verifier to check one with — still ships those two chunks.
+The cost to a user loading the board is **zero bytes**.
 
-**One honest limit on that number.** Those are vendor chunks: they *contain* Clerk, they are not
-necessarily *only* Clerk. I have measured what loads, not what would disappear. The exclusive cost
-is whatever a build with the import removed gives back, and that experiment is what this proposal
-should authorize rather than assume. Treat 200 kB as the upper bound of the prize, not the prize.
+**Total emitted JS — where Clerk actually lives:**
+
+```
+with Clerk      28 chunk files   1,523,182 B raw
+without         25 chunk files   1,329,360 B raw
+difference       3 chunk files     193,822 B raw   (12.7% of emitted JS)
+```
+
+Those 194 kB are lazily-loaded chunks a `local`-mode user never fetches. The cost is build and
+deploy artifacts, not bandwidth to anyone.
+
+Note also: the 258 kB and 259 kB figures quoted at different points are the same build target. That
+delta is build-to-build noise, not a change. ~1 kB differences from this tool are not signal.
+
+### What that means for the decision
+
+On efficiency grounds, **do not touch it**. There is no user-facing saving, and the change moves the
+code path that decides who is logged in. I built the dynamic-import version, measured it, and
+reverted it: it cost ~1 kB and bought nothing.
+
+If Clerk should go, it should go on the argument that stands on its own — production runs
+`AUTH_MODE=local`, and a provider we do not use should not be a dependency — and not on bundle size,
+which does not support it.
 
 ## Why it ships at all
 
@@ -52,25 +87,28 @@ reach the browser bundle).
 
 ## What I propose
 
-Give `ClerkGate` the same `next/dynamic` treatment `ClerkScreen` already has. `NEXT_PUBLIC_AUTH_MODE`
+~~Give `ClerkGate` the same `next/dynamic` treatment `ClerkScreen` already has.~~ **Withdrawn** — built, measured, reverted: zero first-load saving, ~1 kB cost. See the corrected measurement above.
 keeps selecting the provider; `local` builds stop carrying the one they did not select. No change to
 the token contract — the client still sends `x-auth-token` and still cannot mint or refresh one, per
 API's points 1 and 2.
 
-## The one risk, stated plainly because it is the reason I have not already shipped it
+## The risk that stopped it, and why it no longer needs resolving
 
-A dynamic gate is not mounted on the first frame. In `clerk` mode that means a moment where the app
-renders without an auth provider above it, and the safe version renders nothing until it mounts.
-**I cannot verify that mode on this host — there are no Clerk production keys here** (M1.5 still
-lists them as outstanding from the operator). So I would be changing the code path that decides who
-is logged in, in the one mode I cannot run.
+A dynamic gate is not mounted on the first frame, so in `clerk` mode the tree would render above a
+provider that is not there yet (`useAuth()` throws without `ClerkProvider`). The safe form renders
+nothing until it mounts, which is a blank first frame — the same failure shape as the agent
+inspector's first-paint flash, invisible to any assertion that runs after it.
 
-That is the same failure shape I spent today removing from the agent inspector: a first-paint flash,
-invisible to any assertion that runs after it. I know how to test it — a MutationObserver installed
-before load, counting mounts, with the provider slowed — and that test is cheap. It just needs keys,
-or a stub issuer, to run against.
+That risk is now moot: the change is withdrawn on its own merits, because the measurement showed
+nothing to buy. Recording it anyway, because the next person to consider this will hit the same
+question.
 
-So: I will ship this the hour someone hands me either. Ruling wanted on which.
+**One finding worth keeping.** API built a stub JWKS issuer (`120c323`) to unblock this. It does
+unblock the token contract end to end, and it is the right tool for the `/healthz` gate below — but
+it **cannot** exercise `clerk` mode in a browser. `ClerkProvider` throws without a *publishable*
+key, which is a client-side Clerk credential no JWKS issuer supplies. So "point
+`NEXT_PUBLIC_AUTH_MODE` at clerk and use the stub" would throw on mount. Verifying the Clerk client
+path still requires real Clerk keys; nothing else substitutes.
 
 ## On API's healthz interlock — yes, and it is worth more than the bundle
 
@@ -78,7 +116,7 @@ API offered `GET /healthz` reporting the API's `auth_mode` so a build or smoke t
 client and server agree. **I would consume that immediately**, and I think it is the more valuable
 half of this document.
 
-Reason: everything above is money. A mode mismatch is *nobody can log in*, it is invisible to every
+Reason: everything above turned out to be worth nothing in bandwidth. A mode mismatch is *nobody can log in*, it is invisible to every
 test either lane runs alone, and it is discovered by a user. Web cannot detect it today — the client
 learns its mode from a build-time env var and the server from a runtime one, and the two are set in
 different dashboards by different people.

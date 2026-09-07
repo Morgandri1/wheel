@@ -163,11 +163,44 @@ pub fn create_with(
 /// nine good tables and one bad name is still a working board, and refusing
 /// to boot would take the other nine down with it.
 pub fn ensure_tables(conn: &Connection) -> Result<()> {
-    for node in list(conn)? {
-        if let NodeConfig::Table(cfg) = &node.config {
-            if let Err(e) = tables::ensure(conn, &node.name, cfg) {
-                tracing::error!(node = %node.name, error = %e, "could not restore this table node's storage");
+    // Deliberately NOT `list(conn)?`. This runs on the boot path, and `list`
+    // fails WHOLE rather than per row: one node whose `id` is not a uuid — a
+    // hand-seeded fixture, a partial restore, a row written by a tool that did
+    // not know better — makes it return Err, which aborted the engine's boot
+    // with a rusqlite conversion error naming neither the row nor the column.
+    // An engine that refuses to start because of one malformed row is a far
+    // worse failure than the row.
+    //
+    // This pass is a best-effort repair, so it reads only what it needs (table
+    // nodes' names and configs, never their ids) and skips what it cannot
+    // parse, loudly. A skipped node keeps its storage un-ensured; it does not
+    // take the project down with it.
+    let mut stmt = conn.prepare("SELECT name, config FROM nodes WHERE type = 'table'")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>("name")?, r.get::<_, String>("config")?))
+    })?;
+
+    for row in rows {
+        let (name, config) = match row {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "unreadable node row; skipping it rather than refusing to boot");
+                continue;
             }
+        };
+        let Ok(parsed) = name.parse::<wheel_core::NodeName>() else {
+            tracing::error!(name = %name, "table node has an unusable name; skipping its storage");
+            continue;
+        };
+        let cfg: wheel_core::TableConfig = match serde_json::from_str(&config) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(node = %parsed, error = %e, "table node has an unreadable config; skipping its storage");
+                continue;
+            }
+        };
+        if let Err(e) = tables::ensure(conn, &parsed, &cfg) {
+            tracing::error!(node = %parsed, error = %e, "could not restore this table node's storage");
         }
     }
     Ok(())
