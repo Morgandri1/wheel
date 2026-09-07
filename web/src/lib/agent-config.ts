@@ -1,0 +1,58 @@
+import type { AgentNode } from "@/lib/schema";
+
+type AgentConfig = AgentNode["config"];
+export type Budget = NonNullable<AgentConfig["budget"]>;
+export type Workspace = NonNullable<AgentConfig["workspaces"]>[number];
+
+export const IDLE_TIMEOUT_DEFAULT = 300;
+
+/**
+ * An empty field means "unset", never zero.
+ *
+ * The distinction is the whole point: `max_usd: 0` is a budget of nothing, which stops the agent
+ * on its first turn, while an absent budget means no cap. A parser that turns "" into 0 converts
+ * "I did not fill this in" into "spend nothing" — a silent stop with a config that looks deliberate.
+ */
+export function parseOptionalNumber(raw: string): number | null | undefined {
+  const t = raw.trim();
+  if (t === "") return undefined;
+  const n = Number(t);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** `undefined` drops the whole budget; `null` means the input was rejected. */
+export function buildBudget(turns: string, usd: string): Budget | null | undefined {
+  const t = parseOptionalNumber(turns);
+  const u = parseOptionalNumber(usd);
+  if (t === null || u === null) return null;
+  if (t === undefined && u === undefined) return undefined;
+  const budget: Budget = {};
+  if (t !== undefined) budget.max_turns = Math.floor(t);
+  if (u !== undefined) budget.max_usd = u;
+  return budget;
+}
+
+/**
+ * A workspace path must be relative and free of `..`: the engine materialises it under the
+ * project's own data dir, so an absolute path or a traversal is asking to write outside the
+ * tenant. Rejected here as well as engine-side, because a control that offers something the
+ * engine will refuse is a control that lies.
+ */
+export function validateWorkspacePath(path: string): string | null {
+  const t = path.trim();
+  if (t === "") return "A workspace needs a path.";
+  if (t.startsWith("/")) return "Use a path relative to the project, not an absolute one.";
+  if (t.split("/").includes("..")) return "A workspace path cannot contain `..`.";
+  if (!/^[A-Za-z0-9._/-]+$/.test(t)) return "Use letters, digits, dot, dash, underscore and /.";
+  return null;
+}
+
+/** Drops the git block entirely when no url is given, rather than storing an empty one. */
+export function buildWorkspace(path: string, gitUrl: string, gitRef: string): Workspace {
+  const ws: Workspace = { path: path.trim() };
+  const url = gitUrl.trim();
+  if (url) {
+    ws.git = gitRef.trim() ? { url, ref: gitRef.trim() } : { url };
+  }
+  return ws;
+}

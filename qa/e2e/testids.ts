@@ -66,6 +66,12 @@ export const T = {
 
   // endpoint panel. The notice carries its own switch: the operator could not find the toggle
   // on the project-list card, and a notice naming a setting you cannot reach from it is a hunt.
+  agentWorkspaceRow: "agent-workspace-row",
+  agentWorkspaceAdd: "btn-agent-workspace-add",
+  agentWorkspacePath: "input-agent-workspace-path",
+  agentMaxTurns: "input-agent-max-turns",
+  agentMaxUsd: "input-agent-max-usd",
+  agentIdleTimeout: "input-agent-idle-timeout",
   endpointHttpOff: "endpoint-http-off",
   endpointEnableHttp: "btn-endpoint-enable-http",
   // "Reachable" is a measurement, not an inference from a config flag. Ingress does not exist

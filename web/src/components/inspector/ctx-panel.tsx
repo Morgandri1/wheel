@@ -110,7 +110,7 @@ export function CtxPanel({
           onClick={async () => {
             setSaving(true);
             try {
-              await api.patchNode(node.id, { config: { markdown } });
+              await api.patchNode(node.id, { config: { ...node.config, markdown } });
               onChanged();
               toast("Saved. Agents pick it up at their next start or clear.");
             } catch (e) {

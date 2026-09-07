@@ -50,7 +50,7 @@ export function TablePanel({
   const save = async () => {
     setSaving(true);
     try {
-      await api.patchNode(node.id, { config: { columns } });
+      await api.patchNode(node.id, { config: { ...node.config, columns } });
       onChanged();
       toast("Columns saved.");
     } catch (e) {
