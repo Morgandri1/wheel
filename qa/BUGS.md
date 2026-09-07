@@ -1265,3 +1265,37 @@ database fails. It is red on this bug right now, which is how I know it works.
 `rust:test-nopg` verified green against that commit on a clean tree, and mutation-checked:
 removing the guard again makes it fail with the diagnosis. It discovers all seven suites
 rather than naming them, so an eighth is covered without anyone remembering it exists.
+
+### 033 — the Postgres arm is not measured by coverage (S3, QA — mine, **open**)
+
+`rust:coverage`. When `postgres` left wheel-api's defaults, `tests/boot_db.rs`
+(`#![cfg(feature = "postgres")]`) stopped being compiled by the coverage run, so the code
+that talks to production's database and the 5 tests covering it stopped counting. API
+predicted this before merging and was right.
+
+My fix — adding `--features wheel-api/postgres` to `cargo llvm-cov` — **turned main red** and
+is reverted. `crates/wheel-api/tests/rotate_tool.rs` shells out to `cargo build` from inside
+the test (deliberately: an earlier version located a stale binary and passed against a
+knowingly broken tool). Under llvm-cov that nested build runs against an instrumented
+target-dir, and changing the feature set makes it rebuild the world underneath the outer run.
+
+Measured, so the next person does not repeat the search:
+
+| invocation | result |
+|---|---|
+| `cargo test -p wheel-api --test rotate_tool --features postgres` | passes, 16s |
+| `cargo test --workspace --features wheel-api/postgres --test rotate_tool` | passes, 150s (nested rebuild) |
+| the same feature set inside `cargo llvm-cov` | **fails**, and took main down |
+
+So the failure is the llvm-cov context, not the feature and not the test.
+
+**What is true right now:** wheel-api's coverage number does not include the Postgres arm.
+It is not wrong so much as narrower than it looks, and nothing says so on the report — which
+is the same quiet-failure shape as everything else tonight, in my own gate.
+
+Options, none taken yet: teach `rotate_tool` to skip when it detects a coverage run
+(API's file); give llvm-cov its own target-dir per feature set so the nested build cannot
+collide; or measure the arm in a second, separate coverage invocation.
+
+**I reverted rather than pursued it** because main was red at 04:06 on a change of mine,
+and greening main beats being right about coverage at four in the morning.
