@@ -306,7 +306,7 @@ fn resolve_secret(state: &AppState, endpoint: Uuid, vault_ref: &str) -> Option<S
 /// anyone else's payload shape — the agent reads it. That is what keeps an
 /// endpoint node provider-agnostic, which is the whole point of having one
 /// node type rather than a node type per webhook vendor.
-fn deliver(
+pub(crate) fn deliver(
     state: &AppState,
     matched: &MatchedEndpoint,
     method: &Method,
@@ -329,18 +329,26 @@ fn deliver(
         node_type: NodeType::Endpoint,
     };
 
-    let mut delivered = 0usize;
+    let mut queued = 0usize;
     for wire in wires.iter().filter(|w| w.wire_type == WireType::Send) {
         // `enqueue` is the ONLY delivery path. It is what makes the body reach
         // the child through `Message::envelope` — so `type="endpoint"` and the
         // escaping are properties of the message type, not of this module.
         if crate::db::messages::enqueue(&conn, sender.clone(), wire.to, body.clone(), None).is_ok()
         {
-            delivered += 1;
+            queued += 1;
             let supervisor = state.supervisor.clone();
             let target = wire.to;
             tokio::spawn(async move {
-                let _ = supervisor.start(target).await;
+                // `deliver`, never `start`. `start` is idempotent by design
+                // (§3c#13), so against an agent already running, idle, or
+                // wedged in `starting` it returns the existing session having
+                // pumped nothing, and the row just written waits for an event
+                // that never comes. That stranded the operator's board: three
+                // messages queued behind an agent frozen in `starting` while
+                // ingress answered 202. Every other enqueue path in the engine
+                // calls `deliver`; this was the one exception.
+                let _ = supervisor.deliver(target).await;
             });
         }
     }
@@ -348,7 +356,7 @@ fn deliver(
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "accepted": true, "delivered": delivered })),
+        Json(serde_json::json!({ "accepted": true, "queued": queued })),
     )
         .into_response()
 }
@@ -395,6 +403,60 @@ fn envelope_payload(method: &Method, path: &str, headers: &HeaderMap, raw: &[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The P0 that stranded the operator's board: three messages queued, none
+    /// delivered, the `pm` agent frozen in `starting`, and ingress answering
+    /// 202 the whole time.
+    ///
+    /// `start` is IDEMPOTENT by design (§3c#13: a message must never spawn a
+    /// second process for one agent). Against an agent that is already
+    /// running, idle, or wedged in `starting`, it returns the existing session
+    /// having pumped nothing -- so the row ingress just wrote waits for an
+    /// event that never comes. `deliver` resumes a parked agent AND drains the
+    /// queue, which is why every other enqueue path calls it: agent_routes in
+    /// four places, cli_routes in one, and ingress was the exception.
+    ///
+    /// Asserted on the source because the defect is a WRONG CALL, not a wrong
+    /// value: with `start` the handler still answers 202 and still writes the
+    /// row, so nothing observable about the response distinguishes the broken
+    /// engine from the fixed one. The behavioural form of this belongs in QA's
+    /// ING-* suite, where a live engine and a real child exist; there is no
+    /// harness in this module that can watch a child's stdin.
+    #[test]
+    fn an_ingress_hit_pumps_the_queue_rather_than_only_starting_the_agent() {
+        let src = include_str!("ingress.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or_default();
+
+        assert!(
+            code.contains("supervisor.deliver("),
+            "ingress must reach the agent through supervisor.deliver: it is the only \
+             path that drains the queue for an agent that is already running"
+        );
+        assert!(
+            !code.contains("supervisor.start("),
+            "ingress must not reach an agent with supervisor.start — it is a no-op \
+             against a running or wedged agent and leaves the message queued for ever"
+        );
+    }
+
+    /// `delivered` is a defined state in the protocol (§3c#4: the bytes reached
+    /// the child's stdin), and this response is written before any child is
+    /// touched. Filed independently by API and Web: the word made a webhook
+    /// provider mark as succeeded a hook that no agent had seen, so it never
+    /// retried.
+    #[test]
+    fn the_202_body_names_the_state_it_actually_wrote() {
+        let src = include_str!("ingress.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            code.contains("\"queued\": queued"),
+            "the ingress 202 must report `queued`, which is the state it wrote"
+        );
+        assert!(
+            !code.contains("\"delivered\":"),
+            "`delivered` in the ingress body claims a state the engine has not reached"
+        );
+    }
 
     /// ADVERSARY 035's open link, asserted structurally rather than argued.
     ///

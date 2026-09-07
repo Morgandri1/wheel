@@ -113,8 +113,19 @@ sink, size/rate/replay, and the R4 injection blast-radius) against this path the
   A source-grep regression test (`ingress_delivers_only_through_the_one_envelope_sink`) FAILS if a future edit
   hand-rolls delivery beside the sink. So the ingress body IS routed through the single sink (link 6 confirmed
   reached) and the 034 fix defuses the panic (confirmed safe). **The internet → permanently-dead-board chain is
-  closed at the sink for ingress too** — links 1-4 fixed (034 escaper + `catch_unwind` quarantine), link 5 was
-  never a link, link 6 reaches the fixed sink.
+  closed at the sink for ingress too** — link 5 was never a link, link 6 reaches the fixed sink.
+- **RUN, not read (PM's "I want what you ran"):** `cargo test -p wheel-core --test envelope` = 18/18 pass, exit 0
+  (incl. `the_body_that_took_the_board_offline_escapes_instead_of_panicking` and
+  `no_stored_body_can_stop_the_engine_from_starting`) — this is the BEHAVIORAL proof the sink cannot panic.
+  `cargo test -p wheel-engine --lib api::ingress` = 6/6 pass, exit 0 — but the "reaches the sink" test is a
+  SOURCE-GREP tripwire, so "ingress body is safe" is a COMPOSITION (tripwire: ingress→enqueue + 18 sink tests:
+  enqueue→envelope→escaper), not one end-to-end behavioral test. Sound, stated as what it is.
+- **CORRECTION to the escaper+quarantine claim below:** the 034 escaper fix is behaviorally proven (18 tests,
+  run). The `catch_unwind` QUARANTINE belt (mod.rs:686) is PRESENT in source but exercised by NO test — the
+  only test harness (`ShimDriver`) cannot panic in `encode_turn`, and the quarantine tests only cover the DB
+  primitive. See **finding 040**. So links 1-4 are: escaper fixed + verified; quarantine belt present but not
+  test-exercised. The chain conclusion is unchanged (the escaper alone closes the known poison); the belt is a
+  claim I should not have called verified without running it.
 - Attribution correct (`type=endpoint` by construction, never `user`); secret constant-time-compared and
   redacted from the delivered body; forged `x-wheel-*` stripped at the API edge; body capped while reading;
   reject-before-waking-a-child ordering.

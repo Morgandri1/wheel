@@ -32,7 +32,7 @@ fn agent_node_matches_the_contract_example() {
         json!({
             "id": "01010101-0101-0101-0101-010101010101",
             "name": "researcher",
-            "position": { "x": 120.0, "y": 340.0 },
+            "position": { "x": 120, "y": 340 },
             "wires": [ { "to": "02020202-0202-0202-0202-020202020202", "type": "read" } ],
             "type": "agent",
             "config": {

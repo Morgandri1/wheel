@@ -100,6 +100,7 @@ impl Sandbox for EmbeddedSandbox {
             // install has no reason to hold one open — the engine refuses it in production for the
             // same reason.
             tool_allow_hosts: Vec::new(),
+            startup_deadline_secs: wheel_engine::config::DEFAULT_STARTUP_DEADLINE_SECS,
         };
 
         let project = *id;

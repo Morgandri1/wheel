@@ -190,7 +190,8 @@ pub async fn ls(
         .map_err(|d| deny(&s, Some(&me), d))?;
     match node.node_type() {
         NodeType::Table => {
-            let keys = tables::list_keys(&conn, &node.name, q.prefix.as_deref(), MAX_KEYS, 0)
+            let cfg = table_config(&node)?;
+            let keys = tables::list_keys(&conn, &node.name, cfg, q.prefix.as_deref(), MAX_KEYS, 0)
                 .map_err(storage_err)?;
             Ok(Json(serde_json::json!({ "node": node.name, "keys": keys })))
         }

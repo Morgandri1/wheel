@@ -170,3 +170,15 @@ other than what it looked like.**
 - **`make check` exits non-zero and says INCONCLUSIVE when a gate could not run.** Do not
   "fix" that by letting it pass. "Could not check" must never read as "passed" — which is the
   single sentence the rest of this document is about.
+
+### Trap: backticks in `git commit -m` are shell substitution
+
+The contract warns about this for `yoke msg` bodies (§3c #1). It applies identically to
+`git commit -m "...contains `backticks`..."` — zsh substitutes them and the words are
+silently GONE from the stored message. I lost three spans from a commit message this way
+after warning two other agents about the same hazard in the same session. The stored
+message looked like careless writing rather than a mangled one, which is why it is worth a
+note: nothing errors, and the damage is only visible if you read the message back.
+
+Use a heredoc: `git commit -F - <<'MSG'` … `MSG`. The quoted delimiter is what disables
+substitution. Same for `yoke msg --file`.

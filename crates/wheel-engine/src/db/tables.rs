@@ -162,6 +162,15 @@ pub fn put_row(
     key: &str,
     value: &Value,
 ) -> Result<()> {
+    // The node showing this table on the board is not proof its sqlite table
+    // is still there: a restore, an out-of-band drop, or anything else that
+    // touches the file underneath a LIVE engine leaves the node in place and
+    // the table gone, and nothing else calls `ensure` between boots (only
+    // `board::ensure_tables` does, once, at open). Re-ensuring on every
+    // access is the only way a running engine self-heals without a restart --
+    // WOW-table-survives-restart's real name should have been
+    // "...-without-one".
+    ensure(conn, name, cfg)?;
     let table = table_name(name)?;
     let Value::Object(obj) = value else {
         bail!("a table row must be a JSON object of column values");
@@ -225,6 +234,7 @@ pub fn get_row(
     cfg: &TableConfig,
     key: &str,
 ) -> Result<Option<Value>> {
+    ensure(conn, name, cfg)?;
     let table = table_name(name)?;
     let cols = column_names(cfg);
     let select = if cols.is_empty() {
@@ -254,10 +264,12 @@ pub fn delete_row(conn: &Connection, name: &NodeName, key: &str) -> Result<bool>
 pub fn list_keys(
     conn: &Connection,
     name: &NodeName,
+    cfg: &TableConfig,
     prefix: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<String>> {
+    ensure(conn, name, cfg)?;
     let table = table_name(name)?;
     let limit = limit.min(MAX_ROWS);
     let sql = format!(
@@ -291,6 +303,7 @@ pub fn list_rows(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<Value>> {
+    ensure(conn, name, cfg)?;
     let table = table_name(name)?;
     let limit = limit.min(MAX_ROWS);
     let cols = column_names(cfg);
@@ -762,13 +775,19 @@ mod tests {
             put(&conn, k, serde_json::json!({}));
         }
         assert_eq!(
-            list_keys(&conn, &name(), None, 100, 0).unwrap(),
+            list_keys(&conn, &name(), &cfg(), None, 100, 0).unwrap(),
             ["a", "b", "c"]
         );
-        assert_eq!(list_keys(&conn, &name(), None, 2, 1).unwrap(), ["b", "c"]);
+        assert_eq!(
+            list_keys(&conn, &name(), &cfg(), None, 2, 1).unwrap(),
+            ["b", "c"]
+        );
         assert!(delete_row(&conn, &name(), "b").unwrap());
         assert!(!delete_row(&conn, &name(), "b").unwrap(), "already gone");
-        assert_eq!(list_keys(&conn, &name(), None, 100, 0).unwrap(), ["a", "c"]);
+        assert_eq!(
+            list_keys(&conn, &name(), &cfg(), None, 100, 0).unwrap(),
+            ["a", "c"]
+        );
     }
 
     /// A prefix is a literal. An agent passing `%` must not get the whole
@@ -780,14 +799,14 @@ mod tests {
             put(&conn, k, serde_json::json!({}));
         }
         assert_eq!(
-            list_keys(&conn, &name(), Some("a_"), 100, 0).unwrap(),
+            list_keys(&conn, &name(), &cfg(), Some("a_"), 100, 0).unwrap(),
             ["a_1"]
         );
         assert_eq!(
-            list_keys(&conn, &name(), Some("b%"), 100, 0).unwrap(),
+            list_keys(&conn, &name(), &cfg(), Some("b%"), 100, 0).unwrap(),
             ["b%c"]
         );
-        assert!(list_keys(&conn, &name(), Some("%"), 100, 0)
+        assert!(list_keys(&conn, &name(), &cfg(), Some("%"), 100, 0)
             .unwrap()
             .is_empty());
     }
@@ -798,7 +817,7 @@ mod tests {
         put(&conn, "only", serde_json::json!({}));
         // The ceiling is applied to the caller's limit, however large.
         assert_eq!(
-            list_keys(&conn, &name(), None, usize::MAX, 0)
+            list_keys(&conn, &name(), &cfg(), None, usize::MAX, 0)
                 .unwrap()
                 .len(),
             1

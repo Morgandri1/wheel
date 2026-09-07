@@ -261,6 +261,61 @@ pub struct PatchNode {
 mod tests {
     use super::*;
 
+    /// The way IN: a client mid-drag still sends floats, and anything past the
+    /// bound clamps rather than being refused (PM's ruling: a 400 mid-drag is
+    /// not an improvement on a node that springs back).
+    #[test]
+    fn a_patched_position_is_rounded_and_clamped_before_the_handler_sees_it() {
+        let p: PatchNode =
+            serde_json::from_value(serde_json::json!({"position": {"x": 10.6, "y": -99999.0}}))
+                .unwrap();
+        let pos = p.position.expect("position survives the partial patch");
+        assert_eq!(pos.x, 11, "10.6 rounds to the nearest cell");
+        assert_eq!(pos.y, i16::MIN, "past the bound it clamps");
+
+        let c: CreateNode = serde_json::from_value(serde_json::json!({
+            "name": "n", "type": "ctx", "config": {"markdown": ""},
+            "position": {"x": 99999.0, "y": 0.5}
+        }))
+        .unwrap();
+        assert_eq!(c.position.x, i16::MAX);
+        assert_eq!(c.position.y, 1);
+    }
+
+    /// Web renders the position from the PATCH RESPONSE rather than from what
+    /// it sent, which is what makes a clamp invisible to the operator instead
+    /// of a drag that silently stops. That only holds while the handler answers
+    /// with the full node: a 204, or a re-read from the database instead of the
+    /// value it just stored, puts Web back on its fallback without anything
+    /// failing here.
+    ///
+    /// Checked in the source because the failure is an ABSENCE — no assertion
+    /// about a returned body can notice a handler that stopped returning one.
+    #[test]
+    fn patch_answers_with_the_node_it_stored_not_an_empty_body() {
+        let src = include_str!("board_routes.rs");
+        let sig = src
+            .lines()
+            .position(|l| l.contains("pub async fn patch_node"))
+            .expect("patch_node exists");
+        let head: String = src.lines().skip(sig).take(6).collect::<Vec<_>>().join("\n");
+        assert!(
+            head.contains("ApiResult<Json<Node>>"),
+            "patch_node must answer with the full node; Web reads `position` off this reply.\n{head}"
+        );
+        let body: String = src
+            .lines()
+            .skip(sig)
+            .take(40)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("board::update_with(&conn, &node") && body.contains("Ok(Json(node))"),
+            "patch_node must return the SAME node value it stored, so the reply carries the \
+             clamped position rather than an echo of the request"
+        );
+    }
+
     #[test]
     fn constant_time_eq_matches_normal_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));

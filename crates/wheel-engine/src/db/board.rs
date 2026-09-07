@@ -163,11 +163,44 @@ pub fn create_with(
 /// nine good tables and one bad name is still a working board, and refusing
 /// to boot would take the other nine down with it.
 pub fn ensure_tables(conn: &Connection) -> Result<()> {
-    for node in list(conn)? {
-        if let NodeConfig::Table(cfg) = &node.config {
-            if let Err(e) = tables::ensure(conn, &node.name, cfg) {
-                tracing::error!(node = %node.name, error = %e, "could not restore this table node's storage");
+    // Deliberately NOT `list(conn)?`. This runs on the boot path, and `list`
+    // fails WHOLE rather than per row: one node whose `id` is not a uuid — a
+    // hand-seeded fixture, a partial restore, a row written by a tool that did
+    // not know better — makes it return Err, which aborted the engine's boot
+    // with a rusqlite conversion error naming neither the row nor the column.
+    // An engine that refuses to start because of one malformed row is a far
+    // worse failure than the row.
+    //
+    // This pass is a best-effort repair, so it reads only what it needs (table
+    // nodes' names and configs, never their ids) and skips what it cannot
+    // parse, loudly. A skipped node keeps its storage un-ensured; it does not
+    // take the project down with it.
+    let mut stmt = conn.prepare("SELECT name, config FROM nodes WHERE type = 'table'")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>("name")?, r.get::<_, String>("config")?))
+    })?;
+
+    for row in rows {
+        let (name, config) = match row {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "unreadable node row; skipping it rather than refusing to boot");
+                continue;
             }
+        };
+        let Ok(parsed) = name.parse::<wheel_core::NodeName>() else {
+            tracing::error!(name = %name, "table node has an unusable name; skipping its storage");
+            continue;
+        };
+        let cfg: wheel_core::TableConfig = match serde_json::from_str(&config) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(node = %parsed, error = %e, "table node has an unreadable config; skipping its storage");
+                continue;
+            }
+        };
+        if let Err(e) = tables::ensure(conn, &parsed, &cfg) {
+            tracing::error!(node = %parsed, error = %e, "could not restore this table node's storage");
         }
     }
     Ok(())
@@ -454,6 +487,38 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// PM's reviewers flagged this and it is the dangerous half of the i16
+    /// change: a row already outside +/-32767 must CLAMP on the way out, not
+    /// fail to load.
+    ///
+    /// The contract says out of range "clamps and returns what it stored". A
+    /// read that errors instead turns one legacy row into a board that will not
+    /// load at all — the opposite of the ruling, and a far worse failure than
+    /// the one the change was meant to prevent. The boot migration normally
+    /// snaps these rows first; this asserts the read path is safe on its own,
+    /// because a migration that has not run yet (a restore, a copied volume, a
+    /// future code path that opens without migrating) must not be load-bearing
+    /// for whether the engine can read its own board.
+    #[test]
+    fn a_row_outside_the_bounds_clamps_on_read_rather_than_failing_to_load() {
+        let conn = mem();
+        let node = ctx("legacy");
+        create(&conn, &node).unwrap();
+        // Written straight past `Position`, which is the only thing that would
+        // otherwise have clamped it.
+        conn.execute(
+            "UPDATE nodes SET x = ?2, y = ?3 WHERE id = ?1",
+            rusqlite::params![node.id.to_string(), 99999.4_f64, -99999.6_f64],
+        )
+        .unwrap();
+
+        let got = get(&conn, node.id)
+            .expect("an out-of-range row must load")
+            .expect("the node is still there");
+        assert_eq!(got.position.x, i16::MAX);
+        assert_eq!(got.position.y, i16::MIN);
+    }
+
     use super::*;
     use wheel_core::*;
 
@@ -505,7 +570,13 @@ mod tests {
         }
     }
 
-    /// W1 / WOW-table-survives-restart. The node survived, its table did not.
+    /// W1 / WOW-table-survives-restart -- and now WITHOUT one. The node
+    /// survived, its table did not; `board::ensure_tables` (boot) covers a
+    /// restart, but the wheel-dev incident this is named for happened on a
+    /// LIVE engine nobody restarted (QA's `WOW-table-survives-restart`, hit
+    /// for real on the reports table). `tables::list_rows`/`get_row`/
+    /// `put_row` now re-ensure on every access, so this must self-heal with
+    /// no `ensure_tables` call in between.
     ///
     /// QA's two assertions, and the second is the one that matters: a table
     /// rebuilt from a DEFAULT shape rather than from the node's config would
@@ -520,14 +591,11 @@ mod tests {
         // What a restore/migrate does to the file: the node row survives, the
         // user table does not.
         c.execute_batch("DROP TABLE t_reports").unwrap();
-        assert!(
-            tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0).is_err(),
-            "positive control: the read must be broken before the fix runs"
-        );
 
-        ensure_tables(&c).unwrap();
-
-        // (1) The read works and is empty -- never "no such table".
+        // (1) The read works and is empty -- never "no such table" -- with NO
+        // boot/`ensure_tables` call in between. Restoring the old
+        // `list_rows`/`get_row`/`put_row` (without their own `ensure` call)
+        // makes this fail again with "no such table: t_reports": checked.
         assert!(tables::list_rows(&c, &n.name, table_cfg(&n), 10, 0)
             .unwrap()
             .is_empty());

@@ -800,6 +800,56 @@ be seconds.
 | `POS-rounds-and-clamps/*` | Cell size is 1: 10.4→10, 10.6→11, symmetric about zero. Out of range clamps to the i16 bound and returns the stored value. Asserted separately from the agreement above so a disagreement is never reported as a rounding bug, or the reverse. | S2 |
 | `POS-clamps-not-rejects/*` | An out-of-range position must NOT 400. PM's ruling: a node that appears to save, 400s and springs back is the worst shape a UI bug can have, and a 400 mid-drag is not an improvement. | S2 |
 | `POS-is-an-integer/*` | The stored value comes back as an integer, not `11.0`. A float here is what lets a client re-send it and restart the cycle. | S3 |
+| `POS-migration/is-integer` | **CONTROL** for every row below. Until #22 lands the engine stores floats, every migration displacement is exactly 0, and all of the migration checks would pass by doing nothing. They SKIP instead. |  |
+| `POS-migration-loses-no-node` | sqlite cannot change a STRICT column's type in place, so `x REAL`→`INTEGER` is a table rebuild. A rebuild that drops rows leaves a board that still looks plausible with 19 of 20 nodes. | **S1** |
+| `POS-migration-rounds-not-truncates` | The rebuild's obvious form, `CAST(x AS INTEGER)`, TRUNCATES toward zero: 10.6→10 and -10.6→-10, while the write path ROUNDS. That is the engine disagreeing with itself by one cell on every dragged node, arriving through the one door `POS-write-matches-refetch` does not watch. | **S2** |
+| `POS-migration-board-matches-disk` | A row corrected on disk but served stale by `/v1/board` is the same drift one layer up. | **S2** |
+| `POS-migration-no-visible-jump` | Rounding moves a node ≤0.5 cells/axis. One cell renders as one CSS px and the board caps zoom at 1.8 (`canvas.tsx`), so the worst a human can be shown is 1.27 px. Asserted rather than assumed, because it is the claim PM is relying on. | S3 |
+| `POS-migration-clamp-is-reported` | The ONLY unbounded case: a row already outside ±32767 lands on the bound from wherever it was, which is a node teleporting across the screen. Clamping is correct; doing it silently is not. | **S2** |
+| `POS-migration-is-idempotent` | A migration that re-applies its transform on every boot walks the board one cell per restart — invisible until it isn't. | **S2** |
+| `POS-migration-boots-past-unparseable-id` | A row whose `id` is not a UUID must not stop the engine BOOTING. `board::list` parsed every row and failed whole on the first bad one, so one unreadable row took the entire board down — and the board is the thing that would tell you which row is bad. A partial restore, a hand-edited row or an older schema all produce this. Found by accident: a readable fixture id (`mig-0000`) refused to boot the engine, and SDK asked that the awkward id stay rather than be quietly swapped for a UUID. | **S1** |
+| `POS-migration-bad-id-does-not-hide-good-nodes` | Skipping an unreadable row must not skip its neighbours — `/v1/board` still lists the well-formed nodes. | **S2** |
+
+### API-postgres-arm-is-still-built
+
+`postgres` becomes a NON-DEFAULT feature of wheel-api (`docs/decisions/2026-09-06-sqlx.md`), because cargo unifies features across a workspace build: leaving it on put a Postgres driver and a second TLS stack into `wheeld`'s binary however `wheeld` itself asked. Measured by API: wheel-api 214 → 200 crates, workspace 239 → 227.
+
+The hole that opens with it, also measured rather than predicted: every other Rust gate uses DEFAULT features, `tests/boot_db.rs` is `#![cfg(feature = "postgres")]`, and CI builds no API image. So after the change, nothing in CI compiles the code that talks to production's database — `cargo test -p wheel-api` runs **0** of boot_db's tests, `--features postgres` runs **5**. A compile error there would reach Railway before it reached a red build.
+
+This is the case ADVERSARY pre-committed to watching for: efficiency work is where correctness quietly dies. The efficiency win is real and worth taking; the gate has to arrive *with* it, not instead of it.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `API-postgres-arm-is-still-built` | `rust:clippy-pg` and `rust:test-pg` compile and test wheel-api with `--features postgres`. After the default changes these are the only things in CI that build the Postgres arm at all, so the predicate is that the arm is built and its 5 tests run. | **S1** |
+| `INFRA-budget-update-only-lowers` | `deps_gate.py --update` REFUSES to raise a ceiling without `--allow-regression`, naming every number that grew. Writing whichever value the tree happens to hold makes the budget a mirror rather than a ceiling, and A10's "a number someone has to argue for" becomes a number that silently follows the drift. Raised by API, twice. | **S2** |
+
+### EPH-* — an ephemeral agent must settle like any other
+
+PM measured this on the live deployment and the discriminator is one flag: `pm` is the only agent with `ephemeral_context = true`, and the only one stuck. Five others on the same engine and deploy settle normally. The timing is the tell — the turn COMPLETED (the operator got his reply) and status went to `starting` two seconds later. That is the restart that follows an ephemeral clear, and the agent then LIVES in `starting` between every turn rather than passing through it. It is also the operator's own agent: the only ephemeral one on the board is the one he talks to.
+
+Deliberately NOT asserted: that the status never touches `starting`. Restarting is what the flag is *for*, and forbidding the transition would forbid the feature. The defect is failing to leave it — which is why ADVERSARY's `in_flight`-keyed deadline is right and a time-in-`starting` deadline would kill this agent every turn, forever.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `EPH/plain-settles` | **CONTROL.** An identical non-ephemeral agent completes a turn and settles, in the same engine and the same run. If it does not, the fault is not the flag and attributing it to `ephemeral_context` would be wrong. | |
+| `EPH/context-was-cleared` | **NON-VACUITY CONTROL.** The session id changes across the turn. If the flag were silently ignored the agent would settle perfectly and the assertion below would pass while testing nothing — BUG-024's shape. | |
+| `EPH-settles-after-turn` | An agent with `ephemeral_context: true` reaches a settled status after a completed turn. | **S1** |
+| `EPH-second-turn-still-works` | It completes a SECOND turn. One turn proves the first clear survived; the operator's agent does this every turn. | **S1** |
+
+### PROGRESS-* — liveness is not progress
+
+Two production failures in one evening shared a shape: the process was alive, answered `/healthz` with 200, and was doing no work. The escaper panic killed the delivery task while tokio kept the process up; endpoint ingress enqueued and woke the agent but never pumped the queue. Both systems were asked *are you up*, both truthfully said yes, and up was read as working. **This suite contains no liveness assertion at all.** Liveness is recorded in failure text only — because "healthy and stuck" is the signature of the class, and naming it is what stops the next person reaching for a restart.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `PROGRESS-message-reaches-consumed/<producer>` | A message accepted by a producer reaches `consumed`. Parametrised over all four entry points (user-send, agent-msg, endpoint-ingress, script-msg): they share a drain but not an entry, and tonight's P0 was the ingress entry while agent-to-agent worked perfectly. A gate written against the path that broke last time cannot miss the one that breaks next. | **S1** |
+| `PROGRESS/endpoint-ingress` | **BUG-028 (S1, open).** Ingress does not drain to a RUNNING agent on main: 6/6 failures when idle, while interleaved user messages to the same agent are consumed instantly. `168430f` fixed the PARKED path only, which is the one every verification exercised. |  |
+| `PROGRESS-transitional-status-resolves` | `starting`/`queued` resolve **within a bounded deadline** (60s). ADVERSARY 041: a child can spawn cleanly then block forever on an init line that never comes, so an unbounded "eventually" is precisely the test production passes today. The bound is argued both ways — 6× the engine's own 10s health budget so a slow start has room, and far inside the 45 minutes an operator actually waited before calling it broken. | **S1** |
+| `PROGRESS-deadline-outcome` | The deadline checks DECLINE to judge when the agent's queue is empty. PM measured pm sitting in `starting` for 52 minutes with nothing queued, going to `idle` the instant a message arrived — it was waiting correctly, not wedged, and a flat deadline would have killed a healthy agent. The predicate is *an agent with work queued does not stay transitional past the deadline*; an empty queue means there is nothing to be late for. |  |
+| `PROGRESS-deadline-settles` | After the deadline fires, the status is an ANSWER, not another transitional state. A deadline that returns the agent to `starting` has not resolved the hang, it has made it periodic. | **S1** |
+| `PROGRESS-deadline-reason-readable` | The agent leaves the transitional state with a non-empty `last_error`. A status change with no reason sends the operator to the logs to reconstruct it, which is the 45 minutes this class costs. | **S2** |
+| `PROGRESS-deadline-spawns-no-second-process` | No second harness process across the window (contract §3c #13). **This is the axis that separates a real fix from a respawn loop**: a fix that satisfies the deadline by killing and respawning the child every 60s passes a status-only assertion while burning a spawn a minute and still delivering nothing — worse than the bug. Distinct pids are counted over time, because at any single instant a respawn loop looks exactly like an agent that is starting. | **S1** |
+| `PROGRESS-producers-stay-wired` | The producer count never falls below `WIRED_FLOOR`. SKIP is honest only while zero producers are wired; the commit wiring the first bumps the floor, and from then on dropping back to zero is a red build rather than a skip nobody reads. Verified by mutation. | **S2** |
 | `WOW/credential-detector-works` | CONTROL. A credential is planted in a scratch `.git/config` in the shape the production exposure had, and the detector must flag it. "We searched the workspace and found no token" is only evidence if the search would have found one; a wrong path, a typo in the grep or an empty token variable all otherwise read as green. | control |
 | `WOW/remote-was-poisoned` | CONTROL. The remote is deliberately rewritten to the production shape (`https://x-access-token:<pat>@github.com/...`) and must be detected as poisoned before the repair is exercised. | control |
 | `WOW-poisoned-remote-repaired` | The engine rewrites already-poisoned remotes on start (SDK ddaa0e1). Fixing the mechanism only protects clones made from now on; every workspace cloned before it still holds a live token, so a clone made yesterday keeps yesterday's token forever unless it is repaired. | **S1** |

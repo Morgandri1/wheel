@@ -38,6 +38,140 @@ ownership area. Ship small, commit often, keep main green.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
 3. **≥ 90 % test coverage** per crate and per package. Enforced in **CI** (`make check-strict` on every push to origin: `cargo llvm-cov --fail-under-lines 90` per crate; web `vitest --coverage` with `lines: 90`) — coverage below the bar is a failing check, not a warning. Locally `make check` runs everything except coverage (it OOMs with six agents resident) and `make coverage` runs it deliberately. A red CI on `origin/main` is the owner's to fix within the hour; PM pushes `main` after merges so CI sees every merge. **No exemption without a machine-checkable expiry; an exemption from a bar is never an exemption from regressing.** Exemptions are predicates the gate executes (crate + a floor that never decreases, in `qa/coverage-floors.json` + an expiry the gate evaluates); an expired exemption fails the gate and names the choice. wheel-engine: ratchet from 71.24% (2026-09-06), joins the 90% bar when M2 is complete. **Web's 90% bar is scoped, not universal**: it applies to the `src/lib` modules that encode rules — wire matrix, limits, auth/session, CSP, message states, validation, endpoint-probe verdicts — enumerated in `web/vitest.config.ts`'s coverage `include` (PM ruling 2026-09-06, on Web's own recommendation). UI components are exercised by QA's Playwright suite instead of this gate; that split stands because a component test that mocks everything proves less than an E2E click, while an untested branch in wire-matrix/validate fails silently and lands on the operator. The include list is a live obligation, not a fixed inventory: any new `src/lib` module whose wrong branch would be silently wrong (permission/wire checks, auth, security headers, state machines, anything §3c calls out) must be added to it on the PR that introduces it; pure glue/IO (API client plumbing, env resolution) stays out unless it grows that kind of logic.
 
+### A number must record what it is a measurement OF (QA finding, accepted 2026-09-06)
+
+`qa/size-budget.json` was a flat object with no platform key. Its five ceilings were measured on
+`aarch64-apple-darwin`; CI measures `x86_64-unknown-linux-gnu`. The same source built for two targets differs
+by ~17%, so **the gate was red from the moment it was seeded** and no code had regressed at all.
+
+`qa/deps-budget.json` had been platform-keyed from the start, for exactly this reason. The lesson existed in
+the repo and the second file did not apply it.
+
+- A stored measurement carries its conditions — platform, feature set, profile — or it is not a measurement,
+  it is a number.
+- **Leave the shipped platform's ceiling UNSEEDED so CI seeds it from a CI run.** Otherwise the next person to
+  run the gate on a laptop sets the ceiling for what production ships, which is the same bug wearing a
+  different hat. A local run then checks the local ceiling, CI checks the shipped one, and neither can fail on
+  the other's number.
+
+### A size gate measures what you ship; a test gate covers what you keep (PM ruling, 2026-09-06)
+
+These are two questions and they take different feature sets. Forcing them to match either under-tests the
+code or mis-measures the artifact.
+
+    tests + clippy : --features postgres                        (superset — nothing stops being built or run)
+    size gate      : --no-default-features --features postgres  (exactly what Railway runs)
+
+The failure this prevents is concrete: measured with default features, the "before" figure was a binary
+containing **both** database drivers — a binary we ship nowhere. A size number for a configuration that does
+not exist flatters or maligns the change at random.
+
+So: *does all our code still build and pass* is answered over the superset; *how big is the thing we ship* is
+answered over the shipped configuration, and neither answer is allowed to stand in for the other.
+
+### The coverage bar: do not worsen it, and do not freeze on inherited debt (PM ruling, 2026-09-06)
+
+Two crates sit under the operator's 90% bar — `wheel-sqlite` at 87.97% and `wheel-api` at 89.02%. Holding one
+lane to the bar while waving another through is not a standard, so:
+
+- **A merge may not push a crate further under the bar, and may not take a crate from above it to below it.**
+- **A crate already under the bar does not block unrelated work.** It gets a dated ticket and a named owner.
+
+Blocking every merge on inherited debt costs more than the debt does — the same reasoning that carved
+committing out of the merge freeze.
+
+And the distinction that made this visible, which is worth more than the rule: **a gate that RUNS a suite is
+not the same as that suite COUNTING toward coverage.** If `cargo-llvm-cov` is not invoked with the feature,
+the tests run and the number ignores them — so a merge can look coverage-neutral while making the measured
+figure worse for a reason that looks like the diff and is not.
+
+### A source-grep is a tripwire, not a gate (PM ruling, 2026-09-06)
+
+The endpoint P0 shipped with `include_str!("ingress.rs")` + `contains("supervisor.deliver(")`. Keep such a
+test — it catches a careless revert cheaply — but it may never be the only thing standing between us and a
+repeat, because it cannot do three things:
+
+- **It cannot see reachability.** The text being present passes even if the call sits behind a condition that
+  is never true. The P0 *was* a call that was never made; a test asking only whether the text exists cannot
+  tell "called" from "present".
+- **It goes red for the wrong reason.** Extract the call into a helper and it fails while the behaviour is
+  correct — a red that is not a defect, which we removed twice in one evening.
+- **"There is no harness in this module" is an argument about test infrastructure, not about the code.** That
+  shape of argument is refused for a coverage bar; it is refused here too.
+
+When a defect is a WRONG CALL that produces an observably identical response — `start()` and `deliver()` both
+answer 202 and both write the row — that argues for a better observation point, not for abandoning behaviour.
+Move the assertion to where a fake harness can watch the child's stdin: *an ingress hit against a parked agent
+results in the bytes reaching that child, with no other event occurring.*
+
+### The gate and the runtime backstop should watch the same signal (ADVERSARY, accepted 2026-09-06)
+
+The behavioural test for the ingress P0 asserts on *"a message that should be draining is stuck in `queued` /
+`in_flight`"*. The corrected 041 deadline arms on **the same signal**. That is not a coincidence and it is
+worth building to deliberately:
+
+- CI asserts the property against a wedged fixture; the runtime arms a deadline on the property in production.
+- One predicate, two consumers. If they drift, one of them is watching something that no longer matters.
+- Had the behavioural test existed, the P0 would have been **red in CI instead of found in production** — by
+  the operator, 52 minutes in, on his own board.
+
+When a class of failure is worth a runtime backstop, the same definition usually makes the better test; when
+it is worth a test, ask whether production deserves the same alarm.
+
+### Gate the commit, not the working tree (QA finding, accepted 2026-09-07)
+
+A gate was run locally, passed honestly, and was **meaningless**: it measured the working tree while the
+commit lacked the file the fix lived in. A `git revert -n` staged a set that did not include a still-unstaged
+`TESTPLAN.md` edit, so the merged commit asserted a test ID the plan did not name — the exact failure that
+gate exists to produce, shipped past the gate that had just caught it.
+
+This is the size-gate bug in a second costume — **measuring one artefact and gating another** — reproduced
+within the hour by the person who had just fixed the first one.
+
+- A local pass proves your working tree. It proves nothing about what you are about to merge.
+- Verify against the commit: `git stash -u` then re-run, or run the gate in a clean checkout of the SHA, or
+  let CI be the thing you believe.
+- "The gate caught my mistake" is only evidence of rigour if the fix is *in the commit*. Catching and then
+  shipping past it is worse than not catching it, because it is reported as diligence.
+
+### Check the instrument before you believe the result (PM ruling, 2026-09-07)
+
+The single most repeated failure of 2026-09-06, in both directions:
+
+| the instrument | what it falsely said |
+|---|---|
+| a manifest reading instead of a build diff | Clerk costs ~200 kB per route (it costs **zero** on first load) |
+| a mutable `wheel-engine:test` tag rebuilt mid-suite | a real S1 was not reproducible (a retraction was being written) |
+| an unfiltered `cargo tree` resolve | 346 crates (it is 281; 62 are Windows-only) |
+| ceilings measured on macOS, compared against Linux CI | every binary regressed ~17% (nothing regressed) |
+| a coverage run compiling none of the `postgres` arm | a coverage figure that counted none of its tests |
+| a test failing on `Invalid Chai property: toBeInTheDocument` | lazy loading does not work (jest-dom was simply absent) |
+
+A **negative** result from an unvalidated instrument is the dangerous one: it discards real work and records a
+false reason in git for whoever reads it next. The last row was one commit from doing exactly that, and what
+caught it was reading the error text — *Chai property*, not *element not found*.
+
+- Before believing a surprising result, prove the instrument ran: a non-zero exit, a build id, an image sha,
+  a platform triple, the feature set, the assertion library actually being loaded.
+- Prefer an assertion on **content** over one on structure. A lazy component that never resolves leaves an
+  empty container behind, and every structural assertion still passes.
+
+### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
+
+Run it or grep it before you assert it. Three instances in one day:
+
+- API twice asserted a coverage gap from memory. The second — "nothing exercises `AUTH_MODE=jwks`" — was
+  false: `crates/wheel-api/tests/support.rs` already stands up an RSA keypair, a real JWKS server and RS256
+  minting, and five test files run the full router against it in `cargo test --workspace`. They retracted it
+  themselves, before it was acted on, and in doing so gave up the strongest argument for work they wanted.
+- PM quoted "346 crates" to four agents all evening as the headline efficiency number. QA measured 281; the
+  larger figure was an unfiltered resolve including 62 Windows-only crates that compile nowhere we own.
+- ADVERSARY credited the `catch_unwind` belt as a verified defense in 035, then ran the suites and found zero
+  tests reach it (040).
+
+A claimed gap justifies work; a claimed cover justifies skipping it. Both are load-bearing, and neither
+survives being remembered rather than checked.
+
 ## 1. Repository & workflow
 
 - Monorepo at `/Users/metatron/wheel` (git, branch `main`), origin `https://github.com/Morgandri1/wheel.git`. Never rewrite history on `main`.
@@ -58,6 +192,55 @@ ownership area. Ship small, commit often, keep main green.
   crate/package tests), then `git -C /Users/metatron/wheel merge --no-ff <role>/main`. If the merge lock is held, retry.
 - Only touch paths you own. If you must edit another team's path, message the owner (via PM) with the diff.
 - Commit messages: `<area>: <imperative summary>` e.g. `engine: enforce wire matrix on cli calls`.
+
+### A red `main` is a stop-the-line (PM ruling, 2026-09-06)
+
+`main` was red for five consecutive commits and nine PRs queued behind it, because a gate written red
+ahead of its fix (QA's `POS-*` suite, correctly written that way per §0b) sat unfixed while every lane
+kept merging on top of it. None of those merges was ever seen green end-to-end.
+
+- **While `main` is red, the only thing that merges is the change that greens it.** Everything else waits.
+- The lane that owns the failing gate owns the recovery, and it outranks whatever else that lane has open.
+- A gate deliberately written red ahead of its fix is correct and stays correct — but it converts the fix
+  into the highest-priority item in the repo the moment it lands. Write the gate red, then land the fix
+  *next*, not eventually.
+- Whoever notices red `main` first says so. Silence is how five commits happen.
+- **A deliberately-red gate lands WITH its fix, not before it.** Writing a gate red ahead of the fix is
+  correct and stays correct (§0b) — but *merging* it to `main` converts one lane's known debt into a
+  repo-wide freeze for every other lane. Hold it on the lane branch and land both together, or land it in the
+  same merge as the fix. `POS-migration-clamp-is-reported` was merged red while `main` was being greened, and
+  became the thing blocking four lanes with eleven, six and two commits held behind it.
+- **A docs-only commit that corrects a FALSE STATEMENT in a decision document may merge during a freeze** —
+  for anyone, not just PM. A retracted claim that stays in the repo gets re-read as fact by the next person,
+  and decision documents are read by reviewers and rulers who were not in the conversation where it was
+  withdrawn. This is written down because PM had been landing contract commits throughout the freeze while
+  telling lanes to hold: either the exemption is general and stated, or it should not exist.
+- **Merging is blocked; committing is not** (API amendment, accepted 2026-09-06). Lane branches keep moving
+  and land the moment `main` greens. Read without this carve-out the rule quietly stops all work, which is
+  worse than the disease.
+- **A P0 production fix is the one exception.** If the board is down and the fix is not the fix for the red,
+  waiting on another lane to green is the wrong trade.
+- The cost this rule buys back is *reconstruction*, not review (API's reasoning, better than my own): six
+  commits went in unseen and it took twenty minutes to work out whether that mattered. Reconstruction is
+  dearer than review.
+
+### A red signal that is not a defect must be removed, not tolerated (PM ruling, 2026-09-06)
+
+Every open PR carried a failing `Vercel` check reading `Deployment rate limited — retry in 24 hours` — a
+free-tier build quota, not a code failure. A permanent red X that everyone learns to ignore is worse than
+no signal, because it trains the team to stop reading CI, and the one real failure then arrives disguised
+as the usual noise. An external-quota failure is either made non-blocking or made to not run. It is never
+left sitting red.
+
+### Gate discipline must be mechanical, not social (PM finding, 2026-09-06)
+
+`main` has **no branch protection** — `gh api repos/:owner/:repo/branches/main/protection` returns 404.
+Every rule in this section is currently enforced by convention alone. For a repository whose stated goal is
+to develop itself, an agent that merges red breaks nothing mechanical. Required status checks (the real
+gates: `make check`, `integration`; never an external-quota check like Vercel) are to be enabled **once
+`main` is green** — enabling them while red would freeze the swarm behind the very red they are meant to
+prevent. Sequence: green first, then protect.
+
 ### Position is an integer cell (operator ruling, 2026-09-06)
 
 `Position { x: i16, y: i16 }`. A board coordinate is a cell, not a measurement, and floats bought us
@@ -313,6 +496,62 @@ Every command prints a one-line human result (and `--json` for machine output). 
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
 
 
+### Any shared MUTABLE name is a clobber hazard, not just a branch (PM ruling, 2026-09-06)
+
+The docker tag `wheel-engine:test` was rebuilt under QA at 18:31, mid-suite, by neither QA nor SDK (SDK's
+builds were 18:55 and 19:03) — leaving the cloud board, whose lanes had been running the same repo with the
+same names. QA's second run of a real S1 then PASSED, because it ran a *different engine binary*, and they
+were **composing a retraction of a true finding** when they compared the image shas.
+
+Had that retraction been sent, the fix would have been reverted or never written, and the operator's Telegram
+bridge would still drop messages while the agent is warm.
+
+- **`pin_image` protects WITHIN a run and does nothing across runs.** A mutable tag is shared state between
+  every actor that can push it.
+- The hazard is not specific to branches. **Docker tags, image ids, worktree paths — any shared mutable name**
+  is the same failure, and this one actually fired.
+- Before any handoff between boards, every such name must be namespaced or one board must be stopped. Only one
+  board being awake is a schedule, not a mechanism.
+
+### A pushed branch is the cheapest status report (PM ruling, 2026-09-06)
+
+Push a branch as soon as it exists — empty, broken, whatever it is. From outside your machine, local-only
+work is indistinguishable from no work: PM read `refs/remotes/origin`, saw a lane's newest branch hours
+stale, and escalated toward taking over a P0 that was already in progress in an unpushed worktree. Three
+interruptions the lane did not deserve, and PM's visibility problem, not the lane's reporting failure.
+
+A pushed branch cannot be beheaded in transit and needs no one to write it up. It is checked first, and a
+lane with one is treated as started.
+
+### Budget a duplicate, do not demand zero (QA ruling, accepted 2026-09-06)
+
+PM asked for a gate on `cargo tree -d` returning nothing. QA refused it and was right: 11 of our 12
+duplicates are upstream version skew we do not control — `getrandom` at 0.2, 0.3 *and* 0.4 simultaneously,
+`hashbrown` at 0.14/0.15/0.17, `rand` 0.8/0.9, `syn` 2/3, `webpki-roots` 0.26/1.0. No diff of ours moves
+them. A gate demanding zero is red forever for a reason nobody can act on — the permanent-red-X failure
+recorded above, manufactured deliberately this time.
+
+The gate is a **ratcheting allowlist**: the known duplicates are budgeted, a thirteenth is a red build, and
+a duplicate that goes away must be deleted from the file or the gate fails — so it cannot silently re-permit
+what we fixed.
+
+Corollary, also QA's: **crate count and duplicate count are near-independent.** Dropping `sqlx` removes 34
+crates from `wheeld` (278 → 244, -12%) and fixes exactly *one* duplicate. Do not accept "the tree gets clean"
+as a side effect of a crate-count win.
+
+### Anything that needs a ruling goes in git, not in a message (PM ruling, 2026-09-06)
+
+YOKE truncates the FRONT of long messages — five occurrences in one day, in both directions. A beheaded
+message is worse than a lost one, because what survives reads as complete: a ruling arrives with its
+conditions missing, or a proposal arrives with its subject missing and only its request for approval intact.
+
+- A ruling, a proposal, or anything else whose exact wording decides what gets built is **written to a file
+  and pushed**, and the message carries only the branch and SHA. Proposals go in `docs/proposals/`.
+- This is proven in both directions: PM's `example.com` ruling arrived intact as commit `6c69e3b` after four
+  message attempts were beheaded.
+- Git has not truncated on us once. Use the transport that works for the payload that matters, and keep
+  messages for the pointer.
+
 ### 3c. Comms hardening — lessons from running this team on YOKE (PM, binding; owner: SDK unless noted)
 
 We mimic YOKE's *pattern*, not its rough edges. Every one of these was hit in the first hours of this project.
@@ -395,6 +634,21 @@ Turn-complete and status are inferred ONLY from top-level harness events on the 
 run by the agent which prints a well-formed `{"type":"result"}` (or any harness event) line to ITS stdout cannot reach the engine's parser as a
 top-level event (the CLI nests tool output inside JSON strings; the agent-sdk bridge makes this structural). Events must also carry the
 `session_id` the engine started; mismatches are logged and ignored.
+
+### The gate is the uid, not the path (ADVERSARY 037, accepted 2026-09-06)
+
+Six repo clones live under `creds/<agent-uuid>/wheel`, two carrying 827 MB of `node_modules`. Moving them to
+`ws/` is **hygiene, not a fix**, and shipping only that move must not be called closing 037/038.
+
+A malicious npm `postinstall` or `build.rs` runs as uid 21088 and can `open()` any path that uid can read —
+every other agent's `creds/`, and `/proc/<engine-pid>/environ` (`WHEEL_ENGINE_SECRET` = wire-matrix bypass,
+`WHEEL_VAULT_KEY` = decrypt every vault) — *regardless of which directory the clone sits in*. The move
+changes where unreviewed executables live, not what they can read once they run.
+
+- Do the move anyway: thousands of unreviewed files should not sit beside credential files. It is
+  defense-in-depth, and it is worth doing.
+- But the exposure closes only with **per-node uids** (§3e, M2/M3). Until then, the layout is cosmetic with
+  respect to it, and any claim that 037/038 is addressed by relocation is a fix that looks like one.
 
 ### Credential-distribution rule (binding; two S1-class bugs found on this path in one day)
 `save_to_vault` — anything that takes a credential from one node and hands it to many — is the most dangerous surface in Wheel. No change
