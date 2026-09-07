@@ -44,3 +44,32 @@ exit code. That false-clean nearly deleted an agent's uncommitted work. Every ch
    backups, projects, wheel-src, .profile).
 5. Re-measure, report before/after `df` to the operator. Expected ~2.8G → ~1.1-1.2G if all six reclaim;
    ~1.9G → ~1.0G if qa held.
+
+## OUTCOME — executed 2026-09-07 ~01:25 MDT (operator go; SDK scope = pm tree only)
+
+All six `creds/<uuid>/wheel` checkouts deleted, one at a time, each guarded by a live
+delete-time re-check (`git -C <tree> -c safe.directory=<tree> status --porcelain`, rc=0
+AND 0 lines; b969c042's expected dirty ` M qa/BUGS.md` gated instead on its diff sha256
+`5832e81b…` matching the rescued snapshot, which itself is on `origin/main@3d5ea1d`).
+Every agent home preserved; zero deleted-but-open fds; namespace clean afterward.
+
+Authority for the record: PM's own rc/safe.directory/origin-reachability checks on the five
++ QA's own-tree declaration and PM's content-verified rescue at 3d5ea1d + operator's go.
+SDK signed off the **pm tree (ccd0a90) only**; the four-tree evidence never reached SDK
+intact, so SDK did not review the other five. Not a second pair of eyes on the five.
+
+### Space recovered: ~0.2G, not the projected ~1.7G — projection was wrong, here is why
+`df /data`: 2.8G→2.6G used (62%→58%). `du creds`: 2.4G→2.2G.
+
+The ~1.7G projection double-counted shared content. Web's and QA's checkouts (pnpm apps)
+materialise `node_modules` as **hardlinks into each home's `.local/share/pnpm` store**
+(882M each). Per-dir `du wheel/` counted those blocks under the checkout, but they are
+shared with the LIVE agent home; deleting the checkout drops one hardlink, not the blocks.
+Only the checkouts' unique content (`.git` + source, ~0.2G total) was actually freed.
+(The post-delete `find -links +1` count is low precisely because the second link — the
+checkout side — is now gone; it does not disprove the pre-delete sharing.)
+
+### The real space consumer, for any future reclaim
+The remaining 2.2G in `creds/` is agent homes; two `.local/share/pnpm` stores (~882M each,
+~1.76G) dominate. These are re-fetchable caches inside LIVE homes — a separate, more careful
+decision than orphaned-checkout cleanup, and not taken here. Volume at 58% is healthy; no urgency.
