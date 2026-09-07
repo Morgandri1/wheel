@@ -1381,3 +1381,19 @@ evidence, found the route it had tested was dead, and wrote the correction down 
 correction sat uncommitted on a volume scheduled for deletion. Without it, `main` would have
 carried a CONFIRMED claim its own author had already withdrawn, and the next person would have
 hunted a columns bug that the evidence never supported.
+
+### 035 — `generated.ts` drifted from wheel-core; no gate regenerates it (S2, QA gate owed + Web regen, **open**)
+
+Found by Web, verified here. `workspaces` (`crates/wheel-core/src/node.rs:196`): 1 occurrence in
+core, 3 in `docs/schema/*.json`, **0** in `web/src/lib/schema/generated.ts`. `generated.ts` last
+written 2026-09-05 23:54; `index.ts` beside it 2026-09-06 21:38.
+
+**The gate was in my role brief from the start** — "the web's generated TS types match the schema
+(regenerate and `git diff --exit-code`)" — and I never built it. This is the drift it existed to
+prevent, so the entry is against QA, not Web.
+
+Both halves already exist: `cargo run -p wheel-core --bin export-schema` and `pnpm -C web gen:types`
+(`web/package.json`). The gate is the diff check around them.
+
+**Lands WITH Web's regeneration, not before** — it is red today, and a deliberately-red gate on main
+freezes every other lane.

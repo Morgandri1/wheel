@@ -79,3 +79,11 @@ OPERATOR-DOMAIN DECISION (not PM's to take alone): actually activating the cloud
 re-raises the duplication the operator halted earlier ("doing the same job as you"). The resolution is
 to MOVE the loop, not run both — this swarm's role becomes bootstrapping the board to make itself
 unnecessary. Pending the operator's go on that flip.
+
+## DECISION (operator, 2026-09-07): INCREMENTAL WAKE
+
+Move the loop to the board dogfood-driven, not build-first. After the merge-PATCH prereq: wake ONE cloud
+agent on one small real task, observe what breaks, let that drive the build order — iterate agent by agent.
+The laptop swarm stays primary meanwhile, so duplication is bounded to one agent/task and the step is
+reversible. The first wake doubles as SDK's turn-completion discriminator (consumed? left running? "could
+not record spend" in log? turns increment?), so it settles the frozen-state question with a live turn.
