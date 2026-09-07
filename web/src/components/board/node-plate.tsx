@@ -56,7 +56,7 @@ function NodePlateInner({ data, selected }: NodeProps) {
     <div
       data-testid={`node-${node.name}`}
       data-node-type={node.type}
-      className="plate relative w-[190px] select-none"
+      className="plate group relative w-[190px] select-none"
       style={{ borderColor: selected ? "var(--accent)" : undefined }}
       onDoubleClick={() => node.type === "agent" && onOpenLog(node.id)}
     >
@@ -80,7 +80,7 @@ function NodePlateInner({ data, selected }: NodeProps) {
       <Handle
         type="target"
         position={Position.Left}
-        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)]"
+        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
       />
 
       <div className="flex items-center gap-2 border-b border-rule px-2.5 py-1.5">
@@ -219,7 +219,7 @@ function NodePlateInner({ data, selected }: NodeProps) {
       <Handle
         type="source"
         position={Position.Right}
-        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)]"
+        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
       />
     </div>
   );
