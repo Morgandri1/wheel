@@ -477,7 +477,27 @@ pub async fn query(
     // The engine's own connection is NOT held across the query: user SQL runs
     // on its own read-only connection, and holding the writer would let a slow
     // query stall message delivery for everyone.
+    //
+    // That trade is right, and it is also the ONLY cli path where the
+    // capability check and the action do not share a lock. Every other handler
+    // holds the single writer connection across check AND act, so a concurrent
+    // `DELETE /v1/wires` — which needs that same lock — cannot land between
+    // them; the window is closed by the single-writer design rather than by a
+    // transaction. Here the lock is released on purpose, so the window is real:
+    // a wire revoked while a 5s query runs would otherwise still return its
+    // rows.
+    //
+    // So the wire is re-checked before the rows are DISCLOSED. The read may
+    // have happened against a capability that has since been revoked; nothing
+    // is handed back unless the capability still holds at the moment of
+    // disclosure, which is the guarantee that actually matters to the operator
+    // who revoked it.
     let rows = tables::query(&s.cfg.db_path(), &table, &body.sql).map_err(storage_err)?;
+    {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        me.require(&conn, &body.table, WireType::Read)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+    }
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 

@@ -510,6 +510,134 @@ fn explain(e: rusqlite::Error) -> anyhow::Error {
     }
 }
 
+/// The functions a read-only query over one table legitimately needs.
+///
+/// Deliberately a list of NAMES rather than a set of families: a family rule
+/// ("anything starting with `json_`") would re-open the hole the moment sqlite
+/// or a feature flag added a member of that family. Adding a function here is a
+/// decision someone makes and a reviewer sees.
+///
+/// `load_extension` is absent, and so is anything file- or process-shaped.
+/// `random`/`randomblob` are present because they are already bounded by the
+/// per-value byte limit, which is what makes them harmless rather than their
+/// name.
+const QUERY_FUNCTIONS: &[&str] = &[
+    // aggregates
+    "avg",
+    "count",
+    "group_concat",
+    "max",
+    "min",
+    "sum",
+    "total",
+    // conditionals and null handling
+    "coalesce",
+    "if",
+    "iif",
+    "ifnull",
+    "nullif",
+    // strings
+    "char",
+    "concat",
+    "concat_ws",
+    "format",
+    "glob",
+    "hex",
+    "instr",
+    "length",
+    "like",
+    "likelihood",
+    "likely",
+    "lower",
+    "ltrim",
+    "octet_length",
+    "printf",
+    "quote",
+    "replace",
+    "rtrim",
+    "soundex",
+    "substr",
+    "substring",
+    "trim",
+    "unhex",
+    "unicode",
+    "unlikely",
+    "upper",
+    // numbers
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "ceil",
+    "ceiling",
+    "cos",
+    "degrees",
+    "exp",
+    "floor",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "mod",
+    "pi",
+    "pow",
+    "power",
+    "radians",
+    "random",
+    "randomblob",
+    "round",
+    "sign",
+    "sin",
+    "sqrt",
+    "tan",
+    "trunc",
+    // dates
+    "date",
+    "datetime",
+    "julianday",
+    "strftime",
+    "time",
+    "timediff",
+    "unixepoch",
+    // json1
+    "json",
+    "json_array",
+    "json_array_length",
+    "json_error_position",
+    "json_extract",
+    "json_group_array",
+    "json_group_object",
+    "json_insert",
+    "json_object",
+    "json_patch",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_set",
+    "json_type",
+    "json_valid",
+    // window functions, which arrive through this arm too
+    "cume_dist",
+    "dense_rank",
+    "first_value",
+    "lag",
+    "last_value",
+    "lead",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "rank",
+    "row_number",
+    // misc, all pure
+    "abs",
+    "changes",
+    "last_insert_rowid",
+    "nullif",
+    "typeof",
+    "zeroblob",
+];
+
 /// Default DENY (§3). Anything not named here is refused, so a sqlite version
 /// that adds an action does not quietly widen this.
 fn authorize(allowed: &str, action: AuthAction<'_>) -> Authorization {
@@ -525,13 +653,25 @@ fn authorize(allowed: &str, action: AuthAction<'_>) -> Authorization {
         // Common table expressions and subqueries are fine; they still read
         // through `Read`, which is checked above.
         AuthAction::Recursive => Authorization::Allow,
-        // Aggregates, string and date functions. `load_extension` is a
-        // function too, and would be a way out of this box entirely.
+        // ALLOWLISTED, like every other arm (ADVERSARY 044). This used to allow
+        // every function and deny only `load_extension`, which made it the one
+        // place the "default DENY" above did not apply.
+        //
+        // Nothing dangerous is reachable on today's build — that was audited,
+        // not assumed — but the risk lived in Cargo.toml rather than here: add
+        // a rusqlite feature that registers file- or exec-capable functions
+        // (`functions`, `vtab`, `fileio`), or flip an FTS tokenizer flag, and
+        // an allow-by-default arm exposes it with no code change and no review
+        // prompt. That is exactly the quiet widening the comment above is
+        // written to prevent.
         AuthAction::Function { function_name } => {
-            if function_name.eq_ignore_ascii_case("load_extension") {
-                Authorization::Deny
-            } else {
+            if QUERY_FUNCTIONS
+                .iter()
+                .any(|f| function_name.eq_ignore_ascii_case(f))
+            {
                 Authorization::Allow
+            } else {
+                Authorization::Deny
             }
         }
         _ => Authorization::Deny,
@@ -931,6 +1071,50 @@ mod query_tests {
             !err.starts_with("returned"),
             "{sql:?} was ALLOWED and returned data: {err}"
         );
+    }
+
+    /// ADVERSARY 044. Every arm of the authorizer is deny-by-default except
+    /// `Function`, which allowed EVERY function and denied only
+    /// `load_extension` — so the guarantee stated three lines above it did not
+    /// hold for the one action that can reach outside sqlite.
+    ///
+    /// Nothing dangerous is reachable on today's build; the audit confirmed
+    /// that. The risk lived in Cargo.toml: add a rusqlite feature registering
+    /// file- or exec-capable functions and the allow-by-default arm exposes it
+    /// with no code change here and nothing to review.
+    ///
+    /// So this asserts the INVARIANT rather than a blocklist of scary names: a
+    /// function nobody has ever registered is denied. A blocklist test would
+    /// pass on the day someone adds the function that matters.
+    #[test]
+    fn a_function_nobody_allowlisted_is_denied_even_if_sqlite_grows_one() {
+        let (path, _c, _mine, _other) = file_db();
+
+        // Not a real sqlite function today — which is the point. If a future
+        // build registers it, it must still be refused until someone adds it
+        // to the list deliberately.
+        denied(&path, "SELECT readfile('/etc/passwd') FROM t_notes");
+        denied(&path, "SELECT writefile('/tmp/x', 'y') FROM t_notes");
+        denied(&path, "SELECT fts3_tokenizer('simple') FROM t_notes");
+        denied(&path, "SELECT an_invented_function_name(1) FROM t_notes");
+        denied(&path, "SELECT load_extension('evil.so') FROM t_notes");
+
+        // And the hatch still WORKS: an allowlist that breaks ordinary queries
+        // would be traded for an outage, which is not a better bargain.
+        assert!(
+            run(&path, "SELECT count(*) FROM t_notes").is_ok(),
+            "aggregates must still work"
+        );
+        assert!(
+            run(&path, "SELECT upper(key), length(key) FROM t_notes").is_ok(),
+            "string functions must still work"
+        );
+        assert!(
+            run(&path, "SELECT json_extract('{\"a\":1}', '$.a')").is_ok(),
+            "json1 must still work"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// The control: if everything below is denied because everything is
