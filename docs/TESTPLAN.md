@@ -265,6 +265,7 @@ token is wrong.
 | `AUTH-cred-key-var` | An `sk-ant-api…` key arrives as **ANTHROPIC_API_KEY and nothing else**. | S2 |
 | `AUTH-cred-oat-value` / `AUTH-cred-key-value` | The credential that arrives is byte-identical (by sha256) to the one stored — routed to the right variable *and* not mangled on the way. | S2 |
 | `AUTH-cred-no-stale` | Replacing a credential clears the variable the previous one used; a spawn never carries two credentials because an earlier auth left one behind. | **S1** |
+| `AUTH-codex-node-refused-honestly` | Placing a `harness: codex` node is REFUSED with a reason naming codex. Codex is M2, and a node accepted-then-silently-run-as-claude is exactly the success shape an unimplemented capability must never answer with (`08b3492`). `AUTH-cred-codex-var` is PENDING behind it — the CODEX_API_KEY-not-OPENAI_API_KEY claim is preserved, not deleted, and re-arms when Codex lands. | **S2** |
 | `AUTH-cred-codex-var` | A codex agent's key arrives as **CODEX_API_KEY**, never `OPENAI_API_KEY` — the latter is reported as present by `codex doctor` and authenticates nothing. | S2 |
 | `AUTH-cred-config-dir` | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` are set per node, so two agents never share a credential store. | **S1** |
 | `SEC-no-secret-in-argv` | No credential appears in the child's argv — argv is world-readable across uids (§5b). Asserted from the dump's own record of argv. | **S1** |
