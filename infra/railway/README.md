@@ -160,3 +160,35 @@ What filled it was per-agent Rust toolchains: each agent node had its own `.rust
 inside its private credentials directory, and one had cloned the repo into that directory and built
 it there (a 1.9 GB `target/`). ARCHITECTURE M1.6 wants `CARGO_HOME`/`RUSTUP_HOME` **per project**;
 the engine's spawn environment is SDK's.
+
+## The engine's `build` SHA — why Railway cannot supply it
+
+`docker/Dockerfile.host` takes `ARG GIT_SHA` in its **build stage**, and the engine bakes it at
+compile time (`option_env!`). `make engine-image` passes `--build-arg GIT_SHA=$(git rev-parse HEAD)`,
+so a locally- or CI-built image reports the commit its binaries were compiled from. Verified by
+running the real image: `build` matched `git rev-parse HEAD` exactly while the container's own
+`WHEEL_BUILD_SHA` was unset, which is the proof it is compiled in rather than supplied at runtime.
+
+**Railway passes no build args, and cannot be made to.** Both mechanisms were checked rather than
+reasoned about:
+
+1. **The service-settings API has no build-args field.** `apply-settings.sh` pushes each
+   `settings.json` key through Railway's GraphQL `ServiceInstanceUpdateInput`. Introspecting that
+   type returns `builder`, `dockerfilePath`, `watchPatterns`, `startCommand`, `numReplicas`,
+   healthcheck, region and restart policy — and nothing for Docker build arguments. That is the
+   platform's limitation, not our schema's.
+2. **`RAILWAY_GIT_COMMIT_SHA` is not referenceable.** The obvious workaround is a service variable
+   `GIT_SHA=${{RAILWAY_GIT_COMMIT_SHA}}`, since Railway does expose variables at build time. That
+   commit SHA is injected at *deploy* time and is not itself a variable, so the reference resolves to
+   the **empty string**. Measured: setting it produced `GIT_SHA = ''`.
+
+**Do not retry workaround 2.** It is worse than the status quo — a rebuild would bake `GIT_SHA=""`
+and `build` would report an empty string, which reads as a bug, where `"unknown"` declines honestly.
+It was set with `--skip-deploys` and deleted immediately, so production never built with it.
+
+**So `build: "unknown"` on Railway is the end state, not a pending fix.** Making it exact would need
+the SHA to reach the compiler, which here means either a runtime read — and the runtime value names
+the commit that *triggered* the deploy, not the one the binaries were built from, which is a false
+confirm and worse than none — or a build step Railway does not offer.
+
+**Confirm a Railway deploy by checking it actually rebuilt**, not by reading `build`.
