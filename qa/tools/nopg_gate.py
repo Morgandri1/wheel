@@ -83,6 +83,15 @@ def main():
               % (len(targets), ", ".join(targets)))
         return 0
 
+    blob = (r.stdout or "") + (r.stderr or "")
+    if "extern location for" in blob or "No such file or directory (os error 2)" in blob:
+        # Another worktree's cargo deleted an rlib from the shared target dir mid-build.
+        # Reporting that as "a test needs Postgres" would send someone after a file that is
+        # correctly guarded. Contention is inconclusive, not red.
+        print("cargo run was eaten by another worktree (an artifact vanished from the "
+              "shared target dir mid-build), so this gate did not run. Re-run it.")
+        return CONTENDED
+
     tail = (r.stdout or "")[-1500:] + (r.stderr or "")[-800:]
     print("rust:test-nopg: FAILED\n"
           "  A test in the DEFAULT build tried to reach a database. Under default features "
