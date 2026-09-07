@@ -80,10 +80,29 @@ impl Config {
             _ => ListenAddr::default_tcp(),
         };
 
+        let vault_key = std::env::var(ENV_VAULT_KEY).ok().filter(|v| !v.is_empty());
+
+        // ADVERSARY 036/037: until per-node uids land (§3e, M2/M3), every
+        // child of this engine shares ITS uid, so anything left in the
+        // engine's own environ sits in /proc/<engine-pid>/environ, readable
+        // by any of them for the engine's entire lifetime. These two are the
+        // whole story: the control-plane bearer (bypasses the wire matrix
+        // outright) and the key that decrypts every vault in the project. A
+        // stopgap independent of the uid work -- scrub the moment they are
+        // read, not "when M2 lands".
+        //
+        // SAFETY: single-threaded here -- this runs once, synchronously, at
+        // the top of `main`, before any child is spawned or any other thread
+        // that could be reading the environment concurrently exists.
+        unsafe {
+            std::env::remove_var(ENV_ENGINE_SECRET);
+            std::env::remove_var(ENV_VAULT_KEY);
+        }
+
         Ok(Self {
             project_id,
             engine_secret,
-            vault_key: std::env::var(ENV_VAULT_KEY).ok().filter(|v| !v.is_empty()),
+            vault_key,
             data_dir: PathBuf::from(var(ENV_DATA_DIR).unwrap_or_else(|_| "/data".into())),
             listen,
             json_logs: std::env::var(ENV_LOG).map(|v| v == "json").unwrap_or(false),
@@ -265,5 +284,46 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// ADVERSARY 036/037: until per-node uids land, every child of this
+    /// engine shares its uid, so anything `from_env` leaves behind sits in
+    /// `/proc/<engine-pid>/environ` for any of them to read for the engine's
+    /// whole lifetime. The two that matter are the control-plane bearer and
+    /// the vault-decryption key — both must be gone from the process
+    /// environment the moment `Config` has its own copy, not merely absent
+    /// from the returned struct.
+    #[test]
+    fn the_engine_secret_and_vault_key_do_not_survive_in_the_process_environment() {
+        with_env(
+            &[
+                (ENV_PROJECT_ID, Some("2b1f6b0e-6b0a-4c1a-9c1a-000000000000")),
+                (ENV_ENGINE_SECRET, Some("at-least-sixteen-characters")),
+                (ENV_VAULT_KEY, Some("some-vault-key")),
+                (ENV_LISTEN, None),
+                (ENV_DATA_DIR, None),
+                (ENV_LOG, None),
+                (ENV_TOOL_ALLOW_HOST, None),
+                (ENV_ENV, None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("a fully-specified env must configure");
+
+                // The struct still has them -- this is a scrub, not a loss.
+                assert_eq!(cfg.engine_secret, "at-least-sixteen-characters");
+                assert_eq!(cfg.vault_key.as_deref(), Some("some-vault-key"));
+
+                // The process environment -- what a same-uid child's
+                // /proc/<engine-pid>/environ would show -- must not.
+                assert!(
+                    std::env::var(ENV_ENGINE_SECRET).is_err(),
+                    "the engine secret is still in this process's environment"
+                );
+                assert!(
+                    std::env::var(ENV_VAULT_KEY).is_err(),
+                    "the vault key is still in this process's environment"
+                );
+            },
+        );
     }
 }
