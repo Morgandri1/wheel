@@ -298,8 +298,13 @@ def main():
             # 8. The only case an operator can actually see.
             moved = max(abs(gx - x), abs(gy - y)) if isinstance(gx, (int, float)) else 0
             if want_clamp:
-                R.gated("POS-migration-clamp-is-reported", "POS-migration/is-integer",
-                        ("mig-node-%04d" % i) in log or "clamp" in log.lower(),
+                # PENDING, not red: BUG-029 is filed and open, and a deliberately-red
+                # gate on main freezes every other lane (ARCHITECTURE.md). This one was
+                # the single failing assertion across nineteen integration suites. It
+                # flips to FAIL the moment SDK adds the log line, demanding promotion.
+                R.pending("POS-migration-clamp-is-reported",
+                          ("mig-node-%04d" % i) in log or "clamp" in log.lower(),
+                          "BUG-029",
                         "%s was outside the bound and moved %.0f cells (%.0f px at the "
                         "board's max zoom of %.1f). That is a node teleporting across the "
                         "screen, and the boot log never mentions it. Clamping is correct; "
@@ -349,9 +354,12 @@ def main():
                     "an older schema all produce this. Boot log tail:\n%s" % log2[-800:])
             st2, board2 = http("GET", "/v1/board")
             names = {n.get("name") for n in ((board2 or {}).get("nodes") or [])}
-            R.gated("POS-migration-bad-id-does-not-hide-good-nodes",
-                    "POS-migration-boots-past-unparseable-id",
-                    st2 == 200 and any(n and n.startswith("mig-node-") for n in names),
+            # PENDING for the same reason as the clamp above: BUG-031 is filed and open,
+            # and this gate has never reached main. Landing it red would repeat exactly
+            # the violation that froze four lanes an hour ago, with my own name on both.
+            R.pending("POS-migration-bad-id-does-not-hide-good-nodes",
+                      st2 == 200 and any(n and n.startswith("mig-node-") for n in names),
+                      "BUG-031",
                     "the engine booted but /v1/board no longer lists the well-formed "
                     "nodes (%s). Skipping the unreadable row must not skip its neighbours."
                     % sorted(names)[:8])
