@@ -101,11 +101,35 @@ pub async fn patch_node(
     if let Some(pos) = body.position {
         node.position = pos;
     }
-    if let Some(cfg) = body.config {
-        // A config patch must be re-tagged with the node's EXISTING type: a
-        // PATCH may never change what kind of node this is, because the type
-        // determines its wires, its storage and its capabilities.
-        let tagged = serde_json::json!({ "type": node.node_type().as_str(), "config": cfg });
+    if let Some(patch) = body.config {
+        // MERGE, never replace (P0). This used to overwrite `config` wholesale,
+        // so a client that PATCHed only the fields it had controls for erased
+        // every field it did not: workspaces, budget and idle_timeout_secs to
+        // None, run_on_startup to false — 200, no warning, config nobody typed
+        // silently gone. Dogfooding IS editing agents, so the destructive path
+        // was the core path.
+        //
+        // Merged HERE rather than read-modify-write in the UI because the UI is
+        // ONE caller: board-as-code import, the operator CLI, and scripts are
+        // others, and "every caller must remember" is how three of this week's
+        // defects happened. It is also race-free — the handler holds the single
+        // writer lock across read and write, where two clients doing
+        // read-modify-write would silently drop one edit.
+        //
+        // RFC 7386 JSON Merge Patch, so `null` can UNSET a field. A merge with
+        // only "absent means unchanged" can set `budget` and never clear it.
+        let mut merged = serde_json::to_value(&node.config)
+            .ok()
+            .and_then(|tagged| tagged.get("config").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        merge_patch(&mut merged, &patch);
+
+        // The merged RESULT is validated before it is stored: `config` is a
+        // tagged enum, so raw JSON merging can produce a shape that is not a
+        // legal config for this type. An invalid merge is a 400, never a stored
+        // half-config. The type is re-applied from the EXISTING node — a PATCH
+        // may never change what kind of node this is.
+        let tagged = serde_json::json!({ "type": node.node_type().as_str(), "config": merged });
         node.config = serde_json::from_value(tagged)
             .map_err(|e| ApiError::invalid(format!("config does not match node type: {e}")))?;
     }
@@ -155,6 +179,33 @@ fn move_workspace(from: &std::path::Path, to: &std::path::Path) {
             from = %from.display(), to = %to.display(), error = %e,
             "renamed the node but could not move its workspace; the old checkout is orphaned"
         );
+    }
+}
+
+/// RFC 7386 JSON Merge Patch, applied in place.
+///
+/// Absent means unchanged, present means replaced, and explicit `null` means
+/// REMOVE — that last rule is why this is 7386 rather than something simpler.
+/// Without it a field can be set and never unset, so an operator could add a
+/// `budget` through the UI and have no way to take it off again.
+///
+/// A non-object patch replaces the target outright, which is the spec and is
+/// what makes nested objects merge recursively rather than clobber.
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(patch_map) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = target.as_object_mut().expect("just made it an object");
+    for (k, v) in patch_map {
+        if v.is_null() {
+            map.remove(k);
+        } else {
+            merge_patch(map.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+        }
     }
 }
 
@@ -212,6 +263,83 @@ pub async fn remove_wire(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("no such wire"))
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The production bug, at the layer it happened: a client PATCHing only the
+    /// fields it has controls for must not erase the ones it does not.
+    ///
+    /// This is what was destroying agent config on the live board on every
+    /// save — 200, no warning, workspaces and budget gone.
+    #[test]
+    fn a_patch_touching_one_field_leaves_the_others_alone() {
+        let mut cfg = json!({
+            "harness": "claude",
+            "system_prompt": "p",
+            "run_on_startup": true,
+            "idle_timeout_secs": 900,
+            "budget": { "max_turns": 50 },
+            "workspaces": [ { "path": "wheel" } ]
+        });
+
+        // What a UI with only a prompt box sends.
+        merge_patch(&mut cfg, &json!({ "system_prompt": "edited" }));
+
+        assert_eq!(cfg["system_prompt"], "edited");
+        assert_eq!(cfg["run_on_startup"], true, "run_on_startup must survive");
+        assert_eq!(
+            cfg["idle_timeout_secs"], 900,
+            "idle_timeout_secs must survive"
+        );
+        assert_eq!(cfg["budget"]["max_turns"], 50, "budget must survive");
+        assert_eq!(
+            cfg["workspaces"][0]["path"], "wheel",
+            "workspaces must survive"
+        );
+    }
+
+    /// Why RFC 7386 rather than "absent means unchanged" alone: without an
+    /// explicit remove, a field can be SET through the UI and never cleared.
+    #[test]
+    fn an_explicit_null_removes_a_field_so_it_can_be_cleared() {
+        let mut cfg = json!({ "system_prompt": "p", "budget": { "max_turns": 50 } });
+        merge_patch(&mut cfg, &json!({ "budget": null }));
+        assert!(
+            cfg.get("budget").is_none(),
+            "null must REMOVE, or an operator can add a budget and never take it off"
+        );
+        assert_eq!(
+            cfg["system_prompt"], "p",
+            "and it must remove only what it names"
+        );
+    }
+
+    /// Nested objects merge rather than clobber — raising max_usd must not
+    /// silently drop max_turns beside it.
+    #[test]
+    fn a_nested_object_merges_instead_of_replacing_its_siblings() {
+        let mut cfg = json!({ "budget": { "max_turns": 50, "max_usd": 1.0 } });
+        merge_patch(&mut cfg, &json!({ "budget": { "max_usd": 2.0 } }));
+        assert_eq!(cfg["budget"]["max_usd"], 2.0);
+        assert_eq!(
+            cfg["budget"]["max_turns"], 50,
+            "the sibling field must survive"
+        );
+    }
+
+    /// Arrays are values, not collections to merge — 7386 says replace, and
+    /// element-wise merging of a workspace list would be unpredictable.
+    #[test]
+    fn an_array_is_replaced_wholesale_not_merged_element_wise() {
+        let mut cfg = json!({ "workspaces": [ { "path": "a" }, { "path": "b" } ] });
+        merge_patch(&mut cfg, &json!({ "workspaces": [ { "path": "c" } ] }));
+        assert_eq!(cfg["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(cfg["workspaces"][0]["path"], "c");
     }
 }
 
