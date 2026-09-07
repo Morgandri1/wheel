@@ -177,19 +177,34 @@ def main():
             return R.report("ephemeral-context")
 
         # 2. NON-VACUITY — the clear actually happened.
-        before_eph = state_of(eph)
         ran_eph, pre = run_one_turn(eph)
-        after_eph = state_of(eph)
         sid_before = pre.get("session_id")
-        sid_after = after_eph.get("session_id")
+        # WAIT FOR THE CLEAR TO LAND. run_one_turn returns at the harness `result` event,
+        # but clear_context runs AFTER that -- kill the child, clear_session, park -- so
+        # sampling here reads a window in which the OLD session is still recorded. That
+        # raced, deterministically, and reported "the session id did not change" against an
+        # engine doing exactly the right thing.
+        #
+        # NOT fixed by making the fake harness mint a fresh id: it reuses one only when the
+        # engine passes `--resume` (qa/harness/fake-claude:343), so forcing a new id would
+        # destroy this control's ability to notice an engine that really did resume the
+        # context it was told to throw away -- the one failure it exists to catch.
+        sid_after, waited = sid_before, 0.0
+        t0 = time.time()
+        while time.time() - t0 < SETTLE_SECS:
+            sid_after = state_of(eph).get("session_id")
+            if sid_after != sid_before:
+                break
+            time.sleep(1.0)
+        waited = time.time() - t0
         R.control("EPH/context-was-cleared",
                   bool(sid_before) and sid_after != sid_before,
                   "the session id did not change across the turn (%r -> %r), so the "
                   "ephemeral clear did not happen. Either the flag is being ignored -- in "
                   "which case the settle check below would pass while testing nothing -- "
                   "or a cleared context reuses the session id and this control needs a "
-                  "different signal. Not reported as a settle failure either way."
-                  % (sid_before, sid_after))
+                  "different signal. Not reported as a settle failure either way. "
+                  "(waited %.0fs for the clear to land)" % (sid_before, sid_after, waited))
 
         # 3. THE ASSERTION.
         ok_eph, st_eph, waited_eph = settle(eph)
