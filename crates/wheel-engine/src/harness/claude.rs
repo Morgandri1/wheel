@@ -123,7 +123,32 @@ impl Harness for ClaudeDriver {
                 session_id,
                 is_error: v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
                 text: v.get("result").and_then(|r| r.as_str()).map(str::to_string),
+                // Both are CUMULATIVE for the session, not per turn: the second
+                // turn of a session reports num_turns 2. Recorded here as given
+                // and turned into deltas by the supervisor, which is the only
+                // place that knows which session this is.
+                turns: v.get("num_turns").and_then(|t| t.as_u64()),
+                cost_usd: v.get("total_cost_usd").and_then(|c| c.as_f64()),
             },
+            // The platform telling us how much of the account is spent. It used
+            // to fall into `Unknown` and be logged as text, on a plan the
+            // operator pays for.
+            Some("rate_limit_event") => {
+                let info = v.get("rate_limit_info");
+                let field = |k: &str| info.and_then(|i| i.get(k));
+                HarnessEvent::RateLimit {
+                    session_id,
+                    status: field("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    window: field("rateLimitType")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    utilization: field("utilization").and_then(|u| u.as_f64()),
+                    resets_at: field("resetsAt").and_then(|r| r.as_i64()),
+                }
+            }
             // Everything else — including event types we have never seen — is
             // log material, not an error.
             _ => HarnessEvent::Unknown {
@@ -321,7 +346,41 @@ mod tests {
             HarnessEvent::Result {
                 session_id: Some("s1".into()),
                 is_error: false,
-                text: Some("done".into())
+                text: Some("done".into()),
+                turns: None,
+                cost_usd: None,
+            }
+        );
+
+        // The usage the harness hands us on every result, which used to be
+        // dropped on the floor — hence turns=0 and usd=0.0 for every agent.
+        let counted = ClaudeDriver.parse_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s1","num_turns":2,"total_cost_usd":0.5}"#,
+        );
+        assert_eq!(
+            counted,
+            HarnessEvent::Result {
+                session_id: Some("s1".into()),
+                is_error: false,
+                text: Some("ok".into()),
+                turns: Some(2),
+                cost_usd: Some(0.5),
+            }
+        );
+
+        // The platform telling us the account is 70% through a seven-day
+        // window. It parsed as an uninteresting event and was logged as text.
+        let limited = ClaudeDriver.parse_line(
+            r#"{"type":"rate_limit_event","session_id":"s1","rate_limit_info":{"status":"allowed_warning","resetsAt":1789146000,"rateLimitType":"seven_day","utilization":0.7}}"#,
+        );
+        assert_eq!(
+            limited,
+            HarnessEvent::RateLimit {
+                session_id: Some("s1".into()),
+                status: "allowed_warning".into(),
+                window: Some("seven_day".into()),
+                utilization: Some(0.7),
+                resets_at: Some(1789146000),
             }
         );
     }
@@ -335,8 +394,12 @@ mod tests {
             "",
             "   ",
             "{",
-            r#"{"type":"rate_limit_event","limit":100}"#,
+            // `rate_limit_event` used to live in this list. It is a KNOWN
+            // event now — that is the fix — so the property is asserted with
+            // types we genuinely do not handle, which is what the case was
+            // always about (QA's <<FAKE:NOISE>>).
             r#"{"type":"system","subtype":"thinking_tokens","n":5}"#,
+            r#"{"type":"an_event_type_invented_after_this_was_written"}"#,
             r#"{"no_type_field":true}"#,
             r#"[1,2,3]"#,
         ] {
@@ -345,6 +408,24 @@ mod tests {
                 "{line:?} should parse as Unknown, not panic or error"
             );
         }
+    }
+
+    /// A rate-limit event missing the fields we read must still parse: the
+    /// platform owns that shape and can change it, and an event we cannot fully
+    /// read is not a reason to lose the one signal it carries.
+    #[test]
+    fn a_rate_limit_event_without_its_details_still_parses() {
+        let e = ClaudeDriver.parse_line(r#"{"type":"rate_limit_event"}"#);
+        assert_eq!(
+            e,
+            HarnessEvent::RateLimit {
+                session_id: None,
+                status: "unknown".into(),
+                window: None,
+                utilization: None,
+                resets_at: None,
+            }
+        );
     }
 
     #[test]
