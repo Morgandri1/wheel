@@ -808,6 +808,19 @@ be seconds.
 | `POS-migration-clamp-is-reported` | The ONLY unbounded case: a row already outside ±32767 lands on the bound from wherever it was, which is a node teleporting across the screen. Clamping is correct; doing it silently is not. | **S2** |
 | `POS-migration-is-idempotent` | A migration that re-applies its transform on every boot walks the board one cell per restart — invisible until it isn't. | **S2** |
 
+### API-postgres-arm-is-still-built
+
+`postgres` becomes a NON-DEFAULT feature of wheel-api (`docs/decisions/2026-09-06-sqlx.md`), because cargo unifies features across a workspace build: leaving it on put a Postgres driver and a second TLS stack into `wheeld`'s binary however `wheeld` itself asked. Measured by API: wheel-api 214 → 200 crates, workspace 239 → 227.
+
+The hole that opens with it, also measured rather than predicted: every other Rust gate uses DEFAULT features, `tests/boot_db.rs` is `#![cfg(feature = "postgres")]`, and CI builds no API image. So after the change, nothing in CI compiles the code that talks to production's database — `cargo test -p wheel-api` runs **0** of boot_db's tests, `--features postgres` runs **5**. A compile error there would reach Railway before it reached a red build.
+
+This is the case ADVERSARY pre-committed to watching for: efficiency work is where correctness quietly dies. The efficiency win is real and worth taking; the gate has to arrive *with* it, not instead of it.
+
+| ID | Asserts | Sev |
+|---|---|---|
+| `API-postgres-arm-is-still-built` | `rust:clippy-pg` and `rust:test-pg` compile and test wheel-api with `--features postgres`. After the default changes these are the only things in CI that build the Postgres arm at all, so the predicate is that the arm is built and its 5 tests run. | **S1** |
+| `INFRA-budget-update-only-lowers` | `deps_gate.py --update` REFUSES to raise a ceiling without `--allow-regression`, naming every number that grew. Writing whichever value the tree happens to hold makes the budget a mirror rather than a ceiling, and A10's "a number someone has to argue for" becomes a number that silently follows the drift. Raised by API, twice. | **S2** |
+
 ### PROGRESS-* — liveness is not progress
 
 Two production failures in one evening shared a shape: the process was alive, answered `/healthz` with 200, and was doing no work. The escaper panic killed the delivery task while tokio kept the process up; endpoint ingress enqueued and woke the agent but never pumped the queue. Both systems were asked *are you up*, both truthfully said yes, and up was read as working. **This suite contains no liveness assertion at all.** Liveness is recorded in failure text only — because "healthy and stuck" is the signature of the class, and naming it is what stops the next person reaching for a restart.
