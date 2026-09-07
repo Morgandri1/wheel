@@ -74,6 +74,13 @@ pub enum Refusal {
         existing_type: NodeType,
         emitted_type: NodeType,
     },
+    /// The board names a node that already exists, and this apply may only create.
+    ///
+    /// The default is create-only on purpose. A builder-emitted board that merely MENTIONS an
+    /// existing node would otherwise modify it, and "the LLM named it" is not consent. Patching is
+    /// opt-in per apply, and the refusal names every node it would have touched so the caller can
+    /// show the user exactly what they are being asked to allow.
+    PatchNotPermitted { name: String },
     /// The board is larger than the apply step will attempt.
     BoardTooLarge {
         nodes: usize,
@@ -108,6 +115,10 @@ impl Refusal {
                  rename one of them — a node's type cannot be changed",
                 existing_type.as_str(),
                 emitted_type.as_str()
+            ),
+            Refusal::PatchNotPermitted { name } => format!(
+                "{name:?} is already on the board and this apply may only create nodes; \
+                 allow modifying existing nodes to change it"
             ),
             Refusal::BoardTooLarge { nodes, wires, max_nodes, max_wires } => format!(
                 "the board has {nodes} nodes and {wires} wires; this step applies at most \
@@ -158,6 +169,17 @@ pub struct ExistingBoard {
     pub wires: Vec<(String, String, WireType)>,
 }
 
+/// What an apply is permitted to do, beyond being legal.
+///
+/// Separate from validity: a board can be perfectly well-formed and still ask for more authority
+/// than the caller granted. Defaults to the conservative answer, so a caller that forgets to think
+/// about it gets create-only rather than "modify whatever this board happens to name".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApplyPolicy {
+    /// Allow the board to modify nodes that already exist. Off by default.
+    pub allow_patch: bool,
+}
+
 /// The most this step will attempt in one apply.
 ///
 /// Not a security boundary — the authoritative per-project limit is engine-side — but a bound on
@@ -171,7 +193,11 @@ pub const MAX_WIRES: usize = 1000;
 ///
 /// Returns EVERY refusal, not the first: an LLM that got one wire wrong usually got several, and
 /// handing them back one per round trip wastes the user's time.
-pub fn validate(board: &EmittedBoard, existing: &ExistingBoard) -> Result<Plan, Vec<Refusal>> {
+pub fn validate(
+    board: &EmittedBoard,
+    existing: &ExistingBoard,
+    policy: ApplyPolicy,
+) -> Result<Plan, Vec<Refusal>> {
     let mut refusals = Vec::new();
 
     // Size first, and returned alone: every later check is per-node or per-wire, so an oversized
@@ -255,10 +281,20 @@ pub fn validate(board: &EmittedBoard, existing: &ExistingBoard) -> Result<Plan, 
     let mut patch_nodes = Vec::new();
     for node in &board.nodes {
         if existing.nodes.contains_key(&node.name) {
+            if !policy.allow_patch {
+                refusals.push(Refusal::PatchNotPermitted {
+                    name: node.name.clone(),
+                });
+                continue;
+            }
             patch_nodes.push(node.clone());
         } else {
             create_nodes.push(node.clone());
         }
+    }
+
+    if !refusals.is_empty() {
+        return Err(refusals);
     }
 
     let create_wires = board
@@ -522,7 +558,7 @@ mod tests {
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
         let existing = ExistingBoard::default();
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         let report = execute(&plan, &existing, &FakeClient::new()).await;
 
         assert!(report.is_complete(), "{report:?}");
@@ -539,7 +575,7 @@ mod tests {
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
         let existing = ExistingBoard::default();
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         let mut client = FakeClient::new();
         client.fail_node = Some("notes".into());
         let report = execute(&plan, &existing, &client).await;
@@ -564,7 +600,7 @@ mod tests {
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
         let existing = ExistingBoard::default();
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         let mut client = FakeClient::new();
         client.fail_node = Some("notes".into());
         let report = execute(&plan, &existing, &client).await;
@@ -588,7 +624,7 @@ mod tests {
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
         let existing = ExistingBoard::default();
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         let mut client = FakeClient::new();
         client.fail_wire = true;
         let report = execute(&plan, &existing, &client).await;
@@ -622,7 +658,7 @@ mod tests {
         );
 
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         let client = FakeClient::new();
         let report = execute(&plan, &existing, &client).await;
 
@@ -653,7 +689,8 @@ mod tests {
         // The board calls "notes" a ctx; the board already has an AGENT by that name.
         let b = board(serde_json::json!({"nodes": [ctx("notes")], "wires": []}));
 
-        let refusals = validate(&b, &existing).expect_err("a type change must be refused");
+        let refusals = validate(&b, &existing, ApplyPolicy::default())
+            .expect_err("a type change must be refused");
         let m = refusals[0].message();
         assert!(
             matches!(refusals[0], Refusal::NodeTypeMismatch { .. }),
@@ -681,7 +718,8 @@ mod tests {
         );
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
 
-        let plan = validate(&b, &existing).expect("same type is legal");
+        let plan =
+            validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("same type is legal");
         assert_eq!(plan.patch_nodes.len(), 1);
         assert!(
             plan.create_nodes.is_empty(),
@@ -706,7 +744,8 @@ mod tests {
             "nodes": [ctx("secrets"), agent("a")],
             "wires": [{"from": "secrets", "to": "a", "type": "send"}],
         }));
-        let refusals = validate(&b, &existing).expect_err("the collision must be refused first");
+        let refusals = validate(&b, &existing, ApplyPolicy::default())
+            .expect_err("the collision must be refused first");
         assert!(
             refusals
                 .iter()
@@ -721,7 +760,8 @@ mod tests {
         let nodes: Vec<_> = (0..=MAX_NODES).map(|i| agent(&format!("a{i}"))).collect();
         let b = board(serde_json::json!({"nodes": nodes, "wires": []}));
 
-        let refusals = validate(&b, &ExistingBoard::default()).expect_err("too large");
+        let refusals =
+            validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).expect_err("too large");
         assert_eq!(
             refusals.len(),
             1,
@@ -736,7 +776,8 @@ mod tests {
     fn a_board_at_the_cap_is_still_accepted() {
         let nodes: Vec<_> = (0..MAX_NODES).map(|i| agent(&format!("a{i}"))).collect();
         let b = board(serde_json::json!({"nodes": nodes, "wires": []}));
-        let plan = validate(&b, &ExistingBoard::default()).expect("exactly at the cap is legal");
+        let plan = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect("exactly at the cap is legal");
         assert_eq!(plan.create_nodes.len(), MAX_NODES);
     }
 
@@ -748,12 +789,106 @@ mod tests {
                 .map(|_| serde_json::json!({"from": "c", "to": "a", "type": "send"}))
                 .collect::<Vec<_>>(),
         }));
-        let refusals = validate(&b, &ExistingBoard::default()).expect_err("too many wires");
+        let refusals = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("too many wires");
         assert!(
             matches!(refusals[0], Refusal::BoardTooLarge { .. }),
             "{:?}",
             refusals[0]
         );
+    }
+
+    /// SDK's point: the default must not be "modify whatever this board happens to name". A board
+    /// that merely MENTIONS an existing node is refused unless the caller asked for patching.
+    #[test]
+    fn an_existing_node_is_not_modified_unless_the_caller_allowed_it() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "researcher".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Agent,
+            },
+        );
+        let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
+
+        let refusals = validate(&b, &existing, ApplyPolicy::default())
+            .expect_err("create-only must refuse to modify");
+        assert!(
+            matches!(refusals[0], Refusal::PatchNotPermitted { .. }),
+            "{:?}",
+            refusals[0]
+        );
+        assert!(
+            refusals[0].message().contains("researcher"),
+            "{}",
+            refusals[0].message()
+        );
+    }
+
+    /// And the refusal names EVERY node it would have touched, so the confirm step can show the
+    /// user exactly what they are being asked to allow.
+    #[test]
+    fn the_refusal_names_every_node_it_would_have_modified() {
+        let mut existing = ExistingBoard::default();
+        for name in ["a", "b"] {
+            existing.nodes.insert(
+                name.into(),
+                ExistingNode {
+                    id: Uuid::new_v4(),
+                    node_type: NodeType::Agent,
+                },
+            );
+        }
+        let b = board(serde_json::json!({"nodes": [agent("a"), agent("b")], "wires": []}));
+
+        let refusals = validate(&b, &existing, ApplyPolicy::default()).expect_err("both refused");
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        let named: Vec<_> = refusals
+            .iter()
+            .map(|r| match r {
+                Refusal::PatchNotPermitted { name } => name.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(named.contains(&"a".to_string()) && named.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn allowing_it_makes_the_same_board_a_patch() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "researcher".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Agent,
+            },
+        );
+        let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
+
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("opted in");
+        assert_eq!(plan.patch_nodes.len(), 1);
+    }
+
+    /// Create-only is about MODIFYING, not about mentioning: a wire may still reference an existing
+    /// node, because wiring to something is not changing it.
+    #[test]
+    fn create_only_still_allows_wiring_to_an_existing_node() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "researcher".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Agent,
+            },
+        );
+        let b = board(serde_json::json!({
+            "nodes": [ctx("notes")],
+            "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
+        }));
+        let plan = validate(&b, &existing, ApplyPolicy::default())
+            .expect("wiring to an existing node is not modifying it");
+        assert_eq!(plan.create_wires.len(), 1);
     }
 
     #[test]
@@ -762,7 +897,8 @@ mod tests {
             "nodes": [agent("researcher"), ctx("notes")],
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
-        let plan = validate(&b, &ExistingBoard::default()).expect("a legal board");
+        let plan =
+            validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).expect("a legal board");
         assert_eq!(plan.create_nodes.len(), 2);
         assert_eq!(plan.create_wires.len(), 1);
         assert!(plan.patch_nodes.is_empty());
@@ -777,7 +913,8 @@ mod tests {
             // agent -> vault WRITE is not in the matrix; only read is.
             "wires": [{"from": "researcher", "to": "secrets", "type": "write"}],
         }));
-        let refusals = validate(&b, &ExistingBoard::default()).expect_err("must be refused");
+        let refusals = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("must be refused");
         assert_eq!(refusals.len(), 1);
         let msg = refusals[0].message();
         assert!(msg.contains("researcher"), "{msg}");
@@ -801,7 +938,8 @@ mod tests {
                 {"from": "a", "to": "a", "type": "send"},
             ],
         }));
-        let refusals = validate(&b, &ExistingBoard::default()).expect_err("three problems");
+        let refusals = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("three problems");
         assert_eq!(refusals.len(), 3, "{refusals:?}");
     }
 
@@ -811,7 +949,8 @@ mod tests {
             "nodes": [agent("a")],
             "wires": [{"from": "a", "to": "nowhere", "type": "send"}],
         }));
-        let r = validate(&b, &ExistingBoard::default()).expect_err("unknown node");
+        let r = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("unknown node");
         assert!(r[0].message().contains("nowhere"), "{}", r[0].message());
     }
 
@@ -821,7 +960,8 @@ mod tests {
             "nodes": [agent("a")],
             "wires": [{"from": "a", "to": "a", "type": "send"}],
         }));
-        let r = validate(&b, &ExistingBoard::default()).expect_err("self wire");
+        let r =
+            validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).expect_err("self wire");
         assert!(matches!(r[0], Refusal::SelfWire { .. }), "{:?}", r[0]);
     }
 
@@ -831,7 +971,8 @@ mod tests {
             "nodes": [agent("twin"), ctx("twin")],
             "wires": [],
         }));
-        let r = validate(&b, &ExistingBoard::default()).expect_err("duplicate");
+        let r =
+            validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).expect_err("duplicate");
         assert!(
             matches!(r[0], Refusal::DuplicateNodeName { .. }),
             "{:?}",
@@ -854,7 +995,8 @@ mod tests {
             "nodes": [ctx("notes")],
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
-        let plan = validate(&b, &existing).expect("legal against the current board");
+        let plan = validate(&b, &existing, ApplyPolicy::default())
+            .expect("legal against the current board");
         assert_eq!(plan.create_nodes.len(), 1);
         assert_eq!(plan.create_wires.len(), 1);
     }
@@ -884,7 +1026,7 @@ mod tests {
             "nodes": [agent("researcher"), ctx("new-notes")],
             "wires": [{"from": "new-notes", "to": "researcher", "type": "send"}],
         }));
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
 
         assert_eq!(plan.patch_nodes.len(), 1);
         assert_eq!(plan.patch_nodes[0].name, "researcher");
@@ -926,7 +1068,7 @@ mod tests {
             "nodes": [],
             "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
         }));
-        let plan = validate(&b, &existing).expect("legal");
+        let plan = validate(&b, &existing, ApplyPolicy { allow_patch: true }).expect("legal");
         assert!(plan.create_wires.is_empty(), "{:?}", plan.create_wires);
         assert!(
             plan.is_empty(),
@@ -938,8 +1080,10 @@ mod tests {
     #[test]
     fn an_empty_board_is_legal_and_plans_nothing() {
         let b = board(serde_json::json!({"nodes": [], "wires": []}));
-        assert!(validate(&b, &ExistingBoard::default())
-            .expect("legal")
-            .is_empty());
+        assert!(
+            validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+                .expect("legal")
+                .is_empty()
+        );
     }
 }

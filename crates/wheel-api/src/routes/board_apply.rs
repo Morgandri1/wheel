@@ -13,8 +13,8 @@
 //!   half-applied board as a success, which is exactly the invariant this route exists to keep.
 
 use crate::apply::{
-    execute, validate, ApplyReport, BoardClient, EmittedBoard, EmittedNode, ExistingBoard,
-    ExistingNode, Plan, WireRef,
+    execute, validate, ApplyPolicy, ApplyReport, BoardClient, EmittedBoard, EmittedNode,
+    ExistingBoard, ExistingNode, Plan, WireRef,
 };
 use crate::auth::extractor::ProjectScope;
 use crate::error::{ApiError, ApiResult};
@@ -32,6 +32,14 @@ pub struct ApplyRequest {
     /// Plan only: say what applying would do, and change nothing.
     #[serde(default)]
     pub dry_run: bool,
+    /// Allow the board to MODIFY nodes that already exist. Off unless asked for.
+    ///
+    /// A builder-emitted board that merely mentions an existing node would otherwise change it, and
+    /// "the LLM named it" is not the user's consent. Left off, such a board is refused and the
+    /// refusal names every node it would have touched — which is what the confirm step shows before
+    /// anyone opts in.
+    #[serde(default)]
+    pub allow_patch: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,7 +221,10 @@ pub async fn apply_board(
     let client = HttpBoardClient::new(&state, &scope.project.id);
     let existing = read_board(&client).await?;
 
-    let plan = match validate(&req.board, &existing) {
+    let policy = ApplyPolicy {
+        allow_patch: req.allow_patch,
+    };
+    let plan = match validate(&req.board, &existing, policy) {
         Ok(plan) => plan,
         Err(refusals) => {
             let listed: Vec<_> = refusals

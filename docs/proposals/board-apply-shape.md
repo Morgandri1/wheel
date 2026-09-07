@@ -15,9 +15,24 @@ POST /v1/projects/{id}/board/apply
 x-auth-token: …   x-project-id: …
 {
   "board": { "nodes": [ … ], "wires": [ … ] },   // exactly what the builder emitted
-  "dry_run": false                                // true = plan only, change nothing
+  "dry_run": false,                               // true = plan only, change nothing
+  "allow_patch": false                            // true = may MODIFY existing nodes
 }
 ```
+
+### `allow_patch` — create-only is the default
+
+**A board that merely NAMES an existing node does not get to modify it.** Left off (the default),
+such a board is refused with `patch_not_permitted`, one refusal per node it would have touched, so
+the confirm step can show the user exactly what they are being asked to allow before they allow it.
+"The builder named it" is not consent.
+
+Wiring TO an existing node is still fine without the flag — wiring to something is not changing it.
+Only changing a node's own config needs `allow_patch: true`.
+
+For the improve flow this means two round trips by design: apply with the flag off, show the user
+the `patch_not_permitted` list, then re-apply with `allow_patch: true` if they agree. A dry run
+behaves identically, so the preview surfaces the same refusal without touching anything.
 
 ## Responses — the status code carries the outcome
 
@@ -82,7 +97,7 @@ A failure is addressable, not just described:
 ```
 
 Codes: `wire_not_allowed`, `unknown_node`, `self_wire`, `duplicate_node_name`,
-`node_type_mismatch`, `board_too_large`. **Render `message`**; branch on `code` only if you need to.
+`node_type_mismatch`, `board_too_large`, `patch_not_permitted`. **Render `message`**; branch on `code` only if you need to.
 Every refusal is returned, not just the first — one bad wire from a builder usually means several.
 
 ## Guarantees Web can rely on
@@ -97,6 +112,8 @@ Every refusal is returned, not just the first — one bad wire from a builder us
 
 ## Caps
 
-200 nodes, 1000 wires per apply, refused as a single `board_too_large`. Interim: a bounded judgement,
-not a measurement. To be aligned to the engine's per-project cap once SDK confirms it — one number,
-not two.
+200 nodes, 1000 wires per apply, refused as a single `board_too_large`.
+
+SDK has confirmed there is **no engine-side per-project cap** — they grepped; nothing counts nodes.
+So this is not an interim pending a better number: it is the only bound that exists, and it is a
+bounded judgement rather than a measurement. Worth revisiting if a real limit ever lands engine-side.
