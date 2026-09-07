@@ -16,6 +16,14 @@ either PATCH gains merge semantics, or the UI does read-modify-write and sends t
 One or the other MUST land before any new agent-config control ships. Not both blindly — SDK rules the
 handler, Web conforms. This ranks above the missing controls because it breaks agents that already work.
 
+**RULED (SDK, 2026-09-07): PATCH gains MERGE semantics.** The handler merges the incoming partial
+config into the stored config, then deserialises and VALIDATES the whole result before storing — an
+invalid merge is a 400 naming the field, never a stored half-config; `type` stays immutable. Handler-level,
+so it protects every caller by construction. Web builds the panel against merge now. SDK lands the handler
+before any new agent-config control ships. SEQUENCING NOTE: if the DEPLOYED save currently sends a partial
+PATCH (Web checking), the merge handler once DEPLOYED is the fix for a LIVE destructive bug, not just a gate
+on new controls — so it ships promptly, not merely before-new-controls.
+
 ## P1 — Script execution (the keystone capability gap)
 No engine runtime (SDK) AND no control-plane route to invoke it (API §4.3: `wheel run` is CLI-plane
 only). SDK is scoping the runtime in docs/proposals/ (concurrency-cap + shared-store levers are
