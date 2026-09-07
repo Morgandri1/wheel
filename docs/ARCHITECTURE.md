@@ -52,6 +52,14 @@ which is what the binary size gate measures.
 The point is not the script — it is that the size becomes **a number someone has to argue for** rather than
 something that drifts until a disk fills. Same ratchet shape as the dependency and binary budgets.
 
+**A missing-rlib error from the shared dir is a RACE, not a code failure** (API, 2026-09-07). Six worktrees
+share one `target-dir`, so a concurrent build in another worktree can remove an rlib mid-compile — the symptom
+is `extern location for <crate> does not exist — lib<crate>-<hash>.rlib`. It clears on a clean re-run and it is
+never about your change. API nearly reported one as a real failure of their own fix. Re-run before believing
+any missing-rlib error; if it survives a clean re-run it is real, and only then. This is the cost of the shared
+dir, and it is worth paying against six cold compiles and 150 GB — but know the signature so it is not mistaken
+for a defect.
+
 ### A number must record what it is a measurement OF (QA finding, accepted 2026-09-06)
 
 `qa/size-budget.json` was a flat object with no platform key. Its five ceilings were measured on
