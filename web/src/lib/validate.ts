@@ -86,11 +86,20 @@ export function suggestName(type: NodeType, taken: string[]): string {
 export const POSITION_MIN = -32768;
 export const POSITION_MAX = 32767;
 
+/**
+ * Rust's `f64::round` breaks ties AWAY FROM ZERO; JS `Math.round` breaks them toward +Infinity.
+ * They agree everywhere except a negative exact half, where Math.round(-10.5) is -10 and the
+ * engine stores -11. Board coordinates go negative as soon as you pan, so that is reachable.
+ */
+function roundHalfAwayFromZero(value: number): number {
+  return value < 0 ? -Math.round(-value) : Math.round(value);
+}
+
 export function clampCell(value: number): number {
   // NaN carries no direction, so it cannot be clamped toward anything — 0 is the only honest
   // answer. Infinity does carry one, and clamps to that bound like any other far drag.
   if (Number.isNaN(value)) return 0;
-  return Math.min(POSITION_MAX, Math.max(POSITION_MIN, Math.round(value)));
+  return Math.min(POSITION_MAX, Math.max(POSITION_MIN, roundHalfAwayFromZero(value)));
 }
 
 export function clampPosition(position: { x: number; y: number }): { x: number; y: number } {

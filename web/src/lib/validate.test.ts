@@ -3,6 +3,7 @@ import { NODE_TYPES } from "@/lib/schema";
 import {
   POSITION_MAX,
   POSITION_MIN,
+  clampCell,
   clampPosition,
   suggestName,
   validateChestKey,
@@ -186,5 +187,26 @@ describe("board positions are an integer cell", () => {
 
   it("uses the i16 bounds the contract names, not approximations of them", () => {
     expect([POSITION_MIN, POSITION_MAX]).toEqual([-32768, 32767]);
+  });
+});
+
+describe("clampCell ties match the engine's rounding, not the browser's", () => {
+  // Rust f64::round is half-away-from-zero. Math.round is half-up. A negative exact half is the
+  // only place they differ, and it is one cell of permanent drift on every dragged node.
+  it("rounds a negative half away from zero, as Rust does", () => {
+    expect(clampCell(-10.5)).toBe(-11);
+    expect(clampCell(-0.5)).toBe(-1);
+    expect(clampCell(-1.5)).toBe(-2);
+  });
+
+  it("still rounds a positive half up, where the two agree", () => {
+    expect(clampCell(10.5)).toBe(11);
+    expect(clampCell(0.5)).toBe(1);
+  });
+
+  it("leaves every non-tie alone", () => {
+    expect(clampCell(-10.4)).toBe(-10);
+    expect(clampCell(-10.6)).toBe(-11);
+    expect(clampCell(10.4)).toBe(10);
   });
 });
