@@ -118,6 +118,28 @@ worth building to deliberately:
 When a class of failure is worth a runtime backstop, the same definition usually makes the better test; when
 it is worth a test, ask whether production deserves the same alarm.
 
+### Check the instrument before you believe the result (PM ruling, 2026-09-07)
+
+The single most repeated failure of 2026-09-06, in both directions:
+
+| the instrument | what it falsely said |
+|---|---|
+| a manifest reading instead of a build diff | Clerk costs ~200 kB per route (it costs **zero** on first load) |
+| a mutable `wheel-engine:test` tag rebuilt mid-suite | a real S1 was not reproducible (a retraction was being written) |
+| an unfiltered `cargo tree` resolve | 346 crates (it is 281; 62 are Windows-only) |
+| ceilings measured on macOS, compared against Linux CI | every binary regressed ~17% (nothing regressed) |
+| a coverage run compiling none of the `postgres` arm | a coverage figure that counted none of its tests |
+| a test failing on `Invalid Chai property: toBeInTheDocument` | lazy loading does not work (jest-dom was simply absent) |
+
+A **negative** result from an unvalidated instrument is the dangerous one: it discards real work and records a
+false reason in git for whoever reads it next. The last row was one commit from doing exactly that, and what
+caught it was reading the error text — *Chai property*, not *element not found*.
+
+- Before believing a surprising result, prove the instrument ran: a non-zero exit, a build id, an image sha,
+  a platform triple, the feature set, the assertion library actually being loaded.
+- Prefer an assertion on **content** over one on structure. A lazy component that never resolves leaves an
+  empty container behind, and every structural assertion still passes.
+
 ### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
 
 Run it or grep it before you assert it. Three instances in one day:
