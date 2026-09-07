@@ -62,6 +62,25 @@ pub enum Refusal {
     },
     /// A node wired to itself.
     SelfWire { node: String },
+    /// An emitted node reuses the name of an existing node of a DIFFERENT type.
+    ///
+    /// Refused rather than resolved. Treating it as a patch was silently false — the engine rejects
+    /// a type change, so the apply died mid-way with a confusing partial board; and either
+    /// precedence rule (emitted wins / existing wins) silently validates the board's wires against
+    /// a type one side does not agree with. There is no answer here that is not a guess about what
+    /// the builder meant, so the caller is told.
+    NodeTypeMismatch {
+        name: String,
+        existing_type: NodeType,
+        emitted_type: NodeType,
+    },
+    /// The board is larger than the apply step will attempt.
+    BoardTooLarge {
+        nodes: usize,
+        wires: usize,
+        max_nodes: usize,
+        max_wires: usize,
+    },
     /// The wire matrix forbids this pair. Default-DENY: anything not listed is refused.
     WireNotAllowed {
         from: String,
@@ -84,6 +103,16 @@ impl Refusal {
                  and is not being created"
             ),
             Refusal::SelfWire { node } => format!("{node:?} is wired to itself"),
+            Refusal::NodeTypeMismatch { name, existing_type, emitted_type } => format!(
+                "{name:?} is already on the board as a {}, and the board defines it as a {}; \
+                 rename one of them — a node's type cannot be changed",
+                existing_type.as_str(),
+                emitted_type.as_str()
+            ),
+            Refusal::BoardTooLarge { nodes, wires, max_nodes, max_wires } => format!(
+                "the board has {nodes} nodes and {wires} wires; this step applies at most \
+                 {max_nodes} nodes and {max_wires} wires in one go"
+            ),
             Refusal::WireNotAllowed { from, from_type, to, to_type, wire_type } => format!(
                 "no {} wire is allowed from a {} to a {}: {from:?} -> {to:?}",
                 wire_type.as_str(),
@@ -129,12 +158,32 @@ pub struct ExistingBoard {
     pub wires: Vec<(String, String, WireType)>,
 }
 
+/// The most this step will attempt in one apply.
+///
+/// Not a security boundary — the authoritative per-project limit is engine-side — but a bound on
+/// what one builder turn can ask for. Realising a board is one engine call per node and per wire,
+/// so an unbounded board is an unbounded burst against a single project's engine, and the failure
+/// would arrive as a slow partial apply rather than a refusal anyone can read.
+pub const MAX_NODES: usize = 200;
+pub const MAX_WIRES: usize = 1000;
+
 /// Check an emitted board against the matrix and the current board.
 ///
 /// Returns EVERY refusal, not the first: an LLM that got one wire wrong usually got several, and
 /// handing them back one per round trip wastes the user's time.
 pub fn validate(board: &EmittedBoard, existing: &ExistingBoard) -> Result<Plan, Vec<Refusal>> {
     let mut refusals = Vec::new();
+
+    // Size first, and returned alone: every later check is per-node or per-wire, so an oversized
+    // board would otherwise produce thousands of refusals nobody can read.
+    if board.nodes.len() > MAX_NODES || board.wires.len() > MAX_WIRES {
+        return Err(vec![Refusal::BoardTooLarge {
+            nodes: board.nodes.len(),
+            wires: board.wires.len(),
+            max_nodes: MAX_NODES,
+            max_wires: MAX_WIRES,
+        }]);
+    }
 
     // Types by name: emitted nodes first, then whatever is already on the board.
     let mut types: HashMap<&str, NodeType> = HashMap::new();
@@ -148,8 +197,23 @@ pub fn validate(board: &EmittedBoard, existing: &ExistingBoard) -> Result<Plan, 
             });
         }
     }
+    // A name on both sides must agree. Refused above as a guess nobody can justify; and because it
+    // is refused, the resolution order below cannot matter — existing wins, which is the
+    // conservative half of ADVERSARY 049 and makes the invariant obvious rather than incidental.
+    for node in &board.nodes {
+        if let Some(present) = existing.nodes.get(&node.name) {
+            let emitted_type = node.config.node_type();
+            if present.node_type != emitted_type {
+                refusals.push(Refusal::NodeTypeMismatch {
+                    name: node.name.clone(),
+                    existing_type: present.node_type,
+                    emitted_type,
+                });
+            }
+        }
+    }
     for (name, node) in &existing.nodes {
-        types.entry(name.as_str()).or_insert(node.node_type);
+        types.insert(name.as_str(), node.node_type);
     }
 
     for wire in &board.wires {
@@ -513,6 +577,125 @@ mod tests {
             patched,
             vec![researcher],
             "patched the wrong node, or too many"
+        );
+    }
+
+    /// ADVERSARY 049(1)+(2): a name colliding with an existing node of a DIFFERENT type used to
+    /// become a silent patch. The engine rejects a type change, so it died mid-apply with a
+    /// confusing partial board.
+    #[test]
+    fn a_name_colliding_with_a_different_type_is_refused_not_silently_patched() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "notes".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Agent,
+            },
+        );
+        // The board calls "notes" a ctx; the board already has an AGENT by that name.
+        let b = board(serde_json::json!({"nodes": [ctx("notes")], "wires": []}));
+
+        let refusals = validate(&b, &existing).expect_err("a type change must be refused");
+        let m = refusals[0].message();
+        assert!(
+            matches!(refusals[0], Refusal::NodeTypeMismatch { .. }),
+            "{:?}",
+            refusals[0]
+        );
+        assert!(m.contains("notes"), "{m}");
+        assert!(
+            m.contains("agent") && m.contains("ctx"),
+            "both types must be named: {m}"
+        );
+    }
+
+    /// The same name with the SAME type is the improve case and stays a patch — explicit in the
+    /// plan, never mixed in with creates.
+    #[test]
+    fn the_same_name_with_the_same_type_is_a_patch_not_a_refusal() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "researcher".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Agent,
+            },
+        );
+        let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
+
+        let plan = validate(&b, &existing).expect("same type is legal");
+        assert_eq!(plan.patch_nodes.len(), 1);
+        assert!(
+            plan.create_nodes.is_empty(),
+            "a patch must never be planned as a create"
+        );
+    }
+
+    /// 049(2): with mismatches refused, a wire against a colliding name can never be validated
+    /// against a type one side disagrees with — the ambiguity is gone rather than resolved.
+    #[test]
+    fn a_wire_is_never_validated_against_a_disputed_type() {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "secrets".into(),
+            ExistingNode {
+                id: Uuid::new_v4(),
+                node_type: NodeType::Vault,
+            },
+        );
+        // Emitted as a ctx, so ctx->agent send would LOOK legal if the emitted type won.
+        let b = board(serde_json::json!({
+            "nodes": [ctx("secrets"), agent("a")],
+            "wires": [{"from": "secrets", "to": "a", "type": "send"}],
+        }));
+        let refusals = validate(&b, &existing).expect_err("the collision must be refused first");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::NodeTypeMismatch { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    /// 049(3): a cheap bound, refused alone so the caller gets one readable line.
+    #[test]
+    fn an_oversized_board_is_refused_with_one_readable_refusal() {
+        let nodes: Vec<_> = (0..=MAX_NODES).map(|i| agent(&format!("a{i}"))).collect();
+        let b = board(serde_json::json!({"nodes": nodes, "wires": []}));
+
+        let refusals = validate(&b, &ExistingBoard::default()).expect_err("too large");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "an oversized board must not emit one refusal per node"
+        );
+        let m = refusals[0].message();
+        assert!(m.contains(&MAX_NODES.to_string()), "{m}");
+        assert!(matches!(refusals[0], Refusal::BoardTooLarge { .. }));
+    }
+
+    #[test]
+    fn a_board_at_the_cap_is_still_accepted() {
+        let nodes: Vec<_> = (0..MAX_NODES).map(|i| agent(&format!("a{i}"))).collect();
+        let b = board(serde_json::json!({"nodes": nodes, "wires": []}));
+        let plan = validate(&b, &ExistingBoard::default()).expect("exactly at the cap is legal");
+        assert_eq!(plan.create_nodes.len(), MAX_NODES);
+    }
+
+    #[test]
+    fn too_many_wires_is_refused_too() {
+        let b = board(serde_json::json!({
+            "nodes": [agent("a"), ctx("c")],
+            "wires": (0..=MAX_WIRES)
+                .map(|_| serde_json::json!({"from": "c", "to": "a", "type": "send"}))
+                .collect::<Vec<_>>(),
+        }));
+        let refusals = validate(&b, &ExistingBoard::default()).expect_err("too many wires");
+        assert!(
+            matches!(refusals[0], Refusal::BoardTooLarge { .. }),
+            "{:?}",
+            refusals[0]
         );
     }
 
