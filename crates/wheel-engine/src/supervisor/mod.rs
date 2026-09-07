@@ -769,13 +769,26 @@ impl Supervisor {
                 match event {
                     HarnessEvent::Init { session_id } => {
                         initialised = true;
-                        let mut g = slot.lock().await;
-                        if let Some(r) = g.as_mut() {
-                            r.session_id = Some(session_id.clone());
+                        {
+                            let mut g = slot.lock().await;
+                            if let Some(r) = g.as_mut() {
+                                r.session_id = Some(session_id.clone());
+                            }
                         }
-                        let conn = db.lock().unwrap();
-                        set_session(&conn, agent, &session_id);
-                        set_status_db(&conn, agent, AgentStatus::Idle, None);
+                        {
+                            let conn = db.lock().unwrap();
+                            set_session(&conn, agent, &session_id);
+                            set_status_db(&conn, agent, AgentStatus::Idle, None);
+                        }
+                        // The child can be written to now. Anything enqueued
+                        // while it was coming up has no other trigger: the
+                        // queue is pumped when something enqueues and when a
+                        // turn ends, and starting up is neither -- so a message
+                        // that arrived during startup waited for a turn that
+                        // could not begin, because beginning it was the thing
+                        // being waited for. Both guards above are released
+                        // first: `pump_queue` takes the same slot lock.
+                        let _ = self.pump_queue(agent).await;
                     }
                     HarnessEvent::Text { session_id, text } => {
                         let g = slot.lock().await;
@@ -2047,6 +2060,191 @@ done
             None,
         )
         .unwrap();
+    }
+
+    fn enqueue_from_endpoint(sup: &Supervisor, to: Uuid, body: &str) {
+        let conn = sup.db.lock().unwrap();
+        messages::enqueue(
+            &conn,
+            wheel_core::MessageSender::Node {
+                id: Uuid::new_v4(),
+                name: "tg".parse().unwrap(),
+                node_type: NodeType::Endpoint,
+            },
+            to,
+            body.to_string(),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// QA's S1, reproduced: the message arrives while the agent is STARTING.
+    ///
+    /// `pump_queue` runs in exactly two places — when something enqueues, and
+    /// when a turn ends. An agent that reaches `idle` by starting up has ended
+    /// no turn, so anything queued while it was coming up is never picked up.
+    /// Nothing retries: the 60s promotion in `next_for_delivery` can only apply
+    /// on a pump that never happens, which is why QA measured a message still
+    /// `queued` at 75s.
+    ///
+    /// This is the shape production had — three messages behind an agent in
+    /// `starting` — and it is why fixing ingress to call `deliver` was
+    /// necessary but not sufficient: `deliver` pumps once, immediately, into an
+    /// agent with no process to write to yet.
+    #[tokio::test]
+    async fn a_message_queued_while_the_agent_starts_is_delivered_once_it_is_up() {
+        let (sup, id, dir) = shim_supervisor("queued-during-start", ECHO_HARNESS);
+
+        // Deliberately NOT awaiting idle first: the whole bug is the window
+        // between "start was asked for" and "the child can be written to".
+        enqueue_from_endpoint(&sup, id, "arrived while the agent was starting");
+        sup.start(id).await.unwrap();
+
+        until("the message queued during startup to be delivered", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::has_queued(&conn, id).unwrap_or(true)
+        })
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA's S1, through the REAL ingress handler rather than past it.
+    ///
+    /// The test below proves the supervisor delivers an endpoint message to a
+    /// warm agent. That passed while production did not, which means the fault
+    /// was never in `deliver` — it is in what ingress does with it. So this
+    /// drives `ingress::deliver` itself, with a live child on the other end,
+    /// and asserts the bytes actually leave the queue.
+    ///
+    /// This is the test I first said could not be written here. It can: the
+    /// shim harness gives a real child, and `AppState` is constructible from
+    /// the same pieces `serve` uses.
+    #[tokio::test]
+    async fn an_ingress_hit_drains_to_an_agent_that_is_already_warm() {
+        use crate::api::ingress::{deliver as ingress_deliver, MatchedEndpoint};
+        use axum::http::{HeaderMap, Method};
+
+        let (sup, id, dir) = shim_supervisor("warm-ingress-route", ECHO_HARNESS);
+
+        // The endpoint node, wired `send` into the agent — the shape PM
+        // created on the wheel-dev board for the Telegram tile.
+        let endpoint = {
+            let conn = sup.db.lock().unwrap();
+            let ep = wheel_core::Node::new(
+                Uuid::new_v4(),
+                "tg".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Endpoint(wheel_core::EndpointConfig {
+                    method: wheel_core::HttpMethod::Post,
+                    path: "/telegram".into(),
+                    response_mode: wheel_core::ResponseMode::Ack,
+                    auth: wheel_core::EndpointAuth::None,
+                }),
+            );
+            board::create(&conn, &ep).unwrap();
+            board::add_wire(&conn, ep.id, id, wheel_core::WireType::Send, None).unwrap();
+            ep
+        };
+
+        sup.start(id).await.unwrap();
+        until("the agent to be warm and idle", || {
+            status_of(&sup, id) == AgentStatus::Idle
+        })
+        .await;
+
+        let state = crate::api::AppState {
+            cfg: sup.cfg.clone(),
+            supervisor: sup.clone(),
+            db: sup.db.clone(),
+            events: sup.events().clone(),
+            ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
+            logins: Arc::new(crate::oauth::LoginSessions::default()),
+        };
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                wheel_core::NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+
+        ingress_deliver(
+            &state,
+            &matched,
+            &Method::POST,
+            "/telegram",
+            &HeaderMap::new(),
+            b"{\"message\":\"hello from telegram\"}",
+        );
+
+        until("the first ingress message to leave the queue", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::has_queued(&conn, id).unwrap_or(true)
+        })
+        .await;
+
+        // QA's exact interleaving: ingress, user, user, ingress. They ran this
+        // order deliberately, because a suite that happens to send user-first
+        // would be equally explained by "the second message never drains,
+        // whatever produced it" — which points at the wrong file.
+        enqueue(&sup, id, "user one");
+        sup.deliver(id).await.unwrap();
+        enqueue(&sup, id, "user two");
+        sup.deliver(id).await.unwrap();
+        ingress_deliver(
+            &state,
+            &matched,
+            &Method::POST,
+            "/telegram",
+            &HeaderMap::new(),
+            b"{\"message\":\"the second telegram hit\"}",
+        );
+
+        until("every message to leave the queue", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::has_queued(&conn, id).unwrap_or(true)
+        })
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA's S1, found by PROGRESS-message-reaches-consumed/endpoint-ingress:
+    /// an ingress message to an agent that is ALREADY RUNNING never leaves
+    /// `queued`, while user messages to the same agent in the same session are
+    /// consumed instantly.
+    ///
+    /// Every delivery test above enqueues as `MessageSender::User`, so the one
+    /// axis this bug lives on — who the message is FROM — was the one axis
+    /// nothing varied. The parked case works because the queue drains on
+    /// start; this is the warm case, where there is no start transition to do
+    /// the draining.
+    #[tokio::test]
+    async fn an_endpoint_message_reaches_a_warm_agent_not_only_a_parked_one() {
+        let (sup, id, dir) = shim_supervisor("warm-ingress", ECHO_HARNESS);
+
+        sup.start(id).await.unwrap();
+        until("the agent to be warm and idle", || {
+            status_of(&sup, id) == AgentStatus::Idle
+        })
+        .await;
+
+        enqueue_from_endpoint(&sup, id, "from the telegram tile");
+        sup.deliver(id).await.unwrap();
+
+        until("the endpoint message to leave the queue", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::has_queued(&conn, id).unwrap_or(true)
+        })
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `ephemeral_context`: the turn ends, the session is thrown away, and the
