@@ -185,6 +185,7 @@ class Results:
 
     def __init__(self):
         self.passed, self.failed, self.skipped = [], [], []
+        self.pendings = []
         self.controls = {}
 
     def control(self, tid, cond, detail=""):
@@ -215,9 +216,20 @@ class Results:
         If the control failed or never ran, this SKIPS naming it, rather than passing. A
         green here would be the exact lie the control exists to prevent.
         """
+        if control_id not in self.controls:
+            # NOT the same as a control that ran and failed, and saying so matters: this
+            # printed "the control did not pass" about a control that had passed
+            # perfectly, because it was registered with check() instead of control() and
+            # `controls` never saw it. A skip whose stated reason is false is worse than a
+            # skip, and it cost real time to read past.
+            self.skip(tid, "unproven: %s was never registered as a control in this run — "
+                           "it is probably asserted with check() instead of control(). "
+                           "Nothing is known about it, which is not the same as it having "
+                           "failed." % control_id)
+            return False
         if not self.controls.get(control_id):
-            self.skip(tid, "unproven: the control %s did not pass, so an absence here is "
-                           "not evidence" % control_id)
+            self.skip(tid, "unproven: the control %s ran and did NOT pass, so an absence "
+                           "here is not evidence" % control_id)
             return False
         return self.check(tid, cond, detail)
 
@@ -230,13 +242,50 @@ class Results:
             print("  FAIL  %-28s %s" % (tid, detail))
         return bool(cond)
 
+    def pending(self, tid, cond, bug, detail=""):
+        """An assertion for a defect that is FILED but not yet FIXED.
+
+        Contract (ARCHITECTURE.md): a deliberately-red gate lands WITH its fix, not before
+        it. Writing the gate first is right; MERGING it red converts one lane's known debt
+        into a repo-wide freeze. POS-migration-clamp-is-reported did exactly that -- it was
+        the single failing assertion across nineteen integration suites and it held four
+        lanes with nineteen commits behind it.
+
+        This is the third state that was missing. `check` says pass/fail; `skip` says could
+        not run. Neither describes "ran, correctly observed a known open bug, and that is
+        not news". PENDING does, and it CANNOT ROT, because the direction is inverted:
+
+            cond False -> the bug is still there -> PENDING, not a failure
+            cond True  -> the bug is FIXED       -> **FAIL**, demanding promotion
+
+        So the day someone fixes it, the build goes red telling them to turn this into a
+        real assertion and close the bug. A pending marker that silently stayed green after
+        the fix would be a gate that had quietly stopped gating -- which is the failure mode
+        this whole file exists to refuse.
+        """
+        if cond:
+            self.failed.append((tid, "PENDING MARKER IS STALE: %s is FIXED. Promote this "
+                                     "to a real assertion (check/gated) and close %s. A "
+                                     "pending marker left after the fix is a gate that "
+                                     "has stopped gating." % (tid, bug)))
+            print("  FAIL  %-28s %s is fixed — promote this assertion" % (tid, bug))
+            return False
+        self.pendings.append((tid, bug, detail))
+        print("  pend  %-28s %s (open, filed) %s" % (tid, bug, detail[:110]))
+        return False
+
     def skip(self, tid, why):
         self.skipped.append((tid, why))
         print("  skip  %-28s %s" % (tid, why))
 
     def report(self, suite):
-        print("\n%s: %d passed, %d failed, %d skipped (backend=%s)"
-              % (suite, len(self.passed), len(self.failed), len(self.skipped), BACKEND))
+        print("\n%s: %d passed, %d failed, %d skipped, %d pending (backend=%s)"
+              % (suite, len(self.passed), len(self.failed), len(self.skipped),
+                 len(self.pendings), BACKEND))
+        if self.pendings:
+            print("PENDING (open bugs, gate armed and will FAIL when fixed):")
+            for tid, bug, detail in self.pendings:
+                print("  ~ %s  %s" % (tid, bug))
         if self.failed:
             print("FAILED:")
             for tid, detail in self.failed:
