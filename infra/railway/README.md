@@ -160,3 +160,41 @@ What filled it was per-agent Rust toolchains: each agent node had its own `.rust
 inside its private credentials directory, and one had cloned the repo into that directory and built
 it there (a 1.9 GB `target/`). ARCHITECTURE M1.6 wants `CARGO_HOME`/`RUSTUP_HOME` **per project**;
 the engine's spawn environment is SDK's.
+
+## What `build` on the engine's `/healthz` actually tells you
+
+The engine reports a build SHA so a deploy can be confirmed rather than inferred. On Railway that
+number is **weaker than it looks**, and the difference matters.
+
+`make engine-image` passes `--build-arg GIT_SHA=$(git rev-parse HEAD)`, so a locally- or CI-built
+image carries the commit its binaries were **compiled from**. Railway does not build that way: it
+builds `docker/Dockerfile.host` directly from `dockerfilePath` (above), passes no build args, and
+`ARG GIT_SHA` keeps its `unknown` default. Measured on the running host:
+
+```
+WHEEL_BUILD_SHA=[unknown]
+RAILWAY_GIT_COMMIT_SHA=[930020a5eb246d574f7485635805009a33c2f533]
+```
+
+So `docker/entrypoint.sh` falls back to the platform's variable — which names the commit that
+**triggered the deploy**, not necessarily the one the binaries were built from. The two diverge
+whenever a deploy does not rebuild: a restart, or a variable change, redeploys the existing image
+while the platform injects a fresh commit SHA.
+
+That is a **false confirm**, and it is worse than no answer: `unknown` sends you to check, a wrong
+SHA stops you checking. So the entrypoint also exports `WHEEL_BUILD_SHA_SOURCE`:
+
+| value            | meaning                                                              |
+|------------------|----------------------------------------------------------------------|
+| `build-arg`      | compiled fact — the source these binaries were built from            |
+| `deploy-trigger` | the commit that triggered this deploy; may be newer than the binaries |
+| `none`           | no SHA available                                                     |
+
+**Treat `deploy-trigger` as evidence, not proof.** To confirm a deploy under it, check that the
+deploy actually rebuilt (Railway shows a build, not just a restart) rather than trusting the number
+alone.
+
+**Open, and not yet verified:** whether Railway can pass build args at all — the settings schema we
+write has no `buildArgs` key, but that may be our limitation rather than the platform's. If it can,
+setting `GIT_SHA` there gives production the compiled fact and demotes the fallback to a genuine
+safety net. Verifying it requires a deploy, so it is untested rather than ruled out.

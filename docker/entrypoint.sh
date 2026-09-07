@@ -16,6 +16,34 @@
 # drop and we exec directly, so this is safe before and after the `USER` line is removed.
 set -eu
 
+# The build SHA, so a deploy can be CONFIRMED rather than inferred — and a marker saying which
+# KIND of fact it is, because the two are not equally strong.
+#
+# `docker/Dockerfile.host` takes it as `ARG GIT_SHA` and `make engine-image` passes
+# `--build-arg GIT_SHA=$(git rev-parse HEAD)`. Railway does not: it builds the Dockerfile directly
+# from `dockerfilePath`, passes no build args, and the ARG keeps its `unknown` default. Measured on
+# the running host: WHEEL_BUILD_SHA=unknown while RAILWAY_GIT_COMMIT_SHA held the real commit.
+#
+# A build-arg SHA is baked in at BUILD time, so it names the source the binaries were compiled
+# from. The platform variable is injected at DEPLOY time, so it names the commit that TRIGGERED the
+# deploy. They diverge whenever a deploy does not rebuild — a restart, or a variable change — and
+# then the platform value is a FALSE CONFIRM: it reports code the running binaries are not. That is
+# worse than `unknown`, because `unknown` sends an operator to check and a wrong SHA stops them.
+#
+# So the platform value is taken only as a fallback, and never silently: WHEEL_BUILD_SHA_SOURCE
+# always says which kind of fact WHEEL_BUILD_SHA is, so nothing downstream has to guess and nothing
+# can report a triggering commit as though it were a compiled one.
+if [ -n "${WHEEL_BUILD_SHA:-}" ] && [ "${WHEEL_BUILD_SHA}" != "unknown" ]; then
+    WHEEL_BUILD_SHA_SOURCE=build-arg
+elif [ -n "${RAILWAY_GIT_COMMIT_SHA:-}" ]; then
+    WHEEL_BUILD_SHA="$RAILWAY_GIT_COMMIT_SHA"
+    WHEEL_BUILD_SHA_SOURCE=deploy-trigger
+else
+    WHEEL_BUILD_SHA="${WHEEL_BUILD_SHA:-unknown}"
+    WHEEL_BUILD_SHA_SOURCE=none
+fi
+export WHEEL_BUILD_SHA WHEEL_BUILD_SHA_SOURCE
+
 AGENT_UID=10001
 AGENT_GID=10001
 
