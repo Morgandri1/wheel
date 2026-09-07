@@ -43,6 +43,16 @@ it, *because surfacing it cost them nothing and hiding it would have cost the sw
 demands rigor without making honesty cheap produces hidden mistakes, not fewer mistakes. Keep retractions
 free.
 
+**Slack is what makes the irreversible check affordable (SDK, 2026-09-07).** The per-tree `git status` check
+before the disk reclaim caught a tree holding an agent's uncommitted, unreconstructable work — affordable only
+because the volume was at 62% and not filling. SDK's line: *"if it were at 95% I would be arguing the opposite,
+and we would both be more likely to be wrong."* Urgency degrades the exact judgment the irreversible step
+needs. The disk ceiling, "reclaim only when not urgent," and the refusal to green a red main by re-running are
+not only correctness rules — they PRESERVE the slack that lets the careful check happen. Protect the headroom
+(time, disk, a green main) so that when an irreversible step arrives you are not doing it at 95% in a hurry.
+The false-clean that cost nothing to catch at 62% would have cost a night's work at 95%, because at 95% you do
+not look three times.
+
 
 1. **Comments sparingly.** A comment means the code does not describe itself; refactor (names, small functions, types) instead. Doc-comments on public API and a `why` for a genuinely surprising decision are the only exceptions.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
