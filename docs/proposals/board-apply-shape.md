@@ -116,6 +116,24 @@ A failure is addressable, not just described:
   ] }
 ```
 
+When a board is refused ONLY for reasons the user can consent to, the `422` also carries a
+ready-made consent prompt, so the UI does not have to derive it from the refusal list:
+
+```jsonc
+{ "applied": false,
+  "refusals": [ … ],
+  "consent": {
+    "would_modify": ["researcher"],                                   // needs allow_patch
+    "would_wire":   [ {"from":"evil","to":"researcher","type":"send"} ], // needs allow_wire
+    "grant": ["allow_wire"]                                           // set these and re-apply
+  } }
+```
+
+`consent` is **absent** when the board was refused for anything a toggle cannot fix — an illegal
+wire is not something the user can agree their way past, and offering a button for it would be a
+lie. So: if `consent` is present, the board becomes appliable by granting `grant`; if it is absent,
+the builder has to produce a different board.
+
 Codes: `wire_not_allowed`, `unknown_node`, `self_wire`, `duplicate_node_name`,
 `node_type_mismatch`, `board_too_large`, `patch_not_permitted`, `wire_touches_existing_node`. **Render `message`**; branch on `code` only if you need to.
 Every refusal is returned, not just the first — one bad wire from a builder usually means several.

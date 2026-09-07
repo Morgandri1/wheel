@@ -14,7 +14,7 @@
 
 use crate::apply::{
     execute, validate, ApplyPolicy, ApplyReport, BoardClient, EmittedBoard, EmittedNode,
-    ExistingBoard, ExistingNode, Plan, WireRef,
+    ExistingBoard, ExistingNode, Plan, Refusal, WireRef,
 };
 use crate::auth::extractor::ProjectScope;
 use crate::error::{ApiError, ApiResult};
@@ -64,6 +64,64 @@ impl From<&Plan> for PlanPreview {
             create_nodes: p.create_nodes.iter().map(|n| n.name.clone()).collect(),
             patch_nodes: p.patch_nodes.iter().map(|n| n.name.clone()).collect(),
             create_wires: p.create_wires.iter().map(WireRef::of_emitted).collect(),
+        }
+    }
+}
+
+/// What consent would unblock this refusal set, as a ready-made prompt rather than something the
+/// caller has to derive.
+///
+/// Web's point, and it is right: a refusal that is correct but leaves the user to work out what to
+/// do is worse than a bare error, because it looks actionable. For an "improve an existing board"
+/// proposal, touching existing nodes IS the request — the builder cannot route around it, so
+/// "ask the builder to fix it and try again" sends the user in a circle. What they actually need is
+/// the exact list of what they would be agreeing to, and the flag that says yes.
+///
+/// Absent when nothing here is a consent problem: an illegal wire is not something the user can
+/// consent their way past, and offering a toggle for it would be a lie.
+#[derive(Debug, Default, Serialize)]
+struct Consent {
+    /// Existing nodes whose config the board would change. Unblocked by `allow_patch`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    would_modify: Vec<String>,
+    /// Wires that would attach to an existing node. Unblocked by `allow_wire`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    would_wire: Vec<WireRef>,
+    /// The flags that, together, would let this exact board through.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    grant: Vec<&'static str>,
+}
+
+impl Consent {
+    fn of(refusals: &[Refusal]) -> Option<Self> {
+        let mut c = Consent::default();
+        for r in refusals {
+            match r {
+                Refusal::PatchNotPermitted { name } => c.would_modify.push(name.clone()),
+                Refusal::WireTouchesExistingNode {
+                    from,
+                    to,
+                    wire_type,
+                    ..
+                } => c.would_wire.push(WireRef {
+                    from: from.clone(),
+                    to: to.clone(),
+                    wire_type: *wire_type,
+                }),
+                // Everything else is a board the user cannot consent their way out of.
+                _ => return None,
+            }
+        }
+        if !c.would_modify.is_empty() {
+            c.grant.push("allow_patch");
+        }
+        if !c.would_wire.is_empty() {
+            c.grant.push("allow_wire");
+        }
+        if c.grant.is_empty() {
+            None
+        } else {
+            Some(c)
         }
     }
 }
@@ -240,14 +298,15 @@ pub async fn apply_board(
                 .iter()
                 .map(|r| serde_json::json!({"refusal": r, "message": r.message()}))
                 .collect();
-            return Ok((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "applied": false,
-                    "refusals": listed,
-                    "message": "the board was refused; nothing was created",
-                })),
-            ));
+            let mut body = serde_json::json!({
+                "applied": false,
+                "refusals": listed,
+                "message": "the board was refused; nothing was created",
+            });
+            if let Some(consent) = Consent::of(&refusals) {
+                body["consent"] = serde_json::to_value(consent).unwrap_or_default();
+            }
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(body)));
         }
     };
 

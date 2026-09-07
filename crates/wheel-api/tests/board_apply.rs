@@ -28,36 +28,59 @@ enum Engine {
     RefusesWires,
 }
 
+/// A mock engine that REMEMBERS what it created, so a second apply is a genuine "improve" against
+/// an existing board. A static empty board cannot express that case at all — the nodes the first
+/// apply made would come back unknown.
+#[derive(Clone)]
+struct EngineState {
+    behaviour: Engine,
+    nodes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
 async fn mock_engine(behaviour: Engine) -> String {
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
-    let app = Router::new()
-        .route(
-            "/v1/board",
-            get(|| async { axum::Json(json!({"nodes": [], "project": {}})) }),
-        )
-        .route(
-            "/v1/nodes",
-            post(|| async {
-                (
-                    StatusCode::CREATED,
-                    axum::Json(json!({"id": uuid::Uuid::new_v4()})),
-                )
-                    .into_response()
-            }),
-        )
-        .route(
-            "/v1/wires",
-            post(|State(b): State<Engine>| async move {
-                match b {
-                    Engine::Accepts => StatusCode::NO_CONTENT.into_response(),
-                    Engine::RefusesWires => {
-                        (StatusCode::BAD_REQUEST, "wire refused by the engine").into_response()
+    let state = EngineState {
+        behaviour,
+        nodes: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let app =
+        Router::new()
+            .route(
+                "/v1/board",
+                get(|State(s): State<EngineState>| async move {
+                    let nodes = s.nodes.lock().unwrap().clone();
+                    axum::Json(json!({"nodes": nodes, "project": {}}))
+                }),
+            )
+            .route(
+                "/v1/nodes",
+                post(
+                    |State(s): State<EngineState>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        let id = uuid::Uuid::new_v4();
+                        s.nodes.lock().unwrap().push(json!({
+                            "id": id,
+                            "name": body["name"],
+                            "type": body["type"],
+                            "wires": [],
+                        }));
+                        (StatusCode::CREATED, axum::Json(json!({"id": id}))).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/v1/wires",
+                post(|State(s): State<EngineState>| async move {
+                    match s.behaviour {
+                        Engine::Accepts => StatusCode::NO_CONTENT.into_response(),
+                        Engine::RefusesWires => {
+                            (StatusCode::BAD_REQUEST, "wire refused by the engine").into_response()
+                        }
                     }
-                }
-            }),
-        )
-        .with_state(behaviour);
+                }),
+            )
+            .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -327,5 +350,80 @@ async fn a_failed_wire_is_addressable_not_just_described() {
     assert!(
         f["step"].as_str().unwrap().contains("notes -> researcher"),
         "{body}"
+    );
+}
+
+/// Web's point: a refusal the user cannot act on is worse than a bare error, because it looks
+/// actionable. For "improve an existing board", touching existing nodes IS the request — the
+/// builder cannot route around it — so the 422 carries the consent prompt ready-made rather than
+/// leaving the UI to derive it from the refusal list.
+#[tokio::test]
+async fn a_consent_refusal_says_exactly_what_to_grant() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    // Build a board first, so the second apply is an "improve" against existing nodes.
+    let (status, _) = apply(&app, &token, &id, legal_board()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Now a board that wires a NEW ctx into the EXISTING agent — the finding's own escalation.
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {
+            "nodes": [{"name": "evil", "type": "ctx", "config": {"markdown": "x"}}],
+            "wires": [{"from": "evil", "to": "researcher", "type": "send"}]
+        }}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let consent = &body["consent"];
+    assert_eq!(consent["would_wire"][0]["from"], "evil", "{body}");
+    assert_eq!(consent["would_wire"][0]["to"], "researcher", "{body}");
+    assert_eq!(consent["grant"][0], "allow_wire", "{body}");
+
+    // And granting exactly what it asked for lets the same board through.
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {
+            "nodes": [{"name": "evil", "type": "ctx", "config": {"markdown": "x"}}],
+            "wires": [{"from": "evil", "to": "researcher", "type": "send"}]
+        }, "allow_wire": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["applied"], true);
+}
+
+/// A board refused for a reason no toggle can fix must NOT offer one. An illegal wire is not
+/// something the user can consent their way past, and a grant button there would be a lie.
+#[tokio::test]
+async fn an_illegal_wire_offers_no_consent_to_grant() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {
+            "nodes": [
+                {"name": "a", "type": "agent",
+                 "config": {"harness": "claude", "system_prompt": "hi"}},
+                {"name": "v", "type": "vault", "config": {"keys": []}}
+            ],
+            "wires": [{"from": "a", "to": "v", "type": "write"}]
+        }}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body["consent"].is_null(),
+        "offered a toggle for an illegal wire: {body}"
     );
 }
