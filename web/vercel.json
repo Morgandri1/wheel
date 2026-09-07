@@ -26,7 +26,7 @@
       ]
     }
   ],
-  "ignoreCommand": "git diff HEAD^ HEAD -- package.json | grep -q '^+.*\"version\"' && exit 1 || exit 0",
+  "ignoreCommand": "v=$(git show HEAD:package.json | grep '\"version\"'); for p in $(git rev-list --parents -n1 HEAD | cut -d' ' -f2-); do pv=$(git show $p:package.json 2>/dev/null | grep '\"version\"'); [ \"$v\" != \"$pv\" ] && exit 1; done; exit 0",
   "git": {
     "deploymentEnabled": {
       "**": false,
