@@ -7,6 +7,7 @@ import { toast, toastError } from "@/components/ui/toast";
 import { validateEndpointPath } from "@/lib/validate";
 import { HTTP_METHODS } from "@/lib/schema";
 import { probeEndpoint, probeVerdict, type Probe } from "@/lib/endpoint-probe";
+import { publicReach, reachSentence } from "@/lib/endpoint-reach";
 import { projects } from "@/lib/api";
 import type { EngineApi } from "@/lib/api";
 import type { EndpointNode, HttpMethod, Project, ResponseMode, WheelNode } from "@/lib/schema";
@@ -58,6 +59,10 @@ export function EndpointPanel({
   // "/hook" — which looks like a URL, copies like a URL, and goes nowhere.
   const base = project.ingress_base_url || `${process.env.NEXT_PUBLIC_API_URL ?? ""}/p/${project.id}`;
   const url = `${base.replace(/\/$/, "")}${node.config.path}`;
+
+  const reached = publicReach(node, nodes);
+  const reach = reachSentence(reached);
+  const reachedNames = reached.map((r) => r.name).join(", ");
 
   /** What this endpoint actually does with a hit depends entirely on where its wires go. */
   const targets = useMemo(() => {
@@ -135,6 +140,16 @@ export function EndpointPanel({
       <Field label="Public URL" hint="Anyone with this link can hit it. There is no allowlist.">
         <CopyField value={url} testId="inspector-endpoint-url" />
       </Field>
+
+      {reach ? (
+        <p
+          className="border-l-2 border-[var(--danger)] px-2.5 py-2 text-micro leading-relaxed text-ink-dim"
+          data-testid="endpoint-public-reach"
+        >
+          {reach} Everything it receives is delivered as a message, so treat the URL itself as the
+          only thing standing between the internet and {reachedNames}.
+        </p>
+      ) : null}
 
       <div className="flex items-center gap-2">
         <Button size="sm" data-testid="btn-endpoint-test" disabled={probing} onClick={test}>

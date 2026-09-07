@@ -30,6 +30,7 @@ export default defineConfig({
         // operator: a bare 404 read as "your path is wrong" cost an hour on /tg.
         "src/lib/drag-overrides.ts",
         "src/lib/endpoint-probe.ts",
+        "src/lib/endpoint-reach.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },
