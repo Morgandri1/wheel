@@ -179,6 +179,87 @@ fn tool_allow_hosts() -> Result<Vec<String>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `unsafe remove_var` in `from_env` is sound for ONE reason: it runs
+    /// at the top of `wheel-engine`'s `main`, before the tokio runtime exists
+    /// and before any child is spawned, so nothing can be reading the
+    /// environment concurrently. `std::env::remove_var` is undefined behaviour
+    /// the moment a second thread is live.
+    ///
+    /// That safety argument is about the CALL SITE, not about this function,
+    /// so nothing in the type system protects it. A future caller inside a
+    /// running runtime — `wheeld` builds its runtime first and calls the host
+    /// and api configs from inside it — would make this UB silently, with
+    /// every test still green.
+    ///
+    /// So the invariant is asserted where it actually lives: the whole
+    /// workspace is scanned, and `Config::from_env` may be named only by this
+    /// crate's `main.rs` and by tests.
+    #[test]
+    fn the_engine_config_is_only_read_before_a_runtime_exists() {
+        // Outside this crate the engine's config is only reachable as
+        // `wheel_engine::Config`; inside it, unqualified. Checking both
+        // spellings by location avoids matching `wheel-host`'s and
+        // `wheel-api`'s own `Config::from_env`, which are different types with
+        // no `remove_var` in them.
+        fn scan(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    scan(&path, out);
+                    continue;
+                }
+                if !path.extension().is_some_and(|x| x == "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let shown = path.display().to_string();
+                let ours = shown.contains("wheel-engine/");
+                let hit = text.lines().any(|l| {
+                    if ours {
+                        l.contains("Config::from_env")
+                    } else {
+                        l.contains("wheel_engine::Config::from_env")
+                    }
+                });
+                if hit {
+                    out.push(shown);
+                }
+            }
+        }
+
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/ is the parent of this crate")
+            .to_path_buf();
+        let mut callers = Vec::new();
+        scan(&crates, &mut callers);
+
+        let unexpected: Vec<_> = callers
+            .iter()
+            .filter(|p| {
+                // The engine's own entry point, which runs it before building
+                // a runtime, and this file's tests.
+                !p.ends_with("wheel-engine/src/main.rs")
+                    && !p.ends_with("wheel-engine/src/config.rs")
+            })
+            .collect();
+
+        assert!(
+            unexpected.is_empty(),
+            "Config::from_env calls `unsafe std::env::remove_var`, which is UB unless it runs \
+             single-threaded before any runtime. New caller(s) found: {unexpected:?} — if one of \
+             these runs inside a tokio runtime, the unsafe block is no longer sound."
+        );
+    }
     use super::*;
 
     /// Env is process-global, so these run one at a time.
