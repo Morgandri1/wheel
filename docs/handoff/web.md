@@ -1,122 +1,72 @@
-# Web — handoff
+# Web lane — state, 2026-09-07
 
-Owner of `web/` (wheel.dev landing + `/app` board). Stack is fixed in the contract; nothing here
-overrides it.
+Supersedes the stand-down brief, which predated everything below.
 
-## STATE — done and provable on origin/main
+## On main (released, live to the operator)
 
-| What | Merge | Verify |
-|---|---|---|
-| Auth panel never paints an unread state | `9a81ca9` (`0dd01ca`) | `pnpm vitest run src/components/inspector/auth-flow.test.tsx` (19) · `qa/e2e` `tests/auth-first-paint.spec.ts` (2) |
-| Endpoint panel truthfulness + web **0.2.0** | `f477666` (`2ec1782`) | `pnpm vitest run src/lib/endpoint-probe.test.ts src/components/inspector/endpoint-panel.test.tsx` (23) |
-| A 404 the engine *wrote* is not excused as a missing feature, web **0.2.1** | `ea6f2ab` (`36b5b21`) | same suite; `probeVerdict` table |
+`0.3.0` (`bf6acf8`). Endpoint panel truthfulness (four distinct probe states), the 043 composition
+warning, the adopted bearer-auth UI, 45 kB off the board's first load, the auth-mode mismatch gate,
+one shared wired-vault rule.
 
-0.2.1 is the release on `origin/main` and includes the `ea6f2ab` 404-wording fix — it is no longer
-sitting unreleased (a past version of this doc said it was; that was stale, not current truth).
-Vercel builds only on a `web/package.json` version bump; verify with `git diff HEAD^ HEAD --
-package.json | grep -q '^+.*"version"'` rather than assuming.
+Deploy is **triggered, outcome unverified** — see "Why nobody can confirm a deploy" below.
 
-Earlier and still live: `npx wheel-web` (standalone package, runtime API resolution proven by
-building against :8787 and running with `--api :9911`), CSP with per-request nonce, tool panel
-against the live engine, local email/password auth.
+## Held on `web/main`, merged nowhere (NOT live)
 
-## IN FLIGHT
+    917a6e9  wires leave by the side that faces the other node
+    1b327e3  clear a budget or timeout with an explicit null
+    f7b902d  workspaces, budget and idle timeout controls
 
-**PR #3 — endpoint bearer-auth UI**, branch `web/endpoint-bearer-auth-ui`, commit `a676f51`, not
-yet merged. `EndpointConfig.auth` (`{mode:"bearer", vault_ref}`) existed in the schema/engine
-contract with no UI; added the picker, gated so bearer is only selectable once the endpoint holds
-a `read` wire to a vault (the wire matrix already had `endpoint → vault (read)`, so no
-wire-matrix change was needed) and the vault-key datalist only offers keys from wired vaults,
-mirroring `tool-panel.tsx`'s fill-mode picker. A saved config that is `bearer` whose vault wire was
-since removed shows a warning instead of silently dropping the field. `pnpm typecheck` / `lint` /
-`test` (284, 14 new/changed) all green. PM reviewed the design as correct; merge is held only on
-`make check`/integration being red on `main` itself from BUG-022 (journal-mode fast-path — SDK's,
-already filed S1, not this PR's diff) — merge as soon as CI reruns green, nothing more needed from
-web on it.
+All three gated green (`CHECK_ONLY=web`), 353 tests. Needs a merge onto a green main and a bump to
+`0.4.0` — the bump IS the deploy; a merge alone changes nothing the operator can see.
 
-## NEXT — priority order
+## Dogfood findings (the reason to read this file)
 
-1. **Re-probe the endpoint Test button against a real board** once SDK's ingress lands
-   (`crates/wheel-engine/src` has no `/ingress/*` route as of this doc — confirmed directly by
-   grep, not inferred from a stale note; API's CORS/preflight side is already green, per API's own
-   `reports` row: `cors` test `the_public_ingress_answers_any_origin`, 4/4). When ingress lands,
-   the "bodiless 404 → ingress is not built yet" branch in `probeVerdict` becomes unreachable by
-   construction and an E2E hitting a real endpoint is owed. Ask QA for the ID; do not invent one
-   (see TRAPS).
-2. **Coverage include list** (see CONTRACT) — needs a PM ruling before changing.
-3. Nothing else queued. Once PR #3 lands, re-check this list against `origin/main` rather than
-   trusting it verbatim (see TRAPS #13).
+**1. The generated client types were stale, silently.** `workspaces` exists in
+`crates/wheel-core/src/node.rs:196` and in `docs/schema/`, but `web/src/lib/schema/generated.ts`
+had ZERO occurrences of it. Building the workspaces control against those types would have been
+impossible — and worse, casting past the error would have written a field the client believed did
+not exist. `pnpm gen:types` fixes it. **Nothing regenerates this automatically**, so the client can
+drift behind the contract indefinitely and only a person trying to use the missing field finds out.
 
-## TRAPS — every one of these I walked into today
+**2. `undefined` cannot clear a field under merge-PATCH.** `JSON.stringify` DROPS undefined keys, so
+`{...config, budget: undefined}` goes out with no `budget` key. Under replace semantics that clears
+it; under merge, an absent key means "leave unchanged" — a user empties the spend cap, the UI says
+saved, and the cap survives. Clearing now sends an explicit `null`, which means unset under BOTH
+semantics. The test asserts the SERIALISED body, because an object-level assertion passes while the
+wire form is wrong.
 
-1. **An exit code is not evidence.** A Playwright run reported exit 0 with *zero bytes* of output
-   (piping to `tail` swallowed it; a backgrounded `&` detached it from the harness). I re-ran to a
-   file instead of believing it. Earlier the same shape cost more: a stale `next-server` held :3000
-   and my readiness check only asked "is something listening", so I got a **false PASS on CSP**.
-   Assert the BUILD_ID you just built is the one being served.
-2. **A test that has never failed proves nothing.** Every assertion here was mutation-verified:
-   reintroduce the bug, watch the test go red, restore, watch it go green. For the auth fix that
-   meant restoring `?? false` and confirming 3 unit cases *and* the E2E turned red. Do this by
-   default; it is cheap and it is the only thing that makes "green" mean anything.
-3. **A flash is invisible to an assertion that runs after it.** The operator's bug was a one-frame
-   render. Polling for it cannot work. `auth-first-paint.spec.ts` installs a MutationObserver via
-   `addInitScript`, records every mount/unmount of the form, slows `/auth` 2s with `page.route`,
-   and requires the recorded list to be **empty**. Reuse that shape for anything transient.
-4. **Rebase BEFORE diagnosing a red gate.** `make check` went red on `rust:clippy`/`rust:test` and
-   I nearly reported a broken build to SDK. My worktree was 49 commits stale; main already had the
-   fix. Cost: nothing, because I checked `git show main:<file>` first. Always do that first.
-5. **`??` is not `||`.** Bit me twice: `ingress_base_url` arrives as an **empty string** before the
-   project starts (so `??` produced a "URL" of just `/hook`), and `WHEEL_API_URL=` with nothing
-   after it is an ordinary empty string. For anything that can be empty-but-present, use
-   truthiness.
-6. **Never paint a state you have not read.** The whole auth bug. `data?.x ?? false` collapses "not
-   loaded" into "false". Pending is its own state — it deserves its own branch and its own
-   placeholder. The same bug already existed once as `E2E-local-session-gate` (loading ≠ anon); it
-   will happen a third time somewhere else.
-7. **`qa/contract/testid_parity.py` only sees literal `data-testid="..."`.** A computed one
-   (`data-testid={x ? "a" : "b"}`) is invisible, and so is any id passed as a `testId=` *prop*
-   (e.g. `CopyField`). The gate was right both times; I made the testids literal and dropped the
-   registration for the prop-based one rather than loosening the regex. Do not weaken it.
-8. **`web:coverage` is scoped to an explicit include list in `vitest.config.ts`.** A new module is
-   invisible to the 90% gate until someone adds it. I only noticed because my coverage numbers were
-   **byte-identical** before and after adding an 84-line file. If a number does not move when it
-   should, that is the finding.
-9. **Playwright collects spec files at start.** I edited a spec mid-run and could not tell which
-   version had passed. Re-run rather than reason about it.
-10. **Read another agent's constraint literally.** API confirmed my error code and then explained
-    that *only a bodiless 404* becomes 501. That sentence contained a delayed bug in code I had
-    already shipped: once ingress lands, a real "no endpoint at this path" would have rendered as
-    "it does not mean your path is wrong". A plain "yes" would not have surfaced it. Read the
-    boundary, not just the answer.
-11. **Prefer branches that retire themselves.** The "ingress is not built yet" wording becomes
-    unreachable the moment API's fix lands, rather than needing someone to remember it. QA's
-    `pending` marker in `env-allowlist.json` expired the same way, by breaking. Copy the pattern.
-12. **Background work does not survive a session restart.** Long gates died twice. `CHECK_ONLY=web`
-    / `CHECK_ONLY=qa` run in seconds; the rust gates take ~28 min under a contended cargo lock and
-    are not yours to re-prove for a web-only diff — say so instead of implying green (PM ruled this
-    correct).
-13. **This file is a snapshot, not truth.** A prior version of this doc said `ea6f2ab` was merged
-    but unreleased — `git log -- web/package.json` showed it had already shipped as 0.2.1
-    (`36b5b21`). It said NEXT#1 just needed "API's CORS/preflight merge and SDK's ingress" without
-    saying whether either had actually landed — a grep of `crates/wheel-engine/src` (no
-    `/ingress/*` route) settled it in one command, and both API and SDK independently confirmed the
-    same thing minutes later. Before acting on anything in STATE or NEXT, check it against
-    `git log`/grep on the actual paths named — a stale handoff read as current truth wastes a whole
-    agent (or worse, a whole turn) that a two-minute check would have caught.
+**3. Two config writes were safe only by accident.** `ctx-panel` sent `{markdown}` and `table-panel`
+sent `{columns}`. Complete today because those config types have one field each; the day either
+grows a second field, both silently delete it, and `Partial<Config>` type-checks the mistake. Both
+read-modify-write now. Agent, tool and endpoint panels were already correct — **there was no live
+silent-delete bug.**
 
-## CONTRACT — where I think a rule is wrong
+**4. Why nobody can confirm a deploy.** No public route carries a version. `/healthz` gives the API's
+build, nothing gives the web's. Every 0.3.0 change is behind the login wall — I diffed it: ZERO
+public-route files changed — so no unauthenticated check can distinguish 0.2.1 from 0.3.0. I tried
+four (landing chunks, the webpack chunk-id map, reconstructed lazy filenames, `/app`'s referenced
+app-route chunks); the board's chunk hash is never exposed to a logged-out client.
+**Fix worth doing: emit the version on a public route** (a meta tag, or `/version.json` from
+`web/package.json` at build). Five lines, and it retires this whole class of question permanently.
 
-1. **§0b rule 3 says "≥ 90 % test coverage per crate and per package."** For web that is not what
-   is enforced. `web/vitest.config.ts` measures 90% across **nine hand-picked files**; everything
-   else — every component, `runtime-config.ts`, `api.ts` — is outside the gate entirely. The
-   scoping is defensible (those files encode rules; components are covered by Playwright), but the
-   contract's words and the gate's behaviour disagree, and a successor reading only the contract
-   will believe the package is covered. Either narrow the contract to say "the modules that encode
-   rules, listed in vitest.config.ts", or change the include to `src/lib/**` with explicit
-   exclusions. It needs a ruling, not a quiet edit — I left it alone.
-2. **The release rule has no owner for "when".** Vercel now builds only on a `web/package.json`
-   version bump, which correctly stopped 127 no-op deploys. But a fix merged without a bump is
-   invisible in production for an unbounded time, and nothing schedules the next bump. `ea6f2ab` is
-   sitting on main right now in exactly that state. This is fine for cosmetics and *not* fine for a
-   security fix. Suggest: any merge touching auth, CSP, or a secret path bumps the patch version in
-   the same commit, and the rule says so.
+**5. Agent state is not trustworthy, so the board under-reports.** Status never advances past
+`starting` in production. `node-plate` gives `running || starting` the same live treatment (a
+healthy agent spins forever), and the status bar counts only `running` and `parked` — so a stuck
+agent appears in NEITHER count and nothing looks wrong. Engine-side; no UI work until the state is
+true, per PM.
+
+## Traps for whoever is next
+
+- **A merge is not a deploy.** Vercel builds only when `web/package.json` version changes
+  (`b99d1ca`). Merging web work to main changes nothing a user sees. Bump deliberately, changelog in
+  the bump commit.
+- **A triggered build is not a succeeded build.** The ignoreCommand firing means Vercel did not
+  skip; it says nothing about the build passing.
+- **wheel.dev is NOT the app.** It is a catch-all placeholder — `/`, `/app` and any nonsense path
+  return the identical page. The app is `wheel-2708.vercel.app` (`web/DEPLOY.md:115`).
+- **Check that a check can succeed before believing it.** Five times in one session an instrument
+  lied rather than the subject: a manifest that is not what browsers download, a Chai matcher
+  missing from the setup (`toBeInTheDocument` — jest-dom is NOT installed here), a stale local
+  `.next` used as a control, a guessed URL that resolved, and a gate run against a mutated file.
+- **A fast green gate is suspicious.** `web:test` in 4s where it normally takes 20 means stale
+  state; re-run and count the tests.
