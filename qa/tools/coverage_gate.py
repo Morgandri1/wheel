@@ -167,19 +167,24 @@ def main():
     env = dict(os.environ, CARGO_TARGET_DIR=cov_target)
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
-         # COVER THE FEATURE SETS CI TESTS, not just the default one. `postgres` is
-         # becoming non-default on wheel-api, and tests/boot_db.rs is
-         # `#![cfg(feature = "postgres")]` -- so a default-features coverage run would
-         # stop compiling the code that talks to production's database AND stop counting
-         # the 5 tests that cover it. wheel-api is already at 89.02%, under the 90 bar, so
-         # the visible effect would be an under-bar crate dropping further under, blamed
-         # on whichever diff happened to land next rather than on this invocation.
+         # NO `--features wheel-api/postgres` HERE, AND THIS IS A KNOWN GAP, NOT AN
+         # OVERSIGHT -- see BUG-033.
          #
-         # Package-qualified so it is valid for a --workspace run whose other members have
-         # no such feature. Same rule as the size gate's DEPLOY_FEATURES: measure the thing
-         # that actually ships and is actually tested, not whatever the default happens
-         # to be this week.
-         "--features", "wheel-api/postgres",
+         # I added that flag so the Postgres arm would keep being counted once `postgres`
+         # left wheel-api's defaults (tests/boot_db.rs is `#![cfg(feature = "postgres")]`,
+         # so a default-features coverage run stops compiling the code that talks to
+         # production's database and stops counting the 5 tests covering it). The reasoning
+         # still holds. The flag does not.
+         #
+         # It turns main red on `rotate_tool`, which SHELLS OUT to `cargo build` from
+         # inside the test. Under llvm-cov that nested build runs against an instrumented
+         # target dir, and changing the feature set makes it rebuild the world underneath
+         # the outer run. Measured: rotate_tool passes with `-p wheel-api --features
+         # postgres` (16s) and with `cargo test --workspace --features wheel-api/postgres`
+         # (150s -- the nested rebuild), and fails only inside llvm-cov.
+         #
+         # So the coverage number for the Postgres arm is currently NOT measured. That is
+         # worse than it sounds and it is written down rather than quietly accepted.
          # PM-approved, requested by API, owned here rather than in their crates so the
          # team that benefits is not the team that widens it. Scoped to main.rs and
          # nothing wider: those files are pure wiring (config load, pool, router assembly,

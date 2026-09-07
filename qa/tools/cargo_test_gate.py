@@ -37,6 +37,20 @@ REAL_FAILURE = (
     "assertion",
 )
 
+# CHECKED BEFORE the markers above, and that precedence is the point. A shared-target-dir
+# race can produce "error: could not compile" as a SIDE EFFECT of an rlib vanishing
+# mid-build, which would otherwise match REAL_FAILURE and be reported red. The signature
+# below is definitive: an extern location that "does not exist" is another worktree's cargo
+# deleting an artifact under a run in progress -- the file was there when rustc resolved it
+# and gone when it opened it. No diff can cause that.
+#
+# SDK hit it tonight and nearly reported it as a defect in their own fix; PM put the
+# signature in the contract at a67cd71. Re-run before believing it.
+CONTENDED_SIGNATURES = (
+    "extern location for",      # "...does not exist: .../libaxum-<hash>.rlib"
+    "No such file or directory (os error 2)",
+)
+
 CONTENDED = 75
 
 
