@@ -15,6 +15,39 @@
   not be, given every agent currently runs as the SAME uid. Below, each item is marked VERIFIED (traced in
   source + Linux semantics) or REASONED/STAGEABLE (needs the combined process-backend image to demo live).
 
+## CROWN JEWEL — CONFIRMED BY RUN (settles PM's /proc/environ question)
+PM's production test — root over railway ssh — got `Permission denied` reading `/proc/11/environ` (the engine,
+uid 21088), and rightly did NOT treat that as disproof: root-from-OUTSIDE is a different question from a
+**sibling process running AS uid 21088 INSIDE** the sandbox (the actual threat: a compromised/prompt-injected
+agent). I settled the real question by reproducing the engine's exact drop and reading environ as a same-uid
+sibling. PoC: `redteam/pocs/child-isolation/t_proc_environ_same_uid.sh` (Linux container, orbstack kernel
+7.0.14, **`suid_dumpable=0`** — the hardened setting).
+
+The drop is faithful to `crates/wheel-host/src/sandbox/process.rs::drop_privileges`: `setgroups([]) → setgid →
+setuid → PR_SET_NO_NEW_PRIVS`, **no capabilities, no `PR_SET_DUMPABLE`**, then a normal `execve`. Result:
+
+```
+/proc/<engine>/environ  ->  -r-------- 1 21088 21088   (owned by the uid, NOT root)
+TEST 1  same-uid sibling (21088):  READ  WHEEL_ENGINE_SECRET=... and WHEEL_VAULT_KEY=...   → 037 CONFIRMED
+TEST 2  different uid   (21089):   Permission denied                                       → uid IS the boundary
+```
+
+So: **a same-uid sibling reads the engine's environ and gets both crown-jewel secrets.** `suid_dumpable=0` did
+NOT save it — the engine's final `execve` is non-secure, so the process is dumpable and its environ is owned by
+the uid (21088), not root. PM's outside-root denial is explained by the ssh context lacking `CAP_SYS_PTRACE`
+over pid 11 (a namespace/cap artefact), NOT by the engine being protected. **037's crown jewel holds as written;
+PM can stop asking.** TEST 2 (different uid → denied) is the proof that per-node uids (§2/F007) is the real fix.
+
+Two consequences worth stating:
+- **PR #17 (scrub the two secrets from the engine's environ) DOES close THIS carrier for the crown jewels** —
+  the sibling can still read `/proc/engine/environ`, but after #17 those two variables are no longer in it. #17
+  is therefore not just tidiness; it empties the confirmed carrier of exactly the two secrets that matter. It
+  does not close the carrier for anything else the engine's environ holds, nor the other items below.
+- **Cheap interim option (independent of per-node uids):** the host could `prctl(PR_SET_DUMPABLE, 0)` on the
+  engine after the setuid; its environ would then be root-owned and unreadable by a same-uid sibling, closing
+  the carrier for its whole environ. Trade-off: it also blocks core dumps/debugging of the engine. #17 +
+  per-node uids is the cleaner path; noting the option because it is one line and closes the general carrier.
+
 ## The single fact that makes everything below true
 `§2`/F007: per-node uids are not implemented. On the **process backend (production, Railway)** the host
 `setuid`s to the project uid and execs the engine as that uid (§4b: "the engine runs as the project uid the
