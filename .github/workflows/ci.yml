@@ -145,9 +145,35 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # RETRIED, because this step is a NETWORK dependency of every gate that follows it.
+      # `dtolnay/rust-toolchain@stable` resolves the channel by fetching
+      # channel-rust-stable.toml from static.rust-lang.org on every run, so one transient
+      # timeout reds main on ANY commit — it froze four lanes on a DOCS push, which is a
+      # gate measuring the network rather than the code.
+      #
+      # An `uses:` step cannot be wrapped by a retry action, so this calls rustup directly.
+      # rustup is preinstalled on the GitHub runners; `--profile minimal` keeps it to what
+      # the gates need, and clippy is requested explicitly because the clippy step below
+      # depends on it.
+      #
+      # STAGED DELIBERATELY: the same action appears in five jobs and I cannot test a
+      # GitHub Actions change anywhere but in CI. Changing all five on an untested guess
+      # would risk five jobs at once to fix a flake in one. This job is the one that
+      # actually flaked; if it proves out over a few runs, the other four follow.
+      - name: Rust toolchain (retried — the fetch is a network dependency)
+        run: |
+          for attempt in 1 2 3; do
+            if rustup toolchain install stable --profile minimal --component clippy; then
+              rustup default stable
+              rustc --version && cargo --version && cargo clippy --version
+              exit 0
+            fi
+            echo "::warning::rust toolchain fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "::error::rust toolchain could not be installed after 3 attempts. This is a \
+          NETWORK failure, not a code failure — re-run the job." >&2
+          exit 1
       - uses: actions/cache@v4
         with:
           path: |
