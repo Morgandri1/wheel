@@ -1544,6 +1544,50 @@ mod tests {
         }
     }
 
+    /// A driver whose `encode_turn` PANICS on a marked body and behaves
+    /// normally otherwise (ADVERSARY 040).
+    ///
+    /// The `catch_unwind` belt in `pump_queue` had zero tests: `panic = "unwind"`
+    /// is load-bearing in Cargo.toml and nothing proved the belt caught
+    /// anything, so a refactor dropping it would have gone unnoticed until a
+    /// stored body took a board down again — which is the incident it was
+    /// written for.
+    ///
+    /// Panicking on ONE body rather than all of them is what lets the test
+    /// assert the part that matters: the poison is set aside AND the agent goes
+    /// on to the next message. A driver that always panicked could only show
+    /// that everything stops.
+    struct PoisonDriver {
+        program: String,
+    }
+
+    const POISON: &str = "PANIC-ON-THIS-BODY";
+
+    impl crate::harness::Harness for PoisonDriver {
+        fn program(&self) -> &str {
+            &self.program
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<std::ffi::OsString> {
+            ClaudeDriver.argv(spec)
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            ClaudeDriver.env(spec)
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            assert!(
+                !envelope.contains(POISON),
+                "PoisonDriver: this body is the one that panics"
+            );
+            ClaudeDriver.encode_turn(envelope)
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            ClaudeDriver.parse_line(line)
+        }
+        fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(None, stderr)
+        }
+    }
+
     /// Builds a supervisor whose child is `script`, over an in-memory board
     /// holding one agent node. Returns the agent's id and its scratch dir.
     fn shim_supervisor(name: &str, script: &str) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
@@ -1565,11 +1609,37 @@ mod tests {
 
     /// Per-engine deadline, so a test that needs a short one does not have to
     /// mutate a process-wide variable every other test is also reading.
+    /// As `shim_supervisor`, with a driver of the caller's choosing.
+    fn shim_supervisor_driver(
+        name: &str,
+        script: &str,
+        driver: impl FnOnce(String) -> Arc<dyn crate::harness::Harness> + 'static,
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        shim_supervisor_inner(
+            name,
+            script,
+            |_| {},
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            Some(Box::new(driver)),
+        )
+    }
+
     fn shim_supervisor_full(
         name: &str,
         script: &str,
         tweak: impl FnOnce(&mut wheel_core::AgentConfig),
         deadline_secs: u64,
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        shim_supervisor_inner(name, script, tweak, deadline_secs, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn shim_supervisor_inner(
+        name: &str,
+        script: &str,
+        tweak: impl FnOnce(&mut wheel_core::AgentConfig),
+        deadline_secs: u64,
+        driver: Option<Box<dyn FnOnce(String) -> Arc<dyn crate::harness::Harness> + 'static>>,
     ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1616,9 +1686,12 @@ mod tests {
             cfg,
             Arc::new(Mutex::new(conn)),
             Arc::new(crate::events::Bus::new()),
-            Arc::new(ShimDriver {
-                program: program.display().to_string(),
-            }),
+            match driver {
+                Some(make) => make(program.display().to_string()),
+                None => Arc::new(ShimDriver {
+                    program: program.display().to_string(),
+                }),
+            },
         ));
         (sup, id, dir)
     }
@@ -2659,6 +2732,91 @@ done
             AgentStatus::Starting,
             "nothing was queued, so there was nothing to be late for; the deadline must \
              decline to judge rather than invent a failure"
+        );
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADVERSARY 040: the `catch_unwind` quarantine belt was exercised by ZERO
+    /// tests, so `panic = "unwind"` was load-bearing in Cargo.toml with nothing
+    /// proving it. ADVERSARY filed this against their own earlier verdict,
+    /// having credited the belt as verified in 035 and then run the tests.
+    ///
+    /// The belt exists because a stored body that panicked the encoder is
+    /// REPLAYED at every start, so one bad message took a whole board down
+    /// through repeated reboots. Catching the panic is only half; the message
+    /// must be set aside so the next start does not hit it again.
+    #[tokio::test]
+    async fn a_body_that_panics_the_encoder_is_quarantined_and_the_agent_carries_on() {
+        let (sup, id, dir) = shim_supervisor_driver("poison", ECHO_HARNESS, |program| {
+            Arc::new(PoisonDriver { program })
+        });
+
+        let poison = {
+            let conn = sup.db.lock().unwrap();
+            messages::enqueue(
+                &conn,
+                wheel_core::MessageSender::User,
+                id,
+                format!("a body containing {POISON}"),
+                None,
+            )
+            .unwrap()
+        };
+        enqueue(&sup, id, "an ordinary message behind the poison");
+
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the queue to drain past the poison", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::has_queued(&conn, id).unwrap_or(true)
+        })
+        .await;
+
+        let states: Vec<(String, Option<String>)> = {
+            let conn = sup.db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, state, last_error FROM messages WHERE to_id = ?1")
+                .unwrap();
+            stmt.query_map([id.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1).ok().map(|s| {
+                        format!(
+                            "{s}|{}",
+                            r.get::<_, Option<String>>(2)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                        )
+                    }),
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .collect()
+        };
+
+        let poisoned = states
+            .iter()
+            .find(|(mid, _)| *mid == poison.id.to_string())
+            .map(|(_, s)| s.clone().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            poisoned.starts_with("undeliverable"),
+            "the panicking body must be set aside, not retried for ever; got {poisoned:?}"
+        );
+        assert!(
+            poisoned.contains('|') && poisoned.split('|').nth(1).is_some_and(|r| !r.is_empty()),
+            "and it must say WHY, or the operator cannot tell which message was dropped"
+        );
+
+        // The half that makes it a belt rather than a bin: the agent kept going.
+        assert!(
+            !matches!(status_of(&sup, id), AgentStatus::Error),
+            "one unencodable message must not take the agent down with it"
         );
 
         sup.stop(id).await.unwrap();
