@@ -154,12 +154,21 @@ host.db engine_secret but will use SDK's intended path, not poke the engine dire
   2. Textual: tell it in the task body not to message anyone. Weaker; it relies on the agent choosing to comply,
      and our own contract says we never rely on that.
 
-  **One caveat on reading the signals.** In `spawn`, workspace materialisation is currently swallowed:
-  `materialise(...).await.unwrap_or(None).unwrap_or_else(|| workspace.clone())`. If the clone fails, the agent
-  starts anyway with a bare cwd and improvises — so a materialisation failure would present as "it worked, then
-  the agent did something odd" rather than as an error. If signal 5 fails under option (B), check the engine log
-  before concluding the agent misbehaved. I would rather flag my own swallowed error now than have it cost us the
-  first wake. Tightening it is a small follow-up I will take.
+  **One caveat on reading the signals — NOW CLOSED, both halves fixed before the wake.** I flagged two ways a
+  workspace problem would have been unreadable during the wake, and both are on main:
+
+  - *A clone that hangs* (`c446bde`). `workspace::git` used `Command::output`, which waits forever, so an
+    unreachable host or an unsuppressed credential prompt would have hung the spawn with no error — the agent
+    sitting in `starting`, indistinguishable from the wedged-start bug. Now 600s for network git, 60s for the
+    local probe, killed on drop so the child cannot outlive us holding the repository lock.
+  - *A clone that fails quietly* (`ca857c3`). Materialisation failures went to the engine's tracing log only, so
+    the agent would start with a missing directory and the reason would sit somewhere nobody is watching. Each
+    failure now lands on the AGENT's own `engine` log stream — `GET /v1/agents/:id/log` and the events WS —
+    naming which workspace failed and why.
+
+  The start policy is deliberately unchanged: one unusable workspace still does not stop an agent that may need
+  the other two. So if signal 5 fails under option (B), the reason is now in the agent's log next to the
+  behaviour, and you should not have to guess whether the agent misbehaved or the clone did.
 
 ## Trigger
 PM pulls the wake only after all four SDK slots are filled and pushed. Re-read this file, do not trust a
