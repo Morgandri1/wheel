@@ -14,7 +14,7 @@
 
 use crate::apply::{
     execute, validate, ApplyReport, BoardClient, EmittedBoard, EmittedNode, ExistingBoard,
-    ExistingNode, Plan,
+    ExistingNode, Plan, WireRef,
 };
 use crate::auth::extractor::ProjectScope;
 use crate::error::{ApiError, ApiResult};
@@ -38,7 +38,8 @@ pub struct ApplyRequest {
 pub struct PlanPreview {
     pub create_nodes: Vec<String>,
     pub patch_nodes: Vec<String>,
-    pub create_wires: Vec<String>,
+    /// Structured, not formatted: the confirm step draws these on a canvas.
+    pub create_wires: Vec<WireRef>,
 }
 
 impl From<&Plan> for PlanPreview {
@@ -46,11 +47,7 @@ impl From<&Plan> for PlanPreview {
         Self {
             create_nodes: p.create_nodes.iter().map(|n| n.name.clone()).collect(),
             patch_nodes: p.patch_nodes.iter().map(|n| n.name.clone()).collect(),
-            create_wires: p
-                .create_wires
-                .iter()
-                .map(|w| format!("{} -> {} ({})", w.from, w.to, w.wire_type.as_str()))
-                .collect(),
+            create_wires: p.create_wires.iter().map(WireRef::of_emitted).collect(),
         }
     }
 }

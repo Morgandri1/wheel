@@ -286,3 +286,46 @@ async fn an_unauthenticated_apply_is_refused() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// The wire shape is a CONTRACT with the confirm step, not an implementation detail: Web draws
+/// these on a canvas and highlights the ones that failed. A formatted string would force them to
+/// parse a sentence to find an edge, so both the plan and the report carry structure.
+#[tokio::test]
+async fn wires_are_structured_objects_in_both_the_plan_and_the_report() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let mut dry = legal_board();
+    dry["dry_run"] = json!(true);
+    let (_, body) = apply(&app, &token, &id, dry).await;
+    let w = &body["plan"]["create_wires"][0];
+    assert_eq!(w["from"], "notes", "{body}");
+    assert_eq!(w["to"], "researcher", "{body}");
+    assert_eq!(w["type"], "send", "{body}");
+
+    let (_, body) = apply(&app, &token, &id, legal_board()).await;
+    let w = &body["report"]["created_wires"][0];
+    assert_eq!(w["from"], "notes", "{body}");
+    assert_eq!(w["to"], "researcher", "{body}");
+    assert_eq!(w["type"], "send", "{body}");
+}
+
+/// A failed wire carries the same structure, so the failure can be shown ON the edge rather than
+/// only in a list of sentences.
+#[tokio::test]
+async fn a_failed_wire_is_addressable_not_just_described() {
+    let app = app(Engine::RefusesWires).await;
+    let (token, id) = project(&app).await;
+
+    let (_, body) = apply(&app, &token, &id, legal_board()).await;
+    let f = &body["report"]["failures"][0];
+    assert_eq!(f["wire"]["from"], "notes", "{body}");
+    assert_eq!(f["wire"]["to"], "researcher", "{body}");
+    assert_eq!(f["wire"]["type"], "send", "{body}");
+    assert!(f["error"].as_str().unwrap().contains("refused"), "{body}");
+    // The human line is still there for a log; it is not the only way in.
+    assert!(
+        f["step"].as_str().unwrap().contains("notes -> researcher"),
+        "{body}"
+    );
+}

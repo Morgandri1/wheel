@@ -290,11 +290,68 @@ pub trait BoardClient: Send + Sync {
     async fn add_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String>;
 }
 
+/// A wire, as a consumer needs it: addressable, not a sentence.
+///
+/// These are rendered on a canvas and highlighted when they fail, so the shape is structured and
+/// the caller formats. An earlier version returned "notes -> researcher (send)" — readable in a log
+/// and useless to a UI that has to find the edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireRef {
+    pub from: String,
+    pub to: String,
+    #[serde(rename = "type")]
+    pub wire_type: WireType,
+}
+
+impl WireRef {
+    /// From an emitted wire, for a preview built outside this module.
+    pub fn of_emitted(w: &EmittedWire) -> Self {
+        Self::of(w)
+    }
+
+    fn of(w: &EmittedWire) -> Self {
+        Self {
+            from: w.from.clone(),
+            to: w.to.clone(),
+            wire_type: w.wire_type,
+        }
+    }
+    /// The human form, for a `step` label.
+    fn label(&self) -> String {
+        format!("{} -> {} ({})", self.from, self.to, self.wire_type.as_str())
+    }
+}
+
 /// One step that did not land, named so the report says which.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Failure {
     pub step: String,
     pub error: String,
+    /// The node this step was about, when it was about one — so a UI can mark it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The wire this step was about, when it was about one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire: Option<WireRef>,
+}
+
+impl Failure {
+    fn node(name: &str, step: String, error: String) -> Self {
+        Self {
+            step,
+            error,
+            node: Some(name.to_string()),
+            wire: None,
+        }
+    }
+    fn wire(w: &WireRef, error: String) -> Self {
+        Self {
+            step: format!("create wire {}", w.label()),
+            error,
+            node: None,
+            wire: Some(w.clone()),
+        }
+    }
 }
 
 /// Exactly what happened. Never "ok" for a partial apply — see `is_complete`.
@@ -302,7 +359,7 @@ pub struct Failure {
 pub struct ApplyReport {
     pub created_nodes: Vec<String>,
     pub patched_nodes: Vec<String>,
-    pub created_wires: Vec<String>,
+    pub created_wires: Vec<WireRef>,
     pub failures: Vec<Failure>,
 }
 
@@ -342,19 +399,21 @@ pub async fn execute(
                 ids.insert(node.name.clone(), id);
                 report.created_nodes.push(node.name.clone());
             }
-            Err(error) => report.failures.push(Failure {
-                step: format!("create node {:?}", node.name),
+            Err(error) => report.failures.push(Failure::node(
+                &node.name,
+                format!("create node {:?}", node.name),
                 error,
-            }),
+            )),
         }
     }
 
     for node in &plan.patch_nodes {
         let Some(id) = ids.get(&node.name).copied() else {
-            report.failures.push(Failure {
-                step: format!("patch node {:?}", node.name),
-                error: "the node is no longer on the board".into(),
-            });
+            report.failures.push(Failure::node(
+                &node.name,
+                format!("patch node {:?}", node.name),
+                "the node is no longer on the board".into(),
+            ));
             continue;
         };
         // Only `config` is sent, so the merge leaves name and position alone; and because the
@@ -365,15 +424,16 @@ pub async fn execute(
             .unwrap_or(serde_json::Value::Null) });
         match client.patch_config(id, &config).await {
             Ok(()) => report.patched_nodes.push(node.name.clone()),
-            Err(error) => report.failures.push(Failure {
-                step: format!("patch node {:?}", node.name),
+            Err(error) => report.failures.push(Failure::node(
+                &node.name,
+                format!("patch node {:?}", node.name),
                 error,
-            }),
+            )),
         }
     }
 
     for wire in &plan.create_wires {
-        let label = format!("{} -> {} ({})", wire.from, wire.to, wire.wire_type.as_str());
+        let reference = WireRef::of(wire);
         let (Some(from), Some(to)) = (ids.get(&wire.from).copied(), ids.get(&wire.to).copied())
         else {
             let missing = if ids.contains_key(&wire.from) {
@@ -381,18 +441,15 @@ pub async fn execute(
             } else {
                 &wire.from
             };
-            report.failures.push(Failure {
-                step: format!("create wire {label}"),
-                error: format!("{missing:?} was not created, so this wire has no endpoint"),
-            });
+            report.failures.push(Failure::wire(
+                &reference,
+                format!("{missing:?} was not created, so this wire has no endpoint"),
+            ));
             continue;
         };
         match client.add_wire(from, to, wire.wire_type).await {
-            Ok(()) => report.created_wires.push(label),
-            Err(error) => report.failures.push(Failure {
-                step: format!("create wire {label}"),
-                error,
-            }),
+            Ok(()) => report.created_wires.push(reference),
+            Err(error) => report.failures.push(Failure::wire(&reference, error)),
         }
     }
 
