@@ -32,6 +32,8 @@ export default defineConfig({
         "src/lib/auth-mode-check.ts",
         "src/lib/agent-config.ts",
         "src/lib/edge-geometry.ts",
+        "src/lib/password.ts",
+        "src/components/board/sidebar-rail.tsx",
         "src/lib/endpoint-probe.ts",
         "src/lib/wired-vaults.ts",
         "src/lib/endpoint-reach.ts",

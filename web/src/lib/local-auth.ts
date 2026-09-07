@@ -213,6 +213,28 @@ export async function signIn(email: string, password: string): Promise<SessionUs
 }
 
 /**
+ * Change the password, then end the local session — because the API has already ended every one.
+ *
+ * `POST /v1/auth/password` revokes EVERY session including the caller's own (docs/API.md), which is
+ * the point: a password changed because it leaked must not leave the leaked sessions alive. So the
+ * only honest thing the client can do afterwards is forget its token and send the user to sign in.
+ * Keeping them on the board would leave a UI that looks authenticated and 401s on every action.
+ *
+ * The current password is required even though the caller is authenticated, so a stolen token
+ * cannot be turned into a permanent takeover.
+ */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  const token = session?.token;
+  if (!token) throw new Error("You are not signed in.");
+  await authRequest(
+    "/v1/auth/password",
+    { current_password: currentPassword, new_password: newPassword },
+    token,
+  );
+  persist(null);
+}
+
+/**
  * Tell the API first, then forget locally — but forget locally even if the API call fails, because
  * a sign-out that leaves the token in the browser because the network blipped is not a sign-out.
  */

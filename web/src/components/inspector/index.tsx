@@ -22,6 +22,7 @@ import { McpPanel } from "@/components/inspector/mcp-panel";
 import { VaultPanel } from "@/components/inspector/vault-panel";
 import { ChestPanel } from "@/components/inspector/chest-panel";
 import { useBoardStore } from "@/store/board";
+import { CollapseButton, SidebarRail } from "@/components/board/sidebar-rail";
 import type { EngineApi } from "@/lib/api";
 import type { AgentNode, Project, WheelNode } from "@/lib/schema";
 
@@ -40,15 +41,32 @@ export function Inspector({
   projectId: string;
   onChanged: () => void;
 }) {
+  const collapsed = useBoardStore((s) => s.inspectorCollapsed);
+  const toggle = useBoardStore((s) => s.toggleInspector);
+
+  if (collapsed) {
+    return (
+      <SidebarRail side="right" label="Inspector" onExpand={toggle} testId="btn-inspector-expand" />
+    );
+  }
+
   if (!node) {
     return (
       <aside
         data-testid="inspector-empty"
         className="flex w-[360px] shrink-0 flex-col border-l border-rule bg-[var(--panel-1)] p-4"
       >
+        <div className="mb-2 flex justify-end">
+          <CollapseButton
+            side="right"
+            label="Inspector"
+            onCollapse={toggle}
+            testId="btn-inspector-collapse"
+          />
+        </div>
         <p className="text-meta text-ink-dim">
-          Pick a node to see what it is and what it may touch. Drag from a node&apos;s right edge to
-          another node&apos;s left edge to wire them together.
+          Pick a node to see what it is and what it may touch. Drag from a node&apos;s edge to
+          another node to wire them together.
         </p>
       </aside>
     );
@@ -66,6 +84,12 @@ export function Inspector({
         </span>
         <span className="ident flex-1 truncate text-ink">{node.name}</span>
         <span className="text-micro text-ink-faint">{meta.label}</span>
+        <CollapseButton
+          side="right"
+          label="Inspector"
+          onCollapse={toggle}
+          testId="btn-inspector-collapse"
+        />
       </div>
 
       <div className="flex flex-col gap-5 p-4">

@@ -72,6 +72,13 @@ export const T = {
   agentMaxTurns: "input-agent-max-turns",
   agentMaxUsd: "input-agent-max-usd",
   agentIdleTimeout: "input-agent-idle-timeout",
+  // The sidebar collapse controls are deliberately NOT here: they are rendered by a shared
+  // component that takes its testid as a prop, so no literal exists for the parity checker to
+  // find. Select them by their accessible names instead — getByRole("button", {name: "Hide
+  // Inspector"}) / "Show Palette" — which is stabler than a testid and checks the a11y label too.
+  linkSettings: "link-settings",
+  changePassword: "btn-change-password",
+  resetUnavailable: "reset-unavailable",
   endpointHttpOff: "endpoint-http-off",
   endpointEnableHttp: "btn-endpoint-enable-http",
   // "Reachable" is a measurement, not an inference from a config flag. Ingress does not exist

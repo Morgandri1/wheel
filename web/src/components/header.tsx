@@ -99,9 +99,14 @@ function SessionBadge() {
   if (AUTH_MODE !== "local" || session.status !== "authed") return null;
   return (
     <div className="flex items-center gap-2" data-testid="session-badge">
-      <span className="ident max-w-[16rem] truncate text-ink-dim" title={session.user.email}>
+      <Link
+        href="/app/settings"
+        className="ident max-w-[16rem] truncate text-ink-dim transition-colors hover:text-ink"
+        title={`${session.user.email} — account settings`}
+        data-testid="link-settings"
+      >
         {session.user.email}
-      </span>
+      </Link>
       <Button
         size="sm"
         tone="ghost"

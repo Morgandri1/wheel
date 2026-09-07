@@ -3,20 +3,30 @@
 import { NODE_META, PALETTE_ORDER } from "@/lib/node-meta";
 import { Glyph } from "@/components/ui";
 import type { NodeType } from "@/lib/schema";
+import { CollapseButton, SidebarRail } from "@/components/board/sidebar-rail";
+import { useBoardStore } from "@/store/board";
 
 /**
  * Drag a type onto the canvas, or click it to drop one in the middle of the view.
  * Both paths end in the same place, so nobody has to discover drag-and-drop to get started.
  */
 export function Palette({ onPlace }: { onPlace: (type: NodeType) => void }) {
+  const collapsed = useBoardStore((s) => s.paletteCollapsed);
+  const toggle = useBoardStore((s) => s.togglePalette);
+
+  if (collapsed) {
+    return <SidebarRail side="left" label="Palette" onExpand={toggle} testId="btn-palette-expand" />;
+  }
+
   return (
     <aside
       data-testid="palette"
       className="flex w-[172px] shrink-0 flex-col border-r border-rule bg-[var(--panel-1)]"
     >
-      <p className="border-b border-rule px-3 py-2 text-micro text-ink-faint">
-        Drag onto the board, or click to place
-      </p>
+      <div className="flex items-center justify-between border-b border-rule py-2 pl-3 pr-1">
+        <p className="text-micro text-ink-faint">Drag onto the board, or click to place</p>
+        <CollapseButton side="left" label="Palette" onCollapse={toggle} testId="btn-palette-collapse" />
+      </div>
       <ul className="flex flex-col">
         {PALETTE_ORDER.map((type) => {
           const meta = NODE_META[type];

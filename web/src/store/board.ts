@@ -29,6 +29,12 @@ interface BoardState {
   drawerOpen: boolean;
   setDrawerOpen: (open: boolean) => void;
 
+  /** Sidebars collapse so the canvas can have the whole viewport on a small screen. */
+  paletteCollapsed: boolean;
+  inspectorCollapsed: boolean;
+  togglePalette: () => void;
+  toggleInspector: () => void;
+
   pendingWire: PendingWire | null;
   setPendingWire: (w: PendingWire | null) => void;
 
@@ -52,6 +58,11 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   drawerTabs: [],
   activeTab: null,
   drawerOpen: false,
+
+  paletteCollapsed: false,
+  inspectorCollapsed: false,
+  togglePalette: () => set((s) => ({ paletteCollapsed: !s.paletteCollapsed })),
+  toggleInspector: () => set((s) => ({ inspectorCollapsed: !s.inspectorCollapsed })),
   openTab: (id) =>
     set((s) => ({
       drawerTabs: s.drawerTabs.includes(id) ? s.drawerTabs : [...s.drawerTabs, id],
