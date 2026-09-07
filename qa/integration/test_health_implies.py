@@ -307,7 +307,10 @@ def main():
                          "a boot failure rather than a health lie -- loud, and covered by "
                          "POS-migration-boots-past-unparseable-id."):
             return R.report("health-implies")
-        assert_all("one-bad-row", pending_bug="BUG-031")
+        # No pending_bug any more: BUG-031 is fixed (0417a5e), so a failure here is a
+        # REGRESSION and must be red. Leaving the marker in place would quietly re-pend a
+        # bug that had come back — a gate that downgrades its own findings.
+        assert_all("one-bad-row")
 
         return R.report("health-implies")
     finally:
