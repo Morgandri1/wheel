@@ -700,7 +700,7 @@ and re-checked by the engine, which never trusts a child.
 | ctx markdown / table row value | 1 MiB | `too_large` |
 | Chest blob | 50 MiB | `too_large` |
 | Script output captured | 1 MiB | truncated **in the captured output only**, flagged in the result |
-| Script runtime | `timeout_secs`, default 60, max 600 | `timeout`, process killed |
+| Script runtime | `timeout_secs`, default 60, max 300 | `timeout`, process killed |
 | Table query | 5 s | `timeout` |
 
 Exceeding a limit never truncates a *message* (§3c#11).
