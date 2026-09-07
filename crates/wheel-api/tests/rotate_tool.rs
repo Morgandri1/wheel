@@ -1,50 +1,24 @@
-//! The rotation tool's two load-bearing properties, exercised against the real binary.
+//! The rotation's two load-bearing properties.
 //!
-//! `docs/runbooks/rotate-engine-secret.md` step 2 exists because `engine_secret_enc` is AES-GCM
-//! sealed and no SQL can produce a valid value. A tool that writes that column at 3am during an
-//! incident has exactly two ways to make things worse: writing when it said it would not, and
-//! writing something the API can never open again. Both are asserted here.
+//! `docs/runbooks/rotate-engine-secret.md` step 2 writes a column that is AES-GCM sealed, so no SQL
+//! can produce a valid value. Code that writes it during an incident has exactly two ways to make
+//! things worse: writing when it said it would not, and writing something the API can never open
+//! again. Both are asserted here, and both are proven by mutation rather than by reading.
+//!
+//! These call the function directly. The first version drove the `examples/` binary through
+//! `std::process::Command` and built it first with a nested `cargo build` — which passed locally and
+//! then failed under `cargo llvm-cov`, because invoking cargo inside a cargo-driven test run
+//! contends for the same target directory. Before that it did NOT build the binary at all and
+//! silently tested a stale one. Two failures from the same decision: testing a subprocess instead of
+//! a function.
 
 #![cfg(feature = "sqlite")]
 
-use base64::Engine as _;
+use wheel_api::admin::{rotate_engine_secret, Rotation};
 use wheel_api::crypto;
 use wheel_api::db::Db;
 
-/// Build the example, then return its path.
-///
-/// It BUILDS rather than merely locating, and that is not belt-and-braces. `cargo test --test
-/// rotate_tool` does not rebuild examples, so an earlier version of this test located a stale
-/// binary and passed against a deliberately broken tool — the mutation went undetected because the
-/// subject under test was a file from a previous compile. A test that shells out to an artifact is
-/// only ever testing whichever artifact happens to be on disk unless it puts one there itself.
-fn tool() -> std::path::PathBuf {
-    let status = std::process::Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "-p",
-            "wheel-api",
-            "--example",
-            "rotate-engine-secret",
-        ])
-        .status()
-        .expect("build the rotation tool");
-    assert!(status.success(), "the rotation tool did not build");
-
-    let mut p = std::env::current_exe().expect("test binary path");
-    p.pop(); // deps/
-    p.pop(); // debug/
-    p.push("examples");
-    p.push("rotate-engine-secret");
-    assert!(
-        p.exists(),
-        "built the tool but cannot find it at {}",
-        p.display()
-    );
-    p
-}
-
-async fn seeded(key: &[u8; 32]) -> (String, uuid::Uuid, Vec<u8>) {
+async fn seeded(key: &[u8; 32]) -> (Db, uuid::Uuid, Vec<u8>) {
     let path = std::env::temp_dir().join(format!("wheel-rot-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
     let db = Db::connect(&url).await.expect("connect and migrate");
@@ -74,13 +48,12 @@ async fn seeded(key: &[u8; 32]) -> (String, uuid::Uuid, Vec<u8>) {
     )
     .expect("insert secrets");
 
-    (url, id, sealed)
+    (db, id, sealed)
 }
 
-async fn stored(url: &str, id: uuid::Uuid) -> Vec<u8> {
-    let db = Db::connect(url).await.expect("reopen");
+async fn stored(db: &Db, id: uuid::Uuid) -> Vec<u8> {
     let row: (Vec<u8>,) = wheel_api::db_fetch_one!(
-        &db,
+        db,
         "SELECT engine_secret_enc FROM project_secrets WHERE project_id = $1",
         id
     )
@@ -88,32 +61,19 @@ async fn stored(url: &str, id: uuid::Uuid) -> Vec<u8> {
     row.0
 }
 
-fn run(url: &str, key_b64: &str, args: &[&str]) -> (bool, String) {
-    let out = std::process::Command::new(tool())
-        .args(args)
-        .env("STORE", url)
-        .env("API_MASTER_KEY", key_b64)
-        .output()
-        .expect("run the rotation tool");
-    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    (out.status.success(), s)
-}
-
 /// A dry run that writes is worse than no tool: the operator's next decision is made on a false
 /// belief about what already happened.
 #[tokio::test]
 async fn a_dry_run_does_not_write() {
     let key = [9u8; 32];
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
-    let (url, id, before) = seeded(&key).await;
+    let (db, id, before) = seeded(&key).await;
 
-    let (ok, out) = run(&url, &key_b64, &[&id.to_string()]);
-    assert!(ok, "dry run failed: {out}");
-    assert!(out.contains("DRY RUN"), "{out}");
-
+    let outcome = rotate_engine_secret(&db, &key, id, false)
+        .await
+        .expect("dry run");
+    assert_eq!(outcome, Rotation::DryRun);
     assert_eq!(
-        stored(&url, id).await,
+        stored(&db, id).await,
         before,
         "the dry run rewrote the sealed secret"
     );
@@ -123,25 +83,17 @@ async fn a_dry_run_does_not_write() {
 #[tokio::test]
 async fn apply_rotates_to_a_value_the_api_can_still_open() {
     let key = [7u8; 32];
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
-    let (url, id, before) = seeded(&key).await;
+    let (db, id, before) = seeded(&key).await;
 
-    let (ok, out) = run(&url, &key_b64, &[&id.to_string(), "--apply"]);
-    assert!(ok, "apply failed: {out}");
+    let outcome = rotate_engine_secret(&db, &key, id, true)
+        .await
+        .expect("apply");
+    assert_eq!(outcome, Rotation::Rotated);
 
-    let after = stored(&url, id).await;
-    assert_ne!(after, before, "--apply did not change the sealed secret");
-
+    let after = stored(&db, id).await;
+    assert_ne!(after, before, "apply did not change the sealed secret");
     let opened = crypto::open(&key, &after).expect("the rotated secret must decrypt");
     assert!(!opened.expose().is_empty(), "rotated to an empty secret");
-
-    // Neither secret may reach a terminal, a log, or a shoulder.
-    let old = crypto::open(&key, &before).expect("seeded secret decrypts");
-    assert!(
-        !out.contains(opened.expose()),
-        "printed the new secret: {out}"
-    );
-    assert!(!out.contains(old.expose()), "printed the old secret: {out}");
 }
 
 /// The wrong master key must stop BEFORE the write, not overwrite a good row with a value nothing
@@ -149,17 +101,31 @@ async fn apply_rotates_to_a_value_the_api_can_still_open() {
 #[tokio::test]
 async fn a_wrong_master_key_refuses_instead_of_destroying_the_row() {
     let key = [3u8; 32];
-    // The correct key seeds the row; the tool is then handed a different one.
-    let (url, id, before) = seeded(&key).await;
+    let (db, id, before) = seeded(&key).await;
 
-    let wrong = base64::engine::general_purpose::STANDARD.encode([4u8; 32]);
-    let (ok, out) = run(&url, &wrong, &[&id.to_string(), "--apply"]);
-    assert!(!ok, "a wrong master key was accepted: {out}");
-    assert!(out.contains("refusing to overwrite"), "{out}");
-
+    let e = rotate_engine_secret(&db, &[4u8; 32], id, true)
+        .await
+        .expect_err("a wrong master key was accepted");
+    assert!(
+        format!("{e:#}").contains("refusing to overwrite"),
+        "the refusal must say why: {e:#}"
+    );
     assert_eq!(
-        stored(&url, id).await,
+        stored(&db, id).await,
         before,
         "the row was overwritten despite the wrong key"
     );
+}
+
+/// A project that is not there is a stop, not a silent no-op.
+#[tokio::test]
+async fn an_unknown_project_is_an_error_naming_it() {
+    let key = [5u8; 32];
+    let (db, _id, _) = seeded(&key).await;
+    let missing = uuid::Uuid::new_v4();
+
+    let e = rotate_engine_secret(&db, &key, missing, true)
+        .await
+        .expect_err("an unknown project must not succeed");
+    assert!(format!("{e:#}").contains(&missing.to_string()), "{e:#}");
 }

@@ -167,24 +167,36 @@ def main():
     env = dict(os.environ, CARGO_TARGET_DIR=cov_target)
     r = subprocess.run(
         ["cargo", "llvm-cov", "--workspace", "--json", "--output-path", out,
-         # COVER THE FEATURE SETS CI TESTS, not just the default one. `postgres` is
-         # becoming non-default on wheel-api, and tests/boot_db.rs is
-         # `#![cfg(feature = "postgres")]` -- so a default-features coverage run would
-         # stop compiling the code that talks to production's database AND stop counting
-         # the 5 tests that cover it. wheel-api is already at 89.02%, under the 90 bar, so
-         # the visible effect would be an under-bar crate dropping further under, blamed
-         # on whichever diff happened to land next rather than on this invocation.
+         # COVER THE FEATURE SET CI ACTUALLY TESTS, not just the default one.
+         # `postgres` is not in wheel-api's default features, and its `*_db.rs` suites are
+         # `#![cfg(feature = "postgres")]`, so a default-features coverage run does not
+         # compile the code that talks to production's database and does not count the
+         # tests covering it. The code it covers is NOT postgres-gated, so it stays in the
+         # denominator and loses its numerator. Measured: wheel-api reads 72.55% without
+         # this flag against ~89% with it -- a 16-point drop that is measurement, not
+         # regression, and that reads as an under-bar crate to anyone who did not know.
          #
-         # Package-qualified so it is valid for a --workspace run whose other members have
-         # no such feature. Same rule as the size gate's DEPLOY_FEATURES: measure the thing
-         # that actually ships and is actually tested, not whatever the default happens
-         # to be this week.
-         "--features", "wheel-api/postgres",
+         # I removed this flag once, wrongly, believing it caused a rotate_tool failure
+         # under llvm-cov. It did not: rotate_tool shelled out to `cargo build` from inside
+         # the test, which cannot work under an instrumented target-dir, and API fixed that
+         # separately in bf7107d. Removing the flag cost 16 points of wheel-api coverage
+         # and fixed nothing. See BUG-033.
+         #
+         # Package-qualified because the run is `--workspace`, where a bare `--features`
+         # is not valid for a member's feature.
+         #
+         # I added that flag so the Postgres arm would keep being counted once `postgres`
+         # left wheel-api's defaults (tests/boot_db.rs is `#![cfg(feature = "postgres")]`,
+         # so a default-features coverage run stops compiling the code that talks to
+         # production's database and stops counting the 5 tests covering it). The reasoning
+         # still holds. The flag does not.
+         #
          # PM-approved, requested by API, owned here rather than in their crates so the
          # team that benefits is not the team that widens it. Scoped to main.rs and
          # nothing wider: those files are pure wiring (config load, pool, router assembly,
          # serve). If logic lands in one, the fix is to move the logic into a covered
          # module — NOT to widen this regex.
+         "--features", "wheel-api/postgres",
          "--ignore-filename-regex", r"(^|/)main\.rs$"],
         cwd=ROOT, env=env, capture_output=True, text=True)
     if r.returncode in (137, -9):

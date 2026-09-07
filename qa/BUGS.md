@@ -1154,7 +1154,7 @@ drops every message while pm is warm, `/healthz` at 200 throughout.
 
 ---
 
-### 029 — an out-of-range position clamps SILENTLY on migration (S2, SDK, **open**)
+### 029 — an out-of-range position clamps SILENTLY on migration (S2, SDK, ~~closed~~)
 
 `POS-migration-clamp-is-reported`. A stored position outside ±32767 is clamped to the bound
 on read (`cff5fa4`), which is correct — but nothing says so. Measured: a node at
@@ -1183,7 +1183,7 @@ SDK reports `ensure_tables` now reads only the names and configs it needs and sk
 cannot parse, loudly. Still red against `bb20275`, which predates that fix — re-verify on
 the next image.
 
-### 031 — one unparseable node id turns `/v1/board` into a 500 (S1, SDK, **open**)
+### 031 — one unparseable node id turns `/v1/board` into a 500 (S1, SDK, ~~closed~~)
 
 `POS-migration-bad-id-does-not-hide-good-nodes`. Follow-on from BUG-030, on current main
 including `02dd2b5`.
@@ -1215,3 +1215,118 @@ control registered with `check()` rather than `control()`, so it SKIPPED with th
 "the control did not pass" — about a control that had passed. A skip whose stated reason is
 false. Fixed in `wheel_client.gated`, which now distinguishes "never registered" from "ran
 and failed"; the real finding appeared the moment it could.
+
+
+---
+
+## Closed tonight, with the measurement that closed each
+
+A bug is closed when its TESTPLAN ID goes green, not when someone says it is fixed. All
+three were re-measured on an image built from the commit carrying the fix, and the image's
+freshness was asserted before each run — twice tonight a stale or clobbered tag made a
+result describe a different engine, once nearly costing a true S1 a retraction.
+
+| bug | closed by | measurement |
+|---|---|---|
+| 028 ingress never drains to a warm agent | SDK, pump-on-init + deliver | 12/12 consumed on a fresh image (IDLE 0/6 failed, BUSY 0/6). It was IDLE 6/6 and BUSY 3/6 failing when filed. |
+| 029 clamp is silent | `6852068` | the log names the node and both coordinate pairs; asserted on all five substrings rather than the word "clamp", which would have passed on the count line the bug was filed against |
+| 031 one bad row turns `/v1/board` into a 500 | `0417a5e` | `/v1/board` → 200 with the malformed row present, every well-formed node still listed, and the skipped row named in the log with its id as stored |
+
+The third assertion in each row is the one worth keeping. A fix that made the board serve
+while the skipped node vanished unexplained would pass "returns 200" and would be the same
+quiet-failure trade the whole `HEALTH-implies-*` suite exists to catch.
+
+### 032 — `ws_bridge_db.rs` is the seventh Postgres suite and was not guarded (S2, API, ~~closed~~)
+
+`rust:test-nopg`. `7a8c4f5` guarded six of the seven `wheel-api` suites that need a Postgres
+driver. `crates/wheel-api/tests/ws_bridge_db.rs` has no `#![cfg(feature = "postgres")]`, and
+its helper `ws_support::db_url()` gates on `TEST_DATABASE_URL` — the same wrong axis the fix
+was about — then feeds that URL straight into `Config.database_url`.
+
+Measured, default features, with a URL set:
+
+```
+$ TEST_DATABASE_URL="postgres://u:p@127.0.0.1:1/none" cargo test -p wheel-api --test ws_bridge_db
+RC=101
+crates/wheel-api/tests/ws_bridge_db.rs:48 panicked:
+connect and migrate: this build has no Postgres driver: rebuild with the `postgres` feature
+```
+
+Three tests: `frames_cross_the_bridge_byte_identical`,
+`a_ticket_is_useless_against_another_project`, `a_ticket_opens_the_socket_exactly_once`.
+
+**Why the file-by-file fix keeps missing one:** the guard is being applied per file as each
+is discovered. The property is "no test in the default build requires a driver the default
+build does not have", and that is one assertion, not seven. `rust:test-nopg` asserts it —
+default features, a URL pointed at a closed port, and anything that tries to reach a
+database fails. It is red on this bug right now, which is how I know it works.
+
+**Closed** by `268f8ee` ("gate the sixth Postgres suite — the one the grep could not see").
+`rust:test-nopg` verified green against that commit on a clean tree, and mutation-checked:
+removing the guard again makes it fail with the diagnosis. It discovers all seven suites
+rather than naming them, so an eighth is covered without anyone remembering it exists.
+
+### 033 — the Postgres arm is not measured by coverage (S3, QA — mine, ~~closed~~)
+
+`rust:coverage`. When `postgres` left wheel-api's defaults, `tests/boot_db.rs`
+(`#![cfg(feature = "postgres")]`) stopped being compiled by the coverage run, so the code
+that talks to production's database and the 5 tests covering it stopped counting. API
+predicted this before merging and was right.
+
+My fix — adding `--features wheel-api/postgres` to `cargo llvm-cov` — **turned main red** and
+is reverted. `crates/wheel-api/tests/rotate_tool.rs` shells out to `cargo build` from inside
+the test (deliberately: an earlier version located a stale binary and passed against a
+knowingly broken tool). Under llvm-cov that nested build runs against an instrumented
+target-dir, and changing the feature set makes it rebuild the world underneath the outer run.
+
+Measured, so the next person does not repeat the search:
+
+| invocation | result |
+|---|---|
+| `cargo test -p wheel-api --test rotate_tool --features postgres` | passes, 16s |
+| `cargo test --workspace --features wheel-api/postgres --test rotate_tool` | passes, 150s (nested rebuild) |
+| the same feature set inside `cargo llvm-cov` | **fails**, and took main down |
+
+So the failure is the llvm-cov context, not the feature and not the test.
+
+**What is true right now:** wheel-api's coverage number does not include the Postgres arm.
+It is not wrong so much as narrower than it looks, and nothing says so on the report — which
+is the same quiet-failure shape as everything else tonight, in my own gate.
+
+Options, none taken yet: teach `rotate_tool` to skip when it detects a coverage run
+(API's file); give llvm-cov its own target-dir per feature set so the nested build cannot
+collide; or measure the arm in a second, separate coverage invocation.
+
+**I reverted rather than pursued it** because main was red at 04:06 on a change of mine,
+and greening main beats being right about coverage at four in the morning.
+
+
+---
+
+### 033, closed — and I got the diagnosis wrong in the middle of it
+
+Recorded in full because the wrong turn is the useful part.
+
+`rust:coverage` went red. The failing test was `rotate_tool`, and the command carried
+`--features wheel-api/postgres`, a flag I had added. I concluded the flag was the cause,
+reverted it, told PM it was mine, and merged the revert.
+
+**It was not the cause.** The next run failed identically with the flag gone — same test,
+command visibly without `--features`. `rotate_tool` shells out to `cargo build` from inside
+the test, which cannot work under llvm-cov's instrumented target-dir: the nested build
+writes to `target-cov/debug/examples` while the test looks in
+`target-cov/llvm-cov-target/debug/examples`. It had never passed under coverage; it was
+added in `46791c3`, after the last all-green run, so nothing had ever exercised it there.
+API fixed it separately in `bf7107d` by testing the rotation as a function.
+
+**What my revert did cost:** wheel-api fell to **72.55%** against ~89%, and failed the 90
+bar. Not a regression — a measurement of a narrower thing, reading as an under-bar crate to
+anyone who did not know why. Exactly the harm API predicted when they asked me to check
+this before their merge.
+
+**Why I got it wrong:** the flag and the failure appeared in the same command line, and I
+took correlation from a single observation. The second run was the control I should have
+demanded before reverting — and I have spent this entire session insisting on exactly that
+for other people's findings. Two runs, one variable. I had one run and two variables.
+
+Flag restored. The rotate_tool fix and the flag are independent and both are needed.
