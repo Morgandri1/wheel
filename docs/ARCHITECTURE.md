@@ -38,6 +38,22 @@ ownership area. Ship small, commit often, keep main green.
 2. **Every plan and every implementation passes adversarial review and QA.** Plans: ADVERSARY reviews `docs/plans/<role>.md` and sends findings via PM before M1 code is merged. Implementations: nothing merges to `main` without `make check` green, and ADVERSARY gets a `DONE:` for every merged milestone deliverable to attack.
 3. **≥ 90 % test coverage** per crate and per package. Enforced in **CI** (`make check-strict` on every push to origin: `cargo llvm-cov --fail-under-lines 90` per crate; web `vitest --coverage` with `lines: 90`) — coverage below the bar is a failing check, not a warning. Locally `make check` runs everything except coverage (it OOMs with six agents resident) and `make coverage` runs it deliberately. A red CI on `origin/main` is the owner's to fix within the hour; PM pushes `main` after merges so CI sees every merge. **No exemption without a machine-checkable expiry; an exemption from a bar is never an exemption from regressing.** Exemptions are predicates the gate executes (crate + a floor that never decreases, in `qa/coverage-floors.json` + an expiry the gate evaluates); an expired exemption fails the gate and names the choice. wheel-engine: ratchet from 71.24% (2026-09-06), joins the 90% bar when M2 is complete. **Web's 90% bar is scoped, not universal**: it applies to the `src/lib` modules that encode rules — wire matrix, limits, auth/session, CSP, message states, validation, endpoint-probe verdicts — enumerated in `web/vitest.config.ts`'s coverage `include` (PM ruling 2026-09-06, on Web's own recommendation). UI components are exercised by QA's Playwright suite instead of this gate; that split stands because a component test that mocks everything proves less than an E2E click, while an untested branch in wire-matrix/validate fails silently and lands on the operator. The include list is a live obligation, not a fixed inventory: any new `src/lib` module whose wrong branch would be silently wrong (permission/wire checks, auth, security headers, state machines, anything §3c calls out) must be added to it on the PR that introduces it; pure glue/IO (API client plumbing, env resolution) stays out unless it grows that kind of logic.
 
+### A claim about what is tested is a measurement, not a memory (PM ruling, 2026-09-06)
+
+Run it or grep it before you assert it. Three instances in one day:
+
+- API twice asserted a coverage gap from memory. The second — "nothing exercises `AUTH_MODE=jwks`" — was
+  false: `crates/wheel-api/tests/support.rs` already stands up an RSA keypair, a real JWKS server and RS256
+  minting, and five test files run the full router against it in `cargo test --workspace`. They retracted it
+  themselves, before it was acted on, and in doing so gave up the strongest argument for work they wanted.
+- PM quoted "346 crates" to four agents all evening as the headline efficiency number. QA measured 281; the
+  larger figure was an unfiltered resolve including 62 Windows-only crates that compile nowhere we own.
+- ADVERSARY credited the `catch_unwind` belt as a verified defense in 035, then ran the suites and found zero
+  tests reach it (040).
+
+A claimed gap justifies work; a claimed cover justifies skipping it. Both are load-bearing, and neither
+survives being remembered rather than checked.
+
 ## 1. Repository & workflow
 
 - Monorepo at `/Users/metatron/wheel` (git, branch `main`), origin `https://github.com/Morgandri1/wheel.git`. Never rewrite history on `main`.
