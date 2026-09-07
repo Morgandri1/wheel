@@ -644,23 +644,21 @@ stderr is captured as `stream=stderr` and never parsed as JSON.
 
 ### Codex (`harness: "codex"`) — M2
 
-> **WARNING — a `codex` node is accepted today and SILENTLY RUNS CLAUDE. Do not create one.**
+> **GUARDED as of 2026-09-07 — a `codex` node is refused, not silently substituted.**
 > There is no codex driver: `Supervisor::new` hardcodes `ClaudeDriver` (`supervisor/mod.rs:267`) and
-> `ClaudeDriver::program()` returns `"claude"` (`harness/claude.rs:19-20`). `agent_cfg.harness` is consulted
-> **only** to pick which credential env vars to export (`supervisor/mod.rs:468`, `:643`) — never to choose the
-> binary. Nothing rejects the node at creation or at start (no `Harness::Codex` guard in `validate.rs` or
-> `board_routes.rs`).
-> So the node is created, handed `CODEX_API_KEY`, and then `claude` is spawned with it. It fails as an auth
-> problem, or behaves as a Claude agent, and the operator is never told their harness choice was ignored.
-> The auth flows described above for codex are real code, which is what makes this shape convincing — the
-> credential half exists, the execution half does not.
-> **A guard was written and then REVERTED (SDK, 2026-09-07), and the reason is worth recording.** Refusing to
-> start a codex node broke `AUTH-cred-codex-var`, which verifies that a codex node exports `CODEX_API_KEY` —
-> and it verifies it *by spawning the node*. That test can only pass because spawning a codex node runs
-> claude: it is asserting credential SELECTION through a mechanism that only works because of this defect.
-> So the guard and the test cannot both stand as written. The guard is the correct behaviour; the test needs
-> to assert credential selection without spawning (`auth.rs` already unit-tests exactly that). Reverted to
-> keep `main` green rather than break QA's suite unilaterally; to be re-landed with QA.
+> `ClaudeDriver::program()` returns `"claude"`. `agent_cfg.harness` picks which credential env vars to export,
+> never which binary to spawn. So before the guard, a codex node was created, handed `CODEX_API_KEY`, and then
+> `claude` was spawned with it — the operator's harness choice silently substituted. The codex auth code being
+> real is what made it convincing: the credential half existed, the execution half did not.
+> Now: placing one is refused at create/PATCH, and starting an existing one is refused with status `Error` and
+> a `last_error` naming codex.
+>
+> The route here is worth recording. The guard first broke `AUTH-cred-codex-var`, which asserted codex
+> credential routing *by spawning a codex node* — an assertion that could only pass because spawning one ran
+> claude. SDK reverted to clear a red `main`; QA independently reshaped the test to assert the REFUSAL, keeping
+> the credential-routing claim PENDING against Codex landing rather than deleting it. The guard was then
+> re-landed, which is what the test now requires. Two correct fixes to one conflict, from opposite ends; the
+> combination needed both, and briefly neither worked alone.
 
 Deferred. The auth spike established that `codex exec` is not a safe auth probe (it proceeds unauthenticated and
 dies at request time with a 401) and that the API-key env var is **`CODEX_API_KEY`** — `OPENAI_API_KEY` is noticed
