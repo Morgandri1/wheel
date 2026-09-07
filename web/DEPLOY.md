@@ -224,3 +224,37 @@ NEXT_DIST_DIR=.next-local NEXT_PUBLIC_AUTH_MODE=local \
 The mock implements `/v1/auth/signup|login|logout|me` with a seeded account
 (`dev@wheel.dev` / `wheel-dev-password`), a real 5-strike lockout with `Retry-After`, and
 identical answers for a wrong password and an unknown email.
+
+## Releases are fired by CI, not inferred from the deployed commit
+
+`vercel.json`'s `ignoreCommand` can only inspect the commit Vercel is deploying. On a shared main
+that commit is usually **not** the release commit — another lane lands on top within minutes, that
+commit's version equals its parent's, and the release is skipped. It then sits on main deployed to
+nobody, and the only way to notice is to go looking. That is what happened to 0.4.1.
+
+A push RANGE does not have that problem, so CI decides:
+
+```yaml
+# .github/workflows/ci.yml — on push to main (owner: QA)
+- name: Deploy web when the version changed
+  if: github.ref == 'refs/heads/main'
+  env:
+    VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+  run: web/scripts/deploy-if-released.sh "${{ github.event.before }}" "${{ github.sha }}"
+```
+
+`web/scripts/deploy-if-released.sh` compares `web/package.json`'s version at each end of the push
+and fires a Vercel deploy hook only when it changed. It **fails the build** if the version changed
+and `VERCEL_DEPLOY_HOOK` is unset — a release that silently does not ship is the bug being fixed, so
+that case must be loud.
+
+**Sequencing — do not reorder these:**
+
+1. Operator creates a Vercel deploy hook and stores it as the `VERCEL_DEPLOY_HOOK` repo secret.
+2. QA lands the CI step above.
+3. A release proves the hook fires (`/version.json` reports the new version).
+4. **Only then** set `git.deploymentEnabled` to `false` for `main` in `vercel.json`.
+
+Doing step 4 early leaves nothing deploying at all: git triggers off, hook not yet wired. Until
+step 3, both paths are live and a release may build twice — wasteful, but visible, which is the
+right side to fail on while the two halves are being connected.
