@@ -873,6 +873,7 @@ Each *fix* made the failure quieter rather than absent. `PROGRESS-*` gates this 
 | `HEALTH-implies-<capability>/clean` | Every claimed capability works on a clean engine while healthz is green. | **S1** |
 | `HEALTH-implies-<capability>/one-bad-row` | The same, with one malformed row present. This is where the class shows itself. | **S1** |
 | `HEALTH/healthz-green-<state>` | **CONTROL.** healthz really is 200 in that state — an implication with a false antecedent asserts nothing, and an engine that is honestly down is not this suite's bug. | |
+| `HEALTH-implies-<capability>` — **shape, not status** | A capability counts as working only if it returns a WELL-FORMED response, not merely a 200. **An unimplemented capability must never answer with a success shape** (PM, 2026-09-07): a partial implementation that looks like it works is worse than one that says it is missing, because the honest 404 is *detectable* and the stub 200 is not. |  |
 
 A capability that cannot be probed **fails**; "could not check the board" and "the board is fine" read identically, which is this suite's own failure mode one level up. A route returning 404 is *not claimed* (chest is M2) and is skipped naming the milestone — self-arming, since the day it is implemented it stops returning 404 and asserts for real.
 
