@@ -42,7 +42,29 @@ SKIP = 77
 # Same shape as the boot_db hole: a change removes something from the default build and
 # takes a check with it, silently. wheel-api is currently the only member where the
 # deployed feature set differs from the default.
-DEPLOY_FEATURES = {"wheel-api": ["postgres"]}
+# Shape: {member: {"features": [...], "no_default": bool}}. A bare list is shorthand for
+# additive features with defaults left on. `no_default` exists because Railway's wheel-api
+# is built --no-default-features --features postgres: production sets a postgres:// URL and
+# never opens a sqlite store, and dropping the sqlite feature drops libsqlite3-sys -- an
+# actual compiled C library, which is why API measured 2.14 MiB (28.4%) for a 5-crate delta.
+#
+# The declaration and docker/Dockerfile.api must land in the same window. API is holding
+# their Dockerfile change until this can express the shape, because a gate measuring
+# default+postgres while Railway ships no-default+postgres is LOOSE rather than red -- the
+# silent-hole direction, and the exact failure we have each caught once tonight.
+DEPLOY_FEATURES = {"wheel-api": {"features": ["postgres"], "no_default": False}}
+
+
+def deploy_build(member, spec):
+    """cargo args for the artifact this member's Dockerfile actually produces."""
+    if isinstance(spec, list):
+        spec = {"features": spec, "no_default": False}
+    cmd = ["cargo", "build", "--release", "-p", member]
+    if spec.get("no_default"):
+        cmd.append("--no-default-features")
+    if spec.get("features"):
+        cmd += ["--features", ",".join(spec["features"])]
+    return cmd
 # Percent a binary may grow before the gate objects. Release size moves a little with
 # toolchain patches, and a gate that fires on 200 bytes gets ignored.
 TOLERANCE = 0.02
@@ -142,12 +164,11 @@ def main():
     lock = [sys.executable, os.path.join(ROOT, "qa", "tools", "with_lock.py"),
             "/tmp/wheel-cargo.lock"]
     builds = [["cargo", "build", "--release", "--workspace"]]
-    for member, feats in sorted(DEPLOY_FEATURES.items()):
+    for member, spec in sorted(DEPLOY_FEATURES.items()):
         # Built AFTER the workspace so it overwrites that member's binary: what remains in
         # target/release is the artifact its Dockerfile produces, which is the only one
         # whose size is a running cost.
-        builds.append(["cargo", "build", "--release", "-p", member,
-                       "--features", ",".join(feats)])
+        builds.append(deploy_build(member, spec))
     for cmd in builds:
         build = subprocess.run(lock + cmd, cwd=ROOT, env=env,
                                capture_output=True, text=True)
