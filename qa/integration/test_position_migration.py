@@ -338,7 +338,11 @@ def main():
                      % out.strip()[-200:]):
             booted_bad = run_engine()
             log2 = boot_log()
-            R.check("POS-migration-boots-past-unparseable-id", booted_bad,
+            # control(), not check(): this is both a finding in its own right AND the
+            # thing the next assertion depends on. Registered with check() it failed the
+            # suite correctly but left `gated` below claiming the control "did not pass"
+            # when it had passed — a false statement in my own output.
+            R.control("POS-migration-boots-past-unparseable-id", booted_bad,
                     "the engine refuses to BOOT because one row's id is not a uuid. One "
                     "bad row takes the whole board down, and the board is the thing that "
                     "tells you which row is bad. A partial restore, a hand-edited row or "

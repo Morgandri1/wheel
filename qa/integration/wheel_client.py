@@ -215,9 +215,20 @@ class Results:
         If the control failed or never ran, this SKIPS naming it, rather than passing. A
         green here would be the exact lie the control exists to prevent.
         """
+        if control_id not in self.controls:
+            # NOT the same as a control that ran and failed, and saying so matters: this
+            # printed "the control did not pass" about a control that had passed
+            # perfectly, because it was registered with check() instead of control() and
+            # `controls` never saw it. A skip whose stated reason is false is worse than a
+            # skip, and it cost real time to read past.
+            self.skip(tid, "unproven: %s was never registered as a control in this run — "
+                           "it is probably asserted with check() instead of control(). "
+                           "Nothing is known about it, which is not the same as it having "
+                           "failed." % control_id)
+            return False
         if not self.controls.get(control_id):
-            self.skip(tid, "unproven: the control %s did not pass, so an absence here is "
-                           "not evidence" % control_id)
+            self.skip(tid, "unproven: the control %s ran and did NOT pass, so an absence "
+                           "here is not evidence" % control_id)
             return False
         return self.check(tid, cond, detail)
 
