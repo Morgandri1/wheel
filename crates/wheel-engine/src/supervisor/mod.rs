@@ -126,6 +126,12 @@ struct Running {
     in_flight: Option<Uuid>,
     /// Consecutive user-lane deliveries, for the §3 fairness cap.
     consecutive_user: u32,
+    /// The harness reports turns and cost CUMULATIVELY for the session, so the
+    /// last figures seen are kept here and only the DELTA is added to the
+    /// agent's running totals. Summing the reports directly would make a
+    /// board's `turns` a triangular series — three turns would read as six.
+    counted_turns: u64,
+    counted_usd: f64,
 }
 
 /// One agent's slot. `None` means "not running"; the mutex is held ACROSS the
@@ -630,6 +636,8 @@ impl Supervisor {
             child,
             in_flight: None,
             consecutive_user: 0,
+            counted_turns: 0,
+            counted_usd: 0.0,
         });
         drop(guard);
 
@@ -877,6 +885,8 @@ impl Supervisor {
                         session_id,
                         is_error,
                         text,
+                        turns,
+                        cost_usd,
                     } => {
                         let mut g = slot.lock().await;
                         // F008: an agent controls its own stdout. A `result`
@@ -896,7 +906,37 @@ impl Supervisor {
                             continue;
                         }
                         let finished = g.as_mut().and_then(|r| r.in_flight.take());
+                        // Deltas, not totals: see `Running::counted_turns`.
+                        let spend = g.as_mut().map(|r| {
+                            let (dt, du) =
+                                spend_delta(turns, cost_usd, r.counted_turns, r.counted_usd);
+                            r.counted_turns += dt;
+                            r.counted_usd += du;
+                            (dt, du)
+                        });
                         drop(g);
+
+                        let over_budget = if let Some((dt, du)) = spend {
+                            let conn = db.lock().unwrap();
+                            if let Err(e) = board::add_spend(&conn, agent, dt, du) {
+                                tracing::warn!(agent = %agent, error = %e, "could not record spend");
+                            }
+                            board::budget_exceeded(&conn, agent).unwrap_or(None)
+                        } else {
+                            None
+                        };
+
+                        // §3e: the ceiling is enforced here because here is
+                        // where the total changes. Stop first — `stop` writes
+                        // `stopped` unconditionally — then record WHY, which
+                        // the exit cleanup preserves because
+                        // `budget_exhausted` counts as already diagnosed.
+                        if let Some(reason) = over_budget {
+                            tracing::warn!(agent = %agent, %reason, "agent stopped: budget reached");
+                            let _ = self.stop(agent).await;
+                            self.set_status(agent, AgentStatus::BudgetExhausted, Some(reason));
+                            continue;
+                        }
 
                         // Scoped so the sqlite guard cannot be held across the
                         // await below: a rusqlite Connection is not Send, and
@@ -973,6 +1013,32 @@ impl Supervisor {
                         } else {
                             let _ = self.pump_queue(agent).await;
                         }
+                    }
+                    HarnessEvent::RateLimit {
+                        status,
+                        window,
+                        utilization,
+                        resets_at,
+                        ..
+                    } => {
+                        // The operator pays for this window and is the person
+                        // who most needs to know it is closing. It used to be
+                        // logged as anonymous text.
+                        let pct = utilization.map(|u| u * 100.0).unwrap_or(f64::NAN);
+                        let line = format!(
+                            "rate limit ({}): {:.0}% of the {} window used{}",
+                            status,
+                            pct,
+                            window.as_deref().unwrap_or("current"),
+                            resets_at
+                                .map(|t| format!(", resets at unix {t}"))
+                                .unwrap_or_default()
+                        );
+                        if status != "allowed" {
+                            tracing::warn!(agent = %agent, %line, "harness reported a rate limit");
+                        }
+                        let conn = db.lock().unwrap();
+                        log_line_bus(&bus, &conn, agent, "engine", &line);
                     }
                     HarnessEvent::Unknown { raw } => {
                         if raw.is_empty() {
@@ -1254,6 +1320,35 @@ impl Supervisor {
     }
 }
 
+/// Turn the harness's CUMULATIVE session figures into the deltas to add to an
+/// agent's running totals.
+///
+/// Both `num_turns` and `total_cost_usd` count the whole session so far: turn
+/// two of a session reports 2, not 1. Adding the reports directly makes a
+/// board's `turns` the sum of a triangular series — three turns would read as
+/// six, and the money would be wrong in the same shape.
+///
+/// Extracted from the delivery loop because this arithmetic is the part that
+/// can be quietly wrong: a shell harness can prove spend is WIRED, but proving
+/// it is COUNTED needs a value, not a subprocess.
+///
+/// A missing count means one more turn (we know a turn completed — that is what
+/// a `result` is). A figure that goes BACKWARDS contributes nothing rather than
+/// a negative: a harness that resets its counter mid-session must not be able
+/// to refund an agent's budget.
+fn spend_delta(
+    reported_turns: Option<u64>,
+    reported_usd: Option<f64>,
+    counted_turns: u64,
+    counted_usd: f64,
+) -> (u64, f64) {
+    let turns = reported_turns
+        .unwrap_or(counted_turns + 1)
+        .saturating_sub(counted_turns);
+    let usd = (reported_usd.unwrap_or(counted_usd) - counted_usd).max(0.0);
+    (turns, usd)
+}
+
 /// Does an event's session id match the session this supervisor started?
 ///
 /// F008: an agent controls its own stdout, so an event we cannot attribute to
@@ -1497,6 +1592,15 @@ mod tests {
             }),
         ));
         (sup, id, dir)
+    }
+
+    fn spend_of(sup: &Supervisor, id: Uuid) -> (u64, f64) {
+        let conn = sup.db.lock().unwrap();
+        let s = board::agent_state(&conn, id)
+            .unwrap_or_default()
+            .spend
+            .unwrap_or_default();
+        (s.turns, s.usd)
     }
 
     fn status_of(sup: &Supervisor, id: Uuid) -> AgentStatus {
@@ -2177,6 +2281,22 @@ while IFS= read -r line; do :; done
 sleep 300
 "#;
 
+    /// Reports turns and cost the way the real harness does: CUMULATIVELY for
+    /// the session. Turn one says 1, turn two says 2 — not 1 and 1.
+    const ACCOUNTING_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+session=$(cat "$dir/session" 2>/dev/null || echo s1)
+turn=0
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  turn=$((turn + 1))
+  cost=$(awk "BEGIN{printf \"%.2f\", $turn * 0.25}")
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"$session\",\"is_error\":false,\"result\":\"ok\",\"num_turns\":$turn,\"total_cost_usd\":$cost}"
+done
+"#;
+
     const ECHO_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 echo run >> "$dir/runs"
@@ -2259,6 +2379,101 @@ done
         .await;
 
         sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// turns=0 and usd=0.0 for every agent, all night: the harness hands us
+    /// `num_turns` and `total_cost_usd` on every result and the parser threw
+    /// both away.
+    ///
+    /// The arithmetic is asserted here rather than through a child process,
+    /// because the risky part is not whether spend is WIRED — it is whether it
+    /// is COUNTED. Both figures are cumulative for the session, so adding the
+    /// reports directly makes a board's total a triangular series: three turns
+    /// would read as six, and the money would be wrong the same way.
+    #[test]
+    fn cumulative_session_figures_become_deltas_not_a_triangular_series() {
+        // One session reporting 1, 2, 3 turns at 0.25, 0.50, 0.75 cumulative.
+        let mut turns = 0u64;
+        let mut usd = 0.0f64;
+        for (reported_t, reported_u) in [(1u64, 0.25f64), (2, 0.50), (3, 0.75)] {
+            let (dt, du) = spend_delta(Some(reported_t), Some(reported_u), turns, usd);
+            turns += dt;
+            usd += du;
+        }
+        assert_eq!(turns, 3, "three turns is three, not 1+2+3");
+        assert!((usd - 0.75).abs() < 1e-9, "0.75 spent, not 1.50; got {usd}");
+
+        // A harness that reports nothing still counts the turn we just watched
+        // complete — a `result` IS a completed turn.
+        assert_eq!(spend_delta(None, None, 4, 1.0), (1, 0.0));
+
+        // And one that resets its counter mid-session contributes nothing
+        // rather than refunding the agent's budget.
+        assert_eq!(spend_delta(Some(1), Some(0.10), 9, 2.50), (0, 0.0));
+    }
+
+    /// The wiring, end to end: a real child reports usage and it reaches the
+    /// board. Deliberately asserts "counted at all" rather than an exact total
+    /// — the shell shim's turn count is its own, and pinning it here would be
+    /// testing the fixture. The exact arithmetic is pinned above.
+    #[tokio::test]
+    async fn usage_reported_by_a_child_reaches_the_board() {
+        let (sup, id, dir) = shim_supervisor("accounting", ACCOUNTING_HARNESS);
+
+        enqueue(&sup, id, "one");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the turn to be counted", || spend_of(&sup, id).0 >= 1).await;
+        let (turns, usd) = spend_of(&sup, id);
+        assert!(turns >= 1, "turns must leave 0 once a turn completes");
+        assert!(
+            usd > 0.0,
+            "cost must leave 0.0 once a turn completes, got {usd}"
+        );
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §3e's `budget` was a config field nothing consulted, so an agent in a
+    /// loop burned tokens with nothing to stop it. It is the same root as the
+    /// discarded usage: a ceiling cannot be enforced against a total nobody
+    /// counts.
+    #[tokio::test]
+    async fn an_agent_that_reaches_its_turn_budget_is_stopped_with_the_reason() {
+        let (sup, id, dir) = shim_supervisor_cfg("budgeted", ACCOUNTING_HARNESS, |c| {
+            c.budget = Some(wheel_core::Budget {
+                max_turns: Some(1),
+                max_usd: None,
+            });
+        });
+
+        enqueue(&sup, id, "the only turn this agent may take");
+        sup.start(id).await.unwrap();
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to be stopped by its budget", || {
+            matches!(status_of(&sup, id), AgentStatus::BudgetExhausted)
+        })
+        .await;
+
+        let state = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap_or_default()
+        };
+        let reason = state.last_error.unwrap_or_default();
+        assert!(
+            reason.contains("budget") && reason.contains("max_turns"),
+            "the operator needs to know which ceiling stopped it and how to raise it, got {reason:?}"
+        );
+        assert_eq!(
+            count(&dir.join("runs")),
+            1,
+            "a budget stop must not respawn the agent it just stopped"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
