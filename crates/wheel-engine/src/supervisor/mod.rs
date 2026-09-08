@@ -549,6 +549,9 @@ impl Supervisor {
                 log_line_bus(&self.events, &conn, agent, "engine", failure);
             }
         }
+        // Kept before the move: WHEEL_WORKSPACE is set only when a workspace was
+        // really materialised, so it never names the fallback directory.
+        let materialised_ws = materialised.cwd.clone();
         let cwd = materialised.cwd.unwrap_or_else(|| workspace.clone());
         let config_dir = self.cfg.creds_dir().join(agent.to_string());
         std::fs::create_dir_all(&config_dir)?;
@@ -610,6 +613,13 @@ impl Supervisor {
             self.cfg.listen.client_url(),
         );
         cmd.env(wheel_core::spawn::ENV_NODE, node.name.as_str());
+        // The cwd is already this path; the variable exists so an agent or a
+        // script can NAME it without relying on not having moved. Set only when
+        // a workspace was actually materialised — an empty value would read as
+        // "there is one, it is nowhere".
+        if let Some(ws) = materialised_ws.as_ref() {
+            cmd.env(wheel_core::spawn::ENV_WORKSPACE, ws);
+        }
 
         // Git authenticates from the ENVIRONMENT, so an agent never needs to
         // put a token in a remote URL — where it is written to disk — or on a
@@ -784,11 +794,159 @@ impl Supervisor {
         self.agents.lock().await.keys().copied().collect()
     }
 
+    /// Stop an idle agent's process, keeping its session so the next message
+    /// resumes it (§3c#14).
+    ///
+    /// This is the difference between Wheel and YOKE on compute. Measured on
+    /// the production board before this existed: an agent an hour past its last
+    /// turn still held a 162 MB `claude` process, because nothing ever stopped
+    /// it. Six agents is a gigabyte of doing nothing.
+    ///
+    /// Parking is `stop` that keeps `session_id`: `deliver` resumes a parked
+    /// agent when work arrives, and `--resume` continues the same session —
+    /// proven in production, the first wake came back on the id it went to
+    /// sleep with.
+    async fn park(self: &Arc<Self>, agent: Uuid) -> Option<u64> {
+        let slot = self.slot(agent).await;
+        let mut guard = slot.lock().await;
+
+        // Re-checked under the slot lock, because the timer and an arriving
+        // message race by construction. Whichever takes the lock first wins and
+        // the other sees the world it made: park first and `deliver` restarts
+        // it; deliver first and this finds work queued and leaves it alone.
+        let remaining = {
+            let conn = self.db.lock().unwrap();
+            let state = board::agent_state(&conn, agent).unwrap_or_default();
+            if !matches!(state.status, AgentStatus::Idle) {
+                return None;
+            }
+            if messages::has_queued(&conn, agent).unwrap_or(true) {
+                return None;
+            }
+
+            // A timer is armed per turn and none is cancelled, so an OLD timer
+            // outlives the turn that armed it: two turns 250s apart under a 300s
+            // timeout leaves the first firing 50s after the second, parking an
+            // agent that was active moments ago. Parking early is safe — it
+            // resumes — but it silently shortens the hot window the operator
+            // configured, so `idle_timeout_secs` would not mean what it says.
+            //
+            // Comparing against last_activity rather than cancelling timers is
+            // QA's suggestion (BUG-040) and the better one: no extra state, and
+            // it self-corrects however many stale timers are in flight.
+            let idle_secs = Self::idle_timeout_for(&conn, agent);
+            match Self::seconds_since_activity(&conn, agent) {
+                Some(since) if since < idle_secs => Some(idle_secs - since),
+                _ => None,
+            }
+        };
+        // Reported, not re-armed here: re-arming by calling `park` again would
+        // make it recursive, and a recursive async fn's future cannot be proven
+        // Send. The caller's loop does the waiting instead.
+        if let Some(left) = remaining {
+            return Some(left);
+        }
+
+        let Some(mut r) = guard.take() else {
+            // No process to stop: nothing to park, and marking it Parked would
+            // claim a saving that was never made.
+            return None;
+        };
+        {
+            // NOT `let _ =`. A kill that fails leaves a live process while the
+            // board says Parked — the saving is claimed and not made, and it is
+            // invisible. `kill_on_drop(true)` still reaps `r` at the end of this
+            // scope, so the process does die; what was missing was anyone ever
+            // hearing that the direct kill did not work. (ADVERSARY, on the
+            // risk I flagged as #2 in the review request.)
+            if let Err(e) = r.child.kill().await {
+                tracing::warn!(
+                    %agent,
+                    error = %e,
+                    "killing a parked agent's process failed; kill_on_drop is the backstop"
+                );
+            }
+        }
+        {
+            // Same reasoning as `stop`: a token outliving its process is a
+            // credential with no owner. `start` mints a fresh one.
+            let conn = self.db.lock().unwrap();
+            let _ = crate::db::tokens::revoke(&conn, agent);
+        }
+        self.set_status(agent, AgentStatus::Parked, None);
+        tracing::info!(%agent, "parked after idle timeout");
+        None
+    }
+
+    /// The agent's configured idle timeout, or the default.
+    fn idle_timeout_for(conn: &rusqlite::Connection, agent: Uuid) -> u64 {
+        match board::get(conn, agent) {
+            Ok(Some(node)) => match &node.config {
+                wheel_core::NodeConfig::Agent(a) => a.idle_timeout_secs() as u64,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Seconds since the agent's `last_activity`, computed by sqlite.
+    ///
+    /// In SQL rather than in Rust because the timestamp is already stored as
+    /// RFC3339 text and `julianday` is how every other age in this engine is
+    /// measured — the stall report does the same. It also avoids adding a date
+    /// library to a crate that has managed without one.
+    fn seconds_since_activity(conn: &rusqlite::Connection, agent: Uuid) -> Option<u64> {
+        conn.query_row(
+            "SELECT CAST((julianday('now') - julianday(last_activity)) * 86400.0 AS INTEGER)
+               FROM agent_state WHERE node_id = ?1 AND last_activity IS NOT NULL",
+            rusqlite::params![agent.to_string()],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|s| s.max(0) as u64)
+    }
+
+    /// Arm the idle timer for an agent that has just finished a turn.
+    ///
+    /// `idle_timeout_secs == 0` means never park — an agent that must stay hot.
+    fn arm_park_timer(self: &Arc<Self>, agent: Uuid) {
+        let secs = {
+            let conn = self.db.lock().unwrap();
+            match board::get(&conn, agent) {
+                Ok(Some(node)) => match &node.config {
+                    wheel_core::NodeConfig::Agent(a) => a.idle_timeout_secs(),
+                    _ => return,
+                },
+                _ => return,
+            }
+        };
+        if secs == 0 {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut wait = secs as u64;
+            // Loops rather than recurses, and re-waits whatever `park` reports
+            // is left — so a stale timer from an earlier turn corrects itself
+            // instead of parking an agent that was active moments ago.
+            while let Some(left) = {
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                me.park(agent).await
+            } {
+                wait = left.max(1);
+            }
+        });
+    }
+
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {
-            let _ = r.child.kill().await;
+            // Same reasoning as `park`: kill_on_drop reaps it either way, but a
+            // failure that nobody hears is a process the board thinks is gone.
+            if let Err(e) = r.child.kill().await {
+                tracing::warn!(%agent, error = %e, "killing a stopped agent's process failed");
+            }
         }
         {
             // Revoke on stop: a token left live after the process is gone is a
@@ -1075,6 +1233,10 @@ impl Supervisor {
                             }
                         } else {
                             let _ = self.pump_queue(agent).await;
+                            // Nothing left to do: start counting down. If the
+                            // pump delivered something, the timer's re-check
+                            // finds the agent busy and does nothing.
+                            self.arm_park_timer(agent);
                         }
                     }
                     HarnessEvent::RateLimit {
@@ -1218,6 +1380,31 @@ impl Supervisor {
             }
             // A token outliving its process is a credential with no owner.
             let _ = crate::db::tokens::revoke(&conn, agent);
+
+            // A start that passed `--resume` and never reached `init` is the
+            // signature of an unusable session. Nothing else cleared it, so
+            // every later start re-passed the same dead id and failed the same
+            // way — an agent that could never recover without a manual clear.
+            //
+            // Parking makes this matter: resume used to be rare and is now the
+            // normal path back from idle.
+            //
+            // Dropping a session we might have kept costs the agent its context
+            // once; keeping a dead one costs it every start from now on. The
+            // recoverable failure is the better one.
+            if !initialised {
+                let had_session = board::agent_state(&conn, agent)
+                    .unwrap_or_default()
+                    .session_id
+                    .is_some();
+                if had_session {
+                    clear_session(&conn, agent);
+                    tracing::warn!(
+                        %agent,
+                        "a resumed session never initialised; cleared it so the next start is fresh"
+                    );
+                }
+            }
             if !already_diagnosed {
                 set_status_db(&conn, agent, status, detail);
             }
@@ -1265,7 +1452,9 @@ impl Supervisor {
             let slot = self.slot(agent).await;
             let mut guard = slot.lock().await;
             if let Some(mut r) = guard.take() {
-                let _ = r.child.kill().await;
+                if let Err(e) = r.child.kill().await {
+                    tracing::warn!(%agent, error = %e, "killing a cleared agent's process failed");
+                }
             }
         }
         {
@@ -1810,6 +1999,390 @@ mod tests {
         assert!(
             last.unwrap_or_default().contains("codex"),
             "the operator must be told which harness was refused"
+        );
+    }
+
+    /// (a) The agent is STARTED in its worktree, so cwd was always right; what
+    /// was missing was a way to NAME it. A script that has `cd`-ed cannot
+    /// recover the path from `pwd`, and there was no variable to ask.
+    #[tokio::test]
+    async fn a_materialised_workspace_is_named_by_wheel_workspace() {
+        // No git needed: a workspace without a git source still materialises a
+        // directory, and the directory is the thing under test.
+        let (sup, id, dir) = shim_supervisor_cfg("wsenv", ENV_DUMP_HARNESS, |cfg| {
+            cfg.workspaces = vec![wheel_core::Workspace {
+                path: "wheel".into(),
+                git: None,
+            }];
+        });
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+
+        let ws = env
+            .lines()
+            .find_map(|l| l.strip_prefix("WHEEL_WORKSPACE="))
+            .expect("WHEEL_WORKSPACE was not exported for an agent that HAS a workspace");
+        let pwd = env
+            .lines()
+            .find_map(|l| l.strip_prefix("PWD="))
+            .expect("no working directory");
+        let real =
+            |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        assert_eq!(
+            real(ws),
+            real(pwd),
+            "WHEEL_WORKSPACE must name the directory the child is actually in"
+        );
+        assert!(
+            ws.ends_with("/wheel"),
+            "it must be the WORKTREE, not the bare object store: {ws}"
+        );
+    }
+
+    /// An agent with no workspace must not get an empty or invented value: an
+    /// empty WHEEL_WORKSPACE reads as "there is one, and it is nowhere".
+    #[tokio::test]
+    async fn an_agent_without_a_workspace_gets_no_wheel_workspace_at_all() {
+        let (sup, id, dir) = shim_supervisor("nows", ENV_DUMP_HARNESS);
+        sup.start(id).await.unwrap();
+        let dumped = dir.join("child-env");
+        until("the child to report its environment", || dumped.exists()).await;
+        let env = std::fs::read_to_string(&dumped).unwrap();
+        assert!(
+            !env.lines().any(|l| l.starts_with("WHEEL_WORKSPACE=")),
+            "WHEEL_WORKSPACE must be ABSENT, not empty, when no workspace was materialised"
+        );
+    }
+
+    /// (b) §3c#14, and the reason this project exists rather than YOKE.
+    /// Measured before it existed: an agent an hour past its turn still held a
+    /// 162 MB claude process.
+    #[tokio::test]
+    async fn an_idle_agent_parks_and_releases_its_process() {
+        let (sup, id, dir) = shim_supervisor_cfg("parks", ECHO_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(1);
+        });
+        sup.start(id).await.unwrap();
+        until("the agent to be running", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        enqueue(&sup, id, "do a turn");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park after its idle timeout", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+
+        assert_eq!(
+            runs(&dir),
+            1,
+            "parking must stop the process it already had, not spawn another"
+        );
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_some(),
+            "parking must KEEP the session — resume is what makes it free"
+        );
+    }
+
+    /// An agent with work queued must not be parked out from under it.
+    #[tokio::test]
+    async fn an_agent_with_queued_work_is_not_parked() {
+        let (sup, id, _dir) = shim_supervisor_cfg("busy", SILENT_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(1);
+        });
+        sup.start(id).await.unwrap();
+        enqueue(&sup, id, "one");
+        enqueue(&sup, id, "two");
+        let _ = sup.deliver(id).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !matches!(status_of(&sup, id), AgentStatus::Parked),
+            "an agent mid-turn with more queued must never be parked"
+        );
+    }
+
+    /// The sender must be a REAL node: `row_to_message` resolves a `node`
+    /// sender to its CURRENT name and type by id, and falls back to `system`
+    /// when the node is gone — deliberately, so a deleted node cannot break an
+    /// inbox. A fabricated uuid therefore reads back as `system`, which is what
+    /// this helper existing separately is meant to stop anyone rediscovering.
+    fn enqueue_from_agent(sup: &Supervisor, from: &str, to: Uuid, body: &str) {
+        let conn = sup.db.lock().unwrap();
+        let sender = wheel_core::Node::new(
+            Uuid::new_v4(),
+            from.parse().unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+        );
+        board::create(&conn, &sender).unwrap();
+        messages::enqueue(
+            &conn,
+            wheel_core::MessageSender::Node {
+                id: sender.id,
+                name: sender.name.clone(),
+                node_type: NodeType::Agent,
+            },
+            to,
+            body.to_string(),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// (c) The producer a multi-agent board actually runs on.
+    ///
+    /// Agent→agent was covered at the CLI plane, and envelope rendering was
+    /// covered as a wheel-core unit test, but nothing asserted the two TOGETHER
+    /// — every test that watched bytes reach a child's stdin used a `user`
+    /// sender. So the lane the swarm lives on was proven in halves.
+    #[tokio::test]
+    async fn a_message_from_an_agent_reaches_the_child_as_an_agent() {
+        let (sup, id, _dir) = shim_supervisor("recipient", ECHO_HARNESS);
+        sup.start(id).await.unwrap();
+        until("the agent to come up", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+
+        enqueue_from_agent(&sup, "researcher", id, "findings attached");
+        sup.deliver(id).await.unwrap();
+
+        until("the message to be consumed", || {
+            let conn = sup.db.lock().unwrap();
+            messages::has_queued(&conn, id).map(|q| !q).unwrap_or(false)
+        })
+        .await;
+
+        let lines = transcript(&sup, id);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("from=\"researcher\""),
+            "the child must be told WHICH agent sent it; got: {joined}"
+        );
+        assert!(
+            joined.contains("type=\"agent\""),
+            "an agent-sent message must be framed as type=agent, not user — attribution is the \
+             whole point of the envelope; got: {joined}"
+        );
+        assert!(
+            joined.contains("findings attached"),
+            "the body must reach the child intact; got: {joined}"
+        );
+    }
+
+    fn transcript(sup: &Supervisor, id: Uuid) -> Vec<String> {
+        let conn = sup.db.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT text FROM logs WHERE node_id = ?1 AND stream = 'transcript' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![id.to_string()], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// Records the `resume` the ENGINE put in each spawn spec.
+    ///
+    /// The shim driver deliberately passes no argv, so an argv-based assertion
+    /// measures the stub rather than the engine — my first attempt at this test
+    /// did exactly that and failed for its own reasons. What matters is what the
+    /// engine hands the driver; `ClaudeDriver::argv` turning `resume` into
+    /// `--resume` is its own test.
+    struct ResumeRecordingDriver {
+        program: String,
+        log: std::path::PathBuf,
+    }
+
+    impl Harness for ResumeRecordingDriver {
+        fn program(&self) -> &str {
+            &self.program
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<std::ffi::OsString> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log)
+                .unwrap();
+            writeln!(f, "{}", spec.resume.as_deref().unwrap_or("<none>")).unwrap();
+            Vec::new()
+        }
+        fn env(&self, _spec: &SpawnSpec) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            format!("{envelope}\n")
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            ClaudeDriver.parse_line(line)
+        }
+        fn classify_startup_failure(&self, _code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(None, stderr)
+        }
+    }
+
+    const SESSION_HARNESS: &str = r#"#!/bin/sh
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-abc\"}"
+while IFS= read -r line; do
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"sess-abc\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    /// The question parking lives or dies on: after a park, is the next child
+    /// handed the SAME session, or a fresh one — which would be a silent
+    /// context wipe.
+    #[tokio::test]
+    async fn a_resumed_agent_is_handed_the_same_session_it_parked_with() {
+        let root = std::env::temp_dir().join(format!("wheel-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("resumes");
+        std::fs::remove_file(&log).ok();
+
+        let log_for_driver = log.clone();
+        let (sup, id, _dir) = shim_supervisor_inner(
+            "resumes",
+            SESSION_HARNESS,
+            |cfg| cfg.idle_timeout_secs = Some(1),
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            Some(Box::new(move |program| {
+                Arc::new(ResumeRecordingDriver {
+                    program,
+                    log: log_for_driver,
+                }) as Arc<dyn crate::harness::Harness>
+            })),
+        );
+
+        sup.start(id).await.unwrap();
+        until("the agent to initialise", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        enqueue(&sup, id, "first turn");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+
+        enqueue(&sup, id, "second turn");
+        sup.deliver(id).await.unwrap();
+        until("the agent to be respawned", || {
+            std::fs::read_to_string(&log)
+                .map(|a| a.lines().count() >= 2)
+                .unwrap_or(false)
+        })
+        .await;
+
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        let mut lines = recorded.lines();
+        assert_eq!(
+            lines.next(),
+            Some("<none>"),
+            "the FIRST spawn has nothing to resume"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("sess-abc"),
+            "the resumed child must be handed the session it parked with; a fresh one is a \
+             silent context wipe. Recorded: {recorded:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// BUG-040 (QA): a timer is armed per turn and none is cancelled, so an
+    /// OLD timer outlives the turn that armed it. Two turns 250s apart under a
+    /// 300s timeout leaves the first firing 50s after the second — parking an
+    /// agent that was active moments ago and silently shortening the hot window
+    /// the operator asked for.
+    ///
+    /// Asserted by calling `park` directly with a RECENT last_activity: it must
+    /// decline and report the remainder rather than park.
+    #[tokio::test]
+    async fn a_stale_timer_does_not_park_an_agent_that_was_just_active() {
+        let (sup, id, _dir) = shim_supervisor_cfg("stale-timer", ECHO_HARNESS, |cfg| {
+            cfg.idle_timeout_secs = Some(300);
+        });
+        sup.start(id).await.unwrap();
+        until("the agent to initialise", || {
+            matches!(status_of(&sup, id), AgentStatus::Idle)
+        })
+        .await;
+
+        // last_activity is set by the init that just happened, so "now".
+        let left = sup.park(id).await;
+
+        assert!(
+            left.is_some(),
+            "park must DECLINE for an agent active moments ago, and report what is left"
+        );
+        let left = left.unwrap();
+        assert!(
+            left > 250 && left <= 300,
+            "the remainder must be measured from last_activity, not restarted from zero: {left}"
+        );
+        assert!(
+            matches!(status_of(&sup, id), AgentStatus::Idle),
+            "declining to park must leave the agent exactly as it was"
+        );
+    }
+
+    /// A start that resumed a session and never reached `init` must not leave
+    /// that session in place: nothing else cleared it, so every later start
+    /// re-passed the same dead id and failed identically — an agent that could
+    /// never recover on its own.
+    #[tokio::test]
+    async fn a_session_that_never_initialises_is_cleared_so_the_next_start_is_fresh() {
+        // Exits immediately without ever printing an init line.
+        const NEVER_INITS: &str = "#!/bin/sh\nexit 1\n";
+        let (sup, id, _dir) = shim_supervisor("dead-session", NEVER_INITS);
+
+        // Give it a session as though a previous run had established one.
+        {
+            let conn = sup.db.lock().unwrap();
+            set_session(&conn, id, "sess-dead");
+        }
+        assert!(
+            {
+                let conn = sup.db.lock().unwrap();
+                board::agent_state(&conn, id)
+                    .unwrap_or_default()
+                    .session_id
+                    .is_some()
+            },
+            "precondition: the agent starts with a session to lose"
+        );
+
+        let _ = sup.start(id).await;
+        until("the failed start to be reaped", || {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_none()
+        })
+        .await;
+
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .is_none(),
+            "a session that never initialised must be cleared, or the agent retries it forever"
         );
     }
 
