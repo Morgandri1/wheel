@@ -65,7 +65,12 @@ DEFAULT_ENV_DUMP = "/data/wheel-fake-env.jsonl"
 
 
 ENV_DUMP = fake_opt("WHEEL_FAKE_ENV_DUMP", "env_dump") or (
-    DEFAULT_ENV_DUMP if os.path.isdir(os.path.dirname(DEFAULT_ENV_DUMP)) else None)
+    # isdir alone is not enough: a shared multi-tenant host can have /data as a real,
+    # listable directory that this uid still cannot write into (only /data/projects/<id>
+    # is ours). isdir there is true and every spawn then dies in env_dump() trying to
+    # write it -- one unwritable default took out the whole selftest suite, not just the
+    # credential-routing checks, because env_dump() runs on every spawn unconditionally.
+    DEFAULT_ENV_DUMP if os.access(os.path.dirname(DEFAULT_ENV_DUMP), os.W_OK) else None)
 # sha256 digests a test wants located by NAME in this child's environment.
 # Names are the answer; values never leave this process.
 SENTINELS = [d for d in (fake_opt("WHEEL_FAKE_ENV_SENTINELS", "env_sentinels") or "").split(",") if d]
