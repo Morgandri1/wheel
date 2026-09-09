@@ -1,9 +1,11 @@
 # `POST /v1/projects/instantiate` — finalized route shape
 
-Follow-up to `docs/proposals/wow-templates.md` (#26). PM's ruling: I own a single dedicated
-instantiate route (create → capability patch → apply → rollback-on-failure, one atomic server
-sequence), per Web's §4/§6. This doc is the finalized contract — **prep only, per PM: no
-implementation branch until ADVERSARY clears the design.**
+Follow-up to `docs/proposals/wow-templates.md` (#26, merged `8c845ec`). PM's ruling: I own a single
+dedicated instantiate route (create → capability patch → apply → rollback-on-failure, one atomic
+server sequence), per Web's §4/§6. **ADVERSARY cleared this design on 2026-09-09
+(`reports/20260909T200006Z-adversary-task3-review`)**, with the two rulings folded in below
+(`apply::validate()` gains name/config checks; the no-2PC orphan risk is accepted as residual, not
+built around). Implementation may proceed once this doc lands.
 
 ## Why a dedicated route, restated concretely
 
@@ -40,6 +42,22 @@ verbatim; there is no translation step because both sides already agree on `Capa
    after. Doing it first means the common failure case (a malformed board slipping past the CI gate
    somehow, or a caller other than the template gallery hitting this route with a bad board) spends
    zero project-quota and starts zero sandboxes.
+
+   **Per ADVERSARY's design review, `validate()` itself gains two checks it does not run today**,
+   before this route (or the CI gate, or the existing `board/apply` route — all three share this one
+   function) can be called authoritative: for every emitted node, `wheel_core::validate_name` (or
+   `validate_table_name` for a `table` node) against `node.name`, and `wheel_core::validate_config_with(&node.config, &[])`
+   against its config. Today `validate()` only checks board-level structure (dupes, self-wires,
+   unknown refs, size, the matrix) — a bad node name or an SSRF-denied tool `base_url` currently
+   sails through pre-validation and only fails live, at the engine, on the actual create call. Adding
+   these two calls closes that gap for all three callers at once, not just this route: the CI gate
+   (`docs/proposals/wow-templates.md` §3) starts catching them at build time as originally promised,
+   and the existing LLM-builder `board/apply` path gets the same strengthening for free. Both
+   functions are pure (no engine/network dependency, `allow_hosts: &[]` — matches production, where
+   the engine always runs with an empty allowlist per `validate_config_with`'s own doc), so this is
+   cheap to add and belongs in the same PR as the new route, as a small first commit `apply.rs`
+   change plus two new `Refusal` variants (`InvalidName`/`InvalidConfig` naming the node and the
+   underlying `NameError`/`ConfigError`).
    - `Err(refusals)` → **`422`**, nothing created at all:
      ```jsonc
      { "applied": false, "refusals": [...], "message": "the board was refused; nothing was created" }
@@ -114,20 +132,43 @@ case with no special handling here.
   second failure shape.
 - `Capabilities` — reused verbatim as the request's `capabilities` field; no new type.
 
-## Open items for ADVERSARY / PM, not resolved by me alone
+## Resolved by ADVERSARY's design review (`reports/20260909T200006Z-adversary-task3-review`)
 
-- **Rate/quota:** `max_projects_per_user` is checked at project-creation time (step 2), same as
-  today — a burst of instantiate calls is bounded the same way a burst of plain creates is. Nothing
-  new to add, flagging so it's confirmed rather than assumed.
-- **Auth boundary:** this route takes `AuthUser`, not `ProjectScope` (there is no project yet at
-  request time) — the ownership check that matters is baked into `create` (the row is inserted with
-  `owner_id = user.id()`) and into `destroy`'s reuse (rollback deletes by `id AND owner_id`,
-  never a bare id). Worth ADVERSARY explicitly confirming this is equivalent to every other route's
-  boundary rather than a new pattern that happens to look similar.
-- **Board size vs. rollback cost:** a large legal board (near `MAX_NODES`/`MAX_WIRES`) that fails on
-  its last wire pays for creating everything before finding out it must delete it all. Pre-validation
-  (step 1) does not catch engine-side-only failures (a name collision is impossible here, but an
-  engine check we don't mirror is not impossible in principle — `apply.rs`'s own module doc says
-  this). Accepted as the same tradeoff `apply-step-constraints.md` already accepted for the general
-  apply step; naming it again because a template author's board being marginal-but-legal is a more
-  plausible way to hit it than an LLM's.
+**CLEAR to implement.** Everything below was an open question in the earlier draft; each is now
+either fixed in this doc or accepted explicitly, not left ambiguous.
+
+- **Extend `apply::validate()`** — the name/config checks above (step 1). Required before
+  implementation, not optional hardening.
+- **Auth boundary — confirmed equivalent, not just similar-looking.** ADVERSARY verified this
+  structurally rather than by policy: `EmittedBoard`/`EmittedNode`/`EmittedWire` carry no id or
+  project-reference field at all, wires address nodes by name within the same board only, and the
+  target project comes from the route's own server-set path/context (the project this route itself
+  just created) — never from anything in the request body. So there is no way for `board` content to
+  name a different project; `AuthUser`-not-`ProjectScope` is safe for the same reason `create` is:
+  the row is written with `owner_id = user.id()`, and `destroy`'s reuse for rollback stays
+  `id AND owner_id`-scoped. Not a new pattern, just one with no `ProjectScope` to construct yet.
+- **No 2PC across the Postgres project row and the target engine's sqlite — accepted as residual.**
+  RULING (PM, folding in ADVERSARY's finding): an API-process crash mid-sequence (not a client
+  disconnect — the atomic route already covers that; this is the process itself dying) could leave
+  an orphaned partial project with no automatic sweep. Same class as `infra/prune-probe-projects.sh`
+  already handles opportunistically: same-owner-only, no cross-tenant reach, no silent corruption
+  (ADVERSARY separately confirmed `run_on_startup` agents are created `stopped` and only ever parked
+  at boot/reconcile — nothing partially-applied can start running before a rollback completes). Do
+  **not** build a pending-instantiate marker or reconciler for this pre-emptively; revisit only if
+  orphans actually show up in practice.
+- **Board size vs. rollback cost** — a large legal board that fails on its last wire pays for
+  creating everything before finding out it must delete it all. Pre-validation does not catch
+  engine-side-only failures in principle (`apply.rs`'s own module doc says so). Accepted as the same
+  tradeoff `apply-step-constraints.md` already accepted for the general apply step.
+- **Rate/quota** — `max_projects_per_user`, checked at project-creation time (step 2), same as
+  today. Nothing new needed; not re-litigated by the review.
+
+**Adjacent, not part of this route, noted for completeness:** ADVERSARY's review also flagged that
+template-file trust today rests entirely on the deploy pipeline (operator merges to the repo) — fine
+as this proposal stands (no upload path), but `apply::validate()` checks legality, not authorship,
+so it would accept a user-uploaded file just as readily if that path ever opens; and that before any
+self-serve gallery, an `endpoint` node's `auth` mode needs the same build-time lint
+`requires_capabilities` already gets (a `mode:none` endpoint wired to an agent is finding-035-link-6's
+shape, shipped as a one-click template). Both are the CI-gate/template-file side of task 3
+(`wow-templates.md` §3), not this route's request/response contract — flagging here only so they
+aren't lost between the two docs.
