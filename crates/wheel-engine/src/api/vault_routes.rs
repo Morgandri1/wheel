@@ -207,3 +207,145 @@ pub async fn list_keys(
     let keys = crate::vault::list_keys(&conn, id).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(serde_json::json!({ "keys": keys })))
 }
+
+/// 028 face 5: the response `PUT /v1/vault/:id/:key` actually sends. Nothing
+/// above `vault.rs`'s own unit layer ever called this handler before this —
+/// `declares_key`/`supplies_key` were tested in isolation, but never through
+/// the route a client actually calls, so a handler that dropped the
+/// `warning` field (or added it when it should not) would have shipped
+/// green.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wheel_core::{AgentConfig, Node, NodeConfig, Position, VaultConfig, WireType};
+
+    fn mk(conn: &rusqlite::Connection, name: &str, config: NodeConfig) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    #[tokio::test]
+    async fn a_declared_only_overlap_stores_the_value_and_warns() {
+        let state = crate::api::test_state();
+        let (_v1, v2) = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let v1 = mk(
+                &conn,
+                "v1",
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["ANTHROPIC_API_KEY".into()],
+                }),
+            );
+            let v2 = mk(&conn, "v2", NodeConfig::Vault(VaultConfig { keys: vec![] }));
+            board::add_wire(&conn, agent, v1, WireType::Read, None).unwrap();
+            board::add_wire(&conn, agent, v2, WireType::Read, None).unwrap();
+            (v1, v2)
+        };
+
+        let resp = put_value(
+            State(state.clone()),
+            Path((v2, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-real".into(),
+            }),
+        )
+        .await
+        .expect("a declared-only overlap must not block the write")
+        .0;
+
+        assert_eq!(resp["stored"], true);
+        assert!(
+            resp["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("v1") || w.contains("v2")),
+            "the response must name the other vault: {resp}"
+        );
+
+        let conn = state.db.lock().unwrap();
+        assert_eq!(
+            crate::vault::get(
+                &conn,
+                state.supervisor.vault_key().unwrap(),
+                v2,
+                "ANTHROPIC_API_KEY"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("sk-ant-api03-real"),
+            "the warning must not have stopped the value from actually being stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_other_vault_declaring_the_key_means_no_warning() {
+        let state = crate::api::test_state();
+        let v = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let v = mk(&conn, "v", NodeConfig::Vault(VaultConfig { keys: vec![] }));
+            board::add_wire(&conn, agent, v, WireType::Read, None).unwrap();
+            v
+        };
+
+        let resp = put_value(
+            State(state),
+            Path((v, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-real".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(resp["stored"], true);
+        assert!(
+            resp.get("warning").is_none(),
+            "no other vault declares this key, so there is nothing to warn about: {resp}"
+        );
+    }
+
+    /// The block this feature must NOT have loosened: a vault that actually
+    /// HOLDS a value for the key still 409s, warning or not.
+    #[tokio::test]
+    async fn a_vault_that_actually_holds_the_key_still_blocks() {
+        let state = crate::api::test_state();
+        let (v1, v2) = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let v1 = mk(&conn, "v1", NodeConfig::Vault(VaultConfig { keys: vec![] }));
+            let v2 = mk(&conn, "v2", NodeConfig::Vault(VaultConfig { keys: vec![] }));
+            board::add_wire(&conn, agent, v1, WireType::Read, None).unwrap();
+            board::add_wire(&conn, agent, v2, WireType::Read, None).unwrap();
+            (v1, v2)
+        };
+
+        let _ = put_value(
+            State(state.clone()),
+            Path((v1, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-first".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = put_value(
+            State(state),
+            Path((v2, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-second".into(),
+            }),
+        )
+        .await
+        .expect_err("a second vault actually holding the same key must still be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+}

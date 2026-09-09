@@ -387,6 +387,46 @@ pub struct PatchNode {
     pub config: Option<serde_json::Value>,
 }
 
+/// A real [`AppState`] backed by an in-memory database, for a route handler
+/// test to call directly against — extractors like `State`/`Json`/`Path` are
+/// plain tuple structs, so a handler can be invoked exactly as the router
+/// invokes it without a running server. `pub(crate)` and outside `mod tests`
+/// so sibling route modules (`board_routes`, `vault_routes`, ...) can build
+/// one too, rather than each hand-rolling its own.
+///
+/// A usable vault key, same fixed bytes every other test in this crate uses
+/// (`vault.rs`'s `key()`), so a test can PUT/read through a real vault
+/// without also exercising `WHEEL_VAULT_KEY` parsing.
+#[cfg(test)]
+pub(crate) fn test_state() -> AppState {
+    use base64::Engine;
+
+    let cfg = Arc::new(Config {
+        project_id: uuid::Uuid::new_v4(),
+        engine_secret: "0123456789abcdef".into(),
+        vault_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
+        data_dir: std::env::temp_dir().join(format!("wheel-route-test-{}", uuid::Uuid::new_v4())),
+        listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+        json_logs: false,
+        tool_allow_hosts: Vec::new(),
+        startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+    });
+    let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
+    let events = Arc::new(crate::events::Bus::new());
+    AppState {
+        supervisor: Arc::new(crate::supervisor::Supervisor::new(
+            cfg.clone(),
+            db.clone(),
+            events.clone(),
+        )),
+        cfg,
+        db,
+        events,
+        logins: Arc::new(crate::oauth::LoginSessions::default()),
+        ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
