@@ -144,9 +144,16 @@ pub fn credential_env(config_dir: &Path, harness: Harness) -> Vec<(String, Strin
 /// (`claude auth status --json`, `codex login status`) can say that, and the
 /// engine treats an unprobed node as unknown rather than authenticated.
 pub fn has_stored_credentials(config_dir: &Path, harness: Harness) -> bool {
-    if read_token(config_dir).is_some() {
-        return true;
-    }
+    read_token(config_dir).is_some() || has_native_login_store(config_dir, harness)
+}
+
+/// Has the harness's OWN login (`claude auth login` paste-code, `codex
+/// login` device-code) written its own credential store into this node's
+/// config dir -- as opposed to a credential entered through `auth/complete`
+/// into [`TOKEN_FILE`]? The two are different surfaces (module doc); this
+/// checks only the harness's own store, which is what [`is_oauth_shaped`]
+/// needs to tell apart from a stored API key.
+fn has_native_login_store(config_dir: &Path, harness: Harness) -> bool {
     // Both locations, because we set both `CLAUDE_CONFIG_DIR`/`CODEX_HOME`
     // AND `HOME` to this directory: the CLI writes to the config dir it was
     // told about, but if it ever falls back to `$HOME`, the file lands one
@@ -160,6 +167,38 @@ pub fn has_stored_credentials(config_dir: &Path, harness: Harness) -> bool {
         Harness::Codex => (".codex", "auth.json"),
     };
     config_dir.join(file).exists() || config_dir.join(dir_name).join(file).exists()
+}
+
+/// Whether this node's currently-visible credential is OAuth-shaped rather
+/// than an API key, across every surface it can arrive on except a wired
+/// vault (vault values are gated separately, at `PUT` time -- API's half of
+/// docs/proposals/wheel-harness-auth.md).
+///
+/// Backs the `api-key-only` policy's spawn gate AND its periodic re-check
+/// while running (the proposal's "PM ruling: mid-flow enforcement window" --
+/// an agent can run `claude auth login`/`codex login` itself mid-turn, so the
+/// same check has to run more than once).
+///
+/// Claude has a bearer token to classify: either the per-node [`TOKEN_FILE`]
+/// holds one ([`classify_token`] already tells the two kinds apart by the
+/// `sk-ant-oat` prefix), or the harness's own native store does
+/// ([`oauth_token_from_store`] finding anything at all IS an OAuth
+/// credential -- that function only ever looks in `claude auth login`'s own
+/// files). Codex has no such token: per [`token_env`]'s own reasoning, its
+/// OAuth is a *session* written to `auth.json`, not a string this engine can
+/// classify -- so for codex, a native login session existing at all, with no
+/// stored API key to prefer instead, IS the signal.
+pub fn is_oauth_shaped(config_dir: &Path, harness: Harness) -> bool {
+    match harness {
+        Harness::Claude => {
+            let via_token_file = stored_token_kind(config_dir, harness)
+                .is_some_and(|k| k == CredentialKind::OauthToken);
+            via_token_file || oauth_token_from_store(config_dir, None).is_ok()
+        }
+        Harness::Codex => {
+            read_token(config_dir).is_none() && has_native_login_store(config_dir, harness)
+        }
+    }
 }
 
 /// A credential recovered from the harness's own store, so it can be handed to
@@ -543,6 +582,78 @@ mod tests {
         assert!(read_token(&d).is_none());
         // Clearing again must not error: stop/restart paths call it blindly.
         clear_token(&d).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A stored API key is not OAuth-shaped, on either harness -- the whole
+    /// point of `is_oauth_shaped` is telling this apart from the next test.
+    #[test]
+    fn a_stored_api_key_is_not_oauth_shaped() {
+        let d = tmp("shape-apikey");
+        assert!(!is_oauth_shaped(&d, Harness::Claude));
+        store_token(&d, "sk-ant-api03-xyz", Harness::Claude).unwrap();
+        assert!(!is_oauth_shaped(&d, Harness::Claude));
+        std::fs::remove_dir_all(&d).ok();
+
+        let d = tmp("shape-apikey-codex");
+        assert!(!is_oauth_shaped(&d, Harness::Codex));
+        store_token(&d, "sk-proj-xyz", Harness::Codex).unwrap();
+        assert!(!is_oauth_shaped(&d, Harness::Codex));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A `setup_token`/OAuth value in the per-node [`TOKEN_FILE`] is the
+    /// first surface `is_oauth_shaped` has to catch -- classified from the
+    /// value itself, same as `credential_env`.
+    #[test]
+    fn a_stored_oauth_token_is_oauth_shaped() {
+        let d = tmp("shape-oat");
+        store_token(&d, "sk-ant-oat01-abc", Harness::Claude).unwrap();
+        assert!(is_oauth_shaped(&d, Harness::Claude));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The harness's OWN login store is the surface an agent can write to
+    /// itself, mid-turn, with no API route involved -- the gap
+    /// wheel-harness-auth.md's spawn gate and periodic re-check both exist
+    /// to close.
+    #[test]
+    fn a_native_login_store_is_oauth_shaped_even_with_no_wheel_token_file() {
+        let d = tmp("shape-native");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!is_oauth_shaped(&d, Harness::Claude));
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-selfprovisioned"}"#,
+        )
+        .unwrap();
+        assert!(is_oauth_shaped(&d, Harness::Claude));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Codex has no bearer token to classify -- a login SESSION existing at
+    /// all, with no `CODEX_API_KEY` stored to prefer instead, is itself the
+    /// OAuth signal (auth.rs module doc, and `token_env`'s own reasoning).
+    #[test]
+    fn a_codex_login_session_is_oauth_shaped_only_without_a_stored_api_key() {
+        let d = tmp("shape-codex-session");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!is_oauth_shaped(&d, Harness::Codex));
+
+        std::fs::write(d.join("auth.json"), r#"{"tokens":{}}"#).unwrap();
+        assert!(
+            is_oauth_shaped(&d, Harness::Codex),
+            "a login session with no stored API key is OAuth-shaped"
+        );
+
+        // An operator who then stores an API key on this node fixes it going
+        // forward without deleting the stale session file -- the presence of
+        // a real API key must win, not the leftover session.
+        store_token(&d, "sk-proj-real", Harness::Codex).unwrap();
+        assert!(
+            !is_oauth_shaped(&d, Harness::Codex),
+            "a stored API key must outrank a leftover session file"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

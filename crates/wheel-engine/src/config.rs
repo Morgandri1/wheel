@@ -34,7 +34,33 @@ pub struct Config {
     /// exactly how the first version of this failed — green alone, red in the
     /// suite.
     pub startup_deadline_secs: u64,
+    /// Which credential KIND this deployment permits (docs/proposals/
+    /// wheel-harness-auth.md). Deployment-level, not project- or agent-level
+    /// by design: the thing being gated is which kind is allowed to exist at
+    /// all here, and a knob a project's own owner could set would not be a
+    /// policy. `wheeld`/`wheel-host` are the only things that set this.
+    pub harness_auth: HarnessAuthPolicy,
 }
+
+/// `WHEEL_HARNESS_AUTH`'s two values (wheel-harness-auth.md's "Design" §
+/// "Where the switch lives").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HarnessAuthPolicy {
+    /// Today's behaviour: either an OAuth-shaped credential or an API key may
+    /// be stored and used, unrestricted. The default so that upgrading the
+    /// engine binary never changes an existing board's behaviour.
+    #[default]
+    OauthToken,
+    /// OAuth-shaped credentials are refused on every surface (auth/complete,
+    /// vault PUT, and — the gate that actually holds, since an agent can
+    /// self-provision one via its own shell — at spawn and on the periodic
+    /// re-check while running).
+    ApiKeyOnly,
+}
+
+/// Selects which credential kind this deployment permits. See
+/// [`HarnessAuthPolicy`].
+pub const ENV_HARNESS_AUTH: &str = "WHEEL_HARNESS_AUTH";
 
 /// Exact `host:port` targets a tool call may reach despite the SSRF policy.
 ///
@@ -66,6 +92,11 @@ pub enum ConfigError {
     AllowlistInProd(String),
     #[error("{ENV_TOOL_ALLOW_HOST} entry {0:?} must be an exact host:port")]
     BadAllowEntry(String),
+    #[error(
+        "{ENV_HARNESS_AUTH}={0:?} is not a value this engine understands (want \"oauth-token\" \
+         or \"api-key-only\", or leave it unset for oauth-token's unrestricted default)"
+    )]
+    BadHarnessAuth(String),
 }
 
 impl Config {
@@ -124,6 +155,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_STARTUP_DEADLINE_SECS),
+            harness_auth: harness_auth()?,
         })
     }
 
@@ -192,6 +224,20 @@ fn tool_allow_hosts() -> Result<Vec<String>, ConfigError> {
         }
     }
     Ok(entries)
+}
+
+/// Parse `WHEEL_HARNESS_AUTH`. Blank/unset reads as the permissive default,
+/// same treatment as [`tool_allow_hosts`] gives a blank allowlist — an
+/// operator clearing the variable should not have to delete it, and an
+/// engine with no opinion about this must not refuse to boot over it.
+fn harness_auth() -> Result<HarnessAuthPolicy, ConfigError> {
+    let raw = std::env::var(ENV_HARNESS_AUTH).unwrap_or_default();
+    match raw.trim() {
+        "" => Ok(HarnessAuthPolicy::default()),
+        "oauth-token" => Ok(HarnessAuthPolicy::OauthToken),
+        "api-key-only" => Ok(HarnessAuthPolicy::ApiKeyOnly),
+        other => Err(ConfigError::BadHarnessAuth(other.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -423,5 +469,42 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// Unset (or blank) is `oauth-token` -- today's unrestricted behaviour --
+    /// so upgrading the engine binary never changes an existing board's
+    /// behaviour on its own (wheel-harness-auth.md's "Default, unset" clause).
+    #[test]
+    fn harness_auth_defaults_to_oauth_token_when_unset_or_blank() {
+        for blank in [None, Some(""), Some("   ")] {
+            with_env(&[(ENV_HARNESS_AUTH, blank)], || {
+                assert_eq!(harness_auth().unwrap(), HarnessAuthPolicy::OauthToken);
+            });
+        }
+    }
+
+    #[test]
+    fn harness_auth_recognises_both_documented_values() {
+        with_env(&[(ENV_HARNESS_AUTH, Some("oauth-token"))], || {
+            assert_eq!(harness_auth().unwrap(), HarnessAuthPolicy::OauthToken);
+        });
+        with_env(&[(ENV_HARNESS_AUTH, Some("api-key-only"))], || {
+            assert_eq!(harness_auth().unwrap(), HarnessAuthPolicy::ApiKeyOnly);
+        });
+    }
+
+    /// A typo here is a silent policy downgrade if it were ever accepted as
+    /// the permissive default instead of refused -- this is a compliance
+    /// control (wheel-harness-auth.md), so an unrecognised value is a boot
+    /// failure, the same posture `tool_allow_hosts` takes with a bad entry.
+    #[test]
+    fn an_unrecognised_harness_auth_value_is_a_boot_failure_not_a_silent_default() {
+        for bad in ["api-key", "apikeyonly", "oauth", "OAUTH-TOKEN"] {
+            with_env(&[(ENV_HARNESS_AUTH, Some(bad))], || {
+                let err = harness_auth().unwrap_err();
+                assert!(matches!(err, ConfigError::BadHarnessAuth(_)), "{err}");
+                assert!(err.to_string().contains(bad), "{err}");
+            });
+        }
     }
 }

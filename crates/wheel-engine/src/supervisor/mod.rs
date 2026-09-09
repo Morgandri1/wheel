@@ -63,6 +63,14 @@ const TOOL_CACHES: &[(&str, &str)] = &[
 /// for a CLI's error banner, small enough that a runaway child cannot grow it.
 const STARTUP_OUTPUT_TAIL: usize = 8 * 1024;
 
+/// How often a running `api-key-only` agent's credential is re-checked
+/// between idle-park ticks (wheel-harness-auth.md, "PM ruling: mid-flow
+/// enforcement window"). Bounds the window a self-provisioned OAuth
+/// credential can run on to one tick of this instead of "for as long as the
+/// process happens to stay alive" -- short enough that the control means
+/// something, long enough not to be a busy-poll.
+const HARNESS_AUTH_RECHECK_SECS: u64 = 60;
+
 /// The last few KiB of a child's stdout, kept to explain why it died.
 ///
 /// Whole LINES, not bytes. It was a `String` trimmed with
@@ -549,6 +557,25 @@ impl Supervisor {
             return Ok(AgentStatus::NeedsAuth);
         }
 
+        // docs/proposals/wheel-harness-auth.md, enforcement point 4: the gate
+        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT` (API's
+        // half) can refuse an OAuth-shaped credential before it is ever
+        // stored, but an agent is untrusted code with a shell and can write
+        // one itself (`claude auth login`/`claude setup-token`) without going
+        // through any of those routes. Spawn is the one point that inspects
+        // the credential the harness is actually about to run with, so it is
+        // the point that cannot be bypassed.
+        if self.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly {
+            let config_dir = self.cfg.creds_dir().join(agent.to_string());
+            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness) {
+                let reason = "this project is api-key-only: an OAuth-shaped credential is not \
+                               permitted here, store an API key instead"
+                    .to_string();
+                self.set_status(agent, AgentStatus::Error, Some(reason));
+                return Ok(AgentStatus::Error);
+            }
+        }
+
         let run_dir = self.cfg.node_run_dir(agent);
         std::fs::create_dir_all(&run_dir)?;
         // The agent's own working copy (§3e), not the data root. See
@@ -985,7 +1012,12 @@ impl Supervisor {
 
     /// Arm the idle timer for an agent that has just finished a turn.
     ///
-    /// `idle_timeout_secs == 0` means never park — an agent that must stay hot.
+    /// `idle_timeout_secs == 0` means never park — an agent that must stay
+    /// hot -- UNLESS this project is `api-key-only`, in which case the timer
+    /// still runs for the compliance re-check below even though it will
+    /// never park (wheel-harness-auth.md, "PM ruling: mid-flow enforcement
+    /// window": a busy agent that never naturally idles is exactly the case
+    /// that ruling exists for).
     fn arm_park_timer(self: &Arc<Self>, agent: Uuid) {
         let secs = {
             let conn = self.db.lock().unwrap();
@@ -997,22 +1029,134 @@ impl Supervisor {
                 _ => return,
             }
         };
-        if secs == 0 {
+        let recheck_auth = self.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly;
+        if secs == 0 && !recheck_auth {
             return;
         }
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let mut wait = secs as u64;
+            // The compliance re-check's own cadence, capped independently of
+            // the configured idle timeout -- otherwise `idle_timeout_secs: 0`
+            // ("never park") or a long one would leave the mid-flow window
+            // open for as long as the process happens to stay busy, which is
+            // the exact gap the ruling closes.
+            let cap = if recheck_auth {
+                HARNESS_AUTH_RECHECK_SECS
+            } else {
+                u64::MAX
+            };
+            let mut wait = if secs == 0 {
+                cap
+            } else {
+                (secs as u64).min(cap)
+            };
             // Loops rather than recurses, and re-waits whatever `park` reports
             // is left — so a stale timer from an earlier turn corrects itself
             // instead of parking an agent that was active moments ago.
-            while let Some(left) = {
-                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                me.park(agent).await
-            } {
-                wait = left.max(1);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(wait.max(1))).await;
+
+                if recheck_auth && me.kill_if_oauth_shaped(agent).await {
+                    // Policy violation: killed. The next start re-runs the
+                    // identical check at spawn and refuses the credential, so
+                    // there is nothing further for this timer to do.
+                    break;
+                }
+
+                match me.park(agent).await {
+                    Some(left) => wait = left.max(1),
+                    None if recheck_auth => {
+                        // `park` declined -- busy, messages queued, or it
+                        // already parked. Only the first two mean there is
+                        // still a process to keep re-checking; once parked
+                        // (or stopped) there is nothing left to watch.
+                        let still_running = {
+                            let conn = me.db.lock().unwrap();
+                            matches!(
+                                board::agent_state(&conn, agent).unwrap_or_default().status,
+                                AgentStatus::Running | AgentStatus::Idle | AgentStatus::Starting
+                            )
+                        };
+                        if !still_running {
+                            break;
+                        }
+                        wait = cap;
+                    }
+                    None => break,
+                }
             }
         });
+    }
+
+    /// Compliance re-check for `api-key-only` deployments (wheel-harness-
+    /// auth.md, "PM ruling: mid-flow enforcement window"). A running agent
+    /// can execute `claude auth login`/`codex login` inside its own turn --
+    /// an agent is untrusted code with a shell (contract §2) -- and the CLI
+    /// picks up that freshly-written credential immediately, in-process, with
+    /// no restart. The spawn gate alone only re-checks on the NEXT start, so
+    /// on a busy agent that never idles long enough to park that window is
+    /// unbounded. This closes it: same detection [`crate::auth::is_oauth_shaped`]
+    /// spawn already uses, same kill [`Self::park`] already does, just on a
+    /// timer instead of at start.
+    ///
+    /// Returns whether it killed the process.
+    async fn kill_if_oauth_shaped(self: &Arc<Self>, agent: Uuid) -> bool {
+        let (harness, config_dir) = {
+            let conn = self.db.lock().unwrap();
+            match board::get(&conn, agent) {
+                Ok(Some(node)) => match &node.config {
+                    wheel_core::NodeConfig::Agent(a) => {
+                        (a.harness, self.cfg.creds_dir().join(agent.to_string()))
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        };
+        if !crate::auth::is_oauth_shaped(&config_dir, harness) {
+            return false;
+        }
+
+        let slot = self.slot(agent).await;
+        let mut guard = slot.lock().await;
+        let Some(mut r) = guard.take() else {
+            return false; // parked, stopped, or never started: nothing to kill
+        };
+        // NOT `let _ =` -- same reasoning as `park`: a kill that fails leaves
+        // a live process while the board says otherwise. `kill_on_drop(true)`
+        // still reaps `r` when it drops, so the process does die either way;
+        // what matters is that a failure here is heard.
+        if let Err(e) = r.child.kill().await {
+            tracing::warn!(
+                %agent,
+                error = %e,
+                "killing an api-key-only agent on an OAuth-shaped credential failed; \
+                 kill_on_drop is the backstop"
+            );
+        }
+        drop(guard);
+        {
+            // Same reasoning as `park`/`stop`: a token outliving its process
+            // is a credential with no owner. `start` mints a fresh one, and
+            // the spawn gate refuses it again before that ever happens.
+            let conn = self.db.lock().unwrap();
+            let _ = crate::db::tokens::revoke(&conn, agent);
+        }
+        self.set_status(
+            agent,
+            AgentStatus::Error,
+            Some(
+                "this project is api-key-only: an OAuth-shaped credential appeared on this \
+                 node mid-turn (a native harness login run inside the agent's own session) \
+                 and the process was stopped; store an API key instead"
+                    .to_string(),
+            ),
+        );
+        tracing::warn!(
+            %agent,
+            "stopped a running agent: OAuth-shaped credential found under api-key-only policy"
+        );
+        true
     }
 
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
@@ -1921,6 +2065,7 @@ mod tests {
             |_| {},
             crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             Some(Box::new(driver)),
+            crate::config::HarnessAuthPolicy::default(),
         )
     }
 
@@ -1930,7 +2075,30 @@ mod tests {
         tweak: impl FnOnce(&mut wheel_core::AgentConfig),
         deadline_secs: u64,
     ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
-        shim_supervisor_inner(name, script, tweak, deadline_secs, None)
+        shim_supervisor_inner(
+            name,
+            script,
+            tweak,
+            deadline_secs,
+            None,
+            crate::config::HarnessAuthPolicy::default(),
+        )
+    }
+
+    /// As `shim_supervisor`, on a deployment running `api-key-only`
+    /// (wheel-harness-auth.md) rather than the permissive default.
+    fn shim_supervisor_api_key_only(
+        name: &str,
+        script: &str,
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        shim_supervisor_inner(
+            name,
+            script,
+            |_| {},
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            None,
+            crate::config::HarnessAuthPolicy::ApiKeyOnly,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -1940,6 +2108,7 @@ mod tests {
         tweak: impl FnOnce(&mut wheel_core::AgentConfig),
         deadline_secs: u64,
         driver: Option<Box<dyn FnOnce(String) -> Arc<dyn crate::harness::Harness> + 'static>>,
+        harness_auth: crate::config::HarnessAuthPolicy,
     ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1981,6 +2150,7 @@ mod tests {
             json_logs: false,
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: deadline_secs,
+            harness_auth,
         });
         let sup = Arc::new(Supervisor::with_harness(
             cfg,
@@ -2169,6 +2339,89 @@ mod tests {
         );
     }
 
+    /// wheel-harness-auth.md, "PM ruling: mid-flow enforcement window": an
+    /// agent that self-provisions an OAuth credential (`claude auth login`,
+    /// run from inside its own turn -- no API route involved) must not keep
+    /// running on it indefinitely under `api-key-only`. The periodic
+    /// re-check has to catch this even while the agent is otherwise perfectly
+    /// idle-timer-eligible, not just at the next natural park/restart.
+    #[tokio::test]
+    async fn a_running_agent_is_stopped_when_it_goes_oauth_shaped_under_api_key_only() {
+        let (sup, id, dir) = shim_supervisor_inner(
+            "policy-midflow",
+            ECHO_HARNESS,
+            |cfg| cfg.idle_timeout_secs = Some(1),
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            None,
+            crate::config::HarnessAuthPolicy::ApiKeyOnly,
+        );
+        sup.start(id).await.unwrap();
+        until("the agent to be running", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        // No credential yet, so the spawn gate had nothing to refuse. Now the
+        // agent does what an API route never sees: it logs itself in.
+        enqueue(&sup, id, "do a turn");
+        sup.deliver(id).await.unwrap();
+        let config_dir = dir.join("creds").join(id.to_string());
+        std::fs::write(
+            config_dir.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-selfprovisioned"}"#,
+        )
+        .unwrap();
+
+        until(
+            "the periodic re-check to stop the agent for the policy violation",
+            || matches!(status_of(&sup, id), AgentStatus::Error),
+        )
+        .await;
+
+        assert_eq!(
+            runs(&dir),
+            1,
+            "the re-check kills the process; it must not also restart one"
+        );
+        let err = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap().last_error.unwrap()
+        };
+        assert!(err.contains("api-key-only"), "name the policy: {err}");
+        assert!(
+            err.contains("mid-turn"),
+            "say why this is different from a spawn-time refusal: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The re-check must not fire on nothing -- an `api-key-only` agent with
+    /// no OAuth-shaped credential anywhere still parks normally on its own
+    /// idle timer, same as under the permissive default.
+    #[tokio::test]
+    async fn an_api_key_only_agent_with_no_violation_still_parks_normally() {
+        let (sup, id, dir) = shim_supervisor_inner(
+            "policy-clean-park",
+            ECHO_HARNESS,
+            |cfg| cfg.idle_timeout_secs = Some(1),
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            None,
+            crate::config::HarnessAuthPolicy::ApiKeyOnly,
+        );
+        sup.start(id).await.unwrap();
+        until("the agent to be running", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        enqueue(&sup, id, "do a turn");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park after its idle timeout", || {
+            matches!(status_of(&sup, id), AgentStatus::Parked)
+        })
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An agent with work queued must not be parked out from under it.
     #[tokio::test]
     async fn an_agent_with_queued_work_is_not_parked() {
@@ -2340,6 +2593,7 @@ done
                     log: log_for_driver,
                 }) as Arc<dyn crate::harness::Harness>
             })),
+            crate::config::HarnessAuthPolicy::default(),
         );
 
         sup.start(id).await.unwrap();
@@ -2691,6 +2945,60 @@ done
         assert!(err.contains("anthropic"), "name the vault: {err}");
         assert!(err.contains("setup-token"), "name the durable fix: {err}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// docs/proposals/wheel-harness-auth.md, enforcement point 4: on an
+    /// `api-key-only` project, an OAuth-shaped credential must refuse to
+    /// spawn at all -- not `needs_auth` (which implies "log in and it'll
+    /// work"), `error`, naming the policy.
+    #[tokio::test]
+    async fn an_oauth_credential_refuses_to_spawn_under_api_key_only() {
+        let (sup, id, dir) = shim_supervisor_api_key_only("policy-oauth", ECHO_HARNESS);
+        let config_dir = dir.join("creds").join(id.to_string());
+        crate::auth::store_token(&config_dir, "sk-ant-oat01-abc", wheel_core::Harness::Claude)
+            .unwrap();
+
+        assert_eq!(sup.start(id).await.unwrap(), AgentStatus::Error);
+        assert_eq!(status_of(&sup, id), AgentStatus::Error);
+        assert_eq!(runs(&dir), 0, "an OAuth credential must not spawn a child");
+
+        let err = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap().last_error.unwrap()
+        };
+        assert!(err.contains("api-key-only"), "name the policy: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same project, an API key instead -- the policy must not be a
+    /// blanket refusal to start.
+    #[tokio::test]
+    async fn an_api_key_starts_normally_under_api_key_only() {
+        let (sup, id, dir) = shim_supervisor_api_key_only("policy-apikey", ECHO_HARNESS);
+        let config_dir = dir.join("creds").join(id.to_string());
+        crate::auth::store_token(&config_dir, "sk-ant-api03-abc", wheel_core::Harness::Claude)
+            .unwrap();
+
+        sup.start(id).await.unwrap();
+        until("the agent to start", || runs(&dir) > 0).await;
+        assert_ne!(status_of(&sup, id), AgentStatus::Error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A board with no policy set at all (the permissive default) must keep
+    /// accepting an OAuth credential exactly as it does today -- upgrading
+    /// the engine binary must not change an existing board's behaviour.
+    #[tokio::test]
+    async fn an_oauth_credential_still_starts_when_no_policy_is_set() {
+        let (sup, id, dir) = shim_supervisor("policy-unset", ECHO_HARNESS);
+        let config_dir = dir.join("creds").join(id.to_string());
+        crate::auth::store_token(&config_dir, "sk-ant-oat01-abc", wheel_core::Harness::Claude)
+            .unwrap();
+
+        sup.start(id).await.unwrap();
+        until("the agent to start", || runs(&dir) > 0).await;
+        assert_ne!(status_of(&sup, id), AgentStatus::Error);
         std::fs::remove_dir_all(&dir).ok();
     }
 
