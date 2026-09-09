@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! `HostClient` against a mock host.
 //!
 //! This is the code that turns every lifecycle call into an authenticated request to the one

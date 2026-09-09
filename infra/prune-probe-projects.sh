@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 #
 # Delete the projects that automated probes leave behind on the deployed API.
 #

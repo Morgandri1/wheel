@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! A runnable JWKS issuer, so `AUTH_MODE=jwks` can be exercised without a Clerk account.
 //!
 //! We have always tested `jwks` mode — `tests/support.rs` stands up an issuer in-process and five

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Realising a builder-emitted board against a project.
 //!
 //! The input is JSON an LLM produced. It is untrusted in the ordinary sense — it can name nodes

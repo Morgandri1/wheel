@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Dev-only sandbox backend: an engine that someone else already started.
 //!
 //! Exists for one reason. On macOS the docker bridge network is not reachable from the host, so a

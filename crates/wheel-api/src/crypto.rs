@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Envelope encryption for per-project secrets, plus a secret wrapper that resists being logged.
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};

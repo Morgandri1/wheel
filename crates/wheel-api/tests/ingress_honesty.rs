@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! A blank 404 from an engine that serves no endpoints is not a typo.
 //!
 //! The operator opened `/p/<project>/tg`, got a bodiless 404, and read it as a mistyped path. The

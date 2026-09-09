@@ -1,3 +1,7 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Stub engine, for proving the API -> host -> engine chain before SDK's real engine lands.
 FROM python:3.12-slim
 COPY infra/dev/stub_engine.py /stub_engine.py

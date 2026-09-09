@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 #
 # The predicates of a deletion tool, one test each. It runs against production data, so "I read it
 # and it looked right" is not enough: what must be provable is that the deny list wins, that a

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The host's proxy to a project's engine.
 //!
 //! This hop is where the engine secret is injected, and it is the last place a mistake stays

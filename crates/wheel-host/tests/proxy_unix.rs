@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Proxying to an engine that listens on a unix socket.
 //!
 //! This is the Railway path. In process mode there is no TCP endpoint to address — deliberately,
