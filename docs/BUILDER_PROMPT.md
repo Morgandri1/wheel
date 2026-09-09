@@ -175,5 +175,145 @@ pub struct Wire {
 }
 ```
 
+### NodeConfig Variants
+```rs
+pub struct ToolConfig {
+    pub kind: ToolKind,
+    pub source: ToolSource,
+    /// Absolute `http(s)` origin every operation is resolved against.
+    pub base_url: String,
+    #[serde(default)]
+    pub operations: Vec<ToolOperation>,
+}
+
+#[serde(tag = "transport", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpConfig {
+    Stdio {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<BTreeMap<String, String>>,
+    },
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<BTreeMap<String, String>>,
+    },
+}
+
+pub struct ChestConfig {}
+
+pub struct VaultConfig {
+    pub keys: Vec<String>,
+}
+
+pub struct AgentConfig {
+    pub harness: Harness,
+    /// Harness-specific model id. `None` = the CLI's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Appended to the harness's own system prompt, then followed by the
+    /// markdown of every `ctx` node wired `send` into this agent.
+    pub system_prompt: String,
+    /// Start this agent when the container starts.
+    #[serde(default)]
+    pub run_on_startup: bool,
+    /// Clear the session after every completed turn, re-applying the system
+    /// prompt and ctx injections, before draining the next queued message.
+    #[serde(default)]
+    pub ephemeral_context: bool,
+    /// Stop the process after this long idle and resume the session on the next
+    /// message (§3c#14 idle parking). `None` uses
+    /// [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u32>,
+    /// Spend ceiling. On reach, the engine stops the agent with
+    /// `status: budget_exhausted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    /// Working copies the engine materialises before the child starts (§3e).
+    /// The child's cwd is the first one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<Workspace>,
+}
+
+pub struct TableConfig {
+    pub columns: Vec<Column>,
+}
+
+pub struct Column {
+    /// Validated with a sqlite-safe charset so it is safe to quote into DDL.
+    /// Unlike a node name this may be `user`, `system`, ... — the node
+    /// reserved-name list is about message addressing, not columns.
+    pub name: Ident,
+    #[serde(rename = "type")]
+    pub column_type: ColumnType,
+}
+
+pub struct EndpointConfig {
+    pub method: HttpMethod,
+    /// Leading slash, no `..`. Validated by [`crate::validate::validate_endpoint_path`],
+    /// and constrained in the exported schema so the static gate catches it too.
+    #[schemars(regex(pattern = r"^(?!.*(?:^|/)\.\.(?:/|$))/[^\s?#]*$"))]
+    pub path: String,
+    pub response_mode: ResponseMode,
+    #[serde(default)]
+    pub auth: EndpointAuth,
+}
+
+pub struct ScriptConfig {
+    pub language: ScriptLanguage,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 300))]
+    pub timeout_secs: Option<u32>,
+}
+
+pub struct CtxConfig {
+    pub markdown: String,
+}
+```
+
+### Complete example
+```json
+    ---START-WORKFLOW---
+    {
+      "project": { "id": "3f1a2b9c-0d4e-4a6b-8c1d-2e3f4a5b6c7d" },
+      "nodes": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "name": "inbound",
+          "position": { "x": 0, "y": 0 },
+          "type": "endpoint",
+          "config": { /* EndpointConfig */ },
+          "wires": [
+            { "to": "22222222-2222-4222-8222-222222222222", "type": "send" }
+          ]
+        },
+        {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "name": "planner",
+          "position": { "x": 240, "y": 0 },
+          "type": "agent",
+          "config": { /* AgentConfig */ },
+          "wires": [
+            { "to": "33333333-3333-4333-8333-333333333333", "type": "write" }
+          ]
+        },
+        {
+          "id": "33333333-3333-4333-8333-333333333333",
+          "name": "results",
+          "position": { "x": 480, "y": 0 },
+          "type": "table",
+          "config": { /* TableConfig */ },
+          "wires": [],
+          "state": null
+        }
+      ]
+    }
+    ---END-WORKFLOW---
+```
+
 Every wire you emit MUST be one of the legal pairs above. Give each node a fresh `id` (uuid) and reference
 those ids in `wires.to`.

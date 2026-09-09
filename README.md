@@ -43,3 +43,10 @@ cd web && pnpm install && NEXT_PUBLIC_AUTH_MODE=local NEXT_PUBLIC_API_URL=http:/
 Agents are Claude Code / Codex processes. Give them credentials through a **vault** node (one vault per account; wire the agent to it) or the
 agent's Authenticate panel (in-browser Anthropic login, `claude setup-token`, or an API key). Nothing in Wheel ever shows a stored secret back.
 See `docs/ARCHITECTURE.md` for the model and `docs/WHEEL-ON-WHEEL.md` for a board that develops Wheel itself.
+
+# Legal disclaimer, asshole
+Yes, this product was built after using Yoke (https://getyoke.com), a cool product with a similar mechanism to Wheel. However, Wheel was built with:
+- No Yoke assets, code, copy, or protected material
+- No Yoke-proprietary paradigms 
+- No insider-information from Yoke employees 
+- **Only** what I could easily observe by using Yoke as a regular user.
