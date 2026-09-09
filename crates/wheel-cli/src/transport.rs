@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Reaching the engine, over TCP or a unix socket.
 //!
 //! `WHEEL_ENGINE_URL` is `http://…` in docker mode and `unix://…` in process

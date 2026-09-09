@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! `tool` nodes: imported HTTP specs exposed to agents as callable tools (§3d).
 //!
 //! The engine is the only parser of OpenAPI/Swagger/Postman/Insomnia documents;

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Runtime state. Deliberately NOT part of `config`: config is what the user
 //! authored and what round-trips through the API, state is what the engine
 //! observes. `GET /v1/board` reports them alongside each other (§3).

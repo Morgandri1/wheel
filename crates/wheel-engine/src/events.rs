@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The event bus behind `GET /v1/events`.
 //!
 //! A `broadcast` channel rather than per-subscriber queues, for one reason: a

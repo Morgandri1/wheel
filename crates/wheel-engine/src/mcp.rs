@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The tool surface an agent's harness sees over MCP (§3c #1).
 //!
 //! The CLI exists for scripts and humans; MCP is what an LLM should be using,

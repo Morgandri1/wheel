@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The capability layer: token → node → wire check.
 //!
 //! Every `/v1/cli/*` call resolves its authority here and nowhere else. That is

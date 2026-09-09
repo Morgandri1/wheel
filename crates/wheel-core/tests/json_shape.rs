@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The canonical JSON in ARCHITECTURE.md §3 is a cross-team contract: Web
 //! generates TypeScript from it and the API forwards it verbatim. These tests
 //! pin the exact wire shape for all 8 node types.

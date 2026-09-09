@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Git credentials for agent children, supplied out of band.
 //!
 //! An agent holding `GITHUB_TOKEN` will reach for the shortest thing that

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The agent preamble: the system prompt the engine composes for every child on
 //! start and after every context clear (ARCHITECTURE.md §3, "Agent preamble").
 //!
