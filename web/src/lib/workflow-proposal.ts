@@ -62,7 +62,6 @@ export function parseProposal(text: string): ProposalResult {
   }
 
   const problems: string[] = [];
-  const warnings: string[] = [];
   const nodes: ProposedNode[] = [];
   const byId = new Map<string, ProposedNode>();
   const names = new Set<string>();
@@ -134,7 +133,21 @@ export function parseProposal(text: string): ProposalResult {
 
   if (problems.length) return { status: "invalid", problems };
 
-  // Capability warnings, not refusals: the board can hold these, they just will not run yet.
+  return { status: "ok", proposal: { nodes, wires }, warnings: capabilityWarnings(nodes) };
+}
+
+/**
+ * Capability warnings, not refusals: the board can hold these, they just will not run yet.
+ *
+ * Shared between the builder's proposal preview and the template gallery — both show a person a
+ * `{nodes, wires}` shape before anything is created, so both owe the same honesty about what will
+ * not actually run. Keeping this in one place means a new capability restriction only has to be
+ * taught here once.
+ */
+export function capabilityWarnings(
+  nodes: { name: string; type: NodeType; config: Record<string, unknown> }[],
+): string[] {
+  const warnings: string[] = [];
   for (const n of nodes) {
     if (n.type === "agent" && n.config.harness === "codex") {
       warnings.push(`"${n.name}" uses the codex harness, which is not runnable yet.`);
@@ -143,6 +156,5 @@ export function parseProposal(text: string): ProposalResult {
       warnings.push(`"${n.name}" is a script node; script execution is not live yet.`);
     }
   }
-
-  return { status: "ok", proposal: { nodes, wires }, warnings };
+  return warnings;
 }

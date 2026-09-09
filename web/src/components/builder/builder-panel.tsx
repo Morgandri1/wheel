@@ -209,7 +209,8 @@ function visibleText(text: string): string {
   return (start === -1 ? text : text.slice(0, start)).trim() || "(proposed a board)";
 }
 
-function ProposalPreview({ proposal, warnings }: { proposal: Proposal; warnings: string[] }) {
+/** Exported so the template gallery can render a preview identical to the builder's own. */
+export function ProposalPreview({ proposal, warnings }: { proposal: Proposal; warnings: string[] }) {
   return (
     <div className="border border-rule p-2.5" data-testid="builder-preview">
       <p className="mb-1.5 text-micro text-ink-faint">
