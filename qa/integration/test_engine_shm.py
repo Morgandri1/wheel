@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """ENG-starts-without-shm / ENG-concurrent-readers — the WAL fallback, proven.
 
 Production crash-looped on `disk I/O error ... xShmMap`: sqlite's WAL index is a `-shm`

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Per-crate line-coverage gate — ARCHITECTURE.md §0b (>=90% per crate).
 
 PM ruling 2026-09-05: the 90% bar is per CRATE, not workspace-wide, and is on for

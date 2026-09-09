@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """DEPLOY-healthz — prove the deployed service answers on the path its config declares.
 
 Incident #2: a Railway service deployed "successfully" while its configured healthcheckPath

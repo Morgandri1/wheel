@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """DEP-binary-size — what Railway actually ships is a number with a ceiling.
 
 PM's A10. Release binaries are what run in production and what get pulled on every deploy,

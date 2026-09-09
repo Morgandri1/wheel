@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """DEP-* — dependency weight is a number someone has to argue for, not a drift.
 
 PM's A10 (efficiency is P1): "a gate on total crate count ... and cargo tree -d returning

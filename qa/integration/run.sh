@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Integration suite: brings up infra/docker-compose.yml and drives the API.
 #
 # Parameterised on SANDBOX_BACKEND from day one (docker now, process at M3) so the M3

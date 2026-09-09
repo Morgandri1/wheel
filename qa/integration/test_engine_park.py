@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """ENG-park-* — parking is a COST claim, so it is verified by observation, not by status.
 
 Four criteria have been in TESTPLAN since M1 and were asserted by nothing until now:

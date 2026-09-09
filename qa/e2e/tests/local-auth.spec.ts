@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * E2E — local email/password auth. TESTPLAN E2E-local-*, and the browser half of the
  * AUTH-local-* criteria in §7a.
