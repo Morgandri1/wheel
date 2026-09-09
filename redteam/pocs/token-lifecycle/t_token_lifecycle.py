@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """ADVERSARY token-lifecycle live-confirm (PM gated item #2).
 
 Source verdict was SOUND; this confirms it LIVE:

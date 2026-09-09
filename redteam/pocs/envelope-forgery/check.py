@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Envelope-forgery probe (finding 001). Verifies the engine's <AgentPrompt> framing.
 
 SINGLE SOURCE OF TRUTH (PM ruling, contract §1): the attack bodies are QA's shared fixtures, read BY PATH —

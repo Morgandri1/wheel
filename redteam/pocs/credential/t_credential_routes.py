@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Credential-route campaign (PM). Owner: SDK/Engine. Engine control plane (/v1/*, engine secret)
 plus the CLI realm (/v1/cli/*, node token). Targets:
   1 setup_token REFUSES non-durable creds (only sk-ant-oat* durable) — prefix/case/whitespace tricks

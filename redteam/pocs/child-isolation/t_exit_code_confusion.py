@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """002/§4 Exit-code confusion primitive. Owner: SDK.
 
 QA's fake reproduces the real CLI refusing `--permission-mode bypassPermissions` under uid 0:

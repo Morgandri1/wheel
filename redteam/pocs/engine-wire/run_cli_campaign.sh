@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Boot a throwaway wheel-engine:test, build a minimal board, extract node tokens from their 0600
 # files, run the consolidated CLI-gated probe, then tear the container down. PM: remove after.
 set -u

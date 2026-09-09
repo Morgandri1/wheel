@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # (b) PM's S1: a vault that only DECLARES CLAUDE_CODE_OAUTH_TOKEN (no value stored). Does GET agent/auth
 # report authenticated:true mode:env? What does declared-but-empty unlock — child env, the start gate?
 # Throwaway project (my own container), not wheel-dev.

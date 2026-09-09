@@ -1,3 +1,7 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Shared PoC harness. Stdlib only (no deps assumed on the host).
 
 Rules of engagement enforced here: probes talk ONLY to the local stack named by WHEEL_STACK

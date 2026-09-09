@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Vault structural claims (PM's campaign, minus F015 which is filed): encryption-at-rest, write-only
 # API, ambiguity at wire-creation AND PUT (409 ambiguous_credential), auth-source correctness.
 # Driven on the engine control plane (/v1/* with the engine secret). PM: container removed on exit.

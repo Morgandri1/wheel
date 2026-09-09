@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Cross-account MUTATION probe via REAL local-auth (PM S1). Owner: API. Boundary TB1.
 Two DISTINCT accounts created through /v1/auth/signup (opaque `local.<uuid>` session tokens),
 so unlike the dev-HS256 path (which collapses every token to owner_id='user_mock' on this

@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Faithful reproduction of Wheel's process-backend engine drop, to settle 037's /proc carrier.
 # Mirrors crates/wheel-host/src/sandbox/process.rs::drop_privileges:
 #   setgroups([]) -> setgid -> setuid -> PR_SET_NO_NEW_PRIVS, then execve a normal binary.

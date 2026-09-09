@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Boot wheel-engine:dev, run the e2e tool executor/importer HTTP campaign, tear down. PM: removed after.
 set -u
 NAME="wheel-adv-toolhttp-$$"; PORT=7027; SECRET="$(openssl rand -hex 24)"; VK="$(head -c32 /dev/urandom|base64)"; PID="$(uuidgen)"

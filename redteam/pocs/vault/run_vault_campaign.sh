@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Boot a throwaway wheel-engine:dev, build a vault board, PUT a secret, live-check that the
 # plaintext never lands in /data/wheel.db, extract node tokens, run t_vault.py, tear down.
 # PM: containers removed after (trap).

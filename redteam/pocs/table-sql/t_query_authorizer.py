@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """STAGED — `wheel query` rusqlite-authorizer campaign. Owner: SDK/Engine. Plan:
 redteam/reviews/table-query-authorizer-testplan.md. Runs the moment POST /v1/cli/query exists.
 

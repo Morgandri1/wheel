@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """003 Engine wire/token + SQL escapes. Owner: SDK. → THREAT-MODEL TB4.
 Secure outcomes: (a) a node token used on a wire it lacks → exit-3/403. (b) `wheel query` cannot
 ATTACH/PRAGMA/read sqlite_master/other t_ tables/readfile. Run inside a sandbox with WHEEL_TOKEN set

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // Finding: re-import silently UN-PINS a vault/static fill via a param RENAME. Owner: SDK/Engine.
 // merge_operations ported VERBATIM from crates/wheel-engine/src/api/tool_routes.rs:114-149 @ HEAD
 // (only Rust->JS syntax changed). Its own doc says (l.106-109): "re-importing a spec must not hand a

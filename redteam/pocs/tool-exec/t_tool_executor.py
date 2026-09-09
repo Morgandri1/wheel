@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """STAGED — tool-node executor campaign. Owner: SDK/Engine. Plan:
 redteam/reviews/tool-executor-testplan.md. Runs when the call route lands
 (`POST /v1/cli/tool-call` or `/v1/tools/:id/call`). RoE: mock the metadata endpoint, never a real one.

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """§3c#12 — single stdin writer / no mid-turn injection. Owner: SDK. → THREAT-MODEL TB5.
 
 The engine's per-agent delivery loop must be the ONLY writer to the child's stdin: one message per

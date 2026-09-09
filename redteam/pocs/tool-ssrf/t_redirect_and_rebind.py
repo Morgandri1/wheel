@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """004 Tool-node SSRF — the re-validate-AFTER-DNS-AND-EVERY-REDIRECT vector.
 
 This is the "cheap confirmed finding" spot: a base_url that passes the pre-filter (public host) but

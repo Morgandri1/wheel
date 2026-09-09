@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Cross-account MUTATION probe (PM S1): can user B delete/patch/start/stop user A's project?
 Owner: API. Boundary TB1. Local stack only, two of MY OWN dev accounts.
 

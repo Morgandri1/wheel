@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """F003 + F007 — process-backend cross-tenant isolation (M1.5). Owner: API(host)+SDK(engine).
 
 The prod-shape backend: ALL projects' engines + agents + scripts run as `process` sandboxes in ONE

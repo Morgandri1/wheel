@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Boot wheel-engine:dev, build the credential-route board, extract node tokens, run t_credential_routes.py,
 # tear down. PM: containers removed after (trap).
 #   A: agent (claude) wired read->v1 AND read->v2   (v2 declares CLAUDE_CODE_OAUTH_TOKEN -> ambiguity source)

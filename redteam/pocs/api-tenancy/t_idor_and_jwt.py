@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """001 API tenancy: cross-tenant IDOR + JWT alg=none. Owner: API. → THREAT-MODEL TB1.
 Secure outcomes: (a) user A + project B → 404 (no enumeration). (b) alg=none token → 401.
 Fill USER_A_TOKEN / PROJECT_B (another owner's id) from env when the stack is up."""
