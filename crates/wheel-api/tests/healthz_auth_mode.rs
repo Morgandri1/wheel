@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! API-healthz-publishes-auth-mode.
 //!
 //! `AUTH_MODE` on the API and `NEXT_PUBLIC_AUTH_MODE` in the web build must agree. When they do not,

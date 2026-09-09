@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The process sandbox backend.
 //!
 //! The privilege drop itself needs root to exercise, and CI does not have it. What these cover is

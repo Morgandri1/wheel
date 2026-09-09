@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Startup wiring, kept out of `main` so it can be tested.
 //!
 //! `main` should be the one part of a service that nothing depends on: a shell that reads the

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Rotate one project's `WHEEL_ENGINE_SECRET`. **Dry run unless `--apply`.**
 //!
 //! `docs/runbooks/rotate-engine-secret.md` documents the procedure and, until this existed, had a

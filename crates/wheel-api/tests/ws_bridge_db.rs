@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The events WebSocket, end to end through the proxy.
 //!
 //! Two things make this worth a real socket rather than a unit test of the upgrade detector.

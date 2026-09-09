@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Creates the Wheel-on-Wheel board (docs/WHEEL-ON-WHEEL.md) through the public API. Idempotent by project name.
 set -euo pipefail
 : "${WHEEL_API:?set WHEEL_API}"; : "${WHEEL_EMAIL:?}"; : "${WHEEL_PASSWORD:?}"

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Host configuration validation, and the proxy's credential swap.
 //!
 //! The proxy test is the important one. The host sits between two different trust domains: the API

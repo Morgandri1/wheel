@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // Postgres-only: it asserts on a `Db::Pg` pool, which a build without the `postgres` feature does
 // not have. The SQLite half of the same wiring is `tests/sqlite_store.rs`.
 #![cfg(feature = "postgres")]

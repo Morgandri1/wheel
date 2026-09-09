@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The rotation's two load-bearing properties.
 //!
 //! `docs/runbooks/rotate-engine-secret.md` step 2 writes a column that is AES-GCM sealed, so no SQL

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! The single error type crossing the HTTP boundary.
 //!
 //! Rule: the *client* sees a stable machine code and a generic message. The *operator* sees the

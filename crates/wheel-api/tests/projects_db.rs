@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Router-level integration tests against a real Postgres.
 //!
 //! The auth unit tests prove the *verifier* is sound. These prove the *boundary* is wired: that a
