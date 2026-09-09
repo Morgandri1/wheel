@@ -101,6 +101,13 @@ impl Sandbox for EmbeddedSandbox {
             // same reason.
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: wheel_engine::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            // Self-hosted `wheeld` is first-class, not the restricted case
+            // `api-key-only` exists for (docs/proposals/wheel-harness-auth.md,
+            // wow-agent-brief.md task 4): a person running Wheel on their own
+            // machine, on their own subscription, keeps today's unrestricted
+            // default. Only `wheel-host`'s cloud deployment opts into the
+            // stricter policy.
+            harness_auth: wheel_engine::config::HarnessAuthPolicy::default(),
         };
 
         let project = *id;
