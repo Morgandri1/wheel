@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Tool executor/importer e2e HTTP campaign. Owner: SDK/Engine. Confirms 022/023 live + SSRF-config +
 fill precedence + cookie injection + ops projection, against the LIVE routes. RoE: no real outbound
 hosts — every executor test uses curl/dry_run (build_request only) or a config-time-denied base_url;

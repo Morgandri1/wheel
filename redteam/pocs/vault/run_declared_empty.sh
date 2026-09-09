@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # PM's traced S1: a vault that only DECLARES a credential key (config.keys) with NO stored value makes
 # GET /v1/agents/:id/auth report authenticated:true mode:env. This maps the discrepancy: auth-status uses
 # offered_keys (declared UNION stored) while the child env uses stored-only — so an agent reports authed

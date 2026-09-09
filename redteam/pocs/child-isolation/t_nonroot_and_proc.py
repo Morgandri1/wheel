@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """002/003 Child isolation. Owner: SDK/host. → THREAT-MODEL TB6/TB7.
 Runs INSIDE an agent sandbox (as the agent would, via shell). Secure outcomes:
   - not uid 0 (PM ruling: children run non-root, IS_SANDBOX=1)

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // SSRF classifier battery — proves wheel_core::ip_is_denied / host_is_denied by RUNNING,
 // with emphasis on the tricky IPv6-embedded-IPv4 forms (6to4, NAT64, Teredo, mapped, compatible)
 // carrying a private or metadata address. Exit non-zero if any expectation fails.

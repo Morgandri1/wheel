@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # ⚠️  DETECTOR NOTE (F015): this scans all of /proc and matches its OWN `docker exec` probe
 #     shell, which inherits the container `-e` env — so it OVER-REPORTS on a FIXED build.
 #     It reproduces the leak on the VULNERABLE build only. To GATE a fix use verify_env_fix.sh

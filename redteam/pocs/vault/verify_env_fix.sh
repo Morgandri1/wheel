@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # F015 FIX VERIFICATION (scoped, canary-based). After e09e1ec the supervisor and oauth.rs both
 # env_clear() and re-add only an allowlist. This reads the ENGINE-SPAWNED child's own environ —
 # as the child's own uid, which is the ONLY thing that can read it (root lacks CAP_SYS_PTRACE in

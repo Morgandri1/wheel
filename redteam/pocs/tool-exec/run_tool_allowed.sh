@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Allowed-path tool-executor campaign (needs WHEEL_TOOL_ALLOW_HOST + a loopback witness server).
 # Priorities: (1) HEADER CRLF AT SEND with a witness, (2) 026 metadata-deny via all 5 v6 spellings through
 # the REAL lookup_host path (the seam), (3) allowlist can't widen, (4) prod-boot-refusal, (5) redirect

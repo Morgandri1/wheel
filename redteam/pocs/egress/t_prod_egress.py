@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Prod egress probe v2 — script writes connect results to a TABLE, read back via API.
 Bounded: single connects, short timeouts, no loop/flood, real metadata IP excluded (RoE).
 Throwaway project, torn down only AFTER results are read. Stop-and-report on any data returned."""

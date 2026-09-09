@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Allowed-path e2e via a HOSTNAME allowlist entry (PM's insight): a hostname passes create-time
 # host_is_denied (a literal/suffix check; "echo.test" is neither), is allowlisted by that literal, and
 # resolves via /etc/hosts to a loopback witness server. So we exercise send()'s allowed path — header-CRLF

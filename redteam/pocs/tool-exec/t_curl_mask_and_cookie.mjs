@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // Tool executor — TWO findings on the PURE layer (no route needed). Owner: SDK/Engine.
 // The functions below are ported VERBATIM from crates/wheel-engine/src/tools/execute.rs @1f1d5e0
 // (only Rust->JS syntax changed; the logic is identical) so this runs the actual behaviour:

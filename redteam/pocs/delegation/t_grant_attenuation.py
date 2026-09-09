@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """006 Grant/place attenuation (§3e). Owner: SDK/API. → THREAT-MODEL TB9.
 Secure outcomes: a grantor with only `read` on a node cannot grant `write`/`send`; cannot grant a
 wire it doesn't hold; place/grant/manage are owner-authorized. Skeleton; run when §3e lands (M3)."""

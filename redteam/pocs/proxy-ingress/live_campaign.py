@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Live API-tenancy + proxy/ingress campaign against the infra/dev stack (WHEEL_ENV=dev).
 
 Boot: API :8080, host :7100, stub engine :7000 (infra/dev/e2e.py shows the recipe). Dev auth is

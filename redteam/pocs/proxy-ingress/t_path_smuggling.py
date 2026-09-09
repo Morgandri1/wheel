@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Proxy/ingress path traversal. Owner: API. → THREAT-MODEL TB2.
 Secure outcomes: authed proxy cannot reach /v1/cli/* (node-token path); public ingress cannot reach
 /v1/* (control plane). Try raw '..', %2e%2e, double-encode, mixed separators."""

@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // Finding 034 — poison message panics the AgentPrompt escaper by a byte-index slice off a char boundary.
 // The slice condition is ported VERBATIM from crates/wheel-core/src/message.rs:183-214
 // (escape_envelope_body). In Rust, `body[name_at..name_at+TAG.len()]` PANICS if either bound is not a

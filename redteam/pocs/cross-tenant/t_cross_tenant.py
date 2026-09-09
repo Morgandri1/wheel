@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """ADVERSARY cross-tenant reach probe (PM gated item #3, filesystem/socket/environ half).
 
 Runs the wheel-host process backend LOCALLY (WHEEL_ROLE=host, SANDBOX_BACKEND=process, root),

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """004 Tool-node SSRF. Owner: SDK. → THREAT-MODEL TB8 / finding 004.
 Secure outcome: /v1/tools/import + /v1/tools/:id/call reject base_url/redirect resolving to
 loopback/RFC1918/link-local/*.internal, across IP encodings, AND after a redirect (resolve-and-pin).

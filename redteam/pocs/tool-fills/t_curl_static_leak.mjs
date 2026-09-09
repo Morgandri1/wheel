@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 // Finding 012 — static fills leak in --curl / call url (owner: Web mock + engine).
 // renderUrl/renderCurl below are copied VERBATIM from web/mock/server.ts (web/main 85a4028,
 // lines 574-608) — they are pure (only erased TS types removed), so this runs the actual logic,

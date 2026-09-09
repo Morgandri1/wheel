@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Loopback witness server for the tool-executor allowed-path probe. Runs INSIDE the sandbox
 container on 127.0.0.1:<port> (an allowlisted target). It RECORDS what the executor actually sent —
 the whole point is a witness for header-CRLF and body-not-replayed, not just a pass/fail.

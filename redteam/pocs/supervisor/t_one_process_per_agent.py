@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """§3c#13 — exactly one harness process per agent. Owner: SDK. → THREAT-MODEL TB5.
 
 The defect this guards: on YOKE each delivered message launched another `claude --continue`, so N quick

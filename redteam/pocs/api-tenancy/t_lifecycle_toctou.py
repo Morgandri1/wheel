@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """API second-pass: lifecycle TOCTOU + use-after-delete + rate-limit scope. Owner: API.
 
 Live against infra/dev (localhost:8080, WHEEL_ENV=dev). Races the project lifecycle

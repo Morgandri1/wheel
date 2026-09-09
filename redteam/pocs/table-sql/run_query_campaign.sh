@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Boot wheel-engine:dev, build a two-table board, seed a distinctive secret row in the FORBIDDEN table,
 # extract agent A's node token, run t_query_authorizer.py, tear down. PM: containers removed (trap).
 #   A: agent (claude) wired read->selft. A is NOT wired to othert (authorizer must still deny reads of t_othert).

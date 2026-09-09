@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Live tool-executor campaign via the engine-secret realm (/v1/tools/:id/call + POST /v1/nodes).
 # A) 022 fix e2e: query/path vault+static secrets masked in dry_run curl; cookie value encoded (no injection).
 # B) SSRF: per-base_url tool nodes -> classify deny-at-config / deny-at-call / REACHABLE(gap). 6to4/NAT64/Teredo.
