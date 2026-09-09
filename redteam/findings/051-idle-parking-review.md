@@ -85,6 +85,13 @@ SDK documents this as a deliberate prefer-fresh-over-wedged trade. Does not bloc
 Source-verified (trigger + run_id guard read in cbc6b4a); the one live-check to make it run-verified is a
 resumed agent killed pre-init keeping its session vs one exiting pre-init on its own clearing it — offered.
 
+**RUN-VERIFIED (build 98c8e6e, contains cbc6b4a; PoC redteam/pocs/stale-resume/):** established a session
+(init->SESS-POC-1), then — CASE 1: resumed with a fake that never inits, stopped PRE-INIT -> session KEPT
+(run_id guard held); CASE 2: resumed with a fake that exits pre-init on its own -> session CLEARED. Both as
+predicted -> no false-positive wipe of a good session. Independent of QA's angle (they verified session-survival
+across park-resume cycles + --resume carrying the original id; this verifies the CLEAR path and the guard
+boundary). cbc6b4a CLEARED.
+
 ## Note
 Correction: Tighten #2 is NOT low — QA measured it as BUG-040 (premature park); I had reasoned it harmless.
 Tighten #1 (swallowed kill) is Low-Medium and #3 (stale resume) is Low; none of the three is a lost-message,
