@@ -65,11 +65,25 @@ not reasoned. Fix: QA's option 2 — on fire, check elapsed-since-last-activity 
 rather than park; a single re-arming timer also closes the task-leak I flagged. Severity is a real correctness
 bug (an agent parked early = a needless resume + latency on the next message), not the "leak only" I first said.
 
+**FIXED (cbc6b4a, on main):** park now compares `last_activity` and RETURNS the remaining seconds; the timer
+loop re-waits that remainder, so a stale per-turn timer self-corrects instead of parking early. Closes the leak
+too (one self-correcting wait rather than a task per turn). Verified in source.
+
 ## Tighten #3 (Low) — resume trusts the session_id blindly
 Nothing validates the kept `session_id` before `--resume`. If the harness session is stale/expired, `--resume`
 may error or silently start a fresh session (context loss). Preserving+passing the id is the engine's correct
 job (done); confirm the FAILED-resume path falls back to a fresh session rather than wedging in `starting`
 (041's class). Harness/resume semantics — cross-ref 041.
+
+**REVIEWED (cbc6b4a): CLEAN, Low residual — no systematic false-positive session-wipe.** The clear fires only
+in `reap()` (child EXITED) when a `--resume` start exited WITHOUT ever emitting init — a definitive
+unusable-session signal, not a timeout, so a valid-but-slow init is never false-wiped. reap's run_id guard
+(`if slot run_id != this run_id { return }`) means a resumed agent killed PRE-INIT by stop/park/clear does not
+reach the clear (the killer took the slot). The sole residual: a VALID session whose child dies pre-init ON ITS
+OWN from a TRANSIENT cause (OOM/crash) gets its context cleared -> fresh next start (recoverable, not a wedge);
+SDK documents this as a deliberate prefer-fresh-over-wedged trade. Does not block broadening the wake.
+Source-verified (trigger + run_id guard read in cbc6b4a); the one live-check to make it run-verified is a
+resumed agent killed pre-init keeping its session vs one exiting pre-init on its own clearing it — offered.
 
 ## Note
 Correction: Tighten #2 is NOT low — QA measured it as BUG-040 (premature park); I had reasoned it harmless.
