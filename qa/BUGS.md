@@ -1612,3 +1612,37 @@ under `/tmp` directly, not `std::env::temp_dir()`) rather than relying on the pr
 equivalent, not yet searched) — not a project-wide `TMPDIR` policy change, since PR #15's
 convention is correct for what it was built for (spawned children's build/temp output) and the
 failure here is a test harness assumption, not that convention being wrong.
+
+### 042 — `web/vitest.config.ts`'s coverage `include` list missed two rule-encoding modules the templates feature added (S3, QA (mine) + Web, **open**)
+
+**Found during coverage sign-off on PR #33/#34** (`reports/20260909T2055Z-qa-pr33-signoff`,
+`.../20260909T2102Z-qa-pr34-signoff`). `web/vitest.config.ts`'s `coverage.include` is a
+deliberate, curated allowlist, not an oversight in general — the config's own comment says it:
+"Scoped to the modules that encode rules... because that is where being wrong is silent.
+Components are covered by QA's Playwright suite." `src/lib/workflow-proposal.ts` and
+`src/lib/board-apply.ts` are in the list for exactly that reason, and `src/components/builder/
+builder-panel.tsx` and `src/components/board/sidebar-rail.tsx` show the same reasoning applies
+to at least some components too.
+
+**What's missing:** `src/lib/templates.ts` — `parseTemplateFile` (untrusted-JSON validation,
+the same category as `validate.ts`, already in the list) and `readInstantiateOutcome`
+(response-shape parsing, the same category as `board-apply.ts`'s `readOutcome`, already in the
+list) — was never added when PR #33 created it. Measured: it does not appear anywhere in
+`pnpm vitest run --coverage --coverage.reporter=text`'s per-file table at all, despite having
+19 dedicated tests (`templates.test.ts`) that all pass. `src/components/templates/
+template-gallery.tsx` (PR #34) is the same story for the component side, by the
+`builder-panel.tsx`/`sidebar-rail.tsx` precedent.
+
+**Why S3 and not higher:** both files ARE genuinely well-tested — I read every branch against
+its test for both PRs before signing off, and ran the suites for real (`templates.test.ts`
+19/19, `template-gallery.test.tsx` 11/11). This is a blind spot in what the GATE measures, not
+evidence of untested code. But the whole point of `coverage.include` existing is that a file
+can regress silently once nobody is reading every diff by hand the way this sign-off did —
+which is exactly what the gate is supposed to catch instead.
+
+**Fix:** add `"src/lib/templates.ts"` and `"src/components/templates/template-gallery.tsx"` to
+`coverage.include`. Whoever does it should also re-run the coverage gate once to confirm both
+still clear the existing thresholds (`lines: 90, functions: 90, branches: 85, statements: 90`)
+before landing — I did not check the resulting numbers against the THRESHOLD, only that the
+files exist untested by the tool, since that was the coverage-signoff question in front of me
+at the time.
