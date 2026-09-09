@@ -121,6 +121,17 @@ principle (§2) says the containment has to hold anyway; a "global" grant must s
 wires/capabilities the UI can show and the user can revoke, not an invisible bypass flag. Vault values stay
 write-only and out of this agent's reach the same as any other agent unless explicitly wired.
 
+**Operator directive (2026-09-09, binding on the system prompt, not just the wire grant):** breadth of access is
+not the only containment lever here — the helper's `system_prompt` must be written so the agent executes *exactly*
+what the user describes in a given turn and nothing it infers or extrapolates beyond that. No speculative cleanup,
+no "while I'm here" changes to unrelated nodes/wires, no proceeding past the literal ask even if it looks like the
+obviously-next step. Given blanket read/write, an agent that pads out an instruction with what it *assumes* the
+user wants is the actual attack surface, not just a hostile prompt — the precise-system-prompt requirement is load-
+bearing for this task, not a nice-to-have, and the proposal must show the prompt text (or its generation rule), not
+just describe it in the abstract. Whoever writes the proposal should treat "confirm scope, then do only that scope"
+as a hard requirement to design against (e.g. the tool surface favors small, explicit calls the user's instruction
+maps to 1:1, over compound/batch operations the agent would have to infer sub-steps for).
+
 **Open design questions for the agents to answer in a proposal first:** is "global read/write" a project-level flag
 on the agent's config, or does the engine auto-generate real wires to every node (and keep them live as nodes are
 added/removed)? does write-access extend to other agents (i.e. can it `start`/`stop`/`update` peer agents per the
