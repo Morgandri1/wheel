@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """SEC-child-env — an agent child must not inherit the engine's own secrets (F015).
 
 The engine holds two things every tenant would like: WHEEL_ENGINE_SECRET (the

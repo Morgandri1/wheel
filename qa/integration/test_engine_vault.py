@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Vault secrecy end to end — TESTPLAN SEC-vault-* (M1.6, operator priority).
 
 Five properties, each asserted from the side that would actually leak:

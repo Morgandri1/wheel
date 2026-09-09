@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Engine message path — TESTPLAN MSG-*, INJ-*, ENG-* (M1).
 
 Written before wheel-engine:test exists, so it turns green on its own the day SDK lands

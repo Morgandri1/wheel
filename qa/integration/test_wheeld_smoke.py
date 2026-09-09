@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """WHEELD-* — one binary, nothing installed (M1.7).
 
 The claim `wheeld` makes is that a person downloads ONE executable, runs it, and has a

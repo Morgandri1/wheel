@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Engine events WebSocket — TESTPLAN ENG-log-stream-parity, ENG-events-*, COMMS-observability.
 
 Why this suite exists, in SDK's own words: their e2e for BUG-009 "asserted that *a* log

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Answers one question about a live board: will #22's migration move any node visibly?
 
 Rounding cannot. It moves a node at most 0.5 cells per axis, one cell renders as one CSS

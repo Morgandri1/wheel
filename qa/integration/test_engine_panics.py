@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """ENG-panic-* — a bad row must not take the board down, and the escaper must not panic.
 
 The board has been 502 since 14:34 on a panic. A panic in the delivery path is worse than a

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Credential routing into the child — TESTPLAN AUTH-cred-* (§4, §5b).
 
 SDK asked for this and named the gap precisely: their unit tests assert what the engine

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Proves POS-migration-* can actually FAIL, without docker and without #22.
 
 A gate whose logic has never been watched going red is not a gate — BUG-024 was two

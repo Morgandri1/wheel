@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Every TESTPLAN ID a test asserts must exist in docs/TESTPLAN.md.
 
 The plan is the contract; the suites are the evidence. When they drift, both keep looking

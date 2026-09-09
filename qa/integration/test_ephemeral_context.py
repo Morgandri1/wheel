@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """EPH-* — an ephemeral agent must settle after a turn, exactly like a normal one.
 
 PM's measurement on the live deployment, and it is the operator's own agent:

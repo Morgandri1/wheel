@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Lint .github/workflows/ci.yml — it cannot be tested by running it.
 
 A broken workflow file does not fail CI; it means CI never runs, which looks like

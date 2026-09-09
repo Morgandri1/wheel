@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 """Contract test: the engine's documented routes must match ARCHITECTURE.md §4.
 
 TESTPLAN: ENG-route-exists, ENG-route-undocumented, ENG-route-parity.
