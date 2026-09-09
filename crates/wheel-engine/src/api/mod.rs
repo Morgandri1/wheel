@@ -410,6 +410,7 @@ pub(crate) fn test_state() -> AppState {
         json_logs: false,
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+        harness_auth: crate::config::HarnessAuthPolicy::default(),
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());
