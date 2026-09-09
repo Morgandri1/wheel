@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 # Fire the Vercel deploy hook when a push to main CHANGED web/package.json's version.
 #
 # Why this exists: Vercel's ignoreCommand can only inspect the commit it is deploying, and on a
