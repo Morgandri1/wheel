@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * Board templates: `web/public/workflow_templates/*.json`, each one a validated board a user can
  * instantiate as their own project. `docs/proposals/wow-templates.md` §1: a template's `board`

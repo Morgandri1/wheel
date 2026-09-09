@@ -1,5 +1,9 @@
 "use client";
 
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import { useEffect, useState } from "react";
 import { Button, Field, Input, Select } from "@/components/ui";
 import { countdown, completeFailure, expiryFrom, vaultShareNote } from "@/lib/auth-session";

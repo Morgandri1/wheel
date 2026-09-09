@@ -1,5 +1,9 @@
 "use client";
 
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LogStream } from "@/components/drawer/log-stream";
 import { Button } from "@/components/ui";

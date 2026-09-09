@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * In-memory board that behaves the way docs/ARCHITECTURE.md §4 says an engine
  * behaves. This file is the written form of what the web app ASSUMES about the

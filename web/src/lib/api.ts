@@ -1,5 +1,9 @@
 "use client";
 
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * The only way web/ talks to Wheel. Never call the engine directly — everything goes through
  * api.wheel.dev, which authenticates the Clerk session and proxies to the project's container.

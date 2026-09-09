@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * The mock plays the engine, so it enforces wires from the engine's OWN data:
  * docs/schema/wire-matrix.json, generated from wheel_core::wire_allowed.

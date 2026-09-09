@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import type { AgentConfig, CtxConfig, EndpointConfig, TableConfig, VaultConfig } from "@/lib/schema";
 import { boardChanged, createProject, makeNode, type ProjectRecord } from "./state";
 
