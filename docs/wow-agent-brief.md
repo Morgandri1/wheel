@@ -103,4 +103,60 @@ task 2's mechanism.
 API-key path except the operator), Web (self-hosting onboarding on the site). Proposal-first — this is a
 positioning decision with a security edge (the operator-exception must be a real allowlist, not a client flag).
 
+## 5. Board-scoped helper agent (global read/write + workflow-building tools)
+
+**Goal:** a special-purpose agent a user can drop on any board that already has blanket read/write across the
+whole project and a toolset aimed at helping the user build and edit their workflow — no manual wiring per node.
+
+**Shape:** this is not a normal `agent` node with hand-wired connections; it needs *every* node on the project,
+including ones added after it's placed, auto-covered by read (and write where the type allows it — table/chest/ctx)
+without the user drawing N wires. Its tool surface should cover the operations a human would otherwise do through
+the UI: place/update/remove nodes, wire/grant, import a tool spec, inspect the board — i.e. it's an in-band driver
+for the same validated creation/wiring path the API already enforces (§3e `place`/`grant`, `POST /v1/nodes`,
+`POST /v1/wires`), not a new bypass.
+
+**Constraints:** this inverts the default-deny wire matrix (§3, "anything not listed is rejected") for one agent
+type, so the blast radius of that agent being turned hostile or misprompted is the whole board — the untrusted-RCE
+principle (§2) says the containment has to hold anyway; a "global" grant must still be a real, visible set of
+wires/capabilities the UI can show and the user can revoke, not an invisible bypass flag. Vault values stay
+write-only and out of this agent's reach the same as any other agent unless explicitly wired.
+
+**Open design questions for the agents to answer in a proposal first:** is "global read/write" a project-level flag
+on the agent's config, or does the engine auto-generate real wires to every node (and keep them live as nodes are
+added/removed)? does write-access extend to other agents (i.e. can it `start`/`stop`/`update` peer agents per the
+agent→agent `write` = manage cell), or is it capped to data nodes? is this one board-provided node type (e.g.
+`agent.kind: "helper"`) or a template (task 3) that happens to pre-wire everything? how is it kept from being the
+single most dangerous node on every board it's placed on (confirmation on placement, a distinct badge in the UI,
+rate limits on its own place/grant calls)?
+
+**Likely owners:** SDK (engine: auto-wire semantics + the manage-capable tool surface), Web (placement flow,
+"global access" badge/warning, revoke UI), API only if placement needs a new endpoint. Proposal-first given the
+security edge.
+
+## 6. Agent-visible token/usage awareness (avoid silent limit failures)
+
+**Goal:** agents should be able to see their own token/usage consumption as they work, so they can slow down or
+wrap up gracefully as they approach a limit instead of quietly failing (or burning budget) when they hit one.
+
+**Shape:** the harness protocol already emits usage data on result/turn events (input/output tokens, and Anthropic
+API responses carry rate-limit headers) — that data currently lands in engine logs but isn't surfaced back to the
+agent itself. Give agents a way to check it: at minimum an MCP tool (alongside the §3c #1 built-in server, e.g.
+`usage`) returning current turn/session token counts and, where known, how close the agent is to its configured
+`budget` (§3 `budget: {max_turns?, max_usd?}`) or to the provider's own rate limit. Consider also a lightweight
+proactive nudge — e.g. injected into the next turn's context once a threshold is crossed — rather than requiring
+every agent to poll.
+
+**Constraints:** this reads from data the engine already has (harness usage events, budget config) — no new
+external calls per turn. Must not leak cross-project or cross-tenant usage; scoped strictly to the querying agent's
+own session/project. Should degrade gracefully when the harness doesn't report usage for a given turn.
+
+**Open design questions for the agents to answer in a proposal first:** poll (`wheel usage` / MCP tool) vs push
+(context injection at a threshold) vs both? what's the threshold and is it configurable per agent or fixed
+(e.g. 80% of `max_usd`)? does this piggyback on `budget_exhausted` (§3 agent status) as the hard stop, with usage
+visibility as the soft warning before it? does codex expose enough usage data to match claude's, or does this ship
+claude-first with a documented gap?
+
+**Likely owners:** SDK (engine: capture + expose usage from harness events, MCP tool, threshold injection). Web
+only if usage should also render in the agent inspector (likely yes, but secondary to the agent-visible part).
+
 <!-- Further tasks appended as the operator provides them. -->
