@@ -96,9 +96,14 @@ export default function ProjectsPage() {
               after you close the tab.
             </p>
           </div>
-          <Button tone="primary" data-testid="btn-new-project" onClick={() => setCreating(true)}>
-            New project
-          </Button>
+          <div className="flex items-center gap-2">
+            <Link href="/app/templates">
+              <Button data-testid="btn-browse-templates">Browse templates</Button>
+            </Link>
+            <Button tone="primary" data-testid="btn-new-project" onClick={() => setCreating(true)}>
+              New project
+            </Button>
+          </div>
         </div>
 
         {isPending ? (
