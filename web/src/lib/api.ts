@@ -11,6 +11,7 @@ import { ApiError, getAuthToken, notifyUnauthorized } from "@/lib/auth";
 import type { LogStreamName } from "@/lib/schema";
 import { apiBaseUrl } from "@/lib/runtime-config";
 import { readOutcome, type ApplyOutcome } from "@/lib/board-apply";
+import { readInstantiateOutcome, type InstantiateOutcome, type TemplateBoard } from "@/lib/templates";
 import type {
   AuthBegin,
   AuthStatus,
@@ -149,6 +150,37 @@ export async function applyBoard(
     /* readOutcome copes with an empty body: it reports not-applied rather than inventing success */
   }
   return readOutcome(res.status, body);
+}
+
+/**
+ * Instantiate a template as a new project: `POST /v1/projects/instantiate`
+ * (`docs/proposals/wow-templates-instantiate-route.md`) — create, capability-patch, apply and
+ * roll-back-on-failure in one atomic server sequence. `board` is a template's `board` field,
+ * unmodified: same `EmittedBoard` shape `applyBoard` already sends.
+ *
+ * Not routed through `request` for the same reason `applyBoard` isn't: `201`/`207`/`422` are all
+ * real outcomes to read, not exceptions to throw. No `x-project-id` — there is no project yet; this
+ * call creates one under the caller's own account, same auth boundary as `projects.create`.
+ */
+export async function instantiateTemplate(
+  name: string,
+  board: TemplateBoard,
+  capabilities?: { http: boolean },
+): Promise<InstantiateOutcome> {
+  const token = await getAuthToken();
+  const res = await fetch(`${apiBaseUrl()}/v1/projects/instantiate`, {
+    method: "POST",
+    headers: { "x-auth-token": token, "content-type": "application/json" },
+    body: JSON.stringify({ name, board, capabilities }),
+  });
+  if (res.status === 401) notifyUnauthorized();
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* readInstantiateOutcome copes with an empty body: reports rolled_back, never invents success */
+  }
+  return readInstantiateOutcome(res.status, body);
 }
 
 const engine = (projectId: string, path: string) => `/v1/projects/${projectId}/engine/v1${path}`;
