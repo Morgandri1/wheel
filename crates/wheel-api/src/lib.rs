@@ -71,6 +71,13 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/password", post(routes::auth::change_password))
         .route("/v1/projects", post(routes::projects::create))
         .route("/v1/projects", get(routes::projects::list))
+        // Create + capability-patch + apply + rollback-on-failure, one atomic server sequence —
+        // docs/proposals/wow-templates-instantiate-route.md. A static segment, checked before the
+        // dynamic `{id}` routes below by the router regardless of declaration order.
+        .route(
+            "/v1/projects/instantiate",
+            post(routes::instantiate::instantiate),
+        )
         .route("/v1/projects/{id}", get(routes::projects::get_one))
         .route("/v1/projects/{id}", patch(routes::projects::update))
         .route("/v1/projects/{id}", delete(routes::projects::destroy))

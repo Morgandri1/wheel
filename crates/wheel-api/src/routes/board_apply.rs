@@ -127,14 +127,17 @@ impl Consent {
 }
 
 /// The engine, over HTTP, with the host bearer the proxy uses.
-struct HttpBoardClient {
+///
+/// `pub(crate)`: reused by `routes::instantiate`, which applies a template's board against the
+/// project it just created via the exact same engine calls this route makes — no second client.
+pub(crate) struct HttpBoardClient {
     http: reqwest::Client,
     base: String,
     bearer: String,
 }
 
 impl HttpBoardClient {
-    fn new(state: &AppState, project: &Uuid) -> Self {
+    pub(crate) fn new(state: &AppState, project: &Uuid) -> Self {
         Self {
             http: state.http.clone(),
             base: state.engine_base_url(project),

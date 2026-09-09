@@ -34,7 +34,20 @@ pub async fn create(
     user: AuthUser,
     Json(body): Json<CreateProject>,
 ) -> ApiResult<(axum::http::StatusCode, Json<Project>)> {
-    let name = body.name.trim().to_string();
+    let project = create_project(&state, &user, body.name).await?;
+    Ok((axum::http::StatusCode::CREATED, Json(project)))
+}
+
+/// The body of [`create`], reusable by anything that needs a fresh project without going through
+/// HTTP — today that's `routes::instantiate`, which creates one as the first step of instantiating
+/// a template. Same validation, same quota, same provision-and-start; a caller here gets exactly
+/// what a `POST /v1/projects` caller gets, not an approximation of it.
+pub(crate) async fn create_project(
+    state: &AppState,
+    user: &AuthUser,
+    name: String,
+) -> ApiResult<Project> {
+    let name = name.trim().to_string();
     validate_project_name(&name).map_err(ApiError::BadRequest)?;
 
     // Per-user quota. Checked before we do any work that costs money or disk.
@@ -119,17 +132,17 @@ pub async fn create(
         // A new project comes up running (ARCHITECTURE M1: "create project -> sandbox starts"). The
         // first thing anyone does after signing up is create a project, and a project whose engine
         // answers nothing is indistinguishable from a broken install.
-        Ok(()) => start_and_observe(&state, &id)
+        Ok(()) => start_and_observe(state, &id)
             .await
             .unwrap_or(ProjectStatus::Error),
         Err(e) => {
             tracing::error!(project_id = %id, error = ?e, "provisioning failed after row insert");
-            set_status(&state, &id, ProjectStatus::Error).await?;
+            set_status(state, &id, ProjectStatus::Error).await?;
             ProjectStatus::Error
         }
     };
 
-    Ok((axum::http::StatusCode::CREATED, Json(project)))
+    Ok(project)
 }
 
 pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<Project>>> {
@@ -167,6 +180,20 @@ pub async fn update(
     scope: ProjectScope,
     Json(body): Json<UpdateProject>,
 ) -> ApiResult<Json<Project>> {
+    let project = update_project(&state, scope.project.id, scope.user.id(), body).await?;
+    Ok(Json(project))
+}
+
+/// The body of [`update`], reusable by anything that needs to patch a project without going
+/// through HTTP — today that's `routes::instantiate`'s capability-patch step (§4.3 of
+/// `docs/proposals/wow-templates-instantiate-route.md`), which sends `UpdateProject { name: None,
+/// capabilities: Some(...) }` through this exact path rather than a narrower one-field query.
+pub(crate) async fn update_project(
+    state: &AppState,
+    project_id: Uuid,
+    owner_id: &str,
+    body: UpdateProject,
+) -> ApiResult<Project> {
     if let Some(name) = &body.name {
         validate_project_name(name).map_err(ApiError::BadRequest)?;
     }
@@ -190,35 +217,46 @@ pub async fn update(
     let row: ProjectRow = crate::db_fetch_one!(
         &state.db,
         state.db.pick(PG, SQLITE),
-        scope.project.id,
-        scope.user.id(),
+        project_id,
+        owner_id,
         body.name.as_ref().map(|n| n.trim()),
         caps
     )?;
-    Ok(Json(
-        Project::from(row).with_ingress_base(&state.cfg.public_base_url),
-    ))
+    Ok(Project::from(row).with_ingress_base(&state.cfg.public_base_url))
 }
 
 pub async fn destroy(
     State(state): State<AppState>,
     scope: ProjectScope,
 ) -> ApiResult<axum::http::StatusCode> {
+    destroy_project(&state, scope.project.id, scope.user.id()).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The body of [`destroy`], reusable by anything that needs to tear a project down without going
+/// through HTTP — today that's `routes::instantiate`'s rollback path. Same order, same
+/// never-orphan-beyond-our-knowledge guarantee: the row is deleted only if the sandbox teardown
+/// itself succeeded.
+pub(crate) async fn destroy_project(
+    state: &AppState,
+    project_id: Uuid,
+    owner_id: &str,
+) -> ApiResult<()> {
     // Tear down the runtime first. If this fails we keep the row, so the container cannot be
     // orphaned beyond our knowledge — an orphan we have no record of is an orphan nobody cleans up.
     state
         .orch
-        .destroy(&scope.project.id)
+        .destroy(&project_id)
         .await
         .map_err(ApiError::Internal)?;
 
     crate::db_execute!(
         &state.db,
         "DELETE FROM projects WHERE id = $1 AND owner_id = $2",
-        scope.project.id,
-        scope.user.id()
+        project_id,
+        owner_id
     )?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Decrypt this project's engine secrets, in the encoding the engine spawn contract requires.

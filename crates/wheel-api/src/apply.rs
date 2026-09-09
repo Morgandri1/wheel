@@ -28,7 +28,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use wheel_core::{wire_allowed, NodeConfig, NodeType, Position, WireType};
+use wheel_core::{
+    validate_config_with, validate_name, validate_table_name, wire_allowed, NodeConfig, NodeType,
+    Position, WireType,
+};
 
 /// A board exactly as the builder emits it.
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +125,17 @@ pub enum Refusal {
         to_type: NodeType,
         wire_type: WireType,
     },
+    /// A node's name fails the §3 name contract — charset, length, a reserved word, or, for a
+    /// `table` node specifically, the stricter table-name rule (it becomes `t_<name>` in sqlite).
+    ///
+    /// The engine enforces this on create; before now this step did not, so a bad name passed
+    /// pre-validation and only failed live, at the actual engine call — the exact
+    /// "looks-validated-but-isn't" gap this module otherwise exists to close.
+    InvalidName { name: String, reason: String },
+    /// A node's config fails `wheel_core::validate_config_with` — an SSRF-denied tool `base_url`,
+    /// an over-long agent system prompt, a malformed vault key, and so on. Same gap as
+    /// `InvalidName`: the engine already refuses these at create, this step did not until now.
+    InvalidConfig { name: String, reason: String },
 }
 
 impl Refusal {
@@ -167,6 +181,12 @@ impl Refusal {
                 from_type.as_str(),
                 to_type.as_str()
             ),
+            Refusal::InvalidName { name, reason } => {
+                format!("{name:?} is not a valid node name: {reason}")
+            }
+            Refusal::InvalidConfig { name, reason } => {
+                format!("{name:?}'s config is invalid: {reason}")
+            }
         }
     }
 }
@@ -277,6 +297,33 @@ pub fn validate(
             });
         }
     }
+    // Name and config, per node. Same checks the engine runs on create (§3), run here first so a
+    // bad name or an SSRF-denied tool base_url is refused before anything exists rather than only
+    // failing live at the engine — the CI gate that validates template files offline
+    // (docs/proposals/wow-templates.md §3) depends on this to be authoritative.
+    for node in &board.nodes {
+        let name_check = if node.config.node_type() == NodeType::Table {
+            validate_table_name(&node.name)
+        } else {
+            validate_name(&node.name)
+        };
+        if let Err(e) = name_check {
+            refusals.push(Refusal::InvalidName {
+                name: node.name.clone(),
+                reason: e.to_string(),
+            });
+        }
+        // `allow_hosts: &[]` matches production: the engine always runs with an empty SSRF
+        // allowlist (`validate_config_with`'s own doc), so this is the same answer the live
+        // create call would give, not an approximation of it.
+        if let Err(e) = validate_config_with(&node.config, &[]) {
+            refusals.push(Refusal::InvalidConfig {
+                name: node.name.clone(),
+                reason: e.to_string(),
+            });
+        }
+    }
+
     // A name on both sides must agree. Refused above as a guess nobody can justify; and because it
     // is refused, the resolution order below cannot matter — existing wins, which is the
     // conservative half of ADVERSARY 049 and makes the invariant obvious rather than incidental.
@@ -469,6 +516,29 @@ impl Failure {
             node: None,
             wire: Some(w.clone()),
         }
+    }
+
+    /// A step this module does not itself run, reported through the same shape rather than a
+    /// second one — `routes::instantiate` uses these for its capability-patch and sandbox-liveness
+    /// steps, so one failure list, one rendering path, whatever stage a failure came from.
+    pub fn step(step: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            step: step.into(),
+            error: error.into(),
+            node: None,
+            wire: None,
+        }
+    }
+
+    /// The sandbox never became reachable, so attempting an apply against it would only produce a
+    /// confusing `engine_unreachable` rather than a useful failure.
+    pub fn sandbox_did_not_start() -> Self {
+        Self::step("sandbox", "the project engine did not become healthy")
+    }
+
+    /// The capability patch (step 4 of the instantiate sequence) failed.
+    pub fn capabilities(error: impl Into<String>) -> Self {
+        Self::step("capabilities", error)
     }
 }
 
@@ -1191,7 +1261,9 @@ mod tests {
                     serde_json::json!({"harness": "claude", "system_prompt": "s"})
                 }
                 NodeType::Ctx => serde_json::json!({"markdown": "m"}),
-                NodeType::Table => serde_json::json!({"columns": []}),
+                NodeType::Table => {
+                    serde_json::json!({"columns": [{"name": "value", "type": "text"}]})
+                }
                 NodeType::Endpoint => {
                     serde_json::json!({"method": "GET", "path": "/p",
                                        "response_mode": "ack", "auth": {"mode": "none"}})
