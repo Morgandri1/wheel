@@ -1507,7 +1507,14 @@ pass end to end. `API-public-drive-end-to-end`.
 **Operator-gated**, the same way the wake was: it needs a token nobody here holds. That is why
 it is filed rather than done.
 
-### 040 — a stale park timer parks an agent before its configured idle timeout (S3, SDK, **open**)
+### 040 — a stale park timer parks an agent before its configured idle timeout (S3, SDK, **CLOSED**)
+
+**Closed.** Fixed in `cbc6b4a`: `park()` now compares `last_activity` to now and reports the
+remainder instead of parking, and the timer loop re-waits on what it reports — no cancellation
+state, self-correcting however many stale timers are in flight, closing the timer-accumulation
+concern in the same change. ADVERSARY run-verified in `98c8e6e`
+(`redteam/findings/051-idle-parking-review.md`): "stale timers self-correct (fix + leak
+closed)."
 
 `arm_park_timer` (supervisor/mod.rs) spawns a detached `tokio::spawn(sleep -> park)` at EVERY
 turn end and nothing cancels the previous one. A timer armed by an earlier turn fires later,
