@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Golden test for the composed system prompt (ARCHITECTURE.md §3, "Agent
 //! preamble"). The engine passes this to `claude --append-system-prompt`.
 

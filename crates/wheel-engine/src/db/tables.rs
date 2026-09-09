@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Table nodes: a node as a keyspace, backed by a real sqlite table.
 //!
 //! Every table node owns one table `t_<node name>` with an implicit

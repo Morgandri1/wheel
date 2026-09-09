@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Agent lifecycle and messaging routes.
 //!
 //! `send` deliberately does NOT write to the child. It persists a message and

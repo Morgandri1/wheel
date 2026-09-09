@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Vault nodes: secrets at rest, and the credentials an agent runs with.
 //!
 //! RECONSTRUCTION NOTE (SDK session B): the original of this file was written

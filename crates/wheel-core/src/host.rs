@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Types for the host API (ARCHITECTURE.md §4b) and the sandbox abstraction.
 //!
 //! `wheel-host` runs on the single big engine machine and owns every project's

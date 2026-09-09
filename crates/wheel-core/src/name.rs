@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Node names. A node's name is its *address*: it is what agents type in
 //! `wheel msg <name>`, what table nodes derive their sqlite table from, and what
 //! appears in injected context headers. It is therefore validated hard.

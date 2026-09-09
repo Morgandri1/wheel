@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! `wheel` — the CLI an agent or script uses to reach its board.
 //!
 //! Deliberately shaped like `yoke`, because that is the grammar agents already

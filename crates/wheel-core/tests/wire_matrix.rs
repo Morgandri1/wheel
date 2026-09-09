@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! Exhaustive test of the wire matrix: all 9 x 9 x 3 = 243 cells asserted
 //! individually against ARCHITECTURE.md §3 (+ §3d for `tool`).
 //!

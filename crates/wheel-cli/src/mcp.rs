@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 //! `wheel mcp-serve` — the board as MCP tools, over stdio (§3c #1).
 //!
 //! This exists because of a specific failure: a message body passed as argv
