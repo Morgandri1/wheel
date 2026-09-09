@@ -15,7 +15,7 @@ Workflow: one worktree per team under `/Users/metatron/wheel-wt/<role>`, merge t
 
 ## Running Wheel
 
-Wheel is open source. You can run it three ways.
+Wheel is source-available (PolyForm Noncommercial 1.0.0) — free to use, modify, and share for any noncommercial purpose. You can run it three ways.
 
 ### 1. Locally (single executable) — M1.7, in progress
 ```bash
@@ -48,8 +48,6 @@ See `docs/ARCHITECTURE.md` for the model and `docs/WHEEL-ON-WHEEL.md` for a boar
 Wheel develops itself; there is a cloud board (template available for free) that handles each moving piece separately so that the agents can figure out what they need and build it themselves. If you want to contribute to wheel, you can clone it and get started in the `crates/`, `web/`, or `docker/` directory.  
 
 # Legal disclaimer, asshole
-Yes, this product was built after using Yoke (https://getyoke.com), a cool product with a similar mechanism to Wheel. However, Wheel was built with:
-- No Yoke assets, code, copy, or protected material
-- No Yoke-proprietary paradigms 
-- No insider-information from Yoke employees 
-- **Only** what I could easily observe by using Yoke as a regular user.
+Wheel is independent, original work. It shares no code, assets, copy, designs, or other protected material with any other product, and it wasn't built using anyone's confidential or proprietary information.
+
+Ideas aren't ownable; expression is. Wheel is my own expression of ideas that are common to this category of tooling. If you think otherwise, the contact address is in the LICENSE — put it in writing.
