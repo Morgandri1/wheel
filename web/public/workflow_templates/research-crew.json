@@ -1,0 +1,36 @@
+{
+  "title": "Research crew",
+  "description": "A researcher agent that writes its findings to a shared notes doc and can hold a search API key.",
+  "requires_capabilities": { "http": false },
+  "board": {
+    "nodes": [
+      {
+        "name": "notes",
+        "type": "ctx",
+        "config": { "markdown": "# Notes\n\nFindings go here.\n" },
+        "position": { "x": 0, "y": 0 }
+      },
+      {
+        "name": "researcher",
+        "type": "agent",
+        "config": {
+          "harness": "claude",
+          "system_prompt": "You are a research assistant. Investigate the topic the user gives you and write your findings to the `notes` doc, citing sources.",
+          "run_on_startup": true
+        },
+        "position": { "x": 260, "y": 0 }
+      },
+      {
+        "name": "creds",
+        "type": "vault",
+        "config": { "keys": ["SEARCH_API_KEY"] },
+        "position": { "x": 260, "y": 160 }
+      }
+    ],
+    "wires": [
+      { "from": "notes", "to": "researcher", "type": "send" },
+      { "from": "researcher", "to": "notes", "type": "write" },
+      { "from": "researcher", "to": "creds", "type": "read" }
+    ]
+  }
+}
