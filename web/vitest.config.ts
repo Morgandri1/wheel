@@ -40,6 +40,8 @@ export default defineConfig({
         "src/lib/workflow-proposal.ts",
         "src/lib/wired-vaults.ts",
         "src/lib/endpoint-reach.ts",
+        "src/lib/templates.ts",
+        "src/components/templates/template-gallery.tsx",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },
