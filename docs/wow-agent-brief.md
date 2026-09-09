@@ -45,9 +45,10 @@ operator wants a switch to an approved path (a real Anthropic API key / Console 
 existing mode.
 
 **Shape:** an env var (name the agents' to propose, e.g. `WHEEL_HARNESS_AUTH`) whose value chooses the auth method
-per project/agent — at minimum `oauth-token` (today's behaviour, kept for the non-commercial single-user case) and
-an API-key mode that passes an Anthropic API key to the harness the supported way. The default and the migration
-path both matter: existing boards must keep working, and the compliant mode must be a one-line switch.
+per project/agent — at minimum `oauth-token` (today's behaviour, kept for the operator's own board) and an API-key
+mode that passes an Anthropic API key to the harness the supported way. This env var is the *mechanism* task 4's
+policy runs on. The default and the migration path both matter: existing boards must keep working, and the
+compliant mode must be a one-line switch.
 
 **Constraints:** the credential never lands on disk or in a URL (same discipline as GITHUB_TOKEN via askpass — see
 finding 036); the vault stays the store; no secret in logs. See `docs/proposals/auth-model-tos-risk.md` for the
@@ -82,5 +83,24 @@ the target can't grant is rejected at instantiation, not silently dropped.
 
 **Likely owners:** Web (template gallery + instantiate flow on the site), API (instantiate-template → validated
 project/node/wire creation). SDK only if a template needs an engine primitive that doesn't exist yet.
+
+## 4. Self-hosted wheeld as first-class; cloud is API-key-only
+
+**Policy (operator direction):** self-hosted `wheeld` is now a first-class way to run Wheel, not a second-class
+alternative to the cloud. And cloud boards authenticate the harness with an **API key only** — for everyone except
+the operator, whose personal board keeps the OAuth-token mode. This is the positioning/default layer on top of
+task 2's mechanism.
+
+**What this means for the work:**
+- `wheeld` (the one-binary self-hosted mode) gets the docs, defaults, and onboarding of a primary product path —
+  someone running Wheel on their own machine is a supported first-class user, not an afterthought.
+- On cloud, the default and the enforced mode is API-key auth (task 2's `oauth-token` mode becomes operator-only).
+  New cloud boards must not be creatable on the OAuth path except for the operator's account.
+- Nothing here changes the operator's own board (project 6906cadb): it stays on the OAuth token as the explicit
+  exception. So this task does not block or alter the current wheel-on-wheel push.
+
+**Likely owners:** SDK (wheeld first-class + enforce cloud API-key default), API (gate cloud-board creation to the
+API-key path except the operator), Web (self-hosting onboarding on the site). Proposal-first — this is a
+positioning decision with a security edge (the operator-exception must be a real allowlist, not a client flag).
 
 <!-- Further tasks appended as the operator provides them. -->
