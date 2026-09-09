@@ -1,8 +1,8 @@
 # Proposal: `WHEEL_HARNESS_AUTH` — a deployment-level policy gate on credential kind
 
-Status: **proposed, not started.** Doc only — no engine code in this change. Requires a PM ruling to
-merge; ADVERSARY review before implementation (this is a security-relevant gate, and per §2 the design
-must assume the agent will try to route around it, not just fail to notice it).
+Status: **accepted, with one ruling below (see "PM ruling: mid-flow enforcement window").** Adversary
+design review cleared the proposal's shape; SDK/API implement per the design below, including the
+ruling. Doc only in this change — no engine code.
 Author: SDK. Date: 2026-09-09. Answers `docs/wow-agent-brief.md` task 2, informed by the risk this task
 exists to close (`docs/proposals/auth-model-tos-risk.md`).
 
@@ -135,14 +135,44 @@ in-memory `StoredOauth`. The rejection error messages must name *why* (policy, n
 credential") without echoing the value — matching the existing `auth_complete` error style, which
 already does this for its other rejections.
 
+## PM ruling: mid-flow enforcement window (required before this ships)
+
+Adversary's design review (2026-09-09) cleared the proposal's shape but flagged the second open question
+below as more than a UX tradeoff: a running agent can execute `claude auth login`/`codex login` inside
+its own turn, and the CLI process most likely starts using that freshly-written native credential store
+immediately, in-process — no restart needed for the CLI itself to pick it up. "Refuse at next spawn"
+only re-checks on the *next* start; on a busy agent that never naturally idles long enough to park (the
+idle-park review already established agents can run long without a natural park/restart), that window is
+not a rounding error, it is "runs on a self-provisioned OAuth credential for as long as the process
+happens to stay alive" — directly against the ToS-compliance goal this feature exists for
+(`auth-model-tos-risk.md`), and against contract §2's "nothing relies on the agent restraining itself."
+
+**Ruling: required, not optional.** Accepting spawn-only enforcement as a documented residual is the
+wrong posture for a compliance control (as opposed to, e.g., templates' no-2PC residual, which is a
+availability/consistency tradeoff with no compliance exposure). Ship the periodic re-check alongside the
+spawn gate, not as a follow-up:
+
+- Reuse the supervisor's existing idle-park timer loop (already validated under the slot-lock
+  serialization) rather than building new scheduling infrastructure: on each tick, for a *running*
+  `api-key-only` agent, re-run the same OAuth-shaped check spawn already does (§ "Spawn" enforcement
+  point 4) against the on-disk credential store; if it now resolves OAuth-shaped when it didn't at last
+  spawn, kill the process the same way `park` already kills one and let it come back through the normal
+  spawn gate on the next message. No new kill path, no new detection logic — one more condition on a
+  timer that already exists.
+- This closes the *use* window (how long the agent can run on the self-provisioned credential) even
+  though it does not eliminate the *write* — the file still gets written the moment the agent runs the
+  login command; catching that requires watching the harness's own turn/tool output for the login
+  command, which is a different and much more invasive kind of enforcement this proposal is not taking
+  on. Reducing "unbounded while the process stays alive" to "bounded by one park-tick interval" is the
+  right amount of hardening for what this control is actually for.
+- SDK implements this as part of the same change that adds the spawn-time gate (point 4), not a
+  follow-up PR — a compliance control that ships with a known-open enforcement gap on day one is the
+  thing adversary flagged, so closing it before merge is the point of the ruling.
+
 ## Open questions for reviewers (not resolved by this proposal)
 
 - Exact wording of the `auth/begin`/`auth/complete` rejection body — API's call, since API owns those
   routes' response shape.
-- Whether `api-key-only` should also block an agent from running `claude setup-token`/`claude auth
-  login` *interactively inside its own turn* (i.e. detect and kill mid-flow) versus only refusing at the
-  next spawn — this proposal takes the latter (simpler, still closes the gap, costs one restart cycle
-  instead of zero) but a reviewer may want the former for a tighter window.
 - Whether the project-id allowlist (task 4's operator exception) belongs in `wheel-host` config or as a
   literal constant — leaning config (an env var listing allowed project ids), so it isn't a code change
   to add a second exception later, but this is API's call since `wheel-host` is API-owned.
