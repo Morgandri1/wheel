@@ -1,0 +1,41 @@
+{
+  "title": "Webhook logger",
+  "description": "A public, bearer-protected webhook that logs every hit as a row in a table.",
+  "requires_capabilities": { "http": true },
+  "board": {
+    "nodes": [
+      {
+        "name": "hook-secret",
+        "type": "vault",
+        "config": { "keys": ["WEBHOOK_BEARER_TOKEN"] },
+        "position": { "x": 0, "y": 0 }
+      },
+      {
+        "name": "hook",
+        "type": "endpoint",
+        "config": {
+          "method": "POST",
+          "path": "/hook",
+          "response_mode": "ack",
+          "auth": { "mode": "bearer", "vault_ref": "hook-secret/WEBHOOK_BEARER_TOKEN" }
+        },
+        "position": { "x": 260, "y": 0 }
+      },
+      {
+        "name": "events",
+        "type": "table",
+        "config": {
+          "columns": [
+            { "name": "received_at", "type": "text" },
+            { "name": "body", "type": "json" }
+          ]
+        },
+        "position": { "x": 520, "y": 0 }
+      }
+    ],
+    "wires": [
+      { "from": "hook", "to": "hook-secret", "type": "read" },
+      { "from": "hook", "to": "events", "type": "write" }
+    ]
+  }
+}
