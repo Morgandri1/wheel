@@ -44,6 +44,9 @@ Agents are Claude Code / Codex processes. Give them credentials through a **vaul
 agent's Authenticate panel (in-browser Anthropic login, `claude setup-token`, or an API key). Nothing in Wheel ever shows a stored secret back.
 See `docs/ARCHITECTURE.md` for the model and `docs/WHEEL-ON-WHEEL.md` for a board that develops Wheel itself.
 
+# Development
+Wheel develops itself; there is a cloud board (template available for free) that handles each moving piece separately so that the agents can figure out what they need and build it themselves. If you want to contribute to wheel, you can clone it and get started in the `crates/`, `web/`, or `docker/` directory.  
+
 # Legal disclaimer, asshole
 Yes, this product was built after using Yoke (https://getyoke.com), a cool product with a similar mechanism to Wheel. However, Wheel was built with:
 - No Yoke assets, code, copy, or protected material
