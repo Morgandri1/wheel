@@ -170,4 +170,20 @@ claude-first with a documented gap?
 **Likely owners:** SDK (engine: capture + expose usage from harness events, MCP tool, threshold injection). Web
 only if usage should also render in the agent inspector (likely yes, but secondary to the agent-visible part).
 
+## 7. Close out M1.7 (`wheeld` single-binary local run)
+
+**Goal:** the code appears functionally far along — `crates/wheeld` composes API+host+engines into one process,
+the SQLite/Postgres dual-backend store is implemented and dispatch-macro-driven, sockets bind and the whole
+product boots in one process (`wheeld_boots_the_whole_product_in_one_process` passes) — but the milestone isn't
+formally closed: `README.md` still labels it "M1.7, in progress", and `docs/plans/api.md`'s checklist has one
+open item, "E2E against the live stack (`infra/dev/e2e.py`) — blocked only on the docker image build".
+
+**Shape:** confirm the actual remaining gap (may be nothing but the checklist item + doc label), land the
+live-stack E2E once the docker image build unblocks it, then flip the README wording and check off the plan doc.
+If there's a real functional gap beyond docs/E2E, surface it — this task is a status close-out, not assumed to
+be code work.
+
+**Likely owner:** API (wheeld is API's crate territory per the ownership table), SDK if the engine-embedding side
+needs anything. QA signs off the E2E once it lands.
+
 <!-- Further tasks appended as the operator provides them. -->
