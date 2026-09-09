@@ -260,13 +260,25 @@ pub async fn delete_node(State(s): State<AppState>, Path(id): Path<Uuid>) -> Api
 }
 
 /// `POST /v1/wires` — validated against the §3 matrix. Idempotent.
-pub async fn add_wire(State(s): State<AppState>, Json(w): Json<WireSpec>) -> ApiResult<StatusCode> {
-    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    board::add_wire(&conn, w.from, w.to, w.wire_type, None)?;
+///
+/// Usually `{}`; a declared-credential overlap across two vaults (028 face 5)
+/// comes back as `{"warning": "..."}` on the same 200 — the wire is created
+/// either way, since only a STORED clash is refused (409).
+pub async fn add_wire(
+    State(s): State<AppState>,
+    Json(w): Json<WireSpec>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let warning = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        board::add_wire(&conn, w.from, w.to, w.wire_type, None)?
+    };
     s.events.publish(Event::BoardChanged {
         at: Timestamp::now(),
     });
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(match warning {
+        Some(w) => serde_json::json!({ "warning": w }),
+        None => serde_json::json!({}),
+    }))
 }
 
 /// `DELETE /v1/wires`
@@ -488,6 +500,119 @@ mod rename_tests {
         assert!(
             super::reject_unsupported_harness(&claude).is_ok(),
             "the supported harness must still be accepted"
+        );
+    }
+}
+
+/// 028 face 5, extended to wire creation: two vaults DECLARING the same key
+/// for one agent must not block the wire, but must not vanish either. Nothing
+/// below this crate's `vault.rs` unit layer ever asserted on `add_wire`'s
+/// `Option<String>` return before this -- every other call site in this
+/// crate's own tests uses `.unwrap()` and discards it -- so this is the first
+/// place the HANDLER'S response body (what a client actually receives from
+/// `POST /v1/wires`) is checked at all.
+#[cfg(test)]
+mod wire_warning_tests {
+    use super::*;
+    use wheel_core::{AgentConfig, NodeConfig, Position, VaultConfig, WireType};
+
+    fn mk(conn: &rusqlite::Connection, name: &str, config: NodeConfig) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    #[tokio::test]
+    async fn a_declared_only_overlap_is_a_warning_not_a_refusal() {
+        let state = crate::api::test_state();
+        let (agent, _v1, v2) = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let v1 = mk(
+                &conn,
+                "v1",
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["ANTHROPIC_API_KEY".into()],
+                }),
+            );
+            let v2 = mk(
+                &conn,
+                "v2",
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["ANTHROPIC_API_KEY".into()],
+                }),
+            );
+            board::add_wire(&conn, agent, v1, WireType::Read, None).unwrap();
+            (agent, v1, v2)
+        };
+
+        let resp = add_wire(
+            State(state.clone()),
+            Json(WireSpec {
+                from: agent,
+                to: v2,
+                wire_type: WireType::Read,
+            }),
+        )
+        .await
+        .expect("a declared-only overlap must not refuse the wire")
+        .0;
+
+        assert_eq!(
+            resp["warning"]
+                .as_str()
+                .map(|s| s.contains("v1") || s.contains("v2")),
+            Some(true),
+            "the response must name a vault, got {resp}"
+        );
+        {
+            let conn = state.db.lock().unwrap();
+            let node = board::get(&conn, agent).unwrap().unwrap();
+            assert!(
+                node.wires
+                    .iter()
+                    .any(|w| w.to == v2 && w.wire_type == WireType::Read),
+                "the wire must actually exist despite the warning"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_overlap_at_all_leaves_the_response_bare() {
+        let state = crate::api::test_state();
+        let (agent, v) = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let v = mk(
+                &conn,
+                "v",
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["ANTHROPIC_API_KEY".into()],
+                }),
+            );
+            (agent, v)
+        };
+
+        let resp = add_wire(
+            State(state),
+            Json(WireSpec {
+                from: agent,
+                to: v,
+                wire_type: WireType::Read,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(
+            resp.get("warning").is_none(),
+            "no overlap means no warning: {resp}"
         );
     }
 }

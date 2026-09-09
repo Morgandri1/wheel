@@ -759,7 +759,7 @@ fn save_credential_to_vault(
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
     let expires_at = found.expires_at.and_then(millis_to_timestamp);
-    crate::api::vault_routes::store_in_vault_until(
+    let declared_overlap = crate::api::vault_routes::store_in_vault_until(
         s,
         &conn,
         vault.id,
@@ -775,11 +775,21 @@ fn save_credential_to_vault(
     if !peers.is_empty() {
         out["shared_with"] = serde_json::json!(peers);
     }
+    // Two independent reasons a login can carry a warning; join both rather
+    // than letting one clobber the other silently.
+    let mut warnings = Vec::new();
     if !found.is_long_lived() {
-        out["warning"] = serde_json::json!(
+        warnings.push(
             "this is a session credential and will expire; for a durable one, \
              run `claude setup-token` and submit that token as api_key instead"
+                .to_string(),
         );
+    }
+    if let Some(w) = declared_overlap {
+        warnings.push(w);
+    }
+    if !warnings.is_empty() {
+        out["warning"] = serde_json::json!(warnings.join(" / "));
     }
     Ok(out)
 }
@@ -878,4 +888,93 @@ pub async fn auth_clear(State(s): State<AppState>, Path(id): Path<Uuid>) -> ApiR
     let config_dir = s.cfg.creds_dir().join(id.to_string());
     crate::auth::clear_token(&config_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// QA's coverage gap on 028 face 5: `save_credential_to_vault`'s warning-join
+/// (the part this feature added here) had no direct test at all. The two
+/// warnings come from independent conditions -- a session credential, and a
+/// declared-overlap with another wired vault -- and the code joins them with
+/// `" / "` rather than letting one clobber the other. Nothing else in this
+/// crate exercises both branches firing on the same call.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wheel_core::{AgentConfig, Node, NodeConfig, Position, VaultConfig, WireType};
+
+    fn mk(conn: &rusqlite::Connection, name: &str, config: NodeConfig) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    #[test]
+    fn both_warnings_join_with_a_slash_and_neither_clobbers_the_other() {
+        let state = crate::api::test_state();
+        let agent = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            // The vault the credential is actually written to.
+            let creds = mk(
+                &conn,
+                "creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            );
+            // A second vault this same agent reads that DECLARES the same
+            // key -- nothing stored there, so this is a warning, not a
+            // block (028 face 5's own rule), and it must surface alongside
+            // the session-credential warning rather than instead of it.
+            let other = mk(
+                &conn,
+                "other-creds",
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["CLAUDE_CODE_OAUTH_TOKEN".into()],
+                }),
+            );
+            board::add_wire(&conn, agent, creds, WireType::Read, None).unwrap();
+            board::add_wire(&conn, agent, other, WireType::Read, None).unwrap();
+            agent
+        };
+
+        // OAuth-shaped (so it classifies as CLAUDE_CODE_OAUTH_TOKEN, the same
+        // key `other` declares) but carrying an expiry, so `is_long_lived` is
+        // false and the session-credential warning fires too. No other agent
+        // reads `creds`, so the shared-expiry refusal (ADVERSARY 021) never
+        // triggers and both warnings reach the response instead of an error.
+        let found = crate::auth::StoredOauth {
+            token: "sk-ant-oat01-session".into(),
+            expires_at: Some(4_102_444_800_000),
+        };
+
+        let resp = save_credential_to_vault(
+            &state,
+            agent,
+            wheel_core::Harness::Claude,
+            "creds",
+            &found,
+            None,
+            false,
+        )
+        .expect("neither warning may block the write");
+
+        let warning = resp["warning"]
+            .as_str()
+            .expect("both warnings must be present in the response");
+        assert!(
+            warning.contains("session credential"),
+            "the session-credential warning must survive the join: {warning}"
+        );
+        assert!(
+            warning.contains("also declares"),
+            "the declared-overlap warning must survive the join: {warning}"
+        );
+        assert!(
+            warning.contains(" / "),
+            "the two warnings must be joined with \" / \", not concatenated or replaced: {warning}"
+        );
+    }
 }
