@@ -1,5 +1,9 @@
 "use client";
 
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import { create } from "zustand";
 import type { ConnectionStatus } from "@/lib/events";
 import type { EngineFrame, LogLine, Message, NodeType, WireDenial, WireType } from "@/lib/schema";

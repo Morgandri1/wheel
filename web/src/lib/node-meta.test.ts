@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 import { describe, expect, it } from "vitest";
 import { AGENT_STATUSES, NODE_TYPES, WIRE_TYPES } from "@/lib/schema";
 import { AGENT_STATUS_META, NODE_META, PALETTE_ORDER, WIRE_META } from "@/lib/node-meta";

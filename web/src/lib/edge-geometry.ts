@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 export type Box = { x: number; y: number; width: number; height: number };
 export type Point = { x: number; y: number };
 export type Side = "top" | "right" | "bottom" | "left";

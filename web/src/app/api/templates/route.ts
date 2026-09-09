@@ -1,3 +1,7 @@
+// Copyright Morgan Metz
+// Licensed under the PolyForm Noncommercial License 1.0.0.
+// See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
 /**
  * `GET /api/templates` — the gallery's list, read from `public/workflow_templates` at REQUEST time.
  *
