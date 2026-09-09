@@ -122,7 +122,10 @@ case with no special handling here.
 
 ## What's reused, named explicitly (so review can check each claim)
 
-- `apply::{validate, execute, ApplyPolicy, ExistingBoard, EmittedBoard}` — unchanged, same crate.
+- `apply::{validate, execute, ApplyPolicy, ExistingBoard, EmittedBoard}` — same crate, same call
+  sites in `execute`/`HttpBoardClient`. `validate` itself is NOT unchanged: per the ruling above it
+  gains the name/config checks, which is exactly why fixing it here also fixes the CI gate and the
+  existing `board/apply` route for free, rather than three separate patches.
 - `HttpBoardClient` (`board_apply.rs`) — unchanged, same engine calls `board/apply` already makes.
 - Project creation body (`routes::projects::create`) and destroy body (`routes::projects::destroy`)
   — extracted to plain functions both the existing routes and this one call; no behavior change to
