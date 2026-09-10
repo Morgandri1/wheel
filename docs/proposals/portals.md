@@ -103,7 +103,13 @@ entirely one layer up.
    this — it's the same engine control-plane route the vault UI itself calls) at a key the endpoint's `auth`
    already references, and into project A's vault at a key the tool op's `Authorization` fill already
    references. Both are calls to functionality that exists today; nothing new is added to either engine's vault
-   route.
+   route. **Requirement (adversary's review), same weight as the no-staleness-window point below**: this mint
+   step is the one genuinely NEW code path that touches a live secret in the API's own process memory before it
+   is stored anywhere — the mint route's own HTTP response back to the browser must be write-only, identical to
+   the principle the vault PUT route it calls already follows ("vault values are write-only through the API,
+   never returned to the UI"). The response is `{portal_id, created_at, ...}` — never the token value it just
+   generated, even though the API technically holds it in memory for the moment between generating and writing
+   it twice. No line in this proposal currently commits to this; API implements the route to this requirement.
 3. `project_portals` row created, surfaced on both projects' boards as a distinct, labeled card (Web's half) —
    this is the "real, visible, revocable" requirement satisfied structurally, not by convention.
 4. Revoke (either side, either owner if cross-owner later): `DELETE /v1/vault/:id/:key` on the token, mark the
