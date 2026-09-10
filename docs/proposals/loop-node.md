@@ -14,10 +14,16 @@ proposal reuses rather than reinvents:
   resumes a parked agent transparently (§3c#14), and already sits behind the §3c#12 priority-lane fairness rule.
   A loop firing into an agent needs no new delivery logic — it calls the same function every other `send` does.
 - **Tool execution**: `tools::execute::build_request` + `tools::execute::send` (`crates/wheel-engine/src/tools/
-  execute.rs:61,306`) are plain functions, not HTTP handlers — `api/tool_routes.rs::call` is a thin wrapper
-  around them for the human/agent-initiated case. A loop firing into a tool calls the same two functions
-  directly, inheriting every SSRF/redirect/timeout protection §3d already enforces, including the existing
-  30s `CALL_TIMEOUT` (execute.rs:27) — relevant to the interval floor below.
+  execute.rs:61,306`) are plain functions, not HTTP handlers — `api/tool_routes.rs::run_operation` is a thin
+  wrapper around them, explicitly documented as "shared by the operator route and the agent's `/v1/cli/tool`
+  path, so a call made either way resolves its fills the same way" (`tool_routes.rs:352`). A loop firing into a
+  tool calls this same `run_operation`, inheriting every SSRF/redirect/timeout protection §3d already enforces,
+  including the existing 30s `CALL_TIMEOUT` (execute.rs:27) — relevant to the interval floor below. **Confirmed
+  (adversary's review question) that vault-mode fill resolution is caller-independent**: `resolve_vault_fills`
+  (`tool_routes.rs:417`) checks `node.has_wire(vault.id, Read, Vault)` — the TOOL NODE's own wire to the vault —
+  and nothing in `build_request`'s signature takes a caller identity at all. A loop is a third caller of the
+  identical function a human's test-call and an agent's `wheel tool call` already share, and resolves fills
+  exactly as they do, by construction rather than by convention.
 - **Background timers**: the supervisor already runs one per-node `tokio::spawn` + `sleep` loop per idle-park
   timer (`Supervisor::arm_park_timer`), re-checking the node's live state on every tick rather than assuming it
   is still valid. A loop node's timer is the same shape: sleep, re-check the node still exists and is `started`,
@@ -112,8 +118,19 @@ placing a node must never be indistinguishable from deliberately activating it. 
   no `run_on_startup`-equivalent field for a loop in v1; if the operator wants one auto-started they start it
   once and it persists across engine restarts (see next point), which covers the same use case without adding a
   second boolean to reason about.
-- On engine boot, `start_configured_agents()`'s sibling for loops re-arms the timer for every `Running` loop —
-  same reconciliation shape, so a loop survives an engine restart exactly as a parked agent's queue does.
+- **On engine boot, adversary review caught a real bug risk here**: naively re-arming a fresh full-length
+  `interval_ms` sleep for every `Running` loop is NOT the same reconciliation shape as `arm_park_timer` — it is
+  the bug `arm_park_timer` itself had before `cbc6b4a` (BUG-040/051, verified by adversary this session).
+  `arm_park_timer`'s actual safety comes from comparing against a PERSISTED timestamp
+  (`agent_state.last_activity`, read by `seconds_since_activity` via `julianday`) and re-arming for the
+  REMAINDER, not from re-arming at all. A loop needs the identical shape: a persisted `last_fired_at` (a new
+  column, the loop's equivalent of `last_activity`), and boot reconciliation computes
+  `remaining = interval_ms - elapsed_since(last_fired_at)` (floored at 0, meaning "fire immediately if the
+  engine was down longer than one interval — once, not once per missed tick") rather than a fresh full sleep.
+  Without this, every engine restart fires every `Running` loop either immediately or after a full fresh
+  interval — for a tool target with a non-idempotent side effect (a webhook, a send-email op), that is a
+  duplicate real-world action on every deploy, not a cosmetic timing blip. This is a REQUIREMENT, not an
+  implementation detail left to the PR — no implementation ships without the persisted-timestamp comparison.
 - Counts toward the existing per-project node cap (§3e, default 50) — no new cap. A resource a project can
   create 50 of already includes this one; a loop firing every 30s is not categorically more dangerous than an
   agent that never idles, and both are already bounded by that cap plus their own budget/rate limits.
@@ -140,6 +157,18 @@ placing a node must never be indistinguishable from deliberately activating it. 
   DELIBERATE state transition, not a crash or a silent no-op: the operator sees a stopped loop with a reason
   instead of either an invisible zombie or a wall of identical failure log lines. Restarting the loop after
   re-wiring it to a new target is the same `start` call as any other resume.
+- **Target agent is stuck needing the operator** (adversary's review — `BudgetExhausted`, `NeedsAuth`, or `Error`,
+  confirmed at `supervisor/mod.rs:1567` as the same "already diagnosed, needs the operator" bucket): a human
+  naturally stops messaging an agent once they notice it is stuck; a loop has no such judgment and would enqueue
+  into it every tick forever, with nothing ever delivered until the operator intervenes — unbounded queue growth
+  this feature specifically introduces, since nothing currently mechanically messages an agent this persistently
+  without a person in the loop to notice. **Proposed: the same auto-stop-with-reason as the deleted-target case**,
+  checked before enqueueing rather than after — a tick that finds its target agent in one of these three statuses
+  does not enqueue at all, and stops the loop with `last_error` naming the status (e.g. `"stopped: target agent
+  is budget_exhausted"`). This is the same philosophy the tool-target's skip-and-log already has (don't hammer a
+  target that has already told you it cannot proceed), applied to the agent side. A `Parked`/`Stopped` target is
+  unaffected — those are the normal transient states §3c#14 already resumes automatically, and the loop keeps
+  enqueueing into them exactly as proposed above.
 
 ### Fairness: no new lane
 
@@ -150,6 +179,19 @@ exactly as true of a human sending that agent a message every 30 seconds by hand
 loop introduces. No new lane is proposed; the floor and the target agent's own budget are the two controls doing
 real work here, and a third lane would protect against a case (loop vs. other non-user traffic on the SAME
 agent) the operator configuring a 30-second loop has already explicitly asked for.
+
+## Residual risk, accepted (adversary's review, named rather than mitigated)
+
+A tool-target loop makes sustained external hammering CHEAPER than it was: the existing per-project node cap
+(50) × the 30s floor is up to 50 requests/30s sustained indefinitely against whatever the SSRF allowlist already
+permits — i.e., any legitimate public target. An agent looping the same call at least costs real LLM tokens per
+iteration, a natural friction a loop removes entirely. This is not a new hole the SSRF/allowlist policy itself
+has — every one of those 50 requests is still bound by the same host-reachability and redirect checks a human's
+`wheel tool call` would hit — it is a statement about VOLUME: a loop is a cheaper way to reach the ceiling those
+existing controls already bound. Not mitigated further in this proposal (adversary agrees it is not a hard
+block); named explicitly here so it is a decision PM/the operator made with eyes open, not a gap discovered
+after the fact — the same posture this contract already takes for other named-not-mitigated trade-offs (e.g.
+templates' no-2PC residual).
 
 ## Open questions this proposal is taking a position on (not leaving open)
 
