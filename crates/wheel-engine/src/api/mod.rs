@@ -223,6 +223,7 @@ pub fn router(state: AppState) -> Router {
             get(cli_routes::tool_ls).post(cli_routes::tool_call),
         )
         .route("/ctx/clear", post(cli_routes::ctx_clear))
+        .route("/usage", get(cli_routes::usage))
         .route("/mcp/tools", get(cli_routes::mcp_tools));
 
     Router::new()
@@ -694,6 +695,7 @@ mod tests {
             "/query",
             "/tool",
             "/ctx/clear",
+            "/usage",
             "/mcp/tools",
         ] {
             assert!(

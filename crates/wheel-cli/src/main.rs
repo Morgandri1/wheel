@@ -36,6 +36,7 @@ wheel — talk to your Wheel board
   wheel msg   <agent> <text>|--file <path>|--stdin
   wheel inbox [<message-id>]        re-read what I was sent
   wheel ctx clear                   discard my context and start a fresh session
+  wheel usage                       my own turn/spend total, and proximity to my budget
 
 Values: prefer --file or --stdin. A body passed as an argument goes through
 your shell first, where backticks and $(...) are substituted before wheel ever
@@ -277,6 +278,7 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
             };
             show(engine.get(&path)?, json_out, render_inbox)
         }
+        "usage" => show(engine.get("/v1/cli/usage")?, json_out, render_usage),
 
         other => {
             eprintln!("wheel: unknown command {other:?}\n");
@@ -553,6 +555,29 @@ fn render_receipt(v: &serde_json::Value) {
     );
 }
 
+/// Only the ceilings actually configured are shown — an agent with no budget
+/// set sees its raw spend and nothing to compare it against, which is the
+/// truth rather than a fabricated 0%.
+fn render_usage(v: &serde_json::Value) {
+    println!(
+        "{} turns, ${:.4} spent",
+        v["turns"].as_u64().unwrap_or(0),
+        v["usd"].as_f64().unwrap_or(0.0),
+    );
+    if let Some(max) = v["max_turns"].as_u64() {
+        println!(
+            "  turns: {:.1}% of {max}",
+            v["pct_of_max_turns"].as_f64().unwrap_or(0.0)
+        );
+    }
+    if let Some(max) = v["max_usd"].as_f64() {
+        println!(
+            "  usd: {:.1}% of ${max:.4}",
+            v["pct_of_max_usd"].as_f64().unwrap_or(0.0)
+        );
+    }
+}
+
 fn render_inbox(v: &serde_json::Value) {
     if let Some(m) = v.get("message") {
         // A single message prints its EXACT body, which is the whole point of
@@ -646,7 +671,7 @@ mod tests {
             serde_json::json!({"wires": [{"to": {}}]}),
         ];
         type Renderer = fn(&serde_json::Value);
-        let renderers: [(&str, Renderer); 12] = [
+        let renderers: [(&str, Renderer); 13] = [
             ("whoami", render_whoami),
             ("connections", render_connections),
             ("list", render_list),
@@ -659,6 +684,7 @@ mod tests {
             ("tool_call", render_tool_call),
             ("secret", render_secret),
             ("keys", render_keys),
+            ("usage", render_usage),
         ];
         for (name, r) in renderers {
             for b in &bodies {
@@ -729,6 +755,7 @@ mod tests {
             ("tool_call", render_tool_call),
             ("secret", render_secret),
             ("keys", render_keys),
+            ("usage", render_usage),
         ];
         // Empty, wrong-typed, null-valued, and deeply wrong. None of these is
         // hypothetical: an older engine, a proxy that rewrote the body, or a
@@ -818,6 +845,7 @@ mod tests {
         let cases: Vec<(Vec<&str>, &str, &str)> = vec![
             (vec!["whoami"], "GET", "/v1/cli/whoami"),
             (vec!["connections"], "GET", "/v1/cli/connections"),
+            (vec!["usage"], "GET", "/v1/cli/usage"),
             (vec!["list"], "GET", "/v1/cli/list"),
             (vec!["read", "notes"], "GET", "/v1/cli/read?addr=notes"),
             (vec!["ls", "table"], "GET", "/v1/cli/ls?node=table"),

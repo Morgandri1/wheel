@@ -177,6 +177,12 @@ fn builtins(reachable: &[(Node, WireType)]) -> Vec<Value> {
             "Clear your own context. The system prompt and injected context nodes are re-applied.",
             json!({"type": "object", "properties": {}}),
         ),
+        tool(
+            "usage",
+            "Your own turn/spend total and, if a budget is configured, how close you are to it. \
+             Check this before a long or expensive operation instead of finding out by hitting the limit.",
+            json!({"type": "object", "properties": {}}),
+        ),
     ]
 }
 
@@ -299,6 +305,7 @@ mod tests {
             "whoami",
             "connections",
             "ctx_clear",
+            "usage",
         ] {
             assert!(
                 got.contains(&expected.to_string()),

@@ -774,6 +774,61 @@ pub async fn ctx_clear(
     })))
 }
 
+/// `GET /v1/cli/usage` — an agent's own spend against its own budget.
+///
+/// docs/wow-agent-brief.md #6: the harness already reports turns/cost on every
+/// result (§harness/claude.rs), and the engine already counts them into
+/// `agent_state` to enforce `budget` (`board::budget_exceeded`) — but nothing
+/// ever handed that number back to the agent itself, so it found out about a
+/// limit only by hitting `budget_exhausted`. This is a read of data the engine
+/// already has: no new external call, no per-turn token count (the harness
+/// does not report one — see the same module), just turns/usd and, where a
+/// budget is configured, how close this agent is to it.
+///
+/// Only its OWN: same reasoning as `ctx_clear` above, and the same reason this
+/// can never leak cross-agent or cross-project data — the token names the
+/// node, and there is no argument that could ask about a different one.
+pub async fn usage(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    if me.node.node_type() != NodeType::Agent {
+        return Err(ApiError::invalid("only an agent has usage to report"));
+    }
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let spend = board::agent_state(&conn, me.node.id)
+        .unwrap_or_default()
+        .spend
+        .unwrap_or_default();
+
+    let mut out = serde_json::json!({ "turns": spend.turns, "usd": spend.usd });
+    // Budget is optional config (§3); an agent with none configured gets its
+    // raw spend back and nothing to divide by, which is not an error.
+    if let Some(budget) = me.node.config.as_agent().and_then(|a| a.budget) {
+        if let Some(max) = budget.max_turns {
+            out["max_turns"] = serde_json::json!(max);
+            out["pct_of_max_turns"] = serde_json::json!(pct(spend.turns as f64, max as f64));
+        }
+        if let Some(max) = budget.max_usd {
+            out["max_usd"] = serde_json::json!(max);
+            out["pct_of_max_usd"] = serde_json::json!(pct(spend.usd, max));
+        }
+    }
+    Ok(Json(out))
+}
+
+/// A ceiling of zero would divide by zero; treated as "already at the limit"
+/// rather than NaN or infinity reaching the caller as JSON (which `serde_json`
+/// cannot even represent — it would silently become `null`).
+fn pct(spend: f64, max: f64) -> f64 {
+    if max <= 0.0 {
+        100.0
+    } else {
+        ((spend / max) * 100.0 * 10.0).round() / 10.0
+    }
+}
+
 #[cfg(test)]
 mod toctou_tests {
     /// ADVERSARY 046, generalised so the NEXT one is caught rather than filed.
@@ -923,5 +978,153 @@ mod storage_err_tests {
             rendered.contains("no such table: t_reports"),
             "must also name the cause, not just the caption: {rendered}"
         );
+    }
+}
+
+/// docs/wow-agent-brief.md #6: nothing above `db::board::budget_exceeded`'s own
+/// unit layer ever called this handler before this, so a route that dropped a
+/// field or leaked another agent's spend would have shipped green.
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use wheel_core::{AgentConfig, Budget, Node, NodeConfig, Position};
+
+    fn agent_with_token(state: &AppState, config: AgentConfig) -> (uuid::Uuid, HeaderMap) {
+        let node = Node::new(
+            uuid::Uuid::new_v4(),
+            "agent".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(config),
+        );
+        let id = node.id;
+        let token = {
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &node).unwrap();
+            crate::db::tokens::mint(&conn, id).unwrap().plaintext
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        (id, headers)
+    }
+
+    /// No budget configured: raw spend comes back, with nothing fabricated to
+    /// divide it by.
+    #[tokio::test]
+    async fn no_budget_reports_raw_spend_and_no_percentages() {
+        let state = crate::api::test_state();
+        let (id, headers) = agent_with_token(&state, AgentConfig::default());
+        {
+            let conn = state.db.lock().unwrap();
+            board::add_spend(&conn, id, 3, 0.5).unwrap();
+        }
+
+        let resp = usage(State(state), headers).await.unwrap().0;
+        assert_eq!(resp["turns"], 3);
+        assert_eq!(resp["usd"], 0.5);
+        assert!(
+            resp.get("max_turns").is_none() && resp.get("pct_of_max_turns").is_none(),
+            "no budget means nothing to compare against: {resp}"
+        );
+    }
+
+    /// Both ceilings configured: both percentages must be present, each
+    /// computed against its OWN ceiling, not the other one's.
+    #[tokio::test]
+    async fn both_ceilings_report_independent_percentages() {
+        let state = crate::api::test_state();
+        let (id, headers) = agent_with_token(
+            &state,
+            AgentConfig {
+                budget: Some(Budget {
+                    max_turns: Some(50),
+                    max_usd: Some(10.0),
+                }),
+                ..Default::default()
+            },
+        );
+        {
+            let conn = state.db.lock().unwrap();
+            board::add_spend(&conn, id, 5, 2.5).unwrap();
+        }
+
+        let resp = usage(State(state), headers).await.unwrap().0;
+        assert_eq!(resp["turns"], 5);
+        assert_eq!(resp["usd"], 2.5);
+        assert_eq!(resp["max_turns"], 50);
+        assert_eq!(resp["pct_of_max_turns"], 10.0);
+        assert_eq!(resp["max_usd"], 10.0);
+        assert_eq!(resp["pct_of_max_usd"], 25.0);
+    }
+
+    /// Only one ceiling set: the other must not appear at all, not as a null
+    /// or a fabricated zero.
+    #[tokio::test]
+    async fn one_configured_ceiling_does_not_invent_the_other() {
+        let state = crate::api::test_state();
+        let (id, headers) = agent_with_token(
+            &state,
+            AgentConfig {
+                budget: Some(Budget {
+                    max_turns: Some(4),
+                    max_usd: None,
+                }),
+                ..Default::default()
+            },
+        );
+        {
+            let conn = state.db.lock().unwrap();
+            board::add_spend(&conn, id, 2, 9.99).unwrap();
+        }
+
+        let resp = usage(State(state), headers).await.unwrap().0;
+        assert_eq!(resp["pct_of_max_turns"], 50.0);
+        assert!(
+            resp.get("max_usd").is_none() && resp.get("pct_of_max_usd").is_none(),
+            "an unconfigured ceiling must not appear at all: {resp}"
+        );
+    }
+
+    /// A non-agent caller (a script, per `may_use_cli`) has no budget/spend
+    /// concept — this must be a clear error, not a silently empty report.
+    #[tokio::test]
+    async fn a_script_caller_is_refused_not_given_an_empty_report() {
+        let state = crate::api::test_state();
+        let node = Node::new(
+            uuid::Uuid::new_v4(),
+            "script".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Script(wheel_core::ScriptConfig {
+                language: wheel_core::ScriptLanguage::Python,
+                source: "print('hi')".into(),
+                timeout_secs: None,
+            }),
+        );
+        let token = {
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &node).unwrap();
+            crate::db::tokens::mint(&conn, node.id).unwrap().plaintext
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let err = usage(State(state), headers)
+            .await
+            .expect_err("a script has no usage to report");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A zero ceiling is a degenerate config, not a crash: `100.0%`, not a
+    /// divide-by-zero `NaN` that `serde_json` would silently turn into `null`.
+    #[test]
+    fn a_zero_ceiling_reports_100_percent_rather_than_dividing_by_zero() {
+        assert_eq!(pct(5.0, 0.0), 100.0);
+        assert_eq!(pct(0.0, 0.0), 100.0);
     }
 }

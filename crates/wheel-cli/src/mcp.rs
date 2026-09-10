@@ -143,6 +143,7 @@ fn route_for(name: &str, args: &Value) -> Option<Route> {
     Some(match name {
         "whoami" => Route::Get("/v1/cli/whoami".into()),
         "connections" => Route::Get("/v1/cli/connections".into()),
+        "usage" => Route::Get("/v1/cli/usage".into()),
         "list" => Route::Get("/v1/cli/list".into()),
         "read" => Route::Get(format!(
             "/v1/cli/read?addr={}",
@@ -276,6 +277,7 @@ mod tests {
     fn every_tool_addresses_the_route_that_implements_it() {
         assert_eq!(route("whoami", json!({})).0, "/v1/cli/whoami");
         assert_eq!(route("connections", json!({})).0, "/v1/cli/connections");
+        assert_eq!(route("usage", json!({})).0, "/v1/cli/usage");
         assert_eq!(
             route("read", json!({"addr": "notes/r1"})).0,
             "/v1/cli/read?addr=notes%2Fr1"
