@@ -102,8 +102,12 @@ A loop needs the same on/off distinction an agent has, for the same reason `run_
 placing a node must never be indistinguishable from deliberately activating it. Proposed:
 
 - `LoopStatus { Stopped, Running }` (two states — no `starting`/`parked`/`error` richness needed; a loop has no
-  process to spawn, no auth to hold, nothing to crash mid-fire beyond "the last call failed," which is a log
-  line, not a status).
+  process to spawn and no auth to hold). `Stopped` is reached either by an explicit operator `stop`, or by the
+  engine itself when a tick finds its target wire gone (see "Failure handling" below) — both are the same status,
+  distinguished by an accompanying `last_error: Option<String>` (mirroring `AgentState.last_error`): `None` for
+  an operator-requested stop, `Some(reason)` for an engine-initiated one. A tool call that merely FAILS (network
+  error, bad response) does not change status at all — that is a log line on an otherwise still-`Running` loop,
+  not a state transition; only "there is nothing left to fire into" warrants stopping the loop itself.
 - `POST /v1/loops/:id/start` / `.../stop`, mirroring the agent routes' shape. Created `Stopped` always — there is
   no `run_on_startup`-equivalent field for a loop in v1; if the operator wants one auto-started they start it
   once and it persists across engine restarts (see next point), which covers the same use case without adding a
@@ -124,6 +128,18 @@ placing a node must never be indistinguishable from deliberately activating it. 
   tick. No immediate retry — retrying a failing external endpoint inside a tight interval is exactly the
   "hammering" case the floor exists to prevent, and the next scheduled fire IS the retry, on the cadence the
   operator already chose.
+- **Target no longer exists** (PM's review question — the wired agent/tool node, or just the wire, was deleted
+  while the loop kept ticking): the timer re-resolves the loop's OWN outgoing wire fresh from the board on every
+  tick — it never caches a target node id at start time, the same reason `wire_views`/`me.reachable` are always
+  read live rather than snapshotted. So a tick that finds no legal `send`/`read` wire off the loop is not an
+  execution failure (there is nothing to call), and treating it as "skip and retry next tick" would leave a
+  now-purposeless loop ticking forever with nothing to show for it — silently, since nothing about a normal tick
+  cycle is visible on its own. **Proposed: that tick auto-stops the loop** (`LoopStatus::Running → Stopped`) and
+  records the reason on a `last_error: Option<String>` field (mirroring `AgentState.last_error`, so the UI has an
+  existing pattern to render this with) — `"stopped: no agent/tool wire found to fire into"`. This is a
+  DELIBERATE state transition, not a crash or a silent no-op: the operator sees a stopped loop with a reason
+  instead of either an invisible zombie or a wall of identical failure log lines. Restarting the loop after
+  re-wiring it to a new target is the same `start` call as any other resume.
 
 ### Fairness: no new lane
 
