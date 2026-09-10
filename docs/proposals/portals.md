@@ -108,7 +108,19 @@ entirely one layer up.
    this is the "real, visible, revocable" requirement satisfied structurally, not by convention.
 4. Revoke (either side, either owner if cross-owner later): `DELETE /v1/vault/:id/:key` on the token, mark the
    row `revoked_at`. The portal is dead the instant the shared secret is gone — no new revoke mechanism, reusing
-   what vault deletion already does.
+   what vault deletion already does. Confirmed no staleness window here either: `EndpointAuth::Bearer` resolves
+   the vault value on a LIVE read per incoming request (`resolve_secret` → `vault::get`, never cached), so a
+   revoke takes effect on the very next request — there is no cached-capability risk on the receiving side at
+   all, unlike a case (a background timer, say) that might resolve its authorization once and hold it.
+
+**Said explicitly (adversary's review), not left implicit:** the ownership check in step 1 gates the API's
+MINT-AND-DISTRIBUTE convenience flow — it decides who gets a button that automates the copy-paste — it is not
+and does not strengthen the underlying access control. The actual capability is, and remains, **possession of
+the bearer secret**, exactly as true for a hand-built integration today: whoever already has (or guesses) B's
+token can point a tool at B regardless of who owns B, the same as they could for Stripe or any other API key.
+Portals neither strengthen nor weaken this either direction; the headline finding already says access control IS
+the bearer token, and this is that same fact stated again at the specific place a reader might otherwise credit
+the ownership check with doing more than it does.
 
 **v2, cross-owner (explicitly deferred, not in this proposal's scope):** an invite/accept flow between two
 different users' projects. Real design work (how does B's owner discover/approve a request from a stranger's
@@ -144,6 +156,16 @@ call integration already might.
 - Delivery guarantees? — Inherited unchanged from today's ingress semantics (settled above).
 - Grant lifecycle? — Same-owner mint-and-distribute in v1; cross-owner invite/accept explicitly deferred
   (settled above).
+
+## Named, not this proposal's to fix (adversary's review)
+
+If `wheel-host` runs many tenants' tool-initiated egress from one machine, the ingress rate limiter (keyed on
+caller IP, `ingress.rs`) cannot distinguish between different calling projects sharing that one egress IP — a
+busy portal pair shares a rate-limit bucket with every OTHER tenant's tool traffic hitting the same destination.
+This is a property of the shared-host deployment topology, not something portals introduce, but portals make
+sustained cross-project traffic more likely than incidental tool calls would, so it is more likely to actually
+bite here than elsewhere. Named for whoever next works on deployment topology / rate-limiting; not addressed in
+this proposal.
 
 ## Non-goals
 
