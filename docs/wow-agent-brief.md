@@ -200,21 +200,26 @@ needs anything. QA signs off the E2E once it lands.
 ## 8. Loop node — timed re-trigger of an agent or a tool
 
 **Operator's ask (2026-09-10), verbatim:** "Can we also add a loop node? Here's the behaviors I want it to have:
-Connected to agent: send prompt every variable ms. Connected to tool: execute specific tool every variable ms." **Correction from the operator right after:** the unit is seconds, not milliseconds — interval is `interval_secs`, not `interval_ms`.
+Connected to agent: send prompt every variable ms. Connected to tool: execute specific tool every variable ms."
+**Two follow-up clarifications from the operator, final answer:** the stored/wire-level unit is milliseconds
+(`interval_ms`) after all — but at the UI level, most loops will be set in minutes or hours, not raw seconds/ms,
+so the node's config editor should default to a minutes/hours picker that converts to `interval_ms` underneath,
+not a bare numeric-ms input.
 
 **Goal:** a new node type that fires on a configurable interval rather than in response to a message/wire event —
 today every trigger in the system is either an inbound message, an HTTP hit (endpoint), or `run_on_startup`; there
-is no time-based trigger. A `loop` node closes that gap: wired to an agent it sends that agent a prompt every N seconds
+is no time-based trigger. A `loop` node closes that gap: wired to an agent it sends that agent a prompt every N ms
 (new `loop → agent (send)` wire matrix cell, same delivery semantics/queue as any other `send`); wired to a tool
-it invokes a specific operation every N seconds (new `loop → tool (read)` cell, same execution path as `wheel tool
+it invokes a specific operation every N ms (new `loop → tool (read)` cell, same execution path as `wheel tool
 call`).
 
 **Open design questions for the proposal:**
-- Config shape: `{ interval_secs: u64, prompt: string }` for the agent case — is the prompt static config, or can it
+- Config shape: `{ interval_ms: u64, prompt: string }` for the agent case — is the prompt static config, or can it
   read from a wired ctx node (§3 ctx→agent injection precedent) so it can change without editing the loop node?
   For the tool case, which op + args — static config, or does the loop wire to a specific `tool` operation the way
-  an endpoint wires to a script?
-- **Safety valve, non-negotiable:** a floor on `interval_secs` (protect against an agent accidentally budget-burning
+  an endpoint wires to a script? Web: the editor's unit picker (minutes/hours, converting to `interval_ms`) is part
+  of this proposal's UI half, not a separate follow-up.
+- **Safety valve, non-negotiable:** a floor on `interval_ms` (protect against an agent accidentally budget-burning
   itself into `budget_exhausted`, or a tool loop hammering an external HTTP endpoint / tripping the §3d SSRF and
   rate-limit rules that already apply to tool calls). Needs an explicit minimum, not just "whatever the user types."
 - Lifecycle: does a loop node need `start`/`stop` like an agent (so placing one doesn't immediately start firing),
