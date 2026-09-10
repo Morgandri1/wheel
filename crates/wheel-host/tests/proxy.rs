@@ -105,6 +105,7 @@ fn cfg() -> Config {
         disk_floor_mb: 1,
         reconcile_concurrency: 8,
         engine_base_url: "http://127.0.0.1:1".into(),
+        oauth_allowed_projects: Vec::new(),
     }
 }
 

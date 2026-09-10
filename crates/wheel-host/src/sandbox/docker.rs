@@ -141,6 +141,10 @@ impl DockerSandbox {
                 format!("WHEEL_PROJECT_ID={id}"),
                 format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret),
                 format!("WHEEL_VAULT_KEY={}", secrets.vault_key),
+                // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
+                // fail-secure per project, computed by wheel-host itself — never a value a project's
+                // own owner can influence.
+                format!("WHEEL_HARNESS_AUTH={}", self.cfg.harness_auth_for(id)),
                 format!("WHEEL_LISTEN=tcp://0.0.0.0:{}", self.cfg.engine_port),
                 "WHEEL_DATA_DIR=/data".to_string(),
                 "WHEEL_LOG=json".to_string(),

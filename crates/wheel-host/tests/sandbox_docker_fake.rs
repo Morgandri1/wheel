@@ -176,6 +176,7 @@ fn cfg(data_dir: &str) -> Config {
         disk_floor_mb: 1,
         reconcile_concurrency: 8,
         engine_base_url: "http://127.0.0.1:7000".into(),
+        oauth_allowed_projects: Vec::new(),
     }
 }
 
@@ -251,6 +252,56 @@ async fn the_engine_container_carries_its_secrets_and_no_ports() {
     assert!(env.iter().any(|e| e.starts_with("WHEEL_VAULT_KEY=")));
     assert!(env.contains(&format!("WHEEL_PROJECT_ID={id}")));
     assert!(env.contains(&"WHEEL_ROLE=engine".to_string()));
+}
+
+/// `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` (wow-agent-brief task 4): the container the docker backend
+/// actually creates carries the allowlist-derived value, not a fixed constant. Two separate fake
+/// daemons: the fake's "already exists" state is a single flag flipped by the first `create`, not
+/// keyed per container id, so reusing one daemon for a second project's provision would see it as
+/// already-existing and skip `create` entirely (`provisioning_an_existing_container_does_not_recreate_it`
+/// pins exactly that behaviour) — a real daemon would of course track the two containers separately.
+#[tokio::test]
+async fn the_engine_container_carries_the_allowlist_derived_harness_auth_value() {
+    let allowed = Uuid::new_v4();
+    let other = Uuid::new_v4();
+
+    let (sock, rec) = fake_daemon("running");
+    let docker = Docker::connect_with_unix(sock.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+        .expect("connect to the fake daemon");
+    let mut config = cfg("/tmp/wheel-docker-fake-harness-auth-allowed");
+    config.oauth_allowed_projects = vec![allowed];
+    let sb = DockerSandbox::with_client(docker, config);
+    sb.provision(&allowed, &secrets()).await.unwrap();
+    let body = rec.lock().unwrap().bodies["/containers/create"].clone();
+    let env: Vec<String> = body["Env"]
+        .as_array()
+        .expect("env")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        env.contains(&"WHEEL_HARNESS_AUTH=oauth-token".to_string()),
+        "an allowlisted project must get oauth-token: {env:?}"
+    );
+
+    let (sock, rec) = fake_daemon("running");
+    let docker = Docker::connect_with_unix(sock.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+        .expect("connect to the fake daemon");
+    let mut config = cfg("/tmp/wheel-docker-fake-harness-auth-other");
+    config.oauth_allowed_projects = vec![allowed];
+    let sb = DockerSandbox::with_client(docker, config);
+    sb.provision(&other, &secrets()).await.unwrap();
+    let body = rec.lock().unwrap().bodies["/containers/create"].clone();
+    let env: Vec<String> = body["Env"]
+        .as_array()
+        .expect("env")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        env.contains(&"WHEEL_HARNESS_AUTH=api-key-only".to_string()),
+        "a project not on the allowlist must get the fail-secure default: {env:?}"
+    );
 }
 
 /// Provision is idempotent by contract: an existing container is left alone rather than recreated,

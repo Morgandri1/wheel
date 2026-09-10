@@ -17,6 +17,7 @@ fn base() {
     std::env::remove_var("CONTAINER_MEMORY_MB");
     std::env::remove_var("BIND_ADDR");
     std::env::remove_var("PORT");
+    std::env::remove_var("WHEEL_HARNESS_AUTH_OAUTH_PROJECTS");
 }
 
 #[test]
@@ -130,6 +131,39 @@ fn host_config_validation() {
     std::env::set_var("PORT", "8080");
     std::env::set_var("BIND_ADDR", "127.0.0.1:9000");
     assert_eq!(Config::from_env().unwrap().bind_addr, "127.0.0.1:9000");
+
+    // --- WHEEL_HARNESS_AUTH_OAUTH_PROJECTS ("docs/proposals/wheeld-first-class-cloud-api-key-
+    // policy.md", wow-agent-brief task 4) — fail-secure: unset means nobody is exempted, and a
+    // malformed entry fails the boot naming the token rather than being silently dropped, the same
+    // discipline `SANDBOX_BACKEND=nonsense` gets above.
+    base();
+    assert!(
+        Config::from_env()
+            .unwrap()
+            .oauth_allowed_projects
+            .is_empty(),
+        "unset must mean no exemptions, not \"unrestricted\""
+    );
+
+    base();
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    std::env::set_var("WHEEL_HARNESS_AUTH_OAUTH_PROJECTS", format!(" {a}, {b} "));
+    assert_eq!(
+        Config::from_env().unwrap().oauth_allowed_projects,
+        vec![a, b],
+        "comma-separated ids, whitespace trimmed"
+    );
+
+    base();
+    std::env::set_var("WHEEL_HARNESS_AUTH_OAUTH_PROJECTS", "not-a-uuid");
+    match Config::from_env() {
+        Ok(_) => panic!("a malformed project id must fail boot, not be silently dropped"),
+        Err(e) => assert!(
+            e.to_string().contains("not-a-uuid"),
+            "error should name the bad token: {e}"
+        ),
+    }
 
     base();
 }

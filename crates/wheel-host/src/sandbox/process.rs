@@ -120,6 +120,13 @@ impl ProcessSandbox {
             ("WHEEL_PROJECT_ID", id.to_string()),
             ("WHEEL_ENGINE_SECRET", secrets.engine_secret.clone()),
             ("WHEEL_VAULT_KEY", secrets.vault_key.clone()),
+            // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
+            // fail-secure per project, computed by wheel-host itself — never a value a project's
+            // own owner can influence.
+            (
+                "WHEEL_HARNESS_AUTH",
+                self.cfg.harness_auth_for(id).to_string(),
+            ),
             ("WHEEL_DATA_DIR", self.project_dir(id).display().to_string()),
             ("WHEEL_LISTEN", format!("unix://{}", socket.display())),
             ("WHEEL_LOG", "json".to_string()),
@@ -648,12 +655,49 @@ mod tests {
                 "TMPDIR",
                 "WHEEL_DATA_DIR",
                 "WHEEL_ENGINE_SECRET",
+                "WHEEL_HARNESS_AUTH",
                 "WHEEL_LISTEN",
                 "WHEEL_LOG",
                 "WHEEL_PROJECT_ID",
                 "WHEEL_ROLE",
                 "WHEEL_VAULT_KEY",
             ]
+        );
+    }
+
+    /// `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` (wow-agent-brief task 4): the value that actually reaches
+    /// the child is `harness_auth_for`'s, not a fixed constant — an allowlisted project gets
+    /// `oauth-token`, everything else (including an empty allowlist) gets the fail-secure default.
+    #[test]
+    fn the_engine_child_gets_the_allowlist_derived_harness_auth_value() {
+        let dir = tempdir();
+        let mut cfg = Config::for_tests(&dir.display().to_string());
+        let allowed = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        cfg.oauth_allowed_projects = vec![allowed];
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        let sb = ProcessSandbox::new(cfg, store);
+        let secrets = Secrets {
+            engine_secret: "s".into(),
+            vault_key: "k".into(),
+        };
+
+        let allowed_env: std::collections::HashMap<_, _> = sb
+            .engine_env(&allowed, &secrets, std::path::Path::new("/run/x.sock"))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            allowed_env.get("WHEEL_HARNESS_AUTH").map(String::as_str),
+            Some("oauth-token")
+        );
+
+        let other_env: std::collections::HashMap<_, _> = sb
+            .engine_env(&other, &secrets, std::path::Path::new("/run/x.sock"))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            other_env.get("WHEEL_HARNESS_AUTH").map(String::as_str),
+            Some("api-key-only")
         );
     }
 
