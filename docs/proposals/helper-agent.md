@@ -44,6 +44,15 @@ recorded but unused for attenuation) to the helper's own id, so `wheel connectio
 operator can `remove_wire` any one individually, exactly like a hand-drawn wire. "Global" is a real, visible,
 per-wire-revocable set from the moment it's created — never an invisible flag checked at authorization time.
 
+**Said explicitly (adversary asked this be confirmed rather than assumed):** the hook above only ever creates
+wires OUTGOING from the helper — `(Agent, <other node>, WireType)` — never the reverse `(Ctx, Agent, Send)`
+injection direction a ctx node's own wire would need to auto-inject its markdown into the helper's preamble. This
+is intentional, not an oversight of the enumeration: "global read/write" and "inject everything into my context"
+are different capabilities with different costs (the latter is unbounded preamble bloat as ctx nodes accumulate,
+and a helper does not need every ctx's content sitting in its context window to `wheel read <ctx>` one on
+demand). The helper gets on-demand data access to every ctx node's content, exactly as proposed; it does not get
+every ctx node's content permanently baked into its own system prompt.
+
 ### Vault is a hard-coded exclusion, not an assumed carve-out
 
 **Adversary anchor 3, addressed directly**: the auto-wire hook above **unconditionally skips `NodeType::Vault`**
