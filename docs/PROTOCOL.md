@@ -214,6 +214,7 @@ POST   /v1/cli/query   {table, sql}        → {rows}   read-only, one table
 POST   /v1/cli/msg     {to, body, reply_to?} → {id, sha256, bytes, state}
 GET    /v1/cli/inbox[?id=<message id>]     → {messages} or one message, verbatim
 POST   /v1/cli/ctx/clear                   → {node, cleared, status}   own context only
+GET    /v1/cli/usage                       → {turns, usd, max_turns?, pct_of_max_turns?, max_usd?, pct_of_max_usd?}   own agent only
 GET    /v1/cli/tool?node=<tool>            → {tool, operations}  agent-fill fields only
 POST   /v1/cli/tool   {node, op, args, curl?} → the call result, or the masked curl
 GET    /v1/cli/mcp/tools                   → {tools} the MCP tool list for this node
@@ -693,6 +694,7 @@ wheel run   <script> [args…]          M2 — NOT IMPLEMENTED. There is no `run
                                       (wheel-core/src/preamble.rs), so an agent WILL try it and fail.
 wheel inbox [--since <ts>] [--limit n] | wheel inbox <id>    re-read my messages    (§3c#2)
 wheel ctx clear                       clear my own context
+wheel usage                           my own turn/spend total and proximity to my budget, if one is set
 ```
 
 Every command prints one human line, or JSON with `--json`.
