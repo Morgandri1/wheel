@@ -81,9 +81,29 @@ function NodePlateInner({ data, selected }: NodeProps) {
           )))
         : null}
 
+      {/*
+        A wire is only ever draggable FROM a `source` handle TO a `target` handle (react-flow's own
+        rule), and this plate's rendered edge always exits/enters whichever side actually faces the
+        other node (`wire-edge.tsx`'s `floatingEndpoints`, independent of which handle was used) —
+        but with only one handle of each type, fixed left/right, a node whose facing side is the
+        FIXED side's opposite has nothing to grab there at all. The operator hit this dragging
+        tool→vault where both nodes' facing sides were on the right. Both sides now carry both
+        types, offset vertically so the two on one side don't sit exactly on top of each other; each
+        needs its own `id` because react-flow requires one once a node has more than one handle of
+        the same type.
+      */}
       <Handle
+        id="target-left"
         type="target"
         position={Position.Left}
+        style={{ top: "40%" }}
+        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
+      />
+      <Handle
+        id="source-left"
+        type="source"
+        position={Position.Left}
+        style={{ top: "60%" }}
         className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
       />
 
@@ -221,8 +241,17 @@ function NodePlateInner({ data, selected }: NodeProps) {
       ) : null}
 
       <Handle
+        id="source-right"
         type="source"
         position={Position.Right}
+        style={{ top: "40%" }}
+        className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
+      />
+      <Handle
+        id="target-right"
+        type="target"
+        position={Position.Right}
+        style={{ top: "60%" }}
         className="!h-2.5 !w-2.5 !rounded-none !border !border-rule !bg-[var(--panel-2)] !opacity-0 transition-opacity group-hover:!opacity-100"
       />
     </div>
