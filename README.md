@@ -28,6 +28,7 @@ Sign up at the API (`POST /v1/auth/signup`) or in the web app; auth is local ema
 ### 2. Locally with Docker (today)
 ```bash
 export API_MASTER_KEY=$(openssl rand -base64 32) SESSION_SECRET=$(openssl rand -base64 32)
+docker network create wheel
 docker compose -f infra/docker-compose.yml up --build      # postgres + api + host (docker sandbox backend) on :8080
 cd web && pnpm install && NEXT_PUBLIC_AUTH_MODE=local NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev   # UI on :3000
 ```
