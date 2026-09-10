@@ -9,9 +9,12 @@ Mints a dev HS256 token, creates a project, starts its sandbox, and reads the bo
 the authenticated proxy. Also exercises the two failure modes that matter most: an unauthenticated
 request, and one user reaching for another user's project.
 """
-import base64, hmac, hashlib, json, sys, time, urllib.request, urllib.error
+import base64, hmac, hashlib, json, os, sys, time, urllib.request, urllib.error
 
-API = "http://localhost:8080"
+# Same override `qa/integration/run.sh` and every suite under `qa/integration/` already honour, so
+# this script runs against whatever stack is up (a different port, a CI-assigned host) rather than
+# only ever the hardcoded default a human runs locally.
+API = os.environ.get("WHEEL_API_URL", "http://localhost:8080")
 ISSUER = "https://dev.wheel.local"
 DEV_SECRET = b"dev-only-hs256-secret"
 
