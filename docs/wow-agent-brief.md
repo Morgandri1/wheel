@@ -197,4 +197,35 @@ be code work.
 **Likely owner:** API (wheeld is API's crate territory per the ownership table), SDK if the engine-embedding side
 needs anything. QA signs off the E2E once it lands.
 
+## 8. Loop node — timed re-trigger of an agent or a tool
+
+**Operator's ask (2026-09-10), verbatim:** "Can we also add a loop node? Here's the behaviors I want it to have:
+Connected to agent: send prompt every variable ms. Connected to tool: execute specific tool every variable ms."
+
+**Goal:** a new node type that fires on a configurable interval rather than in response to a message/wire event —
+today every trigger in the system is either an inbound message, an HTTP hit (endpoint), or `run_on_startup`; there
+is no time-based trigger. A `loop` node closes that gap: wired to an agent it sends that agent a prompt every N ms
+(new `loop → agent (send)` wire matrix cell, same delivery semantics/queue as any other `send`); wired to a tool
+it invokes a specific operation every N ms (new `loop → tool (read)` cell, same execution path as `wheel tool
+call`).
+
+**Open design questions for the proposal:**
+- Config shape: `{ interval_ms: u64, prompt: string }` for the agent case — is the prompt static config, or can it
+  read from a wired ctx node (§3 ctx→agent injection precedent) so it can change without editing the loop node?
+  For the tool case, which op + args — static config, or does the loop wire to a specific `tool` operation the way
+  an endpoint wires to a script?
+- **Safety valve, non-negotiable:** a floor on `interval_ms` (protect against an agent accidentally budget-burning
+  itself into `budget_exhausted`, or a tool loop hammering an external HTTP endpoint / tripping the §3d SSRF and
+  rate-limit rules that already apply to tool calls). Needs an explicit minimum, not just "whatever the user types."
+- Lifecycle: does a loop node need `start`/`stop` like an agent (so placing one doesn't immediately start firing),
+  and does it count toward any per-project resource cap? What happens to a scheduled fire if the target agent is
+  `parked`/`stopped` or the target tool call fails — skip, queue, or retry?
+- Does a loop firing into an agent respect the same priority-lane/fairness rules as any other queued message
+  (§3c #12), or does it need its own lane so a fast loop can't starve user/agent traffic?
+
+**Likely owners:** SDK (new node type + wire matrix cells + the timer/scheduler itself — this is engine core),
+Web (loop node UI: interval + prompt/op config, start/stop). Short proposal first given it's a new node type
+touching the wire matrix and the schema (§3) — lighter-weight than portals/helper-agent since it doesn't cross
+any auth boundary, but the interval floor and budget/rate-limit interaction need to be nailed down before code.
+
 <!-- Further tasks appended as the operator provides them. -->
