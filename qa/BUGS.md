@@ -1574,3 +1574,41 @@ this job's own disposable test branch needs and nothing else does.
 
 **Status:** merged (`89ceb67`). Filed as its own entry per PM's ask, so it does not get
 re-litigated as a fresh mystery the next time someone hits it.
+
+### 043 — a deep sandbox `TMPDIR` breaks any test that binds a real unix socket (S3, QA + API, **open**)
+
+**Numbered 043, not 042** — `qa/vitest-coverage-include-gap` (PR #36) already claims 042 and is
+still unmerged at filing time; skipping ahead avoids yet another renumbering collision.
+
+**Found independently twice, same session.** I hit it verifying `wheel-cli` while adding
+copyright headers (PR #43): 5 `transport::tests::*` in `crates/wheel-cli/src/transport.rs`
+panic with `Error { kind: InvalidInput, message: "path must be shorter than SUN_LEN" }`.
+API then hit the identical failure in a different crate — `crates/wheel-host/tests/
+config_and_proxy.rs:517/535`'s `unix_transport::proxies_over_a_unix_socket_and_still_swaps_the_
+bearer` — and filed it against me with a cleaner repro than I had.
+
+**Root cause:** this sandbox's `TMPDIR` is `/tmp/wheel-scratch/<project-id>/tmp` — PR #15's
+scratch-dir convention (`CARGO_TARGET_DIR`/`TMPDIR` off the small `/data` volume), applied to
+interactive agent sessions as well as spawned children. `std::env::temp_dir()` reads `TMPDIR`,
+so any test that joins a generated filename onto it and binds an `AF_UNIX` socket there can
+exceed the ~108-byte `SUN_LEN` limit — a limit sqlite file paths (the *.db tests in the same
+files) do not have, which is why only the socket tests fail.
+
+**Confirmed environmental, not a regression, twice independently:** I reproduced the wheel-cli
+failure identically on a clean `main` checkout via `git stash` before/after my own change. API
+did the same for wheel-host around PR #40 (copyright headers there too). Both pass clean with
+`TMPDIR=/tmp`.
+
+**Why S3:** does not affect CI (GitHub Actions' runner `TMPDIR` is short), does not affect
+production (nothing here runs with a `/tmp/wheel-scratch/...`-style `TMPDIR`), and has a known
+workaround (`TMPDIR=/tmp make check`). It costs local `make check` runs in this specific
+sandbox shape, silently, until someone hits it and re-derives the same diagnosis a third time.
+
+**Likely fix (API's suggestion, sound):** the affected tests should build their unix socket
+path from a short, dedicated temp dir (e.g. `tempfile::Builder::new().prefix("ws").tempdir()`
+under `/tmp` directly, not `std::env::temp_dir()`) rather than relying on the process's
+`TMPDIR`. Scoped to the handful of tests that actually bind `AF_UNIX` sockets — `wheel-cli`'s
+`transport::tests::*` and `wheel-host`'s `unix_transport::*` (and check for a wheel-engine
+equivalent, not yet searched) — not a project-wide `TMPDIR` policy change, since PR #15's
+convention is correct for what it was built for (spawned children's build/temp output) and the
+failure here is a test harness assumption, not that convention being wrong.
