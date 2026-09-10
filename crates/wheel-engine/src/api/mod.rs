@@ -404,6 +404,14 @@ pub struct PatchNode {
 /// without also exercising `WHEEL_VAULT_KEY` parsing.
 #[cfg(test)]
 pub(crate) fn test_state() -> AppState {
+    test_state_with_harness_auth(crate::config::HarnessAuthPolicy::default())
+}
+
+/// As [`test_state`], on a deployment running a specific `WHEEL_HARNESS_AUTH`
+/// policy rather than the permissive default -- for the enforcement points in
+/// wheel-harness-auth.md that only differ under `api-key-only`.
+#[cfg(test)]
+pub(crate) fn test_state_with_harness_auth(policy: crate::config::HarnessAuthPolicy) -> AppState {
     use base64::Engine;
 
     let cfg = Arc::new(Config {
@@ -415,7 +423,7 @@ pub(crate) fn test_state() -> AppState {
         json_logs: false,
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
-        harness_auth: crate::config::HarnessAuthPolicy::default(),
+        harness_auth: policy,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());

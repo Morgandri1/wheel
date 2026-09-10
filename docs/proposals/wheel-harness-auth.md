@@ -179,7 +179,13 @@ spawn gate, not as a follow-up:
 
 ## Owners
 
-SDK: `classify_token`/spawn-time check extensions in `wheel-engine` (points 2 and 4 above are already
-adjacent to code SDK owns). API: `auth/begin` offer-suppression and vault `PUT` rejection (points 1 and
-3, both in routes API owns per the ownership table), plus the `wheel-host` project-id allowlist for
-task 4. Both halves are additive to existing routes, not new ones — no schema/wire-matrix change.
+**Correction (2026-09-10, API caught this before task 4 code depended on it):** all four enforcement points
+live in `crates/wheel-engine` — `agent_routes.rs` and `vault_routes.rs` are SDK's crate, not wheel-api. The
+paragraph below originally split 1/3 to "API" by conflating the contract's ownership TABLE (which lists API as
+the conceptual owner of the auth/vault API surface) with actual file location; `wheel-api` only proxies
+`/v1/projects/:id/engine/*` verbatim (`wheel-api/src/routes/proxy.rs`) and has no layer that parses or gates an
+engine request body, so there was never a wheel-api-side home for a pre-check here. All four points shipped in
+`wheel-engine`: point 4 in 872ac31, points 1-3 following it.
+
+SDK: all four enforcement points, in `wheel-engine`. API: the `wheel-host` project-id allowlist for task 4
+(unaffected by this correction — it lives in `wheel-host`, which IS API's crate). No schema/wire-matrix change.

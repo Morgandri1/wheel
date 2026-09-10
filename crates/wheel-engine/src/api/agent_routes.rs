@@ -337,10 +337,30 @@ pub async fn auth_complete(
     Json(body): Json<AuthComplete>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let harness = agent_harness(&s, id)?;
+    // docs/proposals/wheel-harness-auth.md, enforcement point 2. `code` and
+    // `setup_token` are OAuth-shaped BY WHICH FIELD THE CALLER USED, not by
+    // inspecting a value -- a paste-code login has no value to classify yet,
+    // and a setup_token IS the long-lived OAuth credential type regardless of
+    // its actual bytes. `api_key` is checked below, after a value exists to
+    // classify.
+    let api_key_only = s.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly;
+    let harness_auth_refusal = |what: &str| {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "harness_auth_policy",
+            format!(
+                "this project is api-key-only: {what} is an OAuth-shaped credential and is not \
+                 permitted here, submit an api_key instead"
+            ),
+        ))
+    };
 
     // Paste-code OAuth: the code goes to the child that `auth/begin` left
     // waiting, and the CLI writes its own credentials into the node's dir.
     if let Some(code) = body.code {
+        if api_key_only {
+            return harness_auth_refusal("a paste-code login");
+        }
         return finish_paste_code(
             &s,
             id,
@@ -354,6 +374,9 @@ pub async fn auth_complete(
     }
 
     if let Some(token) = body.setup_token {
+        if api_key_only {
+            return harness_auth_refusal("a setup_token");
+        }
         return finish_setup_token(
             &s,
             id,
@@ -374,6 +397,14 @@ pub async fn auth_complete(
              or code (paste-code OAuth)",
         ));
     };
+    // The value itself, not the field name, decides here -- `api_key` is
+    // where an operator or a self-provisioning agent would try to slip an
+    // `sk-ant-oat` value past the two checks above.
+    if api_key_only
+        && crate::auth::classify_token(&key, harness) == wheel_core::CredentialKind::OauthToken
+    {
+        return harness_auth_refusal("that value");
+    }
 
     let config_dir = s.cfg.creds_dir().join(id.to_string());
     let kind = crate::auth::store_token(&config_dir, &key, harness)
@@ -560,6 +591,22 @@ pub async fn auth_begin(
         return Err(ApiError::invalid(
             "codex uses device-code login, which is not implemented yet; \
              use auth/complete with an api_key for now",
+        ));
+    }
+    // docs/proposals/wheel-harness-auth.md, enforcement point 1: under
+    // api-key-only, never OFFER the OAuth flow at all -- better UX than
+    // starting a login the operator cannot finish (point 2 refuses it at
+    // `auth/complete` too, but a half-started login with nowhere to go is
+    // worse than not starting one). The real gate an agent's own shell
+    // cannot route around is spawn (point 4, already enforced); this and
+    // point 2 exist so the API-mediated paths fail fast with a clear reason
+    // instead of a credential that spawn later refuses to use.
+    if s.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "harness_auth_policy",
+            "this project is api-key-only: OAuth login is not offered here, use \
+             auth/complete with an api_key instead",
         ));
     }
 
@@ -980,5 +1027,181 @@ mod tests {
             warning.contains(" / "),
             "the two warnings must be joined with \" / \", not concatenated or replaced: {warning}"
         );
+    }
+
+    /// docs/proposals/wheel-harness-auth.md, enforcement points 1-2. These
+    /// were the actual gap API caught: only the spawn gate (point 4) had
+    /// landed, and agent_routes.rs had zero references to harness_auth at
+    /// all before this.
+    #[cfg(test)]
+    mod api_key_only_tests {
+        use super::*;
+
+        fn claude_agent() -> (AppState, Uuid) {
+            let state = crate::api::test_state_with_harness_auth(
+                crate::config::HarnessAuthPolicy::ApiKeyOnly,
+            );
+            let id = {
+                let conn = state.db.lock().unwrap();
+                mk(
+                    &conn,
+                    "agent",
+                    NodeConfig::Agent(AgentConfig {
+                        harness: wheel_core::Harness::Claude,
+                        ..Default::default()
+                    }),
+                )
+            };
+            (state, id)
+        }
+
+        /// Point 1: never offer the OAuth flow under api-key-only, rather
+        /// than starting a login the operator cannot finish.
+        #[tokio::test]
+        async fn auth_begin_refuses_to_offer_oauth_under_api_key_only() {
+            let (state, id) = claude_agent();
+            let err = auth_begin(State(state), Path(id))
+                .await
+                .expect_err("must not offer a paste-code login here");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert!(
+                format!("{err:?}").contains("api-key-only"),
+                "the refusal must name the policy: {err:?}"
+            );
+        }
+
+        /// Point 2, the `code` field: refused before ever touching the login
+        /// session, since `auth/begin` never should have offered one.
+        #[tokio::test]
+        async fn auth_complete_refuses_a_paste_code_under_api_key_only() {
+            let (state, id) = claude_agent();
+            let err = auth_complete(
+                State(state),
+                Path(id),
+                Json(AuthComplete {
+                    api_key: None,
+                    code: Some("some-code".into()),
+                    session: None,
+                    setup_token: None,
+                    save_to_vault: None,
+                    vault_key: None,
+                    allow_shared_expiry: false,
+                }),
+            )
+            .await
+            .expect_err("a paste-code login must be refused here");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "harness_auth_policy");
+        }
+
+        /// Point 2, the `setup_token` field: refused by WHICH FIELD was used,
+        /// not by inspecting the value -- a setup_token IS the long-lived
+        /// OAuth type regardless of its literal bytes.
+        #[tokio::test]
+        async fn auth_complete_refuses_a_setup_token_under_api_key_only() {
+            let (state, id) = claude_agent();
+            let err = auth_complete(
+                State(state),
+                Path(id),
+                Json(AuthComplete {
+                    api_key: None,
+                    code: None,
+                    session: None,
+                    setup_token: Some("sk-ant-oat01-anything".into()),
+                    save_to_vault: None,
+                    vault_key: None,
+                    allow_shared_expiry: false,
+                }),
+            )
+            .await
+            .expect_err("a setup_token must be refused here regardless of its value");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        /// Point 2, the `api_key` field: this is the one refused by VALUE --
+        /// an operator or a self-provisioning agent could otherwise slip an
+        /// OAuth-shaped credential past the two field-based checks above by
+        /// simply naming it `api_key` instead.
+        #[tokio::test]
+        async fn auth_complete_refuses_an_oauth_shaped_api_key_under_api_key_only() {
+            let (state, id) = claude_agent();
+            let err = auth_complete(
+                State(state),
+                Path(id),
+                Json(AuthComplete {
+                    api_key: Some("sk-ant-oat01-smuggled".into()),
+                    code: None,
+                    session: None,
+                    setup_token: None,
+                    save_to_vault: None,
+                    vault_key: None,
+                    allow_shared_expiry: false,
+                }),
+            )
+            .await
+            .expect_err("an OAuth-shaped value must be refused however it is submitted");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+        }
+
+        /// The policy must not be a blanket refusal: a real API key still
+        /// authenticates the agent normally.
+        #[tokio::test]
+        async fn auth_complete_still_accepts_a_real_api_key_under_api_key_only() {
+            let (state, id) = claude_agent();
+            let resp = auth_complete(
+                State(state),
+                Path(id),
+                Json(AuthComplete {
+                    api_key: Some("sk-ant-api03-real".into()),
+                    code: None,
+                    session: None,
+                    setup_token: None,
+                    save_to_vault: None,
+                    vault_key: None,
+                    allow_shared_expiry: false,
+                }),
+            )
+            .await
+            .expect("a real api key must not be refused");
+            assert_eq!(resp["authenticated"], true);
+        }
+
+        /// A board with no policy set at all (the permissive default) must
+        /// keep accepting every path exactly as it does today.
+        #[tokio::test]
+        async fn no_policy_set_still_offers_and_accepts_oauth() {
+            let state = crate::api::test_state();
+            let id = {
+                let conn = state.db.lock().unwrap();
+                mk(
+                    &conn,
+                    "agent",
+                    NodeConfig::Agent(AgentConfig {
+                        harness: wheel_core::Harness::Claude,
+                        ..Default::default()
+                    }),
+                )
+            };
+            assert!(
+                auth_begin(State(state.clone()), Path(id)).await.is_ok(),
+                "the permissive default must keep offering the OAuth flow"
+            );
+            let resp = auth_complete(
+                State(state),
+                Path(id),
+                Json(AuthComplete {
+                    api_key: Some("sk-ant-oat01-fine-here".into()),
+                    code: None,
+                    session: None,
+                    setup_token: None,
+                    save_to_vault: None,
+                    vault_key: None,
+                    allow_shared_expiry: false,
+                }),
+            )
+            .await
+            .expect("an OAuth-shaped value must still be accepted with no policy set");
+            assert_eq!(resp["authenticated"], true);
+        }
     }
 }

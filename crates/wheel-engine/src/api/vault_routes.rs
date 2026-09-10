@@ -46,6 +46,22 @@ pub async fn put_value(
         // nothing, which is the worst of both.
         return Err(ApiError::invalid("an empty value is not a secret"));
     }
+    // docs/proposals/wheel-harness-auth.md, enforcement point 3. A vault has
+    // no harness of its own -- any agent that later wires to it might be
+    // Claude or codex -- but the `sk-ant-oat` prefix is unambiguous regardless
+    // of who eventually reads the key, so `Harness::Claude` here is a
+    // deliberate constant for the shape check, not a claim about the reader.
+    if s.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly
+        && crate::auth::classify_token(&body.value, wheel_core::Harness::Claude)
+            == wheel_core::CredentialKind::OauthToken
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "harness_auth_policy",
+            "this project is api-key-only: that value is an OAuth-shaped credential (sk-ant-oat) \
+             and is not permitted in a vault here",
+        ));
+    }
 
     let warning = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
@@ -351,5 +367,50 @@ mod tests {
         .await
         .expect_err("a second vault actually holding the same key must still be refused");
         assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// docs/proposals/wheel-harness-auth.md, enforcement point 3.
+    #[tokio::test]
+    async fn an_oauth_shaped_value_is_refused_under_api_key_only() {
+        let state =
+            crate::api::test_state_with_harness_auth(crate::config::HarnessAuthPolicy::ApiKeyOnly);
+        let v = {
+            let conn = state.db.lock().unwrap();
+            mk(&conn, "v", NodeConfig::Vault(VaultConfig { keys: vec![] }))
+        };
+
+        let err = put_value(
+            State(state),
+            Path((v, "CLAUDE_CODE_OAUTH_TOKEN".to_string())),
+            Json(PutValue {
+                value: "sk-ant-oat01-smuggled".into(),
+            }),
+        )
+        .await
+        .expect_err("an OAuth-shaped value must be refused under api-key-only");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "harness_auth_policy");
+    }
+
+    /// The policy must not be a blanket refusal on ordinary values.
+    #[tokio::test]
+    async fn a_normal_value_is_unaffected_by_api_key_only() {
+        let state =
+            crate::api::test_state_with_harness_auth(crate::config::HarnessAuthPolicy::ApiKeyOnly);
+        let v = {
+            let conn = state.db.lock().unwrap();
+            mk(&conn, "v", NodeConfig::Vault(VaultConfig { keys: vec![] }))
+        };
+
+        let resp = put_value(
+            State(state),
+            Path((v, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-real".into(),
+            }),
+        )
+        .await
+        .expect("an ordinary value must not be refused");
+        assert_eq!(resp["stored"], true);
     }
 }
