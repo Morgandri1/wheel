@@ -61,7 +61,10 @@ mode? what happens on a board that has only the OAuth token set (graceful defaul
 **Likely owners:** SDK (engine: env plumbing + harness spawn), with API if the selector is surfaced through the
 project API.
 
-## 3. Board templates on the website
+## 3. Board templates on the website — **DONE**, shipped
+
+Shipped end to end: `public/workflow_templates` gate + parsing (PR #30), gallery lib (#33), gallery UI (#34),
+`POST /v1/projects/instantiate` (#35). Kept below for context/traceability, not an open task.
 
 **Goal:** the website offers ready-made workflow *templates* a user can instantiate as their own wheel-hosted
 project — pick a template, get a project pre-populated with its nodes and wires, then edit. Turns the empty grid
