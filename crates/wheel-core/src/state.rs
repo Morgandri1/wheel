@@ -93,6 +93,12 @@ pub struct AgentState {
     /// Observed spend, from the harness's usage events. Drives `budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<Spend>,
+    /// How close `spend` is to this agent's configured `budget`, if it has
+    /// one. `None` means no budget is set at all -- distinct from a `Some`
+    /// with both percentages absent, so a reader does not have to inspect
+    /// the struct's insides to tell "no budget" from "nothing computed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_status: Option<BudgetStatus>,
 }
 
 /// Accumulated cost for an agent's current lifetime.
@@ -102,6 +108,53 @@ pub struct Spend {
     pub turns: u64,
     #[serde(default)]
     pub usd: f64,
+}
+
+/// docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET
+/// /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board`
+/// for the UI -- one computation, two callers, so the CLI and the board can
+/// never disagree about what "80% of budget" means.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, Default)]
+pub struct BudgetStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct_of_max_turns: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct_of_max_usd: Option<f64>,
+}
+
+impl BudgetStatus {
+    /// `None` when no budget is configured -- an agent with no ceiling has
+    /// spend but nothing to divide it by, which is the truth rather than a
+    /// fabricated 0%.
+    pub fn compute(spend: Spend, budget: Option<crate::node::Budget>) -> Option<Self> {
+        let budget = budget?;
+        if budget.max_turns.is_none() && budget.max_usd.is_none() {
+            return None;
+        }
+        Some(Self {
+            max_turns: budget.max_turns,
+            pct_of_max_turns: budget
+                .max_turns
+                .map(|m| pct_of(spend.turns as f64, m as f64)),
+            max_usd: budget.max_usd,
+            pct_of_max_usd: budget.max_usd.map(|m| pct_of(spend.usd, m)),
+        })
+    }
+}
+
+/// A ceiling of zero is "already at the limit" (`100.0`), not a divide-by-zero
+/// `NaN` -- `serde_json` cannot represent `NaN` and would silently turn it
+/// into `null`, which reads as "unknown" rather than "exceeded".
+fn pct_of(spend: f64, max: f64) -> f64 {
+    if max <= 0.0 {
+        100.0
+    } else {
+        ((spend / max) * 100.0 * 10.0).round() / 10.0
+    }
 }
 
 /// `state` as reported next to a node on `GET /v1/board`. Only agent nodes

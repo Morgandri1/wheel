@@ -348,6 +348,41 @@
       },
       "additionalProperties": false
     },
+    "BudgetStatus": {
+      "description": "docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what \"80% of budget\" means.",
+      "type": "object",
+      "properties": {
+        "max_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "pct_of_max_turns": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "pct_of_max_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
     "ChestConfig": {
       "description": "Chest has no configuration; its content lives on disk under `/data/chest/<node_id>/` and is indexed in sqlite.",
       "type": "object",
@@ -679,6 +714,17 @@
             "status"
           ],
           "properties": {
+            "budget_status": {
+              "description": "How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell \"no budget\" from \"nothing computed\".",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/BudgetStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "hosted_on": {
               "description": "Where this agent's process lives: `\"cloud\"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.",
               "default": null,
