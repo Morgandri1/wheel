@@ -9,6 +9,14 @@ green, PM merges, every implementation passes adversarial review + QA at ≥90% 
 
 ## 1. Portals — inter-workflow communication
 
+**Operator clarification (2026-09-10):** "Portals are really just internal networking endpoints and tools being
+combined. That's all it's supposed to be anyway." Read this as de-scoping guidance: don't build a new cross-project
+messaging primitive from scratch — compose from what already exists. A portal's **in** side is an `endpoint` node
+(§3 config, already the thing that turns an HTTP hit into a delivered message) reachable from a peer project
+instead of only public ingress; its **out** side is closer to a `tool` node (§3d, already "call this other HTTP
+surface, typed, wire-gated") pointed at a peer's in-portal. Prefer extending those two existing node types /
+routing paths over inventing a third, if the design holds up — say explicitly in the proposal if it doesn't.
+
 **Goal:** let one project's board communicate with another's. Today every wire is intra-project; a *portal* is the
 node (or wire class) that carries a `send`/`read` across the project boundary, so a workflow can hand work to, or
 read a result from, a different workflow.
