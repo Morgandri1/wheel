@@ -57,7 +57,7 @@ wants the helper to read one specific vault still can, by hand-drawing that one 
 any other agent — that is an explicit, visible, single decision, categorically different from an automatic
 carve-in.
 
-### Manage capability: lifecycle only, never a peer's prompt content
+### Manage capability: an allowlist (position + lifecycle only), never any peer config content
 
 **Adversary anchor 2, addressed directly**: if `agent → agent, write` (manage: start/stop/restart/update/remove,
 per §3e) is in the helper's wire set, "update" on a peer agent includes changing that peer's `system_prompt` —
@@ -66,16 +66,26 @@ into someone else's config after inferring what the user "probably" wants that o
 engine cannot verify "the helper copied the user's words verbatim into agent X's prompt" versus "the helper
 paraphrased/extended them" — that is not a checkable property at the API boundary.
 
-**Proposed resolution: the helper's `manage` wire is real but field-scoped.** A helper's `update` on a peer
-agent may change `position` and may call `start`/`stop`/`restart`/`clear` (lifecycle, not content), but the
-underlying `PATCH /v1/nodes/:id` path taken via the helper's tool surface refuses (400) any patch that touches
-`config.system_prompt` on an agent the helper does not itself own (i.e., did not place). This is enforced the
-same place `patch_node`'s existing merge-patch validation already runs (`board_routes.rs`), as an additional
-check gated on "caller is a helper AND target is not `owner_node == caller`" — an ordinary agent's `write` wire
-to another agent is unaffected; this restriction is specific to the helper role, because the helper is the only
-agent type this proposal grants blanket manage-everything to. A helper managing an agent it PLACED ITSELF (via
-its own `place` call, this session) may still set that new agent's prompt at CREATION time — the risk the anchor
-names is rewriting an EXISTING peer's identity mid-operation, not authoring a new one the user asked for.
+**Proposed resolution: the helper's `manage` wire is real but field-scoped, by an ALLOWLIST, not a denylist**
+(PM's review — closing an ambiguity in an earlier draft of this section, which named only `system_prompt` as
+refused and left every other config field's status implicit). Anchor 2's concern is not specific to prompts: a
+helper inferring what it "probably" should write into a peer's `budget`, `workspaces`, `harness`, or any other
+config field is the identical unverifiable-inference problem, just aimed at a different key. Naming prompts
+alone and leaving the rest implicit would have reintroduced the same gap one field at a time as this ships.
+
+**The allowlist, for a peer agent the helper does not own (did not itself `place`), is exactly two things:**
+`position` (layout only — no semantic content) via `PATCH /v1/nodes/:id`, and the four pure-lifecycle POST
+routes (`start`/`stop`/`restart`/`clear`, which carry no body the helper could inject content through at all).
+**Everything else in `config` — `system_prompt`, `budget`, `workspaces`, `harness`, `model`,
+`idle_timeout_secs`, `ephemeral_context`, `run_on_startup`, all of it — is refused (400) on a PATCH to a peer
+agent the helper does not own,** enforced the same place `patch_node`'s existing merge-patch validation already
+runs (`board_routes.rs`), as an additional check gated on "caller is a helper AND target is not
+`owner_node == caller`". An ordinary agent's `write` wire to another agent is unaffected — this restriction is
+specific to the helper role, because the helper is the only agent type this proposal grants blanket
+manage-everything to, and blanket capability is exactly the case an allowlist (not a growing denylist) has to
+bound. A helper managing an agent it PLACED ITSELF (via its own `place` call, this session) may still set that
+new agent's FULL config at CREATION time — the risk the anchor names is rewriting an EXISTING peer's identity
+mid-operation, not authoring a new one the user asked for.
 
 ### Placement: a real, unavoidable consent gate
 
@@ -143,8 +153,9 @@ of it.
 
 - **Project-level flag vs. real auto-generated wires?** Real wires, kept live via create-time hooks — settled
   above (anchor 1).
-- **Does write-access extend to other agents (manage)?** Yes, but field-scoped to lifecycle actions, explicitly
-  excluding a peer's `system_prompt` — settled above (anchor 2).
+- **Does write-access extend to other agents (manage)?** Yes, but bounded by an ALLOWLIST — `position` plus the
+  four lifecycle routes only, on a peer the helper does not own; every other config field is refused, not only
+  `system_prompt` — settled above (anchor 2).
 - **One node type/kind, or a template?** A discriminant field (`AgentConfig.role`), not a template — templates
   cannot auto-cover future nodes — settled above.
 - **How is it kept from being the most dangerous node on the board?** The sum of: real per-wire revocability
