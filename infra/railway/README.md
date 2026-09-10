@@ -88,7 +88,22 @@ Set in the Railway dashboard or with `railway variables --set`, never in git.
 `https://wheel.dev,https://www.wheel.dev,https://wheel-2708.vercel.app`).
 
 `wheel-host`: `WHEEL_HOST_SECRET` (same value as the API's), `SANDBOX_BACKEND=process`,
-`WHEEL_DATA_DIR=/data`, volume mounted at `/data`.
+`WHEEL_DATA_DIR=/data`, volume mounted at `/data`, `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` (see below).
+
+### `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` — the operator exception (wow-agent-brief task 4)
+
+Comma-separated project ids. `wheel-host` spawns every project's engine with
+`WHEEL_HARNESS_AUTH=api-key-only` **except** the ids listed here, which get `oauth-token`
+(`docs/proposals/wheeld-first-class-cloud-api-key-policy.md`). Cloud is API-key-only by policy; the
+only sanctioned exception is the operator's own board (project `6906cadb-…`), which stays on the
+OAuth-token path per M1.6/M1.7. Unset or empty means the allowlist is empty, not unrestricted — a
+missing value here must never be the reason an unintended board gets the OAuth-eligible path, so set
+it explicitly on this deployment rather than relying on a default. A malformed entry fails
+`wheel-host`'s boot naming the bad token, the same as every other misconfigured var here.
+
+This is host config, not a database column or anything a project's own owner can reach through the
+project API — changing it means redeploying `wheel-host` itself, which only whoever controls this
+Railway service can do.
 
 ## Pruning probe projects
 

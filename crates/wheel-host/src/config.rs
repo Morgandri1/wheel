@@ -53,6 +53,11 @@ pub struct Config {
     pub reconcile_concurrency: usize,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
+    /// Project ids whose engines get `WHEEL_HARNESS_AUTH=oauth-token` instead of the fail-secure
+    /// `api-key-only` every other project gets (`docs/proposals/wheeld-first-class-cloud-api-key-
+    /// policy.md`, wow-agent-brief task 4). Deliberately host config, never a project-reachable
+    /// value — see [`Config::harness_auth_for`].
+    pub oauth_allowed_projects: Vec<uuid::Uuid>,
 }
 
 fn var(k: &str) -> Result<String> {
@@ -68,6 +73,27 @@ fn parse_or<T: std::str::FromStr>(k: &str, d: T) -> Result<T> {
             .map_err(|_| anyhow::anyhow!("{k} is not a valid {}", std::any::type_name::<T>())),
         Err(_) => Ok(d),
     }
+}
+
+/// `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS`: comma-separated project ids, empty/unset meaning "none" —
+/// never "not configured, so allow everything." A malformed entry fails the boot naming the exact
+/// token, the same discipline `crates/wheel-engine/src/config.rs`'s `harness_auth()` already uses
+/// for the env var this one gates: a typo that silently dropped an id would look identical to "the
+/// operator successfully exempted this project" right up until it doesn't.
+fn parse_oauth_allowlist() -> Result<Vec<uuid::Uuid>> {
+    let raw = var_or("WHEEL_HARNESS_AUTH_OAUTH_PROJECTS", "");
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<uuid::Uuid>().map_err(|_| {
+                anyhow::anyhow!(
+                    "WHEEL_HARNESS_AUTH_OAUTH_PROJECTS contains {s:?}, which is not a valid \
+                     project id (uuid)"
+                )
+            })
+        })
+        .collect()
 }
 
 impl Config {
@@ -157,6 +183,7 @@ impl Config {
             disk_floor_mb: parse_or("DISK_FLOOR_MB", 256u64)?,
             reconcile_concurrency: parse_or("RECONCILE_CONCURRENCY", 8usize)?,
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
+            oauth_allowed_projects: parse_oauth_allowlist()?,
         })
     }
 
@@ -188,6 +215,7 @@ impl Config {
             disk_floor_mb: 1,
             reconcile_concurrency: 8,
             engine_base_url: "http://127.0.0.1:7000".into(),
+            oauth_allowed_projects: Vec::new(),
         }
     }
 
@@ -199,5 +227,55 @@ impl Config {
     }
     pub fn engine_url(&self, id: &uuid::Uuid) -> String {
         format!("http://wheel-p-{}:{}", id, self.engine_port)
+    }
+
+    /// The `WHEEL_HARNESS_AUTH` value this project's engine should be spawned with
+    /// (`docs/proposals/wheeld-first-class-cloud-api-key-policy.md`). Fail-secure: a project not on
+    /// the allowlist — including an unconfigured allowlist — gets `api-key-only`. `wheel-host` is
+    /// the cloud side of this policy; `wheeld` (self-hosted) never calls this at all and keeps the
+    /// engine's own permissive default.
+    ///
+    /// ADVERSARY (task-4 review): whether a redeployed allowlist takes effect immediately depends
+    /// on the backend, not on this method — it is pure and re-evaluated on every call. `process`
+    /// (production) calls it fresh from `engine_env()` on every single spawn, so a start right
+    /// after a `wheel-host` redeploy already sees the new list. `docker` (local dev) bakes env into
+    /// the container at `create()` and `start`/`restart` reuse that existing container without
+    /// recreating it (`provisioning_an_existing_container_does_not_recreate_it`) — an already-
+    /// running docker-backed project keeps its value until the container is destroyed and
+    /// reprovisioned. Same class of staleness `WHEEL_PROJECT_ID` and everything else in that env
+    /// already has; not new here, and not a path production runs (production is `process`).
+    pub fn harness_auth_for(&self, id: &uuid::Uuid) -> &'static str {
+        if self.oauth_allowed_projects.contains(id) {
+            "oauth-token"
+        } else {
+            "api-key-only"
+        }
+    }
+}
+
+// Env-var parsing (`WHEEL_HARNESS_AUTH_OAUTH_PROJECTS`, including the boot-failure case) is
+// covered in `tests/config_env.rs`'s single sequenced test, alongside every other `Config::from_env`
+// case — env vars are process-global, so this crate keeps one test function for them rather than
+// several that would race each other. `harness_auth_for` itself takes an already-parsed `Vec`, so
+// its tests need no env at all and live here as ordinary unit tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_auth_for_is_oauth_token_only_for_a_listed_id() {
+        let allowed = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut cfg = Config::for_tests("/tmp/irrelevant");
+        cfg.oauth_allowed_projects = vec![allowed];
+        assert_eq!(cfg.harness_auth_for(&allowed), "oauth-token");
+        assert_eq!(cfg.harness_auth_for(&other), "api-key-only");
+    }
+
+    #[test]
+    fn an_empty_allowlist_is_api_key_only_for_everyone_fail_secure() {
+        let cfg = Config::for_tests("/tmp/irrelevant");
+        assert!(cfg.oauth_allowed_projects.is_empty());
+        assert_eq!(cfg.harness_auth_for(&uuid::Uuid::new_v4()), "api-key-only");
     }
 }
