@@ -135,6 +135,24 @@ placing a node must never be indistinguishable from deliberately activating it. 
   create 50 of already includes this one; a loop firing every 30s is not categorically more dangerous than an
   agent that never idles, and both are already bounded by that cap plus their own budget/rate limits.
 
+### Revocation is live, not cached (adversary's sharpened question — answered explicitly)
+
+**The fire logic looks up the loop's current outgoing wire fresh, immediately before firing, on every single
+tick — it never resolves or caches a target node id at `start` and fires at that id forever after.** This is not
+new behavior invented for the failure case below; it is the same principle every other capability check in this
+engine already follows (`me.reachable`/`wire_views` are read live per call, never snapshotted; `deliver` and
+tool execution re-check the caller's wire before acting, not once at some earlier point) — a wire's presence is
+the ENTIRE authorization for the action it gates, checked at the moment of the action, or revoking it would not
+actually mean anything.
+
+Concretely, this closes the exact gap adversary named: an operator removing the `loop → agent (send)` or
+`loop → tool (read)` wire IS the revoke action, and it takes effect on the very next tick — the loop cannot fire
+using an authorization the board no longer grants, because the check that would let it fire is re-done from
+scratch every time, not carried forward from an earlier one. The only latency between revoke and effect is
+bounded by one tick interval (the loop is asleep between ticks; it is never mid-fire on a stale wire, since the
+wire is read at the instant firing would begin) — the same latency any live-checked-per-action system has
+relative to a concurrent revoke, not an authorization bypass.
+
 ### Failure handling: queue for agents (free), skip-and-log for tools (deliberate)
 
 - **Target is an agent, and it's parked/stopped**: nothing new — `supervisor.deliver` on a stopped/parked agent
@@ -146,12 +164,12 @@ placing a node must never be indistinguishable from deliberately activating it. 
   "hammering" case the floor exists to prevent, and the next scheduled fire IS the retry, on the cadence the
   operator already chose.
 - **Target no longer exists** (PM's review question — the wired agent/tool node, or just the wire, was deleted
-  while the loop kept ticking): the timer re-resolves the loop's OWN outgoing wire fresh from the board on every
-  tick — it never caches a target node id at start time, the same reason `wire_views`/`me.reachable` are always
-  read live rather than snapshotted. So a tick that finds no legal `send`/`read` wire off the loop is not an
-  execution failure (there is nothing to call), and treating it as "skip and retry next tick" would leave a
-  now-purposeless loop ticking forever with nothing to show for it — silently, since nothing about a normal tick
-  cycle is visible on its own. **Proposed: that tick auto-stops the loop** (`LoopStatus::Running → Stopped`) and
+  while the loop kept ticking): per "Revocation is live, not cached" above, the fire logic already re-resolves
+  the wire fresh every tick, so this case is simply the wire lookup coming back empty. A tick that finds no
+  legal `send`/`read` wire off the loop is not an execution failure (there is nothing to call), and treating it
+  as "skip and retry next tick" would leave a now-purposeless loop ticking forever with nothing to show for it —
+  silently, since nothing about a normal tick cycle is visible on its own. **Proposed: that tick auto-stops the
+  loop** (`LoopStatus::Running → Stopped`) and
   records the reason on a `last_error: Option<String>` field (mirroring `AgentState.last_error`, so the UI has an
   existing pattern to render this with) — `"stopped: no agent/tool wire found to fire into"`. This is a
   DELIBERATE state transition, not a crash or a silent no-op: the operator sees a stopped loop with a reason
