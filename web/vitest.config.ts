@@ -42,6 +42,7 @@ export default defineConfig({
         "src/lib/endpoint-reach.ts",
         "src/lib/templates.ts",
         "src/components/templates/template-gallery.tsx",
+        "src/lib/budget-status.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },

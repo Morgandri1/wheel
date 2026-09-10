@@ -144,6 +144,41 @@ describe("the endpoint panel, specifically", () => {
   });
 });
 
+describe("the agent panel's budget usage (wow-agent-brief.md #6)", () => {
+  function agentWithState(state: Record<string, unknown> | null): WheelNode {
+    return { ...node("agent"), state } as WheelNode;
+  }
+
+  it("shows nothing when the agent has no budget configured", () => {
+    renderInspector(agentWithState({ kind: "agent", status: "idle" }));
+    expect(screen.queryByTestId("agent-budget-usage")).toBeNull();
+  });
+
+  it("shows spend against the ceiling once SDK's budget_status is present", () => {
+    renderInspector(
+      agentWithState({
+        kind: "agent",
+        status: "idle",
+        spend: { turns: 3, usd: 0 },
+        budget_status: { max_turns: 10, pct_of_max_turns: 30 },
+      }),
+    );
+    expect(screen.getByTestId("agent-budget-usage-turns").textContent).toBe("3 / 10 turns");
+  });
+
+  it("colours a near-limit line as a warning", () => {
+    renderInspector(
+      agentWithState({
+        kind: "agent",
+        status: "idle",
+        spend: { turns: 9, usd: 0 },
+        budget_status: { max_turns: 10, pct_of_max_turns: 90 },
+      }),
+    );
+    expect(screen.getByTestId("agent-budget-usage-turns").style.color).toBe("var(--danger)");
+  });
+});
+
 describe("PanelBoundary", () => {
   function Boom(): React.ReactNode {
     throw new Error("field went missing");
