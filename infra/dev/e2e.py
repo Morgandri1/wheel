@@ -5,31 +5,16 @@
 
 """End-to-end proof of the API -> host -> engine chain.
 
-Mints a dev HS256 token, creates a project, starts its sandbox, and reads the board back through
-the authenticated proxy. Also exercises the two failure modes that matter most: an unauthenticated
-request, and one user reaching for another user's project.
+Signs up two throwaway users, creates a project, starts its sandbox, and reads the board back
+through the authenticated proxy. Also exercises the two failure modes that matter most: an
+unauthenticated request, and one user reaching for another user's project.
 """
-import base64, hmac, hashlib, json, os, sys, time, urllib.request, urllib.error
+import json, os, sys, urllib.request, urllib.error, uuid
 
 # Same override `qa/integration/run.sh` and every suite under `qa/integration/` already honour, so
 # this script runs against whatever stack is up (a different port, a CI-assigned host) rather than
 # only ever the hardcoded default a human runs locally.
 API = os.environ.get("WHEEL_API_URL", "http://localhost:8080")
-ISSUER = "https://dev.wheel.local"
-DEV_SECRET = b"dev-only-hs256-secret"
-
-
-def b64u(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def mint(sub: str) -> str:
-    header = b64u(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    now = int(time.time())
-    payload = b64u(json.dumps({"sub": sub, "iss": ISSUER, "exp": now + 3600, "nbf": now - 60}).encode())
-    signing_input = f"{header}.{payload}".encode()
-    sig = b64u(hmac.new(DEV_SECRET, signing_input, hashlib.sha256).digest())
-    return f"{header}.{payload}.{sig}"
 
 
 def call(method, path, token=None, body=None):
@@ -57,7 +42,22 @@ def check(label, cond, detail=""):
     return cond
 
 
-alice, mallory = mint("user_alice"), mint("user_mallory")
+def signup() -> str:
+    """A real session token from `/v1/auth/signup` (docs/API.md), the only kind the local auth
+    backend accepts. Docker-compose's api service runs AUTH_MODE=local (unset defaults there, per
+    config.rs), so a hand-minted HS256 JWT for the jwks/dev-bypass path was never actually verified
+    here — it only looked like it worked because this script's own PASS/FAIL output never matched
+    run.sh's result-line regex, so a 401 on every run went unnoticed until that regex was fixed.
+    A random email per run avoids a 409 against a store that persists between runs."""
+    email = f"e2e-{uuid.uuid4()}@wheel.test"
+    status, body = call("POST", "/v1/auth/signup", body={"email": email, "password": "Correct-Horse-9!"})
+    if status != 201:
+        print(f"FAIL  signup ({email}) — {(status, body)}")
+        sys.exit(1)
+    return body["token"]
+
+
+alice, mallory = signup(), signup()
 ok = True
 
 status, health = call("GET", "/healthz")
