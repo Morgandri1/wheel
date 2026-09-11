@@ -158,6 +158,14 @@ fn a_fresh_data_dir_boots_headless_with_a_working_operator_token() {
         )
     );
 
+    // Reachable from this machine only, signup stays open: a laptop user is never locked out.
+    let signup = reqwest::blocking::Client::new()
+        .post(format!("{}/v1/auth/signup", daemon.base))
+        .json(&serde_json::json!({"email": "local@example.test", "password": "Correct-Horse-9!"}))
+        .send()
+        .unwrap();
+    assert_eq!(signup.status().as_u16(), 201);
+
     // DNS rebinding: the page's own name arrives as the Host, and is refused.
     assert_eq!(
         daemon.status(
@@ -223,7 +231,6 @@ fn an_exposed_bind_says_so_and_a_closed_signup_is_closed() {
             &format!("0.0.0.0:{port}"),
         ],
         &[
-            ("WHEEL_SIGNUP", "closed"),
             ("PUBLIC_BASE_URL", "https://wheel.example"),
             ("WHEEL_TRUSTED_PROXIES", "127.0.0.1/32"),
         ],
@@ -245,7 +252,30 @@ fn an_exposed_bind_says_so_and_a_closed_signup_is_closed() {
         .json(&serde_json::json!({"email": "late@example.test", "password": "Correct-Horse-9!"}))
         .send()
         .unwrap();
-    assert_eq!(signup.status().as_u16(), 404);
+    assert_eq!(
+        signup.status().as_u16(),
+        403,
+        "an exposed wheeld must close signup without being told"
+    );
+
+    // The owner still lets people in, with the operator token, and they can then sign in.
+    let operator = std::fs::read_to_string(dir.join("operator-token")).unwrap();
+    let client = reqwest::blocking::Client::new();
+    let person =
+        serde_json::json!({"email": "invited@example.test", "password": "Correct-Horse-9!"});
+    let added = client
+        .post(format!("{base}/v1/auth/users"))
+        .header("x-auth-token", operator.trim())
+        .json(&person)
+        .send()
+        .unwrap();
+    assert_eq!(added.status().as_u16(), 201);
+    let login = client
+        .post(format!("{base}/v1/auth/login"))
+        .json(&person)
+        .send()
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
 
     // Behind a proxy, ingress URLs name the public address the operator configured.
     let operator = std::fs::read_to_string(dir.join("operator-token")).unwrap();

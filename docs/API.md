@@ -28,7 +28,7 @@ with different keys, so this needs no special case — it falls out of the desig
 
 ## Local auth routes (`AUTH_MODE=local`)
 
-All five return `404` when `AUTH_MODE` is not `local`, so switching providers cannot leave a second
+All six return `404` when `AUTH_MODE` is not `local`, so switching providers cannot leave a second
 way in.
 
 ### `POST /v1/auth/signup`
@@ -53,6 +53,32 @@ Send `token` as `x-auth-token` on every subsequent request.
 - Hashed with argon2id as a PHC string, so parameters can be raised later without invalidating
   existing rows.
 - `409` if the email is taken. Rate limited globally per hour.
+- `403`, with the generic `forbidden` body, when signup is closed. See the signup policy below.
+
+### Signup policy (`WHEEL_SIGNUP`)
+`open` (the default for the `wheel-api` binary) or `closed`. Any other value refuses to boot, and
+`invite` is refused with a pointer to the route below.
+
+- **Closed:** `POST /v1/auth/signup` answers `403` before it counts against the signup limit, and
+  creates nothing.
+- **`wheeld` closes it by default** whenever it can be reached from beyond its own machine:
+  - it binds a non-loopback address;
+  - `WHEEL_TRUSTED_PROXIES` is set;
+  - the operator set `PUBLIC_BASE_URL`.
+
+  Otherwise it stays open, so a laptop install is never locked out.
+- **Why:** the embedded backend runs every account's agents as the daemon's own user. An open signup
+  on a public box is a stranger's code on it.
+
+### `POST /v1/auth/users`
+The owner adds an email/password account, whatever the signup policy. Same body as signup. `201` →
+`{ "id", "email", "created_at" }`, with no session: the new user signs in themselves.
+
+- **Only the owner may call it:** the token-only account `wheeld` created on first boot, the one
+  account a signup can never produce. Anyone else gets `403`, including people the owner added and
+  their tokens, so a closed signup cannot be reopened from the inside.
+- `401` without a credential; `409` if the email is taken; `400` for a bad email or password.
+- `404` when `AUTH_MODE` is not `local`.
 
 ### `POST /v1/auth/login`
 Same body. `200` with the same shape as signup.
@@ -79,8 +105,9 @@ This is why sessions are rows rather than pure stateless JWTs: a stateless token
 before it expires, and a "logout" that leaves the token working for seven more days is not a logout.
 
 ### `GET /v1/auth/me`
-`200` → `{ "id", "email", "created_at" }`. `401` if the account no longer exists — the signature can
-still verify over a user that has been deleted.
+`200` → `{ "id", "email", "created_at", "owner" }`. `owner` is true for the token-only owner, the
+one account that may call `POST /v1/auth/users`. `401` if the account no longer exists — the
+signature can still verify over a user that has been deleted.
 
 ### `POST /v1/auth/password`
 ```json
@@ -407,6 +434,7 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
 | `PUBLIC_BASE_URL` | no | `http://localhost:8080` | The public base of every `ingress_base_url` and the issuer of local sessions. Behind TLS, `https://<domain>`. Changing it ends every session: the issuer moved. `wheeld` defaults it to `http://localhost:<port>` of its bind. |
+| `WHEEL_SIGNUP` | no | `open` | `open` or `closed`, local auth only. `wheeld` defaults it to `closed` when reachable beyond loopback, behind a proxy, or given a `PUBLIC_BASE_URL`. See [Signup policy](#signup-policy-wheel_signup). |
 | `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
 

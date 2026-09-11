@@ -86,6 +86,7 @@ fn cfg(db_url: &str) -> Config {
         ingress_body_limit_bytes: 1024,
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
+        signup: wheel_api::config::SignupPolicy::Open,
     }
 }
 

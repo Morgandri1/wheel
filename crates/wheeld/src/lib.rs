@@ -188,15 +188,42 @@ fn default_public_base(bind: &str) -> String {
     }
 }
 
+/// Closed wherever a stranger could reach this daemon: a bind beyond loopback, a proxy in front of
+/// it, or a public address. Open otherwise, so a laptop user is not locked out of their own
+/// install. With the embedded backend an account's agents run as this daemon's user, so a
+/// stranger's signup is a stranger's code on the box.
+fn default_signup(bind: &str, trusted_proxies: &str, public_base_set: bool) -> &'static str {
+    if guard::exposure(bind).is_some() || !trusted_proxies.trim().is_empty() || public_base_set {
+        "closed"
+    } else {
+        "open"
+    }
+}
+
 async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
-    let guard = Arc::new(guard::Guard::from_env(bind).context("request guard configuration")?);
+    let guard = Arc::new(guard::Guard::from_env(bind));
     let trusted = Arc::new(
         wheel_api::http::client_ip::TrustedProxies::from_env()
             .map_err(anyhow::Error::msg)
             .context("trusted proxies")?,
     );
-    supervise::apply_defaults(&[("PUBLIC_BASE_URL", default_public_base(bind))]);
+    // The signup default reads what the operator set, so it is decided before wheeld fills in a
+    // PUBLIC_BASE_URL of its own.
+    let signup = default_signup(
+        bind,
+        &std::env::var(wheel_api::http::client_ip::ENV_TRUSTED_PROXIES).unwrap_or_default(),
+        std::env::var_os("PUBLIC_BASE_URL").is_some(),
+    );
+    supervise::apply_defaults(&[
+        ("WHEEL_SIGNUP", signup.to_string()),
+        ("PUBLIC_BASE_URL", default_public_base(bind)),
+    ]);
     let cfg = wheel_api::config::Config::from_env().context("api configuration")?;
+    if cfg.signup == wheel_api::config::SignupPolicy::Closed {
+        tracing::info!(
+            "signup is closed; the owner adds accounts with POST /v1/auth/users and the operator token"
+        );
+    }
     let http = wheel_api::boot::http_client(&cfg)?;
     let db = wheel_api::boot::connect_and_migrate(&cfg).await?;
     if let Some(path) = tokens::bootstrap_operator(&db, data_dir).await? {
@@ -282,6 +309,19 @@ mod tests {
         assert_eq!(displayable("[::]:8080"), "localhost:8080");
         assert_eq!(displayable("127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(displayable("localhost:8080"), "localhost:8080");
+    }
+
+    #[test]
+    fn signup_closes_by_default_wherever_a_stranger_could_reach_it() {
+        assert_eq!(default_signup("127.0.0.1:8080", "", false), "open");
+        assert_eq!(default_signup("[::1]:8080", " ", false), "open");
+        assert_eq!(default_signup("0.0.0.0:8080", "", false), "closed");
+        assert_eq!(default_signup("192.168.1.5:8080", "", false), "closed");
+        assert_eq!(
+            default_signup("127.0.0.1:8080", "127.0.0.1/32", false),
+            "closed"
+        );
+        assert_eq!(default_signup("127.0.0.1:8080", "", true), "closed");
     }
 
     /// The issuer of every session and the base of every ingress URL. It must not move for an

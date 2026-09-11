@@ -188,6 +188,18 @@ pub async fn count_users(db: &Db) -> ApiResult<i64> {
     Ok(crate::db_scalar!(db, "SELECT COUNT(*) FROM users")?)
 }
 
+/// Is this the token-only owner: the account `wheeld` creates on first boot, which no signup can
+/// ever produce?
+pub async fn is_token_only(db: &Db, id: &Uuid) -> ApiResult<bool> {
+    let n: i64 = crate::db_scalar!(
+        db,
+        "SELECT COUNT(*) FROM users WHERE id = $1 AND password_hash = $2",
+        id,
+        TOKEN_ONLY
+    )?;
+    Ok(n > 0)
+}
+
 impl UserRow {
     fn into_user(self) -> User {
         User {

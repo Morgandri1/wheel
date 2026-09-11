@@ -73,6 +73,8 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/logout", post(routes::auth::logout))
         .route("/v1/auth/me", get(routes::auth::me))
         .route("/v1/auth/password", post(routes::auth::change_password))
+        // The owner adds accounts, which is how people get in when signup is closed.
+        .route("/v1/auth/users", post(routes::auth::create_account))
         // The caller's own API tokens, under every AUTH_MODE: how a non-browser client signs in.
         .route("/v1/auth/tokens", post(routes::tokens::create))
         .route("/v1/auth/tokens", get(routes::tokens::list))

@@ -10,7 +10,7 @@
 
 use crate::auth::local;
 use crate::auth::AuthUser;
-use crate::config::AuthMode;
+use crate::config::{AuthMode, SignupPolicy};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::extract::State;
@@ -56,6 +56,10 @@ pub async fn signup(
     Json(body): Json<Credentials>,
 ) -> ApiResult<(axum::http::StatusCode, Json<SessionResponse>)> {
     require_local(&state)?;
+    // Before the limiter, so a closed door is not also a counter anyone can run up.
+    if state.cfg.signup == SignupPolicy::Closed {
+        return Err(ApiError::Forbidden("signup is closed"));
+    }
     state.auth_limiter.check_signup(&state.db).await?;
 
     let user = local::create_user(&state.db, &body.email, &body.password).await?;
@@ -141,6 +145,7 @@ pub async fn me(
             "id": u.id,
             "email": u.email,
             "created_at": u.created_at.to_rfc3339(),
+            "owner": local::is_token_only(&state.db, &u.id).await?,
         }))),
         // A signature over a user that no longer exists. The token verifies; the account does not.
         None => Err(ApiError::Unauthorized("user no longer exists")),
@@ -160,4 +165,22 @@ pub async fn change_password(
     // Every session is now revoked, including this one: the caller must log in again with the new
     // password. That is the point — a password change has to end sessions an attacker may hold.
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The owner adds an email/password account, whatever the signup policy.
+///
+/// The owner is the token-only account `wheeld` creates on first boot: the one account a signup
+/// can never produce, so a closed signup cannot be reopened by anyone who managed to sign up.
+pub async fn create_account(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(body): Json<Credentials>,
+) -> ApiResult<(axum::http::StatusCode, Json<local::User>)> {
+    require_local(&state)?;
+    let caller = Uuid::parse_str(user.id()).map_err(|_| ApiError::Forbidden("not the owner"))?;
+    if !local::is_token_only(&state.db, &caller).await? {
+        return Err(ApiError::Forbidden("only the owner creates accounts"));
+    }
+    let created = local::create_user(&state.db, &body.email, &body.password).await?;
+    Ok((axum::http::StatusCode::CREATED, Json(created)))
 }
