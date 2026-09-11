@@ -31,6 +31,7 @@ use crate::{config::Config, db};
 pub mod agent_routes;
 pub mod board_routes;
 pub mod cli_routes;
+mod engine_routes;
 pub mod events_route;
 pub mod ingress;
 mod table_routes;
@@ -156,6 +157,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
+        .route("/engine", get(engine_routes::engine_info))
         .route("/board", get(board_routes::get_board))
         .route("/nodes", post(board_routes::create_node))
         .route(

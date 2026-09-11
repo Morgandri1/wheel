@@ -189,6 +189,27 @@ async fn open_ingress(app: &Router, tok: &str, id: &str) {
 // ---------------------------------------------------------------- proxy
 
 #[tokio::test]
+async fn engine_discovery_reaches_the_engine_through_the_project_proxy() {
+    let (engine, seen) = mock_engine().await;
+    let Some(app) = app(engine).await else { return };
+    let tok = token(&user());
+    let id = make_project(&app, &tok).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/projects/{id}/engine/v1/engine"))
+        .header("x-auth-token", &tok)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    assert_eq!(
+        seen.path.lock().unwrap().as_deref(),
+        Some("/v1/engine"),
+        "the project proxy must preserve the engine's v1 prefix"
+    );
+}
+
+#[tokio::test]
 async fn proxy_strips_the_users_credentials_before_the_hop() {
     let (engine, seen) = mock_engine().await;
     let Some(app) = app(engine).await else { return };
