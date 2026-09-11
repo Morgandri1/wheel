@@ -226,6 +226,11 @@ export function EndpointPanel({
                 <p className="text-micro text-ink-faint">The response had no body.</p>
               )}
             </>
+          ) : probe.kind === "sent" ? (
+            <p className="text-micro text-ink-dim" data-testid="endpoint-probe-sent">
+              Sent — the endpoint hasn&rsquo;t answered within {Math.round(probe.timeoutMs / 1000)}s. Script
+              endpoints can run for minutes, so this is not a sign it failed: it was delivered.
+            </p>
           ) : (
             <p className="text-micro text-ink-dim" data-testid="endpoint-probe-unreadable">
               {probe.reason}

@@ -26,11 +26,23 @@ import {
  * whether the caller owns the project first: ingress is public, but this server reaching it on
  * someone's behalf is not, least of all when the API itself is not public. The ingress request
  * carries no credential of any kind.
+ *
+ * TWO DIFFERENT DEADLINES. The ownership check is a small, fast lookup — API_CALL_TIMEOUT_MS (5s)
+ * is right for it, and a slow answer there really is "the API is unreachable". The ingress HIT is
+ * not: a `script` endpoint runs its script before it answers (default 60s, ceiling 300s), so a real
+ * hit that is doing real work is indistinguishable from a dead one at 5s. Holding it to the same
+ * deadline reported delivered, running work as "the test did not run" — wrong on both counts: it WAS
+ * sent, and the absence of an answer yet says nothing about whether the endpoint is down.
+ *
+ * HIT_TIMEOUT_MS gives it room without hanging the panel for the full five minutes: past it, this
+ * reports SENT rather than failed, and the panel says so rather than "did not run".
  */
 
 const PROBE_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
 const REQUEST_LIMIT = 4 * 1024;
 const ANSWER_LIMIT = 64 * 1024;
+/** Well under the 300s script ceiling, and well under a UI anyone would wait out without feedback. */
+export const HIT_TIMEOUT_MS = 30_000;
 
 /**
  * An endpoint's configured path, percent-encoded segment by segment, or null if it could escape
@@ -78,10 +90,20 @@ export async function probeIngress(req: Request): Promise<Response> {
 
   const hit = await callApi(apiUrl(`/p/${projectId}${path}`), {
     method,
-    timeoutMs: API_CALL_TIMEOUT_MS,
+    timeoutMs: HIT_TIMEOUT_MS,
     ...(method === "GET" ? {} : { json: { source: "wheel-endpoint-test" } }),
   });
-  if (!answered(hit)) return apiFailed(hit);
+  if (!answered(hit)) {
+    // A timeout here is not a failure to report: the hit was delivered and may still be running.
+    // Anything else (the API itself unreachable) really is a failure — apiFailed, as before.
+    if (hit.failure === "timeout") {
+      return Response.json(
+        { sent: true, timeout_ms: HIT_TIMEOUT_MS },
+        { headers: { "cache-control": "no-store" } },
+      );
+    }
+    return apiFailed(hit);
+  }
   const { bytes, truncated } = await readUpTo(hit.body, ANSWER_LIMIT);
   return Response.json(
     { status: hit.status, status_text: hit.statusText, body: new TextDecoder().decode(bytes), truncated },

@@ -106,6 +106,25 @@ describe("probing an endpoint through this app's server", () => {
 });
 
 /**
+ * QA review round 2: a script endpoint that outlives the server's own hit deadline is delivered,
+ * not failed, so it must read as "sent" — never as "unreadable" (which the panel would show as
+ * "the test did not run") and never as "answered" with an invented status code.
+ */
+describe("a hit that has not answered yet", () => {
+  const sent = (timeoutMs = 30_000) => answering(Response.json({ sent: true, timeout_ms: timeoutMs }));
+
+  it("reads the server's sent outcome as its own kind, not answered or unreadable", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: sent(30_000) });
+    expect(probe).toEqual({ kind: "sent", timeoutMs: 30_000 });
+  });
+
+  it("falls back to a default timeout if the server omits it, rather than failing to read the answer", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: answering(Response.json({ sent: true })) });
+    expect(probe).toEqual({ kind: "sent", timeoutMs: 30_000 });
+  });
+});
+
+/**
  * The operator hit a bare 404 on `/tg` and could not tell "ingress is not built" from "I typed the
  * path wrong". Those two readings send someone to completely different places for an hour.
  */

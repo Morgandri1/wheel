@@ -21,6 +21,13 @@ export type Probe =
       /** `error.code` from the API's envelope, when it sent one. A bare status carries no code. */
       code: string | null;
     }
+  /**
+   * Delivered, but the server gave up waiting for an answer (a `script` endpoint can run for
+   * minutes). This is NOT a failure: the hit reached ingress and whatever is wired to it. It is
+   * reported apart from "answered" so the panel does not invent a status code, and apart from
+   * "unreadable" so it does not read as "the test did not run" — it did.
+   */
+  | { kind: "sent"; timeoutMs: number }
   | { kind: "unreadable"; reason: string };
 
 const BODY_LIMIT = 2000;
@@ -163,20 +170,21 @@ export async function probeEndpoint(
     if (res.status === 401) notifyUnauthorized();
     return { kind: "unreadable", reason: refusalReason(res.status, text) };
   }
-  const reading = readReading(text);
-  if (!reading) {
+  const answer = readServerAnswer(text);
+  if (!answer) {
     return {
       kind: "unreadable",
       reason: "This app's server answered the test with something it can't read, so there is no reading. This is not evidence that the endpoint is down.",
     };
   }
+  if (answer.kind === "sent") return answer;
   return {
     kind: "answered",
-    status: reading.status,
-    statusText: reading.statusText,
-    body: reading.body.slice(0, BODY_LIMIT),
-    truncated: reading.truncated || reading.body.length > BODY_LIMIT,
-    code: errorCode(reading.body),
+    status: answer.status,
+    statusText: answer.statusText,
+    body: answer.body.slice(0, BODY_LIMIT),
+    truncated: answer.truncated || answer.body.length > BODY_LIMIT,
+    code: errorCode(answer.body),
   };
 }
 
@@ -192,11 +200,28 @@ function refusalReason(status: number, text: string): string {
   return `The test did not run${message ? `: ${message}` : ` (HTTP ${status})`}. This is not evidence that the endpoint is down.`;
 }
 
-function readReading(text: string): { status: number; statusText: string; body: string; truncated: boolean } | null {
+type ServerAnswer =
+  | { kind: "sent"; timeoutMs: number }
+  | { kind: "answered"; status: number; statusText: string; body: string; truncated: boolean };
+
+const DEFAULT_HIT_TIMEOUT_MS = 30_000;
+
+function readServerAnswer(text: string): ServerAnswer | null {
   try {
-    const r = JSON.parse(text) as { status?: unknown; status_text?: unknown; body?: unknown; truncated?: unknown };
+    const r = JSON.parse(text) as {
+      sent?: unknown;
+      timeout_ms?: unknown;
+      status?: unknown;
+      status_text?: unknown;
+      body?: unknown;
+      truncated?: unknown;
+    };
+    if (r?.sent === true) {
+      return { kind: "sent", timeoutMs: typeof r.timeout_ms === "number" ? r.timeout_ms : DEFAULT_HIT_TIMEOUT_MS };
+    }
     if (typeof r?.status !== "number" || typeof r.body !== "string") return null;
     return {
+      kind: "answered",
       status: r.status,
       statusText: typeof r.status_text === "string" ? r.status_text : "",
       body: r.body,

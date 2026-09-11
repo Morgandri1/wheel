@@ -5,7 +5,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { liveJwt } from "../../test/tokens";
-import { ingressPath, probeIngress } from "./ingress-probe";
+import { API_CALL_TIMEOUT_MS } from "./upstream";
+import { HIT_TIMEOUT_MS, ingressPath, probeIngress } from "./ingress-probe";
 
 const API = "http://api.test:8080";
 const TOKEN = liveJwt({ sub: "u1" });
@@ -28,6 +29,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  // Belt for the AbortSignal.timeout spies below: if one of those tests threw before reaching its
+  // own mockRestore(), a broken spy left in place recurses into every later test that dials out.
+  vi.restoreAllMocks();
 });
 
 function probe(body: unknown, init: { cookie?: string | null; origin?: string; contentType?: string } = {}) {
@@ -158,5 +162,62 @@ describe("probing", () => {
       return Response.json({});
     });
     expect((await probe({ project_id: "p1", method: "GET", path: "/hook" })).status).toBe(502);
+  });
+});
+
+/**
+ * QA review round 2: the hit was bound to the same 5s deadline as the ownership check, so a
+ * `script` endpoint doing real work (default timeout 60s, ceiling 300s) got misreported as
+ * "the test did not run" the moment it ran past 5s. The ownership check is a small, fast lookup
+ * and keeps its 5s deadline; the hit gets its own, longer one, and a hit that outlives IT is
+ * reported as delivered, not failed.
+ */
+describe("the ownership check and the hit have different deadlines", () => {
+  it("asks AbortSignal.timeout for 5s on the ownership check and 30s on the hit — never the same value", async () => {
+    const requested: number[] = [];
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      requested.push(ms);
+      // Fire almost immediately regardless of the real deadline, so this test costs milliseconds.
+      return realTimeout(5);
+    });
+    fetchMock.mockImplementation((url: string, init: RequestInit) =>
+      url.includes("/p/")
+        ? new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason)))
+        : Promise.resolve(Response.json({ id: "p1" })),
+    );
+
+    await probe({ project_id: "p1", method: "GET", path: "/hook" });
+
+    expect(requested).toEqual([API_CALL_TIMEOUT_MS, HIT_TIMEOUT_MS]);
+    expect(HIT_TIMEOUT_MS).toBeGreaterThan(API_CALL_TIMEOUT_MS);
+    spy.mockRestore();
+  });
+
+  it("reports a hit that outlives its own deadline as SENT, not as a failure", async () => {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => realTimeout(Math.min(ms, 5)));
+    fetchMock.mockImplementation((url: string, init: RequestInit) =>
+      url.includes("/p/")
+        ? new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason)))
+        : Promise.resolve(Response.json({ id: "p1" })),
+    );
+
+    const res = await probe({ project_id: "p1", method: "GET", path: "/hook" });
+
+    // A 200 the panel reads as "delivered", never the 502/504 apiFailed would answer.
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ sent: true, timeout_ms: HIT_TIMEOUT_MS });
+    spy.mockRestore();
+  });
+
+  it("still reports the API genuinely being unreachable as a failure, not as sent", async () => {
+    fetchMock.mockImplementation((url: string) =>
+      url.includes("/p/") ? Promise.reject(new TypeError("fetch failed")) : Promise.resolve(Response.json({ id: "p1" })),
+    );
+
+    const res = await probe({ project_id: "p1", method: "GET", path: "/hook" });
+    expect(res.status).toBe(502);
+    expect((await res.json()).error.code).toBe("api_unreachable");
   });
 });

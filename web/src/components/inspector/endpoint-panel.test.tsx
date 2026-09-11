@@ -167,6 +167,20 @@ describe("testing the public URL", () => {
     renderPanel(true);
     expect(screen.queryByTestId("endpoint-probe")).toBeNull();
   });
+
+  // QA review round 2: a script endpoint outliving the server's own deadline is delivered, not
+  // failed, so it must read as sent — never alongside "did not run" or an invented status code.
+  it("reads a script endpoint that has not answered yet as sent, not as a failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ sent: true, timeout_ms: 30_000 })));
+    renderPanel(true);
+    fireEvent.click(screen.getByTestId("btn-endpoint-test"));
+
+    await waitFor(() => expect(screen.getByTestId("endpoint-probe-sent")).toBeDefined());
+    expect(screen.getByTestId("endpoint-probe-sent").textContent).toMatch(/sent.*30s/i);
+    expect(screen.queryByTestId("endpoint-probe-unreadable")).toBeNull();
+    expect(screen.queryByTestId("endpoint-probe-status")).toBeNull();
+    vi.unstubAllGlobals();
+  });
 });
 
 /**
