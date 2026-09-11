@@ -39,7 +39,7 @@ case "$layer" in
         git -C "$repo" show "$ref:infra/vps/Caddyfile" >"$work/Caddyfile" || exit 2
         git -C "$repo" show "$ref:infra/vps/rehearsal/mutations/publish-wheeld.yml" >"$work/extra.yml" || exit 2
         python3 - "$work/Caddyfile" <<'PY' || exit 2
-import re, sys
+import sys
 path = sys.argv[1]
 text = open(path).read()
 edits = [
@@ -48,19 +48,17 @@ edits = [
     ("\t\tmax_size 256KiB\n", "\t\tmax_size 10MiB\n"),
     ("\t\t\theader_up -Cookie\n", ""),
     ("\t\t\tflush_interval -1\n", "\t\t\tflush_interval -1\n\t\t\tresponse_buffers 1MiB\n"),
+    ('\t\texpression `"{$WHEEL_SIGNUP:closed}" != "open"`\n', "\t\texpression false\n"),
 ]
 for old, new in edits:
     count = text.count(old)
     if count != 1:
         sys.exit(f"mutate: {old!r} occurs {count} times, so this mutation would not apply")
     text = text.replace(old, new)
-text, count = re.subn(r"^\trespond @signup .*\n", "", text, flags=re.M)
-if count != 1:
-    sys.exit(f"mutate: the sign-up block occurs {count} times")
 open(path, "w").write(text)
 PY
         caddyfile="$work/Caddyfile"
-        red="edge-headers signup-closed-at-edge web-sse forwarded-headers-overwritten body-limits ingress-rate-limit-ignores-xff not-exposed cookie-stripped-to-wheeld caddy-admin-off"
+        red="edge-headers signup-closed-at-edge web-sse forwarded-headers-overwritten body-limits ingress-rate-limit-ignores-xff not-published cookie-stripped-to-wheeld caddy-admin-off"
         ;;
     config)
         git -C "$repo" show "$ref:infra/vps/rehearsal/mutations/config.yml" >"$work/extra.yml" || exit 2

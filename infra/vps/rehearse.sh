@@ -207,10 +207,10 @@ check forwarded-headers-overwritten
 check body-limits
 check ingress-rate-limit-ignores-xff
 
-exposed=""
+published=""
 for svc in wheeld web; do
-    published="$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' "$(compose ps -q "$svc")")"
-    [ -n "$published" ] && exposed="$exposed $svc publishes $published;"
+    ports="$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' "$(compose ps -q "$svc")")"
+    [ -z "$ports" ] || published="$published $svc publishes $ports;"
 done
 pid="$(recall project)"
 session="$(recall session)"
@@ -220,30 +220,40 @@ if [ -n "$pid" ]; then
         port="${probe%% *}"
         path="${probe#* }"
         body="$(curl -s -m 3 -H "x-auth-token: $session" -H "cookie: $cookie" -H "origin: http://127.0.0.1:$port" "http://127.0.0.1:$port$path")"
-        case "$body" in *"$pid"*) exposed="$exposed 127.0.0.1:$port answers with this project;" ;; esac
+        case "$body" in *"$pid"*) published="$published 127.0.0.1:$port answers with this project;" ;; esac
     done
 else
-    exposed="$exposed no project to look for (an earlier check failed);"
+    published="$published no project to look for (an earlier check failed);"
 fi
+if [ -z "$published" ]; then
+    say PASS not-published "wheeld and web publish no port, and 127.0.0.1:8080/3000/7000 do not reach them"
+    record not-published 0
+else
+    say FAIL not-published "$published"
+    record not-published 1
+fi
+
+engine="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"
 docker network create "$project-outside" >/dev/null
+reached=""
 for target in "wheeld 8080 /healthz" "web 3000 /version.json"; do
     read -r svc port path <<<"$target"
     ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_edge\"}}{{.IPAddress}}{{end}}" "$(compose ps -q "$svc")")"
     if ! compose exec -T caddy wget -q -T 3 -O /dev/null "http://$svc:$port$path"; then
-        exposed="$exposed control failed: caddy cannot reach $svc:$port$path, so the next probe proves nothing;"
+        reached="$reached control failed: caddy cannot reach $svc:$port$path, so the next probe proves nothing;"
     fi
     if docker run --rm --network "$project-outside" --entrypoint wget caddy:2 -q -T 3 -O /dev/null "http://$ip:$port$path" 2>/dev/null; then
-        exposed="$exposed a container on another network reached $svc at $ip:$port;"
+        reached="$reached $svc at $ip:$port;"
     fi
     curl -s -m 3 -o /dev/null "http://$ip:$port$path"
-    echo "  info: this machine → $svc's edge address $ip:$port: curl rc=$? (7/28 = unreachable)"
+    echo "  info: this machine (the docker host) → $svc's edge address $ip:$port: curl rc=$? (0 is expected here even when isolation holds — the docker host itself always routes to its own bridge networks; that is not what 'internal: true' promises)"
 done
-if [ -z "$exposed" ]; then
-    say PASS not-exposed "wheeld and web publish no port; 127.0.0.1:8080/3000/7000 do not reach them; a container on another network cannot reach their edge addresses"
-    record not-exposed 0
+if [ -z "$reached" ]; then
+    say PASS isolated-from-other-networks "a container on another Docker network cannot reach wheeld's or web's edge address (engine: $engine)"
+    record isolated-from-other-networks 0
 else
-    say FAIL not-exposed "$exposed"
-    record not-exposed 1
+    say FAIL isolated-from-other-networks "a container on another Docker network reached$reached (engine: $engine). Measured: stock dockerd (docker:dind) enforces 'internal: true' here (iptables blocks the cross-network hop); OrbStack's engine does not (confirmed 2026-09-11). If \$engine here is a Mac dev engine, this is that gap, not a bug in the Caddyfile or compose.yml — the real VPS runs stock dockerd and this check passes there."
+    record isolated-from-other-networks 1
 fi
 
 adapted="$(compose exec -T caddy caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null)"

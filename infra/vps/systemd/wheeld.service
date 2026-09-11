@@ -18,9 +18,10 @@ Group=wheel
 EnvironmentFile=/etc/wheel/wheeld.env
 EnvironmentFile=-/etc/wheel/wheeld.local.env
 ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind 127.0.0.1:8080
-# SIGTERM goes to wheeld alone: it stops every engine and each agent's whole process group itself.
-# Whatever is left after the timeout is killed with the cgroup.
-KillMode=mixed
+# control-group, not mixed: systemd's supported native mode. wheeld's own SIGTERM handler drains
+# in-flight turns for up to 20s and stops every agent's process group itself, inside this 30s
+# budget; anything still in the cgroup after the timeout is killed.
+KillMode=control-group
 TimeoutStopSec=30
 # Also the auto-update hook: WHEEL_UPDATE_RESTART=exit swaps the binary and exits 75.
 Restart=on-failure

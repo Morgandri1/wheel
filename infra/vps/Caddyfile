@@ -40,11 +40,14 @@
 
 	# Belt to wheeld's WHEEL_SIGNUP braces: the edge refuses sign-up, direct or through the web
 	# app's session route, even from a build that ignores the flag. wheeld's flag is the binding one.
+	# A `handle`, and the first one: handle blocks run before a bare `respond` would.
 	@signup {
 		path /v1/auth/signup /api/session/signup
 		expression `"{$WHEEL_SIGNUP:closed}" != "open"`
 	}
-	respond @signup `{"error":{"code":"signup_closed","message":"Sign-up is closed on this server. Ask its operator for an account."}}` 403
+	handle @signup {
+		respond `{"error":{"code":"signup_closed","message":"Sign-up is closed on this server. Ask its operator for an account."}}` 403
+	}
 
 	# Wheel's own limits. An ingress body becomes a message: 256 KiB. wheeld and the web app's API
 	# proxy each buffer at most 5 MiB. A chest blob is 50 MiB by contract; no route stores one yet.

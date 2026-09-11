@@ -152,6 +152,41 @@ The `wheel` CLI has no operator mode yet. Today it is the agent-side CLI that ru
 project's sandbox. `wheel login`/`wheel projects` against a server is follow-up F1 in
 `docs/proposals/headless-first.md`; until then use AgentGrid or the API directly.
 
+## 7. Agent credentials
+
+An agent's Claude/Codex login lives in a **vault node**, never in `.env`, never in a compose file,
+never in this document with a real value in it. Start with a single Anthropic API key:
+
+**In the web app** (`https://wheel.example.com/app`): add a `vault` node, name it (e.g.
+`anthropic`), add the key `ANTHROPIC_API_KEY` to it, and enter the value in the vault inspector —
+it is write-only and is never shown back, on the board, in an export or in a log. Wire your agent
+to the vault with a `read` wire. The key is exported into the agent's environment the next time it
+starts.
+
+**From the API**, with your own session or a `wht_` token, three calls against the project's engine
+(`/v1/projects/<id>/engine/v1/...`, proxied and ownership-checked the same as everything else):
+
+```bash
+VAULT=$(curl -fsS https://wheel.example.com/v1/projects/$PID/engine/v1/nodes \
+  -H "x-auth-token: $TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"anthropic","type":"vault","config":{"keys":["ANTHROPIC_API_KEY"]}}' | jq -r .id)
+
+curl -fsS https://wheel.example.com/v1/projects/$PID/engine/v1/wires \
+  -H "x-auth-token: $TOKEN" -H 'content-type: application/json' \
+  -d "{\"from\":\"$AGENT_ID\",\"to\":\"$VAULT\",\"type\":\"read\"}"
+
+read -rs ANTHROPIC_API_KEY   # typed, not in shell history or argv
+printf '{"value":"%s"}' "$ANTHROPIC_API_KEY" |
+  curl -fsS -X PUT https://wheel.example.com/v1/projects/$PID/engine/v1/vault/$VAULT/ANTHROPIC_API_KEY \
+    -H "x-auth-token: $TOKEN" -H 'content-type: application/json' -d @-
+```
+
+Restart the agent (or start it for the first time) and its `GET .../agents/$AGENT_ID/auth` reports
+`mode: "env"`: authenticated, no browser step. Other recognised keys: `CLAUDE_CODE_OAUTH_TOKEN`
+(from `claude setup-token`, the native OAuth flow rather than an API key) and `CODEX_API_KEY`. One
+vault per account, so wiring the same agent to two vaults that both define `ANTHROPIC_API_KEY` is
+refused at wire-creation time — see `docs/ARCHITECTURE.md` M1.6.
+
 ## Webhooks (`/p`)
 
 `https://wheel.example.com/p/<project>/<path>` is public by design: a webhook sender can be given
@@ -237,7 +272,56 @@ Your own settings go in `/etc/wheel/wheeld.local.env` and `/etc/wheel/web.local.
 script never touches. The operator token is at `/var/lib/wheel/operator-token`.
 
 Caddy runs with its admin API off, so change its configuration with `systemctl restart caddy`, not
-`reload`.
+`reload`. `--dry-run` resolves settings and the target commit, prints every command it would run,
+and changes nothing — no package, no file, no user, no service:
+
+```bash
+sudo /opt/wheel-installer/infra/vps/install.sh --domain wheel.example.com --email you@example.com --dry-run
+```
+
+### Deploying over SSH, non-interactively
+
+`install.sh` takes every input as a flag; nothing reads stdin, and re-running it is safe. Given a
+host, a user with passwordless sudo, and a dedicated SSH key, this is the whole sequence — run it
+from your own machine, or by anything that can run a script (an operator's own automation included):
+
+```bash
+HOST=203.0.113.5 SSH_USER=root KEY=~/.ssh/wheel_deploy_key DOMAIN=wheel.example.com EMAIL=you@example.com REF=main
+
+ssh_run() { ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$HOST" "$@"; }
+
+# 1. Confirm non-interactive access before doing anything else.
+ssh_run 'sudo -n true' || { echo "no passwordless sudo for $SSH_USER@$HOST" >&2; exit 1; }
+
+# 2. Fetch the installer at the target ref (a shallow clone of the whole repo, since install.sh
+#    itself clones it again to build from — this first clone is only to get the script).
+ssh_run bash -s -- "$REF" <<'REMOTE'
+set -euo pipefail
+ref="$1"
+if [ ! -d /opt/wheel-installer/.git ]; then
+    git clone --quiet https://github.com/Morgandri1/wheel.git /opt/wheel-installer
+fi
+git -C /opt/wheel-installer fetch --quiet origin "$ref"
+git -C /opt/wheel-installer -c advice.detachedHead=false checkout --quiet --force "origin/$ref"
+REMOTE
+
+# 3. Dry run, so a config mistake shows up before anything is touched.
+ssh_run sudo /opt/wheel-installer/infra/vps/install.sh \
+  --domain "$DOMAIN" --email "$EMAIL" --ref "$REF" --firewall --dry-run
+
+# 4. The real run.
+ssh_run sudo /opt/wheel-installer/infra/vps/install.sh \
+  --domain "$DOMAIN" --email "$EMAIL" --ref "$REF" --firewall
+
+# 5. The operator token, read once and not printed to a terminal that logs.
+TOKEN=$(ssh_run sudo cat /var/lib/wheel/operator-token)
+```
+
+`BatchMode=yes` fails instead of ever prompting (for a password, a passphrase, anything);
+`StrictHostKeyChecking=accept-new` accepts a host's key on first connection and still verifies it
+on every one after, so a re-run cannot be silently redirected to a different machine. Nothing here
+types into a prompt: `sudo -n` and passwordless sudo are what make step 1 the actual gate, not a
+convenience.
 
 ### Auto-update hook points
 

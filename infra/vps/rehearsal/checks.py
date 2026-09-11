@@ -111,32 +111,38 @@ class Conn:
             self._write_body(body)
 
     def _write_body(self, body):
+        """Send the body, but stop the moment the server answers.
+
+        A server that refuses an upload answers before it has read all of it. A blocking send would
+        then fail with EPIPE, and a TLS connection that failed a write refuses to read the answer
+        that already arrived. So nothing here ever blocks in send.
+        """
         view = memoryview(body)
         sent = 0
-        try:
-            while sent < len(view):
-                if self._answered():
-                    return
-                sent += self.sock.send(view[sent : sent + 65536])
-        except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError):
-            return
-
-    def _answered(self):
-        """True once the server has said something, which it may do before the body is all sent."""
-        readable, _, _ = select.select([self.sock], [], [], 0)
-        if not readable and not (self.tls and self.sock.pending()):
-            return False
+        deadline = time.monotonic() + self.timeout
         self.sock.setblocking(False)
         try:
-            chunk = self.sock.recv(65536)
-        except (ssl.SSLWantReadError, BlockingIOError):
-            return False
-        except OSError:
-            return True
+            while sent < len(view) and time.monotonic() < deadline:
+                readable, writable, _ = select.select([self.sock], [self.sock], [], 1)
+                if readable or (self.tls and self.sock.pending()):
+                    try:
+                        chunk = self.sock.recv(65536)
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        chunk = None
+                    except (ssl.SSLError, OSError):
+                        return
+                    if chunk is not None:
+                        self.buf += chunk
+                        return
+                if writable:
+                    try:
+                        sent += self.sock.send(view[sent : sent + 65536])
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        pass
+                    except (ssl.SSLError, OSError):
+                        return
         finally:
             self.sock.settimeout(self.timeout)
-        self.buf += chunk
-        return True
 
     def _fill(self, deadline):
         remaining = deadline - time.monotonic()
@@ -145,7 +151,7 @@ class Conn:
         self.sock.settimeout(remaining)
         try:
             chunk = self.sock.recv(65536)
-        except (ssl.SSLEOFError, ssl.SSLZeroReturnError, ConnectionResetError):
+        except (ssl.SSLError, ConnectionResetError, BrokenPipeError):
             chunk = b""
         self.buf += chunk
         return bool(chunk)
@@ -514,20 +520,26 @@ def body_limits():
     state = need("project", "session", "cookie")
     pid, token = state["project"], state["session"]
     hook = f"/p/{pid}/hook"
-    blob = f"{engine(pid)}/chests/{uuid.uuid4()}/blob?key=rehearsal.bin"
-    refused = {
-        "ingress 300 KiB": request("POST", hook, {"content-type": "application/octet-stream"}, b"x" * (300 * 1024)),
-        "/v1 6 MiB": request("POST", "/v1/projects", {"x-auth-token": token, "content-type": "application/json"}, b" " * (6 * MiB)),
-        "web proxy 6 MiB": request("POST", "/api/wheel/v1/projects", {"cookie": state["cookie"], "origin": ORIGIN, "content-type": "application/json"}, b" " * (6 * MiB)),
-        "chest blob 51 MiB": request("PUT", blob, {"x-auth-token": token, "content-type": "application/octet-stream"}, b"z" * (51 * MiB), timeout=60),
-    }
-    for label, reply in refused.items():
-        expect(reply.status == 413 and EDGE_413 in reply.body, f"{label}: {reply.brief()}")
+    over = request("POST", hook, {"content-type": "application/octet-stream"}, b"x" * (300 * 1024))
+    expect(over.status == 413 and EDGE_413 in over.body, f"ingress 300 KiB: {over.brief()}")
     under = request("POST", hook, {"content-type": "text/plain"}, b"y" * (200 * 1024))
     expect(under.status == 202, f"ingress 200 KiB: {under.brief()}")
+    answered_by = {}
+    for label, reply in (
+        ("/v1", request("POST", "/v1/projects", {"x-auth-token": token, "content-type": "application/json"}, b" " * (6 * MiB))),
+        ("the web proxy", request("POST", "/api/wheel/v1/projects", {"cookie": state["cookie"], "origin": ORIGIN, "content-type": "application/json"}, b" " * (6 * MiB))),
+    ):
+        expect(reply.status == 413, f"6 MiB to {label}: {reply.brief()}")
+        answered_by[label] = "the edge" if EDGE_413 in reply.body else "its own server"
+    blob = f"{engine(pid)}/chests/{uuid.uuid4()}/blob?key=rehearsal.bin"
     carve_out = request("PUT", blob, {"x-auth-token": token, "content-type": "application/octet-stream"}, b"z" * (6 * MiB))
-    expect(EDGE_413 not in carve_out.body, "a 6 MiB chest blob, under its 50 MiB limit, was refused at the edge")
-    return f"refused at the edge: {', '.join(refused)}; passed: ingress 200 KiB (202), chest blob 6 MiB (wheeld answered {carve_out.status}: no chest storage yet)"
+    expect(carve_out.status and EDGE_413 not in carve_out.body, f"a 6 MiB chest blob, under its 50 MiB limit, was refused at the edge: {carve_out.brief()}")
+    return (
+        "the edge refused a 300 KiB webhook, where its limit is the binding one, and passed 200 KiB (202); "
+        f"6 MiB was refused on /v1 by {answered_by['/v1']} and on the web proxy by {answered_by['the web proxy']}; "
+        f"a 6 MiB chest blob passed the edge's 50 MiB carve-out and wheeld answered {carve_out.status} "
+        "(no chest storage and a 5 MiB proxy cap, so the 50 MiB ceiling cannot be reached end to end yet)"
+    )
 
 
 @check

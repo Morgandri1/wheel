@@ -48,6 +48,12 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile.web
     restart: unless-stopped
+    # The image is root-owned and never writes to it (web/DEPLOY.md): a read-only root filesystem
+    # is not a hardening extra here, it is what the image already is. /tmp stays a small tmpfs
+    # rather than removed outright, so an incidental write fails loudly instead of wedging Node.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     depends_on:
       preflight:
         condition: service_completed_successfully
