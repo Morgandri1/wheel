@@ -6,7 +6,7 @@
  * Mock api.wheel.dev — §5 routes, proxying to a §4-shaped in-memory engine.
  *
  *   pnpm mock          → http://localhost:8787
- *   NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
+ *   pnpm dev:mock      → the mock, plus the web server pointed at it (WHEEL_API_URL)
  *
  * It enforces the §3 wire matrix independently of the browser, refuses
  * unauthenticated calls, and 404s projects it does not own — so the failure
@@ -96,18 +96,21 @@ async function readJson<T>(req: IncomingMessage): Promise<T> {
   }
 }
 
+/**
+ * Why a token is refused, or null. A local-mode token is a real session here, so signing out
+ * actually invalidates it and the client's "any 401 means signed out" path can be exercised. Mock
+ * and dev tokens are opaque strings the mock has no opinion about.
+ */
+function tokenProblem(token: unknown): string | null {
+  if (typeof token !== "string" || token.length === 0) return "missing x-auth-token";
+  if (localAuth.isLocalToken(token) && !localAuth.userForToken(token)) return "that session is no longer valid";
+  return null;
+}
+
 /** §5: verify the token, then load, then assert ownership. Never in another order. */
 function requireAuth(req: IncomingMessage) {
-  const token = req.headers["x-auth-token"];
-  if (typeof token !== "string" || token.length === 0) {
-    throw new EngineRefusal(401, "missing x-auth-token", "unauthenticated");
-  }
-  // A local-mode token is a real session here, so signing out actually invalidates it and the
-  // client's "any 401 means signed out" path can be exercised. Mock and dev tokens are opaque
-  // strings the mock has no opinion about, and every project belongs to OWNER either way.
-  if (localAuth.isLocalToken(token) && !localAuth.userForToken(token)) {
-    throw new EngineRefusal(401, "that session is no longer valid", "unauthenticated");
-  }
+  const problem = tokenProblem(req.headers["x-auth-token"]);
+  if (problem) throw new EngineRefusal(401, problem, "unauthenticated");
   return OWNER;
 }
 
@@ -698,7 +701,10 @@ server.on("upgrade", (req, socket, head) => {
   const match = /^\/v1\/projects\/([^/]+)\/engine\/v1\/events$/.exec(url.pathname);
   const record = match ? projects.get(match[1]!) : undefined;
 
-  const authorised = match ? tickets.redeem(url.searchParams.get("ticket"), match[1]!) : false;
+  // The web's events relay authenticates with the header, as the real API lets non-browser
+  // clients do. The ticket stays for anything else that still uses one.
+  const byHeader = tokenProblem(req.headers["x-auth-token"]) === null;
+  const authorised = match ? byHeader || tickets.redeem(url.searchParams.get("ticket"), match[1]!) : false;
 
   if (!record || !authorised) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");

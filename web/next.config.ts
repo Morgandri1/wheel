@@ -14,6 +14,10 @@ const config: NextConfig = {
    * the packaging script and by nothing else.
    */
   ...(process.env.WHEEL_STANDALONE === "1" ? { output: "standalone" as const } : {}),
+  // The events relay's WebSocket client. Bundled, ws loses its optional native helpers and fails
+  // at run time on its first masked frame; loaded from node_modules it works and is traced into
+  // the standalone output like any other dependency.
+  serverExternalPackages: ["ws"],
   reactStrictMode: true,
   eslint: { ignoreDuringBuilds: false },
   typescript: { ignoreBuildErrors: false },

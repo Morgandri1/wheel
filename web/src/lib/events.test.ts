@@ -5,154 +5,312 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * The ticket rules, asserted.
- *
- * API: the ws-ticket is single-use and expires in 30 seconds, so it must be minted immediately
- * before the socket opens and freshly again on every reconnect. A socket that opens and then
- * closes is usually a replayed ticket rather than a network fault. That is a property a
- * perfectly reasonable refactor — hoisting the ticket up to where the board mounts, say — would
- * quietly break, and the symptom would look like flaky networking. So it is a test.
+ * The relay's rules, asserted: one EventSource at this app's own path, `open` only when the relay
+ * says upstream is live, our own backoff instead of the browser's, and a 401 that ends the session
+ * rather than retrying forever. A refactor that restored EventSource's native reconnect, or marked
+ * the board live when the HTTP response arrived, would look fine and behave wrongly.
  */
-// The ticket carries the project it was minted for, so a test can prove the socket used that one.
-const wsTicket = vi.fn(async (projectId: string) => ({
-  ticket: `${projectId}-t${wsTicket.mock.calls.length}`,
-  expires_in: 30,
-}));
+type Listener = (e: { data?: string }) => void;
 
-vi.mock("@/lib/api", () => ({
-  projects: { wsTicket: (id: string) => wsTicket(id) },
-}));
-
-// The base URL is resolved at runtime now, so the socket's origin comes from here.
-vi.mock("@/lib/runtime-config", () => ({
-  apiBaseUrl: () => "http://api.test",
-}));
-
-class FakeSocket {
-  static instances: FakeSocket[] = [];
-  onopen: (() => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  static throwNext = false;
   onmessage: ((e: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
   closed = false;
+  private readonly listeners = new Map<string, Listener[]>();
+
   constructor(readonly url: string) {
-    FakeSocket.instances.push(this);
+    if (FakeEventSource.throwNext) {
+      FakeEventSource.throwNext = false;
+      throw new SyntaxError("bad url");
+    }
+    FakeEventSource.instances.push(this);
   }
+
+  addEventListener(type: string, fn: Listener) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+  }
+
+  emit(type: string, data?: string) {
+    for (const fn of this.listeners.get(type) ?? []) fn({ data });
+  }
+
+  message(frame: unknown) {
+    this.onmessage?.({ data: typeof frame === "string" ? frame : JSON.stringify(frame) });
+  }
+
   close() {
     this.closed = true;
-    this.onclose?.();
   }
 }
 
-const ticketOf = (url: string) => new URL(url).searchParams.get("ticket");
-const settle = () => new Promise((r) => setTimeout(r, 0));
+const sources = () => FakeEventSource.instances;
+const latest = () => sources().at(-1)!;
+
+async function load() {
+  vi.resetModules();
+  const events = await import("./events");
+  const auth = await import("./auth");
+  return { ...events, auth };
+}
+
+function watch() {
+  const statuses: string[] = [];
+  const batches: unknown[][] = [];
+  return { statuses, batches, handlers: { onStatus: (s: string) => statuses.push(s), onBatch: (b: unknown[]) => batches.push(b) } };
+}
 
 beforeEach(() => {
-  FakeSocket.instances = [];
-  wsTicket.mockClear();
-  vi.stubGlobal("WebSocket", FakeSocket);
+  FakeEventSource.instances = [];
+  FakeEventSource.throwNext = false;
+  vi.useFakeTimers();
+  vi.stubGlobal("EventSource", FakeEventSource);
   vi.stubGlobal("requestAnimationFrame", (cb: () => void) => setTimeout(cb, 0) as unknown as number);
   vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
-  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.spyOn(Math, "random").mockReturnValue(0);
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
-  vi.resetModules();
+  vi.restoreAllMocks();
 });
 
-describe("the events socket", () => {
-  it("mints the ticket immediately before opening, and puts it in the query", async () => {
-    const { connectEvents } = await import("./events");
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: () => {} });
-    await settle();
-
-    expect(wsTicket).toHaveBeenCalledTimes(1);
-    expect(FakeSocket.instances).toHaveLength(1);
-    // Minted for THIS project, and used by the socket that was opened for it.
-    expect(wsTicket).toHaveBeenCalledWith("p1");
-    expect(ticketOf(FakeSocket.instances[0]!.url)).toBe("p1-t1");
+describe("where it connects", () => {
+  it("opens one EventSource, at this app's own relay for the project", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    expect(sources()).toHaveLength(1);
+    expect(latest().url).toBe("/api/wheel/projects/p1/events");
     stop();
   });
 
-  it("mints a FRESH ticket on every reconnect rather than replaying one", async () => {
-    const { connectEvents } = await import("./events");
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: () => {} });
-    await settle();
-
-    FakeSocket.instances[0]!.close();
-    await vi.advanceTimersByTimeAsync(1000);
-    await settle();
-
-    expect(FakeSocket.instances).toHaveLength(2);
-    const [first, second] = FakeSocket.instances;
-    expect(ticketOf(second!.url)).not.toBe(ticketOf(first!.url));
-    expect(wsTicket).toHaveBeenCalledTimes(2);
+  it("names no API origin, ticket or token", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("9b1d-44", watch().handlers);
+    expect(latest().url.startsWith("/")).toBe(true);
+    expect(latest().url).not.toMatch(/\/\/|\?|ticket|token/);
     stop();
   });
 
-  it("never puts the session token in the socket URL", async () => {
-    const { connectEvents } = await import("./events");
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: () => {} });
-    await settle();
+  it("escapes the project id into a single path segment", async () => {
+    const { eventsPath } = await load();
+    expect(eventsPath("a/../b")).toBe("/api/wheel/projects/a%2F..%2Fb/events");
+  });
+});
 
-    const url = FakeSocket.instances[0]!.url;
-    expect(url.startsWith("ws://api.test/")).toBe(true);
-    expect(new URL(url).searchParams.has("token")).toBe(false);
-    expect(url).not.toMatch(/x-auth-token|Bearer|eyJ/);
+describe("status", () => {
+  it("stays connecting until the relay says upstream is live, not merely when the response arrives", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    expect(w.statuses).toEqual(["connecting"]);
+    latest().emit("open");
+    expect(w.statuses).toEqual(["connecting"]);
+    latest().emit("wheel-open");
+    expect(w.statuses).toEqual(["connecting", "open"]);
     stop();
   });
+});
 
-  it("gives up on a 401 instead of hammering the API with dead sessions", async () => {
-    wsTicket.mockRejectedValueOnce(Object.assign(new Error("unauthenticated"), { status: 401 }));
-    const { connectEvents } = await import("./events");
-    const seen: string[] = [];
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: (s) => seen.push(s) });
-    await settle();
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    expect(seen.at(-1)).toBe("closed");
-    expect(FakeSocket.instances).toHaveLength(0);
-    expect(wsTicket).toHaveBeenCalledTimes(1);
-    stop();
-  });
-
-  it("retries when minting fails for any other reason", async () => {
-    wsTicket.mockRejectedValueOnce(Object.assign(new Error("boom"), { status: 503 }));
-    const { connectEvents } = await import("./events");
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: () => {} });
-    await settle();
-    await vi.advanceTimersByTimeAsync(1000);
-    await settle();
-
-    expect(wsTicket).toHaveBeenCalledTimes(2);
-    expect(FakeSocket.instances).toHaveLength(1);
-    stop();
-  });
-
-  it("stops minting once the board is closed", async () => {
-    const { connectEvents } = await import("./events");
-    const stop = connectEvents("p1", { onBatch: () => {}, onStatus: () => {} });
-    await settle();
-    stop();
-
-    FakeSocket.instances[0]!.close();
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(wsTicket).toHaveBeenCalledTimes(1);
-  });
-
+describe("frames", () => {
   it("batches frames into one callback per animation frame", async () => {
-    const { connectEvents } = await import("./events");
-    const batches: number[] = [];
-    const stop = connectEvents("p1", { onBatch: (b) => batches.push(b.length), onStatus: () => {} });
-    await settle();
-
-    const sock = FakeSocket.instances[0]!;
-    for (let i = 0; i < 50; i += 1) sock.onmessage?.({ data: JSON.stringify({ type: "log", i }) });
-    await vi.advanceTimersByTimeAsync(20);
-
-    expect(batches).toEqual([50]);
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    for (let i = 0; i < 50; i += 1) latest().message({ type: "log", i });
+    vi.advanceTimersByTime(16);
+    expect(w.batches.map((b) => b.length)).toEqual([50]);
     stop();
+  });
+
+  it("ignores a frame it cannot parse", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    latest().message("{{{");
+    latest().message({ type: "log" });
+    vi.advanceTimersByTime(16);
+    expect(w.batches).toEqual([[{ type: "log" }]]);
+    stop();
+  });
+
+  it("keeps only the newest 2000 frames while a background tab throttles animation frames", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    for (let i = 0; i < 2100; i += 1) latest().message({ i });
+    vi.advanceTimersByTime(16);
+    expect(w.batches[0]).toHaveLength(2000);
+    expect(w.batches[0]![0]).toEqual({ i: 100 });
+    stop();
+  });
+});
+
+describe("reconnecting", () => {
+  it("closes a failed EventSource itself and retries on our schedule, not the browser's", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    latest().onerror!();
+    expect(sources()[0]!.closed).toBe(true);
+    expect(w.statuses.at(-1)).toBe("reconnecting");
+    vi.advanceTimersByTime(499);
+    expect(sources()).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(sources()).toHaveLength(2);
+    stop();
+  });
+
+  it("waits longer after each consecutive failure", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    latest().onerror!();
+    vi.advanceTimersByTime(999);
+    expect(sources()).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(sources()).toHaveLength(3);
+    stop();
+  });
+
+  it("starts the schedule over once a connection has really opened", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    latest().emit("wheel-open");
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    expect(sources()).toHaveLength(3);
+    stop();
+  });
+
+  it.each([
+    ["an upstream failure", '{"status":502}'],
+    ["an unreadable error", "not json"],
+    ["an error with no status", "{}"],
+  ])("retries after %s from the relay", async (_label, data) => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().emit("wheel-error", data);
+    expect(sources()[0]!.closed).toBe(true);
+    vi.advanceTimersByTime(500);
+    expect(sources()).toHaveLength(2);
+    stop();
+  });
+
+  it("ignores an error from a source it has already replaced", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    const first = latest();
+    first.emit("wheel-error", '{"status":502}');
+    first.onerror!();
+    vi.advanceTimersByTime(5000);
+    expect(sources()).toHaveLength(2);
+    stop();
+  });
+
+  it("retries when EventSource cannot even be constructed", async () => {
+    const { connectEvents } = await load();
+    FakeEventSource.throwNext = true;
+    const stop = connectEvents("p1", watch().handlers);
+    expect(sources()).toHaveLength(0);
+    vi.advanceTimersByTime(500);
+    expect(sources()).toHaveLength(1);
+    stop();
+  });
+});
+
+// QA review, finding 1: the relay drains the engine, so the engine never says `lagged` any more,
+// and a stream that dropped and came back has missed whatever was sent meanwhile.
+describe("after a gap", () => {
+  it("asks the page to refetch when a stream reopens, and not on the first open", async () => {
+    const { connectEvents } = await load();
+    const resync = vi.fn();
+    const stop = connectEvents("p1", { ...watch().handlers, onResync: resync });
+    latest().emit("wheel-open");
+    expect(resync).not.toHaveBeenCalled();
+
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    latest().emit("wheel-open");
+    expect(resync).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it("does the same after a relay error, and only once per reopening", async () => {
+    const { connectEvents } = await load();
+    const resync = vi.fn();
+    const stop = connectEvents("p1", { ...watch().handlers, onResync: resync });
+    latest().emit("wheel-open");
+    latest().emit("wheel-error", '{"status":502}');
+    vi.advanceTimersByTime(500);
+    latest().emit("wheel-open");
+    latest().emit("wheel-open");
+    expect(resync).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it("is optional for a caller that holds nothing to refetch", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    expect(() => latest().emit("wheel-open")).not.toThrow();
+    stop();
+  });
+});
+
+describe("a dead session", () => {
+  it("ends the session instead of retrying forever", async () => {
+    const { connectEvents, auth } = await load();
+    const unauthorized = vi.fn();
+    auth.setUnauthorizedHandler(unauthorized);
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    latest().emit("wheel-error", '{"status":401}');
+    vi.advanceTimersByTime(60_000);
+    expect(unauthorized).toHaveBeenCalledOnce();
+    expect(w.statuses.at(-1)).toBe("closed");
+    expect(sources()).toHaveLength(1);
+    expect(sources()[0]!.closed).toBe(true);
+    stop();
+  });
+});
+
+describe("stopping", () => {
+  it("closes the source, reports closed, and never reconnects", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    const first = latest();
+    stop();
+    expect(first.closed).toBe(true);
+    expect(w.statuses.at(-1)).toBe("closed");
+    first.onerror?.();
+    vi.advanceTimersByTime(30_000);
+    expect(sources()).toHaveLength(1);
+  });
+
+  it("cancels a pending retry", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().onerror!();
+    stop();
+    vi.advanceTimersByTime(30_000);
+    expect(sources()).toHaveLength(1);
+  });
+
+  it("drops frames still waiting for an animation frame", async () => {
+    const { connectEvents } = await load();
+    const w = watch();
+    const stop = connectEvents("p1", w.handlers);
+    latest().message({ type: "log" });
+    stop();
+    vi.advanceTimersByTime(16);
+    expect(w.batches).toEqual([]);
   });
 });

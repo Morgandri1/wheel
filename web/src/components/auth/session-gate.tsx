@@ -6,29 +6,28 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
-import { AUTH_MODE } from "@/lib/auth";
-import { hydrateSession, useSession } from "@/lib/local-auth";
+import { Button } from "@/components/ui";
+import { authMode } from "@/lib/auth";
+import { hydrateSession, retrySession, useSession } from "@/lib/local-auth";
 
 /**
- * Guards /app in local auth mode.
+ * Guards /app in local auth mode, behind middleware's cookie check. Middleware can only see a
+ * cookie shaped like a live session; this asks the server whether it is one. Both are routing
+ * courtesies, not a boundary: the API is the boundary (web/DEPLOY.md, "The trust model").
  *
- * This runs in the browser rather than in middleware, because a local session lives in
- * localStorage and the server cannot see it — there is no cookie to read at the edge. That makes
- * this a routing courtesy, not a security boundary: the boundary is the API, which refuses every
- * request without a valid `x-auth-token` and 404s projects you do not own. The point here is that
- * a signed-out visitor lands on a sign-in page instead of on a board full of failed requests.
- *
- * The three states are deliberately distinct. `loading` means we have not looked in storage yet,
- * and redirecting during it would sign out every returning user for one frame.
+ * Only `anon` redirects. `loading` has not asked yet, `unreachable` could not get an answer, and
+ * `error` is the server refusing outright (most often a deployment missing `WHEEL_PUBLIC_ORIGIN`)
+ * — none of those are "signed out", and sending any of them to sign-in would either bounce a
+ * returning user over a blip or loop them into a form that cannot fix a server misconfiguration.
  */
 export function SessionGate({ children }: { children: React.ReactNode }) {
   const session = useSession();
   const router = useRouter();
   const pathname = usePathname();
-  const local = AUTH_MODE === "local";
+  const local = authMode() === "local";
 
   useEffect(() => {
-    if (local) hydrateSession();
+    if (local) void hydrateSession();
   }, [local]);
 
   useEffect(() => {
@@ -46,6 +45,34 @@ export function SessionGate({ children }: { children: React.ReactNode }) {
         data-testid="session-loading"
       >
         Checking your session…
+      </div>
+    );
+  }
+
+  if (session.status === "unreachable") {
+    return (
+      <div
+        className="flex min-h-screen flex-col items-center justify-center gap-3 text-micro text-ink-faint"
+        data-testid="session-unreachable"
+      >
+        <p>Can&rsquo;t reach the server to check your session. Trying again…</p>
+        <Button size="sm" tone="ghost" data-testid="btn-session-retry" onClick={() => void retrySession()}>
+          Try now
+        </Button>
+      </div>
+    );
+  }
+
+  if (session.status === "error") {
+    return (
+      <div
+        className="flex min-h-screen flex-col items-center justify-center gap-3 text-micro text-ink-faint"
+        data-testid="session-error"
+      >
+        <p>{session.message}</p>
+        <Button size="sm" tone="ghost" data-testid="btn-session-retry" onClick={() => void retrySession()}>
+          Try again
+        </Button>
       </div>
     );
   }

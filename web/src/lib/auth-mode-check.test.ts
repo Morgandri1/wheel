@@ -18,8 +18,8 @@ describe("authModeMismatch", () => {
 
   it("names both sides and both env vars when they disagree", () => {
     const m = authModeMismatch("local", "jwks") ?? "";
-    expect(m).toContain("NEXT_PUBLIC_AUTH_MODE");
-    expect(m).toContain("AUTH_MODE");
+    expect(m).toContain("WHEEL_AUTH_MODE");
+    expect(m).toContain("AUTH_MODE on the API");
     expect(m).toContain("jwks");
   });
 
@@ -28,11 +28,11 @@ describe("authModeMismatch", () => {
   });
 
   it("flags mock talking to a real API, and says the env var is probably unset", () => {
-    // AUTH_MODE defaults to "mock" when NEXT_PUBLIC_AUTH_MODE is missing, so this is what a
+    // The web server's mode defaults to "mock" when WHEEL_AUTH_MODE is missing, so this is what a
     // forgotten env var looks like in production: a fixed fake token sent to a real server.
     const m = authModeMismatch("mock", "local") ?? "";
     expect(m).toContain("mock");
-    expect(m).toContain("unset");
+    expect(m).toContain("WHEEL_AUTH_MODE is probably unset");
   });
 });
 

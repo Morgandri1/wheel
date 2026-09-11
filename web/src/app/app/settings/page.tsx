@@ -8,7 +8,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button, Field, Input } from "@/components/ui";
 import { toast, toastError } from "@/components/ui/toast";
-import { AUTH_MODE } from "@/lib/auth";
+import { authMode } from "@/lib/auth";
 import { changePassword, useSession } from "@/lib/local-auth";
 import { passwordChangeProblem } from "@/lib/password";
 
@@ -46,7 +46,7 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      {AUTH_MODE === "local" ? (
+      {authMode() === "local" ? (
         <form
           method="post"
           onSubmit={submit}
