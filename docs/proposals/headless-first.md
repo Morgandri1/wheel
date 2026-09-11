@@ -21,9 +21,8 @@ that talks to the API from its own server and is never needed to get a credentia
 | 1 | Loopback by default | `wheeld` with no `--bind`/`BIND_ADDR` listens on `127.0.0.1:8080`. Any bind whose host is not loopback logs one `WARN` line naming the address and what it exposes. |
 | 2 | No browser needed | First boot on a store with no users creates a token-only owner account and writes an operator token to `<data-dir>/operator-token` (mode `0600`). The log names the path, never the value. `wheeld token create\|list\|revoke` manage tokens against the local store. Any authenticated client mints its own tokens over HTTP, on `wheeld` and on the cloud API alike. |
 | 3 | No browser origins | wheeld's CORS allow-list is empty unless `CORS_ALLOWED_ORIGINS` says otherwise. Requests addressed to a host name nobody configured are refused (DNS rebinding). |
-| 4 | Clean shutdown | SIGTERM/SIGINT stops every embedded engine, and every engine stops every agent's whole process group before `wheeld` exits. Stopping one project does the same for that project while the daemon keeps running. No orphans, no zombies. |
+| 4 | Clean shutdown | SIGTERM/SIGINT stops every embedded engine. Each lets turns in flight finish (up to 20 s), marks any that cannot as interrupted without re-running them, then kills every agent's whole process group before `wheeld` exits. Stopping one project does the same for that project while the daemon keeps running. A descendant that leaves its agent's process group (`setsid`) is out of reach natively: run under systemd (`KillMode=control-group`, its default) or in the Docker image, where the container's PID namespace ends everything. |
 | 5 | Docker, headless | `docker/Dockerfile.wheeld` is one non-root image with `/data` as its volume and a healthcheck. Every documented `-p`/`ports:` is `127.0.0.1:`-only. The web UI is a compose profile. |
-
 | 6 | Closed signup unless opened | `WHEEL_SIGNUP=closed\|open`; unset or empty is `closed`, everywhere. A closed signup is a plain `403`, and the owner adds accounts with `POST /v1/auth/users`. |
 
 Email/password stays fully functional for the web UI. Signup is a decision the operator makes out loud
@@ -53,11 +52,11 @@ is still reachable by every account on the machine and by any proxy or tunnel th
 
 ```
 api_tokens(id uuid PK, user_id text, name text, token_hash text UNIQUE, minted_by uuid NULL,
-           created_at, last_used_at NULL, revoked_at NULL)
+           session_id uuid NULL, created_at, last_used_at NULL, revoked_at NULL)
 ```
 
-The schema is the same in `migrations/0004_api_tokens.sql` (Postgres) and
-`migrations_sqlite/0004_api_tokens.sql`.
+The schema is the same in `migrations/0004_api_tokens.sql` plus `0005_api_token_sessions.sql`
+(Postgres) and their `migrations_sqlite/` twins. `session_id` is the local session that minted a token.
 
 `user_id` is the verified subject, stored as text exactly like `projects.owner_id`: a local user's uuid
 under `AUTH_MODE=local`, the identity provider's `sub` under `jwks`. So it has no foreign key to `users`.
@@ -70,9 +69,13 @@ under `AUTH_MODE=local`, the identity provider's `sub` under `jwks`. So it has n
    `token_from_headers`, unchanged.
 2. A `wht_` token takes the API-token path *before* the provider is consulted, in both modes.
    Anything else is verified as a session, exactly as before.
-3. The API-token path runs one statement:
-   `UPDATE api_tokens SET last_used_at = <db now> WHERE token_hash = $1 AND revoked_at IS NULL RETURNING user_id, id`.
-   It checks revocation and records use atomically.
+3. The API-token path runs one statement: a recursive CTE walks the token's minting chain, and
+   `UPDATE api_tokens SET last_used_at = <db now> WHERE token_hash = $1 AND NOT EXISTS (<a revoked token in
+   the chain>) RETURNING user_id, id`. It checks revocation, the token's own and every ancestor's, and
+   records use atomically. The ancestor check is what kills a child minted in the instant before its
+   parent's revocation landed (review round 1).
+   A password change revokes, in its own transaction, every token that account's sessions minted and
+   their descendants.
 4. The lookup key is the token's SHA-256, never the token. How long an index probe takes can depend only
    on a digest the caller cannot aim at a stored one, so this hash lookup is the constant-time property.
    A second compare in Rust after an exact-match lookup could never fail a test, so it is not written.
@@ -166,8 +169,18 @@ The design:
   and marks each agent `parked`, so its session resumes on the next message after a restart.
 - `stop`, `park`, `clear` and the api-key-only kill signal the group with `SIGKILL` instead of only the
   leader. It is the same bug class and the same one-line change at each site.
-- **EmbeddedSandbox** keeps a oneshot sender per engine. `stop` fires it and awaits the task, falling back
-  to `abort` after 15 s. `shutdown_all` stops every engine concurrently. `wheeld::run` calls it after the
+- **Turns in flight** (review round 1). Once shutdown begins, nothing starts and no new message is
+  written. Turns already running get up to 20 s to finish and are consumed normally. A turn still running
+  after that is consumed with `last_error = "interrupted by engine shutdown"` and its message event is
+  published. It is never requeued: a turn killed mid-flight may already have committed or pushed, and
+  replaying it would do that twice (`docs/proposals/deploy-resume-and-drain.md`).
+- **Bounded HTTP drains.** After the signal the engine drains open requests for 2 s, and wheeld's API for
+  3 s, and then stops anyway; the supervisor shutdown always runs. An event stream or a half-sent request
+  can no longer hold a stop open until something aborts it and skips the agents. The whole sequence fits
+  the 30 s stop window. That replaces §4b's 15 s, because the drain the operator ruled for needs the
+  room.
+- **EmbeddedSandbox** keeps a oneshot sender per engine. `stop` fires it and awaits the task. A 30 s
+  `abort` remains, but only as a backstop. `shutdown_all` stops every engine concurrently. `wheeld::run` calls it after the
   API has stopped accepting requests. Embedded engines install no signal handlers of their own any more.
 - **Container PID 1** is `tini`. A grandchild that outlives its parent is reparented to PID 1 and reaped.
 
@@ -290,7 +303,7 @@ Assets:
 | A6 | Timing observer on token verification | Recover a token or learn that one exists | The lookup key is `sha256(token)`, which an attacker cannot aim at a real token's hash. Every failure is one indistinguishable 401 | None known |
 | A7 | An agent (untrusted code, §2) inside an embedded engine | Read secrets, act as the operator | Unchanged, and stated at boot: the embedded backend runs agents as the daemon's uid, so an agent can read `master.key` and `operator-token`. The token adds nothing an agent could not already forge from `master.key`. In Docker the blast radius is the container | Pre-existing: this is the embedded backend's documented trade. Per-node uids are §2/M3 |
 | A8 | A container on the same compose network | Reach wheeld | Reachable only by service name, and only because `WHEEL_ALLOWED_HOSTS=wheeld`. Nothing else is in the headless compose project | The compose network is the operator's trust domain |
-| A9 | Orphaned or zombie agent processes (cost and integrity, not an attacker) | Keep running, and keep spending, after stop | Process-group kill on stop, park and shutdown. Graceful drain on SIGTERM/SIGINT. `tini` as PID 1 in the image | `SIGKILL` of `wheeld` outside a container cannot clean up. Inside a container, PID-namespace teardown kills everything. `PR_SET_PDEATHSIG` was rejected: it fires when the spawning *thread* exits, and tokio's blocking threads come and go |
+| A9 | Orphaned or zombie agent processes (cost and integrity, not an attacker) | Keep running, and keep spending, after stop | Process-group kill on stop, park and shutdown; bounded drains, so a stop always reaches the agents. `tini` as PID 1 in the image, and the container's PID namespace ends everything with it. Natively, systemd's `KillMode=control-group` (its default) kills the unit's whole cgroup on stop | **Not unconditional.** Natively, outside systemd, a descendant that double-forks and calls `setsid` leaves its agent's process group and survives SIGTERM (review round 1). So does anything, if `wheeld` itself is SIGKILLed. A Linux child subreaper was considered and deferred: it makes every escaped orphan `wheeld`'s child, and reaping those while tokio reaps its own children races for exit statuses, so it is not the simple fix the ruling allowed. Cgroup per engine is F7. `PR_SET_PDEATHSIG` fires when the spawning *thread* exits, and tokio's threads come and go |
 | A10 | Anyone reading logs | Harvest a token | Only the operator token's path is logged. `wheeld token create` prints the token on stdout alone, with diagnostics on stderr. No route returns a value after its `POST` | A terminal scrollback that captured `token create` holds the value |
 | A11 | Remote signup racing for `operator@wheeld.invalid` | Become the account `wheeld token create` mints for | The owner is matched by email **and** by a sentinel hash that signup cannot produce. `.invalid` is reserved (RFC 2606) | None known |
 | A12 | A user the identity provider has banned or signed out (cloud, `AUTH_MODE=jwks`) | Keep using the cloud API | Their sessions die at the provider, as before | **A `wht_` token does not consult the provider**, so it keeps working until revoked. Deprovisioning a user means revoking their tokens too (F6) |
@@ -311,5 +324,9 @@ Assets:
 - **F4 — token expiry and project-scoped tokens.**
 - **F5 — one runtime base for `Dockerfile.host` and `Dockerfile.wheeld`** (SDK lane owns the host image).
   Until then they are kept instruction-identical so they share layers.
+- **F7 — a cgroup per engine** on native Linux, so a project stop reaches a descendant that left its process
+  group, without relying on the service manager. Includes the child-subreaper question in A9.
+- **F8 — accounts record the token that created them**, with an owner-side account list, so a leaked owner
+  token's accounts can be found and removed (A5).
 - **F6 — tokens follow the identity provider's user status** on the cloud API (A12): an admin
   "revoke every token of subject X", or a periodic check against the provider.

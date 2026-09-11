@@ -34,6 +34,10 @@ use anyhow::Context;
 pub use config::Config;
 use wheel_core::ListenAddr;
 
+/// How long the HTTP server drains open requests after the shutdown signal. An event stream or a
+/// half-sent request would otherwise hold it open forever, and every agent with it.
+const HTTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run an engine until SIGTERM or SIGINT.
 ///
 /// The caller owns the runtime, so an embedder can host this alongside other
@@ -111,12 +115,33 @@ pub async fn serve_until(
     let app = api::router(state);
     // Whatever serving ends in — a clean stop or a bind that failed after startup resumed agents
     // with queued work — no agent outlives the engine that owns it.
-    let served = serve_on(listen, app, shutdown).await;
+    let (asked, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let signal = async move {
+        shutdown.await;
+        let _ = asked.send(());
+    };
+    let serving = serve_on(listen, app, signal);
+    tokio::pin!(serving);
+    let served = tokio::select! {
+        result = &mut serving => result,
+        () = drain_deadline(stop_asked) => {
+            tracing::warn!("requests were still open {HTTP_DRAIN:?} after the shutdown signal; stopping without them");
+            Ok(())
+        }
+    };
     supervisor.shutdown().await;
     served?;
 
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Resolves `HTTP_DRAIN` after the shutdown signal fired, and never if serving ended first.
+async fn drain_deadline(stop_asked: tokio::sync::oneshot::Receiver<()>) {
+    match stop_asked.await {
+        Ok(()) => tokio::time::sleep(HTTP_DRAIN).await,
+        Err(_) => std::future::pending().await,
+    }
 }
 
 async fn serve_on(

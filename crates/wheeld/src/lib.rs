@@ -236,14 +236,33 @@ async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
     // process is not listening on is the least helpful possible first line.
     tracing::info!("wheel is ready — open http://{}", displayable(bind));
     // With connect info: the peer address is what decides whether X-Forwarded-For is believed.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(stop_requested())
-    .await?;
+    let (asked, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let serving = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            stop_requested().await;
+            let _ = asked.send(());
+        }),
+    );
+    tokio::pin!(serving);
+    // A stuck connection must not keep the engines, and their agents, waiting behind it.
+    tokio::select! {
+        result = &mut serving => result?,
+        () = async {
+            match stop_asked.await {
+                Ok(()) => tokio::time::sleep(API_DRAIN).await,
+                Err(_) => std::future::pending().await,
+            }
+        } => tracing::warn!("requests were still open {API_DRAIN:?} after the stop signal; stopping without them"),
+    }
     Ok(())
 }
+
+/// How long the API drains open requests once asked to stop, before the engines are stopped anyway.
+const API_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Resolves when the daemon has been asked to stop.
 ///

@@ -17,9 +17,9 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 use wheel_host::sandbox::{Sandbox, Secrets, Status};
 
-/// How long an engine gets to stop its agents before its task is abandoned. The §4b spawn contract
-/// gives a standalone engine the same 15s after SIGTERM.
-const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// A backstop only: an engine bounds its own stop (a 2 s HTTP drain, up to 20 s for turns in
+/// flight, a 3 s SIGTERM grace), so this is reached only if that bound itself failed.
+const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A running engine: its task, and the signal that asks it to stop.
 ///

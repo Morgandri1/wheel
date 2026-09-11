@@ -62,7 +62,15 @@ wheeld token list                         # id, account, name, created, last use
 wheeld token revoke <id>                  # revokes it and every token it minted
 ```
 Any signed-in client can also mint its own over HTTP (`POST /v1/auth/tokens`, in `docs/API.md`). SIGTERM or ctrl-c
-stops every project's agents, and anything they started, before `wheeld` exits.
+lets turns in flight finish (up to 20 s), then stops every project's agents and their process groups before `wheeld`
+exits; allow 30 s. A process an agent deliberately detaches (`setsid`) is beyond that. As a service, run it under
+systemd, whose default `KillMode=control-group` stops the whole unit:
+```ini
+[Service]
+ExecStart=/usr/local/bin/wheeld --data-dir /var/lib/wheel
+KillMode=control-group
+TimeoutStopSec=30
+```
 
 The browser-facing settings are closed by default. `CORS_ALLOWED_ORIGINS` is empty, and a request is refused unless
 its `Host` is an IP address, `localhost`, the bind address, or a name in `WHEEL_ALLOWED_HOSTS`. That is what stops a
