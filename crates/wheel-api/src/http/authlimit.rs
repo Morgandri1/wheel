@@ -15,10 +15,15 @@
 use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
 
+/// API tokens one account may mint per hour. Minting is authenticated, so this bounds what a
+/// leaked credential can fan out into before its owner notices, not what a stranger can do.
+pub const MINTS_PER_HOUR: i64 = 20;
+
 #[derive(Clone)]
 pub struct AuthLimiter {
     login_per_15min: i64,
     signups_per_hour: i64,
+    mints_per_hour: i64,
 }
 
 impl AuthLimiter {
@@ -26,7 +31,16 @@ impl AuthLimiter {
         Self {
             login_per_15min,
             signups_per_hour,
+            mints_per_hour: MINTS_PER_HOUR,
         }
+    }
+
+    pub async fn check_mint(&self, db: &Db, user_id: &str) -> ApiResult<()> {
+        let attempts = self.bump(db, &format!("mint:{user_id}"), 60 * 60).await?;
+        if attempts > self.mints_per_hour {
+            return Err(ApiError::RateLimited);
+        }
+        Ok(())
     }
 
     pub async fn check_login(&self, db: &Db, email: &str) -> ApiResult<()> {

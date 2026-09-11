@@ -57,6 +57,44 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a secret to a file created fresh, readable only by its owner.
+///
+/// Removed first, then created exclusively at 0600: opening an existing file keeps whatever mode
+/// it already had, and a token left world-readable by some earlier accident would stay that way.
+pub fn write_new_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("replacing {}", path.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// The API's store: `STORE` when the operator set one, else the SQLite file in the data directory.
+/// One answer for the daemon and for `wheeld token`, so the two can never open different stores.
+pub fn store_url(data_dir: &Path) -> String {
+    store_url_from(std::env::var("STORE").ok(), data_dir)
+}
+
+fn store_url_from(configured: Option<String>, data_dir: &Path) -> String {
+    configured
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default_store(data_dir))
+}
+
+fn default_store(data_dir: &Path) -> String {
+    format!("sqlite://{}", data_dir.join("wheel.db").display())
+}
+
 fn random_base64_32() -> String {
     use rand::RngCore;
     let mut buf = [0u8; 32];
@@ -101,10 +139,7 @@ pub fn composed_env(data_dir: &Path, keys: &Keys, host_url: &str) -> Vec<(&'stat
         ("SANDBOX_BACKEND", "process".into()),
         // SQLite, so a local install needs nothing installed. Postgres remains production, and
         // setting STORE explicitly still wins — this is a default, not a restriction.
-        (
-            "STORE",
-            format!("sqlite://{}", data_dir.join("wheel.db").display()),
-        ),
+        ("STORE", default_store(data_dir)),
     ]
 }
 
@@ -221,6 +256,41 @@ mod tests {
         );
         assert!(!env.contains_key("AUTH_DEV_SECRET"));
         assert!(!env.contains_key("CLERK_JWKS_URL"));
+        // Headless-first: no browser origin is granted unless the operator names one, and no host
+        // name beyond loopback is admitted unless the operator names one.
+        assert!(!env.contains_key("CORS_ALLOWED_ORIGINS"));
+        assert!(!env.contains_key("WHEEL_ALLOWED_HOSTS"));
+    }
+
+    #[test]
+    fn the_store_is_the_operators_choice_else_the_data_directory() {
+        let dir = PathBuf::from("/tmp/wheeld-y");
+        assert_eq!(
+            store_url_from(None, &dir),
+            "sqlite:///tmp/wheeld-y/wheel.db"
+        );
+        assert_eq!(
+            store_url_from(Some("  ".into()), &dir),
+            "sqlite:///tmp/wheeld-y/wheel.db"
+        );
+        assert_eq!(
+            store_url_from(Some("sqlite:///elsewhere.db".into()), &dir),
+            "sqlite:///elsewhere.db"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_recreated_private_whatever_was_there_before() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tempdir().join("operator-token");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_new_private(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the old file's mode survived: {mode:o}");
     }
 
     #[test]

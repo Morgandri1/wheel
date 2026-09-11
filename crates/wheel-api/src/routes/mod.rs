@@ -5,4 +5,5 @@ pub mod ingress;
 pub mod instantiate;
 pub mod projects;
 pub mod proxy;
+pub mod tokens;
 pub mod ws_ticket;

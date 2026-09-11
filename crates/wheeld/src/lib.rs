@@ -9,11 +9,14 @@
 
 pub mod config;
 pub mod embedded;
+pub mod guard;
 pub mod supervise;
+pub mod tokens;
 
 pub use config::Settings;
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Boot the whole product in this process.
@@ -26,7 +29,7 @@ pub async fn run(settings: Settings) -> Result<()> {
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
     let host = start_host(&data_dir, &keys).await?;
-    let served = serve_api(&settings.bind).await;
+    let served = serve_api(&settings.bind, &data_dir).await;
     // After the API stops taking requests, before the process exits: every engine stops its
     // agents, whatever ended serving. Nothing this daemon started may outlive it.
     host.sandbox.shutdown_all().await;
@@ -86,6 +89,15 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
             Ok(())
         }
         config::Action::Run(settings) => run(settings).await,
+        config::Action::Token { data_dir, command } => {
+            tokens::run(
+                command,
+                &data_dir,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await
+        }
     }
 }
 
@@ -158,24 +170,73 @@ fn displayable(bind: &str) -> String {
     }
 }
 
-async fn serve_api(bind: &str) -> Result<()> {
+/// Where this daemon says it is reached — the issuer of its sessions and the base of every ingress
+/// URL — when `PUBLIC_BASE_URL` does not say. `localhost` for loopback and wildcard binds, which is
+/// what every earlier install used, so their sessions keep their issuer across the upgrade.
+fn default_public_base(bind: &str) -> String {
+    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, "8080"));
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = host.is_empty()
+        || host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    match () {
+        _ if local => format!("http://localhost:{port}"),
+        _ if host.contains(':') => format!("http://[{host}]:{port}"),
+        _ => format!("http://{host}:{port}"),
+    }
+}
+
+async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
+    let guard = Arc::new(guard::Guard::from_env(bind).context("request guard configuration")?);
+    let trusted = Arc::new(
+        wheel_api::http::client_ip::TrustedProxies::from_env()
+            .map_err(anyhow::Error::msg)
+            .context("trusted proxies")?,
+    );
+    supervise::apply_defaults(&[("PUBLIC_BASE_URL", default_public_base(bind))]);
     let cfg = wheel_api::config::Config::from_env().context("api configuration")?;
     let http = wheel_api::boot::http_client(&cfg)?;
     let db = wheel_api::boot::connect_and_migrate(&cfg).await?;
+    if let Some(path) = tokens::bootstrap_operator(&db, data_dir).await? {
+        tracing::info!(
+            path = %path.display(),
+            "wrote an operator token for the token-only owner account; send it as x-auth-token"
+        );
+    }
     let origins = wheel_api::boot::cors_origins_from_env();
+    if !origins.is_empty() {
+        tracing::info!(
+            origins = %origins.join(","),
+            "CORS_ALLOWED_ORIGINS lets pages on these origins call the API from a browser"
+        );
+    }
     let state = wheel_api::boot::build_state(cfg, db.clone(), http).await;
     wheel_api::boot::spawn_maintenance(db, std::time::Duration::from_secs(60));
 
-    let app = wheel_api::build_router(state, &origins);
+    let app = wheel_api::build_router(state, &origins)
+        .layer(axum::middleware::from_fn_with_state(guard, guard::check))
+        .layer(axum::middleware::from_fn_with_state(
+            trusted,
+            wheel_api::http::client_ip::resolve,
+        ));
+    if let Some(warning) = guard::exposure(bind) {
+        tracing::warn!("{warning}");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
     // The real address, not a guessed one: --bind exists, and telling someone to open a port the
     // process is not listening on is the least helpful possible first line.
     tracing::info!("wheel is ready — open http://{}", displayable(bind));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(stop_requested())
-        .await?;
+    // With connect info: the peer address is what decides whether X-Forwarded-For is believed.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(stop_requested())
+    .await?;
     Ok(())
 }
 
@@ -221,6 +282,31 @@ mod tests {
         assert_eq!(displayable("[::]:8080"), "localhost:8080");
         assert_eq!(displayable("127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(displayable("localhost:8080"), "localhost:8080");
+    }
+
+    /// The issuer of every session and the base of every ingress URL. It must not move for an
+    /// install that has always been `http://localhost:8080`, or an upgrade logs everyone out.
+    #[test]
+    fn the_public_base_defaults_to_where_this_daemon_is_reached() {
+        assert_eq!(
+            default_public_base("127.0.0.1:8080"),
+            "http://localhost:8080"
+        );
+        assert_eq!(default_public_base("0.0.0.0:9000"), "http://localhost:9000");
+        assert_eq!(default_public_base("[::1]:8080"), "http://localhost:8080");
+        assert_eq!(
+            default_public_base("localhost:8081"),
+            "http://localhost:8081"
+        );
+        assert_eq!(
+            default_public_base("192.168.1.5:8080"),
+            "http://192.168.1.5:8080"
+        );
+        assert_eq!(
+            default_public_base("[2001:db8::1]:80"),
+            "http://[2001:db8::1]:80"
+        );
+        assert_eq!(default_public_base("box.lan:8080"), "http://box.lan:8080");
     }
 
     /// `stop_requested` is what makes ctrl-c and `docker stop`/systemd's SIGTERM actually end the

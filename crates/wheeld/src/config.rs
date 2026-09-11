@@ -1,5 +1,6 @@
 //! Settings for the single-process daemon: two flags, and defaults for everything else.
 
+use crate::tokens::TokenCommand;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
@@ -8,17 +9,31 @@ wheeld — Wheel in one process: API, sandbox host, and per-project engines.
 
 USAGE:
     wheeld [--data-dir <path>] [--bind <addr>]
+    wheeld token create [--name <label>] [--email <account>] [--data-dir <path>]
+    wheeld token list [--data-dir <path>]
+    wheeld token revoke <id> [--data-dir <path>]
 
 OPTIONS:
     --data-dir <path>   Where boards, secrets and project data live.
                         Default: $WHEEL_DATA_DIR, else ~/.wheel
-    --bind <addr>       Address to serve on. Default: $BIND_ADDR, else 0.0.0.0:8080
+    --bind <addr>       Address to serve on. Default: $BIND_ADDR, else 127.0.0.1:8080.
+                        Any other address is reachable from other machines, and says so.
     -h, --help          Print this message
     -V, --version       Print the version
 
-Everything else is configured for you: local email/password accounts, a sqlite
-store, and one sandboxed engine per project. Open http://localhost:8080 and sign up.
+The first start writes an operator token to <data-dir>/operator-token. Send it as
+`x-auth-token: <token>` or `Authorization: Bearer <token>`. `wheeld token` makes more,
+lists them and revokes them, straight from the data directory.
+
+ENVIRONMENT:
+    WHEEL_ALLOWED_HOSTS   More host names a request may be addressed to, besides localhost
+                          and IP addresses. Refusing the rest keeps DNS-rebinding pages out.
+    WHEEL_SIGNUP          open (the default) or closed.
+    CORS_ALLOWED_ORIGINS  Browser origins allowed to call the API directly. Default: none.
 ";
+
+/// Loopback: only this machine can reach it until the operator says otherwise.
+pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -30,6 +45,10 @@ pub struct Settings {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Run(Settings),
+    Token {
+        data_dir: PathBuf,
+        command: TokenCommand,
+    },
     PrintUsage,
     PrintVersion,
 }
@@ -44,9 +63,14 @@ impl Settings {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+        if args.first().map(String::as_str) == Some("token") {
+            return parse_token(&args[1..]);
+        }
+
         let mut data_dir: Option<PathBuf> = None;
         let mut bind: Option<String> = None;
-        let mut it = args.into_iter().map(|s| s.as_ref().to_string());
+        let mut it = args.into_iter();
 
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -71,16 +95,69 @@ impl Settings {
             }
         }
 
-        let data_dir = data_dir
-            .or_else(|| std::env::var("WHEEL_DATA_DIR").ok().map(PathBuf::from))
-            .map(Ok)
-            .unwrap_or_else(default_data_dir)?;
+        let data_dir = resolve_data_dir(data_dir)?;
         let bind = bind
             .or_else(|| std::env::var("BIND_ADDR").ok())
-            .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+            .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
         Ok(Action::Run(Settings { data_dir, bind }))
     }
+}
+
+/// `wheeld token create|list|revoke`, with the same `--data-dir` rules as the daemon.
+fn parse_token(args: &[String]) -> Result<Action> {
+    let mut it = args.iter();
+    let sub = it.next().map(String::as_str);
+    let (mut data_dir, mut name, mut email) = (None, None, None);
+    let mut positional: Vec<&str> = Vec::new();
+
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let mut value = |what: &str| -> Result<String> {
+            match &inline {
+                Some(v) => Ok(v.clone()),
+                None => it
+                    .next()
+                    .cloned()
+                    .with_context(|| format!("{flag} needs {what}")),
+            }
+        };
+        match flag {
+            "-h" | "--help" => return Ok(Action::PrintUsage),
+            "--data-dir" => data_dir = Some(PathBuf::from(value("a path")?)),
+            "--name" => name = Some(value("a label")?),
+            "--email" => email = Some(value("an account's email")?),
+            other if other.starts_with('-') => bail!("unknown argument {other:?}\n\n{USAGE}"),
+            _ => positional.push(arg),
+        }
+    }
+
+    if sub != Some("create") && (name.is_some() || email.is_some()) {
+        bail!("--name and --email are options of `wheeld token create`");
+    }
+    let command = match (sub, positional.as_slice()) {
+        (Some("create"), []) => TokenCommand::Create {
+            name: name.unwrap_or_else(|| "cli".to_string()),
+            email,
+        },
+        (Some("list"), []) => TokenCommand::List,
+        (Some("revoke"), [id]) => TokenCommand::Revoke { id: id.to_string() },
+        (Some("revoke"), _) => bail!("`wheeld token revoke` takes exactly one token id"),
+        _ => bail!("expected `wheeld token create|list|revoke`\n\n{USAGE}"),
+    };
+    Ok(Action::Token {
+        data_dir: resolve_data_dir(data_dir)?,
+        command,
+    })
+}
+
+fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
+    flag.or_else(|| std::env::var("WHEEL_DATA_DIR").ok().map(PathBuf::from))
+        .map(Ok)
+        .unwrap_or_else(default_data_dir)
 }
 
 /// `~/.wheel`, or an error that says what to pass instead.
@@ -122,12 +199,13 @@ mod tests {
         }
 
         // Nothing set: the defaults are a working configuration on their own, which is the whole
-        // promise of "zero flags".
+        // promise of "zero flags" — and the default bind is loopback, so zero flags also means
+        // nothing but this machine can reach it (docs/proposals/headless-first.md).
         clear();
         std::env::set_var("HOME", "/home/someone");
         let s = run(&[]);
         assert_eq!(s.data_dir, PathBuf::from("/home/someone/.wheel"));
-        assert_eq!(s.bind, "0.0.0.0:8080");
+        assert_eq!(s.bind, "127.0.0.1:8080");
 
         // The environment supplies defaults when no flags are given.
         std::env::set_var("WHEEL_DATA_DIR", "/from/env");
@@ -147,6 +225,16 @@ mod tests {
         assert_eq!(s.data_dir, PathBuf::from("/x"));
         assert_eq!(s.bind, "[::1]:80");
 
+        // The token subcommands find the data directory by the same rules.
+        std::env::set_var("WHEEL_DATA_DIR", "/from/env");
+        assert_eq!(
+            Settings::parse(["token", "list"]).unwrap(),
+            Action::Token {
+                data_dir: PathBuf::from("/from/env"),
+                command: TokenCommand::List
+            }
+        );
+
         // No HOME and no flag: there is nothing to derive a data directory from, so the error has
         // to name the flag that fixes it rather than invent a location.
         clear();
@@ -163,6 +251,10 @@ mod tests {
         assert_eq!(Settings::parse(["--help"]).unwrap(), Action::PrintUsage);
         assert_eq!(Settings::parse(["-h"]).unwrap(), Action::PrintUsage);
         assert_eq!(Settings::parse(["-V"]).unwrap(), Action::PrintVersion);
+        assert_eq!(
+            Settings::parse(["token", "create", "--help"]).unwrap(),
+            Action::PrintUsage
+        );
     }
 
     /// A mistyped flag must not be ignored: silently running with a default the user did not ask
@@ -179,6 +271,59 @@ mod tests {
     fn a_flag_without_its_value_is_an_error() {
         assert!(Settings::parse(["--data-dir"]).is_err());
         assert!(Settings::parse(["--bind"]).is_err());
+        assert!(Settings::parse(["token", "create", "--name"]).is_err());
+    }
+
+    fn token(args: &[&str]) -> TokenCommand {
+        let mut all = vec!["token"];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&["--data-dir", "/d"]);
+        match Settings::parse(all).unwrap() {
+            Action::Token { data_dir, command } => {
+                assert_eq!(data_dir, PathBuf::from("/d"));
+                command
+            }
+            other => panic!("expected a token command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_subcommands_parse() {
+        assert_eq!(
+            token(&["create"]),
+            TokenCommand::Create {
+                name: "cli".into(),
+                email: None
+            }
+        );
+        assert_eq!(
+            token(&["create", "--name", "ci", "--email=me@example.com"]),
+            TokenCommand::Create {
+                name: "ci".into(),
+                email: Some("me@example.com".into())
+            }
+        );
+        assert_eq!(token(&["list"]), TokenCommand::List);
+        assert_eq!(
+            token(&["revoke", "0b0e"]),
+            TokenCommand::Revoke { id: "0b0e".into() }
+        );
+    }
+
+    #[test]
+    fn a_malformed_token_command_is_refused_with_a_reason() {
+        for (args, says) in [
+            (vec!["token"], "create|list|revoke"),
+            (vec!["token", "rotate"], "create|list|revoke"),
+            (vec!["token", "revoke"], "exactly one"),
+            (vec!["token", "revoke", "a", "b"], "exactly one"),
+            (vec!["token", "list", "extra"], "create|list|revoke"),
+            (vec!["token", "list", "--name", "x"], "wheeld token create"),
+            (vec!["token", "create", "--bogus"], "--bogus"),
+        ] {
+            let e = Settings::parse(args.clone()).unwrap_err();
+            assert!(format!("{e:#}").contains(says), "{args:?}: {e:#}");
+        }
     }
 }
 

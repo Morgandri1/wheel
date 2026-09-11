@@ -39,7 +39,10 @@ pub async fn create(
     Json(body): Json<CreateProject>,
 ) -> ApiResult<(axum::http::StatusCode, Json<Project>)> {
     let project = create_project(&state, &user, body.name).await?;
-    Ok((axum::http::StatusCode::CREATED, Json(project)))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(project.with_ingress_base(&state.cfg.public_base_url)),
+    ))
 }
 
 /// The body of [`create`], reusable by anything that needs a fresh project without going through

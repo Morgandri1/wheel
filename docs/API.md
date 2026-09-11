@@ -15,6 +15,7 @@ configuration, not code.
 |---|---|---|
 | `local` (built in) | HS256, issued by this API | `SESSION_SECRET`, plus a live row in `sessions` |
 | `jwks` | RS256, issued by an external provider | the provider's JWKS |
+| either | `wht_…` API token, issued by this API | its SHA-256 in `api_tokens`, not revoked (see [API tokens](#api-tokens-every-auth_mode)) |
 
 `AUTH_MODE` must be set explicitly in production — an unset value refuses to boot rather than
 defaulting, because guessing wrong either rejects every real user or accepts tokens from the wrong
@@ -94,6 +95,61 @@ compromised, leaving existing sessions alive would defeat the point. Clients mus
 
 Email-based password *reset* is M3 — it needs a mail provider, and there is none yet.
 
+## API tokens (every `AUTH_MODE`)
+
+API tokens are how a client without a browser signs in: a script, CI, or a desktop app such as AgentGrid. They work the
+same way against a local `wheeld` and the cloud API. Design and threat model: `docs/proposals/headless-first.md`.
+
+- **Format.** `wht_` followed by 43 base64url characters, which encode 32 random bytes.
+- **Sending one.** Use it wherever a session goes: `x-auth-token: wht_…` or `Authorization: Bearer wht_…`.
+- **Subject.** A token speaks for the account that minted it. Under `local` that is the user's id; under `jwks` it is the
+  identity provider's `sub`. Projects and ownership checks cannot tell a token from a session.
+- **Storage.** The server keeps only the token's SHA-256, which is also the lookup key. The value is returned once, when
+  it is minted, and never again: not by any route, and not in any log.
+- **Failure.** An unknown or revoked token gets the same `401`, with the same body, as every other authentication failure.
+  Nothing tells a caller that the token existed or was revoked.
+- **Last use.** Every authenticated request stamps `last_used_at`. The revocation check and the stamp are one statement.
+
+### `POST /v1/auth/tokens`
+Authenticated by a session or by an existing token.
+```json
+{ "name": "laptop" }
+```
+`201` →
+```json
+{ "id": "<uuid>", "name": "laptop", "token": "wht_…", "created_at": "2026-09-11T10:00:00+00:00" }
+```
+- `name` is 1–64 characters after trimming, with no control characters. Otherwise `400`.
+- Minting is rate limited to **20 per account per hour**, counted in the database like the login limit. Over the limit
+  returns `429`.
+- A token minted *by a token* records its parent as `minted_by`.
+
+### `GET /v1/auth/tokens`
+`200` → the caller's own tokens, newest first. It never includes a token value or a hash.
+```json
+[ { "id": "<uuid>", "name": "laptop", "minted_by": null,
+    "created_at": "…", "last_used_at": "…" | null, "revoked_at": "…" | null } ]
+```
+
+### `DELETE /v1/auth/tokens/{id}`
+`204`. The token stops working on the next request.
+
+- **It revokes the token's whole lineage**: every token it minted, transitively. Whoever used a leaked token to mint
+  successors loses them with it, so revoking the leak ends it.
+- It is idempotent, and a second revoke keeps the first `revoked_at`.
+- It returns `404` for a token that belongs to someone else, exactly as for one that does not exist or an id that is not
+  a uuid.
+
+### `wheeld`: the operator token and `wheeld token`
+On its first start against a store with no accounts, `wheeld` does three things:
+1. It creates `operator@wheeld.invalid`, an account with no password that signs in only with tokens.
+2. It writes that account's first token to `<data-dir>/operator-token` (`0600`).
+3. It logs the path, never the value.
+
+`wheeld token create [--name N] [--email E] | list | revoke <id>` manages tokens against the local store directly. It
+needs no running daemon and no HTTP. Access to the data directory is the boundary, the same one that guards `master.key`.
+With no `--email`, `create` mints for the token-only owner.
+
 ### Note on revocation vs. `session_version`
 
 The review asked for a `users.session_version` counter. This implements the same guarantee with a
@@ -105,7 +161,7 @@ rather than silently substituted; say the word if you want the counter instead.
 
 | Header | Required | Notes |
 |---|---|---|
-| `x-auth-token` | yes | Clerk session JWT (RS256). `Authorization: Bearer <jwt>` is accepted as an alias. |
+| `x-auth-token` | yes | A session JWT (local HS256 or the provider's RS256), or a `wht_` API token. `Authorization: Bearer <token>` is accepted as an alias. |
 | `x-project-id` | project-scoped routes | Must be a UUID. If the route also carries the id in its path, **the two must match exactly** or the request is rejected `400`. |
 | `x-request-id` | no | Echoed back and attached to every log line for that request. |
 
@@ -345,11 +401,13 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `WHEEL_HOST_URL` | yes | — | e.g. `http://wheel-host.railway.internal:7100`. |
 | `WHEEL_HOST_SECRET` | yes | — | Bearer for the host. Must never appear in a sandbox's environment. |
 | `AUTH_DEV_SECRET` | no | — | HS256 test tokens. **Only honoured when `WHEEL_ENV=dev`.** |
-| `CORS_ALLOWED_ORIGINS` | no | — | Comma-separated exact origins. |
+| `CORS_ALLOWED_ORIGINS` | no | empty | Comma-separated exact origins. Empty means no browser may call the API directly: the web UI calls it from its own server. |
 | `MAX_PROJECTS_PER_USER` | no | `20` | |
 | `INGRESS_RATE_PER_MIN` | no | `60` | `0` disables. |
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
+| `PUBLIC_BASE_URL` | no | `http://localhost:8080` | The public base of every `ingress_base_url` and the issuer of local sessions. Behind TLS, `https://<domain>`. Changing it ends every session: the issuer moved. `wheeld` defaults it to `http://localhost:<port>` of its bind. |
+| `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
 
 ### Running `AUTH_MODE=jwks` without a provider account
@@ -441,6 +499,24 @@ the attacker chose (ADVERSARY 017, where a mock-auth build resolved every token 
 `owner_id`). Boot is the only place to catch it. Dev is unaffected: pointing at a local issuer is
 exactly what dev is for. The host is checked as a literal, without DNS — boot is not the place to
 trust a resolver, and a name that resolves publicly today may not tomorrow.
+
+## Behind a reverse proxy
+
+Behind a proxy, the TCP peer is the proxy, and the caller's address is whatever `X-Forwarded-For`
+says. A client can write that header itself. So:
+
+- **`X-Forwarded-For` is believed only from a peer inside `WHEEL_TRUSTED_PROXIES`.** The default
+  trusts no one, and then the peer is the client.
+- **The client is the first address, counting from the right, that is not a trusted proxy.** A value
+  a client prepended is never reached. A hop that is not an address ends the walk at the last one that
+  could be vouched for.
+- **A public ingress hit carries that address to the engine as `x-wheel-client-ip`.** The caller's
+  own `x-wheel-*` headers are stripped first, so only the API can set it. The engine's per-caller
+  ingress limit and an endpoint's `ip_allow` key on it.
+- **`X-Forwarded-Proto` is never read.** The scheme the API advertises comes from `PUBLIC_BASE_URL`.
+
+Both the `wheel-api` binary and `wheeld` apply this, and both are served with the peer address
+available to it. For a proxy on the same machine, `WHEEL_TRUSTED_PROXIES=127.0.0.1/32,::1`.
 
 ## CORS
 
