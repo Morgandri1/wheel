@@ -58,7 +58,7 @@ for old, new in edits:
 open(path, "w").write(text)
 PY
         caddyfile="$work/Caddyfile"
-        red="edge-headers signup-closed-at-edge web-sse forwarded-headers-overwritten body-limits ingress-rate-limit-ignores-xff not-published cookie-stripped-to-wheeld caddy-admin-off"
+        red="edge-headers signup-closed-at-edge web-sse forwarded-headers-overwritten body-limits ingress-rate-limit-ignores-xff loopback-only cookie-stripped-to-wheeld caddy-admin-off"
         ;;
     config)
         git -C "$repo" show "$ref:infra/vps/rehearsal/mutations/config.yml" >"$work/extra.yml" || exit 2

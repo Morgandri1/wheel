@@ -2,9 +2,12 @@
 # Licensed under the PolyForm Noncommercial License 1.0.0.
 # See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
-# Mutation: the mistake `not-published` exists to catch.
+# Mutation: the mistake `loopback-only` exists to catch — a bind that isn't 127.0.0.1.
+# wheeld already publishes on 127.0.0.1:8080 by design (the SSH-tunnel path), so exercising a real
+# failure means overriding that to a non-loopback bind, not merely adding a second port.
 
 services:
   wheeld:
     ports:
-      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:18080:8080"

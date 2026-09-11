@@ -71,6 +71,8 @@ if [ -n "${REHEARSE_COMPOSE_EXTRA:-}" ]; then
     variant="$variant MUTATION:compose+=$REHEARSE_COMPOSE_EXTRA"
 fi
 
+# shellcheck source=/dev/null
+. "$vps/lib/derive-env.sh"
 (
     umask 077
     cat >"$vps/.env" <<EOF
@@ -80,6 +82,7 @@ WHEEL_SIGNUP=closed
 WHEEL_EDGE_SUBNET=10.231.$octet.0/24
 WHEEL_CADDY_IP=10.231.$octet.10
 EOF
+    WHEEL_DOMAIN="$domain" WHEEL_CADDY_IP="10.231.$octet.10" wheel_derive_env "$vps/.env"
 )
 
 compose() {
@@ -207,30 +210,40 @@ check forwarded-headers-overwritten
 check body-limits
 check ingress-rate-limit-ignores-xff
 
-published=""
+# wheeld and web deliberately publish on 127.0.0.1 in every mode (the SSH-tunnel access path), so
+# the property this checks is loopback-ONLY, not "no port at all": every published binding must be
+# 127.0.0.1, never 0.0.0.0 or a real interface address, and the loopback path must actually work —
+# a check that only confirmed a bind exists, without confirming it answers, would prove nothing.
+non_loopback=""
 for svc in wheeld web; do
-    ports="$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' "$(compose ps -q "$svc")")"
-    [ -z "$ports" ] || published="$published $svc publishes $ports;"
+    binds="$(docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}} {{end}}{{end}}' "$(compose ps -q "$svc")")"
+    for ip in $binds; do
+        case "$ip" in
+            127.0.0.1) ;;
+            *) non_loopback="$non_loopback $svc binds $ip (not 127.0.0.1);" ;;
+        esac
+    done
 done
 pid="$(recall project)"
 session="$(recall session)"
 cookie="$(recall cookie)"
+loopback_answers=1
 if [ -n "$pid" ]; then
-    for probe in "8080 /v1/projects" "3000 /api/wheel/v1/projects" "7000 /v1/projects"; do
-        port="${probe%% *}"
-        path="${probe#* }"
-        body="$(curl -s -m 3 -H "x-auth-token: $session" -H "cookie: $cookie" -H "origin: http://127.0.0.1:$port" "http://127.0.0.1:$port$path")"
-        case "$body" in *"$pid"*) published="$published 127.0.0.1:$port answers with this project;" ;; esac
+    for probe in "8080 x-auth-token:$session /v1/projects" "3000 cookie:$cookie /api/wheel/v1/projects"; do
+        read -r port header path <<<"$probe"
+        body="$(curl -s -m 3 -H "${header%%:*}: ${header#*:}" -H "origin: http://127.0.0.1:$port" "http://127.0.0.1:$port$path")"
+        case "$body" in *"$pid"*) ;; *) loopback_answers=0; non_loopback="$non_loopback 127.0.0.1:$port did not answer with this project;" ;; esac
     done
 else
-    published="$published no project to look for (an earlier check failed);"
+    loopback_answers=0
+    non_loopback="$non_loopback no project to check against (an earlier check failed);"
 fi
-if [ -z "$published" ]; then
-    say PASS not-published "wheeld and web publish no port, and 127.0.0.1:8080/3000/7000 do not reach them"
-    record not-published 0
+if [ -z "$non_loopback" ] && [ "$loopback_answers" = 1 ]; then
+    say PASS loopback-only "wheeld and web publish on 127.0.0.1 only, and both answer there (the SSH-tunnel path)"
+    record loopback-only 0
 else
-    say FAIL not-published "$published"
-    record not-published 1
+    say FAIL loopback-only "$non_loopback"
+    record loopback-only 1
 fi
 
 engine="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"

@@ -2,9 +2,20 @@
 # Licensed under the PolyForm Noncommercial License 1.0.0.
 # See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
-# Wheel on one server. Caddy is the only thing with a published port; wheeld and the web app are
-# reachable only across the internal `edge` network. Configure with infra/vps/.env (start from
-# .env.example) and read infra/vps/README.md first.
+# Wheel on one server. Two modes, chosen by whether WHEEL_DOMAIN is set — never invoke this file
+# directly with `docker compose`; use ./deploy.sh (a real server) or ./rehearse.sh (a laptop),
+# both of which compute the settings below from infra/vps/.env via lib/derive-env.sh.
+#
+#   tunnel (default, no WHEEL_DOMAIN): wheeld and web publish on 127.0.0.1 only. Caddy does not
+#     run. Reach the board over an SSH tunnel. Nothing on this host is reachable from the network.
+#   TLS (WHEEL_DOMAIN set): Caddy starts (COMPOSE_PROFILES=tls) and is the only public listener,
+#     on 80 and 443. wheeld and web still publish on 127.0.0.1 too — that is never a public
+#     exposure, and it is a convenient direct path for the operator's own tunnel or for debugging.
+#
+# There is no third mode that serves plain HTTP to the internet. A VPS's published ports are
+# reachable the moment anything upstream — a misconfigured cloud firewall, ufw not covering
+# Docker's own iptables rules — lets traffic through, and a password or a wht_ token does not get
+# a second chance once it has crossed the network once in the clear.
 
 name: wheel
 
@@ -17,10 +28,11 @@ services:
     volumes:
       - ./preflight.sh:/preflight.sh:ro
     environment:
-      WHEEL_DOMAIN: ${WHEEL_DOMAIN:-}
-      WHEEL_PUBLIC_HOST: ${WHEEL_PUBLIC_HOST:-}
-      WHEEL_TLS_INTERNAL: ${WHEEL_TLS_INTERNAL:-}
-      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}
+      - WHEEL_DOMAIN
+      - ACME_EMAIL
+      - WHEEL_TLS_INTERNAL
+      - COMPOSE_PROFILES
+      - WHEEL_SIGNUP=${WHEEL_SIGNUP:-closed}
 
   wheeld:
     build:
@@ -32,11 +44,18 @@ services:
       preflight:
         condition: service_completed_successfully
     environment:
-      PUBLIC_BASE_URL: ${WHEEL_DOMAIN:+https://${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+http://${WHEEL_PUBLIC_HOST}}
-      WHEEL_ALLOWED_HOSTS: wheeld${WHEEL_DOMAIN:+,${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+,${WHEEL_PUBLIC_HOST}}
-      WHEEL_TRUSTED_PROXIES: ${WHEEL_CADDY_IP:-10.231.8.10}
-      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}
-      RUST_LOG: ${RUST_LOG:-info}
+      # Bare (no `=`) so an unset one is OMITTED, not passed through empty: wheeld's own default
+      # (derived from its bind address) applies only when the key is absent entirely. Resolved by
+      # lib/derive-env.sh from WHEEL_DOMAIN — never hand-set these.
+      - PUBLIC_BASE_URL
+      - WHEEL_TRUSTED_PROXIES
+      - WHEEL_ALLOWED_HOSTS=${WHEEL_ALLOWED_HOSTS:-wheeld}
+      - WHEEL_SIGNUP=${WHEEL_SIGNUP:-closed}
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      # Loopback only, in every mode. Reachable from this machine (an SSH tunnel, or the operator
+      # themselves) and never from the network, whether or not Caddy is also running.
+      - "127.0.0.1:${WHEEL_WHEELD_PORT:-8080}:8080"
     volumes:
       - wheel-data:/data
     networks:
@@ -48,30 +67,32 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile.web
     restart: unless-stopped
-    # The image is root-owned and never writes to it (web/DEPLOY.md): a read-only root filesystem
-    # is not a hardening extra here, it is what the image already is. /tmp stays a small tmpfs
-    # rather than removed outright, so an incidental write fails loudly instead of wedging Node.
-    read_only: true
-    tmpfs:
-      - /tmp:size=16m,mode=1777
     depends_on:
       preflight:
         condition: service_completed_successfully
       wheeld:
         condition: service_healthy
     environment:
-      WHEEL_API_URL: http://wheeld:8080
-      WHEEL_AUTH_MODE: local
-      # Authoritative for the session cookie's Secure flag and the CSRF origin check; it wins over
-      # any forwarded header. Trusting the proxy is safe only because Caddy is the web server's only
-      # peer and overwrites X-Forwarded-Proto/Host.
-      WHEEL_PUBLIC_ORIGIN: ${WHEEL_DOMAIN:+https://${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+http://${WHEEL_PUBLIC_HOST}}
-      WHEEL_TRUST_PROXY: "1"
+      - WHEEL_API_URL=http://wheeld:8080
+      - WHEEL_AUTH_MODE=local
+      # WHEEL_PUBLIC_ORIGIN is authoritative for the session cookie's Secure flag and the CSRF
+      # origin check, in both modes: https://<domain> in TLS mode, http://localhost:<port> in
+      # tunnel mode (matching what an SSH-tunneled browser actually sees). WHEEL_TRUST_PROXY is
+      # bare: "1" only in TLS mode, where Caddy is the web server's only peer and overwrites
+      # X-Forwarded-Proto/Host; omitted in tunnel mode, where nothing proxies to it at all.
+      - WHEEL_PUBLIC_ORIGIN=${WHEEL_PUBLIC_ORIGIN:-http://localhost:3000}
+      - WHEEL_TRUST_PROXY
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "127.0.0.1:${WHEEL_WEB_PORT:-3000}:3000"
     networks:
       - edge
 
   caddy:
     image: caddy:2
+    profiles: ["tls"]
     restart: unless-stopped
     depends_on:
       preflight:
@@ -85,7 +106,13 @@ services:
       - "443:443"
       - "443:443/udp"
     environment:
-      CADDY_SITE: ${WHEEL_DOMAIN:-:80}
+      # Deliberately no fallback: Compose interpolates every service's environment before it
+      # filters by profile (measured — a `:?` guard here fires even when the tls profile is
+      # inactive and this service is never created), so this cannot refuse to boot AT THE COMPOSE
+      # LEVEL the way preflight does. The Caddyfile itself is what refuses to start on an empty
+      # CADDY_SITE, so a caddy container started without WHEEL_DOMAIN — by hand, bypassing
+      # deploy.sh/rehearse.sh — fails loudly instead of silently binding plain HTTP to :80.
+      CADDY_SITE: ${WHEEL_DOMAIN:-}
       CADDY_EMAIL_OPTION: ${ACME_EMAIL:+email ${ACME_EMAIL}}
       CADDY_TLS_OPTION: ${WHEEL_TLS_INTERNAL:+tls internal}
       WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}

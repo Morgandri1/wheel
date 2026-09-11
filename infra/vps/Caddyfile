@@ -3,9 +3,14 @@
 # See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 # The only public listener in front of Wheel. One file for every mode, driven by environment
-# variables that compose.yml (or /etc/wheel/caddy.env on bare metal) derives from .env:
+# variables that compose.yml (or /etc/wheel/caddy.env on bare metal) derives from .env. This
+# container only runs at all with COMPOSE_PROFILES=tls (compose.yml), which lib/derive-env.sh sets
+# only alongside WHEEL_DOMAIN — there is no plain-HTTP-publicly mode. CADDY_SITE has deliberately
+# no fallback: an empty site address is a Caddyfile syntax error (measured — "server block without
+# any key is global configuration"), so Caddy refuses to start rather than silently binding :80,
+# if this is ever run by hand without WHEEL_DOMAIN set.
 #
-#   CADDY_SITE          wheel.example.com → automatic HTTPS via ACME.   Unset → plain HTTP on :80.
+#   CADDY_SITE          wheel.example.com — automatic HTTPS via ACME. Never empty; see above.
 #   CADDY_EMAIL_OPTION  "email you@example.com", or blank.
 #   CADDY_TLS_OPTION    "tls internal" for Caddy's own CA (LAN, rehearsal), or blank.
 #   WHEEL_API_UPSTREAM  wheeld:8080 in compose, 127.0.0.1:8080 on bare metal.
@@ -25,7 +30,7 @@
 	header_up -Forwarded
 }
 
-{$CADDY_SITE::80} {
+{$CADDY_SITE} {
 	{$CADDY_TLS_OPTION}
 
 	header {
