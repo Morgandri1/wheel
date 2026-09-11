@@ -3125,6 +3125,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+ "url",
  "uuid",
 ]
 
@@ -3185,6 +3186,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wheel-core",
  "wheel-sqlite",
 ]
 

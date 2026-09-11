@@ -23,6 +23,7 @@ pub mod message;
 pub mod name;
 pub mod node;
 pub mod preamble;
+pub mod proxy_path;
 pub mod spawn;
 pub mod state;
 pub mod timestamp;

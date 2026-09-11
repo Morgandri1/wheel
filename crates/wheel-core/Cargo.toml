@@ -12,6 +12,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 schemars = { version = "0.8", features = ["uuid1"] }
 time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+url = "2"
 
 [[bin]]
 name = "export-schema"
