@@ -452,7 +452,9 @@ async fn tokens_work_under_jwks_for_a_subject_with_no_local_account() {
     for (db, url) in stores().await {
         let app = router(&db, &url, AuthMode::Jwks);
         let sub = format!("user_{}", Uuid::new_v4().simple());
-        let issued = api_token::issue(&db, &sub, "desktop", None).await.unwrap();
+        let issued = api_token::issue(&db, &sub, "desktop", api_token::Mint::Operator)
+            .await
+            .unwrap();
 
         let (status, projects) = call(
             &app,
@@ -600,8 +602,105 @@ async fn a_store_that_already_has_accounts_gets_no_owner() {
 #[tokio::test]
 async fn revoking_without_an_owner_is_the_operators_store_wide_revoke() {
     let (db, _) = sqlite().await;
-    let issued = api_token::issue(&db, "someone", "cli", None).await.unwrap();
+    let issued = api_token::issue(&db, "someone", "cli", api_token::Mint::Operator)
+        .await
+        .unwrap();
     assert!(api_token::revoke(&db, &issued.id, None).await.unwrap());
     assert!(!api_token::revoke(&db, &Uuid::new_v4(), None).await.unwrap());
     assert!(api_token::verify(&db, &issued.token).await.is_err());
+}
+
+/// The mint race (review round 1): a mint that passed its credential check just before its parent's
+/// revocation landed inserts a child after the family was revoked. Revoking the family cannot see
+/// that child; checking the chain at use time does.
+#[tokio::test]
+async fn a_token_whose_ancestor_is_revoked_never_authenticates() {
+    for (db, url) in stores().await {
+        let app = router(&db, &url, AuthMode::Local);
+        let (session, user) = account(&app).await;
+        let (parent, parent_id) = minted(&app, Auth::Header(&session), "parent").await;
+        let (child, _) = minted(&app, Auth::Header(&parent), "child").await;
+        let (status, _) = call(&app, "GET", "/v1/projects", Auth::Header(&child), None).await;
+        assert_eq!(status, StatusCode::OK, "a live family refused its child");
+
+        let (status, _) = call(
+            &app,
+            "DELETE",
+            &format!("/v1/auth/tokens/{parent_id}"),
+            Auth::Header(&session),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let parent_id = Uuid::parse_str(&parent_id).unwrap();
+        let late = api_token::issue(&db, &user, "late", api_token::Mint::Token(parent_id))
+            .await
+            .unwrap();
+        let later = api_token::issue(&db, &user, "later", api_token::Mint::Token(late.id))
+            .await
+            .unwrap();
+        for token in [&late.token, &later.token, &child] {
+            let (status, _) = call(&app, "GET", "/v1/projects", Auth::Header(token), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a token under a revoked parent authenticated"
+            );
+        }
+    }
+}
+
+/// A password is changed because someone else may know it, and whoever knew it could have logged
+/// in and minted a token that outlives the password (review round 1). Tokens the operator minted
+/// from the data directory are not a session's, and survive.
+#[tokio::test]
+async fn a_password_change_revokes_what_the_accounts_sessions_minted() {
+    for (db, url) in stores().await {
+        let app = router(&db, &url, AuthMode::Local);
+        let (session, user) = account(&app).await;
+        let (from_session, from_session_id) = minted(&app, Auth::Header(&session), "laptop").await;
+        let (from_token, _) = minted(&app, Auth::Header(&from_session), "ci").await;
+        let operator = api_token::issue(&db, &user, "operator", api_token::Mint::Operator)
+            .await
+            .unwrap();
+
+        let change =
+            json!({"current_password": "Correct-Horse-9!", "new_password": "Another-Horse-10!"});
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/password",
+            Auth::Header(&session),
+            Some(change),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for token in [&session, &from_session, &from_token] {
+            let (status, _) = call(&app, "GET", "/v1/projects", Auth::Header(token), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a credential outlived the password change"
+            );
+        }
+        let (status, _) = call(
+            &app,
+            "GET",
+            "/v1/projects",
+            Auth::Header(&operator.token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the operator's token died with a web password"
+        );
+        assert!(
+            row(&db, &from_session_id).await.2.is_some(),
+            "the list does not show the revocation"
+        );
+    }
 }

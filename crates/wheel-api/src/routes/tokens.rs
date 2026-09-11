@@ -38,11 +38,11 @@ pub async fn create(
     Json(body): Json<NewToken>,
 ) -> ApiResult<(StatusCode, Json<CreatedToken>)> {
     state.auth_limiter.check_mint(&state.db, user.id()).await?;
-    let minted_by = match user.credential() {
-        Credential::ApiToken(parent) => Some(parent),
-        Credential::Session => None,
+    let mint = match user.credential() {
+        Credential::ApiToken(parent) => api_token::Mint::Token(parent),
+        Credential::Session(session) => api_token::Mint::Session(session),
     };
-    let issued = api_token::issue(&state.db, user.id(), &body.name, minted_by).await?;
+    let issued = api_token::issue(&state.db, user.id(), &body.name, mint).await?;
     Ok((
         StatusCode::CREATED,
         Json(CreatedToken {

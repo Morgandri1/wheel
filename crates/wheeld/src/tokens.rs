@@ -59,7 +59,9 @@ pub async fn run(
                          wheeld first started. Pass --email <account>",
                     )?,
             };
-            let issued = api_token::issue(&db, &owner.id.to_string(), &name, None).await?;
+            let issued =
+                api_token::issue(&db, &owner.id.to_string(), &name, api_token::Mint::Operator)
+                    .await?;
             writeln!(out, "{}", issued.token)?;
             writeln!(
                 err,

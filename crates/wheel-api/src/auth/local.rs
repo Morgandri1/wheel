@@ -298,7 +298,8 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
 
     let hash = hash_password(new)?;
 
-    // Both statements or neither. Every other session dies with the old password — if it was
+    // All of it or none. Every other session dies with the old password, and so does every token
+    // those sessions minted — if it was
     // changed because it was compromised, leaving the old sessions alive defeats the point — and a
     // new password whose revocation did not commit would be exactly that failure, silently.
     //
@@ -319,6 +320,10 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
                 .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(crate::auth::api_token::REVOKE_SESSION_MINTED_PG)
+                .bind(user_id.to_string())
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         #[cfg(feature = "sqlite")]
@@ -331,6 +336,10 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
                 .await?;
             sqlx::query(REVOKE_SESSIONS)
                 .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(crate::auth::api_token::REVOKE_SESSION_MINTED_SQLITE)
+                .bind(user_id.to_string())
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -385,12 +394,19 @@ pub async fn issue_session(
 ///
 /// Signature and claims are checked first, then the session row: a stateless JWT alone cannot be
 /// logged out, and "log out" that leaves the token working is not a logout.
+/// A local session that verified: who it is, and which session, so what it mints can be ended with
+/// the password it was opened with.
+pub struct LiveSession {
+    pub user_id: String,
+    pub session_id: Uuid,
+}
+
 pub async fn verify_session(
     db: &Db,
     token: &str,
     secret: &str,
     issuer: &str,
-) -> Result<String, ApiError> {
+) -> Result<LiveSession, ApiError> {
     let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     v.set_issuer(&[issuer]);
     v.validate_exp = true;
@@ -417,7 +433,10 @@ pub async fn verify_session(
     let live = live.map(|r| r.0);
 
     match live {
-        Some(user_id) if user_id.to_string() == data.claims.sub => Ok(data.claims.sub),
+        Some(user_id) if user_id.to_string() == data.claims.sub => Ok(LiveSession {
+            user_id: data.claims.sub,
+            session_id: sid,
+        }),
         // A valid signature over a revoked session, or one whose subject was tampered with.
         _ => Err(ApiError::Unauthorized("session is no longer valid")),
     }

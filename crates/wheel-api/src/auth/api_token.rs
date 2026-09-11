@@ -52,6 +52,18 @@ pub struct Issued {
     pub created_at: DateTime<Utc>,
 }
 
+/// What minted a token, which decides what else can end it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mint {
+    /// The operator, from the data directory: `wheeld token create`, or first boot.
+    Operator,
+    /// A login session: a local session's id, or none for an identity provider's. A password
+    /// change revokes every token a local session of that account minted.
+    Session(Option<Uuid>),
+    /// Another token, which it dies with.
+    Token(Uuid),
+}
+
 /// Who a live token speaks for, and which token it was.
 pub struct Verified {
     pub user_id: String,
@@ -110,24 +122,25 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-pub async fn issue(
-    db: &Db,
-    user_id: &str,
-    name: &str,
-    minted_by: Option<Uuid>,
-) -> ApiResult<Issued> {
+pub async fn issue(db: &Db, user_id: &str, name: &str, mint: Mint) -> ApiResult<Issued> {
     let name = validate_name(name).map_err(ApiError::BadRequest)?;
+    let (minted_by, session_id) = match mint {
+        Mint::Operator => (None, None),
+        Mint::Session(session) => (None, session),
+        Mint::Token(parent) => (Some(parent), None),
+    };
     let id = Uuid::new_v4();
     let token = generate();
     let (created_at,): (DateTime<Utc>,) = crate::db_fetch_one!(
         db,
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, minted_by) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING created_at",
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, minted_by, session_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING created_at",
         id,
         user_id,
         &name,
         digest(&token),
-        minted_by
+        minted_by,
+        session_id
     )?;
     Ok(Issued {
         id,
@@ -142,12 +155,27 @@ pub async fn issue(
 /// Unknown and revoked are one answer, so a caller learns nothing about which tokens exist. The
 /// revocation check and the use stamp are one statement, so a token revoked mid-request cannot be
 /// stamped as used after it died.
+///
+/// A token is live only while every token in its minting chain is: a child minted by a parent in
+/// the instant before the parent's revocation landed is inserted after the family was revoked, and
+/// only a check at use time, walking up the chain, can see that it belongs to a dead family.
 pub async fn verify(db: &Db, token: &str) -> Result<Verified, ApiError> {
-    const PG: &str = "UPDATE api_tokens SET last_used_at = now() \
-         WHERE token_hash = $1 AND revoked_at IS NULL RETURNING user_id, id";
-    const SQLITE: &str = "UPDATE api_tokens \
-         SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-         WHERE token_hash = $1 AND revoked_at IS NULL RETURNING user_id, id";
+    const PG: &str = "WITH RECURSIVE chain(id, minted_by, revoked_at) AS ( \
+             SELECT id, minted_by, revoked_at FROM api_tokens WHERE token_hash = $1 \
+             UNION SELECT t.id, t.minted_by, t.revoked_at FROM api_tokens t \
+                 JOIN chain c ON t.id = c.minted_by \
+         ) \
+         UPDATE api_tokens SET last_used_at = now() \
+         WHERE token_hash = $1 AND NOT EXISTS (SELECT 1 FROM chain WHERE revoked_at IS NOT NULL) \
+         RETURNING user_id, id";
+    const SQLITE: &str = "WITH RECURSIVE chain(id, minted_by, revoked_at) AS ( \
+             SELECT id, minted_by, revoked_at FROM api_tokens WHERE token_hash = $1 \
+             UNION SELECT t.id, t.minted_by, t.revoked_at FROM api_tokens t \
+                 JOIN chain c ON t.id = c.minted_by \
+         ) \
+         UPDATE api_tokens SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE token_hash = $1 AND NOT EXISTS (SELECT 1 FROM chain WHERE revoked_at IS NOT NULL) \
+         RETURNING user_id, id";
     let row: Option<(String, Uuid)> =
         crate::db_fetch_optional!(db, db.pick(PG, SQLITE), digest(token))?;
     row.map(|(user_id, token_id)| Verified { user_id, token_id })
@@ -224,6 +252,23 @@ pub async fn revoke(db: &Db, id: &Uuid, owner: Option<&str>) -> ApiResult<bool> 
     Ok(changed > 0)
 }
 
+/// Revoke every token an account's local sessions minted, and everything those minted. Run in the
+/// password change's transaction; `$1` is the account's id as text.
+#[cfg(feature = "postgres")]
+pub(crate) const REVOKE_SESSION_MINTED_PG: &str = "WITH RECURSIVE family(id) AS ( \
+         SELECT id FROM api_tokens WHERE user_id = $1 AND session_id IS NOT NULL \
+         UNION SELECT t.id FROM api_tokens t JOIN family f ON t.minted_by = f.id \
+     ) \
+     UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, now()) \
+     WHERE id IN (SELECT id FROM family)";
+#[cfg(feature = "sqlite")]
+pub(crate) const REVOKE_SESSION_MINTED_SQLITE: &str = "WITH RECURSIVE family(id) AS ( \
+         SELECT id FROM api_tokens WHERE user_id = $1 AND session_id IS NOT NULL \
+         UNION SELECT t.id FROM api_tokens t JOIN family f ON t.minted_by = f.id \
+     ) \
+     UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+     WHERE id IN (SELECT id FROM family)";
+
 /// First boot of a store with no accounts: a token-only owner and its first token.
 ///
 /// `None` once any account exists. An install that already has users says which of them a token
@@ -233,7 +278,7 @@ pub async fn bootstrap_owner(db: &Db, email: &str, token_name: &str) -> ApiResul
         return Ok(None);
     }
     let owner = crate::auth::local::create_token_only_user(db, email).await?;
-    issue(db, &owner.id.to_string(), token_name, None)
+    issue(db, &owner.id.to_string(), token_name, Mint::Operator)
         .await
         .map(Some)
 }

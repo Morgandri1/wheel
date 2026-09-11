@@ -25,8 +25,8 @@ use uuid::Uuid;
 /// How a request proved who it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Credential {
-    /// A login: a local session JWT, or the identity provider's token.
-    Session,
+    /// A login: a local session JWT (by session id), or the identity provider's token (none).
+    Session(Option<Uuid>),
     /// A long-lived `wht_` API token, by id.
     ApiToken(Uuid),
 }
@@ -70,21 +70,21 @@ impl FromRequestParts<AppState> for AuthUser {
             });
         }
         let (user_id, credential) = match state.cfg.auth_mode {
-            crate::config::AuthMode::Local => (
-                crate::auth::local::verify_session(
+            crate::config::AuthMode::Local => {
+                let live = crate::auth::local::verify_session(
                     &state.db,
                     token,
                     state.cfg.session_secret.expose(),
                     &state.cfg.public_base_url,
                 )
-                .await?,
-                Credential::Session,
-            ),
+                .await?;
+                (live.user_id, Credential::Session(Some(live.session_id)))
+            }
             crate::config::AuthMode::Jwks => (
                 crate::auth::claims::verify(token, &state.cfg, &state.jwks)
                     .await?
                     .user_id,
-                Credential::Session,
+                Credential::Session(None),
             ),
         };
 

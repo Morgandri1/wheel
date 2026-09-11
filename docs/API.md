@@ -134,6 +134,12 @@ same way against a local `wheeld` and the cloud API. Design and threat model: `d
 - **Failure.** An unknown or revoked token gets the same `401`, with the same body, as every other authentication failure.
   Nothing tells a caller that the token existed or was revoked.
 - **Last use.** Every authenticated request stamps `last_used_at`. The revocation check and the stamp are one statement.
+- **A dead family stays dead.** A token authenticates only while every token in its minting chain is
+  unrevoked. That covers a child minted in the instant before its parent's revocation landed, which the
+  revocation itself could not see.
+- **A password change ends what that account's sessions minted,** and everything those tokens minted,
+  along with the sessions themselves. Tokens the operator minted from the data directory
+  (`wheeld token create`, the first-boot operator token) are not a session's, and survive it.
 
 ### `POST /v1/auth/tokens`
 Authenticated by a session or by an existing token.
