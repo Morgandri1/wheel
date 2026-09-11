@@ -158,13 +158,9 @@ fn a_fresh_data_dir_boots_headless_with_a_working_operator_token() {
         )
     );
 
-    // Reachable from this machine only, signup stays open: a laptop user is never locked out.
-    let signup = reqwest::blocking::Client::new()
-        .post(format!("{}/v1/auth/signup", daemon.base))
-        .json(&serde_json::json!({"email": "local@example.test", "password": "Correct-Horse-9!"}))
-        .send()
-        .unwrap();
-    assert_eq!(signup.status().as_u16(), 201);
+    // Even on loopback, signup is closed until the operator opens it: loopback is reachable from
+    // every account on the machine, and from anything behind a proxy that says 127.0.0.1.
+    assert_eq!(signup(&daemon.base), 403);
 
     // DNS rebinding: the page's own name arrives as the Host, and is refused.
     assert_eq!(
@@ -303,6 +299,25 @@ fn an_exposed_bind_says_so_and_a_closed_signup_is_closed() {
         log.contains(&format!("0.0.0.0:{port}")) && log.contains("every network interface"),
         "{log}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn signup(base: &str) -> u16 {
+    reqwest::blocking::Client::new()
+        .post(format!("{base}/v1/auth/signup"))
+        .json(&serde_json::json!({"email": "walk-in@example.test", "password": "Correct-Horse-9!"}))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[test]
+fn signup_opens_only_when_the_operator_says_so() {
+    let dir = data_dir("open");
+    let daemon = Daemon::start(&dir, &[("WHEEL_SIGNUP", "open")]);
+    assert_eq!(signup(&daemon.base), 201);
+    daemon.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
 

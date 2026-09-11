@@ -24,10 +24,12 @@ that talks to the API from its own server and is never needed to get a credentia
 | 4 | Clean shutdown | SIGTERM/SIGINT stops every embedded engine, and every engine stops every agent's whole process group before `wheeld` exits. Stopping one project does the same for that project while the daemon keeps running. No orphans, no zombies. |
 | 5 | Docker, headless | `docker/Dockerfile.wheeld` is one non-root image with `/data` as its volume and a healthcheck. Every documented `-p`/`ports:` is `127.0.0.1:`-only. The web UI is a compose profile. |
 
-| 6 | Closed signup wherever strangers could reach it | `WHEEL_SIGNUP=open\|closed`. `wheeld` defaults to `closed` when it binds beyond loopback, trusts a proxy, or has a `PUBLIC_BASE_URL`; otherwise `open`. A closed signup is a plain `403`, and the owner adds accounts with `POST /v1/auth/users`. |
+| 6 | Closed signup unless opened | `WHEEL_SIGNUP=closed\|open`; unset or empty is `closed`, everywhere. A closed signup is a plain `403`, and the owner adds accounts with `POST /v1/auth/users`. |
 
-Email/password stays fully functional for the web UI. On a loopback-only `wheeld` signup stays open, so a
-laptop user, and QA's `WHEELD-*` smoke, are never locked out.
+Email/password stays fully functional for the web UI. Signup is a decision the operator makes out loud
+(`WHEEL_SIGNUP=open`), never one inferred from the bind: review round 1 showed a loopback-only `wheeld`
+is still reachable by every account on the machine and by any proxy or tunnel that presents
+`127.0.0.1`. QA's `WHEELD-*` smoke and the dev compose stack set `open` explicitly.
 
 ## 1. Loopback by default
 
@@ -232,9 +234,8 @@ The kit itself (`infra/vps/*`) is the `api/vps-deploy` lane's. This lane owns th
     tokens are unaffected.
 - **`WHEEL_ALLOWED_HOSTS=<domain>`.** Caddy passes the public `Host` through, and the DNS-rebinding
   guard refuses names it was not given.
-- **Signup is closed there without being told**, because `PUBLIC_BASE_URL` and `WHEEL_TRUSTED_PROXIES`
-  are set. The kit should still set `WHEEL_SIGNUP=closed` explicitly, so the box is closed by
-  configuration rather than by inference.
+- **Signup is closed** unless `WHEEL_SIGNUP=open`. The kit sets `WHEEL_SIGNUP=closed` anyway, so the
+  box's policy is visible in its configuration.
 
 The kit's contract, as environment:
 
@@ -283,7 +284,7 @@ Assets:
 |---|---|---|---|---|
 | A1 | Network peer (LAN, café wifi, cloud VPC) | Reach the API or public ingress | Loopback default. A non-loopback bind is explicit and warned. Docs and compose publish only on `127.0.0.1` | A deliberate public bind is the operator's choice; TLS, firewalling and a reverse proxy are theirs to add |
 | A2 | A web page in the operator's browser | CSRF, or scripting the API through DNS rebinding | Empty CORS list. JSON bodies force a preflight, which fails. The `Host` guard refuses the rebinding page's own name. Ingress `/p/*` is exempt, being public already | A page on an *admitted* host (`localhost:<other port>`, an IP literal) is a server on that address, which is inside the operator's trust domain |
-| A3 | A stranger on the internet, or another OS user on the same machine, without data-dir access | Get an account, then run agent code as the operator's uid | **Signup is closed by default whenever `wheeld` binds beyond loopback, trusts a proxy, or has a `PUBLIC_BASE_URL`**: a plain `403`. Only the token-only owner adds accounts (`POST /v1/auth/users`); accounts it adds, and their tokens, cannot. The data dir stays `0700` and the token file `0600` | A loopback-only `wheeld` keeps open signup, so another OS user on a shared machine can still sign up and run agents as the operator's uid. `WHEEL_SIGNUP=closed` fixes that there. Making it the loopback default too needs a ruling (F2) |
+| A3 | A stranger on the internet, or another OS user on the same machine, without data-dir access | Get an account, then run agent code as the operator's uid | **Signup is closed unless `WHEEL_SIGNUP=open`, on every deployment**: a plain `403`. Only the token-only owner adds accounts (`POST /v1/auth/users`); accounts it adds, and their tokens, cannot. The data dir stays `0700` and the token file `0600` | An operator who sets `WHEEL_SIGNUP=open` on a shared or proxied box hands every account on it the daemon's uid |
 | A4 | Reader of a DB backup (`wheel.db` or the Postgres dump, without the token file) | Turn stored rows into credentials | Tokens are stored as SHA-256 only. Sessions need the master-key-derived key | A backup that includes the data dir includes `master.key` and `operator-token`: that reader is the owner |
 | A5 | A holder of a leaked token (shell history, CI log, `ps`, a lost laptop running AgentGrid) | Keep or extend access | 256-bit secret with immediate revocation (checked on every request, no cache). **Lineage revocation**: revoking the leaked token revokes every token minted from it. Minting is limited to 20 per account per hour. `last_used_at` and `minted_by` make use and fan-out visible in `GET /v1/auth/tokens`. A token-only account has no password to change. The README quickstart keeps the token out of argv (`curl -H @<(…)`) | While live, a holder can mint (rate-limited) tokens and revoke the account's other tokens: they hold the account. A token placed in argv is visible via `ps` for the life of that process. Tokens do not expire (F4) |
 | A6 | Timing observer on token verification | Recover a token or learn that one exists | The lookup key is `sha256(token)`, which an attacker cannot aim at a real token's hash. Every failure is one indistinguishable 401 | None known |
@@ -300,8 +301,8 @@ Assets:
 
 - **F1 — `wheel` operator mode**: `wheel login` (store or accept a token), `wheel projects`, `wheel apply`
   (board/apply). Today `wheel` is agent-only, and it stays that way in this change.
-- **F2 — close signup on loopback too** (A3, shared machines). Needs a ruling, because QA's `WHEELD-signup`
-  and the laptop web-UI flow sign up. The exposed and proxied cases are already closed by default.
+- **F2 — closed signup everywhere: done** (operator ruling, review round 1). The inferred default missed a
+  public box behind a proxy that presents `127.0.0.1`, and `WHEEL_ALLOWED_HOSTS` without a proxy list.
 - **F2b — `WHEEL_SIGNUP=invite`**: owner-minted, single-use invite codes. Refused at boot today rather
   than half-built. It would also cover an upgraded install that has no token-only owner.
 - **F3 — a web password for the token-only owner**, so that projects created headless show up in the web

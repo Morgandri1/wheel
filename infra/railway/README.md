@@ -85,7 +85,9 @@ Set in the Railway dashboard or with `railway variables --set`, never in git.
 
 `wheel-api`: `DATABASE_URL`, `API_MASTER_KEY`, `AUTH_MODE`, `WHEEL_ENV`, `WHEEL_HOST_URL`,
 `WHEEL_HOST_SECRET`, `PUBLIC_BASE_URL`, `CORS_ALLOWED_ORIGINS` (comma-separated; currently
-`https://wheel.dev,https://www.wheel.dev,https://wheel-2708.vercel.app`).
+`https://wheel.dev,https://www.wheel.dev,https://wheel-2708.vercel.app`). `WHEEL_SIGNUP`: under
+`AUTH_MODE=local`, signup is **closed** unless this is `open`, so a local-auth deployment that
+wants public signup must set it explicitly; under `jwks` the local signup route is 404 regardless.
 
 `wheel-host`: `WHEEL_HOST_SECRET` (same value as the API's), `SANDBOX_BACKEND=process`,
 `WHEEL_DATA_DIR=/data`, volume mounted at `/data`, `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` (see below).

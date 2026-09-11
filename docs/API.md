@@ -56,17 +56,15 @@ Send `token` as `x-auth-token` on every subsequent request.
 - `403`, with the generic `forbidden` body, when signup is closed. See the signup policy below.
 
 ### Signup policy (`WHEEL_SIGNUP`)
-`open` (the default for the `wheel-api` binary) or `closed`. Any other value refuses to boot, and
-`invite` is refused with a pointer to the route below.
+`closed` (the default: unset or empty) or `open`, for the `wheel-api` binary and `wheeld` alike. Any
+other value refuses to boot, and `invite` is refused with a pointer to the route below.
 
 - **Closed:** `POST /v1/auth/signup` answers `403` before it counts against the signup limit, and
   creates nothing.
-- **`wheeld` closes it by default** whenever it can be reached from beyond its own machine:
-  - it binds a non-loopback address;
-  - `WHEEL_TRUSTED_PROXIES` is set;
-  - the operator set `PUBLIC_BASE_URL`.
-
-  Otherwise it stays open, so a laptop install is never locked out.
+- **Closed is not inferred from how the box looks.** An earlier version opened it on a loopback-only
+  `wheeld`, and a review showed that is still reachable by every account on the machine and by any
+  proxy or tunnel that presents `127.0.0.1`. Opening it is a decision made out loud:
+  `WHEEL_SIGNUP=open`.
 - **Why:** the embedded backend runs every account's agents as the daemon's own user. An open signup
   on a public box is a stranger's code on it.
 
@@ -434,7 +432,7 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
 | `PUBLIC_BASE_URL` | no | `http://localhost:8080` | The public base of every `ingress_base_url` (`<PUBLIC_BASE_URL>/p/<id>`, returned by every project route, including create), and the issuer of local sessions. Clients display it as-is: the web app no longer builds it. Behind TLS, `https://<domain>`. Changing it ends every session: the issuer moved. `wheeld` defaults it to `http://localhost:<port>` of its bind. |
-| `WHEEL_SIGNUP` | no | `open` | `open` or `closed`, local auth only. `wheeld` defaults it to `closed` when reachable beyond loopback, behind a proxy, or given a `PUBLIC_BASE_URL`. See [Signup policy](#signup-policy-wheel_signup). |
+| `WHEEL_SIGNUP` | no | `closed` | `closed` or `open`, local auth only. Unset or empty is closed. See [Signup policy](#signup-policy-wheel_signup). |
 | `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
 
@@ -606,7 +604,7 @@ DATABASE_URL=postgres://wheel:wheel@127.0.0.1:55432/wheel_dev \
 CLERK_ISSUER=https://dev.wheel.local AUTH_DEV_SECRET=dev-only-hs256-secret \
 API_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 WHEEL_HOST_URL=http://127.0.0.1:7100 WHEEL_HOST_SECRET=dev-host-secret-at-least-16-chars \
-CORS_ALLOWED_ORIGINS=http://localhost:3000 ./target/debug/wheel-api
+WHEEL_SIGNUP=open CORS_ALLOWED_ORIGINS=http://localhost:3000 ./target/debug/wheel-api
 ```
 
 `SANDBOX_BACKEND=external` points the host at an engine someone else started, instead of creating

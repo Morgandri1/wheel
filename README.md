@@ -69,9 +69,9 @@ its `Host` is an IP address, `localhost`, the bind address, or a name in `WHEEL_
 web page from reaching wheeld through DNS rebinding.
 
 **Signup** (`WHEEL_SIGNUP=open|closed`):
-- It stays open on a wheeld only this machine can reach. It closes by default as soon as wheeld binds beyond loopback,
-  trusts a proxy, or has a `PUBLIC_BASE_URL`. An account's agents run as your user, so a stranger's signup is a
-  stranger's code on your box.
+- Closed unless you set `WHEEL_SIGNUP=open`, on every wheeld. An account's agents run as your user, so a stranger's
+  signup is a stranger's code on your box, and loopback is reachable by every account on the machine and by anything a
+  proxy forwards. Open it only where nobody else can reach it.
 - A closed signup answers `403`. The owner still adds people, using the operator token and keeping the password off the
   command line:
   ```bash
@@ -104,8 +104,9 @@ The same thing as a compose file: `docker compose -f infra/compose.wheeld.yml up
 WHEEL_API_URL=http://127.0.0.1:8080 npx wheel-web                                # against wheeld on this machine
 docker compose -f infra/compose.wheeld.yml --profile web up -d --build           # or both in compose: UI on http://127.0.0.1:3000
 ```
-The UI signs in with email and password: sign up on its login page. It calls the API from its own server, and the browser
-never talks to the API directly.
+The UI signs in with email and password. Signup is closed by default, so the owner adds your account with
+`POST /v1/auth/users` (above); on a machine only you use, `WHEEL_SIGNUP=open` lets you sign up on the login page
+instead. The UI calls the API from its own server, and the browser never talks to the API directly.
 
 Projects belong to the account that created them. To script the boards you use in the UI, mint a token for that account,
 either from the UI or with `wheeld token create --email you@example.com`.

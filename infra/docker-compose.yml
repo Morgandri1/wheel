@@ -75,6 +75,9 @@ services:
       # No browser origins: the web UI calls the API from its own server. Set this only for a
       # browser client you are deliberately developing against the API directly.
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      # A development stack on loopback: the web UI and QA's integration client sign up. Signup is
+      # closed wherever this is unset.
+      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-open}
       # Local HS256 tokens for testing without Clerk. Only honoured because WHEEL_ENV=dev;
       # the API refuses to boot if this is set with WHEEL_ENV=prod.
       AUTH_DEV_SECRET: ${AUTH_DEV_SECRET:-dev-only-hs256-secret}

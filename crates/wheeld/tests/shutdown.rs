@@ -35,6 +35,7 @@ fn sigterm_stops_the_daemon_its_engines_and_every_agent_process() {
     ])
     .env_clear()
     .env("PATH", common::path_with(&fake))
+    .env("WHEEL_SIGNUP", "open")
     .env("HOME", std::env::var("HOME").unwrap_or_default())
     .stdout(Stdio::null())
     .stderr(Stdio::null());

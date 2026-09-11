@@ -28,7 +28,8 @@ lists them and revokes them, straight from the data directory.
 ENVIRONMENT:
     WHEEL_ALLOWED_HOSTS   More host names a request may be addressed to, besides localhost
                           and IP addresses. Refusing the rest keeps DNS-rebinding pages out.
-    WHEEL_SIGNUP          open (the default) or closed.
+    WHEEL_SIGNUP          closed (the default) or open. Closed, the owner adds
+                          accounts with POST /v1/auth/users and the operator token.
     CORS_ALLOWED_ORIGINS  Browser origins allowed to call the API directly. Default: none.
 ";
 

@@ -73,6 +73,9 @@ def clean_env(data_dir):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("WHEEL_") and k not in ("DATABASE_URL", "BIND_ADDR")}
     env["WHEEL_DATA_DIR"] = data_dir          # the one flag a user would pass
+    # Signup is closed unless the operator opens it (headless-first review, round 1), and this
+    # smoke signs up; saying so is the one decision a user makes out loud.
+    env["WHEEL_SIGNUP"] = "open"
     return env
 
 
