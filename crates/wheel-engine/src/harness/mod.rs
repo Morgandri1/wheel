@@ -14,6 +14,13 @@ use uuid::Uuid;
 
 pub mod claude;
 
+/// Whether this build has a driver for `harness`. The one answer node creation,
+/// agent start and `GET /v1/engine` all give, so none can claim a harness the
+/// others refuse.
+pub fn has_driver(harness: wheel_core::Harness) -> bool {
+    matches!(harness, wheel_core::Harness::Claude)
+}
+
 /// Everything needed to spawn a child for one agent node.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {

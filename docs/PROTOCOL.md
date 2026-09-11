@@ -136,6 +136,53 @@ not silent.
 
 ## 2. Control plane (`/v1/*`, engine-secret bearer)
 
+### Engine discovery
+
+| Route | Response | M |
+|---|---|---|
+| `GET /v1/engine` | `EngineInfo` | M1 |
+
+`EngineInfo` (`docs/schema/engine-info.json`) is how a client learns what this engine can do, as deployed,
+before it sends anything optional. `features` can differ between two deployments of one build: see
+`oauth_paste_code` below. Agent configs are `deny_unknown_fields`, so a field the engine does not know is
+a `400`, not an ignored key: check `features` first.
+
+```jsonc
+{
+  "version": "0.1.0",        // CARGO_PKG_VERSION, compile-time
+  "build": "a1b2c3d…",       // the same stamp /healthz reports; "unknown" when unstamped
+  "api_version": "v1",
+  "harnesses": ["claude"],   // harnesses with a driver. codex is modelled but refused (M2), so absent
+  "profiles": ["sandboxed"],
+  "features": ["board", "wires", "…"]
+}
+```
+
+- **Additive only.** A client ignores fields and feature ids it does not know. An absent id means the
+  capability is not there: do not call its routes or send its fields.
+- `harnesses` comes from the same predicate node creation and agent start use, so an advertised harness
+  is never refused by either.
+- Behind the API this is `GET /v1/projects/:id/engine/v1/engine`, behind the host
+  `GET /host/v1/projects/:id/engine/v1/engine`: the ordinary engine proxy, with no route of its own.
+
+| Feature id | What it guarantees |
+|---|---|
+| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id` |
+| `wires` | `POST`/`DELETE /v1/wires` |
+| `messages` | `POST /v1/agents/:id/send` |
+| `inbox` | `GET /v1/agents/:id/inbox`, `GET /v1/agents/:id/inbox/:message_id` |
+| `tables` | `GET /v1/tables/:id/rows`, `POST /v1/tables/:id/query` |
+| `vault` | `GET /v1/vault/:id`, `PUT`/`DELETE /v1/vault/:id/:key` |
+| `tools` | `POST /v1/tools/import`, `POST /v1/tools/:id/import`, `GET /v1/tools/:id/ops`, `POST /v1/tools/:id/call` |
+| `ingress` | endpoint nodes answer on the public `/ingress/*` realm |
+| `idle_parking` | `AgentConfig.idle_timeout_secs` (§5b) |
+| `ephemeral_context` | `AgentConfig.ephemeral_context` |
+| `budgets` | `AgentConfig.budget` `{max_turns?, max_usd?}` |
+| `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**: there the OAuth credential this login produces is refused at spawn, so a client must offer API-key auth instead |
+
+Each id is held to its row by a test that calls the routes or creates an agent carrying the field
+(`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.
+
 ### Board
 
 | Route | Body → Response | M |

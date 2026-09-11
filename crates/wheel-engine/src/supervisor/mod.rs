@@ -542,11 +542,12 @@ impl Supervisor {
         // a hardcoded ClaudeDriver. Starting a codex node would therefore spawn
         // `claude` with codex credentials and never say so — a silent harness
         // substitution the operator cannot see. Refuse instead, and say why.
-        if agent_cfg.harness == wheel_core::Harness::Codex {
-            let reason =
-                "harness \"codex\" is not supported by this build (M2): there is no codex \
-                          driver, so starting this node would silently run claude instead"
-                    .to_string();
+        if !crate::harness::has_driver(agent_cfg.harness) {
+            let h = agent_cfg.harness;
+            let reason = format!(
+                "harness \"{h}\" is not supported by this build (M2): there is no {h} \
+                 driver, so starting this node would silently run claude instead"
+            );
             self.set_status(agent, AgentStatus::Error, Some(reason));
             return Ok(AgentStatus::Error);
         }

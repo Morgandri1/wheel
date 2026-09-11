@@ -52,11 +52,12 @@ pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::
 /// and nothing says so. Refusing beats running the wrong thing quietly.
 fn reject_unsupported_harness(config: &wheel_core::NodeConfig) -> Result<(), ApiError> {
     if let wheel_core::NodeConfig::Agent(a) = config {
-        if a.harness == wheel_core::Harness::Codex {
-            return Err(ApiError::invalid(
-                "harness \"codex\" is not supported by this build (M2): there is no codex driver, \
-                 and running the node would silently spawn claude instead",
-            ));
+        if !crate::harness::has_driver(a.harness) {
+            let h = a.harness;
+            return Err(ApiError::invalid(format!(
+                "harness \"{h}\" is not supported by this build (M2): there is no {h} driver, \
+                 and running the node would silently spawn claude instead"
+            )));
         }
     }
     Ok(())

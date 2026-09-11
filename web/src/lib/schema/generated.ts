@@ -146,6 +146,39 @@ export type EndpointAuth =
     };
 
 /**
+ * The capabilities of a running engine, as deployed.
+ *
+ * Node configs reject unknown fields, so a client checks `features` before sending an optional one. Clients ignore fields they do not know.
+ */
+
+export interface EngineInfo {
+  /**
+   * The control-plane contract version, `v1`.
+   */
+  api_version: string;
+  /**
+   * The commit this binary was built from, or `unknown` for an unstamped build.
+   */
+  build: string;
+  /**
+   * Stable ids of the capabilities this deployment honours. Clients ignore ids they do not know.
+   */
+  features: string[];
+  /**
+   * Harnesses this build can run. A modelled harness without a driver is absent.
+   */
+  harnesses: string[];
+  /**
+   * Spawn profiles this build supports.
+   */
+  profiles: string[];
+  /**
+   * The engine crate version, compiled in.
+   */
+  version: string;
+}
+
+/**
  * The uniform error body used by both the host and the engine.
  */
 
