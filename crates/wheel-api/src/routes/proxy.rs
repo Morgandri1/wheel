@@ -9,9 +9,10 @@
 //!   * `WHEEL_HOST_SECRET` is attached here and never travels back to the client. The client's own
 //!     credentials are stripped by `sanitize_for_upstream` — the host authenticates *us*, not the
 //!     user, and relaying a user token downstream is how replay bugs start.
-//!   * The upstream URL is built from a `Uuid` we loaded from our own database plus a path
-//!     suffix that axum already percent-decoded and split, so the client cannot redirect the
-//!     proxy at another project (or another host) by smuggling `../` or an absolute URL.
+//!   * The upstream URL is the project's host base, built from a `Uuid` we loaded from our own
+//!     database, with the caller's suffix appended by `wheel_core::proxy_path`. Concatenating the
+//!     suffix instead let an encoded `..` be decoded again by the URL parser and climb into another
+//!     project's route on the host, which answers with that project's engine secret.
 
 use crate::auth::ProjectScope;
 use crate::error::{ApiError, ApiResult};
@@ -23,6 +24,7 @@ use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
+use wheel_core::proxy_path::{self, ProxyPathError, Url};
 
 /// Ceiling on the upstream WebSocket handshake. Generous for a healthy engine on the same private
 /// network, and short enough that a stalled peer cannot hold the connection open indefinitely.
@@ -34,20 +36,12 @@ pub async fn engine_proxy(
     Path((_id, rest)): Path<(uuid::Uuid, String)>,
     req: Request,
 ) -> ApiResult<Response> {
-    // Reject traversal outright rather than relying on the upstream to normalise it.
-    if rest.split('/').any(|seg| seg == "..") {
-        return Err(ApiError::BadRequest(
-            "path traversal is not permitted".into(),
-        ));
-    }
-
-    let base = state.engine_base_url(&scope.project.id);
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let upstream = format!("{base}/{rest}{query}");
+    refuse_ambiguous_path(&rest)?;
+    let upstream = upstream_url(
+        &state.engine_base_url(&scope.project.id),
+        &rest,
+        req.uri().query(),
+    )?;
 
     // axum 0.8 will not extract `Option<WebSocketUpgrade>` (that needs `OptionalFromRequestParts`,
     // which `WebSocketUpgrade` does not implement), so the upgrade is detected explicitly and the
@@ -61,6 +55,28 @@ pub async fn engine_proxy(
     } else {
         forward_http(state, req, upstream).await
     }
+}
+
+/// Refuse a caller's path suffix that a parser further down could read differently. Runs before
+/// any lookup, so the answer is the same whichever project the path names.
+pub(crate) fn refuse_ambiguous_path(rest: &str) -> ApiResult<()> {
+    proxy_path::proxy_segments(rest)
+        .map(|_| ())
+        .map_err(|_| path_refused())
+}
+
+/// `base` with the caller's decoded suffix appended segment by segment and the raw query attached.
+pub(crate) fn upstream_url(base: &str, rest: &str, query: Option<&str>) -> ApiResult<Url> {
+    proxy_path::upstream_url(base, rest, query).map_err(|e| match e {
+        ProxyPathError::BadBase => {
+            ApiError::Internal(anyhow::anyhow!("the host base URL cannot carry a path"))
+        }
+        _ => path_refused(),
+    })
+}
+
+fn path_refused() -> ApiError {
+    ApiError::BadRequest("path traversal is not permitted".into())
 }
 
 /// RFC 6455 handshake detection: `Upgrade: websocket` plus `Connection: Upgrade`, both
@@ -112,16 +128,14 @@ pub async fn engine_events(
         }
     }
 
-    let base = state.engine_base_url(&id);
     // The ticket is deliberately dropped here rather than forwarded: it has already been consumed,
     // and passing credentials further down the chain is how replay bugs start.
     let forwarded = strip_query_param(&raw_query, "ticket");
-    let suffix = if forwarded.is_empty() {
-        String::new()
-    } else {
-        format!("?{forwarded}")
-    };
-    let upstream = format!("{base}/v1/events{suffix}");
+    let upstream = upstream_url(
+        &state.engine_base_url(&id),
+        "v1/events",
+        (!forwarded.is_empty()).then_some(forwarded.as_str()),
+    )?;
 
     let req = Request::from_parts(parts, body);
     if is_websocket_upgrade(req.headers()) {
@@ -182,7 +196,7 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn forward_http(state: AppState, req: Request, upstream: String) -> ApiResult<Response> {
+async fn forward_http(state: AppState, req: Request, upstream: Url) -> ApiResult<Response> {
     let method = req.method().clone();
     let headers = hop::sanitize_for_upstream(req.headers(), &[]);
 
@@ -194,7 +208,7 @@ async fn forward_http(state: AppState, req: Request, upstream: String) -> ApiRes
 
     let resp = state
         .http
-        .request(method, &upstream)
+        .request(method, upstream)
         .headers(headers)
         .bearer_auth(state.cfg.host_secret.expose())
         .body(body)
@@ -230,20 +244,20 @@ async fn forward_http(state: AppState, req: Request, upstream: String) -> ApiRes
 async fn bridge_websocket(
     state: AppState,
     upgrade: WebSocketUpgrade,
-    upstream_http: String,
+    upstream: Url,
 ) -> ApiResult<Response> {
-    let ws_url = upstream_http
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
+    let ws_url = proxy_path::websocket_url(upstream).ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!("the host base URL has no websocket scheme"))
+    })?;
 
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&ws_url)
+        .uri(ws_url.as_str())
         .header(
             "Authorization",
             format!("Bearer {}", state.cfg.host_secret.expose()),
         )
         // Handshake headers required by RFC 6455; tungstenite does not add these for a raw request.
-        .header("Host", host_of(&ws_url).unwrap_or_default())
+        .header("Host", proxy_path::authority(&ws_url))
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -275,11 +289,6 @@ async fn bridge_websocket(
     };
 
     Ok(upgrade.on_upgrade(move |client| pump(client, upstream)))
-}
-
-fn host_of(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1)?;
-    Some(after_scheme.split('/').next()?.to_string())
 }
 
 async fn pump(

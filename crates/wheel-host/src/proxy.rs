@@ -8,6 +8,11 @@
 //! secrets at runtime (§4b): the API stores them encrypted and hands them over on `PUT`, and they
 //! never travel back up. The API's own bearer has already been checked by the middleware before
 //! anything here runs.
+//!
+//! The caller's suffix reaches the engine through `wheel_core::proxy_path`, never by string
+//! concatenation: it is refused if any segment could be read as `..` or a separator, appended one
+//! segment at a time, and the result is pinned beneath this project's engine base (and beneath
+//! `ingress/` for the ingress route) before it is sent.
 
 use crate::HostState;
 use axum::body::Body;
@@ -18,6 +23,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use uuid::Uuid;
+use wheel_core::proxy_path::{self, ProxyPathError, Url};
 
 /// Uniform error body, matching the shape the API and the engine both use:
 /// `{"error":{"code","message"}}`.
@@ -33,13 +39,25 @@ fn err(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+fn path_refused() -> Response {
+    err(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        "Path traversal is not permitted.",
+    )
+}
+
 /// Ceiling on the upstream WebSocket handshake, so a stalled engine cannot hold a bridge
 /// half-open indefinitely.
 const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A unix-socket engine has no authority, so its URL is built against this placeholder: only the
+/// path and query go down the socket, and the host name fills the `Host` header.
+const SOCKET_BASE: &str = "http://engine";
+
 /// `ANY /host/v1/projects/{id}/engine/{*rest}` → the engine's `/{rest}`.
 ///
-/// The suffix is forwarded verbatim. Callers address the control plane as
+/// The suffix is forwarded as given. Callers address the control plane as
 /// `/v1/projects/<id>/engine/v1/board`, so `rest` already carries the engine's own `v1/` prefix;
 /// adding another here produced `/v1/v1/board` and a 404 from the engine.
 pub async fn engine(
@@ -47,7 +65,7 @@ pub async fn engine(
     Path((id, rest)): Path<(Uuid, String)>,
     req: Request,
 ) -> Response {
-    forward(state, id, rest, req).await
+    forward(state, id, None, rest, req).await
 }
 
 /// `ANY /host/v1/projects/{id}/ingress/{*rest}` → the engine's `/ingress/{rest}`.
@@ -56,16 +74,54 @@ pub async fn ingress(
     Path((id, rest)): Path<(Uuid, String)>,
     req: Request,
 ) -> Response {
-    forward(state, id, format!("ingress/{rest}"), req).await
+    forward(state, id, Some("ingress"), rest, req).await
 }
 
-async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Response {
-    if suffix.split('/').any(|seg| seg == "..") {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "Path traversal is not permitted.",
-        );
+/// Where a proxied request goes: a URL on a TCP engine, or a unix socket and the URL whose path
+/// and query form the request target.
+enum Target {
+    Tcp(Url),
+    Unix { socket: String, url: Url },
+}
+
+impl Target {
+    /// `mount` is a fixed first segment the caller's suffix is confined beneath.
+    fn resolve(
+        engine_base: &str,
+        mount: Option<&str>,
+        rest: &str,
+        query: Option<&str>,
+    ) -> Result<Self, ProxyPathError> {
+        let (socket, base) = match engine_base.strip_prefix("unix://") {
+            Some(socket) => (Some(socket), SOCKET_BASE),
+            None => (None, engine_base),
+        };
+        let base = base.trim_end_matches('/');
+        let base = match mount {
+            Some(mount) => format!("{base}/{mount}"),
+            None => base.to_string(),
+        };
+        let url = proxy_path::upstream_url(&base, rest, query)?;
+        Ok(match socket {
+            Some(socket) => Target::Unix {
+                socket: socket.to_string(),
+                url,
+            },
+            None => Target::Tcp(url),
+        })
+    }
+}
+
+async fn forward(
+    state: HostState,
+    id: Uuid,
+    mount: Option<&str>,
+    rest: String,
+    req: Request,
+) -> Response {
+    // Before the store lookup, so a refused path answers the same for every project id.
+    if proxy_path::proxy_segments(&rest).is_err() {
+        return path_refused();
     }
 
     let Ok(Some(rec)) = state.store.get(&id).await else {
@@ -76,17 +132,26 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         );
     };
 
-    let base = state.sandbox.engine_base(&id);
-    let query = req
-        .uri()
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let upstream = format!("{base}/{suffix}{query}");
+    let engine_base = state.sandbox.engine_base(&id);
+    let target = match Target::resolve(&engine_base, mount, &rest, req.uri().query()) {
+        Ok(target) => target,
+        Err(ProxyPathError::BadBase) => {
+            tracing::warn!(project = %id, "engine base is not a usable URL");
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "engine_unreachable",
+                "The project engine is not reachable.",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(project = %id, error = %e, "refused an engine path");
+            return path_refused();
+        }
+    };
 
     // The events stream arrives here as a WebSocket upgrade rather than a normal request.
     if is_websocket_upgrade(req.headers()) {
-        return bridge_ws(state, rec.engine_secret, upstream, req).await;
+        return bridge_ws(state, rec.engine_secret, target, req).await;
     }
 
     let method = req.method().clone();
@@ -119,28 +184,27 @@ async fn forward(state: HostState, id: Uuid, suffix: String, req: Request) -> Re
         }
     };
 
-    // In process mode the engine has no TCP endpoint at all — `engine_base` names a unix socket,
-    // which reqwest cannot dial. Route those over the socket instead of failing to parse a URL.
-    // Note this reads the socket from `base`, not from `upstream`: `upstream` already has the
-    // request path appended, so stripping the scheme off it would yield "<socket>/v1/board" and
-    // try to connect to a path that does not exist.
-    if let Some(socket) = base.strip_prefix("unix://") {
-        return forward_over_socket(
-            socket,
-            &suffix,
-            &query,
-            method,
-            headers,
-            body,
-            &rec.engine_secret,
-            id,
-        )
-        .await;
-    }
+    // In process mode the engine has no TCP endpoint at all, only a unix socket, which reqwest
+    // cannot dial.
+    let url = match target {
+        Target::Tcp(url) => url,
+        Target::Unix { socket, url } => {
+            return forward_over_socket(
+                &socket,
+                proxy_path::origin_form(&url),
+                method,
+                headers,
+                body,
+                &rec.engine_secret,
+                id,
+            )
+            .await;
+        }
+    };
 
     let resp = match state
         .http
-        .request(method, &upstream)
+        .request(method, url)
         .headers(headers)
         .bearer_auth(&rec.engine_secret)
         .body(body)
@@ -229,40 +293,30 @@ enum WsStream {
 async fn bridge_ws(
     state: HostState,
     engine_secret: String,
-    upstream_http: String,
+    target: Target,
     req: Request,
 ) -> Response {
-    // In process mode the engine has no TCP endpoint at all: `upstream_http` names a unix socket,
-    // and the http->ws rewrite below would leave a `unix://` URI that no WebSocket client can dial.
-    // That is exactly what made the events socket 502 in production while ordinary HTTP over the
-    // same socket worked — the backend looked healthy and only the live board was dead.
-    let unix_socket = upstream_http
-        .strip_prefix("unix://")
-        .map(|rest| match rest.find("/v1/") {
-            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
-            None => (rest.to_string(), "/".to_string()),
-        });
-
-    let ws_url = match &unix_socket {
-        // A unix socket has no authority, but the handshake still needs a syntactically valid URI
-        // and a Host header, so this uses a placeholder that never resolves.
-        Some((_, path)) => format!("ws://engine{path}"),
-        None => upstream_http
-            .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1),
+    // A unix-socket engine is dialled directly, and the handshake still needs a syntactically valid
+    // URI and a Host header, which the placeholder authority supplies. Rewriting a `unix://` URL
+    // to `ws://` is what once made the events socket 502 in production while ordinary HTTP over
+    // the same socket worked.
+    let (socket, url) = match target {
+        Target::Tcp(url) => (None, url),
+        Target::Unix { socket, url } => (Some(socket), url),
+    };
+    let Some(ws_url) = proxy_path::websocket_url(url) else {
+        tracing::warn!("engine base has no websocket scheme");
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "engine_unreachable",
+            "The project engine websocket is not reachable.",
+        );
     };
 
-    let host_hdr = ws_url
-        .split("://")
-        .nth(1)
-        .and_then(|s| s.split('/').next())
-        .unwrap_or_default()
-        .to_string();
-
     let upstream_req = match tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(&ws_url)
+        .uri(ws_url.as_str())
         .header("Authorization", format!("Bearer {engine_secret}"))
-        .header("Host", host_hdr)
+        .header("Host", proxy_path::authority(&ws_url))
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -282,8 +336,8 @@ async fn bridge_ws(
     // Connect upstream *before* accepting the client upgrade, so a dead engine surfaces as a clean
     // 502 rather than a WebSocket that opens and immediately closes.
     let connect = async {
-        match &unix_socket {
-            Some((sock, _)) => {
+        match &socket {
+            Some(sock) => {
                 let stream = tokio::net::UnixStream::connect(sock)
                     .await
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
@@ -382,16 +436,17 @@ where
 
 /// Speak HTTP/1.1 to an engine listening on a unix socket.
 ///
+/// `request_target` is the origin-form path and query of a URL built by `proxy_path`, so it has
+/// already been refused or encoded and pinned; nothing caller-supplied is spliced in here.
+///
 /// The socket is mode 0600 and owned by the project uid, inside a 0700 directory — SDK sets that
 /// explicitly after bind rather than inheriting a umask, because under `umask 000` the inherited
 /// mode was 0777 and on a shared kernel that is reachable by every tenant. The host runs as root
 /// and so passes the permission check without anything being widened; if this ever starts failing,
 /// the fix is to run the proxy as the project uid, never to loosen the mode.
-#[allow(clippy::too_many_arguments)]
 async fn forward_over_socket(
     socket: &str,
-    suffix: &str,
-    query: &str,
+    request_target: &str,
     method: axum::http::Method,
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
@@ -432,7 +487,7 @@ async fn forward_over_socket(
 
     let mut builder = hyper::Request::builder()
         .method(method)
-        .uri(format!("/{suffix}{query}"))
+        .uri(request_target)
         // A unix socket has no authority, but HTTP/1.1 still requires a Host header.
         .header("host", "engine")
         .header("authorization", format!("Bearer {engine_secret}"));

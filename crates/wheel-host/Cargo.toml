@@ -29,6 +29,8 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 wheel-sqlite = { path = "../wheel-sqlite" }
+# Shared with the API so both proxies refuse and encode a caller's path the same way.
+wheel-core = { path = "../wheel-core" }
 http = "1"
 libc = "0.2"
 base64 = "0.22"
