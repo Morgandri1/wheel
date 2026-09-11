@@ -16,11 +16,13 @@ import { expectHydrated } from "../hydration";
  * where a runtime value was intended, a CSP computed for a different origin.
  *
  * Web named this gap and asked for the coverage. The load-bearing claim is `--api <url>`:
- * NEXT_PUBLIC_* values are inlined when the bundle compiles, so the natural implementation
- * of that flag is one that does nothing whatsoever, and it would look completely fine in
- * review. The package here is started against a mock on 8789 while the build-time default
- * is 8787 — so if the flag were decorative, every assertion below fails on an empty board
- * rather than passing quietly.
+ * the natural implementation of a flag like that is one that does nothing whatsoever, and it
+ * would look completely fine in review. The package here is started against a mock on 8789
+ * while its own default is 127.0.0.1:8080, where nothing listens — so if the flag were
+ * decorative, sign-up fails with "can't reach the API" rather than passing quietly.
+ *
+ * Since web/server-side-api the browser never calls the API at all; the package's server
+ * does. So "which API" is proven by an outcome, and "not the browser" by the request log.
  *
  * KNOWN LIMITATION, recorded rather than glossed. I checked this suite CAN fail, by starting
  * the package against the wrong api. It does fail — but by TIMING OUT rather than by hitting
@@ -40,50 +42,44 @@ import { expectHydrated } from "../hydration";
 
 const PKG_API = process.env.WHEEL_PKG_API_URL ?? "http://localhost:8789";
 
-test("E2E-pkg-runtime-api: --api is honoured at run time, not frozen at build time", async ({ page }) => {
+test("E2E-pkg-runtime-api: --api is honoured at run time by the server, and the browser never calls it", async ({ page }) => {
   const calls: string[] = [];
-  page.on("request", (r) => {
-    if (r.url().includes("/v1/")) calls.push(r.url());
-  });
+  page.on("request", (r) => calls.push(r.url()));
 
   // `domcontentloaded`, not the default `load`: Next aborts its own RSC prefetches on this
   // page, and a page with an aborted request never fires `load`, so the default wait hangs
   // until the test times out and reports nothing useful about the package.
-  await page.goto("/app", { waitUntil: "domcontentloaded" });
+  await page.goto("/sign-up", { waitUntil: "domcontentloaded" });
 
-  // The packaged build is AUTH_MODE=local, so /app redirects to /sign-in and an
-  // unauthenticated board calls no API at all. Asserting on "some /v1/ request happened"
-  // was unsatisfiable by construction — it would have hung here forever waiting for a call
-  // this page never makes. Signing in is what actually produces one.
-  await expect(page).toHaveURL(/\/sign-in/);
-  await page.getByTestId(T.emailInput).fill("packaged@example.test");
+  // The package's server is the only thing that talks to the API now, so WHICH api is proven
+  // by an outcome only the right one can produce: signing up succeeds only if the server
+  // reached the mock on :8789. With a decorative --api it would try its default, 127.0.0.1:8080,
+  // where nothing listens, and the form would say "can't reach the API" instead.
+  const email = `packaged-${Date.now()}@example.test`;
+  await page.getByTestId(T.emailInput).fill(email);
   await page.getByTestId(T.passwordInput).fill("correct-horse-battery");
-  // noWaitAfter: with a wrong --api the submit targets an origin nothing is listening on,
-  // and awaiting the navigation makes the test HANG until its own timeout instead of
-  // failing on the assertion. A gate should fail fast and say why; a hang says nothing and
-  // costs a minute to say it.
+  // noWaitAfter: a failing server answers the form instead of navigating, and awaiting a
+  // navigation that never comes would HANG until the test's own timeout. A gate should fail
+  // fast and say why; a hang says nothing and costs a minute to say it.
   await page.getByTestId(T.authSubmit).click({ noWaitAfter: true });
+  await expect(page.getByTestId(T.sessionBadge)).toContainText(email, { timeout: 20_000 });
 
-  await expect.poll(() => calls.length, { timeout: 20_000 }).toBeGreaterThan(0);
-
-  // WHICH api, not THAT an api. The build-time default is :8787; this package was started
-  // with --api :8789. A single call to 8787 means the flag is decorative. The outcome of
-  // the sign-in is irrelevant — a 401 proves the routing just as well as a 200.
-  const strays = calls.filter((u) => !u.startsWith(PKG_API));
-  expect(strays, `these went somewhere other than ${PKG_API}`).toEqual([]);
+  // And the browser went nowhere but its own server: not to PKG_API, not to anything else.
+  const origin = new URL(page.url()).origin;
+  const strays = calls.filter((u) => new URL(u).origin !== origin);
+  expect(strays, "the browser talked to something other than the package's own server").toEqual([]);
 });
 
-test("E2E-pkg-csp-agrees: the CSP allows the API the server was pointed at", async ({ page }) => {
+test("E2E-pkg-csp-agrees: the CSP lets the page reach its own server and names no API", async ({ page }) => {
   const res = await page.goto("/app", { waitUntil: "domcontentloaded" });
   const csp =
     res?.headers()["content-security-policy"] ?? res?.headers()["content-security-policy-report-only"];
 
-  // A CSP computed for a different origin than the one the app calls blocks every request
-  // in the browser and reports it as a violation, not a failed fetch — so it reads as a
-  // network fault and gets debugged in the wrong place entirely. The page and the policy
-  // have to be derived from the same resolved value, and this is what proves they are.
+  // The browser has no business with the API, so the policy says so: connect-src is the
+  // page's own origin and nothing else, and the address the server was given never appears.
   expect(csp, "the packaged server sent no CSP at all").toBeTruthy();
-  expect(csp).toContain(PKG_API);
+  expect(/connect-src ([^;]*)/.exec(csp!)?.[1]?.trim()).toBe("'self'");
+  expect(csp).not.toContain(PKG_API);
 });
 
 test("E2E-pkg-assets: the package ships the assets it references", async ({ page }) => {

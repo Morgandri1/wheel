@@ -8,8 +8,8 @@ import { defineConfig, devices } from "@playwright/test";
  * than stubbed in the browser. Web offered it; using it beats standing up the whole
  * Rust stack for UI assertions.
  *
- * TWO SERVERS, because `NEXT_PUBLIC_AUTH_MODE` is inlined at build time and one server
- * can only be built for one mode:
+ * TWO SERVERS, because one web server runs one auth mode (`WHEEL_AUTH_MODE`, read by the
+ * server at start). The browser only ever talks to its web server, which reaches the mock:
  *   - `chromium`   :3000 / mock :8787 — mock auth mode; the board, agent and vault specs.
  *   - `local-auth` :3200 / mock :8788 — AUTH_MODE=local; the sign-in/sign-up specs.
  * They get separate `.next` caches via NEXT_DIST_DIR (Web added that for exactly this),
@@ -68,8 +68,8 @@ export default defineConfig({
           reuseExistingServer: !process.env.CI,
           timeout: 180_000,
           env: {
-            NEXT_PUBLIC_API_URL: "http://localhost:8787",
-            NEXT_PUBLIC_AUTH_MODE: "mock",
+            WHEEL_API_URL: "http://127.0.0.1:8787",
+            WHEEL_AUTH_MODE: "mock",
           },
         },
         {
@@ -89,8 +89,8 @@ export default defineConfig({
           timeout: 180_000,
           env: {
             NEXT_DIST_DIR: ".next-local",
-            NEXT_PUBLIC_API_URL: LOCAL_API,
-            NEXT_PUBLIC_AUTH_MODE: "local",
+            WHEEL_API_URL: LOCAL_API,
+            WHEEL_AUTH_MODE: "local",
           },
         },
       ],

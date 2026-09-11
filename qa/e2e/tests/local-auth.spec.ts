@@ -23,13 +23,19 @@
  *  4. URLs come from the config's baseURL rather than a literal, so WHEEL_WEB_URL still
  *     works and the local-mode server's port lives in one place.
  *
+ * THE COOKIE MODEL (web/server-side-api, changed deliberately by Web). The browser no longer
+ * talks to the API: sign-in posts to the web server's `/api/session/*`, which keeps the
+ * API's JWT in an httpOnly cookie. So the session is asserted as a cookie, requests are
+ * intercepted at `/api/session/*` rather than at the API, and `E2E-local-token-storage` now
+ * asserts the stronger property — the page never holds or sends the token at all.
+ *
  * This runs as its own Playwright project (`local-auth`) against its own dev server on
- * 3200: NEXT_PUBLIC_AUTH_MODE is inlined at build time, so local mode cannot share the
- * default suite's mock-mode server on 3000.
+ * 3200: one web server runs one auth mode, so local mode cannot share the default suite's
+ * mock-mode server on 3000.
  */
 import { expect, test, type Page } from "@playwright/test";
 import { T } from "../testids";
-import { SEEDED_SHAPE, SESSION_KEY } from "../session";
+import { RETIRED_STORAGE_KEY, SEEDED_SHAPE, SESSION_COOKIE } from "../session";
 
 const API = process.env.WHEEL_LOCAL_API_URL ?? "http://localhost:8788";
 const SEEDED = { email: "dev@wheel.dev", password: "wheel-dev-password" };
@@ -40,6 +46,10 @@ async function submit(page: Page, email: string, password: string) {
   await page.getByTestId(T.emailInput).fill(email);
   await page.getByTestId(T.passwordInput).fill(password);
   await page.getByTestId(T.authSubmit).click();
+}
+
+async function sessionCookie(page: Page) {
+  return (await page.context().cookies()).find((c) => c.name === SESSION_COOKIE);
 }
 
 test("E2E-local-signin-redirect: a signed-out visitor to /app is taken to sign in", async ({ page }) => {
@@ -59,7 +69,7 @@ test("E2E-local-bad-password: wrong credentials say so, and do not sign anyone i
   await submit(page, SEEDED.email, "definitely-wrong");
   await expect(page.getByTestId(T.authError)).toBeVisible();
   expect(page.url()).toContain("/sign-in");
-  expect(await page.evaluate(() => window.localStorage.getItem("wheel.session"))).toBeNull();
+  expect(await sessionCookie(page)).toBeUndefined();
   // Emptied on failure so a retry is not a half-edit of a wrong value.
   await expect(page.getByTestId(T.passwordInput)).toHaveValue("");
 });
@@ -94,8 +104,12 @@ test("E2E-local-error-plumbing: the API's own message reaches the UI, not a fall
   // It cannot be rescued by matching copy: local-auth.ts's 401 fallback is byte-identical to
   // the server's 401 message, deliberately. So the only way to prove the pathway is live is to
   // put a value on the wire that the fallback could not invent.
+  //
+  // The browser's hop is now /api/session/login, so that is where the sentinel goes in. The
+  // other hop — the web server passing the API's envelope through byte for byte — is asserted
+  // in web/src/lib/session-routes.test.ts ("passes a rejection through byte for byte").
   const sentinel = `server-said-${Date.now()}`;
-  await page.route(`${API}/v1/auth/login`, (route) =>
+  await page.route("**/api/session/login", (route) =>
     route.fulfill({
       status: 401,
       contentType: "application/json",
@@ -109,7 +123,7 @@ test("E2E-local-error-plumbing: the API's own message reaches the UI, not a fall
 
 test("E2E-local-pw-policy: the password rule is taught before a round trip", async ({ page }) => {
   let posted = 0;
-  await page.route(`${API}/v1/auth/signup`, (route) => {
+  await page.route("**/api/session/signup", (route) => {
     posted += 1;
     return route.continue();
   });
@@ -146,8 +160,8 @@ test("E2E-local-session-gate: a returning user is never shown as signed out firs
   await submit(page, SEEDED.email, SEEDED.password);
   await page.waitForURL(/\/app$/);
 
-  // Three states, not two: `loading` (storage unread) is distinct from `anon`. If they are
-  // ever collapsed, a returning user is bounced to /sign-in for a frame — an intermittent
+  // Three states, not two: `loading` (server not asked yet) is distinct from `anon`. If they
+  // are ever collapsed, a returning user is bounced to /sign-in for a frame — an intermittent
   // report nobody can reproduce. Assert we never reach the signed-out state on the way back.
   const redirected: string[] = [];
   page.on("framenavigated", (f) => {
@@ -160,57 +174,54 @@ test("E2E-local-session-gate: a returning user is never shown as signed out firs
 });
 
 test("E2E-local-session-shape: what a real sign-in stores is what seedSession fakes", async ({ page }) => {
-  // The guard for qa/e2e/session.ts. Other specs seed a session instead of driving this
+  // The guard for qa/e2e/session.ts. Other specs may seed a session instead of driving this
   // form, which is steadier and keeps sign-in failures in one place — but a seeded session
   // is a fake of the app's own state, and a fake nobody compares to the real thing drifts.
-  // If the stored shape ever gains a field, or nests the user, or renames the token, every
-  // seeded spec keeps passing against a shape the app stopped producing. This is the test
-  // that makes the seed safe to rely on, so it must sign in FOR REAL.
+  // If the cookie is ever renamed, loses HttpOnly or changes SameSite, every seeded spec keeps
+  // passing against a cookie the app stopped setting. This is the test that makes the seed
+  // safe to rely on, so it must sign in FOR REAL.
   await page.goto("/sign-in");
   await submit(page, SEEDED.email, SEEDED.password);
   await page.waitForURL(/\/app$/);
 
-  const stored = await page.evaluate((k) => {
-    const raw = window.localStorage.getItem(k);
-    return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
-  }, SESSION_KEY);
+  const cookie = await sessionCookie(page);
+  expect(cookie, "a real sign-in set no session cookie at all").toBeTruthy();
 
-  expect(stored, "a real sign-in stored no session at all").toBeTruthy();
-
-  // Compared as SHAPE, not value: keys and types, since the token and id are per-session.
-  const shapeOf = (o: unknown): unknown =>
-    o && typeof o === "object" && !Array.isArray(o)
-      ? Object.fromEntries(
-          Object.entries(o as Record<string, unknown>)
-            .map(([k, v]) => [k, shapeOf(v)])
-            .sort(([a], [b]) => (a as string).localeCompare(b as string)),
-        )
-      : typeof o;
-
+  // Compared as SHAPE, not value: the name and flags are fixed, the token is per-session.
+  const { name, path, httpOnly, secure, sameSite } = cookie!;
   expect(
-    shapeOf(stored),
-    "a real sign-in no longer stores what seedSession() fakes — update SEEDED_SHAPE in " +
-      "qa/e2e/session.ts, or every spec that seeds a session is testing a shape that no " +
+    { name, path, httpOnly, secure, sameSite },
+    "a real sign-in no longer sets what seedSession() fakes — update SEEDED_SHAPE in " +
+      "qa/e2e/session.ts, or every spec that seeds a session is testing a cookie that no " +
       "longer exists",
-  ).toEqual(shapeOf(SEEDED_SHAPE));
+  ).toEqual(SEEDED_SHAPE);
+
+  // The old localStorage mirror is gone, and must stay gone.
+  expect(await page.evaluate((k) => window.localStorage.getItem(k), RETIRED_STORAGE_KEY)).toBeNull();
 });
 
-test("E2E-local-token-storage: the token is sent as x-auth-token and never appears in a URL", async ({ page }) => {
+test("E2E-local-token-storage: the page never holds or sends the token, and never calls the API", async ({ page }) => {
   const urls: string[] = [];
-  let sawHeader = false;
+  let sentToken = false;
   page.on("request", (r) => {
     urls.push(r.url());
-    if (r.url().startsWith(`${API}/v1/projects`) && r.headers()["x-auth-token"]) sawHeader = true;
+    if (r.headers()["x-auth-token"]) sentToken = true;
   });
   await page.goto("/sign-in");
   await submit(page, SEEDED.email, SEEDED.password);
   await page.waitForURL(/\/app$/);
   await expect(page.getByTestId(T.sessionBadge)).toBeVisible();
 
-  const token = await page.evaluate(
-    () => JSON.parse(window.localStorage.getItem("wheel.session")!).token as string,
-  );
-  expect(sawHeader).toBe(true);
+  const token = (await sessionCookie(page))!.value;
+  // The server attaches the session; the page has no token to attach.
+  expect(sentToken).toBe(false);
+  // Script cannot see an httpOnly cookie, and nothing else on the page holds a copy.
+  expect(await page.evaluate(() => document.cookie)).not.toContain(token);
+  expect(await page.evaluate(() => JSON.stringify(window.localStorage))).not.toContain(token);
+  // Every request went to the web server; the API's address is not the browser's business.
+  const webOrigin = new URL(page.url()).origin;
+  expect(urls.filter((u) => new URL(u).origin !== webOrigin)).toEqual([]);
+  expect(urls.filter((u) => u.startsWith(API))).toEqual([]);
   // A token in a URL is in history, in Referer, and in every proxy log on the way.
   expect(urls.filter((u) => u.includes(token))).toEqual([]);
 });
@@ -222,7 +233,7 @@ test("E2E-local-logout: signing out clears the session and the board becomes unr
 
   await page.getByTestId(T.signOut).click();
   await page.waitForURL(/\/sign-in/);
-  expect(await page.evaluate(() => window.localStorage.getItem("wheel.session"))).toBeNull();
+  expect(await sessionCookie(page)).toBeUndefined();
 
   // Asserted by navigation, not by a button changing label.
   await page.goto("/app");
@@ -235,15 +246,14 @@ test("E2E-local-revoked: a session the API has revoked signs you out instead of 
   await page.waitForURL(/\/app$/);
   await expect(page.getByTestId(T.sessionBadge)).toBeVisible();
 
-  // Exactly what an expired token looks like from the browser: still stored, no longer accepted.
-  await page.evaluate(() => {
-    const s = JSON.parse(window.localStorage.getItem("wheel.session")!);
-    s.token = "local.00000000-0000-4000-8000-000000000000";
-    window.localStorage.setItem("wheel.session", JSON.stringify(s));
-  });
+  // Exactly what an expired token looks like from the browser: a cookie still present, no
+  // longer accepted by the API.
+  const live = (await sessionCookie(page))!;
+  await page.context().addCookies([{ ...live, value: "local.00000000-0000-4000-8000-000000000000" }]);
   await page.reload();
   await page.waitForURL(/\/sign-in/, { timeout: 15_000 });
-  expect(await page.evaluate(() => window.localStorage.getItem("wheel.session"))).toBeNull();
+  // The web server clears a cookie the API has refused, on the way back.
+  expect(await sessionCookie(page)).toBeUndefined();
 });
 
 test("E2E-local-ratelimit: too many attempts says how long to wait", async ({ page }) => {
