@@ -44,13 +44,13 @@ pub enum SignupPolicy {
 }
 
 impl SignupPolicy {
-    /// `WHEEL_SIGNUP`. Unset is open, today's behaviour; `wheeld` sets closed wherever it can be
-    /// reached from beyond its own machine. Anything unrecognised refuses to boot rather than
-    /// guessing which way to fail.
+    /// `WHEEL_SIGNUP`. Unset or empty is closed: every account's agents run as the daemon's user, so
+    /// whether strangers may create one is a decision an operator makes out loud, never one inferred
+    /// from how the box looks. Anything unrecognised refuses to boot.
     pub fn parse(raw: Option<&str>) -> Result<Self> {
         match raw.map(str::trim) {
-            None | Some("") | Some("open") => Ok(Self::Open),
-            Some("closed") => Ok(Self::Closed),
+            None | Some("") | Some("closed") => Ok(Self::Closed),
+            Some("open") => Ok(Self::Open),
             Some("invite") => bail!(
                 "WHEEL_SIGNUP=invite is not supported yet: use \"closed\" and have the owner \
                  create accounts with POST /v1/auth/users"
@@ -406,16 +406,16 @@ mod tests {
     use super::SignupPolicy;
 
     #[test]
-    fn signup_is_open_unless_closed_and_an_unknown_value_refuses_to_boot() {
-        assert_eq!(SignupPolicy::parse(None).unwrap(), SignupPolicy::Open);
-        assert_eq!(SignupPolicy::parse(Some("")).unwrap(), SignupPolicy::Open);
-        assert_eq!(
-            SignupPolicy::parse(Some(" open ")).unwrap(),
-            SignupPolicy::Open
-        );
+    fn signup_is_closed_unless_opened_and_an_unknown_value_refuses_to_boot() {
+        assert_eq!(SignupPolicy::parse(None).unwrap(), SignupPolicy::Closed);
+        assert_eq!(SignupPolicy::parse(Some("")).unwrap(), SignupPolicy::Closed);
         assert_eq!(
             SignupPolicy::parse(Some("closed")).unwrap(),
             SignupPolicy::Closed
+        );
+        assert_eq!(
+            SignupPolicy::parse(Some(" open ")).unwrap(),
+            SignupPolicy::Open
         );
         let invite = SignupPolicy::parse(Some("invite")).unwrap_err().to_string();
         assert!(invite.contains("POST /v1/auth/users"), "{invite}");
