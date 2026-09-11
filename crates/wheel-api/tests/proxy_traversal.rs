@@ -20,7 +20,7 @@ use axum::Router;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
-use wheel_api::config::{AuthMode, Config, Env};
+use wheel_api::config::{AuthMode, Config, Env, SignupPolicy};
 use wheel_api::crypto::Secret;
 use wheel_api::db::Db;
 use wheel_api::orchestrator::{NoopOrchestrator, Orchestrator};
@@ -103,6 +103,7 @@ fn cfg(db_url: &str, host_url: &str) -> Config {
         dev_secret: None,
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
+        signup: SignupPolicy::Open,
         master_key: [9u8; 32],
         host_url: host_url.into(),
         host_secret: Secret::new("host-secret"),
