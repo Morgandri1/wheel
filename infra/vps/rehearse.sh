@@ -296,6 +296,7 @@ for i in "${!names[@]}"; do
         *) verdict=FAIL; failed=$((failed + 1)) ;;
     esac
     printf '  rc=%-2s %-5s %s\n' "${codes[$i]}" "$verdict" "${names[$i]}"
+    [ -z "${REHEARSE_RESULTS:-}" ] || printf '%s %s\n' "${names[$i]}" "${codes[$i]}" >>"$REHEARSE_RESULTS"
 done
 echo "  ${#names[@]} checks: $((${#names[@]} - failed - skipped)) passed, $failed failed, $skipped skipped"
 [ "$failed" = 0 ] && [ "$skipped" = 0 ]

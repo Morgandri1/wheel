@@ -1,0 +1,14 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Mutation: wheeld's own signup flag opened while the edge still blocks it, and a web origin with
+# the wrong scheme. `signup-closed-at-wheeld` and `sign-in` must turn red; the edge checks must not.
+
+services:
+  wheeld:
+    environment:
+      WHEEL_SIGNUP: open
+  web:
+    environment:
+      WHEEL_PUBLIC_ORIGIN: http://${WHEEL_DOMAIN:-localhost}

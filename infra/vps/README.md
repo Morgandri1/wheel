@@ -283,6 +283,20 @@ REHEARSE_FAKE_HARNESS=1 infra/vps/rehearse.sh                # messages reach `d
 It needs ports 80 and 443 free, and it builds from `git archive` of a commit, never your working
 tree.
 
+A gate that has never failed proves nothing, so `rehearsal/mutate.sh edge` breaks the Caddyfile
+the way people break proxies, and publishes wheeld's port. It exits 0 only if every check that
+guards those layers comes back red. The broken layers:
+
+- trusting every proxy
+- dropping HSTS
+- raising the webhook limit
+- un-blocking sign-up
+- forwarding the cookie
+- buffering the event stream
+- turning the admin API on
+
+`rehearsal/mutate.sh config` does the same for wheeld's signup flag and the web app's origin.
+
 ## When something is wrong
 
 | Symptom | Cause |
