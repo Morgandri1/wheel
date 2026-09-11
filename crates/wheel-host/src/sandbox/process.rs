@@ -30,6 +30,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// How long a `stop()` gives the engine's own SIGTERM handler before SIGKILL.
+///
+/// The §4b spawn contract now gives the engine up to ~25s to shut down cleanly on its own (a 2s
+/// HTTP drain, up to 20s waiting for turns already running, then a 3s SIGTERM grace for its
+/// agents) before it stops on its own initiative — a shorter timeout here would SIGKILL an engine
+/// that was already finishing exactly the drain this contract asks for, mid-write to sqlite
+/// (review round 2, finding 2).
+const ENGINE_STOP_GRACE_SECS: u64 = 30;
+
 pub struct ProcessSandbox {
     cfg: Config,
     store: Arc<Store>,
@@ -425,8 +434,11 @@ impl Sandbox for ProcessSandbox {
         let Some(mut child) = self.children.lock().await.remove(id) else {
             return Ok(()); // already stopped; stop must converge
         };
-        // SIGTERM first: the engine's contract is a clean shutdown within 15s (children stopped,
-        // sqlite flushed). Killing outright would risk a torn database.
+        // SIGTERM first: the engine's contract is a clean shutdown within ENGINE_STOP_GRACE_SECS
+        // (agents drained and stopped, sqlite flushed). Killing outright would risk a torn
+        // database, or a replayed turn (review round 2, finding 2 — SIGKILLing an engine that is
+        // still inside its own drain is exactly the mid-turn kill the shutdown redesign exists to
+        // avoid).
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             // SAFETY: pid came from a child we spawned.
@@ -435,7 +447,8 @@ impl Sandbox for ProcessSandbox {
             }
         }
 
-        let graceful = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+        let graceful =
+            tokio::time::timeout(Duration::from_secs(ENGINE_STOP_GRACE_SECS), child.wait()).await;
         if graceful.is_err() {
             tracing::warn!(project = %id, "engine ignored SIGTERM; killing");
             let _ = child.kill().await;
@@ -549,6 +562,20 @@ fn real_uid(status: &Path) -> Option<u32> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Review round 2, finding 2: the engine's own shutdown sequence can legitimately take close
+    /// to 25s (a 2s HTTP drain, up to 20s for turns in flight, a 3s SIGTERM grace for its agents),
+    /// so a SIGKILL budget shorter than that would cut off exactly the drain the redesign asks the
+    /// engine to do.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_engine_stop_grace_covers_its_own_shutdown_budget() {
+        assert!(
+            ENGINE_STOP_GRACE_SECS >= 30,
+            "ENGINE_STOP_GRACE_SECS is {ENGINE_STOP_GRACE_SECS}s, which is not enough room for a \
+             ~25s engine shutdown to finish before being SIGKILLed"
+        );
+    }
 
     /// Serve one HTTP response on a unix socket, then close.
     async fn socket_answering(path: std::path::PathBuf, response: &'static str) {

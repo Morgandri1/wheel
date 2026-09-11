@@ -64,11 +64,16 @@ wheeld token revoke <id>                  # revokes it and every token it minted
 Any signed-in client can also mint its own over HTTP (`POST /v1/auth/tokens`, in `docs/API.md`). SIGTERM or ctrl-c
 lets turns in flight finish (up to 20 s), then stops every project's agents and their process groups before `wheeld`
 exits; allow 30 s. A process an agent deliberately detaches (`setsid`) is beyond that. As a service, run it under
-systemd, whose default `KillMode=control-group` stops the whole unit:
+systemd with **`KillMode=mixed`** (not `control-group`, systemd's default): `mixed` sends SIGTERM to `wheeld` alone, so
+it runs its own drain and stops its agents itself rather than losing the race to systemd signalling them directly —
+`control-group` SIGTERMs every agent process at the same instant as `wheeld`, before the drain even starts, which
+turned a turn already running into one killed mid-flight. `TimeoutStopSec` remains the backstop: if `wheeld` has not
+exited by then, systemd SIGKILLs the whole cgroup, which is still what cleans up a process an agent has detached from
+its group (`setsid`) and so is unreachable to `wheeld` itself.
 ```ini
 [Service]
 ExecStart=/usr/local/bin/wheeld --data-dir /var/lib/wheel
-KillMode=control-group
+KillMode=mixed
 TimeoutStopSec=30
 ```
 
@@ -95,7 +100,7 @@ web page from reaching wheeld through DNS rebinding.
 ### 2. Docker, headless
 ```bash
 docker build -f docker/Dockerfile.wheeld -t wheeld .              # or: make wheeld-image
-docker run -d --name wheeld -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
+docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
 (umask 077; docker exec wheeld cat /data/operator-token > ~/.wheel-token)
 export WHEEL_TOKEN_FILE=~/.wheel-token                             # then `wh` as above
 docker exec wheeld wheeld token create --name ci                   # more tokens, the same way
@@ -105,8 +110,9 @@ The same thing as a compose file: `docker compose -f infra/compose.wheeld.yml up
 - One non-root image: `wheeld`, the `wheel` CLI, `claude` and `codex`, and a development toolchain. `/data` is its volume.
 - Inside the container wheeld listens on `0.0.0.0`, which is only the container's own network. Publish it on
   `127.0.0.1` only, as above.
-- `docker stop` sends SIGTERM, which stops every agent first. Allow it time: `docker stop -t 30`, or
-  `stop_grace_period` in compose.
+- `docker stop` sends SIGTERM to `wheeld` (PID 1 is `tini`, which forwards it) and waits out its stop timeout — Docker's
+  own default is 10 s, too short for the drain above, which is why `--stop-timeout 30` is in the `docker run` example
+  and `stop_grace_period: 30s` is in `infra/compose.wheeld.yml`. A running `docker stop` still honours `-t 30` too.
 
 ### 3. The board UI (optional)
 ```bash

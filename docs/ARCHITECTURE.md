@@ -825,7 +825,11 @@ The host persists its sandbox table in `/data/host.db` (sqlite) and reconciles r
 `WHEEL_PROJECT_ID`, `WHEEL_ENGINE_SECRET`, `WHEEL_VAULT_KEY` (base64), `WHEEL_DATA_DIR` (default `/data`), `WHEEL_LISTEN`
 (`tcp://0.0.0.0:7000` in docker mode; `unix:///run/wheel/<id>/engine.sock` in process mode), `WHEEL_LOG=json`. The engine must be
 healthy (`GET /healthz` → 200) within 10s of start, exit non-zero with a one-line reason on misconfiguration, and shut down cleanly on SIGTERM
-(stop children, flush sqlite) within 15s. In process mode the engine runs as the project uid the host has already dropped to (the host does the
+(drain, wait for turns in flight, stop its agents, flush sqlite) within 30s — up from 15s (review round 2, finding 2):
+a clean shutdown now itself budgets up to ~25s (a 2s HTTP drain, up to 20s waiting for turns already running so a
+killed-mid-flight turn is never silently replayed, then a 3s SIGTERM grace for its agents), so the host's own SIGKILL
+timeout, in both the `process` backend (`ProcessSandbox::stop`) and the `docker` backend (`stop_container`'s `t`),
+must give that room rather than cut it off. In process mode the engine runs as the project uid the host has already dropped to (the host does the
 setuid, not the engine). `docker/Dockerfile.host` is one image: SDK owns it and installs engine+cli+claude+codex+python+node; API adds the `wheel-host`
 binary and entrypoint (`wheel-host` by default; `wheel-engine` when `WHEEL_ROLE=engine`, which is what the docker backend uses).
 

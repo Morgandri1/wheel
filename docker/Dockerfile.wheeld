@@ -5,8 +5,11 @@
 # wheeld: all of Wheel in one headless container (docs/proposals/headless-first.md).
 #
 #   docker build -f docker/Dockerfile.wheeld -t wheeld .
-#   docker run -d --name wheeld -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
+#   docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
 #   docker exec wheeld cat /data/operator-token
+#
+# --stop-timeout 30: `docker stop`'s own default is 10s, shorter than the ~25s a clean shutdown
+# can take (drain, wait for turns in flight, signal the agents) -- review round 2, finding 2/3.
 #
 # The build, runtime and toolchain stages are docker/Dockerfile.host's, instruction for
 # instruction: agents in here get the environment a hosted engine gives them, and the two images

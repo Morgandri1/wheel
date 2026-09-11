@@ -1717,17 +1717,37 @@ impl Supervisor {
 
         {
             let conn = self.db.lock().unwrap();
-            // Anything written to the dying child never ran a turn, so it goes
-            // back on the queue rather than being lost as though it had been
-            // handled.
-            let n = messages::requeue_all_undelivered(
-                &conn,
-                agent,
-                "the harness exited before this message could be processed",
-            )
-            .unwrap_or(0);
-            if n > 0 {
-                tracing::info!(agent = %agent, requeued = n, in_flight = ?in_flight, "returned in-flight messages to the queue");
+            // Anything written to the dying child never ran a turn, so ordinarily it goes back on
+            // the queue rather than being lost as though it had been handled. But if the engine is
+            // shutting down, this exit may not be the supervisor's own doing — a cgroup-wide kill
+            // (review round 2, finding 1: `KillMode=control-group` sends SIGTERM to the agent
+            // process at the same instant as to wheeld, well before `shutdown`'s own drain and
+            // signal sequence reaches it) — and a turn killed mid-flight may already have taken an
+            // effect the process never reported. Requeuing it there would run that turn again,
+            // which is the replay `Supervisor::shutdown`'s own drain-timeout branch already refuses.
+            if self.closing.load(Ordering::SeqCst) {
+                let n = messages::consume_all_delivered_as_interrupted(
+                    &conn,
+                    agent,
+                    INTERRUPTED_BY_SHUTDOWN,
+                )
+                .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(agent = %agent, interrupted = n, "consumed in-flight message(s) as interrupted by shutdown rather than replaying them");
+                }
+                if let Some(mid) = in_flight {
+                    publish_message(&self.events, &conn, mid);
+                }
+            } else {
+                let n = messages::requeue_all_undelivered(
+                    &conn,
+                    agent,
+                    "the harness exited before this message could be processed",
+                )
+                .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(agent = %agent, requeued = n, in_flight = ?in_flight, "returned in-flight messages to the queue");
+                }
             }
             // A token outliving its process is a credential with no owner.
             let _ = crate::db::tokens::revoke(&conn, agent);
@@ -4533,9 +4553,13 @@ done
     }
 
     /// Answers each message after the number of seconds in `turn_secs` beside it (default 1).
+    /// Writes its own pid to `pid`, so a test can end it from outside the supervisor entirely --
+    /// the shape of a cgroup-wide kill, which reaches the agent without going through
+    /// `Supervisor::shutdown`'s own `signal_group`/`kill` path at all.
     const SLOW_TURN_HARNESS: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 echo run >> "$dir/runs"
+echo $$ > "$dir/pid"
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 while IFS= read -r line; do
   sleep "$(cat "$dir/turn_secs" 2>/dev/null || echo 1)"
@@ -4632,5 +4656,87 @@ done
         send_user(&sup, id, "wake up");
         assert!(sup.deliver(id).await.is_err());
         assert_eq!(runs(&dir), 0, "a process was spawned after shutdown");
+    }
+
+    /// Review round 2, finding 1, reproduced live by the security reviewer against
+    /// `KillMode=control-group`: that setting SIGTERMs the agent process at the same instant as
+    /// wheeld, so the agent can die well before `shutdown`'s own drain-wait even finishes -- its
+    /// death is caught by `reap`, not by `shutdown`'s own signal/kill loop, and `reap` must still
+    /// refuse to replay the turn. Before this fix `reap` always requeued, so the message came back
+    /// `queued` and was redelivered (re-running the turn) the next time the agent started.
+    #[tokio::test]
+    async fn a_process_killed_out_of_band_during_the_drain_is_interrupted_not_replayed() {
+        let (sup, id, dir) = shim_supervisor("killed-during-drain", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        let mid = deliver_one(&sup, id, "never finishes").await;
+
+        // Long enough that this test's own SIGKILL, not `shutdown`'s SHUTDOWN_GRACE-then-kill
+        // sequence, is what ends the process.
+        sup.shutdown_drain_ms.store(5000, Ordering::SeqCst);
+        let shutting_down = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.shutdown().await }
+        });
+
+        until("shutdown to set the closing flag", || {
+            sup.closing.load(Ordering::SeqCst)
+        })
+        .await;
+        // Past the moment `shutdown` has read `in_flight` for its own drain check, so the kill
+        // below is unambiguously the thing that ends the process, not a race with it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let pid: i32 = until_present(&dir.join("pid"))
+            .await
+            .trim()
+            .parse()
+            .expect("the harness wrote a pid");
+        // The whole process GROUP, not just the leader: the shell forks a real child to run
+        // `sleep`, which inherits the same stdout pipe fd, and killing only the leader leaves that
+        // child holding the write end open forever, so the reader never sees EOF. A cgroup-wide
+        // kill (`KillMode=control-group`) does not have that gap -- it reaches every process in
+        // the tree at once -- and `-pid` is the closest a test gets to reproducing that without a
+        // real cgroup.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+
+        until("the interrupted message to be consumed", || {
+            state_and_error(&sup, mid).0 == MessageState::Consumed
+        })
+        .await;
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (
+                MessageState::Consumed,
+                Some(INTERRUPTED_BY_SHUTDOWN.to_string())
+            ),
+            "the turn was replayed instead of being marked interrupted"
+        );
+
+        shutting_down.await.expect("shutdown itself must not panic");
+
+        // "Not redelivered after a restart": consumed, not queued, so the ordinary
+        // resume-on-message path finds nothing waiting for this agent.
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            !messages::has_queued(&conn, id).unwrap(),
+            "the interrupted message was put back in the queue"
+        );
+    }
+
+    /// Waits for a file to exist and returns its contents, for a value a background process
+    /// writes at an unpredictable moment (its own pid, here).
+    async fn until_present(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.trim().is_empty() {
+                    return s;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {}", path.display());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
