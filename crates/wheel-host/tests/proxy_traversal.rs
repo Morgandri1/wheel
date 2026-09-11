@@ -523,3 +523,32 @@ async fn websockets_still_bridge_over_both_transports() {
         assert_eq!(hits[0].bearer, format!("Bearer {SECRET_A}"));
     }
 }
+
+/// The `%` refusal in `wheel_core::proxy_path` is sound only because axum decodes a wildcard
+/// exactly once: a second decode would hand the proxy something the check never saw. This pins
+/// the extractor shape the proxy uses, so an axum upgrade that changes it goes red here.
+#[tokio::test]
+async fn axum_decodes_the_wildcard_exactly_once() {
+    let app =
+        Router::new().route(
+            "/{id}/{*rest}",
+            axum::routing::any(
+                |axum::extract::Path((_, rest)): axum::extract::Path<(Uuid, String)>| async move {
+                    rest
+                },
+            ),
+        );
+    let id = Uuid::new_v4();
+    for (raw, decoded) in [
+        ("%2525", "%25"),
+        ("%252e%252e/x", "%2e%2e/x"),
+        ("%2e%2e/x", "../x"),
+        ("a%2fb", "a/b"),
+        ("a%5cb", "a\\b"),
+        ("a%20b", "a b"),
+    ] {
+        let (status, body) = get(&app, &format!("/{id}/{raw}")).await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(body, decoded, "{raw}");
+    }
+}

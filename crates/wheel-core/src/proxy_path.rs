@@ -37,7 +37,7 @@ pub enum ProxyPathError {
 /// segment for `..`; and an empty segment anywhere but the end, where it is a trailing slash.
 pub fn proxy_segments(rest: &str) -> Result<Vec<&str>, ProxyPathError> {
     let segments: Vec<&str> = rest.split('/').collect();
-    let last = segments.len() - 1;
+    let last = segments.len().saturating_sub(1);
     for (i, seg) in segments.iter().enumerate() {
         if seg.is_empty() && i != last {
             return Err(ProxyPathError::EmptySegment);

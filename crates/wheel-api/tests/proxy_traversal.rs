@@ -443,3 +443,31 @@ async fn a_websocket_upgrade_on_a_traversing_path_is_refused_before_the_bridge()
     let seen = h.log.take();
     assert!(seen.is_empty(), "the host was dialled: {seen:?}");
 }
+
+/// The `%` refusal in `wheel_core::proxy_path` is sound only because axum decodes a wildcard
+/// exactly once: a second decode would hand the proxy something the check never saw. This pins
+/// the extractor shape the proxies use, so an axum upgrade that changes it goes red here.
+#[tokio::test]
+async fn axum_decodes_the_wildcard_exactly_once() {
+    let app = Router::new().route(
+        "/{id}/{*rest}",
+        axum::routing::any(
+            |axum::extract::Path((_, rest)): axum::extract::Path<(uuid::Uuid, String)>| async move {
+                rest
+            },
+        ),
+    );
+    let id = uuid::Uuid::new_v4();
+    for (raw, decoded) in [
+        ("%2525", "%25"),
+        ("%252e%252e/x", "%2e%2e/x"),
+        ("%2e%2e/x", "../x"),
+        ("a%2fb", "a/b"),
+        ("a%5cb", "a\\b"),
+        ("a%20b", "a b"),
+    ] {
+        let (status, body) = call(&app, "GET", &format!("/{id}/{raw}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(body, decoded, "{raw}");
+    }
+}

@@ -19,9 +19,9 @@
       "crates": {
         "wheel-api": 248,
         "wheel-cli": 63,
-        "wheel-core": 29,
+        "wheel-core": 57,
         "wheel-engine": 195,
-        "wheel-host": 203,
+        "wheel-host": 207,
         "wheel-sqlite": 32,
         "wheeld": 278
       },
@@ -44,9 +44,9 @@
       "crates": {
         "wheel-api": 248,
         "wheel-cli": 63,
-        "wheel-core": 29,
+        "wheel-core": 57,
         "wheel-engine": 196,
-        "wheel-host": 203,
+        "wheel-host": 207,
         "wheel-sqlite": 32,
         "wheeld": 278
       },
