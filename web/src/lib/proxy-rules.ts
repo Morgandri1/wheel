@@ -5,21 +5,16 @@
 import "server-only";
 
 /**
- * What the same-origin proxy will pass to the API, decided without I/O so every refusal is a test.
- *
- * The target origin is fixed server configuration; nothing in a request chooses it. What a request
- * CAN influence — the path, two headers, the body — is narrowed here:
- *  - only `/v1/projects…`, the routes the board calls. `/v1/auth/*` is served by the session
- *    routes instead: a login answered through a generic proxy would hand the token to page script.
- *  - no dot segment, encoded slash or backslash, so no path leaves `/v1/projects`.
- *  - only `x-project-id` and `content-type` in. Cookies and any client `x-auth-token` never leave.
+ * What the same-origin proxy passes to the API, decided without I/O so every refusal is a test.
+ * Each refusal and its reason is listed once, in web/DEPLOY.md ("What the proxy refuses").
  */
 
 export const PROXY_PREFIX = "/api/wheel";
 export const PROJECT_ID = /^[A-Za-z0-9-]{1,64}$/;
-const SEGMENT = /^[A-Za-z0-9._~!$&'()*+,;=:@%-]+$/;
+const SEGMENT = /^[A-Za-z0-9._~!$&'()*+,=:@%-]+$/;
 const HEADER_VALUE = /^[\t\x20-\x7e]{1,256}$/;
-const FORBIDDEN_DECODED = /[/\\\u0000-\u001f\u007f]/;
+const FORBIDDEN_DECODED = /[%/\\\u0000-\u001f\u007f]/;
+const PROJECT_ACTIONS = new Set(["start", "stop", "restart"]);
 const RETURNED_HEADERS = [
   "content-type",
   "content-disposition",
@@ -30,6 +25,11 @@ const RETURNED_HEADERS = [
   "x-wheel-mock",
 ];
 
+/**
+ * One path segment, decoded exactly once. A `%` that survives that decode is a second layer of
+ * encoding aimed at a hop that decodes again (`%252e%252e` → `%2e%2e` → `..`), so it is refused
+ * rather than decoded further — as are `.`, `..`, slashes, backslashes and control characters.
+ */
 export function safeSegment(raw: string): boolean {
   if (!SEGMENT.test(raw)) return false;
   let decoded: string;
@@ -41,16 +41,26 @@ export function safeSegment(raw: string): boolean {
   return decoded !== "." && decoded !== ".." && !FORBIDDEN_DECODED.test(decoded);
 }
 
+/**
+ * The board's routes and nothing else, compared on the raw segments. A positive list: another
+ * spelling of some route that is not on it — `ws%2Dticket`, `WS-TICKET` — is simply not on it.
+ */
+function isBoardRoute(segments: string[]): boolean {
+  const [v1, projects, id, action, ...rest] = segments;
+  if (v1 !== "v1" || projects !== "projects") return false;
+  if (id === undefined || action === undefined) return true;
+  if (PROJECT_ACTIONS.has(action)) return rest.length === 0;
+  if (action === "board") return rest.length === 1 && rest[0] === "apply";
+  if (action === "engine") return rest[0] === "v1" && rest.length >= 2;
+  return false;
+}
+
 /** The API path a request to this proxy may reach, or null. */
 export function upstreamPath(pathname: string): string | null {
   if (!pathname.startsWith(`${PROXY_PREFIX}/`)) return null;
   const path = pathname.slice(PROXY_PREFIX.length);
   const segments = path.split("/").slice(1);
-  if (segments[0] !== "v1" || segments[1] !== "projects") return null;
-  if (!segments.every(safeSegment)) return null;
-  // Events reach the browser through this app's relay; a ticket minted here is only a second door.
-  if (segments.length === 4 && segments[3] === "ws-ticket") return null;
-  return path;
+  return segments.every(safeSegment) && isBoardRoute(segments) ? path : null;
 }
 
 /** `path` on the fixed API origin, or null if parsing would land it anywhere else. */
@@ -78,10 +88,17 @@ export function forwardedRequestHeaders(incoming: Headers): Headers | null {
   return out;
 }
 
+export function isJsonMediaType(type: string | null): boolean {
+  const media = type?.split(";")[0]?.trim().toLowerCase() ?? "";
+  return media === "application/json" || media.endsWith("+json");
+}
+
 /**
- * Response headers the browser may see. `content-length` and `content-encoding` stay behind on
- * purpose: fetch has already decoded the body, so passing them on would describe bytes that are
- * not the ones being sent. `set-cookie` stays behind because only this app sets cookies.
+ * Response headers the browser may see, plus what makes an upstream body safe on this origin.
+ * `content-length` and `content-encoding` stay behind (fetch already decoded the body), and so
+ * does `set-cookie` (only this app sets cookies). A chest can hold anything, and HTML rendered on
+ * this origin would run with the user's session — so nothing is sniffed, and anything that is not
+ * JSON is sandboxed and downloaded rather than rendered.
  */
 export function returnedResponseHeaders(upstream: Headers): Headers {
   const out = new Headers();
@@ -89,12 +106,35 @@ export function returnedResponseHeaders(upstream: Headers): Headers {
     const value = upstream.get(name);
     if (value !== null) out.set(name, value);
   }
+  out.set("x-content-type-options", "nosniff");
+  if (!isJsonMediaType(out.get("content-type"))) {
+    out.set("content-security-policy", "sandbox");
+    if (!out.get("content-disposition")?.toLowerCase().startsWith("attachment")) out.set("content-disposition", "attachment");
+  }
   return out;
 }
 
 export function declaredLength(headers: Headers): number {
   const n = Number(headers.get("content-length"));
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Passes a body through while counting it, and errors the stream the moment it passes `limit`. */
+export function cappedStream(limit: number): { transform: TransformStream<Uint8Array, Uint8Array>; exceeded: () => boolean } {
+  let total = 0;
+  let over = false;
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      total += chunk.byteLength;
+      if (total > limit) {
+        over = true;
+        controller.error(new RangeError(`request body over ${limit} bytes`));
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+  });
+  return { transform, exceeded: () => over };
 }
 
 /** At most `limit` bytes, counted while streaming, and whether there was more. */
@@ -131,7 +171,7 @@ export async function readUpTo(
   return { bytes, truncated };
 }
 
-/** The whole body, or null the moment it passes `limit` — never buffered past the cap first. */
+/** The whole body, or null the moment it passes `limit` — for the small bodies this app reads itself. */
 export async function readCapped(
   body: ReadableStream<Uint8Array> | null,
   limit: number,

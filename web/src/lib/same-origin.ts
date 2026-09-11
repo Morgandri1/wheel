@@ -7,18 +7,8 @@ import { errorEnvelope } from "@/lib/proxy-rules";
 import { publicOriginSetting, trustProxy } from "@/lib/runtime-config";
 
 /**
- * CSRF: a state-changing request must come from a page on this app's PUBLIC origin.
- *
- * The session is a cookie, so the browser attaches it to any request aimed here, including one a
- * hostile page makes. SameSite=Lax already withholds it from cross-site POSTs; this is the second
- * lock, and the only one in dev and mock mode, where the server supplies the credential itself.
- * A page cannot forge `Origin` or `Sec-Fetch-Site`; a non-browser client can forge both, but it
- * carries no victim's cookie.
- *
- * The public origin is what the browser sees, which behind a TLS-terminating proxy is not what
- * this server sees. In order of authority: WHEEL_PUBLIC_ORIGIN; X-Forwarded-Proto and -Host, but
- * only from a proxy declared trusted; otherwise the connection's own scheme and Host. A forged
- * X-Forwarded-* from anyone else changes nothing.
+ * The CSRF and DNS-rebinding checks every /api route runs first. The rules and their reasons are
+ * written down once, in web/DEPLOY.md ("The trust model"); this file is their implementation.
  */
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -35,8 +25,8 @@ export function proxyTrust(): ProxyTrust {
 /** The origin a browser uses to reach this app, e.g. `https://wheel.example.com`; `"null"` if it cannot be told. */
 export function publicOrigin(req: Request, trust: ProxyTrust = proxyTrust()): string {
   if (trust.publicOrigin) return trust.publicOrigin;
-  const proto = trust.trustProxy ? firstValue(req.headers.get("x-forwarded-proto")) : null;
-  const forwardedHost = trust.trustProxy ? firstValue(req.headers.get("x-forwarded-host")) : null;
+  const proto = trust.trustProxy ? lastValue(req.headers.get("x-forwarded-proto")) : null;
+  const forwardedHost = trust.trustProxy ? lastValue(req.headers.get("x-forwarded-host")) : null;
   try {
     const url = new URL(req.url);
     const host = forwardedHost ?? req.headers.get("host") ?? url.host;
@@ -47,12 +37,36 @@ export function publicOrigin(req: Request, trust: ProxyTrust = proxyTrust()): st
 }
 
 /**
- * The scheme of the connection this server accepted. Next derives the request URL's scheme from
- * X-Forwarded-Proto whenever one is present, so with an untrusted one in play the URL cannot be
- * believed either — and this server never terminates TLS itself, so the connection is plain http.
+ * The scheme of the connection this server accepted. Next fills X-Forwarded-Proto only when it is
+ * absent and keeps a client's own, so that header — and the URL scheme Next derives from it — may
+ * be the client's words. Untrusted, they mean nothing, and this server never terminates TLS itself.
  */
 function connectionProtocol(req: Request, url: URL): string {
   return req.headers.has("x-forwarded-proto") ? "http:" : url.protocol;
+}
+
+export function isLoopbackHost(host: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(`http://${host}`).hostname;
+  } catch {
+    return false;
+  }
+  return hostname === "localhost" || hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+/** With no public origin and no trusted proxy, any Host but loopback may be a DNS-rebound name. */
+export function hostAllowed(req: Request, trust: ProxyTrust = proxyTrust()): boolean {
+  if (trust.publicOrigin || trust.trustProxy) return true;
+  return isLoopbackHost(req.headers.get("host") ?? new URL(req.url).host);
+}
+
+/**
+ * The client's address as the nearest proxy recorded it. Only as good as that proxy: without a
+ * trusted one, Next keeps whatever X-Forwarded-For the client sent, so this is the client's claim.
+ */
+export function clientAddress(req: Request): string | null {
+  return lastValue(req.headers.get("x-forwarded-for"));
 }
 
 export interface RequestOrigin {
@@ -63,11 +77,9 @@ export interface RequestOrigin {
 }
 
 export function isSameOrigin(r: RequestOrigin): boolean {
-  // Nothing legitimately calls these routes from another site, whatever the method.
   if (r.secFetchSite === "cross-site") return false;
   if (SAFE_METHODS.has(r.method.toUpperCase())) return true;
-  // A browser sends Origin with every state-changing request it makes, and when it does that is
-  // the whole answer. Sec-Fetch-Site stands in only for a request that carries no Origin.
+  // When Origin is present it is the whole answer; Sec-Fetch-Site stands in only when it is absent.
   if (r.origin !== null) return r.publicOrigin !== "null" && originOf(r.origin) === r.publicOrigin;
   return r.secFetchSite === "same-origin";
 }
@@ -89,12 +101,20 @@ export function requestOrigin(req: Request, trust: ProxyTrust = proxyTrust()): R
   };
 }
 
-/** A 403 for a request that did not come from this app, or null to carry on. */
+/** A 403 for a request this app should not answer, or null to carry on. */
 export function refuseCrossOrigin(req: Request): Response | null {
-  const facts = requestOrigin(req);
+  const trust = proxyTrust();
+  if (!hostAllowed(req, trust)) {
+    return errorEnvelope(
+      403,
+      "public_origin_required",
+      "This server answers only on localhost until WHEEL_PUBLIC_ORIGIN names the address browsers use to reach it.",
+    );
+  }
+  const facts = requestOrigin(req, trust);
   if (isSameOrigin(facts)) return null;
-  // The browser says the page is this site, yet its Origin is not the one this server computed:
-  // that is a proxy nobody told this server about, not an attack. Say so where the operator looks.
+  // The browser says the page is this site, yet its Origin is not the one computed here: a proxy
+  // nobody told this server about, not an attack. Said where the operator looks.
   if (facts.origin && (facts.secFetchSite === "same-origin" || facts.secFetchSite === "same-site")) {
     console.warn(
       `wheel-web: refused ${facts.method} from Origin ${facts.origin}; this server believes its origin is ${facts.publicOrigin}. Behind a proxy, set WHEEL_PUBLIC_ORIGIN.`,
@@ -103,7 +123,8 @@ export function refuseCrossOrigin(req: Request): Response | null {
   return errorEnvelope(403, "cross_origin", "This request did not come from this app, so it was refused.");
 }
 
-function firstValue(header: string | null): string | null {
-  const value = header?.split(",")[0]?.trim();
+/** The nearest proxy writes the rightmost value; anything to its left came from further out. */
+function lastValue(header: string | null): string | null {
+  const value = header?.split(",").at(-1)?.trim();
   return value ? value : null;
 }

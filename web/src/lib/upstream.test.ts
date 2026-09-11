@@ -4,13 +4,15 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { expiredJwt, liveJwt } from "../../test/tokens";
 
 const getToken = vi.hoisted(() => vi.fn());
 vi.mock("@clerk/nextjs/server", () => ({ auth: async () => ({ getToken }) }));
 
 import {
   MOCK_TOKEN,
-  apiUnreachable,
+  answered,
+  apiFailed,
   apiUrl,
   callApi,
   clearCookieOn401,
@@ -19,13 +21,16 @@ import {
   upstreamToken,
 } from "./upstream";
 
+const TOKEN = liveJwt({ sub: "u1" });
 const withCookie = (cookie: string, headers: Record<string, string> = {}) =>
-  new Request("http://wheel.test/api/wheel/v1/projects", { headers: { cookie, ...headers } });
+  new Request("http://localhost:3000/api/wheel/v1/projects", { headers: { cookie, ...headers } });
 
 beforeEach(() => {
   vi.stubEnv("WHEEL_API_URL", "http://api.test:8080");
   vi.stubEnv("WHEEL_DEV_TOKEN", "");
-  vi.stubEnv("NEXT_PUBLIC_DEV_TOKEN", "");
+  vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "");
+  vi.stubEnv("WHEEL_TRUST_PROXY", "");
+  vi.stubEnv("VERCEL", "");
   getToken.mockReset();
 });
 
@@ -35,13 +40,21 @@ afterEach(() => {
 });
 
 describe("the credential this server presents", () => {
-  it("in local mode is the session cookie", async () => {
-    expect(await upstreamToken(withCookie("wheel_session=tok"), "local")).toBe("tok");
+  it("in local mode is the session cookie, when it is a live JWT", async () => {
+    expect(await upstreamToken(withCookie(`wheel_session=${TOKEN}`), "local")).toBe(TOKEN);
     expect(await upstreamToken(withCookie("other=1"), "local")).toBeNull();
   });
 
+  it.each([
+    ["any string at all", "tok"],
+    ["an expired JWT", expiredJwt()],
+    ["a token of the wrong shape", "a.b"],
+  ])("in local mode is nothing for %s: no body is read and no socket dialled for it", async (_label, value) => {
+    expect(await upstreamToken(withCookie(`wheel_session=${value}`), "local")).toBeNull();
+  });
+
   it("never a credential the browser supplied itself", async () => {
-    const req = withCookie("other=1", { "x-auth-token": "attacker", authorization: "Bearer attacker" });
+    const req = withCookie("other=1", { "x-auth-token": TOKEN, authorization: `Bearer ${TOKEN}` });
     expect(await upstreamToken(req, "local")).toBeNull();
   });
 
@@ -60,16 +73,17 @@ describe("the credential this server presents", () => {
     expect(await upstreamToken(withCookie(""), "dev")).toBeNull();
   });
 
-  it("in mock mode is the mock's constant unless a dev token is set", async () => {
+  // Security review, finding 2: a real dev token must never ride the mock mode an unset
+  // WHEEL_AUTH_MODE falls into.
+  it("in mock mode is the mock's constant and nothing else, even with a real dev token set", async () => {
+    vi.stubEnv("WHEEL_DEV_TOKEN", "secret-dev-token");
     expect(await upstreamToken(withCookie(""), "mock")).toBe(MOCK_TOKEN);
-    vi.stubEnv("WHEEL_DEV_TOKEN", "override");
-    expect(await upstreamToken(withCookie(""), "mock")).toBe("override");
   });
 
   it("follows WHEEL_AUTH_MODE when no mode is passed", async () => {
     vi.stubEnv("WHEEL_AUTH_MODE", "dev");
     vi.stubEnv("WHEEL_DEV_TOKEN", "from-env");
-    expect(await upstreamToken(withCookie("wheel_session=cookie"))).toBe("from-env");
+    expect(await upstreamToken(withCookie(`wheel_session=${TOKEN}`))).toBe("from-env");
   });
 });
 
@@ -88,7 +102,7 @@ describe("callApi", () => {
     const fetchMock = vi.fn(async () => new Response("{}"));
     vi.stubGlobal("fetch", fetchMock);
     await callApi("http://api.test:8080/v1/x", { method: "POST", token: "tok", projectId: "p1", json: { a: 1 } });
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit & { duplex?: string }];
     const headers = new Headers(init.headers);
     expect(url).toBe("http://api.test:8080/v1/x");
     expect(headers.get("x-auth-token")).toBe("tok");
@@ -97,24 +111,58 @@ describe("callApi", () => {
     expect(init.body).toBe('{"a":1}');
     expect(init.redirect).toBe("manual");
     expect(init.cache).toBe("no-store");
+    expect(init.duplex).toBeUndefined();
   });
 
-  it("passes a raw body and the given headers through", async () => {
+  it("sends a stream body half-duplex, as Node requires", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
-    const body = new Uint8Array([1, 2, 3]);
+    const body = new ReadableStream<Uint8Array>();
     await callApi("http://api.test:8080/v1/x", { method: "PUT", body, headers: new Headers({ "content-type": "image/png" }) });
-    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit & { duplex?: string }];
     expect(init.body).toBe(body);
+    expect(init.duplex).toBe("half");
     expect(new Headers(init.headers).get("content-type")).toBe("image/png");
     expect(new Headers(init.headers).has("x-auth-token")).toBe(false);
   });
 
-  it("is null when the API cannot be reached at all", async () => {
+  it("reports an API that cannot be reached at all", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => {
       throw new TypeError("fetch failed");
     }));
-    expect(await callApi("http://api.test:8080/v1/x", { method: "GET" })).toBeNull();
+    expect(await callApi("http://api.test:8080/v1/x", { method: "GET" })).toEqual({ failure: "unreachable" });
+  });
+
+  it("gives up on an API that does not answer in time, and says it timed out", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason))),
+      ),
+    );
+    const started = Date.now();
+    expect(await callApi("http://api.test:8080/v1/x", { method: "GET", timeoutMs: 30 })).toEqual({ failure: "timeout" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("still honours the caller's own abort alongside the deadline, as unreachable rather than timed out", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason))),
+      ),
+    );
+    const caller = new AbortController();
+    const pending = callApi("http://api.test:8080/v1/x", { method: "GET", signal: caller.signal, timeoutMs: 60_000 });
+    caller.abort();
+    expect(await pending).toEqual({ failure: "unreachable" });
+  });
+
+  it("tells an answer from a failure", () => {
+    expect(answered(new Response(null))).toBe(true);
+    expect(answered({ failure: "timeout" })).toBe(false);
   });
 });
 
@@ -131,6 +179,7 @@ describe("handing the API's answer back", () => {
     expect(await res.text()).toBe('{"error":{"code":"conflict","message":"taken"}}');
     expect(res.headers.get("retry-after")).toBe("5");
     expect(res.headers.get("set-cookie")).toBeNull();
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   it("sends no body with a status that must not have one", async () => {
@@ -144,10 +193,13 @@ describe("handing the API's answer back", () => {
     expect(res.headers.get("set-cookie")).toBe("wheel_session=; Max-Age=0");
   });
 
-  it("reports an unreachable API as a 502 in the API's own shape", async () => {
-    const res = apiUnreachable();
-    expect(res.status).toBe(502);
-    expect(await res.json()).toEqual({ error: { code: "api_unreachable", message: expect.stringMatching(/can't reach the api/i) } });
+  it.each<["unreachable" | "timeout", number, string]>([
+    ["unreachable", 502, "api_unreachable"],
+    ["timeout", 504, "api_timeout"],
+  ])("reports %s as %i in the API's own shape", async (failure, status, code) => {
+    const res = apiFailed({ failure });
+    expect(res.status).toBe(status);
+    expect((await res.json()).error.code).toBe(code);
   });
 });
 
@@ -160,7 +212,7 @@ describe("a missing or dead session", () => {
   });
 
   it("names the server-only variable to set in dev mode, and touches no cookie", async () => {
-    const res = unauthenticated(new Request("http://wheel.test/x"), "dev");
+    const res = unauthenticated(new Request("http://localhost/x"), "dev");
     expect(res.headers.get("set-cookie")).toBeNull();
     expect((await res.json()).error.message).toContain("WHEEL_DEV_TOKEN");
   });
@@ -170,6 +222,6 @@ describe("a missing or dead session", () => {
     [403, "local", 0],
     [401, "clerk", 0],
   ])("clears the cookie on %i in %s mode: %i header(s)", (status, mode, count) => {
-    expect(clearCookieOn401(status, new Request("http://wheel.test/"), mode)).toHaveLength(count);
+    expect(clearCookieOn401(status, new Request("http://localhost/"), mode)).toHaveLength(count);
   });
 });

@@ -6,21 +6,14 @@ import "server-only";
 import { publicOrigin } from "@/lib/same-origin";
 
 /**
- * The local-mode session, held where page script cannot read it.
- *
- * The cookie carries the API's own session JWT and nothing else. Who it belongs to is asked of the
- * API when needed (`GET /api/session`), so there is no second copy of the user to drift.
- *
- * HttpOnly, so an XSS cannot exfiltrate it. SameSite=Lax, so it is not sent on cross-site
- * subrequests or POSTs. Path=/. Secure whenever the PUBLIC origin is https — which behind a
- * TLS-terminating proxy is known only from WHEEL_PUBLIC_ORIGIN or a trusted proxy's headers, never
- * from a header anyone could send — and then under the `__Host-` prefix, which a browser accepts
- * only from a secure origin with no Domain, so a sibling subdomain cannot plant or overwrite it.
+ * The local-mode session cookie: its name, flags and lifetime, and which values are worth
+ * presenting to the API at all. The design and its reasons: web/DEPLOY.md ("The trust model").
  */
 
 export const SESSION_COOKIE = "wheel_session";
 export const SECURE_SESSION_COOKIE = "__Host-wheel_session";
 const COOKIE_SAFE_TOKEN = /^[A-Za-z0-9._~+/=-]{1,4096}$/;
+const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 export function isSecureRequest(req: Request): boolean {
   return publicOrigin(req).startsWith("https:");
@@ -41,6 +34,21 @@ export function readCookie(header: string | null, name: string): string | null {
 
 export function readSessionToken(req: Request): string | null {
   return readCookie(req.headers.get("cookie"), sessionCookieName(isSecureRequest(req)));
+}
+
+/**
+ * Worth presenting: shaped like the API's session JWT and not past its own `exp`. The signature is
+ * the API's to check; this only stops a garbage cookie from buying a body read or an upstream socket.
+ */
+export function isLiveSessionToken(token: string, nowMs: number): boolean {
+  if (token.length > 4096 || !JWT_SHAPE.test(token)) return false;
+  const expiry = jwtExpiryMs(token);
+  return expiry !== null && expiry > nowMs;
+}
+
+export function liveSessionToken(req: Request, nowMs = Date.now()): string | null {
+  const token = readSessionToken(req);
+  return token !== null && isLiveSessionToken(token, nowMs) ? token : null;
 }
 
 /** The API is trusted, but a value that could break out of a Set-Cookie header is not written into one. */
@@ -81,8 +89,8 @@ export function clearedSessionCookie(secure: boolean): string {
 }
 
 /**
- * Where middleware sends a visitor to /app who holds no session cookie. A routing courtesy only:
- * a cookie that is present but dead still reaches the page, and the API refuses it there.
+ * Where middleware sends a visitor to /app who holds no live-looking session cookie. A routing
+ * courtesy only: the API is what refuses a session that is not real.
  */
 export function signInRedirect(pathname: string, hasSession: boolean): string | null {
   if (hasSession) return null;

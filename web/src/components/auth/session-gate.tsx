@@ -6,19 +6,17 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
+import { Button } from "@/components/ui";
 import { authMode } from "@/lib/auth";
-import { hydrateSession, useSession } from "@/lib/local-auth";
+import { hydrateSession, retrySession, useSession } from "@/lib/local-auth";
 
 /**
- * Guards /app in local auth mode, behind middleware's cookie check.
+ * Guards /app in local auth mode, behind middleware's cookie check. Middleware can only see a
+ * cookie shaped like a live session; this asks the server whether it is one. Both are routing
+ * courtesies, not a boundary: the API is the boundary (web/DEPLOY.md, "The trust model").
  *
- * Middleware can only see that a cookie is present; this asks the server whether it is still
- * alive, and sends a visitor whose session has died to sign in. Both are routing courtesies, not
- * a security boundary: the boundary is the API, which refuses every request without a valid
- * session and 404s projects you do not own.
- *
- * The three states are deliberately distinct. `loading` means the server has not answered yet,
- * and redirecting during it would sign out every returning user for one frame.
+ * Only `anon` redirects. `loading` has not asked yet, and `unreachable` could not get an answer —
+ * sending either to sign-in would sign out a returning user over a blip.
  */
 export function SessionGate({ children }: { children: React.ReactNode }) {
   const session = useSession();
@@ -45,6 +43,20 @@ export function SessionGate({ children }: { children: React.ReactNode }) {
         data-testid="session-loading"
       >
         Checking your session…
+      </div>
+    );
+  }
+
+  if (session.status === "unreachable") {
+    return (
+      <div
+        className="flex min-h-screen flex-col items-center justify-center gap-3 text-micro text-ink-faint"
+        data-testid="session-unreachable"
+      >
+        <p>Can&rsquo;t reach the server to check your session. Trying again…</p>
+        <Button size="sm" tone="ghost" data-testid="btn-session-retry" onClick={() => void retrySession()}>
+          Try now
+        </Button>
       </div>
     );
   }

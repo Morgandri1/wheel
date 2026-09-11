@@ -26,11 +26,13 @@ if (args.includes("--help") || args.includes("-h")) {
   wheel-web — the Wheel board, served locally.
 
   Usage
-    npx wheel-web [--port <n>] [--api <url>]
+    npx wheel-web [--port <n>] [--api <url>] [--public-origin <url>]
 
   Options
-    --port <n>   Port to listen on.                   (default 3000, or PORT)
-    --api <url>  The Wheel API this server talks to.  (default http://127.0.0.1:8080, or WHEEL_API_URL)
+    --port <n>             Port to listen on.                   (default 3000, or PORT)
+    --api <url>            The Wheel API this server talks to.  (default http://127.0.0.1:8080, or WHEEL_API_URL)
+    --public-origin <url>  The address browsers use, if not localhost (or WHEEL_PUBLIC_ORIGIN).
+                           Without it the server answers on localhost only.
 
   The browser only ever talks to this server; the API can stay on loopback or a private network.
   Sign-in is the API's own email/password (WHEEL_AUTH_MODE=local) unless WHEEL_AUTH_MODE says otherwise.
@@ -48,6 +50,7 @@ const port = flag("--port") ?? process.env.PORT ?? "3000";
 // 127.0.0.1, not localhost: Node may resolve localhost to ::1 while the API listens on IPv4 only.
 const apiUrl = flag("--api") ?? process.env.WHEEL_API_URL ?? "http://127.0.0.1:8080";
 const authMode = process.env.WHEEL_AUTH_MODE || "local";
+const publicOrigin = flag("--public-origin") ?? process.env.WHEEL_PUBLIC_ORIGIN;
 
 try {
   // Fail on a malformed URL now, with a sentence, rather than on every request later.
@@ -73,6 +76,7 @@ const child = spawn(process.execPath, [server], {
     HOSTNAME: process.env.HOSTNAME ?? "0.0.0.0",
     WHEEL_API_URL: apiUrl,
     WHEEL_AUTH_MODE: authMode,
+    ...(publicOrigin ? { WHEEL_PUBLIC_ORIGIN: publicOrigin } : {}),
   },
 });
 

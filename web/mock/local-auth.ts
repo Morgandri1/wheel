@@ -10,8 +10,9 @@ import { EngineRefusal } from "./state";
  *
  * This exists so the sign-in, sign-up, rate-limit and expired-session paths in the UI are
  * exercised in development rather than discovered in production. It is NOT a model of the API's
- * security: passwords are compared in plaintext here and the token is a random id rather than a
- * signed JWT, because the web treats the token as opaque and would not notice the difference.
+ * security: passwords are compared in plaintext here and the token is shaped like the API's JWT
+ * (the web server refuses a cookie that is not) but unsigned — the mock looks tokens up, it never
+ * verifies them.
  * The parts that ARE modelled faithfully are the parts the UI has to handle — status codes, error
  * codes, Retry-After, and the fact that a wrong email and a wrong password answer identically.
  */
@@ -42,7 +43,7 @@ export function seedUser() {
 
 /** Local tokens are checked; anything else (mock/dev modes) is waved through by the caller. */
 export function isLocalToken(token: string) {
-  return token.startsWith("local.");
+  return token.endsWith(".local");
 }
 
 export function userForToken(token: string): string | null {
@@ -52,11 +53,14 @@ export function userForToken(token: string): string | null {
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** The API's session shape, `expires_at` included, so the web server's cookie lifetime is exercised. */
+const b64url = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+
 function issue(user: MockUser) {
-  const token = `local.${randomUUID()}`;
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const claims = { sub: user.id, exp: Math.floor(expiresAt / 1000), jti: randomUUID() };
+  const token = `${b64url({ alg: "none", typ: "JWT" })}.${b64url(claims)}.local`;
   tokens.set(token, user.id);
-  const expires_at = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  return { token, expires_at, user: { id: user.id, email: user.email } };
+  return { token, expires_at: new Date(expiresAt).toISOString(), user: { id: user.id, email: user.email } };
 }
 
 function assertCredentialShape(email: string, password: unknown) {

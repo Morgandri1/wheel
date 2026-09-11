@@ -9,7 +9,9 @@ import {
   SESSION_COOKIE,
   clearedSessionCookie,
   isCookieSafeToken,
+  isLiveSessionToken,
   isSecureRequest,
+  liveSessionToken,
   readCookie,
   readSessionToken,
   sessionCookie,
@@ -172,6 +174,39 @@ describe("how long it lasts", () => {
 
   it("is zero, never negative, for a session already over", () => {
     expect(sessionMaxAge("2026-09-11T11:00:00Z", "t", now)).toBe(0);
+  });
+});
+
+// Security review, finding 3: any cookie value used to count as a credential, and bought a 5 MiB
+// body read or an upstream socket. Only a live JWT is worth presenting now.
+describe("which cookie values are worth presenting", () => {
+  const now = Date.parse("2026-09-11T12:00:00Z");
+  const exp = (offsetSeconds: number) => jwt({ sub: "u1", exp: now / 1000 + offsetSeconds });
+
+  it("is a JWT not yet past its exp", () => {
+    expect(isLiveSessionToken(exp(60), now)).toBe(true);
+  });
+
+  it.each([
+    ["an expired JWT", exp(-1)],
+    ["a JWT expiring this instant", exp(0)],
+    ["a JWT with no exp", jwt({ sub: "u1" })],
+    ["a JWT whose exp is not a number", jwt({ exp: "tomorrow" })],
+    ["an opaque token", "local.00000000-0000-4000-8000-0000000000ff"],
+    ["two parts", "a.b"],
+    ["four parts", `${exp(60)}.extra`],
+    ["an empty signature", exp(60).replace(/\.[^.]+$/, ".")],
+    ["a plain string", "mock-session-token"],
+    ["something enormous", `${exp(60)}${"A".repeat(5000)}`],
+  ])("is not %s", (_label, token) => {
+    expect(isLiveSessionToken(token, now)).toBe(false);
+  });
+
+  it("reads a live cookie and drops anything else", () => {
+    const live = jwt({ exp: Date.now() / 1000 + 60 });
+    expect(liveSessionToken(new Request("http://localhost/", { headers: { cookie: `wheel_session=${live}` } }))).toBe(live);
+    expect(liveSessionToken(new Request("http://localhost/", { headers: { cookie: "wheel_session=garbage" } }))).toBeNull();
+    expect(liveSessionToken(new Request("http://localhost/"))).toBeNull();
   });
 });
 

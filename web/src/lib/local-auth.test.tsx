@@ -7,11 +7,12 @@ import { act, render, screen } from "@testing-library/react";
 
 /**
  * The browser side of a cookie session. What matters: the browser never holds the token, a 401
- * from anywhere signs the UI out, "not asked yet" is never mistaken for "signed out", and the
- * sign-in form still reads the API's own words through this app's server.
+ * from anywhere signs the UI out, "not asked yet" and "could not ask" are never mistaken for
+ * "signed out", and the sign-in form still reads the API's own words through this app's server.
  *
  * Each case imports the module fresh: it holds process-wide state on purpose (one session per
- * browser) and a session leaked between cases would make an assertion pass for the wrong reason.
+ * browser). setTimeout is faked throughout, so a retry one case schedules can never fire inside
+ * the next one and call its fetch.
  */
 
 type Mod = typeof import("./local-auth");
@@ -34,12 +35,14 @@ function call(i = 0) {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   window.localStorage.clear();
   fetchMock = vi.fn();
   vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -60,23 +63,67 @@ describe("hydration", () => {
     expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
   });
 
-  it.each([
-    ["no user", () => respond(200, { user: null })],
-    ["a user missing its email", () => respond(200, { user: { id: "u1" } })],
-    ["a failure from the server", () => respond(502, { error: { code: "api_unreachable", message: "x" } })],
-    ["an empty body", () => respond(200)],
-  ])("reads %s as signed out", async (_label, answer) => {
-    fetchMock.mockResolvedValue(answer());
+  it("reads only an explicit {user: null} as signed out", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: null }));
     const m = await load();
     await m.hydrateSession();
     expect(m.sessionSnapshot().status).toBe("anon");
   });
 
-  it("reads an unreachable server as signed out rather than hanging on 'checking'", async () => {
+  // QA review, finding 3: an API blip at page load used to sign the UI out.
+  it.each([
+    ["a failure from the server", () => respond(502, { error: { code: "api_unreachable", message: "x" } })],
+    ["a timeout from the server", () => respond(504, { error: { code: "api_timeout", message: "x" } })],
+    ["an empty body", () => respond(200)],
+    ["an answer with no user field", () => respond(200, {})],
+    ["a user it cannot read", () => respond(200, { user: { id: "u1" } })],
+  ])("reads %s as unreachable, not as signed out", async (_label, answer) => {
+    fetchMock.mockResolvedValue(answer());
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot().status).toBe("unreachable");
+  });
+
+  it("reads a network failure as unreachable", async () => {
     fetchMock.mockRejectedValue(new TypeError("failed to fetch"));
     const m = await load();
     await m.hydrateSession();
-    expect(m.sessionSnapshot().status).toBe("anon");
+    expect(m.sessionSnapshot().status).toBe("unreachable");
+  });
+
+  it("asks again after a blip, backing off, and settles on the answer it finally gets", async () => {
+    fetchMock
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.hydrateSession();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(m.sessionSnapshot().status).toBe("unreachable");
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("asks at once when the gate says try now, instead of waiting out the backoff", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("offline")).mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.hydrateSession();
+    await m.retrySession();
+    expect(m.sessionSnapshot().status).toBe("authed");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("asks once, however many gates call it", async () => {
@@ -98,6 +145,16 @@ describe("hydration", () => {
     await hydrating;
     expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
   });
+
+  it("lets a sign-in that lands while unreachable stand, rather than the next retry", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("offline")).mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.hydrateSession();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(m.sessionSnapshot().status).toBe("authed");
+  });
 });
 
 describe("the token never reaches the browser", () => {
@@ -116,6 +173,7 @@ describe("the token never reaches the browser", () => {
     await m.signIn("dev@wheel.dev", "wheel-dev-password");
     const headers = new Headers(call().init?.headers);
     expect(headers.has("x-auth-token")).toBe(false);
+    expect(headers.get("content-type")).toBe("application/json");
     expect(call().init?.credentials).toBe("same-origin");
   });
 });
@@ -220,10 +278,13 @@ describe("forgetting", () => {
     expect(m.sessionSnapshot().status).toBe("anon");
   });
 
-  it("drops the session when any route 401s", async () => {
-    fetchMock.mockResolvedValue(respond(200, { user: USER }));
+  it("drops the session when any route 401s, from any state", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("offline")).mockResolvedValueOnce(respond(200, { user: USER }));
     const m = await load();
     const { notifyUnauthorized } = await import("./auth");
+    await m.hydrateSession();
+    notifyUnauthorized();
+    expect(m.sessionSnapshot().status).toBe("anon");
     await m.signIn("dev@wheel.dev", "wheel-dev-password");
     notifyUnauthorized();
     expect(m.sessionSnapshot().status).toBe("anon");

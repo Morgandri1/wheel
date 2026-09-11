@@ -5,21 +5,22 @@
 import "server-only";
 import {
   apiTarget,
+  cappedStream,
   declaredLength,
   errorEnvelope,
   forwardedRequestHeaders,
-  readCapped,
   upstreamPath,
 } from "@/lib/proxy-rules";
 import { proxyBodyLimit, serverApiBaseUrl, serverAuthMode } from "@/lib/runtime-config";
 import { refuseCrossOrigin } from "@/lib/same-origin";
-import { apiUnreachable, callApi, clearCookieOn401, passThrough, unauthenticated, upstreamToken } from "@/lib/upstream";
+import { answered, apiFailed, callApi, clearCookieOn401, passThrough, unauthenticated, upstreamToken } from "@/lib/upstream";
 
 /**
  * `/api/wheel/v1/projects…` → `${WHEEL_API_URL}/v1/projects…`, with the session attached here.
  *
  * Order matters and is the same on every request: refuse cross-origin, refuse a path or header
- * the rules will not pass, resolve the caller's credential, cap the body, then forward.
+ * the rules will not pass, resolve the caller's credential, then stream the body through a
+ * counter — never buffered — to the API.
  */
 export async function proxyToApi(req: Request): Promise<Response> {
   const refused = refuseCrossOrigin(req);
@@ -39,15 +40,24 @@ export async function proxyToApi(req: Request): Promise<Response> {
   const token = await upstreamToken(req, mode);
   if (!token) return unauthenticated(req, mode);
 
-  let body: Uint8Array<ArrayBuffer> | undefined;
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    const limit = proxyBodyLimit();
-    const read = declaredLength(req.headers) > limit ? null : await readCapped(req.body, limit);
-    if (!read) return errorEnvelope(413, "payload_too_large", `Request bodies over ${limit} bytes are refused.`);
-    if (read.byteLength > 0) body = read;
+  const limit = proxyBodyLimit();
+  let body: ReadableStream<Uint8Array> | undefined;
+  let capped: ReturnType<typeof cappedStream> | undefined;
+  if (req.body && req.method !== "GET" && req.method !== "HEAD") {
+    if (declaredLength(req.headers) > limit) return tooLarge(limit);
+    capped = cappedStream(limit);
+    body = req.body.pipeThrough(capped.transform);
   }
 
   const res = await callApi(target, { method: req.method, token, headers, body, signal: req.signal });
-  if (!res) return apiUnreachable();
+  if (capped?.exceeded()) {
+    if (answered(res)) await res.body?.cancel();
+    return tooLarge(limit);
+  }
+  if (!answered(res)) return apiFailed(res);
   return passThrough(res, clearCookieOn401(res.status, req, mode));
+}
+
+function tooLarge(limit: number): Response {
+  return errorEnvelope(413, "payload_too_large", `Request bodies over ${limit} bytes are refused.`);
 }

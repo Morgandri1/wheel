@@ -6,14 +6,9 @@ import "server-only";
 import type { AuthMode } from "@/lib/auth";
 
 /**
- * Where the API lives and which auth mode is in force, resolved on the SERVER at run time.
- *
- * The browser never learns the API's address: every call goes through this app's own route
- * handlers, which is what lets the API bind to loopback or a private network. `server-only`
- * turns a client import of this module into a build error instead of a leak.
- *
- * Read per call, not at module load, so one prebuilt bundle (`npx wheel-web`, the Docker image)
- * serves whatever its environment says when it starts.
+ * Server configuration, read per call on the SERVER and never shipped to the browser, so one
+ * prebuilt bundle follows the environment it starts in. What each setting means for the trust
+ * model is written down once, in web/DEPLOY.md ("The trust model").
  */
 
 export const DEFAULT_API_URL = "http://127.0.0.1:8080";
@@ -39,13 +34,14 @@ export function serverApiBaseUrl(): string {
 
 /** `WHEEL_AUTH_MODE`, else `NEXT_PUBLIC_AUTH_MODE` for deployments configured before it existed. */
 export function serverAuthMode(): AuthMode {
-  return parseAuthMode(firstNonEmpty(process.env.WHEEL_AUTH_MODE, process.env.NEXT_PUBLIC_AUTH_MODE));
+  return refuseSharedCredentialInProduction(
+    parseAuthMode(firstNonEmpty(process.env.WHEEL_AUTH_MODE, process.env.NEXT_PUBLIC_AUTH_MODE)),
+  );
 }
 
 /**
  * Unset means `mock`, as it always has. A value that is set but unrecognised throws: a typo here
- * used to fail silently as "sign-in works, then everything 401s", and a server that refuses to
- * render with the reason in its log is the cheaper failure.
+ * used to fail silently as "sign-in works, then everything 401s".
  */
 export function parseAuthMode(raw: string | undefined): AuthMode {
   if (raw === undefined) return "mock";
@@ -55,10 +51,21 @@ export function parseAuthMode(raw: string | undefined): AuthMode {
 }
 
 /**
- * `WHEEL_PUBLIC_ORIGIN`: the origin browsers use to reach this app (`https://wheel.example.com`),
- * for when a TLS-terminating proxy stands in front and this server cannot see it. When set it is
- * the whole answer: forwarded headers are ignored entirely.
+ * mock and dev present one credential for every visitor, so in production either makes this
+ * server an open door to the API — and mock is what an UNSET WHEEL_AUTH_MODE means. Refused
+ * unless WHEEL_ALLOW_INSECURE_AUTH=1 says an open server is meant.
  */
+export function refuseSharedCredentialInProduction(mode: AuthMode): AuthMode {
+  const shared = mode === "mock" || mode === "dev";
+  if (shared && process.env.NODE_ENV === "production" && process.env.WHEEL_ALLOW_INSECURE_AUTH !== "1") {
+    throw new Error(
+      `WHEEL_AUTH_MODE=${mode} (the default when unset) would let every visitor of this production server act with one shared credential. Set WHEEL_AUTH_MODE=local or clerk, or WHEEL_ALLOW_INSECURE_AUTH=1 if an open server is really meant.`,
+    );
+  }
+  return mode;
+}
+
+/** `WHEEL_PUBLIC_ORIGIN`: the origin browsers use to reach this app, when a proxy stands in front. */
 export function publicOriginSetting(): string | null {
   const value = firstNonEmpty(process.env.WHEEL_PUBLIC_ORIGIN);
   if (!value) return null;
@@ -74,26 +81,35 @@ export function publicOriginSetting(): string | null {
   return parsed.origin;
 }
 
-/**
- * Whether X-Forwarded-Proto and X-Forwarded-Host describe the public origin. Only a proxy that
- * overwrites them may be trusted, and this server cannot see who connected, so it is declared:
- * `WHEEL_TRUST_PROXY=1`, or on Vercel, whose edge always sets them.
- */
+/** `WHEEL_TRUST_PROXY=1`, or Vercel, whose edge always sets the forwarded headers. */
 export function trustProxy(): boolean {
   const value = firstNonEmpty(process.env.WHEEL_TRUST_PROXY)?.toLowerCase();
   if (value !== undefined) return value === "1" || value === "true";
   return process.env.VERCEL === "1";
 }
 
-/** What dev and mock modes present to the API. Server-only by construction: never NEXT_PUBLIC_. */
+/** What dev mode presents to the API. Server-only by construction: never NEXT_PUBLIC_. */
 export function devToken(): string | null {
   return firstNonEmpty(process.env.WHEEL_DEV_TOKEN) ?? null;
 }
 
-/** Bodies over this are refused before they are buffered. Keep it at the API's INGRESS_BODY_LIMIT_BYTES. */
+/** Bodies over this are refused. Keep it at the API's INGRESS_BODY_LIMIT_BYTES. */
 export function proxyBodyLimit(): number {
   const n = Number(process.env.WHEEL_PROXY_BODY_LIMIT_BYTES);
   return Number.isSafeInteger(n) && n > 0 ? n : DEFAULT_PROXY_BODY_LIMIT;
+}
+
+/**
+ * Every setting validated at once, for the startup line (src/instrumentation.ts): a server that
+ * would refuse every request should fail to start, not come up looking healthy.
+ */
+export function checkServerConfig(): string {
+  const api = serverApiBaseUrl();
+  const mode = serverAuthMode();
+  const origin = publicOriginSetting();
+  const answers = origin ?? (trustProxy() ? "whatever a trusted proxy reports" : "localhost only");
+  const defaulted = firstNonEmpty(process.env.WHEEL_API_URL, process.env.NEXT_PUBLIC_API_URL) ? "" : " (WHEEL_API_URL unset)";
+  return `API ${api}${defaulted} · auth ${mode} · public origin: ${answers}`;
 }
 
 function firstNonEmpty(...values: (string | undefined)[]): string | undefined {

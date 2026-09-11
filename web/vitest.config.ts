@@ -57,6 +57,10 @@ export default defineConfig({
         "src/lib/session-routes.ts",
         "src/lib/ingress-probe.ts",
         "src/lib/event-relay.ts",
+        "src/lib/session-user.ts",
+        // Which ids may become an API path, and where sign-in may send you: both silent when wrong.
+        "src/lib/api-paths.ts",
+        "src/lib/next-path.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },

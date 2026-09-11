@@ -26,6 +26,12 @@ export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed"
 interface Handlers {
   onBatch: (events: EngineFrame[]) => void;
   onStatus: (status: ConnectionStatus) => void;
+  /**
+   * The stream reopened after a gap. The relay has no replay and drops a reader that falls behind,
+   * so whatever was sent while it was down is gone and what the page holds is stale — the same
+   * situation as the engine's own `lagged`, and it wants the same answer: refetch.
+   */
+  onResync?: () => void;
 }
 
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000] as const;
@@ -86,8 +92,10 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
     source = es;
 
     es.addEventListener("wheel-open", () => {
+      const resumed = attempt > 0;
       attempt = 0;
       handlers.onStatus("open");
+      if (resumed) handlers.onResync?.();
     });
 
     es.onmessage = (ev) => {

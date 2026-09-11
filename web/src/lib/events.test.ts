@@ -224,6 +224,46 @@ describe("reconnecting", () => {
   });
 });
 
+// QA review, finding 1: the relay drains the engine, so the engine never says `lagged` any more,
+// and a stream that dropped and came back has missed whatever was sent meanwhile.
+describe("after a gap", () => {
+  it("asks the page to refetch when a stream reopens, and not on the first open", async () => {
+    const { connectEvents } = await load();
+    const resync = vi.fn();
+    const stop = connectEvents("p1", { ...watch().handlers, onResync: resync });
+    latest().emit("wheel-open");
+    expect(resync).not.toHaveBeenCalled();
+
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    latest().emit("wheel-open");
+    expect(resync).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it("does the same after a relay error, and only once per reopening", async () => {
+    const { connectEvents } = await load();
+    const resync = vi.fn();
+    const stop = connectEvents("p1", { ...watch().handlers, onResync: resync });
+    latest().emit("wheel-open");
+    latest().emit("wheel-error", '{"status":502}');
+    vi.advanceTimersByTime(500);
+    latest().emit("wheel-open");
+    latest().emit("wheel-open");
+    expect(resync).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it("is optional for a caller that holds nothing to refetch", async () => {
+    const { connectEvents } = await load();
+    const stop = connectEvents("p1", watch().handlers);
+    latest().onerror!();
+    vi.advanceTimersByTime(500);
+    expect(() => latest().emit("wheel-open")).not.toThrow();
+    stop();
+  });
+});
+
 describe("a dead session", () => {
   it("ends the session instead of retrying forever", async () => {
     const { connectEvents, auth } = await load();

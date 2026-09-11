@@ -3,12 +3,14 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0.
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   apiTarget,
+  cappedStream,
   declaredLength,
   errorEnvelope,
   forwardedRequestHeaders,
+  isJsonMediaType,
   readCapped,
   readUpTo,
   returnedResponseHeaders,
@@ -19,16 +21,19 @@ import {
 function streamOf(...chunks: number[]): { stream: ReadableStream<Uint8Array>; pulls: () => number; cancelled: () => boolean } {
   let i = 0;
   let cancelled = false;
-  const stream = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      const size = chunks[i++];
-      if (size === undefined) controller.close();
-      else controller.enqueue(new Uint8Array(size).fill(i));
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        const size = chunks[i++];
+        if (size === undefined) controller.close();
+        else controller.enqueue(new Uint8Array(size).fill(i));
+      },
+      cancel() {
+        cancelled = true;
+      },
     },
-    cancel() {
-      cancelled = true;
-    },
-  }, { highWaterMark: 0 });
+    { highWaterMark: 0 },
+  );
   return { stream, pulls: () => i, cancelled: () => cancelled };
 }
 
@@ -36,9 +41,14 @@ describe("which paths reach the API", () => {
   it.each([
     ["/api/wheel/v1/projects", "/v1/projects"],
     ["/api/wheel/v1/projects/instantiate", "/v1/projects/instantiate"],
+    ["/api/wheel/v1/projects/9b1d-44", "/v1/projects/9b1d-44"],
+    ["/api/wheel/v1/projects/p1/start", "/v1/projects/p1/start"],
+    ["/api/wheel/v1/projects/p1/stop", "/v1/projects/p1/stop"],
+    ["/api/wheel/v1/projects/p1/restart", "/v1/projects/p1/restart"],
+    ["/api/wheel/v1/projects/p1/board/apply", "/v1/projects/p1/board/apply"],
     ["/api/wheel/v1/projects/9b1d/engine/v1/board", "/v1/projects/9b1d/engine/v1/board"],
     ["/api/wheel/v1/projects/p1/engine/v1/vault/n1/ANTHROPIC_API_KEY", "/v1/projects/p1/engine/v1/vault/n1/ANTHROPIC_API_KEY"],
-    ["/api/wheel/v1/projects/p1/engine/v1/agents/a1/ws-ticket", "/v1/projects/p1/engine/v1/agents/a1/ws-ticket"],
+    ["/api/wheel/v1/projects/p1/engine/v1/chests/c1/blob", "/v1/projects/p1/engine/v1/chests/c1/blob"],
   ])("forwards %s as %s", (pathname, expected) => {
     expect(upstreamPath(pathname)).toBe(expected);
   });
@@ -48,14 +58,10 @@ describe("which paths reach the API", () => {
     "/api/wheel/v1/auth/login",
     "/api/wheel/v1/auth/signup",
     "/api/wheel/v1/auth/me",
-    // Not the board's business.
     "/api/wheel/healthz",
     "/api/wheel/v1/host/healthz",
     "/api/wheel/v2/projects",
     "/api/wheel/p/p1/hook",
-    // The ticket route stays on the API for other clients; the web never mints one.
-    "/api/wheel/v1/projects/p1/ws-ticket",
-    // Prefix confusion.
     "/api/wheelx/v1/projects",
     "/api/wheel",
     "/api/wheel/",
@@ -64,27 +70,61 @@ describe("which paths reach the API", () => {
     expect(upstreamPath(pathname)).toBeNull();
   });
 
+  // A positive list of the board's routes, so any route not on it is refused however it is spelled.
+  it.each([
+    "/api/wheel/v1/projects/p1/ws-ticket",
+    "/api/wheel/v1/projects/p1/ws%2Dticket",
+    "/api/wheel/v1/projects/p1/ws%2dticket",
+    "/api/wheel/v1/projects/p1/ws-ticket;x",
+    "/api/wheel/v1/projects/p1/WS-TICKET",
+    "/api/wheel/v1/projects/p1/board",
+    "/api/wheel/v1/projects/p1/board/apply/extra",
+    "/api/wheel/v1/projects/p1/start/now",
+    "/api/wheel/v1/projects/p1/engine",
+    "/api/wheel/v1/projects/p1/engine/v1",
+    "/api/wheel/v1/projects/p1/engine/v2/board",
+    "/api/wheel/v1/projects/p1/anything",
+    "/api/wheel/%76%31/projects",
+    "/api/wheel/v1/%70rojects",
+  ])("refuses the route %s", (pathname) => {
+    expect(upstreamPath(pathname)).toBeNull();
+  });
+
   it.each([
     ["a dot-dot segment", "/api/wheel/v1/projects/../auth/login"],
     ["a single dot", "/api/wheel/v1/projects/./x"],
     ["an encoded dot-dot", "/api/wheel/v1/projects/%2e%2e/auth/login"],
-    ["an encoded dot-dot in capitals", "/api/wheel/v1/projects/%2E%2E/auth"],
-    ["an encoded slash", "/api/wheel/v1/projects/p1/a%2F..%2Fb"],
-    ["an encoded backslash", "/api/wheel/v1/projects/p1/a%5Cb"],
-    ["an encoded NUL", "/api/wheel/v1/projects/p1/a%00"],
-    ["an encoded newline", "/api/wheel/v1/projects/p1/a%0d%0aX-Evil:1"],
-    ["a malformed escape", "/api/wheel/v1/projects/p1/%zz"],
-    ["an empty segment", "/api/wheel/v1/projects/p1//x"],
+    ["an encoded dot-dot in mixed case", "/api/wheel/v1/projects/p1/engine/v1/%2E%2e/x"],
+    ["half an encoded dot-dot", "/api/wheel/v1/projects/p1/engine/v1/.%2e/x"],
+    ["a double-encoded dot-dot", "/api/wheel/v1/projects/p1/engine/v1/%252e%252e/%252e%252e/auth"],
+    ["a double-encoded slash", "/api/wheel/v1/projects/p1/engine/v1/a%252fb"],
+    ["an encoded percent", "/api/wheel/v1/projects/p1/engine/v1/100%25"],
+    ["an encoded slash", "/api/wheel/v1/projects/p1/engine/v1/a%2F..%2Fb"],
+    ["an encoded backslash", "/api/wheel/v1/projects/p1/engine/v1/a%5Cb"],
+    ["an encoded NUL", "/api/wheel/v1/projects/p1/engine/v1/a%00"],
+    ["an encoded newline", "/api/wheel/v1/projects/p1/engine/v1/a%0d%0aX-Evil:1"],
+    ["a malformed escape", "/api/wheel/v1/projects/p1/engine/v1/%zz"],
+    ["an empty middle segment", "/api/wheel/v1/projects/p1//engine/v1/board"],
     ["a trailing slash", "/api/wheel/v1/projects/"],
-    ["a raw space", "/api/wheel/v1/projects/p1/a b"],
+    ["a raw space", "/api/wheel/v1/projects/p1/engine/v1/a b"],
     ["a raw backslash", "/api/wheel/v1/projects/p1\\..\\auth"],
+    ["a semicolon", "/api/wheel/v1/projects/p1/engine/v1/board;x"],
   ])("refuses a path with %s", (_label, pathname) => {
     expect(upstreamPath(pathname)).toBeNull();
   });
 
-  it("accepts a segment with ordinary escapes", () => {
-    expect(safeSegment("hello%20world")).toBe(true);
-    expect(safeSegment("a%2Fb")).toBe(false);
+  it.each<[string, boolean]>([
+    ["hello%20world", true],
+    ["ANTHROPIC_API_KEY", true],
+    ["a%2Fb", false],
+    ["%2e", false],
+    ["%2e%2e", false],
+    ["%252e", false],
+    ["%25", false],
+    ["abc%", false],
+    ["", false],
+  ])("safeSegment(%j) is %s", (segment, ok) => {
+    expect(safeSegment(segment)).toBe(ok);
   });
 });
 
@@ -153,7 +193,6 @@ describe("which response headers come back", () => {
     const out = returnedResponseHeaders(
       new Headers({
         "content-type": "application/json",
-        "content-disposition": "attachment; filename=a.txt",
         "retry-after": "30",
         "cache-control": "no-store",
         etag: '"x"',
@@ -169,13 +208,48 @@ describe("which response headers come back", () => {
     );
     expect([...out.keys()].sort()).toEqual([
       "cache-control",
-      "content-disposition",
       "content-type",
       "etag",
       "last-modified",
       "retry-after",
+      "x-content-type-options",
       "x-wheel-mock",
     ]);
+    expect(out.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it.each(["text/html; charset=utf-8", "image/svg+xml", "application/octet-stream", null])(
+    "sandboxes a %s body and downloads it instead of rendering it on this origin",
+    (type) => {
+      const out = returnedResponseHeaders(new Headers(type ? { "content-type": type } : {}));
+      expect(out.get("content-security-policy")).toBe("sandbox");
+      expect(out.get("content-disposition")).toBe("attachment");
+      expect(out.get("x-content-type-options")).toBe("nosniff");
+    },
+  );
+
+  it("keeps an upstream attachment and its filename, and turns inline into attachment", () => {
+    const named = 'attachment; filename="notes.html"';
+    expect(returnedResponseHeaders(new Headers({ "content-type": "text/html", "content-disposition": named })).get("content-disposition")).toBe(named);
+    expect(returnedResponseHeaders(new Headers({ "content-type": "text/html", "content-disposition": "inline" })).get("content-disposition")).toBe("attachment");
+  });
+
+  it.each(["application/json", "application/json; charset=utf-8", "application/problem+json"])("leaves JSON (%s) to be read", (type) => {
+    const out = returnedResponseHeaders(new Headers({ "content-type": type }));
+    expect(out.has("content-security-policy")).toBe(false);
+    expect(out.has("content-disposition")).toBe(false);
+  });
+
+  it.each<[string | null, boolean]>([
+    ["application/json", true],
+    ["Application/JSON; charset=utf-8", true],
+    ["application/vnd.api+json", true],
+    ["text/plain", false],
+    ["application/jsonp", false],
+    ["", false],
+    [null, false],
+  ])("isJsonMediaType(%j) is %s", (type, ok) => {
+    expect(isJsonMediaType(type)).toBe(ok);
   });
 });
 
@@ -189,10 +263,23 @@ describe("body size", () => {
     expect(declaredLength(new Headers(value === null ? {} : { "content-length": value }))).toBe(expected);
   });
 
-  it("returns a body at exactly the limit whole", async () => {
-    const { stream } = streamOf(4, 6);
-    const bytes = await readCapped(stream, 10);
-    expect(bytes?.byteLength).toBe(10);
+  it("streams a body at exactly the limit through untouched", async () => {
+    const { transform, exceeded } = cappedStream(10);
+    const out = await new Response(streamOf(4, 6).stream.pipeThrough(transform)).arrayBuffer();
+    expect(out.byteLength).toBe(10);
+    expect(exceeded()).toBe(false);
+  });
+
+  it("errors a streamed body the moment it passes the limit, without reading the rest", async () => {
+    const source = streamOf(8, 8, 8, 8, 8, 8);
+    const { transform, exceeded } = cappedStream(10);
+    await expect(new Response(source.stream.pipeThrough(transform)).arrayBuffer()).rejects.toThrow();
+    expect(exceeded()).toBe(true);
+    expect(source.pulls()).toBeLessThan(6);
+  });
+
+  it("returns a body it reads itself at exactly the limit whole", async () => {
+    expect((await readCapped(streamOf(4, 6).stream, 10))?.byteLength).toBe(10);
   });
 
   it("refuses one byte more, counted across chunks", async () => {
@@ -224,15 +311,5 @@ describe("errorEnvelope", () => {
     expect(res.status).toBe(413);
     expect(res.headers.get("x-test")).toBe("1");
     expect(await res.json()).toEqual({ error: { code: "payload_too_large", message: "too big" } });
-  });
-});
-
-describe("the instrument", () => {
-  it("really exercises a stream that would keep going", async () => {
-    const endless = new ReadableStream<Uint8Array>({ pull: (c) => c.enqueue(new Uint8Array(1024)) });
-    const spy = vi.fn();
-    const result = await readCapped(endless, 4096).then((r) => (spy(), r));
-    expect(result).toBeNull();
-    expect(spy).toHaveBeenCalledOnce();
   });
 });

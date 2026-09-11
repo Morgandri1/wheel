@@ -6,10 +6,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_API_URL,
+  checkServerConfig,
   devToken,
   parseAuthMode,
   proxyBodyLimit,
   publicOriginSetting,
+  refuseSharedCredentialInProduction,
   serverApiBaseUrl,
   serverAuthMode,
   trustProxy,
@@ -141,6 +143,46 @@ describe("devToken", () => {
   it("never from the NEXT_PUBLIC_ name, which would put it in the bundle", () => {
     env({ WHEEL_DEV_TOKEN: undefined, NEXT_PUBLIC_DEV_TOKEN: "leaked" });
     expect(devToken()).toBeNull();
+  });
+});
+
+// Security review, finding 2: unset WHEEL_AUTH_MODE is mock, and mock (or dev) in production is
+// one shared credential for every visitor.
+describe("a shared-credential mode in production", () => {
+  it.each(["mock", "dev"] as const)("refuses %s unless it is explicitly meant", (mode) => {
+    env({ NODE_ENV: "production", WHEEL_ALLOW_INSECURE_AUTH: undefined });
+    expect(() => refuseSharedCredentialInProduction(mode)).toThrow(/WHEEL_ALLOW_INSECURE_AUTH=1/);
+  });
+
+  it("refuses an unset WHEEL_AUTH_MODE, which is mock", () => {
+    env({ NODE_ENV: "production", WHEEL_AUTH_MODE: undefined, NEXT_PUBLIC_AUTH_MODE: undefined, WHEEL_ALLOW_INSECURE_AUTH: undefined });
+    expect(() => serverAuthMode()).toThrow(/the default when unset/);
+  });
+
+  it.each(["local", "clerk"] as const)("allows %s", (mode) => {
+    env({ NODE_ENV: "production", WHEEL_ALLOW_INSECURE_AUTH: undefined });
+    expect(refuseSharedCredentialInProduction(mode)).toBe(mode);
+  });
+
+  it("allows mock when WHEEL_ALLOW_INSECURE_AUTH=1 says so, and anything outside production", () => {
+    env({ NODE_ENV: "production", WHEEL_ALLOW_INSECURE_AUTH: "1" });
+    expect(refuseSharedCredentialInProduction("mock")).toBe("mock");
+    env({ NODE_ENV: "development", WHEEL_ALLOW_INSECURE_AUTH: undefined });
+    expect(refuseSharedCredentialInProduction("dev")).toBe("dev");
+  });
+});
+
+describe("checkServerConfig", () => {
+  it("names the API, the mode and where the server answers", () => {
+    env({ WHEEL_API_URL: undefined, NEXT_PUBLIC_API_URL: undefined, WHEEL_AUTH_MODE: "local", WHEEL_PUBLIC_ORIGIN: undefined, WHEEL_TRUST_PROXY: undefined, VERCEL: undefined });
+    expect(checkServerConfig()).toBe("API http://127.0.0.1:8080 (WHEEL_API_URL unset) · auth local · public origin: localhost only");
+  });
+
+  it("names a configured public origin, or a trusted proxy", () => {
+    env({ WHEEL_API_URL: "http://wheeld:8080", WHEEL_AUTH_MODE: "local", WHEEL_PUBLIC_ORIGIN: "https://wheel.example.com", WHEEL_TRUST_PROXY: undefined, VERCEL: undefined });
+    expect(checkServerConfig()).toBe("API http://wheeld:8080 · auth local · public origin: https://wheel.example.com");
+    env({ WHEEL_PUBLIC_ORIGIN: undefined, WHEEL_TRUST_PROXY: "1" });
+    expect(checkServerConfig()).toContain("whatever a trusted proxy reports");
   });
 });
 

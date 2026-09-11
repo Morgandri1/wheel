@@ -6,43 +6,42 @@
 
 import { useSyncExternalStore } from "react";
 import { ApiError, setUnauthorizedHandler } from "@/lib/auth";
+import { readUser, type SessionUser } from "@/lib/session-user";
+
+export type { SessionUser };
 
 /**
- * Local email/password sessions (WHEEL_AUTH_MODE=local), as the browser sees them.
- *
- * The API issues an HS256 session JWT; this app's server keeps it in an httpOnly cookie
- * (`src/lib/session-routes.ts`) and attaches it to every API call. The browser holds only WHO is
- * signed in — never the token — so an XSS on this origin cannot carry a session away. Script can
- * still act as the user while the page is open; the CSP is what bounds that.
+ * Local email/password sessions (WHEEL_AUTH_MODE=local), as the browser sees them. The cookie holds
+ * the token; this module holds only WHO is signed in (web/DEPLOY.md, "The trust model").
  *
  * QA's `E2E-local-session-shape` signs in for real and compares the cookie that lands against
  * `SEEDED_SHAPE` in `qa/e2e/session.ts`. Changing the cookie's name or flags turns it red ON
  * PURPOSE: update the fake, do not route around it.
  *
- * SIGNED IN IS NOT THE SAME AS NOT-YET-KNOWN. The snapshot starts `loading` and becomes `anon` only
- * after the server has answered, because a gate that cannot tell those apart bounces every
- * returning user to the sign-in page for one frame.
+ * FOUR STATES, and the differences are the point. `loading` has not asked yet; `anon` means the
+ * server said `{user: null}`; `unreachable` means it could not say, which is retried rather than
+ * treated as a sign-out; `authed` names the user.
  */
-
-export interface SessionUser {
-  id: string;
-  email: string;
-}
 
 export type SessionState =
   | { status: "loading"; user: null }
   | { status: "anon"; user: null }
+  | { status: "unreachable"; user: null }
   | { status: "authed"; user: SessionUser };
 
 const SESSION_ROUTE = "/api/session";
 /** The API is the authority on this; the client check exists so the round trip is not the teacher. */
 export const MIN_PASSWORD_LENGTH = 10;
+const RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
 
 const LOADING: SessionState = { status: "loading", user: null };
 const ANON: SessionState = { status: "anon", user: null };
+const UNREACHABLE: SessionState = { status: "unreachable", user: null };
 
 let state: SessionState = LOADING;
-let hydrating: Promise<void> | null = null;
+let asking: Promise<void> | null = null;
+let retries = 0;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
 const listeners = new Set<() => void>();
 
 function publish(next: SessionState) {
@@ -50,29 +49,57 @@ function publish(next: SessionState) {
   for (const listener of listeners) listener();
 }
 
-function readUser(value: unknown): SessionUser | null {
-  const user = value as { id?: unknown; email?: unknown } | null | undefined;
-  return typeof user?.id === "string" && typeof user.email === "string" ? { id: user.id, email: user.email } : null;
+const unsettled = () => state === LOADING || state === UNREACHABLE;
+
+/** The server's verdict, or null when it gave none. Only an explicit `{user: null}` means signed out. */
+async function askServer(): Promise<SessionState | null> {
+  try {
+    const res = await fetch(SESSION_ROUTE, { cache: "no-store", credentials: "same-origin" });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { user?: unknown } | null;
+    if (body?.user === null) return ANON;
+    const user = readUser(body?.user);
+    return user ? { status: "authed", user } : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
  * Asks the server who the cookie belongs to. Called by the local-mode gate; safe to call again.
- * A sign-in that lands while this is in flight wins: only a still-`loading` state is overwritten.
+ * A sign-in that lands while this is in flight wins.
  */
 export function hydrateSession(): Promise<void> {
-  if (state !== LOADING) return Promise.resolve();
-  hydrating ??= (async () => {
-    let user: SessionUser | null = null;
-    try {
-      const res = await fetch(SESSION_ROUTE, { cache: "no-store", credentials: "same-origin" });
-      if (res.ok) user = readUser(((await res.json()) as { user?: unknown })?.user);
-    } catch {
-      // Unreachable reads as signed out. The sign-in form then says "can't reach" when it is used,
-      // which names the real problem; a gate stuck on "checking" would not.
+  if (!unsettled()) return Promise.resolve();
+  asking ??= askServer().then((verdict) => {
+    asking = null;
+    if (!unsettled()) return;
+    if (verdict) {
+      retries = 0;
+      publish(verdict);
+      return;
     }
-    if (state === LOADING) publish(user ? { status: "authed", user } : ANON);
-  })();
-  return hydrating;
+    publish(UNREACHABLE);
+    scheduleRetry();
+  });
+  return asking;
+}
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  const wait = RETRY_MS[Math.min(retries, RETRY_MS.length - 1)]!;
+  retries += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void hydrateSession();
+  }, wait);
+}
+
+/** The gate's "try now": ask immediately instead of waiting out the backoff. */
+export function retrySession(): Promise<void> {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = null;
+  return hydrateSession();
 }
 
 export function clearSession() {
@@ -179,11 +206,6 @@ export function signIn(email: string, password: string): Promise<SessionUser> {
 
 /**
  * Change the password, then end the local session — because the API has already ended every one.
- *
- * `POST /v1/auth/password` revokes EVERY session including the caller's own (docs/API.md), which is
- * the point: a password changed because it leaked must not leave the leaked sessions alive. The
- * server clears the cookie on success, and the UI follows.
- *
  * The current password is required even though the caller is authenticated, so a hijacked page
  * cannot be turned into a permanent takeover.
  */

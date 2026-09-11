@@ -6,7 +6,7 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse, type NextFetchEvent, type NextMiddleware, type NextRequest } from "next/server";
 import { serverAuthMode } from "@/lib/runtime-config";
 import { buildCsp } from "@/lib/csp";
-import { readSessionToken, signInRedirect } from "@/lib/session-cookie";
+import { liveSessionToken, signInRedirect } from "@/lib/session-cookie";
 
 /**
  * Three jobs: the Content Security Policy on every response, Clerk's route guard in clerk mode,
@@ -17,8 +17,8 @@ import { readSessionToken, signInRedirect } from "@/lib/session-cookie";
  * unauthenticated visitor reaches the board and only finds out when the API 401s. It also has to
  * run on /api/*, or `auth()` in the route handlers has no session to read.
  *
- * The local-mode redirect looks only for the cookie's presence. That is a routing courtesy, not a
- * boundary: a dead cookie still reaches the page, and the API refuses it there.
+ * The local-mode redirect looks only for a cookie shaped like a live session. That is a routing
+ * courtesy, not a boundary: a revoked session still reaches the page, and the API refuses it there.
  */
 const isProtected = createRouteMatcher(["/app", "/app/(.*)"]);
 
@@ -36,7 +36,7 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
   const csp = buildCsp({ nonce, authMode: mode, dev: process.env.NODE_ENV !== "production" });
 
   if (mode === "local") {
-    const target = signInRedirect(req.nextUrl.pathname, readSessionToken(req) !== null);
+    const target = signInRedirect(req.nextUrl.pathname, liveSessionToken(req) !== null);
     if (target) {
       const redirect = NextResponse.redirect(new URL(target, req.url));
       redirect.headers.set("content-security-policy", csp);

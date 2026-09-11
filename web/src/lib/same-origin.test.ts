@@ -4,10 +4,21 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isSameOrigin, publicOrigin, refuseCrossOrigin, requestOrigin, type ProxyTrust, type RequestOrigin } from "./same-origin";
+import {
+  clientAddress,
+  hostAllowed,
+  isLoopbackHost,
+  isSameOrigin,
+  publicOrigin,
+  refuseCrossOrigin,
+  requestOrigin,
+  type ProxyTrust,
+  type RequestOrigin,
+} from "./same-origin";
 
 const NO_TRUST: ProxyTrust = { publicOrigin: null, trustProxy: false };
 const TRUSTED: ProxyTrust = { publicOrigin: null, trustProxy: true };
+const CONFIGURED: ProxyTrust = { publicOrigin: "https://wheel.example.com", trustProxy: false };
 
 beforeEach(() => {
   vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "");
@@ -31,13 +42,22 @@ describe("the public origin", () => {
     );
   });
 
-  it("behind a trusted proxy is what the proxy reports, not the internal address", () => {
+  it("behind a trusted proxy is what the NEAREST proxy reports: the rightmost value", () => {
+    const behind = req("http://0.0.0.0:3000/api/x", {
+      host: "web:3000",
+      "x-forwarded-proto": "http, https",
+      "x-forwarded-host": "spoofed.example, Wheel.Example.com",
+    });
+    expect(publicOrigin(behind, TRUSTED)).toBe("https://wheel.example.com");
+  });
+
+  it("does not let a value a client prepended win", () => {
     const behind = req("http://0.0.0.0:3000/api/x", {
       host: "web:3000",
       "x-forwarded-proto": "https, http",
-      "x-forwarded-host": "Wheel.Example.com, inner",
+      "x-forwarded-host": "wheel.example.com, inner",
     });
-    expect(publicOrigin(behind, TRUSTED)).toBe("https://wheel.example.com");
+    expect(publicOrigin(behind, TRUSTED)).toBe("http://inner");
   });
 
   it("uses the Host a trusted proxy passed through when it sends no X-Forwarded-Host", () => {
@@ -78,6 +98,50 @@ describe("the public origin", () => {
   });
 });
 
+describe("DNS rebinding", () => {
+  it.each<[string, boolean]>([
+    ["localhost:3000", true],
+    ["localhost", true],
+    ["127.0.0.1:3000", true],
+    ["127.9.9.9", true],
+    ["[::1]:3000", true],
+    ["wheel.example.com", false],
+    ["127.0.0.1.evil.example", false],
+    ["localhost.evil.example", false],
+    ["10.0.0.5:3000", false],
+    ["bad host", false],
+  ])("treats Host %j as loopback: %s", (host, loopback) => {
+    expect(isLoopbackHost(host)).toBe(loopback);
+  });
+
+  it("answers only loopback while no public origin is configured and no proxy is trusted", () => {
+    expect(hostAllowed(req("http://localhost:3000/x", { host: "localhost:3000" }), NO_TRUST)).toBe(true);
+    expect(hostAllowed(req("http://rebound.example:3000/x", { host: "rebound.example:3000" }), NO_TRUST)).toBe(false);
+  });
+
+  it("answers any Host once the public origin is configured or a proxy is trusted", () => {
+    const named = req("http://web:3000/x", { host: "web:3000" });
+    expect(hostAllowed(named, CONFIGURED)).toBe(true);
+    expect(hostAllowed(named, TRUSTED)).toBe(true);
+  });
+
+  it("refuses a rebound page's same-origin GET and POST before anything else is considered", async () => {
+    const headers = { host: "rebound.example:3000", origin: "http://rebound.example:3000", "sec-fetch-site": "same-origin" };
+    for (const method of ["GET", "POST"]) {
+      const res = refuseCrossOrigin(req("http://rebound.example:3000/api/wheel/v1/projects", headers, method));
+      expect(res?.status).toBe(403);
+      expect((await res!.json()).error.code).toBe("public_origin_required");
+    }
+  });
+});
+
+describe("the client's address", () => {
+  it("is the rightmost X-Forwarded-For, the one the nearest proxy wrote", () => {
+    expect(clientAddress(req("http://x/", { "x-forwarded-for": "6.6.6.6, 203.0.113.9" }))).toBe("203.0.113.9");
+    expect(clientAddress(req("http://x/", {}))).toBeNull();
+  });
+});
+
 const post: RequestOrigin = {
   method: "POST",
   origin: "https://wheel.example.com",
@@ -105,7 +169,6 @@ describe("which requests may change state", () => {
     ["a sibling subdomain", { origin: "https://evil.wheel.example.com", secFetchSite: "same-site" }],
     ["Sec-Fetch-Site: same-site with no Origin", { origin: null, secFetchSite: "same-site" }],
     ["Sec-Fetch-Site: cross-site, whatever Origin says", { secFetchSite: "cross-site" }],
-    // Origin is the whole answer when present: a DNS-rebound page is "same-origin" to itself.
     ["a mismatched Origin the browser still calls same-origin", { origin: "http://rebound.example", secFetchSite: "same-origin" }],
     ["a public origin nobody can compute", { origin: "file://", publicOrigin: "null" }],
   ])("refuses a POST with %s", (_label, patch) => {
@@ -130,20 +193,17 @@ describe("the three deployments, end to end", () => {
   it("direct http on localhost: the page's own POST passes, another site's does not", () => {
     const own = req("http://localhost:3000/api/session/login", { host: "localhost:3000", origin: "http://localhost:3000" });
     const hostile = req("http://localhost:3000/api/session/login", { host: "localhost:3000", origin: "http://evil.example" });
-    expect(isSameOrigin(requestOrigin(own, NO_TRUST))).toBe(true);
-    expect(isSameOrigin(requestOrigin(hostile, NO_TRUST))).toBe(false);
+    expect(refuseCrossOrigin(own)).toBeNull();
+    expect(refuseCrossOrigin(hostile)?.status).toBe(403);
   });
 
   it("behind a trusted proxy: Origin is compared with the public origin, not the internal host", () => {
-    const behind = {
-      host: "web:3000",
-      "x-forwarded-proto": "https",
-      "x-forwarded-host": "wheel.example.com",
-    };
+    vi.stubEnv("WHEEL_TRUST_PROXY", "1");
+    const behind = { host: "web:3000", "x-forwarded-proto": "https", "x-forwarded-host": "wheel.example.com" };
     const own = req("http://0.0.0.0:3000/api/session/login", { ...behind, origin: "https://wheel.example.com" });
     const internal = req("http://0.0.0.0:3000/api/session/login", { ...behind, origin: "http://web:3000" });
-    expect(isSameOrigin(requestOrigin(own, TRUSTED))).toBe(true);
-    expect(isSameOrigin(requestOrigin(internal, TRUSTED))).toBe(false);
+    expect(refuseCrossOrigin(own)).toBeNull();
+    expect(refuseCrossOrigin(internal)?.status).toBe(403);
   });
 
   it("a forged X-Forwarded-* from an untrusted peer cannot make a foreign Origin match", () => {
@@ -165,6 +225,8 @@ describe("the three deployments, end to end", () => {
 });
 
 describe("refuseCrossOrigin", () => {
+  beforeEach(() => vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "https://wheel.example"));
+
   it("answers 403 in the API's own error shape", async () => {
     const res = refuseCrossOrigin(req("https://wheel.example/api/x", { origin: "https://evil.example", host: "wheel.example" }));
     expect(res?.status).toBe(403);
@@ -176,6 +238,8 @@ describe("refuseCrossOrigin", () => {
   });
 
   it("tells the operator to set WHEEL_PUBLIC_ORIGIN when the browser says same-origin but the origins disagree", () => {
+    vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "");
+    vi.stubEnv("WHEEL_TRUST_PROXY", "1");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     refuseCrossOrigin(
       req("http://0.0.0.0:3000/api/x", { host: "web:3000", origin: "https://wheel.example.com", "sec-fetch-site": "same-origin" }),
