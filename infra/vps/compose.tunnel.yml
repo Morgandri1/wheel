@@ -1,0 +1,32 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# No public listener at all: wheeld and the web app on this server's loopback, reached from your
+# laptop over SSH. Nothing is exposed, and public webhooks (/p/...) do not exist in this mode.
+#
+#   # on the server, with WHEEL_PUBLIC_HOST=localhost:3000 in .env
+#   docker compose -f compose.yml -f compose.tunnel.yml up -d wheeld web
+#   # on your laptop
+#   ssh -N -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 you@server
+#
+# Then the board is http://localhost:3000 and the API (AgentGrid, curl) is http://localhost:8080.
+
+services:
+  wheeld:
+    environment:
+      PUBLIC_BASE_URL: http://localhost:8080
+      WHEEL_TRUSTED_PROXIES: ""
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  web:
+    environment:
+      WHEEL_PUBLIC_ORIGIN: http://localhost:3000
+      WHEEL_TRUST_PROXY: "0"
+    ports:
+      - "127.0.0.1:3000:3000"
+    # A published port needs a network with a gateway; `edge` has none.
+    networks:
+      - edge
+      - egress

@@ -1,0 +1,41 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+#
+# Installed by infra/vps/install.sh. Settings: /etc/wheel/wheeld.env (managed by install.sh) and
+# /etc/wheel/wheeld.local.env (yours; read second, so it wins).
+
+[Unit]
+Description=Wheel daemon: API, sandbox host and per-project engines
+Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wheel
+Group=wheel
+EnvironmentFile=/etc/wheel/wheeld.env
+EnvironmentFile=-/etc/wheel/wheeld.local.env
+ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind 127.0.0.1:8080
+# SIGTERM goes to wheeld alone: it stops every engine and each agent's whole process group itself.
+# Whatever is left after the timeout is killed with the cgroup.
+KillMode=mixed
+TimeoutStopSec=30
+# Also the auto-update hook: WHEEL_UPDATE_RESTART=exit swaps the binary and exits 75.
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/wheel
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

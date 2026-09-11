@@ -1,0 +1,108 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Wheel on one server. Caddy is the only thing with a published port; wheeld and the web app are
+# reachable only across the internal `edge` network. Configure with infra/vps/.env (start from
+# .env.example) and read infra/vps/README.md first.
+
+name: wheel
+
+services:
+  preflight:
+    image: caddy:2
+    network_mode: none
+    restart: "no"
+    entrypoint: ["/bin/sh", "/preflight.sh"]
+    volumes:
+      - ./preflight.sh:/preflight.sh:ro
+    environment:
+      WHEEL_DOMAIN: ${WHEEL_DOMAIN:-}
+      WHEEL_PUBLIC_HOST: ${WHEEL_PUBLIC_HOST:-}
+      WHEEL_TLS_INTERNAL: ${WHEEL_TLS_INTERNAL:-}
+      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}
+
+  wheeld:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.wheeld
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
+    environment:
+      PUBLIC_BASE_URL: ${WHEEL_DOMAIN:+https://${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+http://${WHEEL_PUBLIC_HOST}}
+      WHEEL_ALLOWED_HOSTS: wheeld${WHEEL_DOMAIN:+,${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+,${WHEEL_PUBLIC_HOST}}
+      WHEEL_TRUSTED_PROXIES: ${WHEEL_CADDY_IP:-10.231.8.10}
+      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - wheel-data:/data
+    networks:
+      - edge
+      - egress
+
+  web:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
+      wheeld:
+        condition: service_healthy
+    environment:
+      WHEEL_API_URL: http://wheeld:8080
+      WHEEL_AUTH_MODE: local
+      # Authoritative for the session cookie's Secure flag and the CSRF origin check; it wins over
+      # any forwarded header. Trusting the proxy is safe only because Caddy is the web server's only
+      # peer and overwrites X-Forwarded-Proto/Host.
+      WHEEL_PUBLIC_ORIGIN: ${WHEEL_DOMAIN:+https://${WHEEL_DOMAIN}}${WHEEL_PUBLIC_HOST:+http://${WHEEL_PUBLIC_HOST}}
+      WHEEL_TRUST_PROXY: "1"
+    networks:
+      - edge
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
+      wheeld:
+        condition: service_started
+      web:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      CADDY_SITE: ${WHEEL_DOMAIN:-:80}
+      CADDY_EMAIL_OPTION: ${ACME_EMAIL:+email ${ACME_EMAIL}}
+      CADDY_TLS_OPTION: ${WHEEL_TLS_INTERNAL:+tls internal}
+      WHEEL_SIGNUP: ${WHEEL_SIGNUP:-closed}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      public: {}
+      edge:
+        ipv4_address: ${WHEEL_CADDY_IP:-10.231.8.10}
+
+networks:
+  public: {}
+  # No gateway: nothing on this network can reach the internet or be published through it.
+  edge:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${WHEEL_EDGE_SUBNET:-10.231.8.0/24}
+  egress: {}
+
+volumes:
+  wheel-data:
+  caddy-data:
+  caddy-config:
