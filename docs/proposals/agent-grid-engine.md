@@ -191,7 +191,8 @@ Each one was confirmed by reading the code path, not taken from the plan:
   writer.
 - **Rationale:** AgentGrid's interrupt maps to an engine operation. A signal would kill the session.
 - **Anchors:**
-  - `docs/PROTOCOL.md:221` lists interrupt as M2, and it is not routed (`api/mod.rs`, `router`).
+  - The interrupt row in PROTOCOL §2 ("Agents") lists it as M2, and it is not routed (`api/mod.rs`,
+    `router`).
   - `supervisor/mod.rs:129-148`: `Running` holds the `ChildStdin`, and `in_flight` holds one message.
   - `pump_queue` (`:1192`) is the only stdin writer (§3c#12). Steering must stay inside it, or the
     single-writer rule is gone.
@@ -289,7 +290,8 @@ All six were accepted as recommended. The reviewer's amendments were adopted wit
 - **R2: approved, as a boot failure, not a warning. Tightened three ways (§1):**
   - "loopback" means the parsed IP (127.0.0.0/8, `::1`), and hostnames, `localhost`, `0.0.0.0` and
     `[::]` are refused;
-  - check 4 is a control: the API or host proxy refuses to serve an engine reporting `desktop`;
+  - check 4 is a control: the API and host proxies refuse to serve an engine reporting `desktop`.
+    Every hosted request passes through the host proxy; the API check is the second layer;
   - Desktop sits behind a cargo feature the hosted image never enables, verified by the image-contents
     gate, so there it is impossible rather than refused.
 - **R3: keep the contract.** The governing clause is ARCHITECTURE §3 ("Stopped agents queue; queue
@@ -304,4 +306,4 @@ All six were accepted as recommended. The reviewer's amendments were adopted wit
 - **R6: agreed.** `GET /v1/engine` and its additive-only rule are now in ARCHITECTURE §4, in the same
   PR as this proposal.
 
-R2's cargo feature and R4's checks are Phase 1 work. Neither is built by this PR.
+None of R2's or R4's controls is built by this PR.
