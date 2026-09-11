@@ -87,8 +87,19 @@ services:
       - /tmp:size=16m,mode=1777
     ports:
       - "127.0.0.1:${WHEEL_WEB_PORT:-3000}:3000"
+    # Also on egress, matching wheeld, or its own loopback publish above does not work at all:
+    # measured directly (a minimal nginx container, no compose, no other setting) that Docker
+    # accepts a published port on a container whose ONLY network is `internal: true` but the
+    # forwarding never actually functions — connections to the host port fail outright. Attaching
+    # a second, non-internal network is what makes port publishing work at the kernel level; it is
+    # not optional here, in either mode. Residual, stated rather than hidden: this container's
+    # network namespace has a path outward through egress, the same class of exposure an agent's
+    # own container already has. The web app's own code makes exactly one outbound call —
+    # WHEEL_API_URL, i.e. wheeld — and has no other server-side fetch capability; this is not a
+    # sandbox boundary claim, only a note on what would have to be true for it to matter.
     networks:
       - edge
+      - egress
 
   caddy:
     image: caddy:2
