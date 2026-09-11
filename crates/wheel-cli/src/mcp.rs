@@ -105,6 +105,7 @@ fn call_tool(engine: &Engine, id: Value, req: &Value) -> Value {
         // which is exactly what isError is for. A protocol error would look to
         // the harness like the server is broken.
         Ok(r) if r.status >= 300 => tool_error(id, &reply_message(&r)),
+        Ok(r) if matches!(name, "ask" | "sent") => awaited_result(id, &r.body),
         Ok(r) => result(
             id,
             json!({
@@ -174,12 +175,61 @@ fn route_for(name: &str, args: &Value) -> Option<Route> {
             })
         }
         "msg" => Route::Post("/v1/cli/msg".into(), args.clone()),
+        "ask" => Route::Post(
+            "/v1/cli/msg".into(),
+            json!({
+                "to": args.get("to"),
+                "body": args.get("body"),
+                "await_secs": args
+                    .get("timeout_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(wheel_core::DEFAULT_AWAIT_SECS),
+            }),
+        ),
+        "sent" => {
+            let mut path = format!("/v1/cli/sent?id={}", crate::urlencode(&s("id")));
+            if let Some(wait) = args.get("wait_secs").and_then(Value::as_u64) {
+                path.push_str(&format!("&wait={wait}"));
+            }
+            Route::Get(path)
+        }
         "write" => Route::Post("/v1/cli/write".into(), args.clone()),
         "rm" => Route::Post("/v1/cli/rm".into(), args.clone()),
         "query" => Route::Post("/v1/cli/query".into(), args.clone()),
         "ctx_clear" => Route::Post("/v1/cli/ctx/clear".into(), json!({})),
         _ => return None,
     })
+}
+
+/// An awaited message as a tool result: the recipient's final text when it was
+/// consumed, and a tool error saying why otherwise, so a model never mistakes
+/// "no answer yet" for an empty answer.
+fn awaited_result(id: Value, v: &Value) -> Value {
+    let mid = v["id"].as_str().unwrap_or("?");
+    match v["outcome"].as_str().unwrap_or_default() {
+        "consumed" => result(
+            id,
+            json!({
+                "content": [{"type": "text", "text": v["result"].as_str().unwrap_or_default()}],
+                "isError": false,
+            }),
+        ),
+        "timeout" | "pending" => tool_error(
+            id,
+            &format!(
+                "message {mid} is still {}: no answer yet. Call `sent` with this id later to \
+                 collect it.",
+                v["state"].as_str().unwrap_or("on its way")
+            ),
+        ),
+        other => tool_error(
+            id,
+            &format!(
+                "message {mid} {other}: {}",
+                v["error"].as_str().unwrap_or("no detail")
+            ),
+        ),
+    }
 }
 
 /// The engine's own message, which is written to be read by whoever hit the
@@ -312,6 +362,42 @@ mod tests {
             assert!(body.is_some(), "{tool} must POST its arguments");
         }
         assert_eq!(route("ctx_clear", json!({})).0, "/v1/cli/ctx/clear");
+    }
+
+    /// `ask` is `msg` with a wait: the same route, so there is one
+    /// implementation of sending, and `sent` reads the outcome back.
+    #[test]
+    fn ask_and_sent_address_the_routes_that_implement_them() {
+        let (path, body) = route("ask", json!({"to": "builder", "body": "ship it"}));
+        assert_eq!(path, "/v1/cli/msg");
+        let body = body.unwrap();
+        assert_eq!(body["to"], "builder");
+        assert_eq!(body["body"], "ship it");
+        assert_eq!(body["await_secs"], wheel_core::DEFAULT_AWAIT_SECS);
+        let (_, body) = route("ask", json!({"to": "b", "body": "x", "timeout_secs": 30}));
+        assert_eq!(body.unwrap()["await_secs"], 30);
+
+        assert_eq!(route("sent", json!({"id": "m1"})).0, "/v1/cli/sent?id=m1");
+        assert_eq!(
+            route("sent", json!({"id": "m1", "wait_secs": 9})).0,
+            "/v1/cli/sent?id=m1&wait=9"
+        );
+    }
+
+    #[test]
+    fn an_awaited_answer_is_the_text_and_anything_else_is_a_tool_error() {
+        let done = awaited_result(json!(1), &json!({"id": "m", "outcome": "consumed", "result": "42"}));
+        assert_eq!(done["result"]["isError"], false);
+        assert_eq!(done["result"]["content"][0]["text"], "42");
+
+        let waiting = awaited_result(json!(1), &json!({"id": "m", "outcome": "timeout", "state": "delivered"}));
+        assert_eq!(waiting["result"]["isError"], true);
+        let text = waiting["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("still delivered") && text.contains("sent"), "{text}");
+
+        let failed = awaited_result(json!(1), &json!({"id": "m", "outcome": "error", "error": "boom"}));
+        assert_eq!(failed["result"]["isError"], true);
+        assert!(failed["result"]["content"][0]["text"].as_str().unwrap().contains("boom"));
     }
 
     /// §3d rule 7: `<tool>__<op>` is a tool-node operation, and the split is

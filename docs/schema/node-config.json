@@ -190,6 +190,14 @@
           "default": false,
           "type": "boolean"
         },
+        "fallback_vault": {
+          "description": "A vault this agent already has a `read` wire to, whose credential it runs on while its own credential's usage window is closed. Refused at config time if the wire is missing, and re-checked at every spawn.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "harness": {
           "$ref": "#/definitions/Harness"
         },

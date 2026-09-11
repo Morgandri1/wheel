@@ -227,6 +227,14 @@
           "default": false,
           "type": "boolean"
         },
+        "fallback_vault": {
+          "description": "A vault this agent already has a `read` wire to, whose credential it runs on while its own credential's usage window is closed. Refused at config time if the wire is missing, and re-checked at every spawn.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
         "harness": {
           "$ref": "#/definitions/Harness"
         },
@@ -315,6 +323,13 @@
           "type": "string",
           "enum": [
             "budget_exhausted"
+          ]
+        },
+        {
+          "description": "The harness reported its usage window closed. The in-flight message was requeued, the process stopped with its session kept, and the engine resumes delivery on its own at `resume_at`. Waiting, not failing.",
+          "type": "string",
+          "enum": [
+            "rate_limited"
           ]
         },
         {
@@ -715,10 +730,21 @@
           ],
           "properties": {
             "budget_status": {
-              "description": "How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell \"no budget\" from \"nothing computed\".",
+              "description": "How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell \"no budget\" from \"nothing computed\".\n\nThe ceiling the BOARD sets. `quota` below is the one the ACCOUNT sets, and an agent can be well inside one and stopped by the other.",
               "anyOf": [
                 {
                   "$ref": "#/definitions/BudgetStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fallback_until": {
+              "description": "Spawns use the agent's `fallback_vault` credential until this moment, because the primary credential's window is closed until then.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Timestamp"
                 },
                 {
                   "type": "null"
@@ -761,6 +787,39 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "quota": {
+              "description": "The last usage window the harness reported, whatever its status.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/QuotaWindow"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resets_at": {
+              "description": "While `rate_limited`: when the harness said the window resets. `None` means it did not say, and `resume_at` is a backoff instead.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Timestamp"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resume_at": {
+              "description": "While `rate_limited`: when the engine will resume delivery by itself.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Timestamp"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "session_id": {
               "description": "The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.",
@@ -816,6 +875,48 @@
         }
       },
       "additionalProperties": false
+    },
+    "QuotaWindow": {
+      "description": "A usage window as the harness reported it (`rate_limit_event`).",
+      "type": "object",
+      "required": [
+        "observed_at",
+        "status"
+      ],
+      "properties": {
+        "observed_at": {
+          "$ref": "#/definitions/Timestamp"
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "`allowed`, `allowed_warning`, `rejected`, or whatever the harness sent.",
+          "type": "string"
+        },
+        "utilization": {
+          "description": "0.0-1.0 of the window consumed.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "window": {
+          "description": "Which window, e.g. `five_hour` or `seven_day`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "ResponseMode": {
       "description": "What an endpoint returns to the HTTP caller.",

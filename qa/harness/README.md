@@ -138,6 +138,12 @@ image or restart the container to test an error path. The fake strips them from 
 | `<<FAKE:GARBAGE>>` | emit one **non-JSON** line on stdout | **engine must not crash or drop the stream** |
 | `<<FAKE:NOISE>>` | emit `rate_limit_event` + `system/thinking_tokens` | **engine must ignore unknown event types** |
 | `<<FAKE:TOOL=cmd>>` | emit a `tool_use` block + `tool_result` turn | engine renders tool calls in the log |
+| `<<FAKE:LIMIT=S>>` | usage window closed: a `rate_limit_event` `{status:"rejected", resetsAt: now+S}`, then an `is_error` result whose text carries no reset | engine parks `rate_limited` at the EVENT's reset |
+| `<<FAKE:LIMIT_TEXT=S>>` | the same, with no event: the result text is `Claude AI usage limit reached\|<now+S>` | engine reads the reset from the text |
+
+A directive limits ONE turn. A real window is account state, and the engine redelivers the same body after the
+reset, so the window that closes and reopens is steered by config instead (§6): `limit_until`, optionally scoped
+to a credential with `limit_when_env`.
 
 `GARBAGE` and `NOISE` are the two I care about most: the real CLI emits event types not in
 `PROTOCOL.md` (I saw `rate_limit_event` and `system/thinking_tokens` from the real binary today),
@@ -170,6 +176,9 @@ say so instead of quietly passing.
 | `WHEEL_FAKE_AUTH=needs_auth` | exit 1 with `Invalid API key · Please run /login` on stderr — drives the `needs_auth` state |
 | `WHEEL_FAKE_STRICT_AUTH=1` | require `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` to be set, else `needs_auth` |
 | `WHEEL_FAKE_TRANSCRIPT=/path` | append every raw stdin line to a file — QA reads it to assert **exactly** what the engine wrote to the child |
+| `WHEEL_FAKE_LIMIT_UNTIL=<unix secs>` / `limit_until` | every turn before that moment ends on a closed usage window (as `LIMIT`, reset = that moment) |
+| `WHEEL_FAKE_LIMIT_WHEN_ENV=A,B` / `limit_when_env` (list) | only while one of those env vars is set in the child — one account closed, its fallback open |
+| `WHEEL_FAKE_LIMIT_STYLE=event\|text` / `limit_style` | which of the two shapes above `limit_until` uses (default `event`) |
 
 `WHEEL_FAKE_TRANSCRIPT` is the other half of injection testing: it captures the engine's stdin
 framing verbatim, independent of what the fake chooses to reply.

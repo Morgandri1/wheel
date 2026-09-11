@@ -127,3 +127,44 @@ pub trait Harness: Send + Sync {
     /// container as needing auth forever.
     fn classify_startup_failure(&self, code: Option<i32>, stderr: &str) -> StartupFailure;
 }
+
+/// `qa/harness/fake-claude`, driven with the real Claude argv and parser.
+///
+/// The fake speaks the CLI's stream-json byte for byte, so the engine under
+/// test runs its real parsing and supervision paths. The engine clears the
+/// child's environment (F015), so the fake is steered by the one variable
+/// added here: the path of its config file.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::{claude::ClaudeDriver, Harness, HarnessEvent, SpawnSpec, StartupFailure};
+    use std::{ffi::OsString, path::PathBuf};
+
+    pub(crate) const PROGRAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
+
+    pub(crate) struct FakeClaude {
+        pub config: PathBuf,
+    }
+
+    impl Harness for FakeClaude {
+        fn program(&self) -> &str {
+            PROGRAM
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<OsString> {
+            ClaudeDriver.argv(spec)
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            let mut env = ClaudeDriver.env(spec);
+            env.push(("WHEEL_FAKE_CONFIG".into(), self.config.display().to_string()));
+            env
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            ClaudeDriver.encode_turn(envelope)
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            ClaudeDriver.parse_line(line)
+        }
+        fn classify_startup_failure(&self, code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(code, stderr)
+        }
+    }
+}

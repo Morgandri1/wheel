@@ -9,7 +9,7 @@
 The fake harness is test infrastructure: if it lies, every integration test that
 depends on it lies too. So it gets tested like production code.
 """
-import json, os, hashlib, subprocess, sys, tempfile
+import json, os, hashlib, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLAUDE = os.path.join(HERE, "fake-claude")
@@ -138,6 +138,35 @@ def t_directives():
               for b in e["message"]["content"]))
     check("directives stripped from reply",
           "<<FAKE:" not in events(run(SJ, turn("visible <<FAKE:NOISE>>")).stdout)[-1]["result"])
+
+def t_usage_limit():
+    evs = events(run(SJ, turn("x <<FAKE:LIMIT=120>>")).stdout)
+    rl = [e for e in evs if e["type"] == "rate_limit_event"]
+    check("LIMIT emits a rejected rate_limit_event with a future reset",
+          rl and rl[0]["rate_limit_info"]["status"] == "rejected"
+          and rl[0]["rate_limit_info"]["resetsAt"] > time.time()
+          and rl[0]["session_id"] == evs[0]["session_id"], str(rl))
+    check("LIMIT ends the turn with an is_error result and no reply",
+          evs[-1]["type"] == "result" and evs[-1]["is_error"] is True
+          and not any(e["type"] == "assistant" for e in evs))
+    check("LIMIT's text carries no reset, so only the event can supply it",
+          "|" not in evs[-1]["result"], evs[-1]["result"])
+    evs = events(run(SJ, turn("x <<FAKE:LIMIT_TEXT=120>>")).stdout)
+    check("LIMIT_TEXT emits no event", not any(e["type"] == "rate_limit_event" for e in evs))
+    check("LIMIT_TEXT names the reset after a pipe",
+          evs[-1]["result"].startswith("Claude AI usage limit reached|")
+          and int(evs[-1]["result"].split("|")[1]) > time.time(), evs[-1]["result"])
+    closed = str(int(time.time()) + 60)
+    last = lambda env: events(run(SJ, turn("a"), env=env).stdout)[-1]
+    check("limit_until limits while the window is closed",
+          last({"WHEEL_FAKE_LIMIT_UNTIL": closed})["is_error"] is True)
+    check("limit_until is over once the window reopens",
+          last({"WHEEL_FAKE_LIMIT_UNTIL": str(int(time.time()) - 1)})["is_error"] is False)
+    check("limit_when_env leaves another credential's turns alone",
+          last({"WHEEL_FAKE_LIMIT_UNTIL": closed, "WHEEL_FAKE_LIMIT_WHEN_ENV": "FAKE_CRED_A"})["is_error"] is False)
+    check("limit_when_env limits the credential it names",
+          last({"WHEEL_FAKE_LIMIT_UNTIL": closed, "WHEEL_FAKE_LIMIT_WHEN_ENV": "FAKE_CRED_A",
+                "FAKE_CRED_A": "x"})["is_error"] is True)
 
 def t_auth():
     p = run(SJ, turn("x"), env={"WHEEL_FAKE_AUTH": "needs_auth"})

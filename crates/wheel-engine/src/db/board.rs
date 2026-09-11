@@ -34,6 +34,9 @@ pub enum BoardError {
     /// A table node's storage could not follow it. Its own message says why.
     #[error("{0}")]
     Storage(String),
+    /// An agent's `fallback_vault` does not name a vault it reads.
+    #[error("{0}")]
+    Fallback(String),
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -89,6 +92,9 @@ pub fn create_with(
     allow_hosts: &[String],
 ) -> Result<(), BoardError> {
     wheel_core::validate_config_with(&node.config, allow_hosts)?;
+    // A node being created has no wires yet, so a fallback set here is always
+    // refused: wire the vault first, then set it.
+    check_fallback_vault(conn, node)?;
     let (ty, cfg) = split_config(&node.config);
     let now = Timestamp::now().to_rfc3339();
 
@@ -487,6 +493,13 @@ pub fn update_with(
     // nothing on the board addressing them -- and then the next table node to
     // claim that name inherits a stranger's data.
     let was = get(conn, node.id).ok().flatten();
+    // Only when it CHANGES. A wire removed later leaves a dangling fallback
+    // that spawn ignores; refusing every unrelated edit (a drag, a rename)
+    // until it is repaired would punish the operator for the spawn check.
+    let fallback_of = |n: &Node| n.config.as_agent().and_then(|a| a.fallback_vault);
+    if was.as_ref().and_then(fallback_of) != fallback_of(node) {
+        check_fallback_vault(conn, node)?;
+    }
     let was_table = was
         .as_ref()
         .filter(|n| matches!(n.config, NodeConfig::Table(_)))
@@ -557,12 +570,16 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
 
     let s = conn
         .prepare(
-            "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd
+            "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd,
+                    resets_at, resume_at, quota, fallback_until
              FROM agent_state WHERE node_id = ?1",
         )?
         .query_row(params![node_id.to_string()], |r| {
             let status: String = r.get(0)?;
-            let last_activity: Option<String> = r.get(2)?;
+            let at = |i: usize| -> rusqlite::Result<Option<Timestamp>> {
+                Ok(r.get::<_, Option<String>>(i)?
+                    .and_then(|t| Timestamp::parse_rfc3339(&t).ok()))
+            };
             let spend = wheel_core::Spend {
                 turns: r.get::<_, i64>(5)? as u64,
                 usd: r.get(6)?,
@@ -571,17 +588,87 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
                 status: serde_json::from_value(serde_json::Value::String(status))
                     .unwrap_or_default(),
                 session_id: r.get(1)?,
-                last_activity: last_activity
-                    .and_then(|t| wheel_core::Timestamp::parse_rfc3339(&t).ok()),
+                last_activity: at(2)?,
                 last_error: r.get(3)?,
                 hosted_on: r.get(4)?,
                 queued_messages: queued as u32,
                 budget_status: wheel_core::BudgetStatus::compute(spend, budget),
                 spend: Some(spend),
+                resets_at: at(7)?,
+                resume_at: at(8)?,
+                quota: r
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|q| serde_json::from_str(&q).ok()),
+                fallback_until: at(10)?,
             })
         })
         .optional()?;
     Ok(s.unwrap_or_default())
+}
+
+/// Park an agent on a closed usage window: status, the harness's reset time
+/// and the engine's own resume time, written together.
+pub fn set_rate_limited(
+    conn: &Connection,
+    node: Uuid,
+    resets_at: Option<Timestamp>,
+    resume_at: Timestamp,
+    reason: &str,
+) {
+    set_status(conn, node, wheel_core::AgentStatus::RateLimited, Some(reason));
+    let _ = conn.execute(
+        "UPDATE agent_state SET resets_at = ?2, resume_at = ?3 WHERE node_id = ?1",
+        params![
+            node.to_string(),
+            resets_at.map(|t| t.to_rfc3339()),
+            resume_at.to_rfc3339()
+        ],
+    );
+}
+
+/// Record the last usage window the harness reported.
+pub fn set_quota(conn: &Connection, node: Uuid, quota: &wheel_core::QuotaWindow) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET quota = ?2 WHERE node_id = ?1",
+        params![
+            node.to_string(),
+            serde_json::to_string(quota).unwrap_or_default()
+        ],
+    );
+}
+
+pub fn set_fallback_until(conn: &Connection, node: Uuid, until: Option<Timestamp>) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET fallback_until = ?2 WHERE node_id = ?1",
+        params![node.to_string(), until.map(|t| t.to_rfc3339())],
+    );
+}
+
+/// Every agent parked on a closed usage window, with when it is due back.
+pub fn rate_limited_agents(conn: &Connection) -> Result<Vec<(Uuid, Option<Timestamp>)>> {
+    let mut stmt =
+        conn.prepare("SELECT node_id, resume_at FROM agent_state WHERE status = 'rate_limited'")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    Ok(rows
+        .flatten()
+        .filter_map(|(id, at)| {
+            Some((
+                id.parse().ok()?,
+                at.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),
+            ))
+        })
+        .collect())
+}
+
+/// An agent's `fallback_vault` must name a vault it already reads, so the
+/// fallback can never reach a credential the agent could not already reach.
+fn check_fallback_vault(conn: &Connection, node: &Node) -> Result<(), BoardError> {
+    let Some(vault) = node.config.as_agent().and_then(|a| a.fallback_vault) else {
+        return Ok(());
+    };
+    crate::vault::check_fallback(conn, node.id, vault).map_err(BoardError::Fallback)
 }
 
 /// Set an agent's status directly. Used by auth to move a node out of
@@ -596,7 +683,8 @@ pub fn set_status(
     let _ = conn.execute(
         "INSERT INTO agent_state (node_id,status,last_activity,last_error)
          VALUES (?1,?2,?3,?4)
-         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4,
+             resets_at=NULL, resume_at=NULL",
         params![
             node.to_string(),
             status.as_str(),
@@ -622,6 +710,85 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
         params![from.to_string(), to.to_string(), ty.as_str()],
     )?;
     Ok(n > 0)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use wheel_core::{AgentConfig, CtxConfig, VaultConfig};
+
+    fn node(name: &str, config: NodeConfig) -> Node {
+        Node::new(Uuid::new_v4(), name.parse().unwrap(), Position::default(), config)
+    }
+
+    fn with_fallback(agent: &Node, fallback: Option<Uuid>) -> Node {
+        let mut n = agent.clone();
+        if let NodeConfig::Agent(a) = &mut n.config {
+            a.fallback_vault = fallback;
+        }
+        n
+    }
+
+    fn refusal(r: Result<(), BoardError>) -> String {
+        match r {
+            Err(BoardError::Fallback(m)) => m,
+            other => panic!("expected a fallback refusal, got {other:?}"),
+        }
+    }
+
+    /// The property the whole fallback rests on: it can never reach a
+    /// credential the agent could not already `wheel secret get`.
+    #[test]
+    fn a_fallback_vault_must_be_a_vault_the_agent_already_reads() {
+        let c = crate::db::open_memory().unwrap();
+        let standby = node(
+            "standby",
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["ANTHROPIC_API_KEY".into()],
+            }),
+        );
+        let notes = node(
+            "notes",
+            NodeConfig::Ctx(CtxConfig {
+                markdown: String::new(),
+            }),
+        );
+        create(&c, &standby).unwrap();
+        create(&c, &notes).unwrap();
+
+        let agent = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let born = with_fallback(&agent, Some(standby.id));
+        assert!(
+            refusal(create(&c, &born)).contains("read wire"),
+            "a node being created has no wires, so a fallback there is always refused"
+        );
+        create(&c, &agent).unwrap();
+
+        assert!(refusal(update(&c, &with_fallback(&agent, Some(Uuid::new_v4()))))
+            .contains("not a node"));
+        assert!(refusal(update(&c, &with_fallback(&agent, Some(notes.id)))).contains("not a vault"));
+        assert!(
+            refusal(update(&c, &with_fallback(&agent, Some(standby.id)))).contains("read wire"),
+            "a vault the agent cannot read is exactly the widening this refuses"
+        );
+
+        add_wire(&c, agent.id, standby.id, WireType::Read, None).unwrap();
+        let chosen = with_fallback(&agent, Some(standby.id));
+        update(&c, &chosen).expect("a vault the agent reads is a valid fallback");
+
+        // Removed afterwards: spawn ignores it, and an unrelated edit is not
+        // held hostage to the dangling reference.
+        remove_wire(&c, agent.id, standby.id, WireType::Read).unwrap();
+        let mut edited = chosen.clone();
+        if let NodeConfig::Agent(a) = &mut edited.config {
+            a.system_prompt = "still editable".into();
+        }
+        update(&c, &edited).expect("an edit that leaves the fallback alone is not re-judged");
+
+        // ...but choosing it again is judged again.
+        update(&c, &with_fallback(&edited, None)).unwrap();
+        assert!(refusal(update(&c, &with_fallback(&edited, Some(standby.id)))).contains("read wire"));
+    }
 }
 
 #[cfg(test)]

@@ -406,6 +406,7 @@ fn all_agent_statuses_serialize_as_the_contract_spells_them() {
         (AgentStatus::Idle, "idle"),
         (AgentStatus::Parked, "parked"),
         (AgentStatus::BudgetExhausted, "budget_exhausted"),
+        (AgentStatus::RateLimited, "rate_limited"),
         (AgentStatus::Error, "error"),
     ];
     for (s, want) in expect {

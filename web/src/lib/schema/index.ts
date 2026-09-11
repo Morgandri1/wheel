@@ -114,6 +114,7 @@ export const AGENT_STATUSES = [
   "idle",
   "parked",
   "budget_exhausted",
+  "rate_limited",
   "error",
 ] as const;
 

@@ -647,6 +647,54 @@ def run_shell(b64):
         p.returncode, p.stdout[-6000:], p.stderr[-6000:])
 
 
+def closed_window(d):
+    """The usage window this turn runs into, as (resets_at, style), or None.
+
+    A window is ACCOUNT state, not message state: the engine redelivers the same
+    body after the reset, so a directive in the body alone could never model a
+    window that reopens. `limit_until` does -- turns are limited while the clock
+    is before it -- and `limit_when_env` scopes it to a credential, so one board
+    can have a closed primary account and an open fallback.
+    """
+    if "LIMIT" in d:
+        return (int(time.time()) + int(d["LIMIT"] or 3600), "event")
+    if "LIMIT_TEXT" in d:
+        return (int(time.time()) + int(d["LIMIT_TEXT"] or 3600), "text")
+    until = fake_opt("WHEEL_FAKE_LIMIT_UNTIL", "limit_until")
+    if until is None or time.time() >= int(until):
+        return None
+    when = fake_opt("WHEEL_FAKE_LIMIT_WHEN_ENV", "limit_when_env")
+    if when:
+        names = when if isinstance(when, list) else str(when).split(",")
+        if not any(os.environ.get(n) for n in names):
+            return None
+    return (int(until), fake_opt("WHEEL_FAKE_LIMIT_STYLE", "limit_style") or "event")
+
+
+def emit_limit(limit, turn, session_id, stream):
+    """End the turn the way the real CLI does when the window is closed.
+
+    `event` style: a `rate_limit_event` with status `rejected` and `resetsAt`, then
+    an is_error result whose text carries NO reset -- so an engine that parks at
+    the right time must have read the event. `text` style: no event, and the
+    reset only in the `|<unix seconds>` suffix of the text.
+    """
+    resets_at, style = limit
+    if stream and style == "event":
+        emit({"type": "rate_limit_event", "session_id": session_id, "uuid": str(uuid.uuid4()),
+              "rate_limit_info": {"status": "rejected", "resetsAt": resets_at,
+                                  "rateLimitType": "five_hour", "utilization": 1.0}})
+    text = ("5-hour limit reached ∙ resets soon" if style == "event"
+            else "Claude AI usage limit reached|%d" % resets_at)
+    result = {"type": "result", "subtype": "success", "is_error": True, "result": text,
+              "session_id": session_id, "num_turns": turn, "duration_ms": 1, "duration_api_ms": 1,
+              "total_cost_usd": 0.0, "permission_denials": [], "uuid": str(uuid.uuid4())}
+    if stream:
+        emit(result)
+    else:
+        sys.stdout.write(text + "\n"); sys.stdout.flush()
+
+
 def respond(user_text, turn, session_id, model, stream):
     rejected = token_rejection()
     if rejected:
@@ -685,6 +733,11 @@ def respond(user_text, turn, session_id, model, stream):
     if "GARBAGE" in d:
         # Emit a non-JSON line: the engine MUST NOT die on this (ENG-log-garbage).
         sys.stdout.write("this is not json\n"); sys.stdout.flush()
+
+    limit = closed_window(d)
+    if limit is not None:
+        emit_limit(limit, turn, session_id, stream)
+        return
 
     # Deterministic reply that ECHOES what we were given.
     if "REPLY" in d:

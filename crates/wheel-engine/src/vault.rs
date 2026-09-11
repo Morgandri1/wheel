@@ -146,7 +146,12 @@ pub fn credential_detail(
         ],
         wheel_core::Harness::Codex => &["CODEX_API_KEY"],
     };
+    // The account an agent normally runs as, so not its standby.
+    let standby = fallback_vault(conn, agent)?.map(|(id, _)| id);
     for (id, name) in wired_vaults(conn, agent)? {
+        if Some(id) == standby {
+            continue;
+        }
         // STORED values only, not declared keys. A vault that lists
         // ANTHROPIC_API_KEY in its config but holds no value for it supplies
         // nothing: reporting it as a credential tells the operator the agent
@@ -535,6 +540,86 @@ pub fn replace_session_if(
         next.expires_at().and_then(millis_to_timestamp),
     )?;
     Ok(true)
+}
+
+/// Why `vault` cannot be `agent`'s `fallback_vault`, if it cannot.
+///
+/// It must be a vault the agent ALREADY reads. That is what keeps a fallback
+/// from widening anything: with the read wire the agent can already
+/// `wheel secret get` every value in it.
+pub fn check_fallback(conn: &Connection, agent: Uuid, vault: Uuid) -> Result<(), String> {
+    let Some(node) = board::get(conn, vault).map_err(|e| e.to_string())? else {
+        return Err(format!("fallback_vault {vault} is not a node on this board"));
+    };
+    if node.node_type() != NodeType::Vault {
+        return Err(format!(
+            "fallback_vault {} is {} {} node, not a vault",
+            node.name,
+            node.node_type().article(),
+            node.node_type()
+        ));
+    }
+    let wired = board::wires_from(conn, agent)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|w| w.to == vault && w.wire_type == WireType::Read);
+    if !wired {
+        return Err(format!(
+            "fallback_vault {} must be a vault this agent already has a read wire to; \
+             wire it first, then set fallback_vault",
+            node.name
+        ));
+    }
+    Ok(())
+}
+
+/// The agent's fallback vault as (id, name), if it has one AND still reads it.
+///
+/// The spawn-time half of [`check_fallback`]: config time is one door, and a
+/// wire removed afterwards walks straight past it.
+pub fn fallback_vault(conn: &Connection, agent: Uuid) -> Result<Option<(Uuid, String)>> {
+    let Some(vault) = board::get(conn, agent)?
+        .and_then(|n| n.config.as_agent().and_then(|a| a.fallback_vault))
+    else {
+        return Ok(None);
+    };
+    if check_fallback(conn, agent, vault).is_err() {
+        return Ok(None);
+    }
+    Ok(board::get(conn, vault)?.map(|n| (n.id, n.name.to_string())))
+}
+
+/// The environment one spawn gets from its wired vaults, with the credential
+/// half chosen by which account this spawn runs as.
+///
+/// Only CREDENTIAL keys are switched; every other key is exported as
+/// [`env_for_agent`] would. A normal spawn withholds the fallback vault's
+/// credentials, or the harness would pick between two accounts by its own
+/// precedence. A fallback spawn exports ONLY the fallback vault's credentials.
+/// The ambiguity rule runs first and is unchanged.
+pub fn env_for_spawn(
+    conn: &Connection,
+    vk: &VaultKey,
+    agent: Uuid,
+    fallback: Option<Uuid>,
+    use_fallback: bool,
+) -> Result<Vec<(String, String)>> {
+    if let Some(a) = find_ambiguity(conn, agent, None)? {
+        bail!(a);
+    }
+    let mut env = Vec::new();
+    for (id, _) in wired_vaults(conn, agent)? {
+        let is_fallback = Some(id) == fallback;
+        for key in list_keys(conn, id)? {
+            if wheel_core::is_credential_key(&key) && is_fallback != use_fallback {
+                continue;
+            }
+            if let Some(v) = get(conn, vk, id, &key)? {
+                env.push((key, v));
+            }
+        }
+    }
+    Ok(env)
 }
 
 /// Blank out any secret that appears in a line bound for a log or transcript.

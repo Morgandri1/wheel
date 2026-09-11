@@ -39,7 +39,7 @@ pub use host::{
 };
 pub use message::{
     escape_envelope_body, sha256_hex, Message, MessageReceipt, MessageSender, MessageState,
-    MAX_MESSAGE_BODY,
+    DEFAULT_AWAIT_SECS, MAX_AWAIT_SECS, MAX_MESSAGE_BODY,
 };
 pub use name::{
     validate_name, validate_table_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES,
@@ -54,7 +54,8 @@ pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, Wi
 pub use spawn::{ListenAddr, ListenAddrError};
 pub use state::{
     is_credential_key, AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, BudgetStatus,
-    CredentialKind, NodeState, NodeWithState, Spend, CLAUDE_OAUTH_SESSION, CREDENTIAL_KEYS,
+    CredentialKind, NodeState, NodeWithState, QuotaWindow, Spend, CLAUDE_OAUTH_SESSION,
+    CREDENTIAL_KEYS,
 };
 pub use timestamp::Timestamp;
 pub use tool::{

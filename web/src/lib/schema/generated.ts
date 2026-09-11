@@ -21,6 +21,7 @@ export type AgentStatus =
   | "idle"
   | "parked"
   | "budget_exhausted"
+  | "rate_limited"
   | "error";
 
 /**
@@ -30,8 +31,14 @@ export type AgentStatus =
 export interface AgentState {
   /**
    * How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell "no budget" from "nothing computed".
+   *
+   * The ceiling the BOARD sets. `quota` below is the one the ACCOUNT sets, and an agent can be well inside one and stopped by the other.
    */
   budget_status?: BudgetStatus | null;
+  /**
+   * Spawns use the agent's `fallback_vault` credential until this moment, because the primary credential's window is closed until then.
+   */
+  fallback_until?: Timestamp | null;
   /**
    * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
    */
@@ -42,6 +49,18 @@ export interface AgentState {
    * Messages persisted but not yet delivered into the child.
    */
   queued_messages?: number;
+  /**
+   * The last usage window the harness reported, whatever its status.
+   */
+  quota?: QuotaWindow | null;
+  /**
+   * While `rate_limited`: when the harness said the window resets. `None` means it did not say, and `resume_at` is a backoff instead.
+   */
+  resets_at?: Timestamp | null;
+  /**
+   * While `rate_limited`: when the engine will resume delivery by itself.
+   */
+  resume_at?: Timestamp | null;
   /**
    * The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.
    */
@@ -62,6 +81,27 @@ export interface BudgetStatus {
   max_usd?: number | null;
   pct_of_max_turns?: number | null;
   pct_of_max_usd?: number | null;
+}
+
+/**
+ * A usage window as the harness reported it (`rate_limit_event`).
+ */
+
+export interface QuotaWindow {
+  observed_at: Timestamp;
+  resets_at?: Timestamp | null;
+  /**
+   * `allowed`, `allowed_warning`, `rejected`, or whatever the harness sent.
+   */
+  status: string;
+  /**
+   * 0.0-1.0 of the window consumed.
+   */
+  utilization?: number | null;
+  /**
+   * Which window, e.g. `five_hour` or `seven_day`.
+   */
+  window?: string | null;
 }
 
 /**
@@ -255,8 +295,14 @@ export type Event =
 export type NodeState = {
   /**
    * How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell "no budget" from "nothing computed".
+   *
+   * The ceiling the BOARD sets. `quota` below is the one the ACCOUNT sets, and an agent can be well inside one and stopped by the other.
    */
   budget_status?: BudgetStatus | null;
+  /**
+   * Spawns use the agent's `fallback_vault` credential until this moment, because the primary credential's window is closed until then.
+   */
+  fallback_until?: Timestamp | null;
   /**
    * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
    */
@@ -268,6 +314,18 @@ export type NodeState = {
    * Messages persisted but not yet delivered into the child.
    */
   queued_messages?: number;
+  /**
+   * The last usage window the harness reported, whatever its status.
+   */
+  quota?: QuotaWindow | null;
+  /**
+   * While `rate_limited`: when the harness said the window resets. `None` means it did not say, and `resume_at` is a backoff instead.
+   */
+  resets_at?: Timestamp | null;
+  /**
+   * While `rate_limited`: when the engine will resume delivery by itself.
+   */
+  resume_at?: Timestamp | null;
   /**
    * The harness's own session identifier for the current session. Changes on every start and on every `ephemeral_context` clear.
    */
@@ -338,6 +396,10 @@ export type WireType = "read" | "write" | "send";
 
 /**
  * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
+
+/**
+ * A usage window as the harness reported it (`rate_limit_event`).
  */
 
 /**
@@ -607,6 +669,10 @@ export interface AgentConfig {
    * Clear the session after every completed turn, re-applying the system prompt and ctx injections, before draining the next queued message.
    */
   ephemeral_context?: boolean;
+  /**
+   * A vault this agent already has a `read` wire to, whose credential it runs on while its own credential's usage window is closed. Refused at config time if the wire is missing, and re-checked at every spawn.
+   */
+  fallback_vault?: string | null;
   harness: Harness;
   /**
    * Stop the process after this long idle and resume the session on the next message (§3c#14 idle parking). `None` uses [`DEFAULT_IDLE_TIMEOUT_SECS`]; `Some(0)` disables parking.
@@ -809,6 +875,10 @@ export interface ToolSource {
  */
 
 /**
+ * A usage window as the harness reported it (`rate_limit_event`).
+ */
+
+/**
  * Accumulated cost for an agent's current lifetime.
  */
 
@@ -951,6 +1021,10 @@ export interface Position {
 
 /**
  * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
+
+/**
+ * A usage window as the harness reported it (`rate_limit_event`).
  */
 
 /**
