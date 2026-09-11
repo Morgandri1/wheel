@@ -134,6 +134,9 @@ struct Running {
     session_id: Option<String>,
     stdin: ChildStdin,
     child: Child,
+    /// The agent leads its own process group (see `start`), so this is also the id of everything
+    /// it spawned. Kept apart from `child.id()`, which is gone once the leader is reaped.
+    pgid: Option<libc::pid_t>,
     /// The message currently occupying the child, if any. Exactly one at a
     /// time: the next is written only after this turn's `result`.
     in_flight: Option<Uuid>,
@@ -145,6 +148,30 @@ struct Running {
     /// board's `turns` a triangular series — three turns would read as six.
     counted_turns: u64,
     counted_usd: f64,
+}
+
+/// How long an agent gets to exit on SIGTERM when the engine shuts down, before SIGKILL.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl Running {
+    /// SIGKILL the agent's whole process group, then reap the leader.
+    ///
+    /// The group, not the leader: an agent's tool shells and MCP servers are its descendants, and
+    /// killing only the process we spawned orphaned every one of them.
+    async fn kill(&mut self) -> std::io::Result<()> {
+        self.signal_group(libc::SIGKILL);
+        match self.child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            _ => self.child.kill().await,
+        }
+    }
+
+    fn signal_group(&self, signal: libc::c_int) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: killpg only delivers a signal. The id is our child's own group.
+            unsafe { libc::killpg(pgid, signal) };
+        }
+    }
 }
 
 /// One agent's slot. `None` means "not running"; the mutex is held ACROSS the
@@ -698,7 +725,9 @@ impl Supervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Its own process group, so stopping the agent can reach everything it started.
+            .process_group(0);
         for (k, v) in self.harness.env(&spec) {
             cmd.env(k, v);
         }
@@ -802,11 +831,13 @@ impl Supervisor {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let run_id = Uuid::new_v4();
+        let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
         *guard = Some(Running {
             run_id,
             session_id: None,
             stdin,
             child,
+            pgid,
             in_flight: None,
             consecutive_user: 0,
             counted_turns: 0,
@@ -968,7 +999,7 @@ impl Supervisor {
             // scope, so the process does die; what was missing was anyone ever
             // hearing that the direct kill did not work. (ADVERSARY, on the
             // risk I flagged as #2 in the review request.)
-            if let Err(e) = r.child.kill().await {
+            if let Err(e) = r.kill().await {
                 tracing::warn!(
                     %agent,
                     error = %e,
@@ -1131,7 +1162,7 @@ impl Supervisor {
         // a live process while the board says otherwise. `kill_on_drop(true)`
         // still reaps `r` when it drops, so the process does die either way;
         // what matters is that a failure here is heard.
-        if let Err(e) = r.child.kill().await {
+        if let Err(e) = r.kill().await {
             tracing::warn!(
                 %agent,
                 error = %e,
@@ -1170,7 +1201,7 @@ impl Supervisor {
         if let Some(mut r) = guard.take() {
             // Same reasoning as `park`: kill_on_drop reaps it either way, but a
             // failure that nobody hears is a process the board thinks is gone.
-            if let Err(e) = r.child.kill().await {
+            if let Err(e) = r.kill().await {
                 tracing::warn!(%agent, error = %e, "killing a stopped agent's process failed");
             }
         }
@@ -1182,6 +1213,43 @@ impl Supervisor {
         }
         self.set_status(agent, AgentStatus::Stopped, None);
         Ok(AgentStatus::Stopped)
+    }
+
+    /// Stop every agent's process group before the engine exits.
+    ///
+    /// SIGTERM to all of them at once, so the harnesses can finish writing their sessions in
+    /// parallel, then SIGKILL for whatever is still there after the grace period. Each agent is
+    /// left `parked`, not `stopped`: its session is kept, and the first message after a restart
+    /// resumes it — an engine shutting down is not an operator stopping an agent.
+    pub async fn shutdown(&self) {
+        let slots: Vec<(Uuid, AgentSlot)> = self
+            .agents
+            .lock()
+            .await
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect();
+
+        let mut stopping = Vec::new();
+        for (agent, slot) in slots {
+            if let Some(running) = slot.lock().await.take() {
+                running.signal_group(libc::SIGTERM);
+                stopping.push((agent, running));
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        for (agent, mut running) in stopping {
+            let _ = tokio::time::timeout_at(deadline, running.child.wait()).await;
+            if let Err(e) = running.kill().await {
+                tracing::warn!(%agent, error = %e, "killing an agent at shutdown failed");
+            }
+            {
+                let conn = self.db.lock().unwrap();
+                let _ = crate::db::tokens::revoke(&conn, agent);
+            }
+            self.set_status(agent, AgentStatus::Parked, None);
+        }
     }
 
     /// Deliver the next queued message if the agent is idle.
@@ -1678,7 +1746,7 @@ impl Supervisor {
             let slot = self.slot(agent).await;
             let mut guard = slot.lock().await;
             if let Some(mut r) = guard.take() {
-                if let Err(e) = r.child.kill().await {
+                if let Err(e) = r.kill().await {
                     tracing::warn!(%agent, error = %e, "killing a cleared agent's process failed");
                 }
             }

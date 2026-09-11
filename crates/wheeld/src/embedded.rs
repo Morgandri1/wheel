@@ -13,17 +13,45 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 use wheel_host::sandbox::{Sandbox, Secrets, Status};
+
+/// How long an engine gets to stop its agents before its task is abandoned. The §4b spawn contract
+/// gives a standalone engine the same 15s after SIGTERM.
+const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A running engine: its task, and the signal that asks it to stop.
+///
+/// Stopping is a request, not an abort. Aborting the task dropped the server but not the agent
+/// supervisor, which its own pump tasks keep alive, so every agent of a stopped project went on
+/// running with nothing left that could stop it.
+struct Engine {
+    task: tokio::task::JoinHandle<()>,
+    stop: oneshot::Sender<()>,
+}
+
+impl Engine {
+    async fn stop(self, project: Uuid) {
+        let _ = self.stop.send(());
+        let mut task = self.task;
+        if tokio::time::timeout(ENGINE_STOP_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(%project, "the engine did not stop within {ENGINE_STOP_TIMEOUT:?}; abandoning it");
+            task.abort();
+        }
+    }
+}
 
 pub struct EmbeddedSandbox {
     data_dir: PathBuf,
     run_dir: PathBuf,
     start_timeout: Duration,
-    /// One task per project. Holding the handle is what makes stop possible: an engine we cannot
-    /// stop is an engine that keeps serving after the project is deleted.
-    engines: Mutex<HashMap<Uuid, tokio::task::JoinHandle<()>>>,
+    /// One engine per project. Holding it is what makes stop possible: an engine we cannot stop is
+    /// an engine that keeps serving after the project is deleted.
+    engines: Mutex<HashMap<Uuid, Engine>>,
 }
 
 /// The longest path a unix socket may be bound to: 104 bytes on macOS, 108 on Linux. The limit is
@@ -62,7 +90,21 @@ impl EmbeddedSandbox {
 
     async fn is_live(&self, id: &Uuid) -> bool {
         let engines = self.engines.lock().await;
-        engines.get(id).is_some_and(|h| !h.is_finished())
+        engines.get(id).is_some_and(|e| !e.task.is_finished())
+    }
+
+    /// Stop every engine, and so every agent, concurrently. What `wheeld` does on SIGTERM.
+    pub async fn shutdown_all(&self) {
+        let engines: Vec<(Uuid, Engine)> = self.engines.lock().await.drain().collect();
+        let mut stopping = tokio::task::JoinSet::new();
+        for (id, engine) in engines {
+            let socket = self.socket_path(&id);
+            stopping.spawn(async move {
+                engine.stop(id).await;
+                let _ = std::fs::remove_file(socket);
+            });
+        }
+        while stopping.join_next().await.is_some() {}
     }
 }
 
@@ -111,12 +153,18 @@ impl Sandbox for EmbeddedSandbox {
         };
 
         let project = *id;
-        let handle = tokio::spawn(async move {
-            if let Err(e) = wheel_engine::serve(cfg).await {
+        let (stop, stop_requested) = oneshot::channel::<()>();
+        // A dropped sender resolves the receiver too, so an engine whose handle is lost stops
+        // rather than running on unowned.
+        let task = tokio::spawn(async move {
+            let stopped = async move {
+                let _ = stop_requested.await;
+            };
+            if let Err(e) = wheel_engine::serve_until(cfg, stopped).await {
                 tracing::error!(project = %project, error = %format_args!("{e:#}"), "engine exited");
             }
         });
-        self.engines.lock().await.insert(*id, handle);
+        self.engines.lock().await.insert(*id, Engine { task, stop });
 
         // Start means serving, not spawned: reporting success earlier just moves the race into the
         // caller's next request.
@@ -138,8 +186,9 @@ impl Sandbox for EmbeddedSandbox {
     }
 
     async fn stop(&self, id: &Uuid) -> Result<()> {
-        if let Some(handle) = self.engines.lock().await.remove(id) {
-            handle.abort();
+        let engine = self.engines.lock().await.remove(id);
+        if let Some(engine) = engine {
+            engine.stop(*id).await;
         }
         let _ = std::fs::remove_file(self.socket_path(id));
         Ok(())

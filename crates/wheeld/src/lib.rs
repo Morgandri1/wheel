@@ -25,8 +25,19 @@ pub async fn run(settings: Settings) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
-    start_host(&data_dir, &keys).await?;
-    serve_api(&settings.bind).await
+    let host = start_host(&data_dir, &keys).await?;
+    let served = serve_api(&settings.bind).await;
+    // After the API stops taking requests, before the process exits: every engine stops its
+    // agents, whatever ended serving. Nothing this daemon started may outlive it.
+    host.sandbox.shutdown_all().await;
+    served
+}
+
+/// The sandbox host, serving, and the engines behind it.
+pub struct Host {
+    /// The loopback URL the API reaches the host on.
+    pub url: String,
+    pub sandbox: Arc<embedded::EmbeddedSandbox>,
 }
 
 /// Everything the binary does, so that `main` is a call and nothing else.
@@ -84,8 +95,8 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
 /// drive the whole host — router, store, embedded engines — without standing up Postgres, and what
 /// it exercises is the real wiring rather than a rehearsal of it.
 ///
-/// Returns the loopback URL the API should use.
-pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<String> {
+/// Returns the loopback URL the API should use, and the engines, which the caller stops.
+pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<Host> {
     // Loopback only, on a port the OS picks. Nothing outside this machine may reach the host: it
     // is the half of the process that can start and stop any project's engine.
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -96,7 +107,7 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
 
     supervise::apply_defaults(&supervise::composed_env(data_dir, keys, &host_url));
 
-    let host_state = build_host_state(data_dir)?;
+    let (host_state, sandbox) = build_host_state(data_dir)?;
     wheel_host::reconcile_on_boot(&host_state).await;
     tokio::spawn(async move {
         if let Err(e) = wheel_host::serve_on(host_listener, host_state).await {
@@ -104,11 +115,16 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
         }
     });
     tracing::info!(%host_url, "sandbox host ready");
-    Ok(host_url)
+    Ok(Host {
+        url: host_url,
+        sandbox,
+    })
 }
 
 /// The host, with engines embedded rather than spawned.
-fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState> {
+fn build_host_state(
+    data_dir: &std::path::Path,
+) -> Result<(wheel_host::HostState, Arc<embedded::EmbeddedSandbox>)> {
     let cfg = wheel_host::config::Config::from_env().context("host configuration")?;
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
@@ -117,9 +133,9 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
         data_dir.to_path_buf(),
         std::time::Duration::from_secs(cfg.start_timeout_secs),
     )?);
-    Ok(wheel_host::HostState {
+    let state = wheel_host::HostState {
         cfg,
-        sandbox,
+        sandbox: sandbox.clone(),
         store,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -127,7 +143,8 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
             .context("building the host http client")?,
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
         ready: wheel_host::Readiness::serving_from_start(),
-    })
+    };
+    Ok((state, sandbox))
 }
 
 /// `0.0.0.0:8080` is not an address a browser can open; say `localhost` instead.
@@ -165,9 +182,9 @@ async fn serve_api(bind: &str) -> Result<()> {
 /// Resolves when the daemon has been asked to stop.
 ///
 /// A person runs `wheeld` in a terminal and stops it with ctrl-c, and a service manager stops it
-/// with SIGTERM; either must end the process. The embedded engines install SIGTERM handlers of
-/// their own for their clean shutdown, and a handled signal no longer terminates the process by
-/// default — so without this, `wheeld` keeps serving something that has been told to go away.
+/// with SIGTERM; either must end the process, and only after every engine has stopped its agents.
+/// This is the one signal handler in the process: embedded engines are stopped by `run`, never by
+/// a signal of their own.
 async fn stop_requested() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = match signal(SignalKind::terminate()) {

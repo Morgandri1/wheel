@@ -30,7 +30,8 @@ async fn start() -> (String, String) {
     let keys = Keys::load_or_create(&dir).unwrap();
     let url = wheeld::start_host(&dir, &keys)
         .await
-        .expect("the sandbox host should start");
+        .expect("the sandbox host should start")
+        .url;
 
     // Read the secret back out of the composed environment rather than from `keys`. Defaults are
     // applied without overriding, so in a process that has already booted a host the standing value
