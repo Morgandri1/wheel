@@ -146,9 +146,9 @@ export type EndpointAuth =
     };
 
 /**
- * The capabilities implemented by a running engine build.
+ * The capabilities of a running engine, as deployed.
  *
- * Node configs reject unknown fields, so a client checks `features` before sending an optional one. Deliberately NOT `deny_unknown_fields`: this is the document a newer engine extends, and an older client must still read it.
+ * Node configs reject unknown fields, so a client checks `features` before sending an optional one. Clients ignore fields they do not know.
  */
 
 export interface EngineInfo {
@@ -161,7 +161,7 @@ export interface EngineInfo {
    */
   build: string;
   /**
-   * Stable ids of implemented capabilities. Clients ignore ids they do not know.
+   * Stable ids of the capabilities this deployment honours. Clients ignore ids they do not know.
    */
   features: string[];
   /**

@@ -769,6 +769,9 @@ to that path (routes, key derivation, expiry, the credential lookup, the vault e
 
 ```
 GET    /v1/board                          → { nodes: [Node+state], project: {...} }
+GET    /v1/engine                         → EngineInfo {version, build, api_version, harnesses, profiles, features}. ADDITIVE ONLY:
+                                            fields and feature ids are only ever added, and clients ignore any they do not know
+                                            (R6, docs/proposals/agent-grid-engine.md).
 POST   /v1/nodes                          → create (validates name, type, config)
 PATCH  /v1/nodes/:id                      → name/position/config (partial). Renaming an AGENT while it is running/starting → 409 `agent_running`
                                             (its name is embedded in every peer's preamble and in its own session; stop or park it first — the UI disables

@@ -142,8 +142,9 @@ not silent.
 |---|---|---|
 | `GET /v1/engine` | `EngineInfo` | M1 |
 
-`EngineInfo` (`docs/schema/engine-info.json`) is how a client learns what this build can do before it
-sends anything optional. Agent configs are `deny_unknown_fields`, so a field the engine does not know is
+`EngineInfo` (`docs/schema/engine-info.json`) is how a client learns what this engine can do, as deployed,
+before it sends anything optional. `features` can differ between two deployments of one build: see
+`oauth_paste_code` below. Agent configs are `deny_unknown_fields`, so a field the engine does not know is
 a `400`, not an ignored key: check `features` first.
 
 ```jsonc
@@ -177,7 +178,7 @@ a `400`, not an ignored key: check `features` first.
 | `idle_parking` | `AgentConfig.idle_timeout_secs` (§5b) |
 | `ephemeral_context` | `AgentConfig.ephemeral_context` |
 | `budgets` | `AgentConfig.budget` `{max_turns?, max_usd?}` |
-| `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete` |
+| `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**: there the OAuth credential this login produces is refused at spawn, so a client must offer API-key auth instead |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.

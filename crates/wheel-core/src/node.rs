@@ -552,6 +552,22 @@ impl Node {
 mod tests {
     use super::*;
 
+    #[test]
+    fn harness_all_names_every_variant_exactly_once() {
+        // Exhaustive: a new variant stops this compiling until it is counted
+        // here, which is the prompt to add it to `Harness::ALL`.
+        let index = |h: Harness| match h {
+            Harness::Claude => 0,
+            Harness::Codex => 1,
+        };
+        let mut seen = [0u8; 2];
+        for h in Harness::ALL {
+            seen[index(h)] += 1;
+        }
+        assert_eq!(Harness::ALL.len(), seen.len());
+        assert_eq!(seen, [1, 1], "every variant listed once");
+    }
+
     /// The canonical JSON of ARCHITECTURE.md §3, byte for byte. Every other
     /// crate and the Web client are generated from this shape, so a silent
     /// change here breaks them at runtime rather than at compile time.

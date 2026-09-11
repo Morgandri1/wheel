@@ -4,13 +4,16 @@
 
 //! `GET /v1/engine`: capability discovery (`docs/PROTOCOL.md` §2).
 
-use axum::Json;
+use axum::{extract::State, Json};
 use wheel_core::{EngineInfo, Harness};
+
+use super::AppState;
+use crate::config::HarnessAuthPolicy;
 
 /// Stable ids a client may test for before depending on a capability. Every id
 /// names a route or config field that exists in this build; the tests hold
 /// each one to that by calling it.
-pub(crate) const FEATURES: &[&str] = &[
+const FEATURES: &[&str] = &[
     "board",
     "wires",
     "messages",
@@ -25,7 +28,7 @@ pub(crate) const FEATURES: &[&str] = &[
     "oauth_paste_code",
 ];
 
-pub async fn engine_info() -> Json<EngineInfo> {
+pub async fn engine_info(State(s): State<AppState>) -> Json<EngineInfo> {
     Json(EngineInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         build: super::build_id().into(),
@@ -36,8 +39,18 @@ pub async fn engine_info() -> Json<EngineInfo> {
             .map(|h| h.as_str().into())
             .collect(),
         profiles: vec!["sandboxed".into()],
-        features: FEATURES.iter().map(|f| (*f).into()).collect(),
+        features: features(s.cfg.harness_auth).map(String::from).collect(),
     })
+}
+
+/// The ids this deployment can honour. A paste-code login produces an OAuth
+/// credential, which an api-key-only deployment refuses at spawn, so there the
+/// login would complete and the agent still could not run.
+fn features(policy: HarnessAuthPolicy) -> impl Iterator<Item = &'static str> {
+    FEATURES
+        .iter()
+        .copied()
+        .filter(move |f| !(*f == "oauth_paste_code" && policy == HarnessAuthPolicy::ApiKeyOnly))
 }
 
 #[cfg(test)]
@@ -51,8 +64,11 @@ mod tests {
     use tower::ServiceExt;
     use wheel_core::{EngineInfo, ErrorBody, Harness};
 
+    use std::sync::Arc;
+
     use super::FEATURES;
     use crate::api::{router, test_state};
+    use crate::config::HarnessAuthPolicy;
 
     struct Engine {
         app: Router,
@@ -61,7 +77,14 @@ mod tests {
 
     impl Engine {
         fn new() -> Self {
-            let state = test_state();
+            Self::under(HarnessAuthPolicy::default())
+        }
+
+        fn under(policy: HarnessAuthPolicy) -> Self {
+            let mut state = test_state();
+            let mut cfg = (*state.cfg).clone();
+            cfg.harness_auth = policy;
+            state.cfg = Arc::new(cfg);
             Self {
                 secret: state.cfg.engine_secret.clone(),
                 app: router(state),
@@ -104,9 +127,15 @@ mod tests {
             self.call(method, uri, Some(&secret), body).await
         }
 
-        async fn create_node(&self, name: &str, node_type: &str, config: Value) -> StatusCode {
+        async fn create_node(
+            &self,
+            name: &str,
+            node_type: &str,
+            config: Value,
+        ) -> (StatusCode, Value) {
             let body = json!({"name": name, "type": node_type, "config": config});
-            self.authed("POST", "/v1/nodes", Some(body)).await.0
+            let (status, body) = self.authed("POST", "/v1/nodes", Some(body)).await;
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
         }
 
         async fn info(&self) -> EngineInfo {
@@ -178,22 +207,63 @@ mod tests {
         );
     }
 
-    /// A client that sends a harness it saw advertised must not be refused for it.
+    /// A client that sends a harness it saw advertised must not be refused for
+    /// it, whether it creates an agent or switches an existing one.
     #[tokio::test]
-    async fn advertised_harnesses_are_exactly_the_ones_node_creation_accepts() {
+    async fn advertised_harnesses_are_exactly_the_ones_node_creation_and_patch_accept() {
         let engine = Engine::new();
         let advertised = engine.info().await.harnesses;
+        let is_advertised = |h: Harness| advertised.iter().any(|a| a == h.as_str());
+
+        let claude = json!({"harness": "claude", "system_prompt": ""});
+        let (status, existing) = engine.create_node("switched", "agent", claude).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let uri = format!("/v1/nodes/{}", existing["id"].as_str().unwrap());
+
         for harness in Harness::ALL {
             let config = json!({"harness": harness.as_str(), "system_prompt": ""});
-            let status = engine
+            let (created, _) = engine
                 .create_node(&format!("{harness}-agent"), "agent", config)
                 .await;
             assert_eq!(
-                status == StatusCode::CREATED,
-                advertised.iter().any(|h| h == harness.as_str()),
-                "{harness}: create answered {status}, advertised {advertised:?}"
+                created == StatusCode::CREATED,
+                is_advertised(harness),
+                "{harness}: create answered {created}, advertised {advertised:?}"
+            );
+
+            let patch = json!({"config": {"harness": harness.as_str()}});
+            let (patched, _) = engine.authed("PATCH", &uri, Some(patch)).await;
+            assert_eq!(
+                patched == StatusCode::OK,
+                is_advertised(harness),
+                "{harness}: patch answered {patched}, advertised {advertised:?}"
             );
         }
+    }
+
+    /// On an api-key-only deployment a paste-code login completes, then the
+    /// spawn gate refuses the OAuth credential it produced.
+    #[tokio::test]
+    async fn paste_code_login_is_not_advertised_where_its_credential_is_refused() {
+        let key_only = Engine::under(HarnessAuthPolicy::ApiKeyOnly)
+            .info()
+            .await
+            .features;
+        let others: Vec<&str> = FEATURES
+            .iter()
+            .copied()
+            .filter(|f| *f != "oauth_paste_code")
+            .collect();
+        assert_eq!(
+            key_only, others,
+            "api-key-only must drop oauth_paste_code and nothing else"
+        );
+
+        let oauth = Engine::under(HarnessAuthPolicy::OauthToken)
+            .info()
+            .await
+            .features;
+        assert!(oauth.iter().any(|f| f == "oauth_paste_code"), "{oauth:?}");
     }
 
     enum Evidence {
@@ -301,7 +371,7 @@ mod tests {
                 let endpoint =
                     json!({"method": "POST", "path": "/engine-probe", "response_mode": "ack"});
                 assert_eq!(
-                    engine.create_node("probe", "endpoint", endpoint).await,
+                    engine.create_node("probe", "endpoint", endpoint).await.0,
                     StatusCode::CREATED
                 );
                 let (after, body) = hit().await;
@@ -317,9 +387,11 @@ mod tests {
 
     #[tokio::test]
     async fn every_advertised_feature_is_callable_or_configurable() {
-        for feature in FEATURES {
-            let engine = Engine::new();
-            assert_holds(&engine, feature, evidence(feature)).await;
+        for policy in [HarnessAuthPolicy::OauthToken, HarnessAuthPolicy::ApiKeyOnly] {
+            for feature in Engine::under(policy).info().await.features {
+                let engine = Engine::under(policy);
+                assert_holds(&engine, &feature, evidence(&feature)).await;
+            }
         }
     }
 

@@ -2,16 +2,17 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0.
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
-//! `GET /v1/engine`: what a running engine build can do.
+//! `GET /v1/engine`: what a running engine can do.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The capabilities implemented by a running engine build.
+/// The capabilities of a running engine, as deployed.
 ///
 /// Node configs reject unknown fields, so a client checks `features` before
-/// sending an optional one. Deliberately NOT `deny_unknown_fields`: this is the
-/// document a newer engine extends, and an older client must still read it.
+/// sending an optional one. Clients ignore fields they do not know.
+// Not `deny_unknown_fields`: a newer engine extends this document, and an
+// older client must still read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EngineInfo {
     /// The engine crate version, compiled in.
@@ -24,6 +25,6 @@ pub struct EngineInfo {
     pub harnesses: Vec<String>,
     /// Spawn profiles this build supports.
     pub profiles: Vec<String>,
-    /// Stable ids of implemented capabilities. Clients ignore ids they do not know.
+    /// Stable ids of the capabilities this deployment honours. Clients ignore ids they do not know.
     pub features: Vec<String>,
 }

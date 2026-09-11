@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "EngineInfo",
-  "description": "The capabilities implemented by a running engine build.\n\nNode configs reject unknown fields, so a client checks `features` before sending an optional one. Deliberately NOT `deny_unknown_fields`: this is the document a newer engine extends, and an older client must still read it.",
+  "description": "The capabilities of a running engine, as deployed.\n\nNode configs reject unknown fields, so a client checks `features` before sending an optional one. Clients ignore fields they do not know.",
   "type": "object",
   "required": [
     "api_version",
@@ -21,7 +21,7 @@
       "type": "string"
     },
     "features": {
-      "description": "Stable ids of implemented capabilities. Clients ignore ids they do not know.",
+      "description": "Stable ids of the capabilities this deployment honours. Clients ignore ids they do not know.",
       "type": "array",
       "items": {
         "type": "string"
