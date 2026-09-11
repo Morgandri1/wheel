@@ -17,6 +17,7 @@ import {
   signUp,
   useSession,
 } from "@/lib/local-auth";
+import { safeNextPath } from "@/lib/next-path";
 import { WheelMark } from "@/components/header";
 import { Button, Field, Input } from "@/components/ui";
 
@@ -56,10 +57,8 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
   useEffect(() => setHydrated(true), []);
   const emailRef = useRef<HTMLInputElement>(null);
 
-  // `next` is where the user was headed before we intercepted them. Same-origin paths only —
-  // an open redirect is exactly the kind of thing a sign-in page gets used for.
-  const raw = params.get("next");
-  const next = raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/app";
+  // `next` is where the user was headed before we intercepted them; only a path on this origin.
+  const next = typeof window === "undefined" ? "/app" : safeNextPath(params.get("next"), window.location.origin);
 
   useEffect(() => {
     void hydrateSession();

@@ -10,8 +10,12 @@
  * `/api/wheel/v1/…` is a same-origin proxy (`src/lib/api-proxy.ts`) that attaches the session on
  * the server and forwards to the API, so the browser holds no token and does not know where the
  * API lives. Project-scoped requests still carry x-project-id; the proxy passes that on.
+ *
+ * Every path with an id in it is built by `projectPath` (`src/lib/api-paths.ts`): a project id that
+ * is not a UUID never becomes a path, and every other id is encoded as a single segment.
  */
 import { ApiError, notifyUnauthorized } from "@/lib/auth";
+import { projectPath, withQuery } from "@/lib/api-paths";
 import type { LogStreamName } from "@/lib/schema";
 import { readOutcome, type ApplyOutcome } from "@/lib/board-apply";
 import { readInstantiateOutcome, type InstantiateOutcome, type TemplateBoard } from "@/lib/templates";
@@ -43,7 +47,13 @@ interface RequestOptions {
   expect?: "json" | "blob" | "void";
 }
 
-async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+/** A path that was refused before it existed answers like the 404 it would have been. */
+function refusedPath(): ApiError {
+  return new ApiError(404, "not_found", "That's gone, or was never yours.");
+}
+
+async function request<T>(path: string | null, opts: RequestOptions = {}): Promise<T> {
+  if (path === null) throw refusedPath();
   const headers: Record<string, string> = {};
   if (opts.projectId) headers["x-project-id"] = opts.projectId;
   if (opts.body !== undefined) headers["content-type"] = "application/json";
@@ -103,16 +113,14 @@ function defaultMessage(status: number): string {
 
 export const projects = {
   list: () => request<Project[]>("/v1/projects"),
-  get: (id: string) => request<Project>(`/v1/projects/${id}`, { projectId: id }),
+  get: (id: string) => request<Project>(projectPath(id), { projectId: id }),
   create: (name: string) => request<Project>("/v1/projects", { method: "POST", body: { name } }),
   patch: (id: string, patch: { name?: string; capabilities?: { http: boolean } }) =>
-    request<Project>(`/v1/projects/${id}`, { method: "PATCH", body: patch, projectId: id }),
-  remove: (id: string) =>
-    request<void>(`/v1/projects/${id}`, { method: "DELETE", projectId: id, expect: "void" }),
-  start: (id: string) => request<Project>(`/v1/projects/${id}/start`, { method: "POST", projectId: id }),
-  stop: (id: string) => request<Project>(`/v1/projects/${id}/stop`, { method: "POST", projectId: id }),
-  restart: (id: string) =>
-    request<Project>(`/v1/projects/${id}/restart`, { method: "POST", projectId: id }),
+    request<Project>(projectPath(id), { method: "PATCH", body: patch, projectId: id }),
+  remove: (id: string) => request<void>(projectPath(id), { method: "DELETE", projectId: id, expect: "void" }),
+  start: (id: string) => request<Project>(projectPath(id, "start"), { method: "POST", projectId: id }),
+  stop: (id: string) => request<Project>(projectPath(id, "stop"), { method: "POST", projectId: id }),
+  restart: (id: string) => request<Project>(projectPath(id, "restart"), { method: "POST", projectId: id }),
 };
 
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
@@ -130,7 +138,9 @@ export async function applyBoard(
   board: unknown,
   dryRun: boolean,
 ): Promise<ApplyOutcome> {
-  const res = await fetch(`${PROXY}/v1/projects/${projectId}/board/apply`, {
+  const path = projectPath(projectId, "board", "apply");
+  if (path === null) throw refusedPath();
+  const res = await fetch(`${PROXY}${path}`, {
     method: "POST",
     headers: { "x-project-id": projectId, "content-type": "application/json" },
     credentials: "same-origin",
@@ -177,32 +187,31 @@ export async function instantiateTemplate(
   return readInstantiateOutcome(res.status, body);
 }
 
-const engine = (projectId: string, path: string) => `/v1/projects/${projectId}/engine/v1${path}`;
-
 export function engineApi(projectId: string) {
   const p = { projectId };
+  const engine = (...segments: string[]) => projectPath(projectId, "engine", "v1", ...segments);
 
   return {
-    board: () => request<Board>(engine(projectId, "/board"), p),
+    board: () => request<Board>(engine("board"), p),
 
     createNode: (input: { name: string; type: NodeType; position: Position; config?: unknown }) =>
-      request<WheelNode>(engine(projectId, "/nodes"), { ...p, method: "POST", body: input }),
+      request<WheelNode>(engine("nodes"), { ...p, method: "POST", body: input }),
 
     patchNode: (nodeId: string, patch: { name?: string; position?: Position; config?: unknown }) =>
-      request<WheelNode>(engine(projectId, `/nodes/${nodeId}`), { ...p, method: "PATCH", body: patch }),
+      request<WheelNode>(engine("nodes", nodeId), { ...p, method: "PATCH", body: patch }),
 
     deleteNode: (nodeId: string) =>
-      request<void>(engine(projectId, `/nodes/${nodeId}`), { ...p, method: "DELETE", expect: "void" }),
+      request<void>(engine("nodes", nodeId), { ...p, method: "DELETE", expect: "void" }),
 
     createWire: (from: string, to: string, type: WireType) =>
-      request<{ from: string; to: string; type: WireType }>(engine(projectId, "/wires"), {
+      request<{ from: string; to: string; type: WireType }>(engine("wires"), {
         ...p,
         method: "POST",
         body: { from, to, type },
       }),
 
     deleteWire: (from: string, to: string, type: WireType) =>
-      request<void>(engine(projectId, "/wires"), {
+      request<void>(engine("wires"), {
         ...p,
         method: "DELETE",
         body: { from, to, type },
@@ -210,12 +219,12 @@ export function engineApi(projectId: string) {
       }),
 
     agent: (nodeId: string) => ({
-      start: () => request<void>(engine(projectId, `/agents/${nodeId}/start`), { ...p, method: "POST" }),
-      stop: () => request<void>(engine(projectId, `/agents/${nodeId}/stop`), { ...p, method: "POST" }),
-      restart: () => request<void>(engine(projectId, `/agents/${nodeId}/restart`), { ...p, method: "POST" }),
-      clear: () => request<void>(engine(projectId, `/agents/${nodeId}/clear`), { ...p, method: "POST" }),
+      start: () => request<void>(engine("agents", nodeId, "start"), { ...p, method: "POST" }),
+      stop: () => request<void>(engine("agents", nodeId, "stop"), { ...p, method: "POST" }),
+      restart: () => request<void>(engine("agents", nodeId, "restart"), { ...p, method: "POST" }),
+      clear: () => request<void>(engine("agents", nodeId, "clear"), { ...p, method: "POST" }),
       send: (body: string) =>
-        request<Message>(engine(projectId, `/agents/${nodeId}/send`), { ...p, method: "POST", body: { body } }),
+        request<Message>(engine("agents", nodeId, "send"), { ...p, method: "POST", body: { body } }),
       /**
        * Backfill. `seq` is monotonic per agent and is the resume cursor: the socket has no
        * replay, so on reconnect you ask for everything after the last seq you saw.
@@ -224,15 +233,11 @@ export function engineApi(projectId: string) {
         const q = new URLSearchParams();
         if (opts.since !== undefined) q.set("since", String(opts.since));
         if (opts.stream) q.set("stream", opts.stream);
-        const query = q.toString();
-        return request<{ lines: LogLine[] }>(
-          engine(projectId, `/agents/${nodeId}/log${query ? `?${query}` : ""}`),
-          p,
-        );
+        return request<{ lines: LogLine[] }>(withQuery(engine("agents", nodeId, "log"), q), p);
       },
-      authStatus: () => request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth`), p),
+      authStatus: () => request<AuthStatus>(engine("agents", nodeId, "auth"), p),
       authBegin: (body?: { mode?: "paste_code" | "device_code" | "api_key" }) =>
-        request<AuthBegin>(engine(projectId, `/agents/${nodeId}/auth/begin`), {
+        request<AuthBegin>(engine("agents", nodeId, "auth", "begin"), {
           ...p,
           method: "POST",
           body: body ?? {},
@@ -245,66 +250,51 @@ export function engineApi(projectId: string) {
         session?: string;
         /** Name of a vault to also store this credential in, so peers wired to it inherit it. */
         save_to_vault?: string;
-      }) =>
-        request<AuthStatus>(engine(projectId, `/agents/${nodeId}/auth/complete`), { ...p, method: "POST", body }),
+      }) => request<AuthStatus>(engine("agents", nodeId, "auth", "complete"), { ...p, method: "POST", body }),
     }),
 
-    messages: () => request<{ messages: Message[] }>(engine(projectId, "/messages"), p),
+    messages: () => request<{ messages: Message[] }>(engine("messages"), p),
 
     table: (nodeId: string) => ({
       rows: (limit = 50, offset = 0) =>
         request<{ rows: Record<string, unknown>[]; total: number }>(
-          engine(projectId, `/tables/${nodeId}/rows?limit=${limit}&offset=${offset}`),
+          withQuery(engine("tables", nodeId, "rows"), new URLSearchParams({ limit: String(limit), offset: String(offset) })),
           p,
         ),
       query: (sql: string) =>
         // PROTOCOL.md: a SQL result is {columns, rows}, rows being positional arrays.
-        request<QueryResult>(engine(projectId, `/tables/${nodeId}/query`), {
-          ...p,
-          method: "POST",
-          body: { sql },
-        }),
+        request<QueryResult>(engine("tables", nodeId, "query"), { ...p, method: "POST", body: { sql } }),
     }),
 
-    chest: (nodeId: string) => ({
-      ls: (prefix = "") =>
-        request<{ entries: { key: string; bytes: number; modified_at: string }[] }>(
-          engine(projectId, `/chests/${nodeId}/ls?prefix=${encodeURIComponent(prefix)}`),
-          p,
-        ),
-      get: (key: string) =>
-        request<Blob>(engine(projectId, `/chests/${nodeId}/blob?key=${encodeURIComponent(key)}`), {
-          ...p,
-          expect: "blob",
-        }),
-      put: (key: string, body: BodyInit) =>
-        request<void>(engine(projectId, `/chests/${nodeId}/blob?key=${encodeURIComponent(key)}`), {
-          ...p,
-          method: "PUT",
-          raw: body,
-          expect: "void",
-        }),
-      remove: (key: string) =>
-        request<void>(engine(projectId, `/chests/${nodeId}/blob?key=${encodeURIComponent(key)}`), {
-          ...p,
-          method: "DELETE",
-          expect: "void",
-        }),
-    }),
+    chest: (nodeId: string) => {
+      const blob = (key: string) => withQuery(engine("chests", nodeId, "blob"), new URLSearchParams({ key }));
+      return {
+        ls: (prefix = "") =>
+          request<{ entries: { key: string; bytes: number; modified_at: string }[] }>(
+            withQuery(engine("chests", nodeId, "ls"), new URLSearchParams({ prefix })),
+            p,
+          ),
+        get: (key: string) => request<Blob>(blob(key), { ...p, expect: "blob" }),
+        put: (key: string, body: BodyInit) =>
+          request<void>(blob(key), { ...p, method: "PUT", raw: body, expect: "void" }),
+        remove: (key: string) => request<void>(blob(key), { ...p, method: "DELETE", expect: "void" }),
+      };
+    },
 
     /** §3d. The engine is the only spec parser — web never re-implements one. */
     tools: {
       /** Normalized preview for a document that has not been saved to a node yet. */
       preview: (raw: string, format?: ToolFormat) =>
-        request<{ operations: ToolOperation[]; base_url?: string; format: ToolFormat }>(
-          engine(projectId, "/tools/import"),
-          { ...p, method: "POST", body: { raw, format } },
-        ),
+        request<{ operations: ToolOperation[]; base_url?: string; format: ToolFormat }>(engine("tools", "import"), {
+          ...p,
+          method: "POST",
+          body: { raw, format },
+        }),
 
       /** Re-import into an existing node: diffs by method+path and keeps the fills already set. */
       reimport: (nodeId: string, raw: string, format?: ToolFormat) =>
         request<{ operations: ToolOperation[]; added: string[]; removed: string[]; kept: string[] }>(
-          engine(projectId, `/tools/${nodeId}/import`),
+          engine("tools", nodeId, "import"),
           { ...p, method: "POST", body: { raw, format } },
         ),
 
@@ -323,10 +313,7 @@ export function engineApi(projectId: string) {
             description?: string;
             input_schema: unknown;
           }[];
-        }>(
-          engine(projectId, `/tools/${nodeId}/ops`),
-          p,
-        ),
+        }>(engine("tools", nodeId, "ops"), p),
 
       /** Run an operation as the user. dry_run returns the equivalent curl instead of sending. */
       call: (nodeId: string, op: string, args: Record<string, unknown>, dryRun = false) =>
@@ -335,7 +322,7 @@ export function engineApi(projectId: string) {
           headers?: Record<string, string>;
           body?: unknown;
           curl?: string;
-        }>(engine(projectId, `/tools/${nodeId}/call`), {
+        }>(engine("tools", nodeId, "call"), {
           ...p,
           method: "POST",
           body: { op, args, dry_run: dryRun },
@@ -347,7 +334,7 @@ export function engineApi(projectId: string) {
      * a guarantee: nothing downstream can render or cache a secret it has no way to fetch.
      */
     putSecret: (nodeId: string, key: string, value: string) =>
-      request<void>(engine(projectId, `/vault/${nodeId}/${encodeURIComponent(key)}`), {
+      request<void>(engine("vault", nodeId, key), {
         ...p,
         method: "PUT",
         body: { value },
