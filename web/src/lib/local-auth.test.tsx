@@ -6,184 +6,266 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 
 /**
- * The session store is the only thing standing between "the API said your token is dead" and a
- * board that keeps firing doomed requests, so the tests that matter here are the forgetting ones.
+ * The browser side of a cookie session. What matters: the browser never holds the token, a 401
+ * from anywhere signs the UI out, "not asked yet" is never mistaken for "signed out", and the
+ * sign-in form still reads the API's own words through this app's server.
  *
  * Each case imports the module fresh: it holds process-wide state on purpose (one session per
- * browser) and a leaked session between cases would make an assertion pass for the wrong reason.
+ * browser) and a session leaked between cases would make an assertion pass for the wrong reason.
  */
 
 type Mod = typeof import("./local-auth");
 
-async function load(mode = "local"): Promise<Mod> {
-  vi.stubEnv("NEXT_PUBLIC_AUTH_MODE", mode);
+async function load(): Promise<Mod> {
   vi.resetModules();
   return (await import("./local-auth")) as Mod;
 }
 
-function respond(status: number, body: unknown, headers: Record<string, string> = {}) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
-    json: async () => body,
-  } as unknown as Response;
+function respond(status: number, body?: unknown, headers: Record<string, string> = {}) {
+  return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
 }
 
-const SESSION = { token: "local.abc", user: { id: "u1", email: "dev@wheel.dev" } };
+const USER = { id: "u1", email: "dev@wheel.dev" };
+let fetchMock: ReturnType<typeof vi.fn>;
+
+function call(i = 0) {
+  const [url, init] = fetchMock.mock.calls[i] as [string, RequestInit | undefined];
+  return { url, init, body: init?.body ? JSON.parse(init.body as string) : undefined };
+}
 
 beforeEach(() => {
   window.localStorage.clear();
+  fetchMock = vi.fn();
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
-  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe("hydration", () => {
-  it("starts in loading, so a gate never mistakes 'not looked yet' for 'signed out'", async () => {
+  it("starts loading, so a gate never mistakes 'not asked yet' for 'signed out'", async () => {
     const m = await load();
-    expect(m.useSession).toBeTypeOf("function");
-    // The snapshot before hydrateSession() is the one a gate reads on first render.
-    expect(m.sessionToken()).toBeNull();
+    expect(m.sessionSnapshot().status).toBe("loading");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("restores a stored session", async () => {
-    window.localStorage.setItem("wheel.session", JSON.stringify(SESSION));
+  it("asks this app's server who the cookie belongs to", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
     const m = await load();
-    m.hydrateSession();
-    expect(m.sessionToken()).toBe("local.abc");
+    await m.hydrateSession();
+    expect(call().url).toBe("/api/session");
+    expect(call().init).toMatchObject({ cache: "no-store", credentials: "same-origin" });
+    expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
   });
 
   it.each([
-    ["not json at all", "{{{"],
-    ["a session with no token", JSON.stringify({ user: SESSION.user })],
-    ["a session with no user", JSON.stringify({ token: "local.abc" })],
-    ["a user missing its email", JSON.stringify({ token: "local.abc", user: { id: "u1" } })],
-  ])("treats %s as signed out rather than throwing", async (_label, raw) => {
-    window.localStorage.setItem("wheel.session", raw);
+    ["no user", () => respond(200, { user: null })],
+    ["a user missing its email", () => respond(200, { user: { id: "u1" } })],
+    ["a failure from the server", () => respond(502, { error: { code: "api_unreachable", message: "x" } })],
+    ["an empty body", () => respond(200)],
+  ])("reads %s as signed out", async (_label, answer) => {
+    fetchMock.mockResolvedValue(answer());
     const m = await load();
-    expect(() => m.hydrateSession()).not.toThrow();
-    expect(m.sessionToken()).toBeNull();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("reads an unreachable server as signed out rather than hanging on 'checking'", async () => {
+    fetchMock.mockRejectedValue(new TypeError("failed to fetch"));
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("asks once, however many gates call it", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
+    const m = await load();
+    await Promise.all([m.hydrateSession(), m.hydrateSession()]);
+    await m.hydrateSession();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a late answer undo a sign-in that landed first", async () => {
+    let answer!: (r: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => (answer = resolve)));
+    const m = await load();
+    const hydrating = m.hydrateSession();
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    answer(respond(200, { user: null }));
+    await hydrating;
+    expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
+  });
+});
+
+describe("the token never reaches the browser", () => {
+  it("keeps nothing in storage and holds no token, even if a server misbehaves and sends one", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER, token: "should.not.stick" }));
+    const m = await load();
+    expect(await m.signIn("dev@wheel.dev", "wheel-dev-password")).toEqual(USER);
+    expect(window.localStorage.length).toBe(0);
+    expect(JSON.stringify(m.sessionSnapshot())).not.toContain("should.not.stick");
+    expect(Object.keys(m)).not.toContain("sessionToken");
+  });
+
+  it("sends no credential of its own; the cookie travels by itself", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
+    const m = await load();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    const headers = new Headers(call().init?.headers);
+    expect(headers.has("x-auth-token")).toBe(false);
+    expect(call().init?.credentials).toBe("same-origin");
   });
 });
 
 describe("signing in", () => {
-  it("keeps the token and mirrors it to storage", async () => {
+  it("posts the trimmed email and the password to this app's server", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
-    const user = await m.signIn("dev@wheel.dev", "wheel-dev-password");
-    expect(user.email).toBe("dev@wheel.dev");
-    expect(m.sessionToken()).toBe("local.abc");
-    expect(JSON.parse(window.localStorage.getItem("wheel.session")!).token).toBe("local.abc");
+    await m.signIn("  Dev@wheel.dev  ", "wheel-dev-password");
+    expect(call().url).toBe("/api/session/login");
+    expect(call().init?.method).toBe("POST");
+    // Trimmed, because a trailing space in an email is a typo the user cannot see.
+    expect(call().body).toEqual({ email: "Dev@wheel.dev", password: "wheel-dev-password" });
+    expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
   });
 
-  it("refuses a response it cannot read instead of storing a broken session", async () => {
+  it("signs up at its own route", async () => {
+    fetchMock.mockResolvedValue(respond(201, { user: USER }));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, { token: 42 })));
+    expect((await m.signUp("dev@wheel.dev", "wheel-dev-password")).id).toBe("u1");
+    expect(call().url).toBe("/api/session/signup");
+  });
+
+  it("refuses an answer it cannot read instead of pretending to be signed in", async () => {
+    fetchMock.mockResolvedValue(respond(200, {}));
+    const m = await load();
     await expect(m.signIn("dev@wheel.dev", "x")).rejects.toThrow(/can't read/i);
-    expect(m.sessionToken()).toBeNull();
+    expect(m.sessionSnapshot().status).not.toBe("authed");
   });
 
-  it("surfaces the API's own message for a rejected credential", async () => {
-    const m = await load();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        respond(401, { error: { code: "invalid_credentials", message: "that email and password don't match" } }),
-      ),
+  it("surfaces the API's own message, which the server passes through", async () => {
+    fetchMock.mockResolvedValue(
+      respond(401, { error: { code: "invalid_credentials", message: "that email and password don't match" } }),
     );
+    const m = await load();
     await expect(m.signIn("dev@wheel.dev", "nope")).rejects.toThrow("that email and password don't match");
   });
 
   it("turns a bare 429 into a countdown the user can act on", async () => {
+    fetchMock.mockResolvedValue(respond(429, {}, { "retry-after": "30" }));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(429, {}, { "retry-after": "30" })));
     await expect(m.signIn("dev@wheel.dev", "nope")).rejects.toThrow(/30 seconds/);
   });
 
   it("does not accuse the user, because the limit is keyed per account", async () => {
+    fetchMock.mockResolvedValue(respond(429, {}));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(429, {})));
-    // Someone else hammering your email throttles you; "too many attempts" would blame the wrong person.
     await expect(m.signIn("dev@wheel.dev", "nope")).rejects.toThrow(/paused for this account/i);
   });
 
-  it("reports an unreachable API as offline, not as bad credentials", async () => {
+  it("names this app's server, not the API, when nothing can be reached at all", async () => {
+    fetchMock.mockRejectedValue(new TypeError("failed to fetch"));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("failed to fetch"); }));
+    await expect(m.signIn("dev@wheel.dev", "x")).rejects.toThrow(/can't reach this app's server/i);
+  });
+
+  it("uses the server's words when it is the API that is down", async () => {
+    fetchMock.mockResolvedValue(
+      respond(502, { error: { code: "api_unreachable", message: "Can't reach the API. Check that it's running." } }),
+    );
+    const m = await load();
     await expect(m.signIn("dev@wheel.dev", "x")).rejects.toThrow(/can't reach the api/i);
-  });
-});
-
-describe("forgetting", () => {
-  it("clears local state even when the logout call fails", async () => {
-    const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
-    await m.signIn("dev@wheel.dev", "wheel-dev-password");
-
-    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("offline"); }));
-    await m.signOut();
-
-    expect(m.sessionToken()).toBeNull();
-    expect(window.localStorage.getItem("wheel.session")).toBeNull();
-  });
-
-  it("drops the session when any route 401s", async () => {
-    const m = await load();
-    const { notifyUnauthorized } = await import("./auth");
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
-    await m.signIn("dev@wheel.dev", "wheel-dev-password");
-    expect(m.sessionToken()).toBe("local.abc");
-
-    notifyUnauthorized();
-    expect(m.sessionToken()).toBeNull();
-    expect(window.localStorage.getItem("wheel.session")).toBeNull();
-  });
-
-  it("notifies subscribers so the UI re-renders instead of showing a stale identity", async () => {
-    const m = await load();
-    const seen: string[] = [];
-    m.subscribeSession(() => seen.push("changed"));
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
-    await m.signIn("dev@wheel.dev", "wheel-dev-password");
-    m.clearSession();
-    expect(seen.length).toBeGreaterThanOrEqual(2);
-  });
-});
-
-describe("signing up", () => {
-  it("posts to the signup route and keeps the session it gets back", async () => {
-    const m = await load();
-    const fetchMock = vi.fn(async () => respond(201, SESSION));
-    vi.stubGlobal("fetch", fetchMock);
-
-    const user = await m.signUp("  Dev@wheel.dev  ", "wheel-dev-password");
-
-    expect(user.id).toBe("u1");
-    expect(m.sessionToken()).toBe("local.abc");
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toMatch(/\/v1\/auth\/signup$/);
-    // Trimmed, because a trailing space in an email is a typo the user cannot see.
-    expect(JSON.parse(init.body as string).email).toBe("Dev@wheel.dev");
-  });
-
-  it("has its own words for a taken email when the API sends none", async () => {
-    const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(409, undefined)));
-    await expect(m.signUp("dev@wheel.dev", "wheel-dev-password")).rejects.toThrow(/already an account/i);
   });
 
   it.each([
     [400, /check the email and password/i],
+    [401, /don't match an account/i],
+    [409, /already an account/i],
     [500, /api failed/i],
     [418, /didn't work/i],
   ])("falls back to plain copy for a bare %i", async (status, pattern) => {
+    fetchMock.mockResolvedValue(respond(status));
     const m = await load();
-    vi.stubGlobal("fetch", vi.fn(async () => respond(status, undefined)));
     await expect(m.signIn("dev@wheel.dev", "x")).rejects.toThrow(pattern);
+  });
+});
+
+describe("forgetting", () => {
+  it("clears the cookie before the UI signs out, so a navigation cannot race it", async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+
+    let statusWhileLoggingOut: string | undefined;
+    fetchMock.mockImplementationOnce(async () => {
+      statusWhileLoggingOut = m.sessionSnapshot().status;
+      return respond(204);
+    });
+    await m.signOut();
+
+    expect(call(1).url).toBe("/api/session/logout");
+    expect(statusWhileLoggingOut).toBe("authed");
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("signs the UI out even when the server cannot be reached", async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    fetchMock.mockRejectedValueOnce(new TypeError("offline"));
+    await m.signOut();
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("drops the session when any route 401s", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
+    const m = await load();
+    const { notifyUnauthorized } = await import("./auth");
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    notifyUnauthorized();
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("notifies subscribers, and only when something changed", async () => {
+    fetchMock.mockResolvedValue(respond(200, { user: USER }));
+    const m = await load();
+    const seen = vi.fn();
+    m.subscribeSession(seen);
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    m.clearSession();
+    m.clearSession();
+    expect(seen).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("changing the password", () => {
+  it("posts both passwords, then signs out — the API ended every session, this one included", async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    fetchMock.mockResolvedValueOnce(respond(204));
+    await m.changePassword("wheel-dev-password", "a-brand-new-password");
+    expect(call(1).url).toBe("/api/session/password");
+    expect(call(1).body).toEqual({ current_password: "wheel-dev-password", new_password: "a-brand-new-password" });
+    expect(m.sessionSnapshot().status).toBe("anon");
+  });
+
+  it("refuses when not signed in, without a round trip", async () => {
+    const m = await load();
+    await expect(m.changePassword("a", "b")).rejects.toThrow(/not signed in/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("stays signed in when the API refuses the new password", async () => {
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.signIn("dev@wheel.dev", "wheel-dev-password");
+    fetchMock.mockResolvedValueOnce(respond(400, { error: { code: "weak_password", message: "too short" } }));
+    await expect(m.changePassword("wheel-dev-password", "short")).rejects.toThrow("too short");
+    expect(m.sessionSnapshot().status).toBe("authed");
   });
 });
 
@@ -198,26 +280,17 @@ describe("useSession", () => {
     render(<Who />);
     expect(screen.getByText("loading")).toBeTruthy();
 
-    act(() => m.hydrateSession());
+    fetchMock.mockResolvedValueOnce(respond(200, { user: null }));
+    await act(async () => {
+      await m.hydrateSession();
+    });
     expect(screen.getByText("anon")).toBeTruthy();
 
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
+    fetchMock.mockResolvedValueOnce(respond(200, { user: USER }));
     await act(async () => {
       await m.signIn("dev@wheel.dev", "wheel-dev-password");
     });
     expect(screen.getByText("dev@wheel.dev")).toBeTruthy();
-  });
-});
-
-describe("mode guard", () => {
-  it("does not hijack the token getter when another provider owns sessions", async () => {
-    const m = await load("clerk");
-    const auth = await import("./auth");
-    auth.setTokenGetter(async () => "clerk-token");
-    vi.stubGlobal("fetch", vi.fn(async () => respond(200, SESSION)));
-    await m.signIn("dev@wheel.dev", "wheel-dev-password");
-    // The local store holds a token, but the API client still asks Clerk for one.
-    await expect(auth.getAuthToken()).resolves.toBe("clerk-token");
   });
 });
 

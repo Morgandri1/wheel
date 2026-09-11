@@ -6,7 +6,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
-import { AUTH_MODE } from "@/lib/auth";
+import { authMode } from "@/lib/auth";
 import { ClerkGate } from "@/components/clerk-bridge";
 import { ToastHost } from "@/components/ui/toast";
 
@@ -37,7 +37,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   return (
     <QueryClientProvider client={client}>
-      {AUTH_MODE === "clerk" ? <ClerkGate>{tree}</ClerkGate> : tree}
+      {authMode() === "clerk" ? <ClerkGate>{tree}</ClerkGate> : tree}
     </QueryClientProvider>
   );
 }

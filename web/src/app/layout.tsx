@@ -6,7 +6,7 @@ import type { Metadata } from "next";
 import { Archivo, JetBrains_Mono } from "next/font/google";
 import { Providers } from "@/app/providers";
 import { RuntimeConfig } from "@/components/runtime-config";
-import { serverApiBaseUrl } from "@/lib/runtime-config";
+import { serverAuthMode } from "@/lib/runtime-config";
 import "./globals.css";
 
 /**
@@ -46,8 +46,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" data-theme="dark" suppressHydrationWarning>
       <body className={`${archivo.variable} ${mono.variable}`}>
-        {/* Before Providers, so the URL is recorded ahead of the first query. */}
-        <RuntimeConfig apiUrl={serverApiBaseUrl()} />
+        {/* Before Providers, so the mode is recorded ahead of anything that branches on it. */}
+        <RuntimeConfig authMode={serverAuthMode()} />
         <Providers>{children}</Providers>
       </body>
     </html>

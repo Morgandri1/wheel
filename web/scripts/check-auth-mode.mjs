@@ -5,23 +5,24 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 /**
- * Fails when the web build's auth mode and the API's disagree.
+ * Fails when the web server's auth mode and the API's disagree.
  *
  * This is the one deployment error neither lane can see alone: both halves are individually
- * correct and the pair is broken, and the symptom is a user who cannot log in. Run it against a
- * deployed API after a deploy, or in CI.
+ * correct and the pair is broken, and the symptom is a user who cannot log in. Run it with the
+ * web server's own environment, against the API it talks to, after a deploy or in CI.
  *
- *   NEXT_PUBLIC_API_URL=https://api.example NEXT_PUBLIC_AUTH_MODE=local node scripts/check-auth-mode.mjs
+ *   WHEEL_API_URL=https://api.example WHEEL_AUTH_MODE=local node scripts/check-auth-mode.mjs
  *
+ * The legacy NEXT_PUBLIC_ names are read as fallbacks, as the server itself does.
  * Exit 0 agree · 1 disagree · 2 could not tell (which is NOT a pass).
  */
 import { authModeMismatch, serverAuthMode } from "../src/lib/auth-mode-check.ts";
 
-const api = process.env.NEXT_PUBLIC_API_URL;
-const client = process.env.NEXT_PUBLIC_AUTH_MODE ?? "mock";
+const api = process.env.WHEEL_API_URL || process.env.NEXT_PUBLIC_API_URL;
+const client = process.env.WHEEL_AUTH_MODE || process.env.NEXT_PUBLIC_AUTH_MODE || "mock";
 
 if (!api) {
-  console.error("NEXT_PUBLIC_API_URL is not set, so there is nothing to compare against.");
+  console.error("WHEEL_API_URL is not set, so there is nothing to compare against.");
   process.exit(2);
 }
 

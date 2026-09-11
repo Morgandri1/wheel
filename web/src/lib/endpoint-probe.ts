@@ -2,8 +2,10 @@
 // Licensed under the PolyForm Noncommercial License 1.0.0.
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
+import { notifyUnauthorized } from "@/lib/auth";
+
 /**
- * Hitting an endpoint's public URL from the browser, so "reachable" is a measurement.
+ * Hitting an endpoint's ingress, so "reachable" is a measurement.
  *
  * The panel used to assert that endpoints were reachable whenever the `http` capability was on.
  * That is a claim about configuration, not about the world: the engine may not serve ingress yet,
@@ -24,13 +26,12 @@ export type Probe =
 const BODY_LIMIT = 2000;
 
 /**
- * A browser reports a CORS refusal and a dead host identically — a TypeError with no status, by
- * design, so a page cannot use fetch to probe what it is not allowed to see. Reporting either as
- * "unreachable" would invent a fact we do not have.
+ * The test runs on this app's server, so a failed fetch here means that server was not reached —
+ * which says nothing about the endpoint. Reporting it as "unreachable" would invent a fact.
  */
 export function unreadableReason(error: unknown): string {
   const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
-  return `No readable response${detail}. The request failed, or the API did not allow this page to read the reply — the browser does not say which, so this is not evidence that the endpoint is down.`;
+  return `No reading${detail}: this app's server could not be reached to run the test. This is not evidence that the endpoint is down.`;
 }
 
 /** The API's `error.code`, if the body is its envelope. Anything else is not an error envelope. */
@@ -129,37 +130,79 @@ export function probeVerdict({
   return "The API answered.";
 }
 
+export const PROBE_ROUTE = "/api/wheel/probe";
+
 /**
- * Never sends credentials: this URL is public by definition and a session token has no business
- * on it. `no-store` so a cached 404 cannot be mistaken for a live measurement.
+ * Asks this app's server to hit the endpoint's ingress and report what came back
+ * (`src/lib/ingress-probe.ts`): the browser can neither reach nor name the API any more. The
+ * ingress request itself carries no credential; this call carries only the session cookie that
+ * proves the project is yours. `no-store` so a cached 404 cannot pass for a live measurement.
+ *
+ * The endpoint's OWN method, not always GET: ingress routes on the method, so a GET against a
+ * POST endpoint can only ever produce 404/405 and the queued-202 state would be unreachable from
+ * the one button that exists to show it.
  */
 export async function probeEndpoint(
-  url: string,
-  { method = "GET", fetchImpl = fetch }: { method?: string; fetchImpl?: typeof fetch } = {},
+  target: { projectId: string; path: string; method?: string },
+  { fetchImpl = fetch }: { fetchImpl?: typeof fetch } = {},
 ): Promise<Probe> {
-  // The endpoint's OWN method, not always GET: ingress routes on the method, so a GET against a
-  // POST endpoint can only ever produce 404/405 and the delivered-202 state would be unreachable
-  // from the one button that exists to show it.
-  const sendsBody = method !== "GET" && method !== "HEAD";
+  let res: Response;
   try {
-    const res = await fetchImpl(url, {
-      method,
-      credentials: "omit",
+    res = await fetchImpl(PROBE_ROUTE, {
+      method: "POST",
       cache: "no-store",
-      ...(sendsBody
-        ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ source: "wheel-endpoint-test" }) }
-        : {}),
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: target.projectId, method: target.method ?? "GET", path: target.path }),
     });
-    const text = await res.text().catch(() => "");
-    return {
-      kind: "answered",
-      status: res.status,
-      statusText: res.statusText,
-      body: text.slice(0, BODY_LIMIT),
-      truncated: text.length > BODY_LIMIT,
-      code: errorCode(text),
-    };
   } catch (error) {
     return { kind: "unreadable", reason: unreadableReason(error) };
+  }
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    if (res.status === 401) notifyUnauthorized();
+    return { kind: "unreadable", reason: refusalReason(res.status, text) };
+  }
+  const reading = readReading(text);
+  if (!reading) {
+    return {
+      kind: "unreadable",
+      reason: "This app's server answered the test with something it can't read, so there is no reading. This is not evidence that the endpoint is down.",
+    };
+  }
+  return {
+    kind: "answered",
+    status: reading.status,
+    statusText: reading.statusText,
+    body: reading.body.slice(0, BODY_LIMIT),
+    truncated: reading.truncated || reading.body.length > BODY_LIMIT,
+    code: errorCode(reading.body),
+  };
+}
+
+/** The test never ran, so nothing was learned about the endpoint — and the copy must not imply otherwise. */
+function refusalReason(status: number, text: string): string {
+  let message = "";
+  try {
+    const said = (JSON.parse(text) as { error?: { message?: unknown } })?.error?.message;
+    if (typeof said === "string") message = said;
+  } catch {
+    /* keep the status */
+  }
+  return `The test did not run${message ? `: ${message}` : ` (HTTP ${status})`}. This is not evidence that the endpoint is down.`;
+}
+
+function readReading(text: string): { status: number; statusText: string; body: string; truncated: boolean } | null {
+  try {
+    const r = JSON.parse(text) as { status?: unknown; status_text?: unknown; body?: unknown; truncated?: unknown };
+    if (typeof r?.status !== "number" || typeof r.body !== "string") return null;
+    return {
+      status: r.status,
+      statusText: typeof r.status_text === "string" ? r.status_text : "",
+      body: r.body,
+      truncated: r.truncated === true,
+    };
+  } catch {
+    return null;
   }
 }

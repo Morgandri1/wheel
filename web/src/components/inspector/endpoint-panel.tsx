@@ -83,11 +83,12 @@ export function EndpointPanel({
     responseMode !== node.config.response_mode ||
     authDirty;
 
-  // `??` is wrong here: the API sends ingress_base_url as an EMPTY STRING until the project has
-  // started, and an empty string is not null. That produced a "public URL" of just the path —
-  // "/hook" — which looks like a URL, copies like a URL, and goes nowhere.
-  const base = project.ingress_base_url || `${process.env.NEXT_PUBLIC_API_URL ?? ""}/p/${project.id}`;
-  const url = `${base.replace(/\/$/, "")}${node.config.path}`;
+  // The API is the only thing that knows its public address; the browser no longer knows any API
+  // address at all. It sends ingress_base_url as an EMPTY STRING until the project has started,
+  // so an empty one means "not yet", never a bare "/hook" that copies like a URL and goes nowhere.
+  const url = project.ingress_base_url
+    ? `${project.ingress_base_url.replace(/\/$/, "")}${node.config.path}`
+    : null;
 
   const reached = publicReach(node, nodes);
   const reach = reachSentence(reached);
@@ -119,7 +120,9 @@ export function EndpointPanel({
     setProbing(true);
     setProbe(null);
     try {
-      setProbe(await probeEndpoint(url, { method: node.config.method }));
+      setProbe(
+        await probeEndpoint({ projectId: project.id, path: node.config.path, method: node.config.method }),
+      );
     } finally {
       setProbing(false);
     }
@@ -169,7 +172,13 @@ export function EndpointPanel({
       ) : null}
 
       <Field label="Public URL" hint="Anyone with this link can hit it. There is no allowlist.">
-        <CopyField value={url} testId="inspector-endpoint-url" />
+        {url ? (
+          <CopyField value={url} testId="inspector-endpoint-url" />
+        ) : (
+          <p className="text-micro text-ink-faint" data-testid="inspector-endpoint-url-pending">
+            The public URL appears once the project has started.
+          </p>
+        )}
       </Field>
 
       {reach ? (
@@ -187,8 +196,8 @@ export function EndpointPanel({
           {probing ? "Sending…" : `Send test ${node.config.method}`}
         </Button>
         <span className="text-micro text-ink-faint">
-          A real {node.config.method} from this browser, using this endpoint&rsquo;s own method —
-          anything wired to it receives the hit.
+          A real {node.config.method}, sent by this app&rsquo;s server to the project&rsquo;s ingress
+          with this endpoint&rsquo;s own method — anything wired to it receives the hit.
         </span>
       </div>
 

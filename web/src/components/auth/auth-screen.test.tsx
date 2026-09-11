@@ -4,6 +4,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import type { AuthMode } from "@/lib/auth";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
@@ -14,19 +15,21 @@ vi.mock("next/navigation", () => ({
  * The sign-in form is the one place in the app where a user types a secret, so the only thing
  * tested here is that the secret cannot escape into a URL.
  *
- * AUTH_MODE is read at module load, so the module is imported fresh with the env stubbed —
- * imported at the top it renders the "not in local mode" notice and there is no form to assert on.
+ * The mode is what the server told the page, recorded in @/lib/auth. It is set here the way
+ * <RuntimeConfig> sets it; otherwise the screen renders the "not in local mode" notice and there is
+ * no form to assert on.
  */
-async function renderScreen(mode: "sign-in" | "sign-up") {
-  vi.stubEnv("NEXT_PUBLIC_AUTH_MODE", "local");
+async function renderScreen(mode: "sign-in" | "sign-up", authMode: AuthMode = "local") {
   vi.resetModules();
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ user: null })));
+  (await import("@/lib/auth")).setAuthMode(authMode);
   const { AuthScreen } = await import("@/components/auth/auth-screen");
   return render(<AuthScreen mode={mode} />);
 }
 
 afterEach(() => {
   cleanup();
-  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 /**
@@ -81,5 +84,12 @@ describe("the auth form cannot leak credentials into a URL", () => {
   it("offers a usable submit button once hydrated", async () => {
     await renderScreen("sign-in");
     expect((screen.getByTestId("btn-auth-submit") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe("outside local mode", () => {
+  it("names the server setting that would give it a form", async () => {
+    await renderScreen("sign-in", "mock");
+    expect(screen.getByTestId("auth-wrong-mode").textContent).toContain("WHEEL_AUTH_MODE=local");
   });
 });

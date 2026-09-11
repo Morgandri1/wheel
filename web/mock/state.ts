@@ -121,6 +121,8 @@ export function createProject(name: string): ProjectRecord {
       status: "stopped",
       created_at: now(),
       updated_at: now(),
+      // The API names the public ingress address; the web never builds one itself any more.
+      ingress_base_url: `http://localhost:${process.env.MOCK_PORT ?? 8787}/p/${id}`,
     },
     nodes: [],
     messages: [],

@@ -5,15 +5,14 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 /**
- * The only way web/ talks to Wheel. Never call the engine directly — everything goes through
- * api.wheel.dev, which authenticates the Clerk session and proxies to the project's container.
+ * The only way web/ talks to Wheel: through this app's own server, never to the API directly.
  *
- * Every project-scoped request carries x-auth-token and x-project-id. The token never appears in
- * a URL, a query string, or a log line.
+ * `/api/wheel/v1/…` is a same-origin proxy (`src/lib/api-proxy.ts`) that attaches the session on
+ * the server and forwards to the API, so the browser holds no token and does not know where the
+ * API lives. Project-scoped requests still carry x-project-id; the proxy passes that on.
  */
-import { ApiError, getAuthToken, notifyUnauthorized } from "@/lib/auth";
+import { ApiError, notifyUnauthorized } from "@/lib/auth";
 import type { LogStreamName } from "@/lib/schema";
-import { apiBaseUrl } from "@/lib/runtime-config";
 import { readOutcome, type ApplyOutcome } from "@/lib/board-apply";
 import { readInstantiateOutcome, type InstantiateOutcome, type TemplateBoard } from "@/lib/templates";
 import type {
@@ -31,7 +30,7 @@ import type {
   WireType,
 } from "@/lib/schema";
 
-export { apiBaseUrl } from "@/lib/runtime-config";
+const PROXY = "/api/wheel";
 
 interface RequestOptions {
   method?: string;
@@ -45,26 +44,28 @@ interface RequestOptions {
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const token = await getAuthToken();
-  const headers: Record<string, string> = { "x-auth-token": token };
+  const headers: Record<string, string> = {};
   if (opts.projectId) headers["x-project-id"] = opts.projectId;
   if (opts.body !== undefined) headers["content-type"] = "application/json";
 
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl()}${path}`, {
+    res = await fetch(`${PROXY}${path}`, {
       method: opts.method ?? "GET",
       headers,
+      credentials: "same-origin",
       body: opts.raw ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined),
       signal: opts.signal,
     });
   } catch (cause) {
     if ((cause as Error)?.name === "AbortError") throw cause;
-    throw new ApiError(0, "offline", "Can't reach the API. Check that it's running.");
+    // The API being down arrives as a 502 from the proxy, with its own message. Failing to fetch
+    // at all means this app's server was not reached.
+    throw new ApiError(0, "offline", "Can't reach this app's server. Check your connection.");
   }
 
-  // A 401 is the API telling us the token is dead. Dropping it here — once, centrally — is what
-  // turns "every request fails silently" into "you are signed out", wherever the 401 came from.
+  // A 401 means the session is dead. Acting on it here — once, centrally — is what turns "every
+  // request fails silently" into "you are signed out", wherever the 401 came from.
   if (res.status === 401) notifyUnauthorized();
   if (!res.ok) throw await toApiError(res);
   if (opts.expect === "void" || res.status === 204) return undefined as T;
@@ -112,17 +113,6 @@ export const projects = {
   stop: (id: string) => request<Project>(`/v1/projects/${id}/stop`, { method: "POST", projectId: id }),
   restart: (id: string) =>
     request<Project>(`/v1/projects/${id}/restart`, { method: "POST", projectId: id }),
-
-  /**
-   * §5: a browser cannot set headers on a WebSocket handshake, and the session JWT must never
-   * ride in a URL. The API mints a single-use ticket bound to (user, project) instead; it is
-   * the only credential that ever appears in a query string, and it expires in 30 seconds.
-   */
-  wsTicket: (id: string) =>
-    request<{ ticket: string; expires_in: number }>(`/v1/projects/${id}/ws-ticket`, {
-      method: "POST",
-      projectId: id,
-    }),
 };
 
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
@@ -140,10 +130,10 @@ export async function applyBoard(
   board: unknown,
   dryRun: boolean,
 ): Promise<ApplyOutcome> {
-  const token = await getAuthToken();
-  const res = await fetch(`${apiBaseUrl()}/v1/projects/${projectId}/board/apply`, {
+  const res = await fetch(`${PROXY}/v1/projects/${projectId}/board/apply`, {
     method: "POST",
-    headers: { "x-auth-token": token, "x-project-id": projectId, "content-type": "application/json" },
+    headers: { "x-project-id": projectId, "content-type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ board, dry_run: dryRun }),
   });
   if (res.status === 401) notifyUnauthorized();
@@ -171,10 +161,10 @@ export async function instantiateTemplate(
   board: TemplateBoard,
   capabilities?: { http: boolean },
 ): Promise<InstantiateOutcome> {
-  const token = await getAuthToken();
-  const res = await fetch(`${apiBaseUrl()}/v1/projects/instantiate`, {
+  const res = await fetch(`${PROXY}/v1/projects/instantiate`, {
     method: "POST",
-    headers: { "x-auth-token": token, "content-type": "application/json" },
+    headers: { "content-type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ name, board, capabilities }),
   });
   if (res.status === 401) notifyUnauthorized();

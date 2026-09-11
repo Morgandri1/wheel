@@ -6,29 +6,28 @@
 
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
-import { AUTH_MODE } from "@/lib/auth";
+import { authMode } from "@/lib/auth";
 import { hydrateSession, useSession } from "@/lib/local-auth";
 
 /**
- * Guards /app in local auth mode.
+ * Guards /app in local auth mode, behind middleware's cookie check.
  *
- * This runs in the browser rather than in middleware, because a local session lives in
- * localStorage and the server cannot see it — there is no cookie to read at the edge. That makes
- * this a routing courtesy, not a security boundary: the boundary is the API, which refuses every
- * request without a valid `x-auth-token` and 404s projects you do not own. The point here is that
- * a signed-out visitor lands on a sign-in page instead of on a board full of failed requests.
+ * Middleware can only see that a cookie is present; this asks the server whether it is still
+ * alive, and sends a visitor whose session has died to sign in. Both are routing courtesies, not
+ * a security boundary: the boundary is the API, which refuses every request without a valid
+ * session and 404s projects you do not own.
  *
- * The three states are deliberately distinct. `loading` means we have not looked in storage yet,
+ * The three states are deliberately distinct. `loading` means the server has not answered yet,
  * and redirecting during it would sign out every returning user for one frame.
  */
 export function SessionGate({ children }: { children: React.ReactNode }) {
   const session = useSession();
   const router = useRouter();
   const pathname = usePathname();
-  const local = AUTH_MODE === "local";
+  const local = authMode() === "local";
 
   useEffect(() => {
-    if (local) hydrateSession();
+    if (local) void hydrateSession();
   }, [local]);
 
   useEffect(() => {

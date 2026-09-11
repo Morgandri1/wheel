@@ -7,7 +7,7 @@
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { AUTH_MODE } from "@/lib/auth";
+import { authMode } from "@/lib/auth";
 import {
   MIN_PASSWORD_LENGTH,
   emailProblem,
@@ -21,7 +21,7 @@ import { WheelMark } from "@/components/header";
 import { Button, Field, Input } from "@/components/ui";
 
 /**
- * Sign in and sign up, for NEXT_PUBLIC_AUTH_MODE=local.
+ * Sign in and sign up, for WHEEL_AUTH_MODE=local.
  *
  * One component for both because they are the same form with a different verb; splitting them
  * duplicates every error path and then they drift. The difference is three strings and whether
@@ -62,7 +62,7 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
   const next = raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/app";
 
   useEffect(() => {
-    hydrateSession();
+    void hydrateSession();
   }, []);
 
   useEffect(() => {
@@ -97,12 +97,12 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
     }
   };
 
-  if (AUTH_MODE !== "local") {
+  if (authMode() !== "local") {
     return (
       <div className="plate max-w-sm p-5 text-meta text-ink-dim" data-testid="auth-wrong-mode">
-        This build is running <span className="ident">{AUTH_MODE}</span> auth, so it has no
-        email and password form. Set <span className="ident">NEXT_PUBLIC_AUTH_MODE=local</span> to
-        use one.
+        This server is running <span className="ident">{authMode()}</span> auth, so it has no
+        email and password form. Set <span className="ident">WHEEL_AUTH_MODE=local</span> on the
+        web server to use one.
       </div>
     );
   }

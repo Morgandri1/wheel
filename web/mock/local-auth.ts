@@ -49,10 +49,14 @@ export function userForToken(token: string): string | null {
   return tokens.get(token) ?? null;
 }
 
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The API's session shape, `expires_at` included, so the web server's cookie lifetime is exercised. */
 function issue(user: MockUser) {
   const token = `local.${randomUUID()}`;
   tokens.set(token, user.id);
-  return { token, user: { id: user.id, email: user.email } };
+  const expires_at = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  return { token, expires_at, user: { id: user.id, email: user.email } };
 }
 
 function assertCredentialShape(email: string, password: unknown) {

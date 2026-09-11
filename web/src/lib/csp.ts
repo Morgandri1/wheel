@@ -5,9 +5,13 @@
 /**
  * Content Security Policy (ADVERSARY R7, binding).
  *
- * The session token lives in localStorage, which any script on this origin can read. CSP is what
- * keeps that tradeoff bounded: no inline script, no eval, and a nonce that only our own server
- * can mint per request. A board XSS would otherwise be a week-long account takeover.
+ * The session is an httpOnly cookie, so script cannot read it — but script running on this origin
+ * can still USE it, by calling this app's routes while the page is open. CSP is what keeps that
+ * bounded: no inline script, no eval, and a nonce that only our own server can mint per request.
+ *
+ * `connect-src` is `'self'` and nothing else. The browser talks only to this app's server, which
+ * reaches the API itself; naming the API here would publish an address the browser never needs.
+ * Clerk mode adds Clerk's own hosts, because Clerk's script talks to Clerk.
  *
  * Two deliberate looseness decisions, both narrower than they look:
  *
@@ -22,28 +26,16 @@
  */
 export function buildCsp({
   nonce,
-  apiUrl,
   authMode,
   dev,
 }: {
   nonce: string;
-  apiUrl: string | undefined;
   authMode: string | undefined;
   dev: boolean;
 }): string {
-  const connect = new Set(["'self'"]);
-  const origin = safeOrigin(apiUrl);
-  if (origin) {
-    connect.add(origin);
-    // The events socket is the same origin over ws/wss; connect-src governs WebSocket too.
-    connect.add(origin.replace(/^http/, "ws"));
-  }
-  if (dev) {
-    // Dev server HMR, and whichever port the mock happens to be on.
-    connect.add("ws://localhost:*");
-    connect.add("http://localhost:*");
-    connect.add("http://127.0.0.1:*");
-  }
+  const connect = ["'self'"];
+  // The dev server's hot-reload socket.
+  if (dev) connect.push("ws://localhost:*", "ws://127.0.0.1:*");
 
   // 'strict-dynamic' turns off host allowlisting, so 'self' stops meaning anything and every
   // script must be nonced or loaded by a nonced one. That is what we want in production — and it
@@ -60,8 +52,7 @@ export function buildCsp({
     // Clerk loads its own script and talks to its own API; without these, clerk mode has no
     // sign-in at all. Listed only in the mode that uses them.
     script.push("https://*.clerk.accounts.dev", "https://*.clerk.com");
-    connect.add("https://*.clerk.accounts.dev");
-    connect.add("https://*.clerk.com");
+    connect.push("https://*.clerk.accounts.dev", "https://*.clerk.com");
     frame.length = 0;
     frame.push("https://*.clerk.accounts.dev", "https://*.clerk.com");
   }
@@ -72,7 +63,7 @@ export function buildCsp({
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",
-    `connect-src ${[...connect].join(" ")}`,
+    `connect-src ${connect.join(" ")}`,
     `frame-src ${frame.join(" ")}`,
     "worker-src 'self' blob:",
     "media-src 'none'",
@@ -85,19 +76,4 @@ export function buildCsp({
   if (!dev) directives.push("upgrade-insecure-requests");
 
   return directives.join("; ");
-}
-
-/**
- * An origin, or nothing. A malformed NEXT_PUBLIC_API_URL must not be able to inject a directive:
- * the URL parser rejects anything with a space or a semicolon in it long before we join.
- */
-function safeOrigin(url: string | undefined): string | null {
-  if (!url) return null;
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return parsed.origin;
-  } catch {
-    return null;
-  }
 }
