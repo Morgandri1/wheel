@@ -22,6 +22,17 @@ import { liveSessionToken, signInRedirect } from "@/lib/session-cookie";
  */
 const isProtected = createRouteMatcher(["/app", "/app/(.*)"]);
 
+/**
+ * `/api/wheel/*` forwards upstream bytes unchanged, and for anything that is not JSON,
+ * `proxy-rules.ts`'s `returnedResponseHeaders` sets `content-security-policy: sandbox` — the lock
+ * that keeps a chest blob or an SSE frame from running as a document with the user's session, if
+ * someone opens its raw URL directly. Next applies middleware's response headers LAST, after the
+ * route handler's, so unconditionally setting the document CSP here would silently replace that
+ * `sandbox` with the page policy and undo the lock. Nothing under this prefix is ever a page, so
+ * the document CSP has no job here and is left to whatever the route itself set.
+ */
+const PROXIED_API_PREFIX = "/api/wheel/";
+
 let clerk: NextMiddleware | null = null;
 const clerkGuard = (): NextMiddleware =>
   (clerk ??= clerkMiddleware(async (auth, req) => {
@@ -52,7 +63,9 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
 
   const res = mode === "clerk" ? await clerkGuard()(req, ev) : NextResponse.next({ request: { headers } });
   const out = res instanceof NextResponse ? res : NextResponse.next({ request: { headers } });
-  out.headers.set("content-security-policy", csp);
+  if (!req.nextUrl.pathname.startsWith(PROXIED_API_PREFIX)) {
+    out.headers.set("content-security-policy", csp);
+  }
   return out;
 }
 
