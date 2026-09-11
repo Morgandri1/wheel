@@ -40,11 +40,12 @@ Change one and restart; nothing is rebuilt. None of these ever reaches the brows
 
 | Variable | Default | Notes |
 |---|---|---|
-| `WHEEL_API_URL` | `http://127.0.0.1:8080` | Where this server reaches the API. Falls back to `NEXT_PUBLIC_API_URL` so an existing deployment keeps working — but that fallback is inlined when the server is built, and `WHEEL_API_URL` is not. A value that is not an http(s) URL fails every proxied request with the reason in the server log. `127.0.0.1` rather than `localhost`: Node may resolve `localhost` to `::1` while the API listens on IPv4 only. |
+| `WHEEL_API_URL` | `http://127.0.0.1:8080` (none in the Docker image) | Where this server reaches the API. Falls back to `NEXT_PUBLIC_API_URL` so an existing deployment keeps working — but that fallback is inlined when the server is built, and `WHEEL_API_URL` is not. A value that is not an http(s) URL stops the server from starting. `127.0.0.1` rather than `localhost`: Node may resolve `localhost` to `::1` while the API listens on IPv4 only. The image has no default and refuses to start without one: `127.0.0.1` inside a container is the container. |
 | `WHEEL_AUTH_MODE` | `mock` | `mock` · `dev` · `local` · `clerk` — see below. Falls back to `NEXT_PUBLIC_AUTH_MODE`. The server hands the mode to the page, so one build serves any mode. |
-| `WHEEL_DEV_TOKEN` | — | The token `dev` mode presents (and `mock` mode, if set). Replaces `NEXT_PUBLIC_DEV_TOKEN`, which put the token in the bundle. |
-| `WHEEL_PUBLIC_ORIGIN` | — | The origin browsers use, e.g. `https://wheel.example.com`. **Set it behind any TLS-terminating proxy.** When set it is the only thing the CSRF check compares `Origin` against and the only thing that decides whether the session cookie is `Secure`; forwarded headers are ignored. Anything but a bare http(s) origin fails loudly. |
-| `WHEEL_TRUST_PROXY` | off (on when `VERCEL=1`) | `1` to honour `X-Forwarded-Proto` / `X-Forwarded-Host` as the public origin. Only for a proxy that overwrites those headers (Caddy does by default; Vercel's edge always does) and only when this server cannot be reached around it. Without it, forwarded headers from any peer are ignored. `WHEEL_PUBLIC_ORIGIN` wins over both. |
+| `WHEEL_DEV_TOKEN` | — | The token `dev` mode presents. Replaces `NEXT_PUBLIC_DEV_TOKEN`, which put the token in the bundle. Mock mode never sends it. |
+| `WHEEL_ALLOW_INSECURE_AUTH` | off | `1` lets a production server run `mock` or `dev`, the modes where one credential serves every visitor. Without it a production server refuses to start in either — and an unset `WHEEL_AUTH_MODE` is `mock`. |
+| `WHEEL_PUBLIC_ORIGIN` | — | The origin browsers use, e.g. `https://wheel.example.com`. **Set it behind any TLS-terminating proxy, and for any address but localhost.** Without it (and without a trusted proxy) the `/api` routes answer only a loopback `Host`. See "The trust model". Anything but a bare http(s) origin stops the server from starting. |
+| `WHEEL_TRUST_PROXY` | off (on when `VERCEL=1`) | `1` to take the public origin from `X-Forwarded-Proto` / `X-Forwarded-Host` — the rightmost value, the one the nearest proxy wrote. Only for a proxy that overwrites them, with this server reachable through it alone. `WHEEL_PUBLIC_ORIGIN` wins over both. |
 | `WHEEL_PROXY_BODY_LIMIT_BYTES` | `5242880` | Request bodies over this are refused with 413 while streaming, before they are buffered. Keep it equal to the API's `INGRESS_BODY_LIMIT_BYTES` (5 MiB by default), which is the limit a chest upload actually meets. |
 | `CLERK_SECRET_KEY` | — | clerk mode only. **Never prefix with `NEXT_PUBLIC_`.** |
 
@@ -59,16 +60,19 @@ Change one and restart; nothing is rebuilt. None of these ever reaches the brows
 
 **An unrecognised value now fails loudly.** It used to be read as a plain string, so `locol` or
 `Local` rendered a sign-in page that "worked" and then 401'd on everything. Now the server refuses
-to render and logs `WHEEL_AUTH_MODE="locol" is not one of: mock, dev, local, clerk.` Leading and
-trailing whitespace is forgiven; case is not.
+to start and logs `WHEEL_AUTH_MODE="locol" is not one of: mock, dev, local, clerk.` Leading and
+trailing whitespace is forgiven; case is not. Every setting is checked when the server starts
+(`src/instrumentation.ts`), which logs one line — `wheel-web: API … · auth … · public origin: …` —
+or refuses to come up.
 
 The web and the API disagreeing about the mode still looks like "sign-in succeeds and everything
 after it 401s". `pnpm check:auth-mode` (with the web server's env) compares the two.
 
 **`dev` and `mock` make this server an authenticated proxy for anyone who can reach it**: it
-presents its own credential for every visitor. That is the point of those modes, and why a
-dev- or mock-mode server must never be exposed. (Before this change the token sat in the bundle,
-which was the same exposure with less honesty about it.)
+presents one credential for every visitor. So a production server (`NODE_ENV=production`, which
+`next start`, the standalone server and the image all set) refuses to start in either mode — and
+mock is what an unset `WHEEL_AUTH_MODE` means — unless `WHEEL_ALLOW_INSECURE_AUTH=1` says an open
+server is meant. Mock presents only the mock's fixed token, never `WHEEL_DEV_TOKEN`.
 
 ### Build-time (`NEXT_PUBLIC_*`)
 
@@ -103,7 +107,8 @@ Inlined into the bundle when it is compiled: changing one needs a rebuild, and a
 
 ## Where the session lives — the trust model
 
-ADVERSARY: this is the section to attack.
+ADVERSARY: this is the section to attack. It is the one statement of the model; the code comments
+point here rather than repeating it.
 
 **local mode.** The API issues an HS256 session JWT at `/v1/auth/login|signup`. This server puts it
 in a cookie and returns only `{user}` to the page:
@@ -117,10 +122,24 @@ in a cookie and returns only `{user}` to the page:
 | `Path` | `/` | |
 | `Max-Age` | seconds until the API's `expires_at` (or the JWT's `exp`) | A session the API has already expired is refused rather than set. |
 
-`GET /api/session` asks the API's `/v1/auth/me` who the cookie belongs to. Logout clears the cookie
-even when the API cannot be reached. A password change clears it, because the API has revoked every
-session. Any 401 from the API clears it on the way back. The old `localStorage` mirror
-(`wheel.session`) is deleted.
+**Only a live-looking cookie is presented.** The value must be shaped like the API's session JWT and
+not past its own `exp`; anything else is treated as no session — and cleared — before a body is
+read or an upstream socket dialled. The signature is the API's to check; this only stops a garbage
+cookie from costing anything.
+
+`GET /api/session` asks the API's `/v1/auth/me` who the cookie belongs to, and only its explicit
+`{user: null}` signs the browser out: a 5xx, a timeout or no answer at all shows "Can't reach the
+server" and retries (1 s → 30 s) rather than bouncing a returning user to sign-in. Logout clears
+the cookie even when the API cannot be reached. A password change clears it, because the API has
+revoked every session. Any 401 from the API clears it on the way back. The old `localStorage`
+mirror (`wheel.session`) is deleted.
+
+**Session and probe calls to the API give up after 5 s** (a 504 `api_timeout`, distinct from the 502
+`api_unreachable`), so a sign-out or a session check cannot hang for as long as the platform
+allows. Proxied board calls are bounded only by the browser's own request.
+
+**Bodies are JSON or refused.** The session routes and the probe take only `application/json`
+(415 otherwise), so a form post from anywhere cannot be read as a sign-in.
 
 **clerk mode.** Clerk keeps its own session cookie on this origin; this server reads the token with
 `auth().getToken()` from `@clerk/nextjs/server` and attaches it. The browser never handles it.
@@ -132,12 +151,18 @@ same-origin` is accepted instead. Anything else is a 403, and so is any request 
 browser labels `Sec-Fetch-Site: cross-site`. SameSite=Lax is the first lock; this is the second,
 and the only one in dev/mock mode.
 
-The public origin is, in order: `WHEEL_PUBLIC_ORIGIN`; `X-Forwarded-Proto` + `X-Forwarded-Host`
-when `WHEEL_TRUST_PROXY` is on; otherwise the connection's own scheme and `Host`. A forged
-`X-Forwarded-*` from a peer nobody declared trusted is ignored — and so is the scheme Next derives
-from it. Set `WHEEL_PUBLIC_ORIGIN` and a DNS-rebound page is refused too, since its `Origin` is
-not yours. When a browser says a request is same-origin but its `Origin` is not the one computed,
-the server logs `…set WHEEL_PUBLIC_ORIGIN` — that is a proxy nobody told it about, not an attack.
+The public origin is, in order: `WHEEL_PUBLIC_ORIGIN`; the rightmost `X-Forwarded-Proto` +
+`X-Forwarded-Host` — the values the nearest proxy wrote — when `WHEEL_TRUST_PROXY` is on;
+otherwise the connection's own scheme and `Host`. A forged `X-Forwarded-*` from a peer nobody
+declared trusted is ignored, and so is the scheme Next derives from it (Next fills those headers
+only when absent, so a client's own survive). When a browser says a request is same-origin but its
+`Origin` is not the one computed, the server logs `…set WHEEL_PUBLIC_ORIGIN` — that is a proxy
+nobody told it about, not an attack.
+
+**DNS rebinding.** With neither `WHEEL_PUBLIC_ORIGIN` nor a trusted proxy, the `/api` routes answer
+only a loopback `Host` (`localhost`, `127.0.0.0/8`, `[::1]`): any other name may be an attacker's,
+rebound to this server, and a page on it is "same-origin" to itself. With `WHEEL_PUBLIC_ORIGIN`
+set, a rebound page's `Origin` is not yours and its writes are refused; its reads carry no cookie.
 
 **What an XSS can still do:** act as the user through same-origin calls while the page is open. It
 can no longer take the session away with it. The CSP (no inline script, per-request nonce,
@@ -151,18 +176,27 @@ requests are allowed to reach the API at all.
 
 All in `src/lib/proxy-rules.ts`, each one a unit test:
 
-- **Any path outside `/v1/projects…`.** `/v1/auth/*` in particular is never proxied: answered
-  through a generic proxy, a login would hand the JWT to page script. The ws-ticket route is not
-  proxied either; the web no longer mints tickets.
-- **Traversal.** Dot segments, encoded dot segments, encoded slashes and backslashes, control
-  characters and malformed escapes are refused, and the parsed target is checked again to be sure
-  it is exactly the path that was validated.
+- **Any route that is not one of the board's.** A positive list, compared on the raw path:
+  `/v1/projects`, `/v1/projects/:id`, `…/:id/{start,stop,restart}`, `…/:id/board/apply` and
+  `…/:id/engine/v1/…`. `/v1/auth/*` in particular is never proxied: answered through a generic
+  proxy, a login would hand the JWT to page script. Nor is ws-ticket, however it is spelled
+  (`ws%2Dticket`, `ws-ticket;x`) — it is simply not on the list.
+- **Traversal.** Each segment is decoded exactly once, and refused if what is left is `.` or `..`,
+  or holds a `%` (a second layer of encoding, `%252e%252e`, aimed at a hop that decodes again), a
+  slash, a backslash or a control character; so are empty segments, `;` and malformed escapes. The
+  parsed target is then checked again to be sure it is exactly the path that was validated. (The
+  API hardens its own hops separately — this is the second lock.)
 - **Headers.** Only `x-project-id` (a bare id — a folded duplicate is refused) and `content-type`
   (printable ASCII) are forwarded. The browser's cookies, a browser-supplied `x-auth-token` or
   `authorization`, and any `x-forwarded-*` never leave. The response comes back with a short
   allow-list of headers; `set-cookie`, `location`, `content-length` and `content-encoding` do not.
-- **Oversized bodies.** A declared `content-length` over the cap is refused without reading; an
-  undeclared body is counted while streaming and refused the moment it passes the cap.
+- **Rendering on this origin.** Every proxied response carries `x-content-type-options: nosniff`,
+  and anything that is not JSON also gets `content-security-policy: sandbox` and
+  `content-disposition: attachment`: a chest can hold HTML, and rendered here it would run with the
+  user's session.
+- **Oversized bodies.** A declared `content-length` over the cap is refused without reading. An
+  undeclared body is streamed to the API through a counter — never buffered here — which errors
+  the stream the moment it passes the cap, and the caller gets a 413.
 - **SSRF.** The target origin is `WHEEL_API_URL` and nothing else. The Host header, a forwarded
   host, the URL the request arrived on and anything in the query cannot change it, and redirects
   from the API are not followed.
@@ -170,7 +204,7 @@ All in `src/lib/proxy-rules.ts`, each one a unit test:
 ## The guard on /app
 
 In local mode, middleware sends a visitor with no session cookie from `/app…` to `/sign-in`
-(keeping `?next=`). It looks only for the cookie's presence. `SessionGate` then asks
+(keeping `?next=`). It looks only for a cookie shaped like a live session. `SessionGate` then asks
 `/api/session` whether the session is alive and redirects if it is not. Both are routing
 courtesies; the API is the boundary. In clerk mode Clerk's middleware guard applies instead.
 
@@ -187,8 +221,14 @@ minted and no credential is ever in a URL. Each frame is relayed verbatim as one
 - `event: wheel-error` with `{"status": …}` when upstream refuses or fails. A 401 signs the UI out;
   anything else reconnects with backoff (0.5 s → 15 s, reset on a real open). EventSource's own
   retry is never used, because it has no backoff and no idea that a 401 is final.
-- The upstream socket closes when the browser goes away, and a reader more than 1 MiB behind is
-  disconnected so it reconnects and refetches instead of buffering forever.
+- The relay has no replay. When a stream reopens after any gap — a reader more than 1 MiB behind is
+  disconnected, the platform cuts it, or it reaches its 15-minute lifetime — `events.ts` calls
+  `onResync` and the board refetches, exactly as it does for the engine's own `lagged`. The
+  lifetime is also why a session revoked at the API stops streaming within 15 minutes.
+- The upstream socket closes when the browser goes away. A garbage or expired cookie never dials
+  one. At most 8 streams per session, 32 per client address (only as trustworthy as the proxy that
+  recorded it) and 1024 per server process are open at once; past that the answer is 429 and the
+  client backs off.
 
 If the board loads but never goes live, look at the `events` request in the network tab: an
 immediate `wheel-error` says exactly what upstream answered.
@@ -258,8 +298,11 @@ The same app ships as a package that needs no toolchain: Next's standalone serve
 ```
 npx wheel-web                                   # API at http://127.0.0.1:8080, local auth
 npx wheel-web --port 3400 --api http://127.0.0.1:8080
-WHEEL_API_URL=http://10.0.0.5:8080 npx wheel-web
+npx wheel-web --public-origin http://192.168.1.5:3000   # opened from another machine
 ```
+
+Without `--public-origin` (or `WHEEL_PUBLIC_ORIGIN`) the server's `/api` routes answer only on
+localhost — see "DNS rebinding" above.
 
 Build and assemble it with `pnpm build:pkg && pnpm pack:pkg`; the publishable tree lands in
 `dist-pkg/` (gitignored) and is published as `wheel-web`, versioned with the API.
@@ -267,7 +310,8 @@ Build and assemble it with `pnpm build:pkg && pnpm pack:pkg`; the publishable tr
 The API URL and the auth mode are both read by the server when it starts; nothing about either is
 baked into the bundle, so one package works against any API. The bin sets `WHEEL_AUTH_MODE=local`
 unless the environment says otherwise. Since the browser never talks to the API, `wheeld` can
-listen on `127.0.0.1` only and still serve a board opened from another machine through this server.
+listen on `127.0.0.1` only and still serve a board opened from another machine through this server
+(given `--public-origin`).
 
 Three traps in this pipeline, all of which produce a package that looks fine:
 
@@ -285,16 +329,18 @@ Three traps in this pipeline, all of which produce a package that looks fine:
 
 ```
 docker build -f docker/Dockerfile.web -t wheel-web .
-docker run --rm -p 3000:3000 -e WHEEL_API_URL=http://api:8080 wheel-web
+docker run --rm --read-only -p 3000:3000 -e WHEEL_API_URL=http://api:8080 wheel-web
 ```
 
 A standalone build (`WHEEL_STANDALONE=1`) on `node:22-bookworm-slim`, running as uid 10001 and
-listening on `0.0.0.0:3000` inside the container. `HEALTHCHECK` fetches `/version.json`.
+listening on `0.0.0.0:3000` inside the container. `HEALTHCHECK` fetches `/version.json`. The files
+are root-owned and never written, so the container runs with a read-only root filesystem.
 
 | Runtime env | Default in the image |
 |---|---|
-| `WHEEL_API_URL` | `http://127.0.0.1:8080` — in compose, set it to the API service, e.g. `http://api:8080` |
+| `WHEEL_API_URL` | **none** — required; the container exits 64 with a sentence if it is unset. In compose, the API service, e.g. `http://wheeld:8080` |
 | `WHEEL_AUTH_MODE` | `local` |
+| `WHEEL_PUBLIC_ORIGIN` | none — set it behind the proxy, e.g. `https://wheel.example.com` |
 
 The build context is the repo root, like the other images; `docker/Dockerfile.web.dockerignore`
 narrows it to `web/` (BuildKit reads it in place of the root `.dockerignore`, which excludes

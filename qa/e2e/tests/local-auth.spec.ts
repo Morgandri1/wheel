@@ -246,10 +246,12 @@ test("E2E-local-revoked: a session the API has revoked signs you out instead of 
   await page.waitForURL(/\/app$/);
   await expect(page.getByTestId(T.sessionBadge)).toBeVisible();
 
-  // Exactly what an expired token looks like from the browser: a cookie still present, no
-  // longer accepted by the API.
+  // Exactly what a revoked session looks like from the browser: the cookie is still there and
+  // still looks live, and the API no longer accepts it. Revoked at the API itself, the way a
+  // sign-out on another device would.
   const live = (await sessionCookie(page))!;
-  await page.context().addCookies([{ ...live, value: "local.00000000-0000-4000-8000-000000000000" }]);
+  const revoked = await fetch(`${API}/v1/auth/logout`, { method: "POST", headers: { "x-auth-token": live.value } });
+  expect(revoked.ok).toBe(true);
   await page.reload();
   await page.waitForURL(/\/sign-in/, { timeout: 15_000 });
   // The web server clears a cookie the API has refused, on the way back.

@@ -18,7 +18,7 @@ import { T } from "../testids";
  * The second half guards the other direction: a credential that comes from a vault must not make
  * the browser sign-in unreachable. That is how a vault gets its FIRST value.
  */
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
+const API = process.env.WHEEL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
 const TOKEN = process.env.WHEEL_E2E_TOKEN ?? "dev";
 
 type Recorder = { __authFlowEvents: string[] };
