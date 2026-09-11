@@ -18,11 +18,13 @@ Group=wheel
 EnvironmentFile=/etc/wheel/wheeld.env
 EnvironmentFile=-/etc/wheel/wheeld.local.env
 ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind 127.0.0.1:8080
-# control-group, not mixed: systemd's supported native mode. wheeld's own SIGTERM handler drains
-# in-flight turns for up to 20s and stops every agent's process group itself, inside this 30s
-# budget; anything still in the cgroup after the timeout is killed.
-KillMode=control-group
-TimeoutStopSec=30
+# mixed: SIGTERM goes to wheeld alone, which drains in-flight turns (~28s) and stops every agent's
+# own process group itself — sending SIGTERM to the whole cgroup directly (control-group) would
+# race wheeld's own orchestrated shutdown instead of letting it run. Whatever is left in the cgroup
+# after the timeout is killed. TimeoutStopSec gives real margin over the ~28s drain, not the bare
+# minimum, since the last couple of seconds are exactly where a slow shutdown gets killed early.
+KillMode=mixed
+TimeoutStopSec=35
 # Also the auto-update hook: WHEEL_UPDATE_RESTART=exit swaps the binary and exits 75.
 Restart=on-failure
 RestartSec=2

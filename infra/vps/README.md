@@ -304,8 +304,8 @@ cd infra/vps && ./deploy.sh --dry-run   # confirm the settings still resolve the
 docker compose -p wheel logs --tail 50 wheeld
 ```
 
-wheeld gets 30 seconds on SIGTERM to stop every engine and each agent's processes. Agents come back
-parked and pick their sessions up on the next message.
+wheeld gets 35 seconds on SIGTERM to drain in-flight turns (about 28s) and stop every agent's own
+process group. Agents come back parked and pick their sessions up on the next message.
 
 ## Installing Docker
 

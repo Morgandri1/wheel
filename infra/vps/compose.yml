@@ -39,7 +39,9 @@ services:
       context: ../..
       dockerfile: docker/Dockerfile.wheeld
     restart: unless-stopped
-    stop_grace_period: 30s
+    # wheeld drains in-flight turns on SIGTERM (~28s) before stopping every agent's process group
+    # itself; this gives real margin over that rather than the bare minimum.
+    stop_grace_period: 35s
     depends_on:
       preflight:
         condition: service_completed_successfully
