@@ -57,17 +57,20 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write a secret to a file created fresh, readable only by its owner.
+/// Write a secret readable only by its owner, atomically and durably.
 ///
-/// Removed first, then created exclusively at 0600: opening an existing file keeps whatever mode
-/// it already had, and a token left world-readable by some earlier accident would stay that way.
+/// A fresh file is created exclusively at 0600 beside the target, written and synced, renamed over
+/// it, and the directory synced. A reader sees the old secret or the new one, never a torn file; an
+/// existing file's looser mode is never inherited; and a crash cannot undo a write the caller was
+/// told had happened.
 pub fn write_new_private(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("replacing {}", path.display())),
-    }
+    let dir = path.parent().context("a private file needs a directory")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secret");
+    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -75,8 +78,20 @@ pub fn write_new_private(path: &Path, contents: &str) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    opts.open(path)?.write_all(contents.as_bytes())?;
-    Ok(())
+    let written = (|| -> Result<()> {
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The API's store: `STORE` when the operator set one, else the SQLite file in the data directory.
@@ -291,6 +306,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the old file's mode survived: {mode:o}");
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["operator-token"],
+            "a temporary file was left behind"
+        );
     }
 
     #[test]

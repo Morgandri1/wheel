@@ -85,7 +85,13 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
             Ok(())
         }
         config::Action::PrintVersion => {
-            println!("wheeld {}", env!("CARGO_PKG_VERSION"));
+            // The commit is baked in at compile time, as the engine's is: an image built with
+            // --build-arg GIT_SHA names the commit it was built from, and a cargo build says so.
+            println!(
+                "wheeld {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("WHEEL_BUILD_SHA").unwrap_or("unknown")
+            );
             Ok(())
         }
         config::Action::Run(settings) => run(settings).await,
@@ -181,10 +187,12 @@ fn default_public_base(bind: &str) -> String {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
-    match () {
-        _ if local => format!("http://localhost:{port}"),
-        _ if host.contains(':') => format!("http://[{host}]:{port}"),
-        _ => format!("http://{host}:{port}"),
+    if local {
+        format!("http://localhost:{port}")
+    } else if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
     }
 }
 

@@ -89,6 +89,7 @@ web page from reaching wheeld through DNS rebinding.
 **Behind a reverse proxy** (the VPS kit in `infra/vps/` sets all of these):
 - `PUBLIC_BASE_URL=https://<domain>`, so ingress URLs and sessions name the public address.
 - `WHEEL_TRUSTED_PROXIES`, the proxy's address, so `X-Forwarded-For` is believed from it and from no one else.
+  Trusting `127.0.0.1` trusts every local process, agents included; the Docker layout trusts the proxy's container.
 - `WHEEL_ALLOWED_HOSTS=<domain>`, because the proxy passes the public `Host` through.
 
 ### 2. Docker, headless

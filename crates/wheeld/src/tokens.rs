@@ -73,8 +73,7 @@ pub async fn run(
             let tokens = api_token::list_all(&db).await?;
             if tokens.is_empty() {
                 writeln!(err, "no tokens")?;
-            }
-            if !tokens.is_empty() {
+            } else {
                 writeln!(
                     out,
                     "{:<36}  {:<28}  {:<16}  {:<19}  {:<19}  REVOKED",

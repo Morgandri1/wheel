@@ -550,6 +550,12 @@ says. A client can write that header itself. So:
 Both the `wheel-api` binary and `wheeld` apply this, and both are served with the peer address
 available to it. For a proxy on the same machine, `WHEEL_TRUSTED_PROXIES=127.0.0.1/32,::1`.
 
+**Trusting loopback trusts every process on the machine, agents included.** A native agent can connect
+over loopback and claim any client address for a hit on another project's `/p/…`, which defeats that
+endpoint's `ip_allow` and per-caller limit. A dedicated loopback alias does not change that, since any
+local process may bind the alias as its source. Prefer the Docker layout, where the trusted address
+is the proxy's own container, on a network the agents are not on.
+
 ## Cookies are never credentials
 
 The API reads a credential from `x-auth-token` or `Authorization: Bearer` and from nothing else.
