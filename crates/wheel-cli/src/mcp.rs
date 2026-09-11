@@ -386,18 +386,33 @@ mod tests {
 
     #[test]
     fn an_awaited_answer_is_the_text_and_anything_else_is_a_tool_error() {
-        let done = awaited_result(json!(1), &json!({"id": "m", "outcome": "consumed", "result": "42"}));
+        let done = awaited_result(
+            json!(1),
+            &json!({"id": "m", "outcome": "consumed", "result": "42"}),
+        );
         assert_eq!(done["result"]["isError"], false);
         assert_eq!(done["result"]["content"][0]["text"], "42");
 
-        let waiting = awaited_result(json!(1), &json!({"id": "m", "outcome": "timeout", "state": "delivered"}));
+        let waiting = awaited_result(
+            json!(1),
+            &json!({"id": "m", "outcome": "timeout", "state": "delivered"}),
+        );
         assert_eq!(waiting["result"]["isError"], true);
         let text = waiting["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("still delivered") && text.contains("sent"), "{text}");
+        assert!(
+            text.contains("still delivered") && text.contains("sent"),
+            "{text}"
+        );
 
-        let failed = awaited_result(json!(1), &json!({"id": "m", "outcome": "error", "error": "boom"}));
+        let failed = awaited_result(
+            json!(1),
+            &json!({"id": "m", "outcome": "error", "error": "boom"}),
+        );
         assert_eq!(failed["result"]["isError"], true);
-        assert!(failed["result"]["content"][0]["text"].as_str().unwrap().contains("boom"));
+        assert!(failed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("boom"));
     }
 
     /// §3d rule 7: `<tool>__<op>` is a tool-node operation, and the split is

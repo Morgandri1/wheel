@@ -139,7 +139,8 @@ pub(crate) mod fake {
     use super::{claude::ClaudeDriver, Harness, HarnessEvent, SpawnSpec, StartupFailure};
     use std::{ffi::OsString, path::PathBuf};
 
-    pub(crate) const PROGRAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
+    pub(crate) const PROGRAM: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
 
     pub(crate) struct FakeClaude {
         pub config: PathBuf,
@@ -154,7 +155,10 @@ pub(crate) mod fake {
         }
         fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
             let mut env = ClaudeDriver.env(spec);
-            env.push(("WHEEL_FAKE_CONFIG".into(), self.config.display().to_string()));
+            env.push((
+                "WHEEL_FAKE_CONFIG".into(),
+                self.config.display().to_string(),
+            ));
             env
         }
         fn encode_turn(&self, envelope: &str) -> String {

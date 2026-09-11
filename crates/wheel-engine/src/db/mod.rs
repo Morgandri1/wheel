@@ -95,7 +95,11 @@ fn migrate(conn: &Connection) -> Result<()> {
     add_column(conn, "agent_state", "resume_at TEXT")?;
     add_column(conn, "agent_state", "quota TEXT")?;
     add_column(conn, "agent_state", "fallback_until TEXT")?;
-    add_column(conn, "messages", "limit_requeues INTEGER NOT NULL DEFAULT 0")?;
+    add_column(
+        conn,
+        "messages",
+        "limit_requeues INTEGER NOT NULL DEFAULT 0",
+    )?;
     // 0 = not requested, 1 = requested, 2 = sent. See messages::claim_notification.
     add_column(conn, "messages", "notify INTEGER NOT NULL DEFAULT 0")?;
     add_column(conn, "messages", "result TEXT")?;

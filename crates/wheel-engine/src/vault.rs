@@ -549,7 +549,9 @@ pub fn replace_session_if(
 /// `wheel secret get` every value in it.
 pub fn check_fallback(conn: &Connection, agent: Uuid, vault: Uuid) -> Result<(), String> {
     let Some(node) = board::get(conn, vault).map_err(|e| e.to_string())? else {
-        return Err(format!("fallback_vault {vault} is not a node on this board"));
+        return Err(format!(
+            "fallback_vault {vault} is not a node on this board"
+        ));
     };
     if node.node_type() != NodeType::Vault {
         return Err(format!(
@@ -578,8 +580,8 @@ pub fn check_fallback(conn: &Connection, agent: Uuid, vault: Uuid) -> Result<(),
 /// The spawn-time half of [`check_fallback`]: config time is one door, and a
 /// wire removed afterwards walks straight past it.
 pub fn fallback_vault(conn: &Connection, agent: Uuid) -> Result<Option<(Uuid, String)>> {
-    let Some(vault) = board::get(conn, agent)?
-        .and_then(|n| n.config.as_agent().and_then(|a| a.fallback_vault))
+    let Some(vault) =
+        board::get(conn, agent)?.and_then(|n| n.config.as_agent().and_then(|a| a.fallback_vault))
     else {
         return Ok(None);
     };

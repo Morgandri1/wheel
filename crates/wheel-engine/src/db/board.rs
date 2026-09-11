@@ -615,7 +615,12 @@ pub fn set_rate_limited(
     resume_at: Timestamp,
     reason: &str,
 ) {
-    set_status(conn, node, wheel_core::AgentStatus::RateLimited, Some(reason));
+    set_status(
+        conn,
+        node,
+        wheel_core::AgentStatus::RateLimited,
+        Some(reason),
+    );
     let _ = conn.execute(
         "UPDATE agent_state SET resets_at = ?2, resume_at = ?3 WHERE node_id = ?1",
         params![
@@ -718,7 +723,12 @@ mod fallback_tests {
     use wheel_core::{AgentConfig, CtxConfig, VaultConfig};
 
     fn node(name: &str, config: NodeConfig) -> Node {
-        Node::new(Uuid::new_v4(), name.parse().unwrap(), Position::default(), config)
+        Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        )
     }
 
     fn with_fallback(agent: &Node, fallback: Option<Uuid>) -> Node {
@@ -764,8 +774,10 @@ mod fallback_tests {
         );
         create(&c, &agent).unwrap();
 
-        assert!(refusal(update(&c, &with_fallback(&agent, Some(Uuid::new_v4()))))
-            .contains("not a node"));
+        assert!(
+            refusal(update(&c, &with_fallback(&agent, Some(Uuid::new_v4()))))
+                .contains("not a node")
+        );
         assert!(refusal(update(&c, &with_fallback(&agent, Some(notes.id)))).contains("not a vault"));
         assert!(
             refusal(update(&c, &with_fallback(&agent, Some(standby.id)))).contains("read wire"),
@@ -787,7 +799,9 @@ mod fallback_tests {
 
         // ...but choosing it again is judged again.
         update(&c, &with_fallback(&edited, None)).unwrap();
-        assert!(refusal(update(&c, &with_fallback(&edited, Some(standby.id)))).contains("read wire"));
+        assert!(
+            refusal(update(&c, &with_fallback(&edited, Some(standby.id)))).contains("read wire")
+        );
     }
 }
 

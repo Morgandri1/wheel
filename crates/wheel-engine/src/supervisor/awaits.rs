@@ -44,7 +44,10 @@ pub struct AwaitGraph {
 pub enum AwaitRefused {
     /// `waiting` is already blocked, directly or through others, on the
     /// caller, holding `message`.
-    Cycle { waiting: Uuid, message: Uuid },
+    Cycle {
+        waiting: Uuid,
+        message: Uuid,
+    },
     TooMany,
 }
 
@@ -256,10 +259,7 @@ mod tests {
         let guards: Vec<_> = (0..MAX_CONCURRENT_AWAITS)
             .map(|n| begin(&g, caller, id(10 + n as u8)).unwrap())
             .collect();
-        assert_eq!(
-            begin(&g, caller, id(99)).err(),
-            Some(AwaitRefused::TooMany)
-        );
+        assert_eq!(begin(&g, caller, id(99)).err(), Some(AwaitRefused::TooMany));
         assert!(
             begin(&g, id(2), id(99)).is_ok(),
             "the cap is per caller, not global"

@@ -1767,8 +1767,14 @@ impl Supervisor {
                         );
 
                         if let quota::TurnEnd::Limited(signal) = &end {
-                            self.on_limit(agent, finished, signal.clone(), on_fallback, over_budget)
-                                .await;
+                            self.on_limit(
+                                agent,
+                                finished,
+                                signal.clone(),
+                                on_fallback,
+                                over_budget,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -2291,7 +2297,9 @@ impl Supervisor {
                     &conn,
                     agent,
                     "engine",
-                    &format!("starting on the fallback credential from vault {vault} until {until}"),
+                    &format!(
+                        "starting on the fallback credential from vault {vault} until {until}"
+                    ),
                 );
                 true
             }
@@ -2593,8 +2601,14 @@ fn notify_sender(conn: &rusqlite::Connection, bus: &crate::events::Bus, mid: Uui
         })
         .unwrap_or(false);
     let body = awaits::notification_body(mid, &recipient, &settled, still_wired);
-    let note = messages::enqueue(conn, wheel_core::MessageSender::System, sender, body, Some(mid))
-        .ok()?;
+    let note = messages::enqueue(
+        conn,
+        wheel_core::MessageSender::System,
+        sender,
+        body,
+        Some(mid),
+    )
+    .ok()?;
     bus.publish(wheel_core::Event::Message { message: note });
     Some(sender)
 }
@@ -2973,18 +2987,20 @@ mod tests {
             harness_auth,
             script_execution_enabled: false,
         });
-        let sup = Arc::new(Supervisor::with_harness(
-            cfg,
-            Arc::new(Mutex::new(conn)),
-            Arc::new(crate::events::Bus::new()),
-            match driver {
-                Some(make) => make(program.display().to_string()),
-                None => Arc::new(ShimDriver {
-                    program: program.display().to_string(),
-                }),
-            },
-        )
-        .with_limit_jitter(0..=0));
+        let sup = Arc::new(
+            Supervisor::with_harness(
+                cfg,
+                Arc::new(Mutex::new(conn)),
+                Arc::new(crate::events::Bus::new()),
+                match driver {
+                    Some(make) => make(program.display().to_string()),
+                    None => Arc::new(ShimDriver {
+                        program: program.display().to_string(),
+                    }),
+                },
+            )
+            .with_limit_jitter(0..=0),
+        );
         (sup, id, dir)
     }
 
@@ -3809,7 +3825,9 @@ done
     }
 
     fn credential_sha(spawn: &serde_json::Value, var: &str) -> Option<String> {
-        spawn["credentials"][var]["sha256"].as_str().map(str::to_string)
+        spawn["credentials"][var]["sha256"]
+            .as_str()
+            .map(str::to_string)
     }
 
     /// The whole of item 1's first half: the window closes mid-work, the
@@ -3840,7 +3858,10 @@ done
             "the reset is the one the harness's rate_limit_event carried"
         );
         assert_eq!(state.resume_at, state.resets_at, "zero jitter in tests");
-        assert_eq!(state.quota.as_ref().map(|q| q.status.as_str()), Some("rejected"));
+        assert_eq!(
+            state.quota.as_ref().map(|q| q.status.as_str()),
+            Some("rejected")
+        );
         let mid = message_to(&sup, id);
         let s = settled(&sup, mid);
         assert_eq!(
@@ -3850,11 +3871,15 @@ done
         );
         assert!(s.last_error.unwrap_or_default().contains("rate limited"));
         assert_eq!(limit_requeues(&sup, mid), 1);
-        assert!(!has_process(&sup, id).await, "a parked agent holds no process");
+        assert!(
+            !has_process(&sup, id).await,
+            "a parked agent holds no process"
+        );
 
-        until("the requeued message to be consumed after the reset", || {
-            settled(&sup, mid).state == MessageState::Consumed
-        })
+        until(
+            "the requeued message to be consumed after the reset",
+            || settled(&sup, mid).state == MessageState::Consumed,
+        )
         .await;
         assert!(
             now_unix() >= reopens,
@@ -3920,9 +3945,16 @@ done
         sup.start(id).await.unwrap();
         enqueue(&sup, id, "build it");
         sup.deliver(id).await.unwrap();
-        until("the turn to end", || status_of(&sup, id) == AgentStatus::Error).await;
+        until("the turn to end", || {
+            status_of(&sup, id) == AgentStatus::Error
+        })
+        .await;
         let s = settled(&sup, message_to(&sup, id));
-        assert_eq!(s.outcome(), "error", "a task error is consumed: poison must not loop");
+        assert_eq!(
+            s.outcome(),
+            "error",
+            "a task error is consumed: poison must not loop"
+        );
         assert!(state_of(&sup, id).resume_at.is_none());
         assert!(engine_log(&sup, id)
             .iter()
@@ -3947,7 +3979,10 @@ done
             .to_string(),
         )
         .unwrap();
-        let (primary, standby) = ("sk-ant-oat01-primary-account", "sk-ant-api03-standby-account");
+        let (primary, standby) = (
+            "sk-ant-oat01-primary-account",
+            "sk-ant-api03-standby-account",
+        );
         wired_vault(&sup, id, "primary", "CLAUDE_CODE_OAUTH_TOKEN", primary);
         let standby_vault = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", standby);
         choose_fallback(&sup, id, standby_vault);
@@ -3967,9 +4002,16 @@ done
         );
         assert!(state_of(&sup, id).fallback_until.is_some());
         let runs = spawns(&dump);
-        assert_eq!(runs.len(), 2, "one spawn on the primary, one on the fallback");
+        assert_eq!(
+            runs.len(),
+            2,
+            "one spawn on the primary, one on the fallback"
+        );
         let sha = |v: &str| Some(wheel_core::sha256_hex(v.as_bytes()));
-        assert_eq!(credential_sha(&runs[0], "CLAUDE_CODE_OAUTH_TOKEN"), sha(primary));
+        assert_eq!(
+            credential_sha(&runs[0], "CLAUDE_CODE_OAUTH_TOKEN"),
+            sha(primary)
+        );
         assert_eq!(
             credential_sha(&runs[0], "ANTHROPIC_API_KEY"),
             None,
@@ -4000,7 +4042,13 @@ done
             .to_string(),
         )
         .unwrap();
-        wired_vault(&sup, id, "primary", "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-a");
+        wired_vault(
+            &sup,
+            id,
+            "primary",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "sk-ant-oat01-a",
+        );
         let standby = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", "sk-ant-api03-b");
         choose_fallback(&sup, id, standby);
 
@@ -4015,7 +4063,10 @@ done
         assert_eq!(spawns(&dump).len(), 2, "primary, then fallback, then park");
         let state = state_of(&sup, id);
         assert!(state.resume_at <= state.fallback_until);
-        assert_eq!(settled(&sup, message_to(&sup, id)).state, MessageState::Queued);
+        assert_eq!(
+            settled(&sup, message_to(&sup, id)).state,
+            MessageState::Queued
+        );
         sup.stop(id).await.ok();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4104,7 +4155,11 @@ done
             status_of(&sup, id) == AgentStatus::RateLimited
         })
         .await;
-        assert_eq!(spawns(&dump).len(), 1, "no second spawn on an unwired vault");
+        assert_eq!(
+            spawns(&dump).len(),
+            1,
+            "no second spawn on an unwired vault"
+        );
         assert!(engine_log(&sup, id)
             .iter()
             .any(|l| l.contains("no longer has a read wire")));
@@ -4153,13 +4208,13 @@ done
     /// run_on_startup agent whose window is still closed.
     #[tokio::test]
     async fn an_engine_restart_rearms_the_resume_and_keeps_a_closed_window_closed() {
-        let (sup, id, dir) =
-            fake_supervisor("quota-boot", serde_json::json!({}), |a| a.run_on_startup = true);
-        let (later, later_id, later_dir) = fake_supervisor(
-            "quota-boot-later",
-            serde_json::json!({}),
-            |a| a.run_on_startup = true,
-        );
+        let (sup, id, dir) = fake_supervisor("quota-boot", serde_json::json!({}), |a| {
+            a.run_on_startup = true
+        });
+        let (later, later_id, later_dir) =
+            fake_supervisor("quota-boot-later", serde_json::json!({}), |a| {
+                a.run_on_startup = true
+            });
         let ago = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
         let ahead = time::OffsetDateTime::now_utc() + time::Duration::seconds(600);
         {

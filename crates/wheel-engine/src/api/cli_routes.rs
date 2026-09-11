@@ -1298,7 +1298,12 @@ mod await_tests {
         let (status, Json(v)) = msg(
             State(s.clone()),
             ha,
-            ask("b", "what is six times seven <<FAKE:REPLY=forty-two>>", Some(60), false),
+            ask(
+                "b",
+                "what is six times seven <<FAKE:REPLY=forty-two>>",
+                Some(60),
+                false,
+            ),
         )
         .await
         .unwrap();
@@ -1308,7 +1313,10 @@ mod await_tests {
         assert_eq!(v["result"], "forty-two");
         assert!(v.get("error").is_none());
         // The receipt is still all there (§3c#3).
-        assert_eq!(v["bytes"], "what is six times seven <<FAKE:REPLY=forty-two>>".len());
+        assert_eq!(
+            v["bytes"],
+            "what is six times seven <<FAKE:REPLY=forty-two>>".len()
+        );
         stop_all(&s, &[b]).await;
     }
 
@@ -1341,10 +1349,7 @@ mod await_tests {
         let Json(later) = sent(
             State(s.clone()),
             ha,
-            axum::extract::Query(SentQuery {
-                id,
-                wait: Some(30),
-            }),
+            axum::extract::Query(SentQuery { id, wait: Some(30) }),
         )
         .await
         .unwrap();
@@ -1410,8 +1415,16 @@ mod await_tests {
             .filter(|m| m.from == MessageSender::System)
             .collect();
         assert_eq!(notes.len(), 1, "exactly one notification: {notes:?}");
-        assert_eq!(notes[0].reply_to, Some(id), "threaded to the message it is about");
-        assert!(notes[0].body.contains("to b finished: consumed"), "{}", notes[0].body);
+        assert_eq!(
+            notes[0].reply_to,
+            Some(id),
+            "threaded to the message it is about"
+        );
+        assert!(
+            notes[0].body.contains("to b finished: consumed"),
+            "{}",
+            notes[0].body
+        );
         assert!(notes[0].body.contains("all done"));
         assert!(!notes[0].body.contains("no news"));
         stop_all(&s, &[b]).await;
@@ -1437,7 +1450,11 @@ mod await_tests {
         let started = std::time::Instant::now();
         let refused = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            msg(State(s.clone()), hb, ask("a", "back at you", Some(60), false)),
+            msg(
+                State(s.clone()),
+                hb,
+                ask("a", "back at you", Some(60), false),
+            ),
         )
         .await
         .expect("B's ask must be answered at once, not hang")
@@ -1445,7 +1462,11 @@ mod await_tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(refused.0, StatusCode::CONFLICT);
         assert_eq!(refused.1, "await_cycle");
-        assert!(refused.2.contains("a is already waiting on you"), "{}", refused.2);
+        assert!(
+            refused.2.contains("a is already waiting on you"),
+            "{}",
+            refused.2
+        );
         assert!(messages_to(&s, a).is_empty(), "a refused ask sends nothing");
 
         let (_, Json(v)) = a_waits.await.unwrap().unwrap();
@@ -1467,7 +1488,12 @@ mod await_tests {
         let waiting = tokio::spawn(msg(
             State(s.clone()),
             ha,
-            ask("b", "<<FAKE:SLEEP=2>><<FAKE:REPLY=the secret plan>>", Some(60), false),
+            ask(
+                "b",
+                "<<FAKE:SLEEP=2>><<FAKE:REPLY=the secret plan>>",
+                Some(60),
+                false,
+            ),
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !messages_to(&s, b)
@@ -1481,7 +1507,10 @@ mod await_tests {
             let conn = s.db.lock().unwrap();
             board::remove_wire(&conn, a, b, WireType::Send).unwrap();
         }
-        let err = waiting.await.unwrap().expect_err("the result must be withheld");
+        let err = waiting
+            .await
+            .unwrap()
+            .expect_err("the result must be withheld");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(!err.2.contains("the secret plan"));
         stop_all(&s, &[b]).await;

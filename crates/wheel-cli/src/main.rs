@@ -1125,7 +1125,10 @@ mod tests {
         assert!(msg_options(&s(&["--await-reply=soon", "x"])).is_err());
         assert!(wait_option(&s(&["--wait=later"])).is_err());
         assert!(wait_option(&s(&["extra"])).is_err());
-        assert_eq!(wait_option(&s(&["--wait"])).unwrap(), Some(wheel_core::DEFAULT_AWAIT_SECS));
+        assert_eq!(
+            wait_option(&s(&["--wait"])).unwrap(),
+            Some(wheel_core::DEFAULT_AWAIT_SECS)
+        );
         assert_eq!(wait_option(&[]).unwrap(), None);
     }
 
@@ -1168,7 +1171,13 @@ mod tests {
 
         let cases: Vec<Vec<String>> = vec![
             s(&["msg", "peer", "--await-reply=30", "hello"]),
-            s(&["msg", "peer", "--notify", "--file", body_file.to_str().unwrap()]),
+            s(&[
+                "msg",
+                "peer",
+                "--notify",
+                "--file",
+                body_file.to_str().unwrap(),
+            ]),
             s(&["sent", "abc", "--wait=5"]),
         ];
         let listener = UnixListener::bind(&sock).unwrap();
@@ -1208,7 +1217,11 @@ mod tests {
         assert_eq!(body(&seen[1])["notify"], true);
         assert_eq!(body(&seen[1])["body"], "from a file");
         assert!(body(&seen[1]).get("await_secs").is_none());
-        assert!(seen[2].starts_with("GET /v1/cli/sent?id=abc&wait=5 HTTP/1.1"), "{}", seen[2]);
+        assert!(
+            seen[2].starts_with("GET /v1/cli/sent?id=abc&wait=5 HTTP/1.1"),
+            "{}",
+            seen[2]
+        );
 
         std::env::remove_var(wheel_core::spawn::ENV_ENGINE_URL);
         std::env::remove_var(wheel_core::spawn::ENV_TOKEN_FILE);

@@ -230,7 +230,10 @@ mod tests {
             classify_turn_end(true, Some("the build failed"), None, false),
             TurnEnd::TaskError
         );
-        assert_eq!(classify_turn_end(true, None, None, false), TurnEnd::TaskError);
+        assert_eq!(
+            classify_turn_end(true, None, None, false),
+            TurnEnd::TaskError
+        );
         assert_eq!(
             classify_turn_end(true, Some("Not logged in"), None, true),
             TurnEnd::NeedsAuth
@@ -274,16 +277,16 @@ mod tests {
         assert_eq!(backoff_secs(5), 4 * 3600);
         assert_eq!(backoff_secs(6), 5 * 3600, "capped");
         assert_eq!(backoff_secs(u32::MAX), 5 * 3600, "no overflow at the cap");
-        assert_eq!(resume_at(now(), None, 2, 3).unix_timestamp(), NOW + 1800 + 3);
+        assert_eq!(
+            resume_at(now(), None, 2, 3).unix_timestamp(),
+            NOW + 1800 + 3
+        );
     }
 
     #[test]
     fn the_requeue_cap_and_jitter_are_the_documented_values() {
         assert_eq!(MAX_LIMIT_REQUEUES, 12);
         assert_eq!(JITTER_SECS, 5..=64);
-        assert_eq!(
-            timestamp(NOW).unwrap().into_inner().unix_timestamp(),
-            NOW
-        );
+        assert_eq!(timestamp(NOW).unwrap().into_inner().unix_timestamp(), NOW);
     }
 }
