@@ -9,11 +9,14 @@
 
 pub mod config;
 pub mod embedded;
+pub mod guard;
 pub mod supervise;
+pub mod tokens;
 
 pub use config::Settings;
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Boot the whole product in this process.
@@ -25,8 +28,19 @@ pub async fn run(settings: Settings) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
-    start_host(&data_dir, &keys).await?;
-    serve_api(&settings.bind).await
+    let host = start_host(&data_dir, &keys).await?;
+    let served = serve_api(&settings.bind, &data_dir).await;
+    // After the API stops taking requests, before the process exits: every engine stops its
+    // agents, whatever ended serving. Nothing this daemon started may outlive it.
+    host.sandbox.shutdown_all().await;
+    served
+}
+
+/// The sandbox host, serving, and the engines behind it.
+pub struct Host {
+    /// The loopback URL the API reaches the host on.
+    pub url: String,
+    pub sandbox: Arc<embedded::EmbeddedSandbox>,
 }
 
 /// Everything the binary does, so that `main` is a call and nothing else.
@@ -71,10 +85,25 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
             Ok(())
         }
         config::Action::PrintVersion => {
-            println!("wheeld {}", env!("CARGO_PKG_VERSION"));
+            // The commit is baked in at compile time, as the engine's is: an image built with
+            // --build-arg GIT_SHA names the commit it was built from, and a cargo build says so.
+            println!(
+                "wheeld {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("WHEEL_BUILD_SHA").unwrap_or("unknown")
+            );
             Ok(())
         }
         config::Action::Run(settings) => run(settings).await,
+        config::Action::Token { data_dir, command } => {
+            tokens::run(
+                command,
+                &data_dir,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await
+        }
     }
 }
 
@@ -84,8 +113,8 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
 /// drive the whole host — router, store, embedded engines — without standing up Postgres, and what
 /// it exercises is the real wiring rather than a rehearsal of it.
 ///
-/// Returns the loopback URL the API should use.
-pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<String> {
+/// Returns the loopback URL the API should use, and the engines, which the caller stops.
+pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<Host> {
     // Loopback only, on a port the OS picks. Nothing outside this machine may reach the host: it
     // is the half of the process that can start and stop any project's engine.
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -96,7 +125,7 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
 
     supervise::apply_defaults(&supervise::composed_env(data_dir, keys, &host_url));
 
-    let host_state = build_host_state(data_dir)?;
+    let (host_state, sandbox) = build_host_state(data_dir)?;
     wheel_host::reconcile_on_boot(&host_state).await;
     tokio::spawn(async move {
         if let Err(e) = wheel_host::serve_on(host_listener, host_state).await {
@@ -104,11 +133,16 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
         }
     });
     tracing::info!(%host_url, "sandbox host ready");
-    Ok(host_url)
+    Ok(Host {
+        url: host_url,
+        sandbox,
+    })
 }
 
 /// The host, with engines embedded rather than spawned.
-fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState> {
+fn build_host_state(
+    data_dir: &std::path::Path,
+) -> Result<(wheel_host::HostState, Arc<embedded::EmbeddedSandbox>)> {
     let cfg = wheel_host::config::Config::from_env().context("host configuration")?;
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
@@ -117,9 +151,9 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
         data_dir.to_path_buf(),
         std::time::Duration::from_secs(cfg.start_timeout_secs),
     )?);
-    Ok(wheel_host::HostState {
+    let state = wheel_host::HostState {
         cfg,
-        sandbox,
+        sandbox: sandbox.clone(),
         store,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -127,7 +161,8 @@ fn build_host_state(data_dir: &std::path::Path) -> Result<wheel_host::HostState>
             .context("building the host http client")?,
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
         ready: wheel_host::Readiness::serving_from_start(),
-    })
+    };
+    Ok((state, sandbox))
 }
 
 /// `0.0.0.0:8080` is not an address a browser can open; say `localhost` instead.
@@ -141,33 +176,108 @@ fn displayable(bind: &str) -> String {
     }
 }
 
-async fn serve_api(bind: &str) -> Result<()> {
+/// Where this daemon says it is reached — the issuer of its sessions and the base of every ingress
+/// URL — when `PUBLIC_BASE_URL` does not say. `localhost` for loopback and wildcard binds, which is
+/// what every earlier install used, so their sessions keep their issuer across the upgrade.
+fn default_public_base(bind: &str) -> String {
+    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, "8080"));
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = host.is_empty()
+        || host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if local {
+        format!("http://localhost:{port}")
+    } else if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
+    let guard = Arc::new(guard::Guard::from_env(bind));
+    let trusted = Arc::new(
+        wheel_api::http::client_ip::TrustedProxies::from_env()
+            .map_err(anyhow::Error::msg)
+            .context("trusted proxies")?,
+    );
+    supervise::apply_defaults(&[("PUBLIC_BASE_URL", default_public_base(bind))]);
     let cfg = wheel_api::config::Config::from_env().context("api configuration")?;
+    if cfg.signup == wheel_api::config::SignupPolicy::Closed {
+        tracing::info!(
+            "signup is closed (WHEEL_SIGNUP=open opens it); the owner adds accounts with POST /v1/auth/users"
+        );
+    }
     let http = wheel_api::boot::http_client(&cfg)?;
     let db = wheel_api::boot::connect_and_migrate(&cfg).await?;
+    if let Some(path) = tokens::bootstrap_operator(&db, data_dir).await? {
+        tracing::info!(
+            path = %path.display(),
+            "wrote an operator token for the token-only owner account; send it as x-auth-token"
+        );
+    }
     let origins = wheel_api::boot::cors_origins_from_env();
+    if !origins.is_empty() {
+        tracing::info!(
+            origins = %origins.join(","),
+            "CORS_ALLOWED_ORIGINS lets pages on these origins call the API from a browser"
+        );
+    }
     let state = wheel_api::boot::build_state(cfg, db.clone(), http).await;
     wheel_api::boot::spawn_maintenance(db, std::time::Duration::from_secs(60));
 
-    let app = wheel_api::build_router(state, &origins);
+    let app = wheel_api::build_router(state, &origins)
+        .layer(axum::middleware::from_fn_with_state(guard, guard::check))
+        .layer(axum::middleware::from_fn_with_state(
+            trusted,
+            wheel_api::http::client_ip::resolve,
+        ));
+    if let Some(warning) = guard::exposure(bind) {
+        tracing::warn!("{warning}");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
     // The real address, not a guessed one: --bind exists, and telling someone to open a port the
     // process is not listening on is the least helpful possible first line.
     tracing::info!("wheel is ready — open http://{}", displayable(bind));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(stop_requested())
-        .await?;
+    // With connect info: the peer address is what decides whether X-Forwarded-For is believed.
+    let (asked, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let serving = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            stop_requested().await;
+            let _ = asked.send(());
+        }),
+    );
+    tokio::pin!(serving);
+    // A stuck connection must not keep the engines, and their agents, waiting behind it.
+    tokio::select! {
+        result = &mut serving => result?,
+        () = async {
+            match stop_asked.await {
+                Ok(()) => tokio::time::sleep(API_DRAIN).await,
+                Err(_) => std::future::pending().await,
+            }
+        } => tracing::warn!("requests were still open {API_DRAIN:?} after the stop signal; stopping without them"),
+    }
     Ok(())
 }
+
+/// How long the API drains open requests once asked to stop, before the engines are stopped anyway.
+const API_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Resolves when the daemon has been asked to stop.
 ///
 /// A person runs `wheeld` in a terminal and stops it with ctrl-c, and a service manager stops it
-/// with SIGTERM; either must end the process. The embedded engines install SIGTERM handlers of
-/// their own for their clean shutdown, and a handled signal no longer terminates the process by
-/// default — so without this, `wheeld` keeps serving something that has been told to go away.
+/// with SIGTERM; either must end the process, and only after every engine has stopped its agents.
+/// This is the one signal handler in the process: embedded engines are stopped by `run`, never by
+/// a signal of their own.
 async fn stop_requested() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = match signal(SignalKind::terminate()) {
@@ -204,6 +314,31 @@ mod tests {
         assert_eq!(displayable("[::]:8080"), "localhost:8080");
         assert_eq!(displayable("127.0.0.1:8080"), "127.0.0.1:8080");
         assert_eq!(displayable("localhost:8080"), "localhost:8080");
+    }
+
+    /// The issuer of every session and the base of every ingress URL. It must not move for an
+    /// install that has always been `http://localhost:8080`, or an upgrade logs everyone out.
+    #[test]
+    fn the_public_base_defaults_to_where_this_daemon_is_reached() {
+        assert_eq!(
+            default_public_base("127.0.0.1:8080"),
+            "http://localhost:8080"
+        );
+        assert_eq!(default_public_base("0.0.0.0:9000"), "http://localhost:9000");
+        assert_eq!(default_public_base("[::1]:8080"), "http://localhost:8080");
+        assert_eq!(
+            default_public_base("localhost:8081"),
+            "http://localhost:8081"
+        );
+        assert_eq!(
+            default_public_base("192.168.1.5:8080"),
+            "http://192.168.1.5:8080"
+        );
+        assert_eq!(
+            default_public_base("[2001:db8::1]:80"),
+            "http://[2001:db8::1]:80"
+        );
+        assert_eq!(default_public_base("box.lan:8080"), "http://box.lan:8080");
     }
 
     /// `stop_requested` is what makes ctrl-c and `docker stop`/systemd's SIGTERM actually end the

@@ -33,6 +33,8 @@ async fn wheeld_boots_the_whole_product_in_one_process() {
     // wheeld reads its API configuration from the environment it composes, and DATABASE_URL is the
     // one thing it cannot invent.
     std::env::set_var("DATABASE_URL", &url);
+    // Signup is closed unless opened, and this test signs up.
+    std::env::set_var("WHEEL_SIGNUP", "open");
 
     let dir = std::path::PathBuf::from(format!(
         "/tmp/wd-b-{}",

@@ -34,6 +34,32 @@ impl AuthMode {
     }
 }
 
+/// Who may create an account through `POST /v1/auth/signup` (local auth only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignupPolicy {
+    /// Anyone who can reach the API.
+    Open,
+    /// Nobody: the owner creates accounts, `POST /v1/auth/users`.
+    Closed,
+}
+
+impl SignupPolicy {
+    /// `WHEEL_SIGNUP`. Unset or empty is closed: every account's agents run as the daemon's user, so
+    /// whether strangers may create one is a decision an operator makes out loud, never one inferred
+    /// from how the box looks. Anything unrecognised refuses to boot.
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("closed") => Ok(Self::Closed),
+            Some("open") => Ok(Self::Open),
+            Some("invite") => bail!(
+                "WHEEL_SIGNUP=invite is not supported yet: use \"closed\" and have the owner \
+                 create accounts with POST /v1/auth/users"
+            ),
+            Some(other) => bail!("WHEEL_SIGNUP must be \"open\" or \"closed\", got {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Env {
     Dev,
@@ -64,6 +90,8 @@ pub struct Config {
     pub auth_mode: AuthMode,
     /// Signing key for locally issued sessions. Only meaningful when `auth_mode == Local`.
     pub session_secret: Secret,
+    /// Whether `POST /v1/auth/signup` creates accounts. Only meaningful when `auth_mode == Local`.
+    pub signup: SignupPolicy,
 
     // Crypto
     pub master_key: [u8; 32],
@@ -221,6 +249,7 @@ impl Config {
             dev_secret,
             auth_mode,
             session_secret,
+            signup: SignupPolicy::parse(std::env::var("WHEEL_SIGNUP").ok().as_deref())?,
             master_key,
             host_url: var("WHEEL_HOST_URL")?.trim_end_matches('/').to_string(),
             host_secret: Secret::new(var("WHEEL_HOST_SECRET")?),
@@ -353,6 +382,7 @@ impl std::fmt::Debug for Config {
         // assertions, and a derived impl would put the master key in the logs.
         f.debug_struct("Config")
             .field("env", &self.env)
+            .field("signup", &self.signup)
             .field("bind_addr", &self.bind_addr)
             .field("clerk_issuer", &self.clerk_issuer)
             .field("clerk_jwks_url", &self.clerk_jwks_url)
@@ -368,5 +398,30 @@ impl std::fmt::Debug for Config {
             .field("max_projects_per_user", &self.max_projects_per_user)
             .field("ingress_rate_per_min", &self.ingress_rate_per_min)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignupPolicy;
+
+    #[test]
+    fn signup_is_closed_unless_opened_and_an_unknown_value_refuses_to_boot() {
+        assert_eq!(SignupPolicy::parse(None).unwrap(), SignupPolicy::Closed);
+        assert_eq!(SignupPolicy::parse(Some("")).unwrap(), SignupPolicy::Closed);
+        assert_eq!(
+            SignupPolicy::parse(Some("closed")).unwrap(),
+            SignupPolicy::Closed
+        );
+        assert_eq!(
+            SignupPolicy::parse(Some(" open ")).unwrap(),
+            SignupPolicy::Open
+        );
+        let invite = SignupPolicy::parse(Some("invite")).unwrap_err().to_string();
+        assert!(invite.contains("POST /v1/auth/users"), "{invite}");
+        let other = SignupPolicy::parse(Some("sometimes"))
+            .unwrap_err()
+            .to_string();
+        assert!(other.contains("WHEEL_SIGNUP"), "{other}");
     }
 }

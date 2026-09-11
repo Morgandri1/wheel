@@ -32,9 +32,21 @@ async fn main() -> Result<()> {
     let state = boot::build_state(cfg, db.clone(), http).await;
     boot::spawn_maintenance(db, std::time::Duration::from_secs(60));
 
-    let app = wheel_api::build_router(state, &origins);
+    let trusted = std::sync::Arc::new(
+        wheel_api::http::client_ip::TrustedProxies::from_env()
+            .map_err(anyhow::Error::msg)
+            .context("trusted proxies")?,
+    );
+    let app = wheel_api::build_router(state, &origins).layer(axum::middleware::from_fn_with_state(
+        trusted,
+        wheel_api::http::client_ip::resolve,
+    ));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

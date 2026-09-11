@@ -38,6 +38,7 @@ const WHEEL_PREFIX: &str = "x-wheel-";
 pub async fn ingress(
     State(state): State<AppState>,
     Path((project_id, rest)): Path<(Uuid, String)>,
+    client: Option<axum::Extension<crate::http::client_ip::ClientIp>>,
     req: Request,
 ) -> ApiResult<Response> {
     refuse_ambiguous_path(&rest)?;
@@ -66,6 +67,14 @@ pub async fn ingress(
     let method = req.method().clone();
     let mut headers = hop::sanitize_for_upstream(req.headers(), &[WHEEL_PREFIX]);
     headers.insert(hop::header_name("x-wheel-ingress"), "1".parse().unwrap());
+    // The engine keys its per-caller ingress limit and `ip_allow` on this, and may trust it: the
+    // caller's own x-wheel-* headers were dropped just above, so only we can have set it.
+    if let Some(axum::Extension(crate::http::client_ip::ClientIp(ip))) = client {
+        headers.insert(
+            hop::header_name("x-wheel-client-ip"),
+            ip.to_string().parse().unwrap(),
+        );
+    }
 
     let body = axum::body::to_bytes(req.into_body(), state.cfg.ingress_body_limit_bytes)
         .await

@@ -73,6 +73,10 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/logout", post(routes::auth::logout))
         .route("/v1/auth/me", get(routes::auth::me))
         .route("/v1/auth/password", post(routes::auth::change_password))
+        .route("/v1/auth/users", post(routes::auth::create_account))
+        .route("/v1/auth/tokens", post(routes::tokens::create))
+        .route("/v1/auth/tokens", get(routes::tokens::list))
+        .route("/v1/auth/tokens/{id}", delete(routes::tokens::revoke))
         .route("/v1/projects", post(routes::projects::create))
         .route("/v1/projects", get(routes::projects::list))
         // Create + capability-patch + apply + rollback-on-failure, one atomic server sequence —
