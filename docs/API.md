@@ -433,7 +433,7 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `INGRESS_RATE_PER_MIN` | no | `60` | `0` disables. |
 | `INGRESS_BODY_LIMIT_BYTES` | no | `5242880` | |
 | `PROXY_TIMEOUT_SECS` | no | `30` | Not applied to WebSockets or log streams. |
-| `PUBLIC_BASE_URL` | no | `http://localhost:8080` | The public base of every `ingress_base_url` and the issuer of local sessions. Behind TLS, `https://<domain>`. Changing it ends every session: the issuer moved. `wheeld` defaults it to `http://localhost:<port>` of its bind. |
+| `PUBLIC_BASE_URL` | no | `http://localhost:8080` | The public base of every `ingress_base_url` (`<PUBLIC_BASE_URL>/p/<id>`, returned by every project route, including create), and the issuer of local sessions. Clients display it as-is: the web app no longer builds it. Behind TLS, `https://<domain>`. Changing it ends every session: the issuer moved. `wheeld` defaults it to `http://localhost:<port>` of its bind. |
 | `WHEEL_SIGNUP` | no | `open` | `open` or `closed`, local auth only. `wheeld` defaults it to `closed` when reachable beyond loopback, behind a proxy, or given a `PUBLIC_BASE_URL`. See [Signup policy](#signup-policy-wheel_signup). |
 | `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
@@ -546,7 +546,23 @@ says. A client can write that header itself. So:
 Both the `wheel-api` binary and `wheeld` apply this, and both are served with the peer address
 available to it. For a proxy on the same machine, `WHEEL_TRUSTED_PROXIES=127.0.0.1/32,::1`.
 
+## Cookies are never credentials
+
+The API reads a credential from `x-auth-token` or `Authorization: Bearer` and from nothing else.
+There is no cookie path, now or ever. This is pinned by `tests/no_cookie_auth.rs`: a valid session
+JWT or `wht_` token placed in a cookie gets `401` on every route, and a cookie-only logout revokes
+nothing.
+
+This matters behind the VPS proxy. `/v1` shares an origin with the web app there, so browsers attach
+the web's `__Host-wheel_session` cookie to every `/v1` request, including ones a hostile page
+causes. A cookie that authenticated would be ambient authority over the whole API. The VPS kit also
+strips `Cookie` on `/v1` and `/p` at the proxy, as a second line; this rule is the first.
+
 ## CORS
+
+The web UI calls the API from its own server, so its origin needs no CORS grant. The default
+allow-list is empty, and the VPS deployment sets none. `CORS_ALLOWED_ORIGINS` exists for a browser
+client someone is deliberately developing against the API directly.
 
 Explicit origin allowlist from `CORS_ALLOWED_ORIGINS`. Never wildcard-with-credentials: the web app
 authenticates with a header rather than cookies, so `allow_credentials` is never needed, and an
