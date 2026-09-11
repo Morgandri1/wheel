@@ -15,8 +15,10 @@ import { hydrateSession, retrySession, useSession } from "@/lib/local-auth";
  * cookie shaped like a live session; this asks the server whether it is one. Both are routing
  * courtesies, not a boundary: the API is the boundary (web/DEPLOY.md, "The trust model").
  *
- * Only `anon` redirects. `loading` has not asked yet, and `unreachable` could not get an answer —
- * sending either to sign-in would sign out a returning user over a blip.
+ * Only `anon` redirects. `loading` has not asked yet, `unreachable` could not get an answer, and
+ * `error` is the server refusing outright (most often a deployment missing `WHEEL_PUBLIC_ORIGIN`)
+ * — none of those are "signed out", and sending any of them to sign-in would either bounce a
+ * returning user over a blip or loop them into a form that cannot fix a server misconfiguration.
  */
 export function SessionGate({ children }: { children: React.ReactNode }) {
   const session = useSession();
@@ -56,6 +58,20 @@ export function SessionGate({ children }: { children: React.ReactNode }) {
         <p>Can&rsquo;t reach the server to check your session. Trying again…</p>
         <Button size="sm" tone="ghost" data-testid="btn-session-retry" onClick={() => void retrySession()}>
           Try now
+        </Button>
+      </div>
+    );
+  }
+
+  if (session.status === "error") {
+    return (
+      <div
+        className="flex min-h-screen flex-col items-center justify-center gap-3 text-micro text-ink-faint"
+        data-testid="session-error"
+      >
+        <p>{session.message}</p>
+        <Button size="sm" tone="ghost" data-testid="btn-session-retry" onClick={() => void retrySession()}>
+          Try again
         </Button>
       </div>
     );

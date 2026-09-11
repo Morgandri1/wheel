@@ -91,6 +91,48 @@ describe("hydration", () => {
     expect(m.sessionSnapshot().status).toBe("unreachable");
   });
 
+  // QA review round 2: GET /api/session can answer 403 (cross-origin, or public_origin_required
+  // behind a misconfigured proxy) — a config problem, not a blip. The old blanket `!res.ok` swept
+  // that into "unreachable", which retried forever and told the operator "can't reach the server"
+  // when the real answer was sitting right there in the response.
+  it.each([403, 404, 400, 418])("reads a %i as a distinct error, not as unreachable", async (status) => {
+    fetchMock.mockResolvedValue(respond(status, { error: { code: "public_origin_required", message: "set WHEEL_PUBLIC_ORIGIN" } }));
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot()).toEqual({ status: "error", user: null, message: "set WHEEL_PUBLIC_ORIGIN" });
+  });
+
+  it("keeps every 5xx as unreachable and retried, never as the error state", async () => {
+    fetchMock.mockResolvedValue(respond(500, { error: { code: "boom", message: "db down" } }));
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot().status).toBe("unreachable");
+  });
+
+  it("falls back to a plain sentence when the 4xx carries no message", async () => {
+    fetchMock.mockResolvedValue(respond(403, {}));
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot()).toEqual({ status: "error", user: null, message: "The server refused this request (HTTP 403)." });
+  });
+
+  it("does not retry a 4xx — it is a server refusal, not a blip that time fixes", async () => {
+    fetchMock.mockResolvedValue(respond(403, { error: { message: "nope" } }));
+    const m = await load();
+    await m.hydrateSession();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries from the error state when asked to, same as from unreachable", async () => {
+    fetchMock.mockResolvedValueOnce(respond(403, { error: { message: "nope" } })).mockResolvedValueOnce(respond(200, { user: USER }));
+    const m = await load();
+    await m.hydrateSession();
+    expect(m.sessionSnapshot().status).toBe("error");
+    await m.retrySession();
+    expect(m.sessionSnapshot()).toEqual({ status: "authed", user: USER });
+  });
+
   it("asks again after a blip, backing off, and settles on the answer it finally gets", async () => {
     fetchMock
       .mockRejectedValueOnce(new TypeError("offline"))

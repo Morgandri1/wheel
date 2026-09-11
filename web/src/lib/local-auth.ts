@@ -18,15 +18,19 @@ export type { SessionUser };
  * `SEEDED_SHAPE` in `qa/e2e/session.ts`. Changing the cookie's name or flags turns it red ON
  * PURPOSE: update the fake, do not route around it.
  *
- * FOUR STATES, and the differences are the point. `loading` has not asked yet; `anon` means the
- * server said `{user: null}`; `unreachable` means it could not say, which is retried rather than
- * treated as a sign-out; `authed` names the user.
+ * FIVE STATES, and the differences are the point. `loading` has not asked yet; `anon` means the
+ * server said `{user: null}`; `unreachable` means a 5xx, a timeout or a network failure — retried,
+ * because that kind of failure passes; `error` means the server answered but refused the request
+ * (most often 403 `public_origin_required` from a deployment missing `WHEEL_PUBLIC_ORIGIN`) — a
+ * config problem retrying will not fix, so its message is shown instead of "can't reach the
+ * server"; `authed` names the user.
  */
 
 export type SessionState =
   | { status: "loading"; user: null }
   | { status: "anon"; user: null }
   | { status: "unreachable"; user: null }
+  | { status: "error"; user: null; message: string }
   | { status: "authed"; user: SessionUser };
 
 const SESSION_ROUTE = "/api/session";
@@ -49,20 +53,37 @@ function publish(next: SessionState) {
   for (const listener of listeners) listener();
 }
 
-const unsettled = () => state === LOADING || state === UNREACHABLE;
+const unsettled = () => state.status === "loading" || state.status === "unreachable" || state.status === "error";
 
-/** The server's verdict, or null when it gave none. Only an explicit `{user: null}` means signed out. */
+/**
+ * The server's verdict, or null when this attempt learned nothing and should be retried: a 5xx, a
+ * timeout, or the fetch itself failing. Only an explicit `{user: null}` means signed out, and only
+ * a 4xx becomes `error` — that is the server refusing the request outright, not a blip, so it is
+ * shown rather than swallowed into "can't reach the server" and retried forever.
+ */
 async function askServer(): Promise<SessionState | null> {
+  let res: Response;
   try {
-    const res = await fetch(SESSION_ROUTE, { cache: "no-store", credentials: "same-origin" });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { user?: unknown } | null;
-    if (body?.user === null) return ANON;
-    const user = readUser(body?.user);
-    return user ? { status: "authed", user } : null;
+    res = await fetch(SESSION_ROUTE, { cache: "no-store", credentials: "same-origin" });
   } catch {
     return null;
   }
+  if (res.status >= 500) return null;
+  if (!res.ok) return { status: "error", user: null, message: await readErrorMessage(res) };
+  const body = (await res.json().catch(() => null)) as { user?: unknown } | null;
+  if (body?.user === null) return ANON;
+  const user = readUser(body?.user);
+  return user ? { status: "authed", user } : null;
+}
+
+async function readErrorMessage(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: { message?: unknown } };
+    if (typeof body?.error?.message === "string" && body.error.message) return body.error.message;
+  } catch {
+    /* fall through to the generic line below */
+  }
+  return `The server refused this request (HTTP ${res.status}).`;
 }
 
 /**
