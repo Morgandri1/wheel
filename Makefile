@@ -80,6 +80,14 @@ bootstrap: ## install the toolchain (rust, node, pnpm, cargo-llvm-cov, QA venv)
 clean: ## remove build artefacts
 	@rm -rf target web/.next web/node_modules
 
+# --- API: images -----------------------------------------------------------
+.PHONY: wheeld-image
+
+wheeld-image: ## build wheeld:dev, all of Wheel in one headless container (docker/Dockerfile.wheeld)
+	docker build -f docker/Dockerfile.wheeld \
+		--build-arg GIT_SHA=$$(git rev-parse HEAD) \
+		-t wheeld:dev .
+
 # --- SDK: images -----------------------------------------------------------
 .PHONY: engine-image engine-image-test image-verify-prod
 

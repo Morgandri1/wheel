@@ -12,3 +12,12 @@ crates/**/target/
 !qa
 qa/*
 !qa/harness
+# docker/Dockerfile.web builds from the repository root like every other image here, so the web
+# sources are admitted; what a local install or build leaves behind is not.
+!web
+web/node_modules/
+web/.next/
+web/coverage/
+web/test-results/
+web/playwright-report/
+**/.env*
