@@ -1,0 +1,62 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+#
+# Installed by infra/vps/install.sh. The native half of the guarantee compose earns with
+# `depends_on: { verify-signup-gate: service_completed_successfully }`.
+#
+# It runs the SAME script the Docker path runs — infra/vps/verify-signup-gate.sh, installed to
+# /opt/wheel/libexec — pointed at wheeld's loopback address instead of the compose service name.
+# One implementation of "is this really wheeld, and does it really enforce its own signup gate",
+# exercised by both deployments, so neither can drift into being the tested one.
+#
+# wheel-web.service Requires= and After= this. A failure here therefore stops the board from
+# starting, on every boot rather than only at install time. Caddy, in TLS mode, is ordered the same
+# way by a drop-in install.sh writes.
+
+[Unit]
+Description=Wheel: prove wheeld enforces its own signup gate before the board starts
+Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/verify-signup-gate.sh
+After=wheeld.service
+Requires=wheeld.service
+
+[Service]
+Type=oneshot
+# The verdict has to survive, or every unit ordered after this one would re-run the probe and
+# wheeld's signup rate limit would start counting deploys.
+RemainAfterExit=yes
+DynamicUser=yes
+# WHEEL_SIGNUP has to be the SAME value wheeld resolved, or this gate correctly reports that the
+# two disagree — which is a true statement about a misconfigured box, but not the property it
+# exists to check. Same files, same order, so the resolution is identical by construction.
+EnvironmentFile=/etc/wheel/wheeld.env
+EnvironmentFile=-/etc/wheel/wheeld.local.env
+Environment=WHEEL_GATE_BASE=http://127.0.0.1:8080
+ExecStart=/opt/wheel/libexec/verify-signup-gate.sh
+SyslogIdentifier=wheel-signup-gate
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

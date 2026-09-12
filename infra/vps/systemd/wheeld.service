@@ -3,13 +3,41 @@
 # See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 #
 # Installed by infra/vps/install.sh. Settings: /etc/wheel/wheeld.env (managed by install.sh) and
-# /etc/wheel/wheeld.local.env (yours; read second, so it wins).
+# /etc/wheel/wheeld.local.env (yours; read second, so it wins). Resource limits are a separate
+# drop-in, 10-resources.conf; override them in 90-local.conf, which install.sh never touches.
+#
+# READ THIS BEFORE TIGHTENING ANYTHING BELOW.
+#
+# Every agent Wheel runs is a process in THIS unit's cgroup and mount namespace. A directive here
+# is not only a constraint on a daemon: it is a constraint on arbitrary code that clones
+# repositories, installs dependencies, compiles, and sometimes drives a browser — the thing Wheel
+# exists to do. So each directive is one of two kinds, and the distinction decides whether it
+# belongs here at all:
+#
+#   host-protective and agent-neutral  — removes something neither a daemon nor an agent has any
+#                                        business doing. Nearly free. Take all of them.
+#   agent-functional                   — removes something a plausible agent workload actually
+#                                        uses. Needs a measurement, not an opinion.
+#
+# A maximal sandbox scores well in `systemd-analyze security` and breaks agents in ways that surface
+# days later as "the model seems dumber". docs/proposals/wheeld-native-production.md §4 records
+# every directive REJECTED here and why, with the measurements:
+# SystemCallFilter= (breaks Chromium/bwrap/debuggers), RestrictNamespaces= (same),
+# ProcSubset=pid (hides /proc/meminfo and /proc/cpuinfo — measured), LimitNPROC= (counts per uid,
+# not per cgroup), LimitFSIZE= (SIGXFSZ is an unattributable build failure).
 
 [Unit]
 Description=Wheel daemon: API, sandbox host and per-project engines
 Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/README.md
+Documentation=https://github.com/Morgandri1/wheel/blob/main/docs/proposals/wheeld-native-production.md
 After=network-online.target
 Wants=network-online.target
+
+# Catches a crashloop without colliding with sdk/auto-update's restart cadence. At RestartSec=2 a
+# genuine crashloop trips this in about 20 seconds; no plausible update cadence reaches 10 restarts
+# in 5 minutes (WHEEL_UPDATE_FETCH_SECS is 300, minimum 60). Shared constant — see that lane.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -17,7 +45,24 @@ User=wheel
 Group=wheel
 EnvironmentFile=/etc/wheel/wheeld.env
 EnvironmentFile=-/etc/wheel/wheeld.local.env
+
+# Refuses to start on a configuration that would boot and then be wrong: a non-loopback bind nobody
+# asked for, a data directory with the wrong mode, a missing or too-old claude. Runs as root (the
+# default for ExecStartPre without a +/! prefix is the unit's User=, so this is deliberately root
+# via `+` — it has to stat files the service user cannot).
+ExecStartPre=+/opt/wheel/libexec/wheel-preflight
+
 ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind 127.0.0.1:8080
+
+# Type=simple reports "active (running)" the instant execve succeeds — before the store is opened,
+# before migrations, before anything binds. systemd does not finish the start job until
+# ExecStartPost exits, so polling /healthz here is what makes `systemctl start` block until wheeld
+# is genuinely serving and `systemctl status` stop lying. It also measures the listening socket and
+# fails the unit if anything but loopback is bound — the native replacement for compose's
+# `ports: 127.0.0.1:` promise, as a measurement rather than a statement about a config file.
+# The real fix is Type=notify plus one sd_notify(READY=1): follow-up F1, API lane.
+ExecStartPost=/opt/wheel/libexec/wheeld-ready
+
 # mixed: SIGTERM goes to wheeld alone, which drains in-flight turns (~28s) and stops every agent's
 # own process group itself — sending SIGTERM to the whole cgroup directly (control-group) would
 # race wheeld's own orchestrated shutdown instead of letting it run. Whatever is left in the cgroup
@@ -28,17 +73,91 @@ TimeoutStopSec=35
 # Also the auto-update hook: WHEEL_UPDATE_RESTART=exit swaps the binary and exits 75.
 Restart=on-failure
 RestartSec=2
+
+# ---------------------------------------------------------------- identity and the data directory
 UMask=0077
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
+# Re-asserts owner and 0700 on every start, and recreates the directory if it is ever lost.
+# install -d in the installer is a fact about one moment; this is a fact about every boot.
+# It also implies ReadWritePaths=/var/lib/wheel, which is restated below because ProtectSystem=strict
+# is what that defends against and a reader should not have to know the implication.
+StateDirectory=wheel
+StateDirectoryMode=0700
 ReadWritePaths=/var/lib/wheel
+
+# ---------------------------------------------------------------- host-protective, agent-neutral
+# No setuid binary can raise privilege from inside this unit. `sudo`/`su` inside an agent cannot
+# work — they could not anyway, `wheel` is in no sudoers file — so this closes a path rather than
+# taking a capability away from anything that had one.
+NoNewPrivileges=yes
+# The whole filesystem is read-only except /dev, /proc, /sys and ReadWritePaths=. Everything an
+# agent writes already lives under the data directory: workspaces, the bare-clone store
+# (wheel-engine/src/supervisor/workspace.rs), per-node creds dirs, TMPDIR — and $HOME for `wheel`
+# IS /var/lib/wheel. An agent that tries to write /usr/local gets EROFS, loudly.
+ProtectSystem=strict
+# /home, /root and /run/user are empty to this unit. The highest-value line in this file: an agent
+# cannot read the operator's SSH keys, ~/.aws, git credentials or shell history. Costs nothing,
+# because nothing Wheel runs lives in a human's home.
+ProtectHome=yes
+# Agents cannot use /tmp as a channel to anything else on this box, and cannot read what another
+# service left there. Cost: the agent's /tmp is not yours — README has the nsenter recipe.
+PrivateTmp=yes
+# A minimal private /dev: no raw block devices, no /dev/kvm, no /dev/fuse, no GPU. /dev/null,
+# /dev/urandom, /dev/tty, /dev/ptmx and a private devpts are all still provided, so pty-allocating
+# CLIs keep working — measured, because that is the breakage this directive would plausibly cause.
+PrivateDevices=yes
+# A mount an agent manages to make cannot propagate host-wide. Implied by the Protect* set above;
+# stated so it survives a future edit to any of them.
+PrivateMounts=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+# dmesg and /dev/kmsg denied: kernel pointers and other services' activity stop being readable.
+ProtectKernelLogs=yes
+# An agent that skews this box's clock breaks TLS validation, token expiry and every log timestamp
+# at once. Nothing legitimate sets the clock from inside a service.
+ProtectClock=yes
+ProtectHostname=yes
+# No SCHED_FIFO/SCHED_RR. On 2 vCPU a realtime-priority spin is a complete denial of service on the
+# box, reachable by any agent. No build tool asks for realtime scheduling.
+RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+# Nothing in this unit can ever hold a capability, including via a file capability on a binary.
+# The one visible cost: `ping` stops working, because Ubuntu ships it with cap_net_raw+ep rather
+# than setuid. An agent diagnosing connectivity uses curl/getent/nc instead.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_PACKET is gone, so no raw packet capture on this VPS's interfaces, along with every exotic
+# family. AF_NETLINK is deliberately KEPT: glibc's __check_pf() uses it to decide about IPv6 in
+# getaddrinfo, getifaddrs() needs it, and so do `ip`, `ss` and Node's os.networkInterfaces().
+# Dropping it is the classic way to make DNS behave strangely in a way nobody attributes to a unit
+# file. (AF_PACKET also needs CAP_NET_RAW, already removed above — this is belt and braces.)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+# An agent can no longer see, or read the cmdline/environ of, processes belonging to other users:
+# sshd, caddy, wheel-web, root's. `ps aux` inside the unit shows only `wheel`'s own processes.
+# IT DOES NOT TOUCH REDTEAM 037 — same-uid siblings stay fully visible to each other, which is
+# 037's entire premise. Claiming otherwise would be the "fix that looks like one" that
+# docs/ARCHITECTURE.md warns about.
+ProtectProc=invisible
+# NOT ProcSubset=pid. Measured: that also hides /proc/meminfo and /proc/cpuinfo, which build tools
+# size their parallelism from and Node's os module reads. The breakage is silent and gets blamed on
+# the model rather than on this file. Stated explicitly so a future tightening is a visible edit
+# somebody has to justify, not a default drifting under us.
+ProcSubset=all
+# A core dump of wheeld contains master.key, the operator token, and every vault value decrypted in
+# flight; systemd-coredump would write that to /var/lib/systemd/coredump and announce it in the
+# journal. Cost: no post-mortem core for a wheeld crash. README documents the temporary
+# `systemctl edit` to get one back, and what that puts on disk.
+LimitCORE=0
+
+# ---------------------------------------------------------------- logs
+SyslogIdentifier=wheeld
+# journald drops messages past 1000 per 30s per service by default, and an incident is the worst
+# possible moment to discover your logs were rate-limited. journald's own SystemMaxUse still bounds
+# the disk.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
 
 [Install]
 WantedBy=multi-user.target

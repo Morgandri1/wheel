@@ -4,12 +4,27 @@
 #
 # Installed by infra/vps/install.sh. Settings: /etc/wheel/web.env and /etc/wheel/web.local.env.
 # A throwaway user per run: the web server holds no data and must not be able to read wheeld's.
+#
+# This unit is the OPPOSITE case to wheeld.service, and it is why the two are hardened so
+# differently. wheeld runs arbitrary agent code and must stay permissive (see the header there).
+# This runs ONE known Node program that spawns nothing, so every directive wheeld had to refuse is
+# taken here: a syscall filter, a namespace restriction, and no network beyond loopback.
 
 [Unit]
 Description=Wheel web app (Next.js standalone server)
 Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/README.md
 After=network-online.target wheeld.service
 Wants=wheeld.service
+
+# The native equivalent of compose's `depends_on: { verify-signup-gate: service_completed_successfully }`.
+#
+# A config value is not a control until the binary that reads it is proven to enforce it, and the
+# board must never come up in front of a wheeld that does not. install.sh used to do this check
+# inline, which meant it ran once at install time and never again — reboot the box and the board
+# came up with nothing having checked. Requires= plus After= on a oneshot re-runs it on every boot,
+# which is what compose's version always did.
+Requires=wheel-signup-gate.service
+After=wheel-signup-gate.service
 
 [Service]
 Type=simple
@@ -23,16 +38,49 @@ WorkingDirectory=/opt/wheel/web
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
 RestartSec=2
+StartLimitIntervalSec=300
+StartLimitBurst=10
+SyslogIdentifier=wheel-web
+
+# ---------------------------------------------------------------- sandbox
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateMounts=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
 RestrictSUIDSGID=yes
+RestrictNamespaces=yes
 LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+# Taken here and refused on wheeld.service: this process is one Node server that spawns nothing, so
+# denying @mount, @debug, @module, @reboot, @swap and @raw-io costs nothing. EPERM rather than the
+# default SIGSYS so a denial shows up as an error Node can report, not a mysterious crash.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+
+# THE BOARD HAS NO BUSINESS ON THE INTERNET. It dials exactly one address, 127.0.0.1:8080, and
+# serves exactly one, 127.0.0.1:3000. If it is ever RCE'd through a Next.js bug, it cannot
+# exfiltrate anything: there is nowhere to send it.
+#
+# COST, stated here because this is where someone will hit it: pointing WHEEL_API_URL at a remote
+# API (the Vercel topology in README.md) or switching WHEEL_AUTH_MODE to `jwks`, which fetches a
+# remote JWKS document, both need this relaxed. Do it in web.local.env's companion drop-in, not by
+# deleting these two lines.
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

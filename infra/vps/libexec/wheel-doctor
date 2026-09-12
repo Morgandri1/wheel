@@ -1,0 +1,157 @@
+#!/bin/bash
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# What is actually true about this box right now. Read-only: it starts nothing, stops nothing and
+# writes nothing, so it is safe to run during an incident.
+#
+#   wheel-doctor            everything below
+#   wheel-doctor health     just the three tiers, for a script. Exit 0 only if all three pass.
+#   wheel-doctor agents     the live process tree, per project
+#
+# THE POINT OF THE THREE TIERS. "Is it up" is three different questions and they fail separately:
+#
+#   running      systemd says the unit is active. Says nothing about whether it serves.
+#   serving      /healthz answers 200. Proves the listener is bound and the router is up. Says
+#                nothing about whether the store opened — /healthz is a static answer plus the
+#                auth mode (crates/wheel-api/src/routes/health.rs).
+#   working      the operator token authenticates a real GET /v1/projects. This is the only one of
+#                the three that proves the database opened, migrations ran and auth verifies. A box
+#                can be "running" and "serving" with a corrupt store for as long as nobody asks.
+#
+# Anything that cannot be determined prints `unknown` and, in `health`, exits non-zero. A check
+# that could not run must never read as a check that passed.
+set -uo pipefail
+
+data_dir="${WHEEL_DATA_DIR:-/var/lib/wheel}"
+port="${WHEEL_PORT:-8080}"
+base="http://127.0.0.1:$port"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+hr() { printf '\n\033[1m%s\033[0m\n' "$*" 2>/dev/null || printf '\n%s\n' "$*"; }
+
+health() {
+    local rc=0 running serving working
+
+    running="$(systemctl is-active wheeld 2>/dev/null || true)"
+    if [ "$running" = active ]; then
+        printf '  %-9s %s\n' running "active since $(systemctl show -P ActiveEnterTimestamp wheeld 2>/dev/null)"
+    else
+        printf '  %-9s %s\n' running "NOT active (${running:-unknown}) — journalctl -u wheeld -n 50"
+        rc=1
+    fi
+
+    if serving="$(curl -fsS -m 5 "$base/healthz" 2>/dev/null)"; then
+        printf '  %-9s %s\n' serving "200 from $base/healthz — $serving"
+    else
+        printf '  %-9s %s\n' serving "NO answer from $base/healthz"
+        rc=1
+    fi
+
+    # The operator token is the credential this box bootstraps itself with, and reading it needs
+    # root. Running as anyone else is not a failure of the box, so it reports `unknown` and says
+    # why rather than claiming the tier failed.
+    if [ ! -r "$data_dir/operator-token" ]; then
+        printf '  %-9s %s\n' working "unknown — cannot read $data_dir/operator-token (run as root)"
+        rc=1
+    elif working="$(curl -fsS -m 10 "$base/v1/projects" -H @<(printf 'x-auth-token: %s\n' "$(cat "$data_dir/operator-token")") 2>/dev/null)"; then
+        printf '  %-9s %s\n' working "GET /v1/projects authenticated — the store opened and auth verifies ($(printf '%s' "$working" | grep -o '"id"' | wc -l | tr -d ' ') project(s) visible to the operator)"
+    else
+        printf '  %-9s %s\n' working "the operator token did NOT authenticate against $base/v1/projects — the listener is up but the store or auth is not"
+        rc=1
+    fi
+    return $rc
+}
+
+agents() {
+    # Agents are ordinary processes in wheeld.service's cgroup. That is the one place native beats
+    # Docker outright for operability: no `docker exec`, no second process namespace to reason
+    # about — the live tree is right here, with arguments, and cgtop costs them for you.
+    if have systemd-cgls; then
+        systemd-cgls --no-pager -u wheeld.service 2>/dev/null || echo "  (no cgroup — wheeld is not running)"
+    else
+        echo "  systemd-cgls not available; falling back to ps"
+        ps -o pid,ppid,etime,rss,args -u wheel 2>/dev/null || true
+    fi
+}
+
+case "${1:-all}" in
+    health) health; exit $? ;;
+    agents) agents; exit 0 ;;
+    all) ;;
+    *) echo "usage: wheel-doctor [health|agents]" >&2; exit 2 ;;
+esac
+
+hr "health"
+health || true
+
+hr "generation"
+if have /opt/wheel/bin/wheeld; then
+    printf '  %-9s %s\n' running "$(/opt/wheel/bin/wheeld --version 2>/dev/null || echo unknown)"
+else
+    printf '  %-9s %s\n' running "unknown (/opt/wheel/bin/wheeld absent)"
+fi
+# The rollback artefact. install.sh and sdk/auto-update both write it and neither deletes the
+# other's, so its presence is what makes `install.sh --rollback` possible at all.
+if [ -e /opt/wheel/bin/wheeld.prev ]; then
+    printf '  %-9s %s\n' previous "$(/opt/wheel/bin/wheeld.prev --version 2>/dev/null || echo 'present, unreadable version') — install.sh --rollback returns to this"
+else
+    printf '  %-9s %s\n' previous "none — there is nothing to roll back to yet"
+fi
+printf '  %-9s %s\n' checkout "$(git -c safe.directory=/opt/wheel/src -C /opt/wheel/src rev-parse --short HEAD 2>/dev/null || echo unknown) ($(stat -c '%U' /opt/wheel/bin 2>/dev/null || echo '?')-owned: root means wheeld cannot rewrite itself, wheel means --updatable is on)"
+
+hr "toolchain"
+for tool in node claude codex git; do
+    if have "$tool"; then
+        printf '  %-9s %s\n' "$tool" "$("$tool" --version 2>/dev/null | head -1)"
+    else
+        printf '  %-9s %s\n' "$tool" "ABSENT — agents that need it will fail at their first message, not here"
+    fi
+done
+if [ -r /etc/wheel/toolchain.env ]; then
+    # shellcheck source=/dev/null
+    . /etc/wheel/toolchain.env
+    printf '  %-9s %s\n' pinned "claude $WHEEL_CLAUDE_VERSION (floor $WHEEL_CLAUDE_MIN), codex $WHEEL_CODEX_VERSION, node $WHEEL_NODE_MAJOR.x, pnpm $WHEEL_PNPM_VERSION"
+fi
+
+hr "exposure"
+# What the ledger promises, measured rather than restated. Every listener on wheeld's and the
+# board's ports, and what they are bound to.
+if have ss; then
+    ss -ltnH 2>/dev/null | awk -v p1="$port" -v p2=3000 '
+        { a=$4; n=split(a, x, ":"); if (x[n]==p1 || x[n]==p2) {
+            host=substr(a, 1, length(a)-length(x[n])-1);
+            loop = (host ~ /^(127\.|\[::1\]|\[::ffff:127\.)/) ? "loopback only" : "REACHABLE FROM THE NETWORK";
+            printf "  %-22s %s\n", a, loop } }'
+else
+    echo "  ss not installed — cannot measure. Not 'fine': unknown."
+fi
+printf '  %-22s %s\n' "trusted proxies" "${WHEEL_TRUSTED_PROXIES:-$(grep -h '^WHEEL_TRUSTED_PROXIES=' /etc/wheel/wheeld.env /etc/wheel/wheeld.local.env 2>/dev/null | tail -1 | cut -d= -f2- || echo 'none — no forwarded header is believed from anybody')}"
+
+hr "sandbox and limits"
+if have systemd-analyze; then
+    systemd-analyze security wheeld.service --no-pager 2>/dev/null | tail -3
+fi
+for prop in MemoryCurrent MemoryHigh MemoryMax TasksCurrent TasksMax CPUQuotaPerSecUSec OOMPolicy; do
+    printf '  %-22s %s\n' "$prop" "$(systemctl show -P "$prop" wheeld 2>/dev/null)"
+done
+# OOMPolicy is the one that decides whether a runaway agent kills the daemon, so it is not merely
+# printed: it is judged. See 10-resources.conf.
+if [ "$(systemctl show -P OOMPolicy wheeld 2>/dev/null)" != continue ]; then
+    printf '  %-22s %s\n' "!! OOMPolicy" "NOT 'continue'. A single agent being OOM-killed will stop wheeld and every other project's agents with it. See infra/vps/systemd/wheeld.service.d/10-resources.conf."
+fi
+
+hr "data"
+if [ -d "$data_dir" ]; then
+    printf '  %-22s %s\n' "$data_dir" "$(ls -ld "$data_dir" | awk '{print $1, $3":"$4}')  $(du -sh "$data_dir" 2>/dev/null | cut -f1) used"
+    for secret in master.key operator-token; do
+        [ -e "$data_dir/$secret" ] && printf '  %-22s %s\n' "$secret" "$(ls -ld "$data_dir/$secret" | awk '{print $1, $3":"$4}')"
+    done
+    printf '  %-22s %s\n' "backup" "$(ls -1t /var/backups/wheel/*.tar.gz* 2>/dev/null | head -1 || echo 'NONE FOUND in /var/backups/wheel — losing master.key loses every vault secret on this board. infra/vps/backup.sh')"
+else
+    printf '  %-22s %s\n' "$data_dir" "does not exist"
+fi
+
+hr "agents"
+agents

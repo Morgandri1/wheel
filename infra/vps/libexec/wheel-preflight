@@ -1,0 +1,140 @@
+#!/bin/sh
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# wheeld.service's ExecStartPre, run as root. Refuses to start the daemon on a configuration that
+# would boot and then be wrong — the native counterpart of compose's `preflight` service, which
+# infra/vps/preflight.sh implements for the Docker path.
+#
+# The two check different things because the two deployments get their guarantees from different
+# places. preflight.sh validates the settings that decide whether COMPOSE will publish a port and
+# start a proxy. This validates the settings and the on-disk state that decide whether SYSTEMD is
+# about to start a daemon that binds where nobody asked, reads a data directory anyone can read, or
+# runs agents against a claude too old to refresh its own OAuth token.
+#
+# Everything here is a refusal, never a repair. A preflight that fixes what it finds is a preflight
+# that stops reporting, and the next person inherits a box that has been quietly corrected for
+# months. The one exception is stated where it happens.
+set -eu
+
+fail() {
+    echo "wheel-preflight: $*" >&2
+    exit 1
+}
+note() {
+    echo "wheel-preflight: $*"
+}
+
+data_dir="${WHEEL_DATA_DIR:-/var/lib/wheel}"
+bin=/opt/wheel/bin/wheeld
+toolchain=/etc/wheel/toolchain.env
+
+# ---------------------------------------------------------------- the bind address
+#
+# THE GUARANTEE THIS ROW OF THE LEDGER RESTS ON. The Docker path promises "nothing is published to
+# the network" with `ports: "127.0.0.1:8080:8080"` in compose.yml. Natively there is no compose to
+# make that promise, so it has to be made here and measured after the fact by wheeld-ready.
+#
+# wheeld's own default is already loopback (crates/wheeld/src/config.rs DEFAULT_BIND) and the unit
+# passes --bind 127.0.0.1:8080 explicitly. What this catches is the third way in: BIND_ADDR set in
+# /etc/wheel/wheeld.local.env, which the unit reads and which nothing else inspects.
+bind="${BIND_ADDR:-127.0.0.1:8080}"
+bind_host="${bind%:*}"
+bind_host="${bind_host#[}"
+bind_host="${bind_host%]}"
+case "$bind_host" in
+    127.* | ::1 | localhost) ;;
+    *)
+        if [ "${WHEEL_ALLOW_EXPOSED_BIND:-0}" = 1 ]; then
+            note "WARNING: BIND_ADDR=$bind is not loopback, and WHEEL_ALLOW_EXPOSED_BIND=1 says you meant it. Everyone who can route to $bind_host reaches the sign-in, signup and public ingress routes directly, with no proxy in front and no TLS."
+        else
+            fail "BIND_ADDR=$bind binds $bind_host, which is not loopback. Nothing in this kit publishes wheeld to the network: tunnel mode reaches it over SSH, TLS mode reaches it through Caddy, and in both cases wheeld itself listens on 127.0.0.1. If you genuinely mean to expose it, set WHEEL_ALLOW_EXPOSED_BIND=1 in /etc/wheel/wheeld.local.env and read infra/vps/README.md first — a password or a wht_ token does not get a second chance once it has crossed the network in the clear."
+        fi
+        ;;
+esac
+
+# ---------------------------------------------------------------- signup
+#
+# Same validation preflight.sh applies on the Docker side, for the same reason: an unrecognised
+# value must not fall through to a default that happens to be safe today.
+case "${WHEEL_SIGNUP:-closed}" in
+    closed) ;;
+    open) note "WARNING: WHEEL_SIGNUP=open lets anyone who reaches this server create an account and run agents on it" ;;
+    *) fail "WHEEL_SIGNUP must be 'closed' or 'open', got '${WHEEL_SIGNUP:-}'" ;;
+esac
+
+# ---------------------------------------------------------------- the binary
+[ -x "$bin" ] || fail "$bin is missing or not executable — run infra/vps/install.sh"
+bin_perm="$(ls -ld "$bin" | cut -c1-10)"
+case "$bin_perm" in
+    # A binary systemd is about to run as the service user must not be writable by that user's
+    # group or by the world. It IS legitimately writable by `wheel` under install.sh --updatable,
+    # which is the auto-update lane's documented switch, so owner-write is not checked here.
+    *w??w*) fail "$bin is group- or world-writable ($bin_perm) — anything that can write it chooses what runs as the account that can read master.key" ;;
+esac
+
+# ---------------------------------------------------------------- the data directory
+#
+# Not created here. StateDirectory=wheel in the unit is what creates it and re-asserts its mode on
+# every start; this checks the result, so a directory systemd could not fix is a refusal rather
+# than a daemon that starts and serves secrets out of a world-readable path.
+if [ -e "$data_dir" ]; then
+    [ -d "$data_dir" ] || fail "$data_dir exists and is not a directory"
+    mode="$(ls -ld "$data_dir" | cut -c1-10)"
+    case "$mode" in
+        drwx------) ;;
+        *) fail "$data_dir is $mode, not drwx------. It holds master.key, which decrypts every vault secret on this box." ;;
+    esac
+    for secret in master.key operator-token; do
+        [ -e "$data_dir/$secret" ] || continue
+        smode="$(ls -ld "$data_dir/$secret" | cut -c1-10)"
+        case "$smode" in
+            -rw-------) ;;
+            *) fail "$data_dir/$secret is $smode, not -rw-------" ;;
+        esac
+    done
+fi
+
+# ---------------------------------------------------------------- the toolchain Docker used to ship
+#
+# The image bundled Node, git and the CLIs, so nothing had to check they were there. Native means
+# the host supplies them, and an agent that cannot find `claude` fails at the first message rather
+# than at boot — which is the wrong moment to discover an install went wrong weeks ago.
+if [ -r "$toolchain" ]; then
+    # shellcheck source=/dev/null
+    . "$toolchain"
+else
+    fail "$toolchain is missing — run infra/vps/install.sh, which writes the pins this checks against"
+fi
+# shellcheck source=/dev/null
+. /opt/wheel/libexec/version.sh
+
+for tool in git node claude; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool is not on PATH. Native wheeld does not bundle a toolchain: the engine shells out to git for any repo-backed workspace, and agents are claude/codex processes. PATH here is '${PATH}' — the unit's PATH comes from /etc/wheel/wheeld.env."
+done
+
+node_v="$(wheel_version_of node)"
+[ -n "$node_v" ] || fail "node is on PATH but printed no version"
+case "$node_v" in
+    "$WHEEL_NODE_MAJOR".*) ;;
+    *) fail "node is $node_v, and this kit is pinned to major $WHEEL_NODE_MAJOR (web/package.json engines.node)" ;;
+esac
+
+# THE ONE THE OAUTH WORK DEPENDS ON. PR #64's headless refresh needs claude >= WHEEL_CLAUDE_MIN.
+# Checked against what the binary PRINTS, never against what npm was asked to install: a cache, a
+# pre-existing global install or a half-failed upgrade all produce a box where the pin says one
+# thing and the binary on PATH is another, and the symptom is an OAuth refresh that stops working a
+# week later rather than an install that fails now.
+claude_v="$(wheel_version_of claude)"
+[ -n "$claude_v" ] || fail "claude is on PATH ($(command -v claude)) but printed no parseable version — cannot confirm it meets the $WHEEL_CLAUDE_MIN floor that headless OAuth refresh needs"
+if ! wheel_version_ge "$claude_v" "$WHEEL_CLAUDE_MIN"; then
+    fail "claude is $claude_v, below the $WHEEL_CLAUDE_MIN floor that PR #64's headless OAuth refresh requires. Agents would authenticate and then silently fail to refresh. Fix: npm install -g @anthropic-ai/claude-code@$WHEEL_CLAUDE_VERSION"
+fi
+
+# ss is how wheeld-ready measures the listening socket after the daemon binds. If it is missing,
+# that measurement silently degrades into an assumption, so it is a prerequisite checked here
+# rather than a fallback taken there.
+command -v ss >/dev/null 2>&1 || fail "ss is not installed (apt-get install iproute2) — wheeld-ready needs it to prove the listening socket is loopback-only, and a check that cannot run must not look like a check that passed"
+
+note "ok — bind $bind, data $data_dir, node $node_v, claude $claude_v (floor $WHEEL_CLAUDE_MIN), signup ${WHEEL_SIGNUP:-closed}"
