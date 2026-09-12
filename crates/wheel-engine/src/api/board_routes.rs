@@ -6,6 +6,7 @@
 
 use axum::{extract::State, http::StatusCode, Json};
 use uuid::Uuid;
+use wheel_core::node::RedactCredentials;
 use wheel_core::{Event, Node, NodeState, NodeType, NodeWithState, Timestamp, WireSpec};
 
 use axum::extract::Path;
@@ -18,13 +19,23 @@ use crate::db::board;
 ///
 /// The only board read. Vault values are never included: a vault node returns
 /// its `config.keys` and nothing else.
-pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn get_board(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    // `GET /v1/board` is a GUEST route, and the board is where a project's whole credential map
+    // would otherwise be handed out in one response: vault key names, every `vault_ref` naming
+    // `<vault>/<KEY>`, and every static fill's operator-typed value in plaintext. Below admin the
+    // config is projected — see `wheel_core::node::RedactCredentials` for what goes and what stays.
+    let tier = super::actor::tier_from_headers(&headers);
+    let redact = tier < super::actor::ActorTier::Admin;
+
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let nodes = board::list(&conn).map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let with_state: Vec<NodeWithState> = nodes
+    let with_state: Vec<serde_json::Value> = nodes
         .into_iter()
-        .map(|n| {
+        .map(|mut n| {
             // `state` is present for every node and null for non-agents, so a
             // client can tell "has no state" from "not loaded".
             let state = match n.node_type() {
@@ -33,7 +44,21 @@ pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::
                 )),
                 _ => None,
             };
-            NodeWithState { node: n, state }
+            // `redacted` is emitted so a client can say "hidden — admin only" rather than render an
+            // empty key list, which reads as "this vault has none". Showing nothing and showing
+            // nothing-because-you-may-not-see-it are different facts.
+            let hidden = redact && n.config.has_redactable_credentials();
+            if redact {
+                n.config = n.config.redact_credentials();
+            }
+            let mut v = serde_json::to_value(NodeWithState { node: n, state })
+                .unwrap_or(serde_json::Value::Null);
+            if hidden {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("redacted".into(), serde_json::Value::Bool(true));
+                }
+            }
+            v
         })
         .collect();
 

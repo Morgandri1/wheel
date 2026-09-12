@@ -1027,10 +1027,35 @@ fn login_error(e: crate::oauth::LoginError) -> ApiError {
 /// they work — only the harness's own probe can say that, and claiming
 /// otherwise would tell an operator they are authenticated right up until the
 /// first request fails.
+/// `GET /v1/agents/:id/auth` — whether this agent holds usable credentials.
+///
+/// **Below admin, the answer is only `authenticated`.** The tier table grants this route to a guest
+/// on the stated ground that it reports "whether an agent is authenticated, not with what" — and the
+/// full response does not honour that. `source` names the vault node supplying the credential;
+/// `refreshable` is set only when the stored key is `CLAUDE_OAUTH_SESSION`, so a `true` there is an
+/// exact key-name disclosure; `account`, `expires_at` and `warning` are all facts about somebody
+/// else's credential.
+///
+/// So the projection is by subtraction rather than by choosing what looks harmless: an admin gets
+/// everything, and everyone else gets the single bit the rule says they may have.
 pub async fn auth_status(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let full = auth_status_full(&s, id).await?;
+    if super::actor::tier_from_headers(&headers) >= super::actor::ActorTier::Admin {
+        return Ok(Json(full));
+    }
+    let authenticated = full
+        .get("authenticated")
+        .cloned()
+        .unwrap_or(serde_json::Value::Bool(false));
+    Ok(Json(serde_json::json!({ "authenticated": authenticated })))
+}
+
+async fn auth_status_full(s: &AppState, id: Uuid) -> ApiResult<serde_json::Value> {
+    let s = s.clone();
     let harness = agent_harness(&s, id)?;
 
     // A wired vault wins over a pasted credential: it is the thing the
@@ -1055,7 +1080,7 @@ pub async fn auth_status(
             }
             _ => (None, None),
         };
-        return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+        return Ok(serde_json::json!(wheel_core::AuthStatus {
             authenticated: true,
             mode: Some(wheel_core::CredentialKind::Env),
             source: Some(source),
@@ -1066,7 +1091,7 @@ pub async fn auth_status(
             expires_at,
             refreshable,
             warning,
-        })));
+        }));
     }
 
     let config_dir = s.cfg.creds_dir().join(id.to_string());
@@ -1098,7 +1123,7 @@ pub async fn auth_status(
         None
     };
 
-    Ok(Json(serde_json::json!(wheel_core::AuthStatus {
+    Ok(serde_json::json!(wheel_core::AuthStatus {
         authenticated,
         mode,
         source: None,
@@ -1106,7 +1131,7 @@ pub async fn auth_status(
         expires_at,
         refreshable: None,
         warning: None,
-    })))
+    }))
 }
 
 /// `DELETE /v1/agents/:id/auth` — forget stored credentials.

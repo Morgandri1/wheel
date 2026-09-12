@@ -304,6 +304,22 @@ pub async fn find(db: &Db, project_id: &Uuid, user_id: &str) -> ApiResult<Option
     }))
 }
 
+/// Whether this principal's membership of this project was **revoked**.
+///
+/// Distinct from [`find`], which only sees live rows. Revocation is a decision about a person, and
+/// the soft-deleted row is the record of that decision — so it has to be readable by the one place
+/// that would otherwise overturn it.
+pub async fn was_revoked(db: &Db, project_id: &Uuid, user_id: &str) -> ApiResult<bool> {
+    let n: i64 = crate::db_scalar!(
+        db,
+        "SELECT count(*) FROM project_members \
+         WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NOT NULL",
+        project_id,
+        user_id
+    )?;
+    Ok(n > 0)
+}
+
 /// End a membership. Soft, so it stays visible, and so a live connection has something to react to.
 pub async fn revoke(
     db: &Db,
@@ -469,23 +485,32 @@ pub async fn accept(
     user_id: &str,
     user_email: Option<&str>,
 ) -> ApiResult<(Uuid, Tier)> {
-    const PG: &str = "UPDATE project_invites SET uses = uses + 1 \
-         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND uses < max_uses \
-         RETURNING project_id, role, email";
-    const SQLITE: &str = "UPDATE project_invites SET uses = uses + 1 \
+    // Look first, consume second.
+    //
+    // This used to be one `UPDATE ... uses = uses + 1 ... RETURNING`, which read beautifully and
+    // was wrong: the email lock and the role parse happened *after* the increment had committed, so
+    // anyone who opened a forwarded link burned it. With the documented default of one use, the
+    // person it was actually for was then told the invite was unknown or already used — a denial of
+    // service any authenticated stranger could perform by clicking.
+    //
+    // The consumption below is still a single atomic statement with `uses < max_uses` as a
+    // predicate, so two callers racing cannot both win. What moved is only the checks that must not
+    // cost a use.
+    const FIND_PG: &str = "SELECT project_id, role, email FROM project_invites \
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND uses < max_uses";
+    const FIND_SQLITE: &str = "SELECT project_id, role, email FROM project_invites \
          WHERE token_hash = $1 AND revoked_at IS NULL \
-           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AND uses < max_uses \
-         RETURNING project_id, role, email";
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AND uses < max_uses";
 
+    let digest = invite_digest(token);
     let row: Option<(Uuid, String, Option<String>)> =
-        crate::db_fetch_optional!(db, db.pick(PG, SQLITE), invite_digest(token))?;
+        crate::db_fetch_optional!(db, db.pick(FIND_PG, FIND_SQLITE), &digest)?;
 
     // Unknown, expired, revoked and exhausted are deliberately one answer: an invite link is a
     // credential, and distinguishing them would say which links exist.
+    let unusable = || ApiError::Unauthorized("invite is unknown, expired, revoked, or fully used");
     let Some((project_id, role, locked_email)) = row else {
-        return Err(ApiError::Unauthorized(
-            "invite is unknown, expired, revoked, or fully used",
-        ));
+        return Err(unusable());
     };
     let tier = Tier::parse(&role).ok_or(ApiError::Unauthorized("invite has an unknown role"))?;
 
@@ -509,21 +534,52 @@ pub async fn accept(
     let project = crate::models::Project::from(project);
 
     // The creator already has admin from `projects.owner_id`. Writing a row for them would be the
-    // second source of truth; accepting is simply a no-op.
+    // second source of truth; accepting is a no-op, and a no-op does not spend a use.
     if project.owner_id == user_id {
         return Ok((project_id, Tier::Admin));
     }
 
+    // **An admin's revocation outranks a link.** Without this, removing somebody was cosmetic: the
+    // token they joined with still redeemed and restored the role, so a revoked member could walk
+    // back in as often as they liked. Refusing here rather than revoking the invite is the narrower
+    // fix — an invite may have been sent to several people, and one person's removal should not
+    // cancel everyone else's.
+    //
+    // Re-admission is deliberately an explicit act: `POST /v1/projects/{id}/members` with the same
+    // user id the revocation named. An admin who changed their mind says so, rather than a link
+    // they no longer remember saying it for them.
+    if was_revoked(db, &project_id, user_id).await? {
+        return Err(ApiError::Unauthorized(
+            "membership of this project was revoked; an admin must grant it again",
+        ));
+    }
+
     // Never lower an existing tier. Otherwise a stale guest link becomes a way to demote a
-    // prompter — a downgrade that anyone holding an old link could trigger.
-    let effective = match find(db, &project_id, user_id).await? {
-        Some(existing) if existing.role >= tier => existing.role,
-        _ => {
-            grant(db, events, &project, "invite", user_id, tier).await?;
-            tier
+    // prompter — a downgrade that anyone holding an old link could trigger. Nothing changes, so
+    // nothing is spent.
+    if let Some(existing) = find(db, &project_id, user_id).await? {
+        if existing.role >= tier {
+            return Ok((project_id, existing.role));
         }
-    };
-    Ok((project_id, effective))
+    }
+
+    // Now consume, atomically. A caller that lost a race to the last use sees the same flat answer
+    // as one whose link never existed.
+    const USE_PG: &str = "UPDATE project_invites SET uses = uses + 1 \
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now() AND uses < max_uses \
+         RETURNING id";
+    const USE_SQLITE: &str = "UPDATE project_invites SET uses = uses + 1 \
+         WHERE token_hash = $1 AND revoked_at IS NULL \
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AND uses < max_uses \
+         RETURNING id";
+    let consumed: Option<(Uuid,)> =
+        crate::db_fetch_optional!(db, db.pick(USE_PG, USE_SQLITE), &digest)?;
+    if consumed.is_none() {
+        return Err(unusable());
+    }
+
+    grant(db, events, &project, "invite", user_id, tier).await?;
+    Ok((project_id, tier))
 }
 
 #[cfg(test)]

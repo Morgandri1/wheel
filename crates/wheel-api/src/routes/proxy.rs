@@ -181,9 +181,12 @@ pub async fn engine_events(
             ProjectScope::from_request_parts(&mut parts, &state).await?
         }
     };
-    // The events stream is a read, so a guest may hold one. Stated through the same table the
-    // wildcard proxy uses rather than hard-coded, so the two cannot disagree about this path.
-    require_engine_tier(&scope, &axum::http::Method::GET, &["v1", "events"])?;
+    // The REAL method, not `GET`. This route forwards whatever verb it was called with, so
+    // checking a hardcoded `GET` and then forwarding a `DELETE` authorises one request and performs
+    // another — the confusion this proxy refuses everywhere else. Latent only because the engine
+    // registers `get("/events")` and answers 405 to the rest; a table consulted about a method
+    // nobody used is not a table.
+    require_engine_tier(&scope, &parts.method, &["v1", "events"])?;
 
     // The ticket is deliberately dropped here rather than forwarded: it has already been consumed,
     // and passing credentials further down the chain is how replay bugs start.

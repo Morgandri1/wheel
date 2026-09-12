@@ -34,6 +34,41 @@
 
 use axum::http::HeaderMap;
 
+/// The tier header the API sets beside the actor id.
+const ACTOR_TIER: &str = "x-wheel-actor-tier";
+
+/// What the caller may see. Ordered least to most capable, like the API's `Tier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActorTier {
+    Guest,
+    Prompter,
+    Admin,
+}
+
+/// The tier a control-plane request asserts, **failing closed**.
+///
+/// An absent, unreadable or unrecognised header is [`ActorTier::Guest`] — the least this system
+/// grants. That matters more than it looks: the API sets this header on every path it reaches an
+/// engine by, so a request without one did not come through the API's project proxy. Treating
+/// "no tier asserted" as *full* access would put the board's credential map one forgotten header
+/// away from a guest, which is the exact shape of the defect this exists to fix.
+///
+/// The cost is that a direct caller holding the engine secret — the host's own calls, QA — must say
+/// `admin` to see an unredacted board. That is the right way round: the party that knows it is an
+/// admin is the one that can say so.
+pub fn tier_from_headers(headers: &HeaderMap) -> ActorTier {
+    match headers.get(ACTOR_TIER).and_then(|v| v.to_str().ok()) {
+        Some("admin") => ActorTier::Admin,
+        Some("prompter") => ActorTier::Prompter,
+        Some("guest") => ActorTier::Guest,
+        Some(other) => {
+            tracing::warn!(tier = other, "unrecognised actor tier; treating as guest");
+            ActorTier::Guest
+        }
+        None => ActorTier::Guest,
+    }
+}
+
 /// The header the API sets. Named here rather than imported so the engine does not depend on the
 /// API crate; `crates/wheel-api/src/http/actor.rs` holds the other copy and the integration suite
 /// is what pins them together.

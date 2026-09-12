@@ -104,8 +104,14 @@ pub async fn instantiate(
         }
     }
 
-    // The caller created this project a moment ago, so they are its admin.
-    let client = HttpBoardClient::new(&state, &project.id, &user, crate::auth::Tier::Admin);
+    // Resolved, not asserted. "The caller created this project a moment ago, so they are its
+    // admin" is true — but it is true because of what `create_project` does two files away, and a
+    // literal `Tier::Admin` here would keep claiming it after that stopped being so. `load_member`
+    // is the one function that answers what tier somebody holds; asking it costs a query and
+    // removes a fact that was only correct by coincidence.
+    let (_, tier) =
+        crate::auth::extractor::load_member(&state, &project.id, user.id()).await?;
+    let client = HttpBoardClient::new(&state, &project.id, &user, tier);
     let report = execute(&plan, &ExistingBoard::default(), &client).await;
 
     if report.is_complete() {

@@ -259,8 +259,13 @@ fn engine_paths() -> Vec<(&'static str, String, &'static str)> {
     vec![
         ("GET", "v1/board".into(), "guest"),
         ("GET", "v1/engine".into(), "guest"),
+        // Omitted before, which is exactly why the route could hardcode `GET` in its policy check
+        // and still pass this matrix. A table the test does not drive is a table the route need not
+        // honour.
+        ("GET", "v1/events".into(), "guest"),
         ("GET", format!("v1/agents/{AGENT}/log"), "guest"),
         ("GET", format!("v1/agents/{AGENT}/inbox"), "guest"),
+        ("GET", format!("v1/agents/{AGENT}/inbox/{AGENT}"), "guest"),
         ("GET", format!("v1/tables/{AGENT}/rows"), "guest"),
         ("GET", format!("v1/tools/{AGENT}/ops"), "guest"),
         ("GET", format!("v1/agents/{AGENT}/auth"), "guest"),
