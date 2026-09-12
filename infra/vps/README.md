@@ -503,3 +503,4 @@ expect this one check red; the real VPS runs stock `dockerd` and it passes there
 | `413 ... at the proxy` | Over the edge limit: 256 KiB for webhooks, 5 MiB for everything else (wheeld and the web app refuse more anyway) |
 | Webhook `403` | The project's `http` capability is off, or you're in tunnel mode (no ingress) |
 | `docker compose build` seems to hang or the daemon logs `Killed` | Out of memory on the first Rust build — see [Running on a small box](#running-on-a-small-box-2-vcpu-4-gib) |
+| `verify-signup-gate` fails with `WHEEL_SIGNUP=open` set | Known limitation: its probe can be rate-limited by wheeld's own global signup counter (50/hour) if a stranger has already used it up — which they could, since `open` means anyone reaching wheeld can sign up at all. Not a security gap; `open` is already documented as unsafe on a reachable server. |

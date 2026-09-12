@@ -37,6 +37,15 @@
 #      enforces its signup gate" while never having reached the signup gate at all. So: a control
 #      request first, to something signup has no say over, and the closed-branch match requires
 #      wheel-api's own generic message text, which the Host-guard does not produce.
+#
+# Known limitation, recorded rather than fixed: in the open branch, this probe counts against
+# wheeld's own global signup rate limit (50/hour). If a stranger has already spent that bucket —
+# reachable only because WHEEL_SIGNUP=open means anyone who reaches wheeld can sign up in the first
+# place — wheeld answers 429 instead of the 400 this script expects, and the deploy fails safe
+# (nothing starts) but for a reason that has nothing to do with whether wheeld enforces its own
+# gate. This is a discouraged-mode-only annoyance, not a security gap: WHEEL_SIGNUP=open itself is
+# already documented as unsafe on a reachable server (README.md, "Signup"), and this just means a
+# stranger can also make deploys fail while it's set that way.
 set -eu
 
 base="http://wheeld:8080"

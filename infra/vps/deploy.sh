@@ -144,8 +144,15 @@ echo "==> docker compose up -d --build"
 if compose up -d --build; then
     compose ps
     exit 0
+else
+    # $? here is compose's own exit status, because it's read as the FIRST thing in the else
+    # branch. A bare `up_rc=$?` placed after the whole if/fi, with no else, is a well-known trap:
+    # an if statement that took neither branch (the "then" skipped, no "else" to run) has exit
+    # status 0 by itself, so `$?` there reflects the IF STATEMENT, not the command it tested —
+    # this script shipped exactly that bug once, silently exiting 0 on a real deploy failure.
+    # rehearsal/test-deploy-exit-code.sh mutation-checks this shape specifically.
+    up_rc=$?
 fi
-up_rc=$?
 
 # depends_on (verify-signup-gate included) gates STARTING a service and never stops one already
 # running, so on a fresh deploy a failed dependency already means wheeld/web never started —
