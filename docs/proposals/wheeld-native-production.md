@@ -169,7 +169,7 @@ this design as the acceptances.
 | **`ProtectHostname=yes`** | no `sethostname` | none. |
 | **`RestrictRealtime=yes`** | no `SCHED_FIFO`/`SCHED_RR`. On 2 vCPU a realtime-priority spin is a complete denial of service on the box, reachable by any agent | none; no build tool asks for realtime scheduling. |
 | **`CapabilityBoundingSet=`** and **`AmbientCapabilities=`** (both empty) | nothing in this unit can ever hold a capability, including via a file capability on a binary | **`ping` stops working**, because Ubuntu ships it with `cap_net_raw+ep` rather than setuid. An agent diagnosing connectivity uses `curl`/`getent`/`nc` instead. Worth naming because it is the one visible break. |
-| **`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`** | `AF_PACKET` is gone, so no raw packet capture on the VPS's interfaces, along with every exotic family | `AF_NETLINK` is deliberately **kept** — glibc's `__check_pf()` uses it to decide about IPv6 in `getaddrinfo`, `getifaddrs()` needs it, and so do `ip`, `ss` and Node's `os.networkInterfaces()`. Dropping it is the classic way to make DNS behave strangely in a way nobody attributes to the unit file. Measured, not assumed — §8. (`AF_PACKET` also needs `CAP_NET_RAW`, which the empty bounding set already removed, so this row is belt and braces and costs nothing.) |
+| **`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`** | `AF_PACKET` is gone, so no raw packet capture on the VPS's interfaces, along with every exotic family | `AF_NETLINK` is deliberately **kept**, and the reason is not the one I first wrote down — see §4a. Measured: dropping it does **not** break DNS. It breaks `ss`, `ip` and `getifaddrs()`, and `ss` is in this kit's own critical path. (`AF_PACKET` also needs `CAP_NET_RAW`, which the empty bounding set already removed, so this row is belt and braces and costs nothing.) |
 | **`ProtectProc=invisible`** | an agent can no longer see, or read the `cmdline`/`environ` of, processes belonging to other users — `sshd`, `caddy`, `wheel-web`, root's | `ps aux` inside the unit shows only `wheel`'s own processes. That is an improvement in every case except confusion. **It does not touch redteam 037**: same-uid siblings stay fully visible to each other, which is 037's entire premise. Claiming otherwise would be the exact "a fix that looks like one" `docs/ARCHITECTURE.md:736-749` warns about. |
 | **`PrivateDevices=yes`** | a minimal private `/dev` — no raw block devices, no `/dev/kvm`, no `/dev/fuse`, no GPU | an agent cannot run a VM, a FUSE mount, or CUDA. None of those exist on a 2 vCPU Linode. `/dev/null`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx` and a private `devpts` are all provided, so pty-allocating CLIs still work — measured in §8, because that is the failure this directive would plausibly cause. |
 | **`PrivateMounts=yes`** | mount propagation is private, so a mount an agent manages to make cannot appear host-wide | none; already implied by the `Protect*` set, stated so it survives a future edit. |
@@ -180,26 +180,29 @@ this design as the acceptances.
 
 **`SystemCallFilter=@system-service`** — rejected on `wheeld.service`; **applied to
 `wheel-web.service`**. `@system-service` denies `@mount` and `@debug` among others. `@mount`
-(`mount`, `umount2`, `unshare`, `pivot_root`) is what Chromium's sandbox, `bwrap` and rootless
-container tooling use, and an agent doing browser QA is a first-class Wheel workload. `@debug`
-(`ptrace`, `process_vm_readv`) is what debuggers and profilers use. A seccomp filter on this unit is
-inherited by every descendant with no per-workload escape. Against that, the protection is thin: the
-denied families are mostly privileged operations that `NoNewPrivileges=yes` plus an empty
+(`mount`, `umount2`, `pivot_root`) is what Chromium's sandbox, `bwrap` and rootless container
+tooling use, and an agent doing browser QA is a first-class Wheel workload. `@debug` (`ptrace`,
+`process_vm_readv`) is what debuggers and profilers use. A seccomp filter on this unit is inherited
+by every descendant with no per-workload escape. Against that, the protection is thin: the denied
+families are mostly privileged operations that `NoNewPrivileges=yes` plus an empty
 `CapabilityBoundingSet=` already put out of reach for an unprivileged uid. So it buys little and can
-break a lot — exactly the trade this section exists to refuse. `wheel-web.service` is the opposite
-case: one known Node program that spawns nothing, so it gets the filter.
+break a lot — exactly the trade this section exists to refuse. Measured in §4a, including the part
+that is *not* obvious: plain `unshare` survives the filter, and only the `mount` that follows it
+fails, so a check that ran `unshare` alone would have concluded the filter was harmless.
+`wheel-web.service` is the opposite case: one known Node program that spawns nothing, so it gets the
+filter.
 
 *Residual acknowledged:* denying `@debug` would have narrowed redteam 037 slightly, by removing
 `process_vm_readv` between same-uid siblings. It would not have closed it — `/proc/<pid>/environ`
 needs no `ptrace` — and Ubuntu's default `kernel.yama.ptrace_scope=1` already restricts `ptrace` to
 descendants. Not enough to pay the price above.
 
-**`RestrictNamespaces=`** — rejected. User, mount and pid namespaces are what Chromium, `bwrap` and
-rootless Podman need. This is the single most likely directive to silently break an agent. The
-security cost of leaving it open is real (unprivileged user namespaces have a history as a kernel
-LPE surface) and is addressed at the host level instead, where it belongs: Ubuntu 24.04 ships
-`kernel.apparmor_restrict_unprivileged_userns=1` on by default. The README says to check it rather
-than assume it.
+**`RestrictNamespaces=`** — rejected, and measured (§4a). User, mount and pid namespaces are what
+Chromium, `bwrap` and rootless Podman need. This is the single most likely directive to silently
+break an agent. The security cost of leaving it open is real (unprivileged user namespaces have a
+history as a kernel LPE surface) and is addressed at the host level instead, where it belongs:
+Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1` on by default. The README says
+to check it rather than assume it.
 
 **`ProcSubset=pid`** — rejected. It hides `/proc/meminfo`, `/proc/cpuinfo`, `/proc/stat` and
 `/proc/loadavg` along with the rest of `/proc`. Build tools size their parallelism from those,
@@ -224,6 +227,48 @@ npm and the Anthropic API. **Applied to `wheel-web.service`**, which only ever d
 `127.0.0.1:8080` and serves `127.0.0.1:3000`. If the board is ever RCE'd it cannot exfiltrate
 anything. Cost, stated in the unit: pointing `WHEEL_API_URL` at a remote API or switching
 `WHEEL_AUTH_MODE` to `jwks` requires relaxing it, and the unit says so where someone would hit it.
+
+### 4a. What was actually measured, including where it contradicted me
+
+Every claim above is checked by `infra/vps/rehearsal/native/harden-probe.sh`, which lifts the
+`[Service]` directives out of the shipped `wheeld.service` and its drop-in **verbatim** and runs a
+real workload under them — so it cannot pass against a copy that has drifted from what `install.sh`
+installs. Results on Ubuntu 24.04 / systemd 255, in the container test bed:
+
+| Measured | Result |
+|---|---|
+| `git clone`, `npm install` (a package with a build step), and a real build, all under the full directive set | **work** — 13 checks pass, 0 fail |
+| `ProcSubset=pid` | **hides `/proc/meminfo` and `/proc/cpuinfo`.** Confirms the rejection. `nproc` still works (it uses `sched_getaffinity`), which is exactly why the breakage is easy to miss |
+| `ProtectProc=invisible` | works — `/proc` remounted `hidepid=invisible`, root's `/proc/1/cmdline` is `ENOENT` to the service user. `/proc/meminfo` unaffected |
+| `PrivateDevices=yes` | pty allocation still works (`script -qec` succeeds) |
+| **`RestrictAddressFamilies` without `AF_NETLINK`** | **DNS still works.** `getent hosts`, Node's `dns.lookup` and `npm install` all succeeded. **The folklore I originally wrote down — that dropping `AF_NETLINK` breaks `getaddrinfo` via `__check_pf()` — is false here; glibc falls back.** What actually breaks is `ss`, `ip` and Node's `os.networkInterfaces()`: *"Cannot open netlink socket: Address family not supported by protocol"*. That still settles the question, because **`ss` is what `wheeld-ready` uses to prove the loopback bind** — dropping `AF_NETLINK` would turn §3's strongest row into an unverifiable claim |
+| `RestrictNamespaces=yes` | breaks `unshare -Ur` outright: *"unshare failed: Operation not permitted"* |
+| `SystemCallFilter=@system-service` | plain `unshare -Ur` **survives**; `unshare -Urm` + `mount -t tmpfs` fails at *"cannot change root filesystem propagation"*. The namespaced mount is what `bwrap` and Chromium do, so the filter does break them — but only a probe that mounts finds out |
+| Same-uid `/proc/<pid>/environ` under `SystemCallFilter` | **still readable.** Confirms §9's claim that denying `@debug` would not close redteam 037 — `environ` needs no `ptrace` |
+| `OOMPolicy` | §5, and it is the sharpest result here |
+
+Three of these changed the design or the reasoning behind it. That is the argument for measuring
+rather than reading a hardening guide: the `AF_NETLINK` row would have shipped with a false
+justification, the `SystemCallFilter` rejection would have rested on a claim about `unshare` that is
+wrong, and `ProtectSystem`/`ProtectHome` were briefly "verified" by a probe that was really only
+observing ordinary file permissions — `wheel` cannot write `/usr/local` or read `/root` whether or
+not those directives exist. The mutation harness caught that last one by removing both directives
+and watching nothing turn red; the probe now uses a world-writable directory outside
+`ReadWritePaths=` and a world-readable file under `/home` as decoys, and additionally requires the
+`ProtectSystem` failure to be `EROFS` rather than any refusal at all.
+
+A gate that has never failed proves nothing, so `infra/vps/rehearsal/native/mutate-native.sh`
+breaks each layer on purpose and exits 0 only if the checks guarding it come back red:
+
+- `harden` applies the four tightenings a security review would suggest — `ProcSubset=pid`, dropping
+  `AF_NETLINK`, `SystemCallFilter=@system-service`, `RestrictNamespaces=yes` — and requires the
+  three corresponding agent-capability checks to fail. **This is the mutation that matters**, because
+  a sandbox tightened past what agents need breaks nothing visible: wheeld starts, the board serves,
+  `systemd-analyze security` scores *better*, and the damage surfaces days later as "the model seems
+  worse".
+- `sandbox` removes `ProtectHome`, `ProtectSystem` and `ProtectProc` and requires the three
+  host-protection checks to fail.
+- `oom` removes `OOMPolicy=continue` and requires `oom-containment.sh` to fail.
 
 ## 5. Resource limits on a 2 vCPU, 3.8 GB box
 

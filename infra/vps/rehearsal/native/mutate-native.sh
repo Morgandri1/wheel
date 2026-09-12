@@ -55,8 +55,13 @@ run_probe() { # run_probe <expected-red...>  -- runs harden-probe and checks the
     out="$("$here/harden-probe.sh" 2>&1)"
     rc=$?
     local missed=0
+    # grep -F, not -E. The check names contain regex metacharacters -- "namespaces: unshare + mount"
+    # has a `+`, which as ERE means "one or more of the preceding space" and therefore never matches
+    # the literal text. That bug made this harness report STILL NOT RED for a mutation the probe had
+    # correctly caught, which is the worst failure a mutation harness can have: it accuses a working
+    # gate. Fixed-string matching removes the class of bug rather than escaping one instance of it.
     for want in "$@"; do
-        if printf '%s' "$out" | grep -qE "^  (FAIL|SKIP) +$want"; then
+        if printf '%s\n' "$out" | grep -E '^  (FAIL|SKIP) ' | grep -qF -- "$want"; then
             echo "  red as it must be    $want"
         else
             echo "  STILL NOT RED        $want"
