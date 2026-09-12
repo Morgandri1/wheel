@@ -134,6 +134,13 @@ pub fn build_request(
             // Percent-encoded: a path value containing `/` or `?` would
             // otherwise address a different resource entirely.
             ParamLocation::Path => {
+                if is_dot_segment(&value) {
+                    bail!(
+                        "field {:?} is {value:?}, which cannot be a path segment on its own \
+                         (it would climb out of the operation's configured path)",
+                        p.name
+                    );
+                }
                 path = path.replace(&format!("{{{}}}", p.name), &encode(&value));
             }
             ParamLocation::Query => query.push((p.name.clone(), value)),
@@ -214,6 +221,32 @@ fn encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a raw (pre-`encode`) path-param value, substituted whole into a templated path, becomes
+/// one of the two RFC 3986 dot-segments on its own -- the one case `encode` cannot neutralize by
+/// percent-encoding, because it neutralizes nothing else about it.
+///
+/// `encode`'s job stops a value from introducing STRUCTURE (a `/` would otherwise open a new
+/// segment, `?` a new query). It cannot stop a value from BEING one of the two segment names -- `.`
+/// and `..` -- that a URL parser treats as structure regardless of spelling. `Url::parse` (the
+/// `url` crate, WHATWG-compliant, what `reqwest` builds on) removes a `.`/`..` segment whether it is
+/// written literally OR as `%2e`/`%2E` -- the WHATWG path-parsing state defines "single-dot" and
+/// "double-dot" segments as case-insensitive matches against `.`/`%2e`, `..`/`%2e.`/`.%2e`/`%2e%2e`,
+/// specifically so percent-encoding cannot smuggle a dot-segment past a spec-compliant parser.
+/// Verified empirically: `Url::parse("https://x/a/%2E%2E").path()` is `"/"`, identical to the
+/// literal `".."` case, so re-encoding the dots (an earlier version of this fix) does not work --
+/// only refusing the value does. Substituted into a templated path (`/rooms/{room}/messages` with
+/// `room=".."`) that reads as `/rooms/../messages`, this is what silently drops `/rooms` and reaches
+/// `/messages` on the bare host while still carrying the operation's credential fill.
+///
+/// Since `encode` only leaves `-_.~` and alphanumerics untouched, the ENCODED output can only ever
+/// equal one of those six magic strings if the RAW value already was exactly `.` or `..` -- anything
+/// else that could spell `%2e`/`%2E` contains a literal `%`, which `encode` itself turns into `%25`,
+/// breaking the match. So checking the raw value is exact and sufficient; no case-folding or partial
+/// match is needed.
+fn is_dot_segment(s: &str) -> bool {
+    s == "." || s == ".."
 }
 
 /// The equivalent `curl`, with every static and vault value masked.
@@ -690,6 +723,69 @@ mod tests {
             "https://api.example.com/messages/..%2F..%2Fadmin%2Fkeys"
         );
         assert!(!got.url.contains("/admin/keys"));
+    }
+
+    /// The gap the test above does not cover: `.` is RFC 3986 unreserved, so `encode` alone leaves a
+    /// path value of EXACTLY `".."` (no slash, so the `/`-encoding guard above never fires) as a
+    /// literal dot-segment. Percent-encoding the dots does not help either -- proven inline below,
+    /// against the REAL parser this URL is eventually built with, not an assumption about it -- so
+    /// the only correct answer is refusing the call rather than sending something that silently
+    /// reaches a different path than the operation names.
+    #[test]
+    fn a_path_value_of_exactly_dot_dot_is_refused_rather_than_silently_climbing_out() {
+        assert_eq!(
+            reqwest::Url::parse("https://api.example.com/messages/%2E%2E")
+                .unwrap()
+                .path(),
+            "/",
+            "if this ever stops collapsing, is_dot_segment's reasoning (and this test) needs \
+             revisiting -- it is the whole justification for refusing rather than re-encoding"
+        );
+
+        let o = op(vec![p("room", ParamLocation::Path, Fill::agent())]);
+        let err = build_request(
+            &cfg(vec![o.clone()]),
+            &o,
+            &serde_json::json!({"room": ".."}),
+            &secrets(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("room"), "{err}");
+        assert!(err.contains(".."), "{err}");
+    }
+
+    /// The single-dot sibling: `"."` alone does not climb anywhere, but a client normalizing it away
+    /// still turns `/messages/.` into `/messages` — a real path, just not the one the operation
+    /// names — so it is refused for the same reason.
+    #[test]
+    fn a_path_value_of_exactly_dot_is_also_refused() {
+        let o = op(vec![p("room", ParamLocation::Path, Fill::agent())]);
+        let err = build_request(
+            &cfg(vec![o.clone()]),
+            &o,
+            &serde_json::json!({"room": "."}),
+            &secrets(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("room"), "{err}");
+    }
+
+    /// A value that merely CONTAINS a dot segment among other characters (not equal to it) is
+    /// ordinary data and must still work — this is about the exact degenerate value, not about
+    /// refusing every path value with a `.` in it.
+    #[test]
+    fn a_path_value_that_only_contains_a_dot_segment_is_unaffected() {
+        let o = op(vec![p("room", ParamLocation::Path, Fill::agent())]);
+        let got = build_request(
+            &cfg(vec![o.clone()]),
+            &o,
+            &serde_json::json!({"room": "report.v2..final"}),
+            &secrets(),
+        )
+        .unwrap();
+        assert_eq!(got.url, "https://api.example.com/messages/report.v2..final");
     }
 
     /// A query value must not be able to add another parameter.
