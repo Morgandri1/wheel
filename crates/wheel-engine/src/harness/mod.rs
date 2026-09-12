@@ -13,6 +13,7 @@ use std::{ffi::OsString, path::PathBuf};
 use uuid::Uuid;
 
 pub mod claude;
+pub mod driver;
 
 /// Whether this build has a driver for `harness`. The one answer node creation,
 /// agent start and `GET /v1/engine` all give, so none can claim a harness the
