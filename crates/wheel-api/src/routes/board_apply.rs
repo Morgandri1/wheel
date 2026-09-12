@@ -163,8 +163,12 @@ impl HttpBoardClient {
         }
     }
 
-    /// A request builder carrying the host bearer and the actor markers. Every engine call goes
-    /// through here, so none of them can be the one that forgot.
+    /// A request builder carrying the host bearer and the actor markers.
+    ///
+    /// **Every** engine call goes through here. `read_board` did not, and arrived unattributed —
+    /// caught by `tiers.rs::the_board_apply_path_carries_the_actor_and_refuses_lower_tiers`, which
+    /// asserts on every request the engine saw rather than on the first. That is the whole argument
+    /// for one builder: three call sites and one of them drifts.
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         self.http
             .request(method, url)
@@ -248,9 +252,7 @@ impl BoardClient for HttpBoardClient {
 /// Read the current board into the shape the apply step validates against.
 async fn read_board(client: &HttpBoardClient) -> ApiResult<ExistingBoard> {
     let resp = client
-        .http
-        .get(format!("{}/v1/board", client.base))
-        .header("Authorization", &client.bearer)
+        .request(reqwest::Method::GET, format!("{}/v1/board", client.base))
         .send()
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("could not reach the engine: {e}")))?;

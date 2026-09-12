@@ -33,6 +33,7 @@ use wheel_api::config::{AuthMode, Config, Env, SignupPolicy};
 use wheel_api::crypto::Secret;
 use wheel_api::db::Db;
 use wheel_api::orchestrator::{NoopOrchestrator, Orchestrator};
+use uuid::Uuid;
 use wheel_api::state::{AppState, Inner};
 
 /// Everything the engine actually received: the request target and the headers that survived the
@@ -104,6 +105,7 @@ fn cfg(db_url: &str) -> Config {
 
 struct Harness {
     app: Router,
+    db: Db,
     engine: EngineLog,
     /// Created the project, so admin of it.
     creator: String,
@@ -114,6 +116,7 @@ struct Harness {
     guest_id: String,
     /// A member of nothing.
     outsider: String,
+    outsider_id: String,
     project: String,
 }
 
@@ -187,7 +190,7 @@ async fn harness() -> Harness {
             reqwest::Client::new(),
         ),
         cfg: cfg(&url),
-        db,
+        db: db.clone(),
         http: reqwest::Client::new(),
         orch: Arc::new(NoopOrchestrator) as Arc<dyn Orchestrator>,
         ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(10_000),
@@ -201,7 +204,7 @@ async fn harness() -> Harness {
     let (creator, creator_id) = signup(&app, "creator@example.com").await;
     let (prompter, prompter_id) = signup(&app, "prompter@example.com").await;
     let (guest, guest_id) = signup(&app, "guest@example.com").await;
-    let (outsider, _) = signup(&app, "outsider@example.com").await;
+    let (outsider, outsider_id) = signup(&app, "outsider@example.com").await;
 
     let (status, project) = call(
         &app,
@@ -233,6 +236,7 @@ async fn harness() -> Harness {
     engine.take();
     Harness {
         app,
+        db,
         engine,
         creator,
         creator_id,
@@ -241,6 +245,7 @@ async fn harness() -> Harness {
         guest,
         guest_id,
         outsider,
+        outsider_id,
         project,
     }
 }
@@ -992,4 +997,224 @@ async fn the_member_list_names_the_creator_who_is_not_a_row() {
         members.iter().all(|m| m["user_id"] != json!(h.creator_id)),
         "the creator appeared as a member row: {body}"
     );
+}
+
+// --------------------------------------------------------------------------- migration safety
+
+/// **The test that stands between this change and locking the live deployment's owner out.**
+///
+/// `https://wheel.avo.so` holds projects created before `project_members` existed, so they have no
+/// member rows and never will unless something writes them. Migration 0006 deliberately does not:
+/// it creates two empty tables and touches no existing data, because the creator's admin is
+/// *derived* from `projects.owner_id` rather than stored (`docs/proposals/shared-projects.md` §4.2).
+///
+/// So this inserts a project the way the live database already holds one — a bare row, no
+/// membership, no invites — and proves the owner still has everything and a stranger still has
+/// nothing. If the derivation were ever replaced by a lookup, or a backfill were introduced and got
+/// it wrong, this is what would go red.
+#[tokio::test]
+async fn a_project_that_predates_membership_still_belongs_to_its_owner() {
+    let h = harness().await;
+
+    // Straight into the table, bypassing `POST /v1/projects` entirely: no member row is written,
+    // which is exactly the state of every project that existed before this migration.
+    let legacy = Uuid::new_v4();
+    let caps = serde_json::to_value(wheel_api::models::Capabilities::default()).unwrap();
+    wheel_api::db_execute!(
+        &h.db,
+        "INSERT INTO projects (id, owner_id, name, capabilities, status) \
+         VALUES ($1, $2, $3, $4, 'stopped')",
+        legacy,
+        h.creator_id.as_str(),
+        "a board from before sharing existed",
+        &caps
+    )
+    .expect("seed a pre-membership project");
+
+    // There is genuinely no membership row — so this is not passing for the wrong reason.
+    let members: i64 = wheel_api::db_scalar!(
+        &h.db,
+        "SELECT count(*) FROM project_members WHERE project_id = $1",
+        legacy
+    )
+    .expect("count members");
+    assert_eq!(members, 0, "the fixture accidentally created a member row");
+
+    // The owner is an admin of it, by derivation.
+    let (status, body) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{legacy}"),
+        Some(&h.creator),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the owner lost their own project: {body}");
+    assert_eq!(body["tier"], "admin", "the owner is not an admin of their own board");
+
+    // It is listed, so it does not merely exist — it is reachable the way a person finds it.
+    let (_, list) = call(&h.app, "GET", "/v1/projects", Some(&h.creator), None).await;
+    assert!(
+        list.as_array().unwrap().iter().any(|p| p["id"] == json!(legacy.to_string())),
+        "a pre-membership project vanished from its owner's project list: {list}"
+    );
+
+    // And admin-only actions work on it, not just the read.
+    let (status, _) = call(
+        &h.app,
+        "PATCH",
+        &format!("/v1/projects/{legacy}"),
+        Some(&h.creator),
+        Some(json!({"name": "renamed after the migration"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the owner could not administer their own project");
+
+    // Everyone else still gets nothing, and gets told nothing.
+    for token in [&h.prompter, &h.guest, &h.outsider] {
+        let (status, _) = call(
+            &h.app,
+            "GET",
+            &format!("/v1/projects/{legacy}"),
+            Some(token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a pre-membership project leaked to a non-member"
+        );
+    }
+}
+
+/// The other half of §0: an admin grants a tier by account id, and that account then *finds* the
+/// project. Granting access that the grantee cannot discover is not sharing.
+#[tokio::test]
+async fn a_granted_account_sees_the_project_in_its_own_list() {
+    let h = harness().await;
+
+    // Before: the outsider has no projects at all.
+    let (_, before) = call(&h.app, "GET", "/v1/projects", Some(&h.outsider), None).await;
+    assert!(before.as_array().unwrap().is_empty());
+
+    let (status, body) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/members", h.project),
+        Some(&h.creator),
+        Some(json!({"user_id": h.outsider_id, "role": "guest"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (_, after) = call(&h.app, "GET", "/v1/projects", Some(&h.outsider), None).await;
+    let listed = after.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "the granted project is not in the grantee's list");
+    assert_eq!(listed[0]["id"], h.project);
+    assert_eq!(listed[0]["tier"], "guest");
+
+    // And it is real access: the board reads, and a send does not.
+    let (status, _) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}/engine/v1/board", h.project),
+        Some(&h.outsider),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a granted guest could not read the board");
+
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/engine/v1/agents/{AGENT}/send", h.project),
+        Some(&h.outsider),
+        Some(json!({"body": "hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a guest sent a message");
+}
+
+/// A role string this build cannot parse is **not access**.
+///
+/// The CHECK constraint on `project_members.role` makes this unreachable through the API today,
+/// which is exactly why it needs a test that reaches it another way: the case it defends against is
+/// a *rolling deploy*. Add a fourth tier in a later migration and, for the minutes during which both
+/// versions are live, an old replica reads a row naming a tier it has never heard of. Rounding that
+/// up is how a future `viewer` silently becomes an admin; rounding it down is the only direction
+/// that cannot grant anything.
+///
+/// So the test recreates `project_members` without the CHECK — which is precisely what a future
+/// schema version looks like to this binary — and writes the unknown tier directly.
+#[tokio::test]
+async fn a_role_this_build_cannot_parse_is_refused_rather_than_rounded() {
+    let h = harness().await;
+
+    // A future schema: same columns, no CHECK. Nothing else about the row changes.
+    for stmt in [
+        "DROP INDEX IF EXISTS project_members_user_idx",
+        "ALTER TABLE project_members RENAME TO project_members_old",
+        "CREATE TABLE project_members (
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            user_id    TEXT NOT NULL,
+            role       TEXT NOT NULL,
+            invited_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            revoked_at TEXT,
+            PRIMARY KEY (project_id, user_id))",
+        "INSERT INTO project_members SELECT * FROM project_members_old",
+        "DROP TABLE project_members_old",
+    ] {
+        wheel_api::db_execute!(&h.db, stmt).expect("restage the table without its CHECK");
+    }
+
+    // The guest is promoted to a tier that does not exist in this build.
+    let changed = wheel_api::db_execute!(
+        &h.db,
+        "UPDATE project_members SET role = 'superuser' WHERE project_id = $1 AND user_id = $2",
+        Uuid::parse_str(&h.project).unwrap(),
+        h.guest_id.as_str()
+    )
+    .expect("write the unknown tier");
+    assert_eq!(changed, 1, "the fixture did not actually write an unknown role");
+
+    // It buys nothing — not even the read a guest had a moment ago.
+    let (status, _) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}", h.project),
+        Some(&h.guest),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unrecognised tier granted access instead of failing closed"
+    );
+
+    // And it is refused as a non-member — 404, not 403 — so it cannot be probed for either.
+    let (status, _) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}/engine/v1/board", h.project),
+        Some(&h.guest),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The creator is untouched: an unreadable row for one member must not break the project.
+    let (status, body) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}", h.project),
+        Some(&h.creator),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tier"], "admin");
 }
