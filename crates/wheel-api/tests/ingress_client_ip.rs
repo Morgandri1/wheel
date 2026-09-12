@@ -62,6 +62,9 @@ fn cfg(db_url: &str) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
+        ws_max_bridges_per_project: 16,
+        ws_max_lifetime_secs: 3600,
     }
 }
 
@@ -81,6 +84,9 @@ async fn app(trusted: &str) -> Router {
         ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(600),
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: Some(echoing_engine().await),
+        external_jwks: None,
+        membership: wheel_api::membership::MembershipEvents::new(),
+        bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     wheel_api::build_router(state, &[]).layer(axum::middleware::from_fn_with_state(
         Arc::new(TrustedProxies::parse(trusted).unwrap()),

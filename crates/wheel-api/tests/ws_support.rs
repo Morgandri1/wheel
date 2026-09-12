@@ -50,6 +50,9 @@ pub fn cfg(db_url: &str) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
+        ws_max_bridges_per_project: 16,
+        ws_max_lifetime_secs: 3600,
     }
 }
 

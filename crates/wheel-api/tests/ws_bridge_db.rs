@@ -68,6 +68,9 @@ async fn serve_api(engine: String) -> Option<(String, wheel_api::db::Db)> {
         ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(60),
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: Some(engine),
+        external_jwks: None,
+        membership: wheel_api::membership::MembershipEvents::new(),
+        bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
 
     let app = wheel_api::build_router(state, &[]);

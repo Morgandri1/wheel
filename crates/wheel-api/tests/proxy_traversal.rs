@@ -114,6 +114,9 @@ fn cfg(db_url: &str, host_url: &str) -> Config {
         ingress_body_limit_bytes: 5 * 1024 * 1024,
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
+        external: None,
+        ws_max_bridges_per_project: 16,
+        ws_max_lifetime_secs: 3600,
     }
 }
 
@@ -226,6 +229,9 @@ async fn harness() -> Harness {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         // The real host URL layout, not a direct engine: that layout is what the bug escaped.
         engine_base_override: None,
+        external_jwks: None,
+        membership: wheel_api::membership::MembershipEvents::new(),
+        bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     let app = wheel_api::build_router(state, &[]);
 
