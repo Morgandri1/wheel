@@ -166,6 +166,10 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// [`Supervisor::shutdown`].
 pub const INTERRUPTED_BY_SHUTDOWN: &str = "interrupted by engine shutdown";
 
+/// What a turn is consumed with when [`Supervisor::interrupt`] cancels it. Never requeued, for the
+/// same reason as [`INTERRUPTED_BY_SHUTDOWN`].
+pub const INTERRUPTED_BY_USER: &str = "interrupted at the caller's request";
+
 impl Running {
     /// SIGKILL the agent's whole process group, then reap the leader.
     ///
@@ -1362,6 +1366,53 @@ impl Supervisor {
         Ok(AgentStatus::Stopped)
     }
 
+    /// `POST /v1/agents/:id/interrupt` (§3c#12, PROTOCOL.md M2): cancel the turn this agent is in
+    /// the middle of, without losing its session -- `stop`'s smaller sibling, which also drops the
+    /// ability to resume where the conversation was. A no-op, reporting the CURRENT status, when
+    /// there is no turn in flight: an agent that is stopped or idle between turns has nothing to
+    /// interrupt, and killing it anyway would make this route a second `stop` wearing this name.
+    ///
+    /// Same reasoning as [`Supervisor::shutdown`]'s drain-timeout branch: the cancelled turn is
+    /// consumed with [`INTERRUPTED_BY_USER`] rather than requeued, because a turn killed mid-flight
+    /// may already have committed or pushed and running it again would do that twice. The session
+    /// is kept (`Parked`, not `Stopped`) and whatever is queued behind it -- typically the message
+    /// the caller wanted to steer the agent with -- is delivered immediately after, resuming on the
+    /// SAME session rather than starting a fresh one.
+    pub async fn interrupt(self: &Arc<Self>, agent: Uuid) -> Result<AgentStatus> {
+        let in_flight = {
+            let slot = self.slot(agent).await;
+            let mut guard = slot.lock().await;
+            if !guard.as_ref().is_some_and(|r| r.in_flight.is_some()) {
+                drop(guard);
+                let conn = self.db.lock().unwrap();
+                return Ok(board::agent_state(&conn, agent).unwrap_or_default().status);
+            }
+            let mut running = guard.take().expect("checked Some above");
+            let in_flight = running.in_flight;
+            if let Err(e) = running.kill().await {
+                tracing::warn!(%agent, error = %e, "killing an interrupted agent's process failed");
+            }
+            in_flight
+        };
+
+        {
+            let conn = self.db.lock().unwrap();
+            if let Some(mid) = in_flight {
+                messages::mark_error(&conn, mid, INTERRUPTED_BY_USER).ok();
+                publish_message(&self.events, &conn, mid);
+            }
+            // Same reasoning as `stop`/`park`: a token outliving its process is a credential
+            // with no owner. `deliver`, below, mints a fresh one for the resumed child.
+            let _ = crate::db::tokens::revoke(&conn, agent);
+        }
+        self.set_status(agent, AgentStatus::Parked, None);
+        tracing::info!(%agent, "interrupted at the caller's request");
+
+        self.deliver(agent).await?;
+        let conn = self.db.lock().unwrap();
+        Ok(board::agent_state(&conn, agent).unwrap_or_default().status)
+    }
+
     /// Stop every agent before the engine exits, without losing a turn or running one twice.
     ///
     /// Nothing starts and no new message is written once this begins. Turns already running get up
@@ -2461,6 +2512,7 @@ mod tests {
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: deadline_secs,
             harness_auth,
+            script_execution_enabled: false,
         });
         let sup = Arc::new(Supervisor::with_harness(
             cfg,
@@ -4881,6 +4933,116 @@ done
             !messages::has_queued(&conn, id).unwrap(),
             "the interrupted message was put back in the queue"
         );
+    }
+
+    /// `POST /v1/agents/:id/interrupt` (§3c#12). Distinguishes it from `stop` on the two axes that
+    /// matter: the turn is consumed as interrupted rather than left to be replayed, and the session
+    /// survives -- the next message resumes it instead of starting over.
+    #[tokio::test]
+    async fn interrupt_cancels_an_in_flight_turn_and_keeps_the_session() {
+        let (sup, id, dir) = shim_supervisor("interrupt-mid-turn", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        let mid = deliver_one(&sup, id, "never finishes on its own").await;
+        let session_before = {
+            let conn = sup.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap_or_default().session_id
+        };
+        assert_eq!(
+            session_before.as_deref(),
+            Some("s1"),
+            "the fake harness always inits as s1"
+        );
+
+        let status = sup.interrupt(id).await.unwrap();
+
+        assert_eq!(
+            status,
+            AgentStatus::Parked,
+            "interrupt keeps the session, so it parks"
+        );
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (
+                MessageState::Consumed,
+                Some(INTERRUPTED_BY_USER.to_string())
+            ),
+            "the cancelled turn must be consumed as interrupted, never left to be replayed"
+        );
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            !messages::has_queued(&conn, id).unwrap(),
+            "the interrupted message must not go back on the queue"
+        );
+        assert_eq!(
+            board::agent_state(&conn, id)
+                .unwrap_or_default()
+                .session_id
+                .as_deref(),
+            Some("s1"),
+            "the session id must survive an interrupt -- it is what makes this NOT a stop"
+        );
+    }
+
+    /// A message queued behind the cancelled turn -- the steering message the caller presumably
+    /// wanted delivered -- must not be stranded behind a parked agent nobody wakes up again.
+    #[tokio::test]
+    async fn a_message_queued_during_interrupt_is_delivered_on_the_resumed_session() {
+        let (sup, id, dir) = shim_supervisor("interrupt-then-steer", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        deliver_one(&sup, id, "long turn").await;
+        let steer = send_user(&sup, id, "stop and do this instead");
+
+        std::fs::write(dir.join("turn_secs"), "0").unwrap();
+        sup.interrupt(id).await.unwrap();
+
+        until("the steering message to be answered", || {
+            state_and_error(&sup, steer).0 == MessageState::Consumed
+        })
+        .await;
+        assert_eq!(
+            state_and_error(&sup, steer),
+            (MessageState::Consumed, None),
+            "the queued message must run cleanly on the resumed child, not inherit the interrupt's error"
+        );
+        assert_eq!(
+            runs(&dir),
+            2,
+            "the resumed turn must be a fresh process, not the killed one"
+        );
+    }
+
+    /// Interrupting an agent that is not in the middle of anything must not park a perfectly idle
+    /// process -- that would make this route a second `stop` wearing the wrong name.
+    #[tokio::test]
+    async fn interrupt_on_an_idle_agent_is_a_no_op() {
+        let (sup, id, dir) = shim_supervisor("interrupt-idle", ECHO_HARNESS);
+        sup.start(id).await.unwrap();
+        until("the agent to come up", || {
+            !matches!(status_of(&sup, id), AgentStatus::Starting)
+        })
+        .await;
+        let before = status_of(&sup, id);
+
+        let status = sup.interrupt(id).await.unwrap();
+
+        assert_eq!(
+            status, before,
+            "nothing was in flight, so interrupt must not change the status"
+        );
+        assert_eq!(
+            runs(&dir),
+            1,
+            "an idle agent's process must not be killed by interrupt"
+        );
+    }
+
+    /// Interrupting an agent with no process at all -- never started, or already stopped -- is
+    /// equally a no-op: there is nothing to cancel.
+    #[tokio::test]
+    async fn interrupt_on_a_stopped_agent_reports_its_status_without_panicking() {
+        let (sup, id, _dir) = shim_supervisor("interrupt-stopped", ECHO_HARNESS);
+        let status = sup.interrupt(id).await.unwrap();
+        assert_eq!(status, AgentStatus::default());
     }
 
     /// Waits for a file to exist and returns its contents, for a value a background process
