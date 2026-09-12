@@ -1051,4 +1051,75 @@ mod driver_tests {
             }
         }
     }
+
+    /// ADVERSARY (design review of PR2's §9.2, `docs/proposals/
+    /// harness-driver-contract.md`): `next_event()`'s own doc comment now
+    /// requires cancellation safety, because PR2's single-owner-task pattern
+    /// races it against an incoming command via `tokio::select!` (or, here,
+    /// the equivalent `tokio::time::timeout`) every time it is polled — and
+    /// the losing side of that race is DROPPED, not merely paused. This
+    /// proves `ClaudeSession` actually holds up: cancel a call to
+    /// `next_event()` while a line is genuinely mid-write on the child's
+    /// side (a real partial read, not a timing assumption), then prove the
+    /// bytes already buffered were not lost when the next call completes it.
+    #[tokio::test]
+    async fn next_event_is_cancellation_safe_across_a_partial_line() {
+        let dir = scratch("cancel-safe");
+        let program = dir.join("partial.sh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\n\
+             printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"'\n\
+             sleep 0.3\n\
+             printf 'done\",\"session_id\":\"s1\",\"num_turns\":1,\"total_cost_usd\":0.0}\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.display().to_string();
+        let driver = ProgramDriver(program.clone());
+        let mut session = driver
+            .launch(crate::supervisor::child_command(&program), &spec(&dir))
+            .await
+            .unwrap();
+
+        match session.next_event().await {
+            DriverEvent::SessionStarted { .. } => {}
+            other => panic!("expected SessionStarted first, got {other:?}"),
+        }
+
+        // The child is asleep between its two `printf` calls, so the line is
+        // genuinely half-written when this races and the timeout wins --
+        // `{"type":"result",...,"result":"` is already in `Lines`'s own
+        // buffer (a field of `self`, not of this dropped future) when the
+        // call below is cancelled.
+        let raced =
+            tokio::time::timeout(std::time::Duration::from_millis(50), session.next_event()).await;
+        assert!(
+            raced.is_err(),
+            "the timeout must win the race for this test to prove anything about cancellation"
+        );
+
+        // The real event must still arrive intact, prefix and all, on the
+        // NEXT call -- proving the cancelled call's dropped future did not
+        // take the already-buffered bytes with it.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), session.next_event())
+            .await
+            .expect("the real event must still arrive after being raced once");
+        match event {
+            DriverEvent::TurnComplete {
+                text, session_id, ..
+            } => {
+                assert_eq!(
+                    text.as_deref(),
+                    Some("done"),
+                    "the pre-sleep half of the line was lost when the raced call was cancelled"
+                );
+                assert_eq!(session_id.as_deref(), Some("s1"));
+            }
+            other => {
+                panic!("expected the real TurnComplete intact, got {other:?} instead")
+            }
+        }
+    }
 }
