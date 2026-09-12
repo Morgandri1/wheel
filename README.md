@@ -21,6 +21,13 @@ It is **headless-first**: a shell and `curl` are enough to run it, drive it and 
 add-on that calls the API from its own server. The design and its threat model: `docs/proposals/headless-first.md`.
 
 ### 1. `wheeld` — one executable
+Before this: a **Rust toolchain** (stable; https://rustup.rs — nothing in this workspace pins a
+version) and a **C compiler** (`build-essential` on Debian/Ubuntu, Xcode Command Line Tools on
+macOS: `rusqlite`'s bundled SQLite and `ring`'s assembly both need one to build; nothing here needs
+OpenSSL, every TLS path in the dependency graph is `rustls`). `git`, to get this repo. The examples
+below also use `curl` and `jq`. Building `wheeld` does **not** need Node — but running an agent
+does: install Node.js 22+ and `npm install -g @anthropic-ai/claude-code @openai/codex` yourself, or
+use Docker, which bundles both.
 ```bash
 cargo build --release -p wheeld
 ./target/release/wheeld          # API + sandbox host + agents in one process, sqlite store, on http://127.0.0.1:8080
@@ -98,6 +105,10 @@ web page from reaching wheeld through DNS rebinding.
 - `WHEEL_ALLOWED_HOSTS=<domain>`, because the proxy passes the public `Host` through.
 
 ### 2. Docker, headless
+Before this: **Docker Engine with the Compose v2 plugin** (`docker compose version` should print a
+`v2.x`; on Ubuntu, `docker.io` from apt is old enough to lack it — use Docker's own repository) and
+`git`, to get this repo (the image is built from it, not pulled). Everything else — Node, the
+`claude`/`codex` CLIs, the Rust toolchain used to compile `wheeld` itself — is inside the image.
 ```bash
 docker build -f docker/Dockerfile.wheeld -t wheeld .              # or: make wheeld-image
 docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
@@ -115,6 +126,9 @@ The same thing as a compose file: `docker compose -f infra/compose.wheeld.yml up
   and `stop_grace_period: 30s` is in `infra/compose.wheeld.yml`. A running `docker stop` still honours `-t 30` too.
 
 ### 3. The board UI (optional)
+Before this: **Node.js 22.x** (`node --version`; `npx` ships with it). Nothing else — `wheel-web`
+is a prebuilt package, not a build from source. The `docker compose` variant below needs only what
+§2 already lists.
 ```bash
 WHEEL_API_URL=http://127.0.0.1:8080 npx wheel-web                                # against wheeld on this machine
 docker compose -f infra/compose.wheeld.yml --profile web up -d --build           # or both in compose: UI on http://127.0.0.1:3000

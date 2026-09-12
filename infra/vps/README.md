@@ -51,8 +51,11 @@ The files:
 
 ## 1. The server
 
-- Ubuntu 24.04, Docker and the Compose plugin already installed (`docker --version`,
-  `docker compose version`). If not, see [Installing Docker](#installing-docker).
+- Ubuntu 24.04, with the prerequisites the root `README.md`'s "Running Wheel" §2 lists for the
+  Docker path already installed: Docker Engine with the Compose v2 plugin (`docker --version`,
+  `docker compose version`) and `git`. If not, see [Installing Docker](#installing-docker) below
+  for the exact commands on this OS. Nothing else in this kit needs installing by hand — Node, the
+  `claude`/`codex` CLIs and the Rust toolchain that builds `wheeld` all come from inside the images.
 - **A small box works, with tuning** — see [Running on a small box](#running-on-a-small-box-2-vcpu-4-gib).
   Wheel compiles Rust to build the images the first time, which is the heaviest moment in the
   server's life.
@@ -370,15 +373,17 @@ network: the web server's calls cross the internet, authenticated by the user's 
 ## Without Docker: `install.sh`
 
 Not the path above — this is systemd services built from source, for a box without Docker at all.
-See its own `--help` for the full flag set (`--domain`, `--public-host`, `--no-proxy`, `--updatable`,
-`--firewall`, `--dry-run`); it installs Node 22, a shared Rust toolchain, the `claude`/`codex` CLIs
-and, when a proxy mode is chosen, Caddy from Caddy's own apt repository. Wheel is compiled by an
-unprivileged `wheel-build` user, so no dependency's build script runs as the account that can read
-`master.key`. wheeld runs as the `wheel` system user on `127.0.0.1:8080`, data in `/var/lib/wheel`
-(`0700`); the web app runs on `127.0.0.1:3000` as a throwaway systemd user. It is idempotent: run
-it again with another `--ref` to upgrade. `--dry-run` resolves settings and the target commit and
-prints every command it would run — verified on a bare `ubuntu:24.04` container to leave no user,
-directory, file or package behind.
+The only thing you install yourself is `git`, to clone this repo far enough to run the script (a
+minimal Ubuntu cloud image does not ship it). See its own `--help` for the full flag set
+(`--domain`, `--no-proxy`, `--updatable`, `--firewall`, `--dry-run`); it installs Node 22, a shared
+Rust toolchain, the `claude`/`codex` CLIs and, when `--domain` is used, Caddy from Caddy's own apt
+repository — none of that is a manual prerequisite, it's what the script does. Wheel is compiled by
+an unprivileged `wheel-build` user, so no dependency's build script runs as the account that can
+read `master.key`. wheeld runs as the `wheel` system user on `127.0.0.1:8080`, data in
+`/var/lib/wheel` (`0700`); the web app runs on `127.0.0.1:3000` as a throwaway systemd user. It is
+idempotent: run it again with another `--ref` to upgrade. `--dry-run` resolves settings and the
+target commit and prints every command it would run — verified on a bare `ubuntu:24.04` container
+to leave no user, directory, file or package behind.
 
 ```bash
 sudo git clone https://github.com/Morgandri1/wheel.git /opt/wheel-installer
