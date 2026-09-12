@@ -26,6 +26,7 @@ const FEATURES: &[&str] = &[
     "ephemeral_context",
     "budgets",
     "oauth_paste_code",
+    "oauth_refresh",
 ];
 
 pub async fn engine_info(State(s): State<AppState>) -> Json<EngineInfo> {
@@ -47,10 +48,10 @@ pub async fn engine_info(State(s): State<AppState>) -> Json<EngineInfo> {
 /// credential, which an api-key-only deployment refuses at spawn, so there the
 /// login would complete and the agent still could not run.
 fn features(policy: HarnessAuthPolicy) -> impl Iterator<Item = &'static str> {
-    FEATURES
-        .iter()
-        .copied()
-        .filter(move |f| !(*f == "oauth_paste_code" && policy == HarnessAuthPolicy::ApiKeyOnly))
+    FEATURES.iter().copied().filter(move |f| {
+        !(matches!(*f, "oauth_paste_code" | "oauth_refresh")
+            && policy == HarnessAuthPolicy::ApiKeyOnly)
+    })
 }
 
 #[cfg(test)]
@@ -203,6 +204,7 @@ mod tests {
                 "ephemeral_context",
                 "budgets",
                 "oauth_paste_code",
+                "oauth_refresh",
             ]
         );
     }
@@ -241,10 +243,11 @@ mod tests {
         }
     }
 
-    /// On an api-key-only deployment a paste-code login completes, then the
-    /// spawn gate refuses the OAuth credential it produced.
+    /// On an api-key-only deployment an OAuth credential is refused wherever
+    /// it comes from, so neither the login that produces one nor the renewal
+    /// that keeps one alive is offered.
     #[tokio::test]
-    async fn paste_code_login_is_not_advertised_where_its_credential_is_refused() {
+    async fn the_oauth_features_are_not_advertised_where_the_credential_is_refused() {
         let key_only = Engine::under(HarnessAuthPolicy::ApiKeyOnly)
             .info()
             .await
@@ -252,18 +255,20 @@ mod tests {
         let others: Vec<&str> = FEATURES
             .iter()
             .copied()
-            .filter(|f| *f != "oauth_paste_code")
+            .filter(|f| !matches!(*f, "oauth_paste_code" | "oauth_refresh"))
             .collect();
         assert_eq!(
             key_only, others,
-            "api-key-only must drop oauth_paste_code and nothing else"
+            "api-key-only must drop the OAuth features and nothing else"
         );
 
         let oauth = Engine::under(HarnessAuthPolicy::OauthToken)
             .info()
             .await
             .features;
-        assert!(oauth.iter().any(|f| f == "oauth_paste_code"), "{oauth:?}");
+        for f in ["oauth_paste_code", "oauth_refresh"] {
+            assert!(oauth.iter().any(|a| a == f), "{f} missing from {oauth:?}");
+        }
     }
 
     enum Evidence {
@@ -318,6 +323,9 @@ mod tests {
                 ("POST", "/v1/agents/{id}/auth/begin"),
                 ("POST", "/v1/agents/{id}/auth/complete"),
             ]),
+            // The engine renews a vaulted login itself; `GET auth` is where a
+            // client reads that (`refreshable`, `expires_at`, `warning`).
+            "oauth_refresh" => Routes(&[("GET", "/v1/agents/{id}/auth")]),
             other => panic!("{other:?} is advertised with no evidence that it exists"),
         }
     }

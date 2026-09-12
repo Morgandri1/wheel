@@ -606,6 +606,16 @@ pub fn set_status(
     );
 }
 
+/// Set or clear an agent's `last_error` without touching its status or its
+/// `last_activity`: a warning about its credential must not also reset the
+/// idle clock that decides when it parks.
+pub fn set_last_error(conn: &Connection, node: Uuid, err: Option<&str>) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET last_error = ?2 WHERE node_id = ?1",
+        params![node.to_string(), err],
+    );
+}
+
 pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Result<bool> {
     let n = conn.execute(
         "DELETE FROM wires WHERE from_id=?1 AND to_id=?2 AND type=?3",

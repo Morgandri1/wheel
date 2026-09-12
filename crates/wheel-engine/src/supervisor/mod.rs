@@ -123,6 +123,7 @@ impl StartupTail {
 
 pub mod git_creds;
 mod prompt;
+mod refresh;
 pub mod workspace;
 pub use prompt::compose_prompt;
 
@@ -149,6 +150,9 @@ struct Running {
     /// board's `turns` a triangular series — three turns would read as six.
     counted_turns: u64,
     counted_usd: f64,
+    /// The vault login this child was started on, if it runs on one. A renewal
+    /// since then means it holds a token on its way out.
+    credential_gen: Option<refresh::CredentialGen>,
 }
 
 /// How long an agent gets to exit on SIGTERM when the engine shuts down, before SIGKILL.
@@ -307,6 +311,12 @@ pub struct Supervisor {
     /// Set when shutdown begins: from then on nothing starts and no new message is written.
     closing: AtomicBool,
     shutdown_drain_ms: AtomicU64,
+    pub(crate) broker: refresh::Broker,
+    /// Bumped by every `stop`. `start` releases the slot across a renewal, so
+    /// without this a stop that lands in that window takes the empty slot, sets
+    /// `stopped`, and the renewal then spawns a child anyway: the operator's
+    /// stop returns success and the agent keeps running.
+    stops: Mutex<HashMap<Uuid, u64>>,
 }
 
 impl Supervisor {
@@ -357,7 +367,19 @@ impl Supervisor {
             events,
             closing: AtomicBool::new(false),
             shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
+            broker: refresh::Broker::default(),
+            stops: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many times this agent has been stopped. Read before a start gives
+    /// up the slot and again when it takes it back.
+    fn stop_epoch(&self, agent: Uuid) -> u64 {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0)
+    }
+
+    fn note_stop(&self, agent: Uuid) {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0) += 1;
     }
 
     fn startup_deadline(&self) -> std::time::Duration {
@@ -525,14 +547,43 @@ impl Supervisor {
     /// an agent whose credential is fine.
     fn lapsed_credential(&self, agent: Uuid, harness: wheel_core::Harness) -> Option<String> {
         let conn = self.db.lock().ok()?;
-        let (vault, _key, expires_at) =
+        let (vault, key, expires_at) =
             crate::vault::credential_detail(&conn, agent, harness).ok()??;
+        // A refreshable login's expiry is a renewal deadline, not a lapse:
+        // `start` renews it instead of refusing on it.
+        if key == wheel_core::CLAUDE_OAUTH_SESSION {
+            return None;
+        }
         let expires_at = expires_at?;
         (expires_at.into_inner() <= time::OffsetDateTime::now_utc()).then(|| {
             format!(
                 "the credential from vault {vault} expired at {expires_at}; \
                  sign in again, or store a `claude setup-token` token which does not expire"
             )
+        })
+    }
+
+    /// Does a wired vault hand this agent an OAuth credential of any shape: a
+    /// refreshable login, a `CLAUDE_CODE_OAUTH_TOKEN`, or an `sk-ant-oat` value
+    /// under any other name (an agent can export any key it can read)?
+    fn vault_supplies_oauth(&self, agent: Uuid) -> bool {
+        let conn = self.db.lock().unwrap();
+        if crate::vault::session_vault_for(&conn, agent)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+        let Some(vk) = self.vault_key() else {
+            return false;
+        };
+        crate::vault::env_for_agent(&conn, vk, agent).is_ok_and(|env| {
+            env.iter().any(|(k, v)| {
+                k == "CLAUDE_CODE_OAUTH_TOKEN"
+                    || crate::auth::classify_token(v, wheel_core::Harness::Claude)
+                        == wheel_core::CredentialKind::OauthToken
+            })
         })
     }
 
@@ -551,18 +602,19 @@ impl Supervisor {
     /// a no-op that returns the existing session (§3c#13).
     pub async fn start(self: &Arc<Self>, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
-        let mut guard = slot.lock().await;
-
-        // Checked under the slot lock: shutdown takes every slot after setting the flag, so a
-        // start either finishes first and is stopped with the rest, or sees the flag and refuses.
-        if self.closing.load(Ordering::SeqCst) {
-            anyhow::bail!("the engine is shutting down; nothing starts now");
-        }
-
-        if let Some(r) = guard.as_ref() {
-            // Already running. Do NOT spawn a second process.
-            let _ = r.session_id;
-            return Ok(AgentStatus::Running);
+        let stops_before = self.stop_epoch(agent);
+        {
+            // Checked under the slot lock: shutdown takes every slot after setting the flag, so a
+            // start either finishes first and is stopped with the rest, or sees the flag and refuses.
+            let guard = slot.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                anyhow::bail!("the engine is shutting down; nothing starts now");
+            }
+            if let Some(r) = guard.as_ref() {
+                // Already running. Do NOT spawn a second process.
+                let _ = r.session_id;
+                return Ok(AgentStatus::Running);
+            }
         }
 
         let (node, resume) = {
@@ -610,8 +662,9 @@ impl Supervisor {
         }
 
         // docs/proposals/wheel-harness-auth.md, enforcement point 4: the gate
-        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT` (API's
-        // half) can refuse an OAuth-shaped credential before it is ever
+        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT`
+        // (api/agent_routes.rs, api/vault_routes.rs) refuse an OAuth-shaped
+        // credential before it is ever
         // stored, but an agent is untrusted code with a shell and can write
         // one itself (`claude auth login`/`claude setup-token`) without going
         // through any of those routes. Spawn is the one point that inspects
@@ -619,13 +672,56 @@ impl Supervisor {
         // the point that cannot be bypassed.
         if self.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly {
             let config_dir = self.cfg.creds_dir().join(agent.to_string());
-            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness) {
+            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness)
+                || self.vault_supplies_oauth(agent)
+            {
                 let reason = "this project is api-key-only: an OAuth-shaped credential is not \
                                permitted here, store an API key instead"
                     .to_string();
                 self.set_status(agent, AgentStatus::Error, Some(reason));
                 return Ok(AgentStatus::Error);
             }
+        }
+
+        // A refreshable vault login is renewed BEFORE the child starts if it is
+        // near its end, so no child is ever handed a token about to die. If it
+        // cannot be renewed and has already lapsed, this is `needs_auth` with
+        // the reason, and the message that woke the agent stays queued.
+        let session_vault = {
+            let conn = self.db.lock().unwrap();
+            crate::vault::session_vault_for(&conn, agent).ok().flatten()
+        };
+        // Deliberately NOT under the slot lock: renewing runs the CLI on a
+        // 60-second budget, and this agent's slot is taken for every delivery
+        // to it -- and `live_agents` walks every slot for `/healthz`. Holding
+        // it across the renewal made one agent's renewal everyone's problem.
+        let credential_gen = match session_vault {
+            Some(vault) => {
+                if let Err(reason) = self.ensure_fresh(vault, None).await {
+                    self.set_status(agent, AgentStatus::NeedsAuth, Some(reason));
+                    return Ok(AgentStatus::NeedsAuth);
+                }
+                Some((vault, self.session_generation(vault)))
+            }
+            None => None,
+        };
+
+        // Re-taken for the spawn itself, which is what §3c#13 requires: one
+        // process per agent, decided under this lock. A start that won the race
+        // while we were renewing has already spawned on the same fresh login.
+        let mut guard = slot.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            anyhow::bail!("the engine is shutting down; nothing starts now");
+        }
+        if guard.is_some() {
+            return Ok(AgentStatus::Running);
+        }
+        // Someone stopped this agent while the renewal ran. They took an empty
+        // slot and got `stopped`; spawning now would hand them a running agent
+        // they just stopped, with a token minted after they stopped it.
+        if self.stop_epoch(agent) != stops_before {
+            tracing::info!(%agent, "a stop landed while this start was renewing its login; not spawning");
+            return Ok(AgentStatus::Stopped);
         }
 
         let run_dir = self.cfg.node_run_dir(agent);
@@ -862,6 +958,7 @@ impl Supervisor {
             consecutive_user: 0,
             counted_turns: 0,
             counted_usd: 0.0,
+            credential_gen,
         });
         drop(guard);
 
@@ -951,7 +1048,34 @@ impl Supervisor {
     /// intended, this map records what is actually running. The stall report
     /// needs both to tell a turn in progress from a wedge.
     pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
-        self.agents.lock().await.keys().copied().collect()
+        // Slots that HOLD a process, not slots that exist. An agent keeps its
+        // slot for ever once it has started one, so counting keys reported a
+        // parked agent as live -- and `stalled_agents` reads this to tell a
+        // turn in progress from a wedge, so the one state the system cannot
+        // leave on its own was the one it could not see.
+        //
+        // The handles are cloned and the MAP lock released before any slot is
+        // touched, and each slot is taken with `try_lock`. Both matter: a slot
+        // can be held for as long as a spawn takes, and the map lock is what
+        // every start, park and delivery needs. Awaiting a slot while holding
+        // the map would let one `/healthz` freeze the whole board.
+        let slots: Vec<(Uuid, AgentSlot)> = {
+            let map = self.agents.lock().await;
+            map.iter().map(|(id, slot)| (*id, slot.clone())).collect()
+        };
+        let mut live = std::collections::HashSet::new();
+        for (agent, slot) in slots {
+            // A slot we cannot take this instant is mid-spawn or mid-kill,
+            // which is a process in transition rather than an absent one.
+            let holding = match slot.try_lock() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            };
+            if holding {
+                live.insert(agent);
+            }
+        }
+        live
     }
 
     /// Stop an idle agent's process, keeping its session so the next message
@@ -1216,6 +1340,9 @@ impl Supervisor {
     }
 
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
+        // Before the slot, so a start that is mid-renewal sees this even
+        // though it holds nothing right now.
+        self.note_stop(agent);
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {
@@ -1322,6 +1449,11 @@ impl Supervisor {
         }
         if self.closing.load(Ordering::SeqCst) {
             return Ok(()); // shutting down: what is queued waits for the next start
+        }
+        // Credentials failed: the queue waits for a person, and is not spent a
+        // turn at a time discovering the same dead token.
+        if current_status(&self.db, agent) == AgentStatus::NeedsAuth {
+            return Ok(());
         }
 
         let next = {
@@ -1486,6 +1618,7 @@ impl Supervisor {
                             r.counted_usd += du;
                             (dt, du)
                         });
+                        let gen = g.as_ref().and_then(|r| r.credential_gen);
                         drop(g);
 
                         let over_budget = if let Some((dt, du)) = spend {
@@ -1570,7 +1703,15 @@ impl Supervisor {
                         if environmental {
                             // Nothing more can run until credentials exist, and
                             // draining the queue into the same failure would
-                            // requeue every message in turn for no reason.
+                            // requeue every message in turn for no reason --
+                            // unless the vault already holds a newer login, or
+                            // this one merely ran out and can be renewed once.
+                            if !self.recover_from_auth_failure(agent, gen).await {
+                                // Nothing to run on: hold the process's place
+                                // rather than spending a turn per queued
+                                // message to be told the same thing again.
+                                self.park_needs_auth(agent).await;
+                            }
                             continue;
                         }
 
@@ -1582,6 +1723,12 @@ impl Supervisor {
                             if let Err(e) = self.clear_context(agent).await {
                                 tracing::warn!(agent = %agent, error = %e, "ephemeral restart failed");
                             }
+                        } else if !is_error && self.credential_stale(gen.as_ref()) {
+                            // Between turns is the one moment a child can be
+                            // swapped without losing work: the vault's login
+                            // was renewed while this turn ran, so the next
+                            // message goes to a child holding the new token.
+                            self.recycle(agent).await;
                         } else {
                             let _ = self.pump_queue(agent).await;
                             // Nothing left to do: start counting down. If the
@@ -2005,21 +2152,34 @@ fn set_status_db(
     status: AgentStatus,
     err: Option<String>,
 ) {
+    // A credential warning outlives the next status change. It says something
+    // about the login rather than about this transition, and it has to still be
+    // there when the operator looks -- otherwise the one warning they get
+    // before their agents stop is erased by the agent starting normally.
     let _ = conn.execute(
         "INSERT INTO agent_state (node_id,status,last_activity,last_error)
          VALUES (?1,?2,?3,?4)
-         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error =
+             CASE WHEN ?4 IS NOT NULL THEN ?4
+                  WHEN last_error LIKE ?5 || '%' THEN last_error
+                  ELSE NULL END",
         rusqlite::params![
             agent.to_string(),
             status.as_str(),
             wheel_core::Timestamp::now().to_rfc3339(),
             err,
+            refresh::WARNING_PREFIX,
         ],
     );
 }
 
 /// Forget the resumable session, so the next start is a NEW context rather
 /// than a `--resume` of the one being discarded.
+fn current_status(db: &Mutex<rusqlite::Connection>, agent: Uuid) -> AgentStatus {
+    let conn = db.lock().unwrap();
+    board::agent_state(&conn, agent).unwrap_or_default().status
+}
+
 fn clear_session(conn: &rusqlite::Connection, agent: Uuid) {
     let _ = conn.execute(
         "UPDATE agent_state SET session_id = NULL WHERE node_id = ?1",

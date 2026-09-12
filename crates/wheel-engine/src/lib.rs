@@ -110,6 +110,9 @@ pub async fn serve_until(
     // any message left queued by the previous run resumes exactly the agents
     // that have work waiting.
     state.supervisor.start_configured_agents().await;
+    // Renewals are timers, and timers do not survive a restart: every vault
+    // holding a refreshable login gets its next renewal scheduled again.
+    state.supervisor.arm_all_refresh_timers();
 
     let supervisor = state.supervisor.clone();
     let app = api::router(state);

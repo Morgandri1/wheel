@@ -223,6 +223,16 @@ pub struct AuthStatus {
     /// this to say "re-login by ..." before it lapses rather than after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<crate::timestamp::Timestamp>,
+    /// `true` when the engine renews this credential itself before
+    /// `expires_at`, so the deadline is not the operator's to meet. Omitted
+    /// when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshable: Option<bool>,
+    /// Something the operator must act on before the credential stops
+    /// working — e.g. the last automatic refresh failed. Shown BEFORE the
+    /// agent is refused, not after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// What kind of credential an agent node holds.
@@ -266,11 +276,21 @@ impl CredentialKind {
 /// wired vaults defining the same one is refused rather than resolved: the
 /// engine would have to pick an account on the user's behalf, and whichever
 /// it picked would be right half the time and silent about it.
-pub const CREDENTIAL_KEYS: [&str; 3] = [
+pub const CREDENTIAL_KEYS: [&str; 4] = [
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "CODEX_API_KEY",
+    CLAUDE_OAUTH_SESSION,
 ];
+
+/// Vault key holding a refreshable Claude login: the CLI's whole
+/// `claudeAiOauth` object, refresh token included.
+///
+/// Never exported to a child as-is. The engine derives
+/// `CLAUDE_CODE_OAUTH_TOKEN` from it at spawn and keeps the refresh token to
+/// itself (docs/proposals/harness-oauth-refresh.md), so for ambiguity it
+/// occupies the same slot as `CLAUDE_CODE_OAUTH_TOKEN`.
+pub const CLAUDE_OAUTH_SESSION: &str = "CLAUDE_OAUTH_SESSION";
 
 pub fn is_credential_key(key: &str) -> bool {
     CREDENTIAL_KEYS.contains(&key)
@@ -461,6 +481,8 @@ mod tests {
             source: None,
             account: None,
             expires_at: None,
+            refreshable: None,
+            warning: None,
         };
         let v = serde_json::to_value(&none).unwrap();
         assert_eq!(v["authenticated"], false);
@@ -475,6 +497,8 @@ mod tests {
             source: Some("anthropic-personal".into()),
             account: None,
             expires_at: None,
+            refreshable: None,
+            warning: None,
         };
         let v = serde_json::to_value(&from_vault).unwrap();
         assert_eq!(v["mode"], "env");
@@ -505,7 +529,8 @@ mod tests {
             [
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "ANTHROPIC_API_KEY",
-                "CODEX_API_KEY"
+                "CODEX_API_KEY",
+                "CLAUDE_OAUTH_SESSION"
             ]
         );
         for k in CREDENTIAL_KEYS {

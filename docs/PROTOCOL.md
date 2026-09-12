@@ -178,7 +178,8 @@ a `400`, not an ignored key: check `features` first.
 | `idle_parking` | `AgentConfig.idle_timeout_secs` (§5b) |
 | `ephemeral_context` | `AgentConfig.ephemeral_context` |
 | `budgets` | `AgentConfig.budget` `{max_turns?, max_usd?}` |
-| `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**: there the OAuth credential this login produces is refused at spawn, so a client must offer API-key auth instead |
+| `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. Headless by construction: the engine never opens a browser, the client shows the URL and posts the code back. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**, where both routes answer `403 policy_denied` |
+| `oauth_refresh` | The engine RENEWS a vault-held claude.ai login before it expires, so an 8-hour token does not become an 8-hour board. `GET /v1/agents/:id/auth` reports `refreshable: true`, the `expires_at` of the current token, and a `warning` when the last renewal failed. **Absent on `api-key-only`** |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.
@@ -274,9 +275,22 @@ ciphertext is bound to its vault id and key name — a row copied to another key
 to decrypt rather than quietly becoming that other secret. Values never appear on `GET /v1/board`,
 in a log line, or in a transcript.
 
-A key whose name is one of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CODEX_API_KEY` is a
-**credential**: it is exported into the child's environment at spawn, so an agent with a read wire to
-a vault holding one is authenticated without anything being pasted into the UI. That is how one
+A key whose name is one of `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CODEX_API_KEY` or
+`CLAUDE_OAUTH_SESSION` is a **credential**: it is exported into the child's environment at spawn, so
+an agent with a read wire to a vault holding one is authenticated without anything being pasted into
+the UI.
+
+`CLAUDE_OAUTH_SESSION` is the odd one and the important one: it holds a **renewable claude.ai login**
+— the CLI's whole credential object, refresh token included — and it is the only credential the
+engine keeps alive by itself. It is never exported as-is. The child receives
+`CLAUDE_CODE_OAUTH_TOKEN=<the access token>` derived from it, so for ambiguity the two occupy the
+same slot and one vault may not hold both. Three rules follow, each enforced:
+
+| | |
+|---|---|
+| `PUT /v1/vault/:id/CLAUDE_OAUTH_SESSION` | **403 `not_writable`.** A login enters a vault only through a sign-in the engine ran (`auth/complete` with `save_to_vault`). A login pasted from elsewhere has another live holder that will spend the same single-use refresh token, and the loser of that race has its store wiped by the CLI |
+| `GET /v1/cli/secret?addr=<vault>/CLAUDE_OAUTH_SESSION` | **403 `not_readable`.** The refresh token stays with the engine; an agent holding one would be a second refresher, and a place to steal it from |
+| renewal | one refresher per vault, serialised, ~30 min before expiry. Running agents move onto the new token at their next turn boundary | That is how one
 project runs several accounts of the same provider — **one vault per account**, and an agent uses the
 vault it is wired to. A vault-supplied credential wins over a pasted one: the vault is the thing the
 operator can see and change on the board. `GET .../auth` then reports
@@ -341,6 +355,18 @@ UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per ag
 reported for `mode: "env"` (from the vault row the credential was stored on) and for
 `mode: "oauth_session"` (from the harness's own store, which is the same file the child reads).
 
+**`refreshable`** (`true`, omitted otherwise) says the engine renews this credential itself before
+`expires_at`, so that deadline is not the operator's to meet — it is a renewable login in a vault
+(`CLAUDE_OAUTH_SESSION`), and `expires_at` moves forward on its own.
+
+**`warning`** (omitted when there is nothing to say) is what the operator must act on BEFORE the
+credential stops working: today, that the last automatic renewal failed, naming the vault, the CLI's
+own reason, and how long agents keep running on the current token. The same text arrives on
+`/v1/events` as the agent's `node.state.last_error` while its status is unchanged, so a client shows
+it without polling. When the token does lapse, readers park `needs_auth` with their messages still
+queued — signing in again resumes every agent that reads that vault, not only the one that signed
+in.
+
 **Absent means durable OR unknown — those are not the same thing, and the engine will not guess.** A UI
 must not render a deadline when the field is missing. When it IS present and in the past, the agent will
 not start: `POST /v1/agents/:id/start` returns `needs_auth` with a `last_error` naming the vault and the
@@ -355,9 +381,13 @@ nothing is stored. It says what kind of credential the node holds, which is a di
 
 Two calls with a **live child process between them**, which is the only real complexity in this flow:
 
-1. `POST auth/begin` spawns `claude auth login --claudeai` with the node's own `CLAUDE_CONFIG_DIR`/`HOME`, reads
-   the authorize URL off its stdout and returns `{mode:"paste_code", url, instructions, session}`. The child is
-   left alive, blocked reading stdin.
+1. `POST auth/begin` spawns `claude auth login --claudeai` in a **staging directory the engine made
+   for this one login** — not the node's own `CLAUDE_CONFIG_DIR`/`HOME` — reads the authorize URL off
+   its stdout and returns `{mode:"paste_code", url, instructions, session}`. The child is left alive,
+   blocked reading stdin. The staging directory is why what the engine reads back afterwards is what
+   the LOGIN produced: an agent is untrusted code whose HOME is its own config dir, so anything read
+   back from there might be something the agent put there instead (ADVERSARY, credential-distribution
+   rule).
 2. The user opens the URL, signs in, and the Anthropic-hosted callback shows them a code. `POST auth/complete
    {code, session?}` writes it to that child's stdin and waits for it to exit.
 
@@ -380,6 +410,14 @@ discover that.
 | the CLI rejected the code | `400` carrying **the CLI's own reason**, not a generic failure |
 | the CLI never printed a URL, or never answered | `502` / `504` |
 | the CLI exited 0 but wrote no credentials | `502` — success here would leave an agent that looks signed in and fails on its first turn |
+| the deployment is `WHEEL_HARNESS_AUTH=api-key-only` | `403 {"error":{"code":"policy_denied"}}` from `auth/begin`, before any login child exists, and from `auth/complete` for `code`, `setup_token` or an OAuth-shaped `api_key` |
+
+With `save_to_vault`, a login that carries a refresh token and scopes is stored as the vault's
+`CLAUDE_OAUTH_SESSION` and the response reports `{"key": "CLAUDE_OAUTH_SESSION", "exports_as":
+"CLAUDE_CODE_OAUTH_TOKEN", "refreshable": true, "expires_at": ...}`; it supersedes a bare
+`CLAUDE_CODE_OAUTH_TOKEN` in that same vault. Without `save_to_vault` the login is installed into the
+node's own config dir, which is the per-agent login: that agent refreshes it itself, and nothing is
+shared.
 
 `codex` signs in by device code, which is a poll rather than a submit; `auth/begin` on a codex node returns
 `400` saying so rather than a paste-code envelope nothing can satisfy.
