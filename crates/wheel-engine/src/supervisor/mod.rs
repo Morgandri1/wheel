@@ -3835,12 +3835,23 @@ done
     /// its state, and it comes back at the reset -- not before -- and finishes.
     #[tokio::test]
     async fn a_closed_usage_window_requeues_parks_and_resumes_at_the_reset() {
-        let reopens = now_unix() + 4;
+        // The window is closed while a MARKER FILE exists, not until a wall
+        // clock: a clock-steered window reopens on its own while a loaded
+        // machine is still spawning, and the suite then fails for load rather
+        // than for behaviour. Here the test decides when it reopens, so the
+        // only thing timed is the engine's own resume.
         let (sup, id, dir) = fake_supervisor("quota-park", serde_json::Value::Null, |_| {});
         let dump = dir.join("spawns.jsonl");
+        let window_closed = dir.join("window-closed");
+        std::fs::write(&window_closed, "").unwrap();
         std::fs::write(
             dir.join("fake.json"),
-            serde_json::json!({ "limit_until": reopens, "env_dump": dump }).to_string(),
+            serde_json::json!({
+                "limit_while_file": window_closed,
+                "limit_resets_in": 5,
+                "env_dump": dump,
+            })
+            .to_string(),
         )
         .unwrap();
         parked(&sup, id);
@@ -3852,10 +3863,14 @@ done
         })
         .await;
         let state = state_of(&sup, id);
-        assert_eq!(
-            state.resets_at.map(|t| t.into_inner().unix_timestamp()),
-            Some(reopens),
-            "the reset is the one the harness's rate_limit_event carried"
+        let reopens = state
+            .resets_at
+            .expect("the harness's rate_limit_event carried a reset")
+            .into_inner()
+            .unix_timestamp();
+        assert!(
+            reopens > now_unix(),
+            "the engine must record the reset the event carried, which is still ahead"
         );
         assert_eq!(state.resume_at, state.resets_at, "zero jitter in tests");
         assert_eq!(
@@ -3876,6 +3891,10 @@ done
             "a parked agent holds no process"
         );
 
+        // The window reopens only when this test says so, so an engine that
+        // came back before its own `resume_at` would find it still shut and
+        // spend another spawn and turn being told so.
+        std::fs::remove_file(&window_closed).unwrap();
         until(
             "the requeued message to be consumed after the reset",
             || settled(&sup, mid).state == MessageState::Consumed,
