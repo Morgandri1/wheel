@@ -334,6 +334,17 @@ Header hygiene, both directions:
   API, not the end user; relaying a user credential downstream is how replay bugs begin.
 - `WHEEL_HOST_SECRET` is attached upstream and never appears in a response.
 
+Two engine routes this proxy carries transparently, with nothing project-specific to add here — the
+generic path above already covers them — but worth naming because Web's board shipped disabled
+buttons pointing at exactly these gaps (PROTOCOL.md §"Agents", § "Script nodes"):
+
+- `POST /v1/projects/{id}/engine/v1/agents/{agent_id}/interrupt` → `{status, session_id?}`. Cancels
+  the turn an agent is in the middle of without losing its session — the smaller sibling of `stop`.
+- `POST /v1/projects/{id}/engine/v1/scripts/{script_id}/run` → `{stdout, stderr, exit_code,
+  timed_out, stdout_truncated, stderr_truncated}`. **Answers `503 config` on a deployment that has
+  not set `WHEEL_SCRIPT_EXEC`** — script execution is gated off by default pending the per-node
+  isolation work in `docs/proposals/script-execution-scope.md`; see PROTOCOL.md for why.
+
 ### Confirming which code a project's engine is running
 
 `GET /v1/projects/{id}/engine/v1/healthz` (through the proxy above) returns the engine's own health,
@@ -648,6 +659,34 @@ ws://localhost:8080/v1/projects/{id}/engine/v1/events?ticket=<ticket>
 
 The ticket is single-use, expires in 30 seconds, and is bound to the (user, project) pair it was
 minted for.
+
+### Reconnecting — there is no replay, on purpose
+
+The events socket carries no history. `GET /v1/board` on connect is the snapshot; the socket only
+ever adds to it from that point on (PROTOCOL.md § Events). Two situations both reduce to the same
+rule, and a client that only handles one of them will silently drift on the other:
+
+1. **The socket itself reconnects** (network blip, the API replica restarting, the ticket path's
+   30 s window). Nothing to negotiate — resubscribing starts a fresh stream with nothing before it.
+2. **A subscriber falls behind mid-connection.** The engine's fan-out never blocks the supervisor
+   for a slow reader (PROTOCOL.md), so a reader that cannot keep up is dropped and told so with a
+   `{"type":"lagged","hint":"events were dropped; refetch GET /v1/board"}` frame rather than being
+   silently starved.
+
+**In both cases: `GET /v1/board` is the only correct response.** Refetch it and reconcile every
+node's `state` from the response — not just the ones a client happens to remember changing — because
+whatever arrived during the gap is gone and unrecoverable from the socket itself.
+
+**Per-agent logs are the one piece with a real resume cursor, and it is a *separate* mechanism from
+the socket:** `GET /v1/agents/:id/log?since=<seq>` (PROTOCOL.md §"Agents") returns `{lines, next}`,
+where `next` is the cursor to pass back in to continue exactly where a prior read left off — no gap,
+no overlap. A client that seeds a log view once from `since=0` and then relies on the `log` WS event
+for everything after has covered the *initial* load, but not a lagged/reconnected socket: nothing
+re-seeds the gap the drop just created, so the visible log silently stops matching the engine's own
+`logs` table until the tab is reloaded. The fix is mechanical — on `lagged`/resync, call `log` again
+with `since` set to the last `seq` a client already has for that agent, for every agent whose log is
+currently open, and append the result — but it touches the same reconnect path the board-refetch
+lives on, so whether it lands as one PR with that path or two is a question for whoever owns it.
 
 ## Local development
 
