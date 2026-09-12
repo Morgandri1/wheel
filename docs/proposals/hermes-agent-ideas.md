@@ -646,8 +646,9 @@ that existing attribute.
 ## 5. Containerization — their model vs Wheel's, measured
 
 The operator asked specifically whether Hermes's containerization is better than Wheel's and, if so, to adopt
-it. **Short answer: on isolation, no — Wheel's model is materially stronger and should not be replaced. On
-supply-chain pinning and process supervision, yes, in three specific and cheap ways.** Detail, because
+it. **Short answer: on isolation, no — Wheel's model is materially stronger and should not be replaced. But
+they have one deployment idea that is better than anything Wheel does (§5.3, egress credential swapping),
+plus several cheap hygiene wins.** Detail, because
 "better" is not a single axis.
 
 ### 5.1 What Hermes actually builds
@@ -698,7 +699,62 @@ Their own `SECURITY.md` §2.2 agrees with this scoring: the supported postures a
 and "whole-process wrapping", and it states plainly that the default local backend "does **not** confine
 `execute_code`, MCP subprocesses, plugin/hook/skill loading, all of which are in-process."
 
-### 5.3 The three things worth adopting
+### 5.3 The best idea in their whole deployment: make a stolen credential worthless
+
+This is the one item from their container work I would rank above everything else in §5, and it speaks
+directly to the shared-uid problem §3.4 could not close.
+
+Hermes can run an **egress credential firewall** (`agent/proxy_sources/iron_proxy.py:1-8`):
+
+> "Sandboxes (Docker/Modal/SSH) hold only **opaque proxy tokens**; iron-proxy — a TLS-intercepting,
+> default-deny egress firewall — swaps them for real credentials on the way out, so a leaked token is useless
+> outside the trusted proxy boundary."
+
+The tokens are injected **under the real provider env names**, so SDKs work unchanged
+(`tools/environments/docker_egress.py:105-109`). It is pinned to a specific version, checksum-verified,
+**fails closed on half-configuration** (`docker_egress.py:47-76`), guards all three config surfaces against
+weakening it (`docker.py:616-629`), and fingerprints the egress posture into a container label so a
+pre-egress container cannot be silently reused (`docker.py:580-588`).
+
+The insight is not "hide the secret better." It is **change what a stolen secret is worth.** That is the
+correct response to an isolation boundary you cannot fully close.
+
+**And here is the finding: Wheel already implements this pattern — and also implements the thing it defends
+against, right next to it.**
+
+- **The good half already ships.** A `tool` node's `{mode: "vault"}` fill is resolved **by the engine at call
+  time**. §3d is explicit: `wheel tool ls` and the MCP schema expose **only** `agent`-mode fields, the engine
+  rejects any non-agent field a caller tries to supply, and `vault`/`static` fills are authoritative —
+  "an agent can never override them," and the value is "never shown to the agent or returned by
+  `/v1/board`." `--curl` masks them. **The engine is the credential-swapping proxy, and the agent already
+  holds nothing.** This is iron-proxy's property, achieved more simply, and it is already built.
+- **The bad half also ships, on the same wire.** An `agent → vault (read)` wire *also* exports every key into
+  the child's environment at spawn — `vault::env_for_agent` (`vault.rs:420`), called from
+  `supervisor/mod.rs:667,839`, with the comment "Every key is exported, not only credentials." Combined with
+  §3.4's same-uid reality, **a sibling agent can read `/proc/<pid>/environ` and take the real secret**, not a
+  swappable token. The `wheel secret get` verb has the same property.
+
+So Wheel has both the strong pattern and the weak one, reachable through one wire type, and the weak one is
+the **default** path an agent will reach for.
+
+**Recommendation, and it is cheap because no new mechanism is needed:**
+
+1. **Make engine-mediated fills the documented and preferred way to use a credential.** `BUILDER_PROMPT.md`
+   currently describes vault as "a read-only key/value store (like a `.env`)… Read-wired to whoever needs a
+   secret" — which points builders at the env-export path. It should point them at a `tool → vault` fill
+   instead, and the workflow builder should prefer emitting that shape.
+2. **Make the env export opt-in per agent rather than implied by the wire** (e.g. `vault_env: bool`, default
+   false). An agent that only needs a credential *to call an API* never needs the plaintext, and today it gets
+   it automatically. This narrows the blast radius of the uid gap without waiting for per-node uids.
+3. **Where a secret must reach an agent's process, prefer a scoped, revocable token over the real
+   credential** — the iron-proxy insight proper. Wheel's `endpoint` bearer auth already resolves from the
+   vault on a live read per request (`portals.md`), so revocation is instant; the same reasoning should apply
+   to anything handed to a child.
+
+This is a better answer to §3.4 than per-node uids alone, because it holds **even if** the uid boundary is
+breached — and unlike per-node uids, most of it is already built.
+
+### 5.4 Other things worth adopting
 
 These are real, cheap, and independent of the rest.
 
@@ -709,6 +765,9 @@ These are real, cheap, and independent of the rest.
    was applied to Wheel's own tags and **not** to the base images Wheel builds on, which are mutable names
    owned by someone else entirely. Pin `@sha256:` and bump deliberately. **Cost: one line each; benefit:
    reproducible builds and a supply-chain surface that cannot change under a rebuild.**
+   *In fairness: Hermes is inconsistent here too* — their three donor stages are `@sha256:`-pinned but their
+   runtime base `debian:13.4` (`Dockerfile:52`) is a bare tag. The idea is worth taking; their execution of it
+   is only partial, so copy the principle, not the file.
 2. **A startup watchdog with a respawn exit code.** `hermes_startup_watchdog.py` exists because of a measured
    incident: *"~30h with every thread in `futex_wait_queue`, zero logs, s6 saw a live PID."* A daemon armed at
    process entry, disarmed once the main loop is confirmed live; on fire it dumps all thread stacks and exits
@@ -721,13 +780,26 @@ These are real, cheap, and independent of the rest.
 3. **`HERMES_UID`/`HERMES_GID`-style uid remapping** is worth remembering **for the local/`wheeld` path only**
    (§3e local runners bind the user's own filesystem). It is irrelevant to the cloud path, where the volume is
    Wheel's.
+4. **Symlink-TOCTOU discipline in the bootstrap.** `refuse_symlinked_path()` runs before *every* `chown`,
+   `chmod` and seed operation in their boot hook (`docker/stage2-hook.sh:185-221`, ~10 call sites), because
+   the data volume is writable by the very agent the boot script is setting up. **Wheel has the same shape of
+   exposure**: the engine materialises workspaces and per-node run dirs under `/data`, which agents can write.
+   Any root-context path operation over an agent-writable tree should refuse a symlinked component rather than
+   follow it. Worth a look from whoever owns workspace materialisation.
+5. **A sealed runtime tree with append-only `sys.path`.** `/opt/hermes` is root-owned and `go-w`, and runtime
+   package installs are redirected to a directory appended to the **end** of `sys.path`, so an install "can
+   only ADD modules — it can never shadow or downgrade a core module" (`Dockerfile:388-401`). The general
+   principle is the one worth keeping: **an agent must not be able to rewrite the runtime that enforces the
+   policy it is subject to.** Wheel is structurally fine here today (the engine is a compiled binary in the
+   image, not a writable tree), but it becomes live the moment script nodes install dependencies. Name it
+   before then, not after.
 
 **Explicitly not adopted: the docker-socket bind mount.** Mounting the host docker socket into a project
 container is equivalent to handing that project root on the host, and it would defeat every row in the §5.2
 table at once. Hermes can offer it because it is a single-user tool the operator runs on their own machine;
 Wheel is multi-tenant.
 
-### 5.4 What this does not change
+### 5.5 What this does not change
 
 Per-node uid isolation inside a project (§3.4) is untouched by anything here — it is the one isolation axis
 where Hermes is no better than Wheel (all their sessions share uid 10000 too, and their skills run fully
@@ -800,16 +872,17 @@ went looking for a primitive and did not find one worth adding.
 | # | Item | § | Maps onto | Cost | Risk | Primitive or pattern |
 |---|---|---|---|---|---|---|
 | 1 | **`wheel search`** — FTS5 over the caller's own received messages | 2.1 | new engine route + CLI verb + MCP tool over the existing `messages` table | **M** (~2–3 d) | Low — grants no access the caller lacks; the one trap is the `wheel query` authorizer, which it must not touch | **Route.** Not a primitive |
-| 2 | **Injected-ctx budget, gauge and loud truncation** | 2.3 | `preamble.rs` + `prompt.rs` + `validate.rs` | **XS** (~0.5 d) | Very low; the risk is *not* doing it — 4 ctx nodes × 1 MiB is a silent ~1M-token prompt today | Pattern |
-| 3 | **Ctx-write threat scan + provenance + the 043-shaped board warning** | 2.4 | ctx write route, preamble render, `warnings[]` | **S–M** (~2 d) | Low. Closes a durable untrusted-input → system-prompt escalation | Pattern (+ one column) |
-| 4 | **`<untrusted_tool_result>` envelope on tool/MCP output** | 4.5 | reuses `escape_envelope_body`'s discipline at a second sink | **S** (~1 d) | Low. Applies ADVERSARY 001's lesson where it was never applied | Pattern |
-| 5 | **Deterministic gates before a judge may say DONE** | 4.4 | `loop` node → agent → script node (gate) → table (verdict log) | **S** as policy; rides loop-node + script execution | Medium — a self-developing board that grades itself is the failure this prevents | Pattern (board) |
-| 6 | **Memory as a table rendered into a ctx** | 2.2 | table + ctx + script, shipped as a **template** | **M** (~3 d incl. template) | Low. Buys provenance, supersession and decay that Hermes's flat file cannot express | Pattern (board) |
-| 7 | **Skill library as chest + table + ctx**, with the negative-learning firewall | 3.2, 3.3 | chest (bodies) + table (index) + ctx (injected index) + curator agent | **M–L** (~5 d) | Medium — junk accumulation; mitigated by a blocking validator and the tier ladder | Pattern (board) |
-| 8 | **Digest-pin base images** | 5.3 | `docker/Dockerfile.*` | **XS** (~0.5 d) | Very low. Extends §0b's mutable-name ruling to images we do not own | Hygiene |
-| 9 | **Boot-liveness watchdog with a respawn exit code** | 5.3 | engine boot + `wheel-host` acting on `/healthz` | **M** (~3 d) | Low. Closes "wedged but healthy-looking", which no current backstop catches | Pattern |
-| 10 | **Stall guardrails on unattended lanes only** | 4.6 | keyed on the existing `<AgentPrompt type>` attribute | **M** (~3 d) | Medium — a false halt on a legitimately slow agent; mitigated by warn-before-halt and tool exemptions | Pattern |
-| 11 | **Script call-budget, with refusals free** | 4.2 | script token mint + `wheel tool call` accounting | **S** (~1 d) | Low. Rides script execution; do not land before it | Pattern |
+| 2 | **Stop handing agents real credentials**: prefer engine-mediated `tool → vault` fills; make the spawn-time env export opt-in | 5.3 | `vault::env_for_agent` + `BUILDER_PROMPT.md` + one agent config flag | **S** (~1–2 d) | Low to build; **it is the only item that mitigates the shared-uid gap without waiting for per-node uids** | Pattern (+ one config field) |
+| 3 | **Injected-ctx budget, gauge and loud truncation** | 2.3 | `preamble.rs` + `prompt.rs` + `validate.rs` | **XS** (~0.5 d) | Very low; the risk is *not* doing it — 4 ctx nodes × 1 MiB is a silent ~1M-token prompt today | Pattern |
+| 4 | **Ctx-write threat scan + provenance + the 043-shaped board warning** | 2.4 | ctx write route, preamble render, `warnings[]` | **S–M** (~2 d) | Low. Closes a durable untrusted-input → system-prompt escalation | Pattern (+ one column) |
+| 5 | **`<untrusted_tool_result>` envelope on tool/MCP output** | 4.5 | reuses `escape_envelope_body`'s discipline at a second sink | **S** (~1 d) | Low. Applies ADVERSARY 001's lesson where it was never applied | Pattern |
+| 6 | **Deterministic gates before a judge may say DONE** | 4.4 | `loop` node → agent → script node (gate) → table (verdict log) | **S** as policy; rides loop-node + script execution | Medium — a self-developing board that grades itself is the failure this prevents | Pattern (board) |
+| 7 | **Memory as a table rendered into a ctx** | 2.2 | table + ctx + script, shipped as a **template** | **M** (~3 d incl. template) | Low. Buys provenance, supersession and decay that Hermes's flat file cannot express | Pattern (board) |
+| 8 | **Skill library as chest + table + ctx**, with the negative-learning firewall | 3.2, 3.3 | chest (bodies) + table (index) + ctx (injected index) + curator agent | **M–L** (~5 d) | Medium — junk accumulation; mitigated by a blocking validator and the tier ladder | Pattern (board) |
+| 9 | **Digest-pin base images** | 5.4 | `docker/Dockerfile.*` | **XS** (~0.5 d) | Very low. Extends §0b's mutable-name ruling to images we do not own | Hygiene |
+| 10 | **Boot-liveness watchdog with a respawn exit code** | 5.4 | engine boot + `wheel-host` acting on `/healthz` | **M** (~3 d) | Low. Closes "wedged but healthy-looking", which no current backstop catches | Pattern |
+| 11 | **Stall guardrails on unattended lanes only** | 4.6 | keyed on the existing `<AgentPrompt type>` attribute | **M** (~3 d) | Medium — a false halt on a legitimately slow agent; mitigated by warn-before-halt and tool exemptions | Pattern |
+| 12 | **Script call-budget, with refusals free** | 4.2 | script token mint + `wheel tool call` accounting | **S** (~1 d) | Low. Rides script execution; do not land before it | Pattern |
 
 ### If the operator picks exactly one: build #1, `wheel search`.
 
@@ -828,6 +901,14 @@ It is also the item with the best cost-to-irreversibility ratio: a read-only rou
 exists, scoped by a key the caller cannot supply, with no schema change to `nodes` or `wires` and no new
 concept for the operator to learn.
 
+**One honest caveat on that ranking.** "Build first" and "fix first" are different questions. #1 is the answer
+to *what makes Wheel's agents more capable*. If the operator is instead asking *what is most urgent*, the
+answer is **#2 (stop exporting real credentials into agent environments) and #4 (ctx writes reach every
+agent's system prompt unscanned)** — both are live exposures on `main` today rather than missing features,
+and #2 in particular is the only item here that meaningfully reduces the blast radius of the shared-uid gap
+while per-node uids are still in flight. I would not let the capability item queue-jump either of them if
+ADVERSARY agrees they are real.
+
 ## 8. Open questions this proposal takes a position on
 
 - **Does the memory model need a new primitive?** — **No.** ctx + table + script + loop express all of it, and
@@ -841,8 +922,12 @@ concept for the operator to learn.
   is markdown. `may_place` must not be able to place a `script` node.
 - **Should we copy their source?** — **Permitted (MIT) but not recommended anywhere in this proposal** (§0).
   The one artifact worth taking near-verbatim is the negative-learning prompt block, which is a spec.
-- **Is their containerization better?** — **No on isolation; yes on three narrow points** (§5). Do not adopt
-  their topology; do pin image digests, add a boot watchdog, and keep `env_clear` over their scrub-list.
+- **Is their containerization better?** — **No on isolation** (§5.2): Wheel has per-project containers with
+  every capability dropped and no port bindings; Hermes is single-tenant, root-PID-1, host-networked by
+  default, and drops everything to one shared uid. Do not adopt their topology. **But one deployment idea
+  beats anything Wheel does** — egress credential swapping, so a stolen token is worthless outside the proxy
+  (§5.3) — and Wheel already has half of it built in tool-node vault fills while undermining it with the
+  spawn-time env export. Also: pin image digests, add a boot watchdog, keep `env_clear` over their scrub-list.
 - **Should Wheel own context compaction?** — **No** (§6.1). The harness owns the window. Wheel owns the
   recovery pointer.
 
@@ -864,8 +949,9 @@ concept for the operator to learn.
   `board-warnings-043.md`.
 - **PM / operator:** the licence posture in §0 is a ruling to make, not an implementer's call — specifically
   whether lifting MIT source is ever acceptable, given the two-licence bookkeeping it starts.
-- **ADVERSARY:** §2.4 (ctx poisoning) and §4.5 (unwrapped tool output) are submitted as findings in their own
-  right, independent of whether the rest of this proposal is accepted. §3.4's `CAP_SETUID`-granted-but-
+- **ADVERSARY:** §2.4 (ctx poisoning), §4.5 (unwrapped tool output) and §5.3 (vault keys exported into every
+  wired agent's environment, readable by same-uid siblings) are submitted as findings in their own right,
+  independent of whether the rest of this proposal is accepted. §3.4's `CAP_SETUID`-granted-but-
   unimplemented observation is flagged to the `node-uids` lane.
 
 ## 11. What I could not determine
