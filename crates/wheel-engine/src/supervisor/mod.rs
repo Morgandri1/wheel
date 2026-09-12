@@ -312,6 +312,11 @@ pub struct Supervisor {
     closing: AtomicBool,
     shutdown_drain_ms: AtomicU64,
     pub(crate) broker: refresh::Broker,
+    /// Bumped by every `stop`. `start` releases the slot across a renewal, so
+    /// without this a stop that lands in that window takes the empty slot, sets
+    /// `stopped`, and the renewal then spawns a child anyway: the operator's
+    /// stop returns success and the agent keeps running.
+    stops: Mutex<HashMap<Uuid, u64>>,
 }
 
 impl Supervisor {
@@ -363,7 +368,18 @@ impl Supervisor {
             closing: AtomicBool::new(false),
             shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
             broker: refresh::Broker::default(),
+            stops: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many times this agent has been stopped. Read before a start gives
+    /// up the slot and again when it takes it back.
+    fn stop_epoch(&self, agent: Uuid) -> u64 {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0)
+    }
+
+    fn note_stop(&self, agent: Uuid) {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0) += 1;
     }
 
     fn startup_deadline(&self) -> std::time::Duration {
@@ -586,18 +602,19 @@ impl Supervisor {
     /// a no-op that returns the existing session (§3c#13).
     pub async fn start(self: &Arc<Self>, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
-        let mut guard = slot.lock().await;
-
-        // Checked under the slot lock: shutdown takes every slot after setting the flag, so a
-        // start either finishes first and is stopped with the rest, or sees the flag and refuses.
-        if self.closing.load(Ordering::SeqCst) {
-            anyhow::bail!("the engine is shutting down; nothing starts now");
-        }
-
-        if let Some(r) = guard.as_ref() {
-            // Already running. Do NOT spawn a second process.
-            let _ = r.session_id;
-            return Ok(AgentStatus::Running);
+        let stops_before = self.stop_epoch(agent);
+        {
+            // Checked under the slot lock: shutdown takes every slot after setting the flag, so a
+            // start either finishes first and is stopped with the rest, or sees the flag and refuses.
+            let guard = slot.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                anyhow::bail!("the engine is shutting down; nothing starts now");
+            }
+            if let Some(r) = guard.as_ref() {
+                // Already running. Do NOT spawn a second process.
+                let _ = r.session_id;
+                return Ok(AgentStatus::Running);
+            }
         }
 
         let (node, resume) = {
@@ -674,6 +691,10 @@ impl Supervisor {
             let conn = self.db.lock().unwrap();
             crate::vault::session_vault_for(&conn, agent).ok().flatten()
         };
+        // Deliberately NOT under the slot lock: renewing runs the CLI on a
+        // 60-second budget, and this agent's slot is taken for every delivery
+        // to it -- and `live_agents` walks every slot for `/healthz`. Holding
+        // it across the renewal made one agent's renewal everyone's problem.
         let credential_gen = match session_vault {
             Some(vault) => {
                 if let Err(reason) = self.ensure_fresh(vault, None).await {
@@ -684,6 +705,24 @@ impl Supervisor {
             }
             None => None,
         };
+
+        // Re-taken for the spawn itself, which is what §3c#13 requires: one
+        // process per agent, decided under this lock. A start that won the race
+        // while we were renewing has already spawned on the same fresh login.
+        let mut guard = slot.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            anyhow::bail!("the engine is shutting down; nothing starts now");
+        }
+        if guard.is_some() {
+            return Ok(AgentStatus::Running);
+        }
+        // Someone stopped this agent while the renewal ran. They took an empty
+        // slot and got `stopped`; spawning now would hand them a running agent
+        // they just stopped, with a token minted after they stopped it.
+        if self.stop_epoch(agent) != stops_before {
+            tracing::info!(%agent, "a stop landed while this start was renewing its login; not spawning");
+            return Ok(AgentStatus::Stopped);
+        }
 
         let run_dir = self.cfg.node_run_dir(agent);
         std::fs::create_dir_all(&run_dir)?;
@@ -1014,10 +1053,26 @@ impl Supervisor {
         // parked agent as live -- and `stalled_agents` reads this to tell a
         // turn in progress from a wedge, so the one state the system cannot
         // leave on its own was the one it could not see.
+        //
+        // The handles are cloned and the MAP lock released before any slot is
+        // touched, and each slot is taken with `try_lock`. Both matter: a slot
+        // can be held for as long as a spawn takes, and the map lock is what
+        // every start, park and delivery needs. Awaiting a slot while holding
+        // the map would let one `/healthz` freeze the whole board.
+        let slots: Vec<(Uuid, AgentSlot)> = {
+            let map = self.agents.lock().await;
+            map.iter().map(|(id, slot)| (*id, slot.clone())).collect()
+        };
         let mut live = std::collections::HashSet::new();
-        for (agent, slot) in self.agents.lock().await.iter() {
-            if slot.lock().await.is_some() {
-                live.insert(*agent);
+        for (agent, slot) in slots {
+            // A slot we cannot take this instant is mid-spawn or mid-kill,
+            // which is a process in transition rather than an absent one.
+            let holding = match slot.try_lock() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            };
+            if holding {
+                live.insert(agent);
             }
         }
         live
@@ -1285,6 +1340,9 @@ impl Supervisor {
     }
 
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
+        // Before the slot, so a start that is mid-renewal sees this even
+        // though it holds nothing right now.
+        self.note_stop(agent);
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {

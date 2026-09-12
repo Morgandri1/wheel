@@ -254,6 +254,28 @@ const CLI_STORE_FILE: &str = ".credentials.json";
 const CLI_CONFIG_FILE: &str = ".claude.json";
 const MAX_STORE_BYTES: u64 = 64 * 1024;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+/// The scope a claude.ai login needs to be worth anything. A renewal that
+/// drops it leaves a token the CLI cannot run inference with, and the CLI
+/// then diverts to its create-an-API-key branch and the login dies quietly.
+/// Nothing else resists a server that echoes back fewer scopes than it was
+/// asked for.
+const REQUIRED_SCOPE: &str = "user:inference";
+
+/// The longest life Wheel will RECORD for a login, whatever the server says.
+///
+/// The CLI's headless refresh asks for `expiresIn: 31536000` — a year — while
+/// its interactive login takes the server's own value, about eight hours.
+/// Nobody has observed which the server honours, so this does not trust the
+/// answer: a login is used for at most this long and then renewed, and the
+/// clamp is logged when it fires.
+///
+/// Twelve hours: comfortably above the ~8 h an interactive login is understood
+/// to last (so a normal renewal is never disturbed), and far below a year. It
+/// bounds how long Wheel USES one token, not how long the token is valid —
+/// only the server can say that, which is why the clamp firing is reported
+/// rather than silently correcting the number.
+pub const MAX_RECORDED_LIFETIME_MS: i64 = 12 * 60 * 60 * 1000;
+
 /// No refreshed login is trusted to last longer than this. `claude
 /// setup-token` mints a one-year token; anything past that is not a refresh.
 const MAX_HORIZON_MS: i64 = 400 * 24 * 60 * 60 * 1000;
@@ -361,6 +383,30 @@ impl OauthSession {
             expires_at: self.expires_at(),
             durable: false,
         })
+    }
+
+    /// How long this login has left, from `now`.
+    pub fn lifetime_ms(&self, now_ms: i64) -> Option<i64> {
+        self.expires_at().map(|e| e - now_ms)
+    }
+
+    /// Hold the RECORDED expiry to a ceiling, and report what the server said
+    /// if it was longer.
+    ///
+    /// Wheel schedules renewal and reports `expires_at` from this number, so
+    /// clamping it means a token is handed to children for at most the
+    /// ceiling. The token itself stays valid for as long as the server decided
+    /// — that is the server's to say and cannot be changed from here — so the
+    /// caller REPORTS a clamp rather than quietly fixing it up.
+    pub fn clamp_expiry(&mut self, now_ms: i64, ceiling_ms: i64) -> Option<i64> {
+        let expires = self.expires_at()?;
+        let ceiling = now_ms.saturating_add(ceiling_ms);
+        if expires <= ceiling {
+            return None;
+        }
+        self.oauth
+            .insert("expiresAt".into(), serde_json::json!(ceiling));
+        Some(expires)
     }
 
     /// Fill what a refresh legitimately leaves out from the login it renewed.
@@ -493,6 +539,8 @@ pub enum RefreshRejected {
     Implausible,
     #[error("it asks for scopes the original login did not have")]
     ScopeEscalation,
+    #[error("it drops the scope the login runs on ({REQUIRED_SCOPE})")]
+    ScopeLost,
     #[error("it belongs to a different account")]
     AccountChanged,
 }
@@ -524,6 +572,10 @@ pub fn check_refresh(
     let allowed = prev.scopes();
     if next.scopes().iter().any(|s| !allowed.contains(s)) {
         return Err(R::ScopeEscalation);
+    }
+    let required = REQUIRED_SCOPE.to_string();
+    if allowed.contains(&required) && !next.scopes().contains(&required) {
+        return Err(R::ScopeLost);
     }
     let differs =
         |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(x), Some(y)) if x != y);

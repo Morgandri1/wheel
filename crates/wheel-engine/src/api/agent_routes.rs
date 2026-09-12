@@ -566,6 +566,13 @@ fn api_key_only(s: &AppState) -> bool {
 /// engine reads back from there after a login might be something the agent put
 /// there instead. Nothing runs with this directory as its HOME but the login
 /// child, so what is in it afterwards is what the login produced.
+///
+/// It is also load-bearing that this directory is EMPTY and THROWAWAY, not an
+/// optimisation to be tidied away later into the node's own dir: the CLI
+/// deletes `claudeAiOauth` from its store before writing the replacement
+/// (`oV` runs ahead of the writer), so a login that dies in that window leaves
+/// no credential at all. In a scratch directory that is harmless; in a
+/// directory holding a credential somebody depends on it is a silent sign-out.
 fn login_staging(s: &AppState, id: Uuid) -> std::path::PathBuf {
     s.cfg.data_dir.join("oauth-staging").join(id.to_string())
 }
@@ -793,6 +800,12 @@ fn save_session_to_vault(
     requested_key: Option<&str>,
 ) -> ApiResult<(Uuid, serde_json::Value)> {
     const KEY: &str = wheel_core::CLAUDE_OAUTH_SESSION;
+    // The same ceiling a renewal applies, reported the same way: this sign-in
+    // is where the operator finds out what the server actually issues.
+    let mut clamped = session.clone();
+    let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    let server_said = clamped.clamp_expiry(now, crate::auth::MAX_RECORDED_LIFETIME_MS);
+    let session = &clamped;
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let vault = target_vault(&conn, agent, vault_name)?;
 
@@ -828,6 +841,10 @@ fn save_session_to_vault(
         crate::api::vault_routes::remove_from_vault(&conn, vault.id, "CLAUDE_CODE_OAUTH_TOKEN")?;
     }
 
+    drop(conn);
+    s.supervisor
+        .record_login_facts(vault.id, session, server_said, "sign-in");
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let peers = peers_reading(&conn, vault.id, agent);
     let mut out = serde_json::json!({
         "name": vault_name,

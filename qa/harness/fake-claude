@@ -171,17 +171,42 @@ def refresh_login(refresh_token):
         die("CLAUDE_CODE_OAUTH_SCOPES is required when using CLAUDE_CODE_OAUTH_REFRESH_TOKEN.", 1)
     if not TOKEN_STORE:
         die("Login failed: fake-claude has no token_store configured", 1)
+    # What the REAL binary prints, verified by disassembling claude 2.1.269: the
+    # token POST goes through axios, whose default validateStatus rejects >=400,
+    # so the throw is axios's own AxiosError and the CLI writes its `.message`.
+    # The `Token refresh failed: <statusText>` line in the CLI is unreachable for
+    # an HTTP error, and the OAuth error CODE never reaches stdout or stderr.
+    # An engine that keys on "invalid_grant" here is reading a dialect the real
+    # CLI does not speak.
+    delay = fake_opt("WHEEL_FAKE_REFRESH_DELAY_MS", "refresh_delay_ms")
+    if delay:
+        # A renewal takes as long as a network round trip; the engine must not
+        # hold anything the rest of the board needs while it waits.
+        time.sleep(float(delay) / 1000.0)
+    transport = fake_opt("WHEEL_FAKE_REFRESH_TRANSPORT_ERROR", "refresh_transport_error")
     with _StoreLock():
         st = store_load()
         entry = st["refresh"].get(refresh_token)
+        if transport:
+            sys.stderr.write("Login failed: %s\n" % transport)
+            sys.exit(1)
         if entry is None:
-            sys.stderr.write("Login failed: Token refresh failed: invalid_grant\n")
+            status = fake_opt("WHEEL_FAKE_REFRESH_STATUS", "refresh_status") or "400"
+            sys.stderr.write("Login failed: Request failed with status code %s\n" % status)
             sys.exit(1)
         if st["rotate"]:
             del st["refresh"][refresh_token]
         access, refresh, exp = store_mint(st, entry["account"], scopes.split())
         st["refreshes"] += 1
         store_save(st)
+    # The CLI's own writer returns success WITHOUT writing when expiresAt is NaN
+    # (`!e.expiresAt`) or the scopes are not claude.ai ones, and the login path
+    # does not throw on that -- so `Login successful.` and exit 0 do NOT mean a
+    # credential was stored. The server has still spent the refresh token.
+    if fake_opt("WHEEL_FAKE_REFRESH_WRITES_NOTHING", "refresh_writes_nothing") == "1":
+        sys.stdout.write("Login successful.\n")
+        sys.stdout.flush()
+        sys.exit(0)
     # Steering for the tamper test: output claiming a different account.
     claimed = fake_opt("WHEEL_FAKE_REFRESH_CLAIMS_ACCOUNT", "refresh_claims_account")
     write_cli_store(entry["account"], access, refresh, exp, scopes.split(), claimed)

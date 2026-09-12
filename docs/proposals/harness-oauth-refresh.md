@@ -66,9 +66,28 @@ one-time live check.
   rotate and the client copes either way. The refresh is guarded by a lockfile
   (`tengu_oauth_token_refresh_lock_*`). That lock coordinates processes that share **one** config dir,
   and nothing else.
-- **On `invalid_grant`** it marks the refresh token dead and clears the store on disk
-  (`refreshToken:"", accessToken:"", expiresAt:0`). Two holders of one rotating refresh token do not
-  merely lose a race: the loser's store is wiped.
+- **On `invalid_grant`** it marks the refresh token dead and tombstones the store on disk
+  (`refreshToken:"", accessToken:"", expiresAt:0` — the record is emptied, not deleted). Precisely:
+  this is reached from the CLI's **in-process refresh loop** (`grn`, called from the refresh error
+  handler), which is exactly the path a CHILD takes under option (a) — so two children holding one
+  rotating refresh token do not merely lose a race, the loser's store is emptied. It is NOT reached
+  from `claude auth login`, the broker's own path, where there is nothing to wipe anyway: the broker
+  renews in a throwaway directory.
+- **The CLI's failure text carries no OAuth error code.** The token POST goes through axios, whose
+  default `validateStatus` rejects anything >= 400, so what surfaces is axios's own error and the CLI
+  prints `Login failed: Request failed with status code 400`. The `Token refresh failed: …` string in
+  the CLI is unreachable for an HTTP failure, and the `invalid_grant`/`revoked` strings belong to the
+  MCP OAuth code, not to this path. Anything keyed on those words is reading a dialect the CLI does
+  not speak — and `CERT_REVOKED` from a TLS fault contains "revoked", so a substring match on it
+  parks a board that only needed its network back.
+- **`Login successful.` and exit 0 do not mean a credential was written.** The writer returns success
+  without writing when `expiresAt` is NaN (`!e.expiresAt`, which an omitted `expires_in` produces) or
+  when the scopes are not claude.ai ones, and the login path does not throw on either. The server has
+  spent the refresh token regardless.
+- **The writer clears before it writes.** `oV` deletes `claudeAiOauth` from the store ahead of the
+  write, so a process death in that window leaves no credential at all. Harmless in a throwaway
+  directory; a silent sign-out in a directory somebody depends on. This is why the staging and
+  renewal directories are empty and disposable, and why that is load-bearing rather than tidy.
 - **An env `CLAUDE_CODE_OAUTH_TOKEN`** is a bare access token that cannot be refreshed.
 - **Headless refresh, CLI-native.** `CLAUDE_CODE_OAUTH_REFRESH_TOKEN=<ort>
   CLAUDE_CODE_OAUTH_SCOPES="<scopes>" claude auth login` makes the CLI exchange the refresh token with
@@ -244,6 +263,23 @@ source, so the race cannot happen. If PM rules (b′) out, the fallback is (a) w
    re-authenticated mid-refresh, their lineage wins and ours is discarded (TH4).
 5. The directory is deleted on every path.
 
+### 5.3b The expiry ceiling: what Wheel records, not what the server claims
+
+The refresh path asks for `expiresIn: 31536000` — one year — while the interactive login takes the
+server's own value, about eight hours. **Nobody has observed which the server honours**, and if it is
+the year, then after the first renewal every child would hold a year-long bearer token instead of an
+eight-hour one: the same theft, two orders of magnitude more blast radius.
+
+So the answer is not trusted. Wheel records at most `MAX_RECORDED_LIFETIME_MS` — **12 hours** —
+whatever comes back, and reports it when the clamp fires. Twelve hours sits comfortably above the
+~8 h an interactive login is understood to last (so a normal renewal is never disturbed) and far
+below a year.
+
+The clamp bounds **how long Wheel uses one token**, not how long that token is valid — only the
+server can say that, and it cannot be changed from here. What it buys is that children are rotated on
+Wheel's schedule rather than the server's, and that the discrepancy becomes a fact in the log instead
+of an assumption in a proposal.
+
 ### 5.4 Scheduling (the engine stays at ~0 CPU)
 
 - One sleeping timer per lineage fires at `expiresAt − lead`.
@@ -347,11 +383,31 @@ same thing through wheeld's UI). Nothing opens a browser on the server.
    "save_to_vault": "anthropic"}`.
    The response carries `vault.key = CLAUDE_OAUTH_SESSION`, `vault.refreshable = true` and the
    current token's `expires_at`.
-6. **That is the last human step.** From then on the engine renews the login about 30 minutes before
+6. **Read back what the server actually issued.** The sign-in writes a line to every reader agent's
+   engine log (`GET /v1/agents/<agent>/log?stream=engine`, or the log pane):
+
+   ```
+   oauth sign-in on vault anthropic: login valid for 480 min, scopes [user:inference user:profile]
+   ```
+
+   and the same line, reading `oauth renewal …`, after each automatic renewal. If the server issued
+   more than the ceiling it says so explicitly:
+
+   ```
+   oauth renewal on vault anthropic: login valid for 720 min, scopes [...]; CLAMPED: the server
+   issued 525600 min, held to 720 min
+   ```
+
+   **This is the live check §2 could not do.** The first real sign-in and the first real renewal
+   settle three things a disassembly cannot: the actual lifetime the server grants, the scopes it
+   echoes back, and whether the one-year `expiresIn` is honoured. No token, refresh token, or
+   anything derived from either appears in these lines.
+
+7. **That is the last human step.** From then on the engine renews the login about 30 minutes before
    each expiry, and every agent wired to that vault picks the new token up at its next turn
    boundary. `GET /v1/agents/<agent>/auth` shows `refreshable: true`, an `expires_at` that moves
    forward on its own, and a `warning` if a renewal ever fails.
-7. **If something is wrong**, the operator sees it BEFORE the board stops: the `warning` on
+8. **If something is wrong**, the operator sees it BEFORE the board stops: the `warning` on
    `GET auth` and a `node.state` event carrying it, while agents keep running on the current token.
    Only when the token really lapses do the agents park `needs_auth` with their messages still
    queued — and signing in again (step 3-5) resumes every one of them.
@@ -400,6 +456,45 @@ test.
    being told the same thing; `pump_queue` also refuses to write to an agent in `needs_auth`.
 8. **The schema drift test compares file NAMES, not contents**, so `docs/schema` was stale while the
    gate was green. Regenerated in this change; worth a QA ticket of its own.
+
+### Round 2 (ADVERSARY review of the implementation)
+
+9. **The dead-refresh classifier read a dialect the CLI does not speak.** It matched
+   `invalid_grant`/`revoked` as substrings; the real CLI prints axios's `Request failed with status
+   code 400` and no OAuth code at all, so a permanently dead token was classified transient and
+   retried for ever — a silent loop on a live box — while `CERT_REVOKED` from a TLS fault was
+   classified permanently dead. It now keys on **exit status plus the HTTP status parsed from the
+   message**: 400–403 is a refused grant (permanent), 429/5xx is worth retrying, and an unreadable
+   failure is retried a BOUNDED number of times and then stops driving itself. The QA fake was fixed
+   FIRST, to emit what the real binary emits; the tests went red; only then was the classifier
+   changed.
+10. **A `stop` during a renewal did not stop the agent** — a regression introduced by the fix for the
+    freeze below. `start` releases the slot across the renewal, so a stop took an empty slot, reported
+    success, and the renewal then spawned a child anyway on a token minted after the operator stopped
+    it. A stop epoch is captured before the renewal and re-checked when the slot is taken back.
+11. **A healthcheck during a renewal froze the board.** `live_agents` awaited every slot while holding
+    the map lock, and `start` held one slot across the CLI's 60 s budget; one `/healthz` then stalled
+    every other agent. Handles are cloned, the map lock is released, and each slot is taken with
+    `try_lock` (a slot in transition counts as live); the renewal happens outside the slot lock.
+    Measured before the fix: an unrelated start waited 4.7 s.
+12. **A renewal schedule that can compute "now" is a loop.** `expires - lead` is already in the past
+    for any token shorter-lived than the lead, so the wait floored at zero and the engine renewed
+    again immediately — ADVERSARY measured 40 unrequested exchanges in two seconds. Timers now have a
+    floor, and a login too short-lived to schedule is not armed at all (it is renewed on demand, which
+    is bounded by messages arriving) and says so.
+13. **A tool node could put the login on the wire.** `resolve_vault_fills` had no session gate, so a
+    tool wired to the vault could send the refresh token upstream as a parameter. It now refuses the
+    key exactly as `wheel secret get` does.
+
+### Deferred to a follow-up, deliberately (they are real, and none blocks the board)
+
+- Every `check_refresh` rejection is classified permanent. A false positive is then unrecoverable
+  without a person, and the gate keys on server-controlled values never observed live.
+- Scopes ratchet downward: the gate blocks escalation, and a server returning a SUBSET passes.
+  `REQUIRED_SCOPE` now refuses a renewal that drops `user:inference`, but a general downgrade is
+  still unresisted.
+- `resume_readers_if_blocked` — the documented VPS recovery path — has no test of its own.
+- A table in PROTOCOL.md swallowed the sentence after it, which now renders as a third cell.
 
 ### Still true, and still residual
 

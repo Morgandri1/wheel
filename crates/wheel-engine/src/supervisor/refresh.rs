@@ -35,6 +35,21 @@ use crate::{auth::OauthSession, db::board, oauth::RefreshFailure};
 const DEFAULT_LEAD: Duration = Duration::from_secs(30 * 60);
 /// How soon a renewal that failed for a reason that may pass is tried again.
 const DEFAULT_RETRY: Duration = Duration::from_secs(5 * 60);
+/// No renewal timer ever fires sooner than this, whatever the arithmetic says.
+///
+/// Every renewal spawns a CLI child that talks to the real token endpoint, so
+/// a schedule that can compute "now" is a self-sustaining loop nobody asked
+/// for. ADVERSARY found exactly that: `expires - lead` is already in the past
+/// for any token shorter-lived than the lead, and the wait floored at zero.
+const DEFAULT_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// How many consecutive UNREADABLE failures before the engine stops trying.
+///
+/// Only ambiguous ones are counted. A failure the classifier understood is
+/// already bounded by the token's own remaining life (`usable`), and on a
+/// deployment with no API-key fallback, converting a quarter of an hour of
+/// network trouble into "a person with a browser" is the wrong direction to
+/// fail — the 8-hour window is there to be used.
+const DEFAULT_MAX_ATTEMPTS: u32 = 12;
 
 /// A failed renewal's warning starts with this, so a later success clears
 /// exactly that warning from an agent's `last_error` and nothing else.
@@ -48,10 +63,14 @@ pub(crate) struct Broker {
     pub(crate) lead: Duration,
     pub(crate) retry: Duration,
     pub(crate) timeout: Duration,
+    pub(crate) min_interval: Duration,
+    pub(crate) max_attempts: u32,
     /// The CLI that performs the exchange; the harness's own when unset.
     pub(crate) program: Option<String>,
     locks: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
-    failures: Mutex<HashMap<Uuid, String>>,
+    failures: Mutex<HashMap<Uuid, Failure>>,
+    /// Consecutive failed renewals per vault, reset by a success or a sign-in.
+    attempts: Mutex<HashMap<Uuid, u32>>,
     timers: Mutex<HashMap<Uuid, u64>>,
     /// Exchanges attempted, for the engine log and for tests that have to
     /// prove N callers cost one exchange.
@@ -64,13 +83,26 @@ impl Default for Broker {
             lead: DEFAULT_LEAD,
             retry: DEFAULT_RETRY,
             timeout: crate::oauth::REFRESH_TIMEOUT,
+            min_interval: DEFAULT_MIN_INTERVAL,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
             program: None,
             locks: Mutex::default(),
             failures: Mutex::default(),
+            attempts: Mutex::default(),
             timers: Mutex::default(),
             exchanges: AtomicU64::new(0),
         }
     }
+}
+
+/// The latest word on why a vault's login could not be renewed.
+#[derive(Clone)]
+struct Failure {
+    warning: String,
+    /// Nothing will renew this login again without a person. `GET auth` stops
+    /// advertising `refreshable` when this is set, rather than promising a
+    /// renewal over a grant the server has already spent.
+    permanent: bool,
 }
 
 fn now_ms() -> i64 {
@@ -82,6 +114,7 @@ impl Supervisor {
     /// failure, schedule its renewal, and move running readers onto it.
     pub fn session_saved(self: &Arc<Self>, vault: Uuid) {
         self.broker.failures.lock().unwrap().remove(&vault);
+        self.broker.attempts.lock().unwrap().remove(&vault);
         self.clear_warnings(vault);
         if let Some(at) = self.session_generation(vault) {
             self.arm_renewal(
@@ -119,7 +152,25 @@ impl Supervisor {
     /// Why the last renewal of this vault's login failed, while that is still
     /// the latest word on it.
     pub fn refresh_warning(&self, vault: Uuid) -> Option<String> {
-        self.broker.failures.lock().unwrap().get(&vault).cloned()
+        self.broker
+            .failures
+            .lock()
+            .unwrap()
+            .get(&vault)
+            .map(|f| f.warning.clone())
+    }
+
+    /// Can this login still be renewed by the engine? False once a renewal has
+    /// failed in a way no retry can fix: `GET auth` must not keep promising an
+    /// automatic renewal over a grant that is gone.
+    pub fn refresh_still_possible(&self, vault: Uuid) -> bool {
+        !self
+            .broker
+            .failures
+            .lock()
+            .unwrap()
+            .get(&vault)
+            .is_some_and(|f| f.permanent)
     }
 
     /// Make sure the vault's login has more than the lead left, renewing it
@@ -182,12 +233,31 @@ impl Supervisor {
         match self.renew(vault, vk, &session).await {
             Ok(next) => {
                 self.broker.failures.lock().unwrap().remove(&vault);
+                self.broker.attempts.lock().unwrap().remove(&vault);
                 self.clear_warnings(vault);
                 self.arm_renewal(vault, next);
                 self.spawn_adopt(vault);
                 Ok(next)
             }
-            Err(failure) => {
+            Err(mut failure) => {
+                let tries = if failure.ambiguous {
+                    let mut attempts = self.broker.attempts.lock().unwrap();
+                    let n = attempts.entry(vault).or_insert(0);
+                    *n += 1;
+                    *n
+                } else {
+                    0
+                };
+                // Only for a failure nothing could read: a classified one is
+                // already bounded by the token's own remaining life.
+                if !failure.permanent && tries >= self.broker.max_attempts {
+                    failure.permanent = true;
+                    failure.reason = format!(
+                        "{} (stopped retrying after {tries} attempts nothing could read; \
+                         starting an agent will try again)",
+                        failure.reason
+                    );
+                }
                 let usable = expires > now;
                 let warning = self.record_failure(vault, &failure, usable.then_some(expires));
                 if usable && !failure.permanent {
@@ -211,7 +281,12 @@ impl Supervisor {
         vk: &crate::vault::VaultKey,
         prev: &OauthSession,
     ) -> Result<i64, RefreshFailure> {
-        let failed = |reason: String, permanent: bool| RefreshFailure { reason, permanent };
+        let failed = |reason: String, permanent: bool| RefreshFailure {
+            reason,
+            permanent,
+            // Ours, not the CLI's: we know exactly what went wrong here.
+            ambiguous: false,
+        };
         let refresh = prev
             .refresh_token()
             .ok_or_else(|| failed("no refresh token".into(), true))?;
@@ -246,6 +321,13 @@ impl Supervisor {
         )
         .await?;
 
+        // THE RULE for everything below: any outcome other than "exit 0 AND a
+        // readable store that passes the gate" means the refresh token we sent
+        // is irreversibly gone -- the server spent it whether or not the CLI
+        // managed to write the result. So the vault keeps the old pair (which
+        // is now dead) and the next attempt gets a 400, which is permanent and
+        // parks with a reason. There is nothing to "retry into" here; the only
+        // recovery is a person signing in.
         let mut next = crate::auth::read_session(&scratch.0)
             .map_err(|e| failed(format!("the renewed login could not be read: {e}"), false))?;
         next.carry_forward(prev);
@@ -254,9 +336,14 @@ impl Supervisor {
         // only repeat the refusal.
         crate::auth::check_refresh(prev, &next, now_ms())
             .map_err(|why| failed(format!("the renewed login was refused: {why}"), true))?;
+        // Not trusted: the refresh path asks the server for a year. Whatever
+        // comes back, Wheel records at most the ceiling — and reports what the
+        // server actually said, which is how the operator finds out.
+        let server_said = next.clamp_expiry(now_ms(), crate::auth::MAX_RECORDED_LIFETIME_MS);
         let expires = next
             .expires_at()
             .ok_or_else(|| failed("no expiry".into(), true))?;
+        self.record_login_facts(vault, &next, server_said, "renewal");
 
         let wrote = {
             let conn = self.db.lock().unwrap();
@@ -305,11 +392,13 @@ impl Supervisor {
             failure.reason
         );
         tracing::warn!(%vault, permanent = failure.permanent, reason = %failure.reason, "oauth refresh failed");
-        self.broker
-            .failures
-            .lock()
-            .unwrap()
-            .insert(vault, warning.clone());
+        self.broker.failures.lock().unwrap().insert(
+            vault,
+            Failure {
+                warning: warning.clone(),
+                permanent: failure.permanent,
+            },
+        );
         self.warn_readers(vault, Some(&warning));
         warning
     }
@@ -344,8 +433,90 @@ impl Supervisor {
         }
     }
 
+    /// Schedule the next renewal of a login that expires at `expires_ms`.
+    ///
+    /// A token with less life than [`Broker::min_interval`] cannot be put on a
+    /// sane cadence: renewing it "before it expires" means renewing it now,
+    /// and again immediately, for ever. That is a server issuing something we
+    /// cannot work with, so it is surfaced as a warning and NOT armed —
+    /// a spawn still renews on demand, which is bounded by messages arriving.
     fn arm_renewal(self: &Arc<Self>, vault: Uuid, expires_ms: i64) {
+        let remaining = expires_ms - now_ms();
+        // Keyed on the LEAD, not the floor: the loop condition is "less than a
+        // lead left", so any token shorter than that is due the moment it is
+        // armed. A five-minute token under a thirty-minute lead cleared a
+        // sixty-second floor and still renewed once a minute for ever.
+        let min = self.broker.lead.as_millis() as i64;
+        if remaining < min {
+            let warning = format!(
+                "{WARNING_PREFIX} for vault {}: the login it was given expires in {}s, \
+                 sooner than the renewal lead, so it is too soon to renew on a schedule; \
+                 renewing only when an agent starts. Sign in again if agents keep stopping.",
+                self.vault_name(vault),
+                (remaining.max(0)) / 1000
+            );
+            tracing::warn!(%vault, remaining_ms = remaining, "a renewed login is too short-lived to schedule");
+            self.broker.failures.lock().unwrap().insert(
+                vault,
+                Failure {
+                    warning: warning.clone(),
+                    // A schedule we cannot keep, not a grant that is gone: a
+                    // start still renews this on demand.
+                    permanent: false,
+                },
+            );
+            self.warn_readers(vault, Some(&warning));
+            return;
+        }
         self.arm_refresh_timer(vault, expires_ms - self.broker.lead.as_millis() as i64);
+    }
+
+    /// Write down what the server actually issued, where the operator can read
+    /// it back: the lifetime, the scopes it echoed, and whether the clamp
+    /// fired. No token, no refresh token, nothing derived from either.
+    ///
+    /// This is the live check the proposal's §9 asks for. The operator's own
+    /// first sign-in on the VPS produces these lines, which is how the
+    /// one-year-token question gets settled by observation rather than by
+    /// reading a disassembly.
+    pub fn record_login_facts(
+        &self,
+        vault: Uuid,
+        session: &OauthSession,
+        server_said: Option<i64>,
+        what: &str,
+    ) {
+        let now = now_ms();
+        let mins = |ms: i64| ms / 60_000;
+        let lifetime = session.lifetime_ms(now).unwrap_or(0);
+        let clamp = match server_said {
+            Some(original) => format!(
+                "; CLAMPED: the server issued {} min, held to {} min",
+                mins(original - now),
+                mins(lifetime)
+            ),
+            None => String::new(),
+        };
+        let line = format!(
+            "oauth {what} on vault {}: login valid for {} min, scopes [{}]{clamp}",
+            self.vault_name(vault),
+            mins(lifetime),
+            session.scopes().join(" ")
+        );
+        tracing::info!(%vault, clamped = server_said.is_some(), "{line}");
+        let conn = self.db.lock().unwrap();
+        for agent in crate::vault::agents_reading(&conn, vault).unwrap_or_default() {
+            super::log_line_bus(&self.events, &conn, agent, "engine", &line);
+        }
+    }
+
+    fn vault_name(&self, vault: Uuid) -> String {
+        let conn = self.db.lock().unwrap();
+        board::get(&conn, vault)
+            .ok()
+            .flatten()
+            .map(|n| n.name.to_string())
+            .unwrap_or_else(|| vault.to_string())
     }
 
     /// One sleeping timer per vault; arming again supersedes the previous one.
@@ -358,8 +529,11 @@ impl Supervisor {
             *g
         };
         let me = Arc::clone(self);
+        let floor = self.broker.min_interval.as_millis() as i64;
         tokio::spawn(async move {
-            let wait = (at_ms - now_ms()).max(0) as u64;
+            // The floor applies to every caller, so no arithmetic anywhere can
+            // produce a timer that fires immediately and re-arms itself.
+            let wait = (at_ms - now_ms()).max(floor) as u64;
             tokio::time::sleep(Duration::from_millis(wait)).await;
             if me.broker.timers.lock().unwrap().get(&vault) != Some(&gen) {
                 return;
@@ -546,17 +720,28 @@ mod tests {
     /// refresh tokens (single use) and checks every turn's access token, which
     /// is what makes a rotation race observable rather than theoretical.
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
+
+    /// These tests spawn real processes and measure real time. Run all of them
+    /// at once on a dev host and a python startup alone can outlast the window
+    /// under test, which reports healthy code as broken (the handoff's own
+    /// "test flakes were my own load"). Three at a time keeps them honest
+    /// without serialising the suite.
+    static RIGS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
     const SCOPES: &[&str] = &["user:inference", "user:profile"];
     const VAULT_KEY_B64: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
     struct Spec {
         agents: &'static [&'static str],
+        /// Agents with no vault wire at all: they share the board, not the login.
+        unwired: &'static [&'static str],
         /// How long the vault's CURRENT access token still has.
         ttl_ms: i64,
         /// Lifetime of every token the fake mints from here on.
         lifetime_ms: i64,
         lead_ms: u64,
         retry_ms: u64,
+        min_interval_ms: u64,
+        max_attempts: u32,
         /// The refresh token is not in the store: renewal fails `invalid_grant`.
         revoked: bool,
         policy: HarnessAuthPolicy,
@@ -568,10 +753,13 @@ mod tests {
         fn default() -> Self {
             Self {
                 agents: &["worker"],
-                ttl_ms: 3_000,
-                lifetime_ms: 20_000,
-                lead_ms: 1_500,
+                unwired: &[],
+                ttl_ms: 10_000,
+                lifetime_ms: 40_000,
+                lead_ms: 5_000,
                 retry_ms: 60_000,
+                min_interval_ms: 200,
+                max_attempts: 3,
                 revoked: false,
                 policy: HarnessAuthPolicy::OauthToken,
                 fake: serde_json::json!({}),
@@ -580,9 +768,11 @@ mod tests {
     }
 
     struct Rig {
+        _permit: tokio::sync::SemaphorePermit<'static>,
         sup: Arc<Supervisor>,
         vault: Uuid,
         agents: Vec<Uuid>,
+        unwired: Vec<Uuid>,
         dir: PathBuf,
         store: PathBuf,
         /// The pair the vault started with, to compare a renewal against.
@@ -598,7 +788,8 @@ mod tests {
     }
 
     impl Rig {
-        fn new(name: &str, spec: Spec) -> Self {
+        async fn new(name: &str, spec: Spec) -> Self {
+            let _permit = RIGS.acquire().await.expect("the limiter is never closed");
             use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!(
                 "wheel-refresh-{name}-{}-{}",
@@ -663,6 +854,22 @@ mod tests {
                 NodeConfig::Vault(VaultConfig { keys: vec![] }),
             );
             board::create(&conn, &vault).unwrap();
+            let mut unwired = Vec::new();
+            for name in spec.unwired {
+                let node = Node::new(
+                    Uuid::new_v4(),
+                    name.parse().unwrap(),
+                    Position::default(),
+                    NodeConfig::Agent(AgentConfig {
+                        harness: wheel_core::Harness::Claude,
+                        system_prompt: "test".into(),
+                        ..Default::default()
+                    }),
+                );
+                board::create(&conn, &node).unwrap();
+                board::set_status(&conn, node.id, AgentStatus::Parked, None);
+                unwired.push(node.id);
+            }
             let mut agents = Vec::new();
             for name in spec.agents {
                 let node = Node::new(
@@ -712,12 +919,16 @@ mod tests {
             sup.broker.program = Some(program);
             sup.broker.lead = Duration::from_millis(spec.lead_ms);
             sup.broker.retry = Duration::from_millis(spec.retry_ms);
+            sup.broker.min_interval = Duration::from_millis(spec.min_interval_ms);
+            sup.broker.max_attempts = spec.max_attempts;
             sup.broker.timeout = Duration::from_secs(30);
 
             Self {
+                _permit,
                 sup: Arc::new(sup),
                 vault: vault.id,
                 agents,
+                unwired,
                 dir,
                 store,
                 first,
@@ -806,6 +1017,10 @@ mod tests {
 
     impl Drop for Rig {
         fn drop(&mut self) {
+            if std::env::var("WHEEL_TEST_KEEP").is_ok() {
+                eprintln!("[keep] {}", self.dir.display());
+                return;
+            }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -881,7 +1096,7 @@ mod tests {
     /// the second message comes back `Login expired · Please run /login`.
     #[tokio::test]
     async fn an_agent_keeps_answering_past_its_original_expiry_and_the_vault_holds_the_renewal() {
-        let rig = Rig::new("survives", Spec::default());
+        let rig = Rig::new("survives", Spec::default()).await;
         let agent = rig.agents[0];
         let mut events = rig.sup.events().subscribe();
         let original_expiry = rig.first.expires_at().unwrap();
@@ -948,13 +1163,13 @@ mod tests {
     /// through an auth failure — `saw_needs_auth` catches it.
     #[tokio::test]
     async fn a_busy_child_moves_onto_the_renewed_login_at_the_end_of_its_turn() {
-        let rig = Rig::new("busy", Spec::default());
+        let rig = Rig::new("busy", Spec::default()).await;
         let agent = rig.agents[0];
         let mut events = rig.sup.events().subscribe();
         let original_expiry = rig.first.expires_at().unwrap();
 
         // A turn that is still running when the renewal timer fires.
-        let long = rig.send_body(agent, "<<FAKE:SLEEP=2.5>> working").await;
+        let long = rig.send_body(agent, "<<FAKE:SLEEP=7>> working").await;
         until("the vault to hold a renewed login", || {
             rig.session().access_token() != rig.first.access_token()
         })
@@ -984,7 +1199,8 @@ mod tests {
                 agents: &["alpha", "beta"],
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let (alpha, beta) = (rig.agents[0], rig.agents[1]);
         let mut events = rig.sup.events().subscribe();
         let original_expiry = rig.first.expires_at().unwrap();
@@ -1035,7 +1251,8 @@ mod tests {
                 agents: &["a", "b", "c"],
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let mut tasks = Vec::new();
         for _ in 0..6 {
             let sup = rig.sup.clone();
@@ -1066,11 +1283,12 @@ mod tests {
             "failing",
             Spec {
                 revoked: true,
-                ttl_ms: 2_500,
-                lead_ms: 5_000, // so the first start already tries, and fails
+                ttl_ms: 8_000,
+                lead_ms: 30_000, // so the first start already tries, and fails
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
         let mut events = rig.sup.events().subscribe();
 
@@ -1085,8 +1303,17 @@ mod tests {
             .sup
             .refresh_warning(rig.vault)
             .expect("a failed renewal must be visible on GET auth");
-        assert!(warning.contains("invalid_grant"), "{warning}");
+        // What the REAL CLI reports for a dead refresh token: axios's own
+        // message, carrying the HTTP status and no OAuth error code at all.
+        assert!(warning.contains("HTTP 400"), "{warning}");
         assert!(warning.contains("agents keep running"), "{warning}");
+        // A refused grant is dead: nothing may keep promising to renew it, and
+        // nothing may keep trying on a timer. This is what the CLASSIFICATION
+        // decides — the message above only reports it.
+        assert!(
+            !rig.sup.refresh_still_possible(rig.vault),
+            "a 400 on the grant means no renewal is coming; it must stop saying otherwise"
+        );
         assert_ne!(rig.status(agent), AgentStatus::NeedsAuth);
         assert!(
             rig.last_error(agent)
@@ -1163,7 +1390,8 @@ mod tests {
                 ttl_ms: -1_000,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
         let queued = rig.send_and_deliver(agent).await;
 
@@ -1172,7 +1400,7 @@ mod tests {
         assert_eq!(rig.message(queued).state, MessageState::Queued);
         let err = rig.last_error(agent).unwrap_or_default();
         assert!(err.contains("anthropic"), "name the vault: {err}");
-        assert!(err.contains("invalid_grant"), "name the reason: {err}");
+        assert!(err.contains("HTTP 400"), "name the reason: {err}");
     }
 
     /// TH1 at the refresher. A renewal whose output belongs to another account
@@ -1190,7 +1418,8 @@ mod tests {
                 fake: serde_json::json!({ "refresh_claims_account": "acct-EVIL" }),
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let before = rig.session();
         let _ = rig.sup.ensure_fresh(rig.vault, None).await;
 
@@ -1221,7 +1450,8 @@ mod tests {
                 ttl_ms: 800,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
 
         // The agent plants a live credential for another account, in both
@@ -1278,7 +1508,8 @@ mod tests {
                 policy: HarnessAuthPolicy::ApiKeyOnly,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
 
         let refused = rig.sup.ensure_fresh(rig.vault, None).await.unwrap_err();
@@ -1320,7 +1551,8 @@ mod tests {
                 ttl_ms: 800,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         // A refresher that records how it was called, then fails loudly with
         // the secret in its own output.
         let spy = rig.dir.join("spy.sh");
@@ -1381,7 +1613,8 @@ mod tests {
                 lead_ms: 1_000,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
         let gen = rig.sup.session_generation(rig.vault);
 
@@ -1411,7 +1644,8 @@ mod tests {
                 lead_ms: 1_000,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
 
         let long = rig.send_body(agent, "<<FAKE:SLEEP=3>> working").await;
@@ -1449,7 +1683,8 @@ mod tests {
                 lead_ms: 1_000,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
         let warm = rig.send_and_deliver(agent).await;
         until("the agent to be warm", || rig.answered(warm)).await;
@@ -1488,16 +1723,329 @@ mod tests {
                 lead_ms: 1_000,
                 ..Spec::default()
             },
-        );
+        )
+        .await;
         let agent = rig.agents[0];
         let first = rig.send_and_deliver(agent).await;
         until("the agent to be running", || rig.answered(first)).await;
         assert!(rig.sup.live_agents().await.contains(&agent));
 
         rig.sup.stop(agent).await.unwrap();
+        // Settled, not sampled: a slot being reaped reads as live on purpose
+        // (a process in transition is not an absent one), so this waits for
+        // the reaping to finish rather than racing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while rig.sup.live_agents().await.contains(&agent) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a stopped agent must stop holding a process"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// ADVERSARY (High): `live_agents` walked every slot for `/healthz` while
+    /// holding the map lock, and `start` held an agent's slot across the
+    /// renewal CLI's 60-second budget. One healthcheck during one renewal
+    /// stalled every other agent on the board.
+    ///
+    /// Mutation-checked: restore either half and this times out.
+    #[tokio::test]
+    async fn a_renewal_does_not_freeze_the_rest_of_the_board() {
+        let rig = Rig::new(
+            "freeze",
+            Spec {
+                ttl_ms: 200,
+                lead_ms: 1_000,
+                unwired: &["bystander"],
+                // A renewal that takes as long as a real network round trip.
+                fake: serde_json::json!({ "refresh_delay_ms": "5000" }),
+                ..Spec::default()
+            },
+        )
+        .await;
+        let renewing = rig.agents[0];
+        let bystander = rig.unwired[0];
+
+        // A renewal in flight THROUGH `start`, which is the shape that matters:
+        // that is where an agent's slot was held for the CLI's whole budget.
+        let sup = rig.sup.clone();
+        let renewal = tokio::spawn(async move { sup.start(renewing).await });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // While it runs: the healthcheck answers, and an agent that has nothing
+        // to do with that login still starts.
+        let started = std::time::Instant::now();
+        let live = rig.sup.live_agents().await;
+        let _ = live;
+        rig.sup
+            .start(bystander)
+            .await
+            .expect("an unrelated agent must still start");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(3),
+            "a healthcheck and an unrelated start waited {waited:?} on somebody else's renewal"
+        );
+        let _ = renewal.await.unwrap();
+    }
+
+    /// A failure nothing could read must not have the engine retrying it for
+    /// ever on its own. After the cap it stops driving retries and stops
+    /// advertising that it can renew — an explicit start still tries, because
+    /// on a box with no API-key fallback a person starting an agent is exactly
+    /// when to try again.
+    ///
+    /// Mutation-checked: remove the cap and it never reports giving up.
+    #[tokio::test]
+    async fn an_unreadable_failure_stops_the_engine_retrying_on_its_own() {
+        let rig = Rig::new(
+            "ambiguous",
+            Spec {
+                revoked: true,
+                ttl_ms: 60_000,
+                lead_ms: 120_000, // always due, so every call tries
+                retry_ms: 60_000,
+                max_attempts: 3,
+                // Not an HTTP failure at all: no status to key on anywhere.
+                fake: serde_json::json!({
+                    "refresh_transport_error": "connect ETIMEDOUT 160.79.104.10:443"
+                }),
+                ..Spec::default()
+            },
+        )
+        .await;
+
+        for _ in 0..5 {
+            let _ = rig.sup.ensure_fresh(rig.vault, None).await;
+        }
+
+        let warning = rig.sup.refresh_warning(rig.vault).unwrap_or_default();
+        assert!(
+            warning.contains("stopped retrying"),
+            "the operator is told the engine has stopped trying: {warning}"
+        );
+        assert!(
+            warning.contains("ETIMEDOUT"),
+            "the CLI's own words must reach the operator: {warning}"
+        );
+        assert!(
+            !rig.sup.refresh_still_possible(rig.vault),
+            "it must stop advertising a renewal it is no longer attempting"
+        );
+    }
+
+    /// The CLI's writer returns success WITHOUT writing when the token
+    /// response omits `expires_in` (`expiresAt` is NaN, and `!e.expiresAt` is
+    /// true) or carries scopes it does not recognise — and the login path does
+    /// not throw. So `Login successful.` and exit 0 do not mean a credential
+    /// exists, and the refresh token has been spent either way.
+    #[tokio::test]
+    async fn a_cli_that_exits_zero_without_writing_is_not_taken_at_its_word() {
+        let rig = Rig::new(
+            "silent",
+            Spec {
+                ttl_ms: 800,
+                fake: serde_json::json!({ "refresh_writes_nothing": "1" }),
+                ..Spec::default()
+            },
+        )
+        .await;
+        let before = rig.session();
+
+        let _ = rig.sup.ensure_fresh(rig.vault, None).await;
+
+        assert_eq!(
+            rig.session(),
+            before,
+            "the vault must keep the login it had: nothing valid was produced"
+        );
+        let warning = rig.sup.refresh_warning(rig.vault).unwrap_or_default();
+        assert!(
+            warning.contains("could not be read"),
+            "the operator is told the CLI wrote nothing: {warning}"
+        );
+    }
+
+    /// The regression this fix introduced. `start` gives the slot up across the
+    /// renewal, so a `stop` that lands in that window takes an EMPTY slot,
+    /// kills nothing, and reports success — and then the renewal finishes and
+    /// spawns a child anyway, on a token minted after the operator stopped it.
+    ///
+    /// Mutation-checked: drop the stop-epoch check on re-take and a stopped
+    /// agent comes back running.
+    #[tokio::test]
+    async fn a_stop_during_a_renewal_actually_stops_the_agent() {
+        let rig = Rig::new(
+            "stop-race",
+            Spec {
+                ttl_ms: 200,
+                lead_ms: 1_000,
+                fake: serde_json::json!({ "refresh_delay_ms": "3000" }),
+                ..Spec::default()
+            },
+        )
+        .await;
+        let agent = rig.agents[0];
+
+        let sup = rig.sup.clone();
+        let starting = tokio::spawn(async move { sup.start(agent).await });
+        // Long enough to be inside the renewal, which holds no slot.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        rig.sup.stop(agent).await.unwrap();
+        let started = starting.await.unwrap().unwrap();
+
+        assert_eq!(
+            started,
+            AgentStatus::Stopped,
+            "a start that was renewing when the operator stopped the agent must not spawn"
+        );
+        assert_eq!(rig.status(agent), AgentStatus::Stopped);
         assert!(
             !rig.sup.live_agents().await.contains(&agent),
-            "a stopped agent holds no process"
+            "the operator's stop must leave no process behind"
+        );
+        assert_eq!(rig.spawns(), 0, "no child may be spawned after a stop");
+    }
+
+    /// The residual on the backoff fix: the guard has to key on the LEAD,
+    /// because the lead is the loop condition. A token longer than the floor
+    /// but shorter than the lead is due the moment it is armed, so it renewed
+    /// once per floor-interval for ever.
+    ///
+    /// Mutation-checked: key the guard on `min_interval` again and the
+    /// exchange count climbs.
+    #[tokio::test]
+    async fn a_token_shorter_than_the_lead_but_longer_than_the_floor_does_not_loop() {
+        let rig = Rig::new(
+            "lead-guard",
+            Spec {
+                ttl_ms: 200,
+                // Longer than the floor, shorter than the lead: the case the
+                // first version of this guard sailed straight past.
+                lifetime_ms: 1_000,
+                lead_ms: 3_000,
+                min_interval_ms: 200,
+                ..Spec::default()
+            },
+        )
+        .await;
+        rig.sup.ensure_fresh(rig.vault, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+
+        assert_eq!(
+            rig.exchanges(),
+            1,
+            "a token shorter than the renewal lead must not renew itself in a loop"
+        );
+        assert!(rig
+            .sup
+            .refresh_warning(rig.vault)
+            .unwrap_or_default()
+            .contains("too soon to renew"));
+    }
+
+    /// The cap exists to bound what nothing could READ. A failure the
+    /// classifier understood is already bounded by the token's own remaining
+    /// life, and on a box with no API-key fallback, spending that budget on a
+    /// passing network fault turns fifteen minutes of trouble into a person
+    /// with a browser.
+    ///
+    /// Mutation-checked: count every failure against the cap again and the
+    /// classified one stops being retried after three.
+    #[tokio::test]
+    async fn a_classified_failure_is_not_spent_from_the_ambiguous_budget() {
+        let rig = Rig::new(
+            "classified",
+            Spec {
+                revoked: true,
+                ttl_ms: 60_000,
+                lead_ms: 120_000, // always due, so every call tries
+                max_attempts: 3,
+                // A server fault: readable, and worth trying again.
+                fake: serde_json::json!({ "refresh_status": "503" }),
+                ..Spec::default()
+            },
+        )
+        .await;
+        for _ in 0..5 {
+            let _ = rig.sup.ensure_fresh(rig.vault, None).await;
+        }
+        assert_eq!(
+            rig.exchanges(),
+            5,
+            "a 503 is bounded by the token's life, not by the ambiguity cap"
+        );
+        let warning = rig.sup.refresh_warning(rig.vault).unwrap_or_default();
+        assert!(warning.contains("HTTP 503"), "{warning}");
+        assert!(
+            !warning.contains("gave up"),
+            "a readable, retryable failure must not report giving up: {warning}"
+        );
+        assert!(
+            rig.sup.refresh_still_possible(rig.vault),
+            "a transient fault must not stop advertising renewal"
+        );
+    }
+
+    /// The one-year question, contained until a live exchange settles it: the
+    /// refresh path asks for `expiresIn: 31536000`, and if the server honours
+    /// it every child would hold a year-long bearer token. Wheel records at
+    /// most its own ceiling, so children are rotated on Wheel's schedule — and
+    /// the fact is written where the operator can read it.
+    ///
+    /// Mutation-checked: remove the clamp and the vault records the year.
+    #[tokio::test]
+    async fn a_login_the_server_says_lasts_a_year_is_held_to_the_ceiling_and_reported() {
+        let year_ms: i64 = 365 * 24 * 60 * 60 * 1000;
+        let rig = Rig::new(
+            "clamp",
+            Spec {
+                ttl_ms: 200,
+                lifetime_ms: year_ms,
+                lead_ms: 1_000,
+                ..Spec::default()
+            },
+        )
+        .await;
+        let agent = rig.agents[0];
+        rig.sup.ensure_fresh(rig.vault, None).await.unwrap();
+
+        let recorded = rig.session().expires_at().unwrap() - now_ms();
+        assert!(
+            recorded <= crate::auth::MAX_RECORDED_LIFETIME_MS,
+            "the vault recorded {recorded} ms, past the ceiling"
+        );
+        assert!(
+            recorded > crate::auth::MAX_RECORDED_LIFETIME_MS - 60_000,
+            "a clamp must hold it AT the ceiling, not shorten it further: {recorded}"
+        );
+
+        // ...and the operator can read what the server actually said.
+        let engine_log = {
+            let conn = rig.sup.db.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT text FROM logs WHERE node_id = ?1 AND stream = 'engine'")
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map(rusqlite::params![agent.to_string()], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows.join("\n")
+        };
+        assert!(engine_log.contains("CLAMPED"), "{engine_log}");
+        assert!(
+            engine_log.contains("scopes [user:inference user:profile]"),
+            "the scope echo is what a live exchange has to confirm: {engine_log}"
+        );
+        assert!(
+            !engine_log.contains("sk-ant-"),
+            "no token material may reach a log line: {engine_log}"
         );
     }
 }

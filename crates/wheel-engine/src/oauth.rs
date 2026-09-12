@@ -318,14 +318,62 @@ impl LoginSessions {
 /// How long the CLI may take to renew a login before it is called failed.
 pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// What the CLI or the token server says about a refresh token that will
-/// never work again. Anything else is treated as worth another try.
-const DEAD_REFRESH_MARKERS: &[&str] = &[
+/// OAuth error codes that mean the grant itself is dead. Matched only as
+/// whole words, and deliberately NOT including a bare "revoked": a TLS fault
+/// reports `CERT_REVOKED`, and calling a network problem a dead credential
+/// parks a board that only needed a retry.
+///
+/// The real CLI does not print these for a failed headless refresh — see
+/// [`classify_refresh_failure`] — so they are a belt for a future version that
+/// does, never the signal this relies on.
+const DEAD_GRANT_CODES: &[&str] = &[
     "invalid_grant",
     "invalid_refresh_token",
     "expired_refresh_token",
-    "revoked",
 ];
+
+/// The HTTP status the CLI's own error message carries, if it carries one.
+///
+/// `claude auth login` renews through axios, whose default `validateStatus`
+/// rejects anything >= 400, so the error that surfaces is axios's own and its
+/// message is literally `Request failed with status code 400` (verified by
+/// disassembling claude 2.1.269). That number is the only account of WHY the
+/// refresh failed that reaches us, so it is what the decision keys on.
+fn http_status_in(said: &str) -> Option<u16> {
+    const MARKER: &str = "status code ";
+    let at = said.find(MARKER)? + MARKER.len();
+    let digits: String = said[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Is this failure worth trying again, or is the login dead until a person
+/// signs in?
+///
+/// Keyed on the exchange's HTTP status, because that is what the CLI actually
+/// reports. A refused grant is 4xx and no amount of retrying changes it; a
+/// server or transport fault is 5xx or has no status at all, and usually
+/// passes. **When the signal is ambiguous — no status anywhere in the output —
+/// this answers "try again", and the CALLER bounds how often** (see
+/// `supervisor::refresh`'s attempt cap): an unrecognised message must not
+/// become an infinite loop, and it must not park a board that would have
+/// recovered on its own either.
+pub(crate) fn classify_refresh_failure(said: &str) -> (bool, Option<u16>) {
+    let status = http_status_in(said);
+    let permanent = match status {
+        // The grant was refused: a dead or rotated-away refresh token, a
+        // revoked one, or one this client may not use.
+        Some(400..=403) => true,
+        // Rate limited, gone, or the server failed: all worth another try.
+        Some(_) => false,
+        None => said
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| DEAD_GRANT_CODES.contains(&word)),
+    };
+    (permanent, status)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshFailure {
@@ -333,6 +381,11 @@ pub struct RefreshFailure {
     pub reason: String,
     /// The refresh token is dead; retrying cannot help, a person must sign in.
     pub permanent: bool,
+    /// Nothing in the output said what went wrong: no HTTP status, no known
+    /// OAuth code. Retried like any other transient failure, but this is the
+    /// case an attempt cap exists to bound — a classified 5xx is already
+    /// bounded by the token's own remaining life.
+    pub ambiguous: bool,
 }
 
 /// Renew a login by having the CLI do it: `claude auth login` with
@@ -352,6 +405,7 @@ pub async fn refresh_via_cli(
     let transient = |reason: String| RefreshFailure {
         reason,
         permanent: false,
+        ambiguous: true,
     };
     let mut cmd = crate::supervisor::child_command(program);
     cmd.args(["auth", "login"])
@@ -385,10 +439,15 @@ pub async fn refresh_via_cli(
         String::from_utf8_lossy(&out.stdout)
     );
     let said = crate::vault::redact(&said, &[refresh_token.to_string()]);
-    let lower = said.to_ascii_lowercase();
+    let (permanent, status) = classify_refresh_failure(&said);
+    let reason = match status {
+        Some(code) => format!("{} (HTTP {code})", clean(&said)),
+        None => clean(&said),
+    };
     Err(RefreshFailure {
-        permanent: DEAD_REFRESH_MARKERS.iter().any(|m| lower.contains(m)),
-        reason: clean(&said),
+        permanent,
+        ambiguous: status.is_none() && !permanent,
+        reason,
     })
 }
 
@@ -1122,5 +1181,81 @@ mod tests {
             LoginError::NoSession
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod refresh_classifier_tests {
+    use super::*;
+
+    /// The exact line the real CLI writes when a refresh token is dead or has
+    /// been rotated away, captured by disassembling claude 2.1.269: the token
+    /// POST goes through axios, whose default `validateStatus` rejects >= 400,
+    /// so what surfaces is axios's own message. The OAuth error code never
+    /// appears anywhere in the output.
+    const REAL_DEAD_TOKEN: &str = "Login failed: Request failed with status code 400";
+
+    #[test]
+    fn a_refused_grant_is_permanent_even_though_the_cli_never_names_the_reason() {
+        let (permanent, status) = classify_refresh_failure(REAL_DEAD_TOKEN);
+        assert!(permanent, "a 400 on a refresh grant is a dead credential");
+        assert_eq!(status, Some(400));
+
+        for code in [400, 401, 403] {
+            let said = format!("Login failed: Request failed with status code {code}");
+            assert!(
+                classify_refresh_failure(&said).0,
+                "{code} must be permanent"
+            );
+        }
+    }
+
+    /// The other half: a server or transport fault is not a dead credential,
+    /// and parking a board for one would need a person to fix something that
+    /// fixed itself.
+    #[test]
+    fn a_server_or_rate_limit_failure_is_worth_trying_again() {
+        for code in [429, 500, 502, 503, 504] {
+            let said = format!("Login failed: Request failed with status code {code}");
+            let (permanent, status) = classify_refresh_failure(&said);
+            assert!(!permanent, "{code} must be retried");
+            assert_eq!(status, Some(code));
+        }
+    }
+
+    /// The trap this classifier replaced: a substring match on "revoked".
+    /// A TLS failure says `CERT_REVOKED`, and calling that a dead credential
+    /// parks a board that only needed its network back.
+    #[test]
+    fn a_tls_fault_is_not_mistaken_for_a_dead_credential() {
+        for said in [
+            "Login failed: unable to verify the first certificate CERT_REVOKED",
+            "Login failed: connect ETIMEDOUT 160.79.104.10:443",
+            "Login failed: getaddrinfo ENOTFOUND platform.claude.com",
+        ] {
+            let (permanent, status) = classify_refresh_failure(said);
+            assert!(!permanent, "{said:?} is a network fault, not a dead grant");
+            assert_eq!(status, None);
+        }
+    }
+
+    /// A belt for a CLI version that DOES name the OAuth error, matched as a
+    /// whole word so it cannot fire on a longer identifier.
+    #[test]
+    fn an_explicit_oauth_error_code_is_still_read_when_one_appears() {
+        assert!(classify_refresh_failure("error: invalid_grant").0);
+        assert!(classify_refresh_failure("{\"error\":\"expired_refresh_token\"}").0);
+        // ...but not as part of another word.
+        assert!(!classify_refresh_failure("not_invalid_grantish").0);
+    }
+
+    /// Ambiguity is not permanence: with nothing to key on, the answer is "try
+    /// again", and the caller bounds how many times (supervisor::refresh's
+    /// attempt cap). Neither an infinite loop nor a board parked on a guess.
+    #[test]
+    fn an_unreadable_failure_is_retried_rather_than_guessed_either_way() {
+        let (permanent, status) = classify_refresh_failure("Login failed: something new");
+        assert!(!permanent);
+        assert_eq!(status, None);
     }
 }
