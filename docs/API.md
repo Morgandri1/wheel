@@ -273,6 +273,50 @@ Known gap: **a prompter cannot write table rows in v1.** There is no structured 
 row-write route for anyone — `POST /v1/tables/{id}/query` is read-only SQL by design — so granting it
 means designing one. Named rather than quietly dropped.
 
+## Sharing a board with someone — the actual sequence
+
+The API has two ways to add a member and they are not interchangeable in practice, so this names the
+one that works when you are sitting in front of a deployment.
+
+**By invite (recommended).** Nobody has to look up or exchange an account id.
+
+```bash
+# 1. The owner mints an invite for one person, at one tier, valid for one use.
+curl -sX POST https://wheel.example/v1/projects/$PROJECT/invites \
+     -H "x-auth-token: $OWNER_TOKEN" -H 'content-type: application/json' \
+     -d '{"role":"guest","email":"souren@example.com","expires_in_days":7}'
+# → {"id":"…","role":"guest","expires_at":"…","token":"wi_…"}   the token is shown ONCE
+
+# 2. Send them the `wi_…` token. They sign in (or sign up) on the same deployment, then:
+curl -sX POST https://wheel.example/v1/invites/accept \
+     -H "x-auth-token: $THEIR_TOKEN" -H 'content-type: application/json' \
+     -d '{"token":"wi_…"}'
+# → {"project_id":"…","role":"guest"}
+
+# 3. It is now in their own project list, with the tier they were given.
+curl -s https://wheel.example/v1/projects -H "x-auth-token: $THEIR_TOKEN"
+```
+
+Setting `email` locks the invite to that address, checked against the account's verified address
+rather than anything in the request — so a leaked link is useless to anyone else.
+
+**By account id.** Direct, and the right call when the owner already knows the id — for example
+because they created the account themselves with `POST /v1/auth/users`:
+
+```bash
+curl -sX POST https://wheel.example/v1/projects/$PROJECT/members \
+     -H "x-auth-token: $OWNER_TOKEN" -H 'content-type: application/json' \
+     -d '{"user_id":"<their users.id>","role":"prompter"}'
+```
+
+There is deliberately **no lookup of an account by email**: an endpoint that turns an address into a
+user id is an account-enumeration oracle, and the invite flow removes the need for one. `GET
+/v1/auth/me` is how somebody finds their *own* id.
+
+**Taking it back** is `DELETE /v1/projects/{id}/members/{user_id}`. It takes effect on the next
+request, and any live events WebSocket that member holds is closed rather than left running — see
+[What bounds a live WebSocket](#what-bounds-a-live-websocket).
+
 ## Membership and invites
 
 ```
