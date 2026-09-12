@@ -529,15 +529,21 @@ def body_limits():
     # checked against Content-Length upfront. A near-limit overage (the 300 KiB case above, 44 KiB
     # over 256 KiB) is caught almost immediately, before reverse_proxy has dialed the backend, and
     # gets a clean 413. A megabyte-scale overage gives reverse_proxy time to start forwarding
-    # before the cutoff lands, and aborting an in-flight proxy read surfaces as 502 instead —
-    # measured directly against this stack: 5 of 6 identical 6 MiB POSTs to /v1/projects came back
-    # 502, one came back a clean 401 (auth checked before the body). Either way nothing over the
-    # limit ever succeeds, which is the property that matters; the client-visible status is not.
+    # before the cutoff lands, and aborting an in-flight proxy read surfaces as either a 502 or a
+    # hard close with no response at all — measured directly, both reproduce on repeated identical
+    # 6 MiB POSTs to /v1/projects. Either way nothing over the limit ever succeeds, which is the
+    # property that matters; the exact client-visible failure mode is not, so a raised connection
+    # error counts the same as a 502 here.
     answered_by = {}
-    for label, reply in (
-        ("/v1", request("POST", "/v1/projects", {"x-auth-token": token, "content-type": "application/json"}, b" " * (6 * MiB))),
-        ("the web proxy", request("POST", "/api/wheel/v1/projects", {"cookie": state["cookie"], "origin": ORIGIN, "content-type": "application/json"}, b" " * (6 * MiB))),
+    for label, path, headers in (
+        ("/v1", "/v1/projects", {"x-auth-token": token, "content-type": "application/json"}),
+        ("the web proxy", "/api/wheel/v1/projects", {"cookie": state["cookie"], "origin": ORIGIN, "content-type": "application/json"}),
     ):
+        try:
+            reply = request("POST", path, headers, b" " * (6 * MiB))
+        except (ConnectionError, TimeoutError) as e:
+            answered_by[label] = f"a hard connection close ({type(e).__name__}: {e}) — a proxy-level refusal, not a clean 413"
+            continue
         expect(reply.status in (413, 502) or (reply.status >= 400 and EDGE_413 not in reply.body), f"6 MiB to {label} succeeded: {reply.brief()}")
         answered_by[label] = "a clean edge 413" if EDGE_413 in reply.body else f"a {reply.status} (proxy-level refusal, not a clean 413 — see the comment above)"
     blob = f"{engine(pid)}/chests/{uuid.uuid4()}/blob?key=rehearsal.bin"
