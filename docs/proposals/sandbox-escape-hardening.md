@@ -549,19 +549,46 @@ if the numbers favor a non-Docker mechanism rather than hedge toward the familia
 and is followed below — but it is not an instruction to assert more certainty than two rounds of
 adversarial review actually support. What is genuinely settled, and what is not:
 
-**Settled — escape-resistance is a difference in KIND, not degree, and nothing since has
-disputed it:**
+**Settled, WITH three qualifications ADVERSARY added by pressure-testing their own earlier phrasing
+rather than re-confirming it — "categorically stronger" does not survive unqualified, and is
+corrected here before it can be quoted back later as "we solved sandbox escape":**
 
 - gVisor still runs the untrusted workload on the HOST's own kernel: `runsc` intercepts syscalls in
   userspace, but the interception layer is a large, complex reimplementation of a huge Linux syscall
   surface, and a bug in it is still a path to the real host kernel — not hypothetical, gVisor has
   real sandbox-escape CVEs in its own history, precisely BECAUSE reimplementing that much of the
-  kernel IS a large attack surface. Firecracker's escape target is a purpose-built, minimal
-  hypervisor — the same one AWS runs Lambda/Fargate on for exactly the "execute arbitrary untrusted
-  customer code" case Wheel's own threat model states. For a threat model stated as "attacker already
-  has RCE, what stops escape," that is the more relevant axis, on its own terms.
+  kernel IS a large attack surface. Removing that specific class of bug — the syscall-emulation layer
+  itself as attack surface — for a workload that never talks to a syscall emulator at all is a real,
+  structural difference, and the right reason to prefer a VM boundary for a "run attacker-chosen
+  code" threat model. That much holds.
+- **But the correct phrase is "removes gVisor's specific attack surface, at the cost of a different
+  one that is smaller and more scrutinized but not risk-free" — not "categorically stronger" standing
+  alone, for three reasons:**
+  1. **Raw Firecracker and Kata Containers are not the same trusted computing base.** Kata adds
+     `containerd-shim-kata-v2` plus Kata's own in-guest agent between the attacker's process and the
+     hypervisor — real extra surface the pure-Firecracker security argument does not account for.
+     Whichever integration path (§ above) ends up costed, the strength claim is for THAT combination,
+     not for "Firecracker" as an abstraction — a raw `FirecrackerSandbox` against `wheel-host`'s own
+     trait is closer to the pure argument than going through Kata is.
+  2. **Firecracker's boundary is KVM's boundary, and KVM is not a zero-risk dependency.**
+     Firecracker's own code is small with a clean record, but the real TCB includes the host kernel's
+     KVM subsystem and the CPU's virtualization extensions underneath it — KVM has had real
+     escape-class CVEs (nested-virtualization bugs, device-emulation issues in QEMU-class
+     components). "Hardware boundary" is a smaller, more scrutinized, structurally DIFFERENT attack
+     surface than gVisor's userspace emulation — not a claim that the risk goes to zero.
+  3. **Neither option addresses side-channel attacks on its own, and this cuts hardest against
+     Firecracker specifically because it is the one being sold as the stronger boundary.**
+     Spectre-class attacks (cache timing, branch-predictor state) exploit shared microarchitectural
+     state on the same physical CPU and cross a software isolation boundary regardless of whether
+     that boundary is a container, a gVisor sandbox, or a VM — unless the deployment ALSO does
+     CPU-level isolation (core pinning, disabling SMT/hyperthreading between tenants). If that
+     operational work is not budgeted as part of choosing Firecracker, a Firecracker VM sharing a
+     hyperthread sibling with another tenant's VM is not meaningfully safer from a cache-timing
+     attack than two gVisor sandboxes would be from each other. Not costed anywhere in this document;
+     named here so the recommendation below does not imply it is solved.
 - The workload profile (syscall-heavy `git`/`npm`/`cargo`) independently favors Firecracker's
-  near-native steady-state over gVisor's worst-fit overhead case — also undisputed.
+  near-native steady-state over gVisor's worst-fit overhead case — undisputed, and not affected by
+  the three qualifications above, which are about the security claim specifically.
 
 **NOT settled — ADVERSARY's own correction, taken at face value rather than defended against:** once
 per-board scale, real networking, persistent storage and multiplayer are weighed TOGETHER rather than
@@ -656,12 +683,15 @@ whether Shape 2 becomes the default.
 - The real boundary: gVisor vs. Firecracker, costed against the actual target — per-BOARD
   micro-isolation plus networking, persistent storage and multiplayer (#70) together, not
   escape-resistance alone — applies to Shapes 1 and 3, structurally does not apply to Shape 2.
-  **Honest state after two rounds of adversarial review, including ADVERSARY walking their own
-  earlier lean back on the fuller picture: escape-resistance settles in Firecracker's favor on its
-  own terms (a difference in KIND — the untrusted workload never touches the host's own kernel — not
-  degree, and gVisor's userspace syscall reimplementation has real escape CVEs of its own), but the
-  full requirement set does NOT resolve cleanly, and this document should not claim more certainty
-  than that.** Networking and persistent storage scale LINEARLY with concurrent projects for
+  **Honest state after two more rounds of adversarial review, including ADVERSARY walking their own
+  earlier lean back on the fuller picture AND then pressure-testing their own "categorically
+  stronger" phrasing: escape-resistance settles in Firecracker's favor on its own terms (removes
+  gVisor's specific syscall-emulation attack surface, which has real escape CVEs of its own) —
+  qualified three ways, not unqualified (§ above): Kata vs. raw Firecracker are different TCBs; KVM
+  itself is a smaller, more scrutinized, not-risk-free attack surface, not "solved"; and neither
+  option addresses CPU-level side-channel attacks without separately budgeted core-pinning/SMT
+  isolation. The full requirement set does NOT resolve cleanly either, and this document should not
+  claim more certainty than either finding supports.** Networking and persistent storage scale LINEARLY with concurrent projects for
   Firecracker (real per-VM infrastructure) and are free for gVisor (inherited from the container);
   whether project-level idle-parking is needed at real scale — which would make Firecracker's boot
   cost a per-resume tax rather than a one-time cost — is not decided; and the published ~5MB
