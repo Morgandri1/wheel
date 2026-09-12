@@ -61,6 +61,10 @@ export default defineConfig({
         // Which ids may become an API path, and where sign-in may send you: both silent when wrong.
         "src/lib/api-paths.ts",
         "src/lib/next-path.ts",
+        // Which controls a member is offered. Not a boundary — the API decides — but a wrong
+        // branch here offers a guest a button that 403s, or hides one an admin needs, and both
+        // read as the product being broken.
+        "src/lib/tiers.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },

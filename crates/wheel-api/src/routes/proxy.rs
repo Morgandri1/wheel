@@ -460,11 +460,13 @@ async fn pump(
     let mut why: &'static str = "peer closed";
 
     loop {
+        // Deliberately NOT `biased`. Biasing the ending conditions ahead of the traffic arms reads
+        // as the safer order, but it means a branch that is always ready — `access.recv()` under a
+        // burst of membership changes — starves the relay entirely. Random selection cannot starve
+        // anything, and what it costs is at most one more frame of a read-only push stream reaching
+        // someone whose access ended microseconds ago. That is a worse trade in a comment than it is
+        // in practice.
         tokio::select! {
-            // Biased so that ending conditions are seen before more traffic is relayed: a revoked
-            // member must not receive one more frame because their socket happened to be busy.
-            biased;
-
             _ = &mut deadline => {
                 why = "lifetime cap reached";
                 break;
