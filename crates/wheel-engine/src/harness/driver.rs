@@ -91,6 +91,30 @@ pub trait DriverSession: Send {
 
     /// The next event. Once this returns `Exited`, it must not be called
     /// again.
+    ///
+    /// # Cancellation safety (ADVERSARY, design review of the PR2 supervisor
+    /// wire-in, `docs/proposals/harness-driver-contract.md` §9.2)
+    ///
+    /// The future this returns MUST be cancellation-safe: dropping it before
+    /// it resolves (as `tokio::select!` does to the losing branch every time
+    /// it races this against something else — which is exactly how PR2's
+    /// single-owner-task pattern selects between `next_event()` and an
+    /// incoming `send_turn`/`interrupt` command) must not lose any bytes the
+    /// child already wrote. Any partial-frame state a driver is mid-parsing
+    /// when cancelled has to survive in `&mut self` (a struct field), not
+    /// live only in the future's own stack -- `ClaudeSession` already
+    /// satisfies this today (the buffer lives in `self.stdout_lines: Lines
+    /// <BufReader<..>>`, so a dropped `next_event()` call loses nothing:
+    /// the next call resumes reading from exactly where the last one left
+    /// off), but this is NOT free for every protocol shape by default. A
+    /// JSON-RPC driver correlating request ids and holding a pending
+    /// approval reply in flight is exactly the kind of stateful client that
+    /// can get this wrong if the parsing loop keeps its progress in local
+    /// variables inside the async fn body instead of `self`. Every
+    /// `HarnessDriver` implementation's own test module must include a
+    /// cancellation-safety proof (poll `next_event()` partway via
+    /// `futures::poll!` or an equivalent, drop it, call it again, assert no
+    /// bytes were lost) before PR2 drives it through `select!`.
     fn next_event(&mut self) -> BoxFuture<'_, DriverEvent>;
 }
 
