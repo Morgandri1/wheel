@@ -684,6 +684,7 @@ mod tests {
                 n.id,
                 "work".into(),
                 None,
+                None,
             )
             .unwrap();
             conn.execute(

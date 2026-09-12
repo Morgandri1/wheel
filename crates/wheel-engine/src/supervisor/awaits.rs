@@ -371,6 +371,7 @@ mod tests {
             delivered_at: None,
             consumed_at: None,
             last_error: None,
+            on_behalf_of: None,
         };
         let env = msg.envelope();
         assert_eq!(

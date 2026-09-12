@@ -957,7 +957,7 @@ mod parity_tests {
 
     fn delivered(c: &Connection) -> (Uuid, Uuid) {
         let to = agent(c, "worker");
-        let m = enqueue(c, MessageSender::User, to, "x".into(), None).unwrap();
+        let m = enqueue(c, MessageSender::User, to, "x".into(), None, None).unwrap();
         advance(c, m.id, MessageState::Delivered).unwrap();
         (to, m.id)
     }
@@ -1045,7 +1045,7 @@ mod parity_tests {
     fn a_settlement_is_pending_until_the_turn_ends() {
         let c = mem();
         let to = agent(&c, "worker");
-        let m = enqueue(&c, MessageSender::User, to, "x".into(), None).unwrap();
+        let m = enqueue(&c, MessageSender::User, to, "x".into(), None, None).unwrap();
         let s = settlement(&c, m.id).unwrap().unwrap();
         assert!(!s.is_terminal());
         assert_eq!(s.outcome(), "pending");
@@ -1062,12 +1062,13 @@ mod parity_tests {
         let c = mem();
         let to = agent(&c, "worker");
         let peer = agent(&c, "peer");
-        let from_user = enqueue(&c, MessageSender::User, to, "x".into(), None).unwrap();
+        let from_user = enqueue(&c, MessageSender::User, to, "x".into(), None, None).unwrap();
         let from_peer = enqueue(
             &c,
             sender_for(&c, peer).unwrap().unwrap(),
             to,
             "y".into(),
+            None,
             None,
         )
         .unwrap();

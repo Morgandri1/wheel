@@ -2607,6 +2607,7 @@ fn notify_sender(conn: &rusqlite::Connection, bus: &crate::events::Bus, mid: Uui
         sender,
         body,
         Some(mid),
+        None,
     )
     .ok()?;
     bus.publish(wheel_core::Event::Message { message: note });

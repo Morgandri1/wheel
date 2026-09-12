@@ -234,16 +234,17 @@ impl ProjectScope {
     /// path: the operator MCP server names a project in each tool call.
     ///
     /// Same predicate, same `NotFound`, deliberately routed through the same
-    /// `load_owned` — this is a second CALLER, never a second rule.
+    /// `load_member` — this is a second CALLER, never a second rule.
     pub(crate) async fn for_target(
         state: &AppState,
         user: &AuthUser,
         id: Uuid,
     ) -> Result<Self, ApiError> {
-        let project = load_owned(state, &id, user.id()).await?;
+        let (project, tier) = load_member(state, &id, user.id()).await?;
         Ok(ProjectScope {
             user: user.clone(),
             project,
+            tier,
         })
     }
 }

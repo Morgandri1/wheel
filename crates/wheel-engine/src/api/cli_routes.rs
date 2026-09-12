@@ -1685,13 +1685,16 @@ mod usage_tests {
                 to: "peer".into(),
                 body: "hello".into(),
                 reply_to: None,
+                await_secs: None,
+                notify: false,
             }),
         )
         .await
         .expect("the send is accepted");
 
+        let receipt_id: uuid::Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
         let conn = state.db.lock().unwrap();
-        let stored = crate::db::messages::get(&conn, receipt.id)
+        let stored = crate::db::messages::get(&conn, receipt_id)
             .unwrap()
             .expect("the row exists");
         assert_eq!(

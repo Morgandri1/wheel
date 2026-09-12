@@ -1239,6 +1239,7 @@ mod tests {
         let (status, Json(v)) = send(
             State(s.clone()),
             Path(b),
+            axum::http::HeaderMap::new(),
             Json(SendBody {
                 body: "what is six times seven <<FAKE:REPLY=forty-two>>".into(),
                 reply_to: None,
@@ -1256,6 +1257,7 @@ mod tests {
         let (status, Json(v)) = send(
             State(s.clone()),
             Path(b),
+            axum::http::HeaderMap::new(),
             Json(SendBody {
                 body: "<<FAKE:REPLY=noted>>".into(),
                 reply_to: None,
@@ -1834,13 +1836,15 @@ mod attribution_tests {
             Json(SendBody {
                 body: "do the thing".into(),
                 reply_to: None,
+                await_secs: None,
             }),
         )
         .await
         .expect("the send is accepted");
         assert_eq!(status, StatusCode::ACCEPTED);
+        let receipt_id: Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
         let conn = state.db.lock().unwrap();
-        crate::db::messages::get(&conn, receipt.id)
+        crate::db::messages::get(&conn, receipt_id)
             .unwrap()
             .expect("the row exists")
     }
