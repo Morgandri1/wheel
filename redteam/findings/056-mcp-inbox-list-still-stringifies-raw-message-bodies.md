@@ -1,5 +1,20 @@
 # 056 — A bare `wheel inbox` over MCP still shows raw, unescaped message bodies in the list view
 
+**Correction (2026-09-12, SDK):** this finding's own claim that the single-message CLI path
+(`wheel inbox <id>`, not over MCP) is unaffected was wrong for the plain-CLI text it prints, though
+right for MCP. `wheel-cli`'s `inbox_single_text` originally read the wrapped `value` field as this
+finding describes below — that broke §3c#3's tested contract ("`wheel inbox <id>` returns the
+original"), caught by QA's `MSG-inbox-reread` fixture test in CI (a 200 KiB byte-exactness fixture came
+back 41 bytes longer than what was sent). Fixed by reverting `inbox_single_text` to print
+`message.body` (raw, byte-exact) again. That reopens the same class of exposure this finding already
+tracks — a model reading raw board content through its own tool use — for one more channel: an agent
+that reads a specific message by id through its own **Bash** tool (not MCP's `inbox` tool, which still
+correctly uses the top-level `value` field and is unaffected by this correction) now sees the forged tag
+live, same as the list path below. Severity stays Low for the same reasons (bounded 256 KiB body,
+requires a `send`-wired peer already inside finding 001's threat model) plus the fact that reading a
+message by a SPECIFIC id via Bash is a narrower, more deliberate action than the list call this finding
+is about.
+
 - **Severity:** Low (narrow, and the single-message path this same PR fixed already closes the
   higher-value case)
 - **Type:** Residual left open by defect #2's implementation (PR #88, ADVERSARY review), not a new

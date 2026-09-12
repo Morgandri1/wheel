@@ -3112,11 +3112,8 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
- "tokio",
  "ureq",
- "uuid",
  "wheel-core",
- "wheel-engine",
 ]
 
 [[package]]
