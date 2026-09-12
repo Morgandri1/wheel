@@ -984,8 +984,14 @@ impl Supervisor {
     /// leave the board exactly as it found it. `shutdown` never calls this —
     /// there, the flag is terminal.
     pub async fn resume_turns(self: &Arc<Self>) {
+        // Only whoever set the pause may lift it. A SIGTERM arriving while an update was waiting
+        // takes the gate over (`shutdown` clears this flag as it sets `closing`), and an abort
+        // landing after that must not re-open it: the turn it would let start is one the shutdown
+        // in progress would then have to interrupt.
+        if !self.paused_for_update.swap(false, Ordering::SeqCst) {
+            return;
+        }
         self.closing.store(false, Ordering::SeqCst);
-        self.paused_for_update.store(false, Ordering::SeqCst);
         let waiting = {
             let conn = self.db.lock().unwrap();
             messages::recipients_with_queued(&conn).unwrap_or_default()
@@ -1307,6 +1313,9 @@ impl Supervisor {
     /// the grace period. Each agent is left `parked`, not `stopped`: its session is kept, and the
     /// first message after a restart resumes it.
     pub async fn shutdown(&self) {
+        // Takes the gate over from any update that was waiting on it, so a concurrent abort
+        // cannot re-open what this is closing for good.
+        self.paused_for_update.store(false, Ordering::SeqCst);
         self.closing.store(true, Ordering::SeqCst);
         let drain = std::time::Duration::from_millis(self.shutdown_drain_ms.load(Ordering::SeqCst));
         let drain_until = tokio::time::Instant::now() + drain;
@@ -5028,6 +5037,29 @@ done
         })
         .await;
         sup.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A SIGTERM during an update takes the gate over for good. Without this, an update whose
+    /// wait ran out could lift a pause a shutdown had already turned into a closure, and the turn
+    /// that started in the gap is one the shutdown would have to interrupt — the exact outcome the
+    /// whole feature exists to avoid.
+    #[tokio::test]
+    async fn an_aborted_update_cannot_reopen_a_gate_a_shutdown_has_closed() {
+        let (sup, id, dir) = shim_supervisor("abortrace", ECHO_HARNESS);
+        sup.pause_turns();
+        sup.shutdown().await;
+
+        sup.resume_turns().await;
+
+        assert!(
+            sup.turns_paused(),
+            "an abort lifted a pause the shutdown owns"
+        );
+        assert!(
+            sup.start(id).await.is_err(),
+            "an agent started after shutdown, because the gate was re-opened"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

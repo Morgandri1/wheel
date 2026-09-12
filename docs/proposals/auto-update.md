@@ -188,7 +188,13 @@ pointer, so §3e's grammar stays available (R3).
   and tells the requester. A bad SHA is never retried automatically and never prompted again. A *newer*
   SHA is still eligible.
 - **Crash before health**: the next boot finds the marker with `attempts ≥ 1` and does the same before
-  anything else runs.
+  anything else runs. "Before anything else" is meant literally: the decision is made on the way into
+  `cli_main`, before the tokio runtime is built and before the data directory, the API's
+  configuration or its migrations are touched — each of which can fail on a bad build, and none of
+  which could then reach a rollback. The residual is a build that crashes in argument parsing itself,
+  which the smoke test (`wheeld --version` on the new binary) already exercises before any swap; past
+  that, systemd's `StartLimitBurst` stops the flapping and `install.sh --rollback` is the operator's
+  recovery.
 - **Circuit breaker**: three failed attempts (any SHA) in 24 h suspend `auto` and agent requests until the
   operator runs `wheeld update`.
 
@@ -237,30 +243,64 @@ wait, so it never does.**
 `resume_turns` is the only thing that clears `closing`, and only on the abort path — `shutdown` keeps it
 terminal.
 
-### The operator's live box runs compose, and compose cannot self-update today
+### The target shape is native systemd, and the seam with `api/wheeld-production`
 
-The board being handed this feature is at `/opt/wheel-compose` (tunnel mode, wheeld on loopback). In that
-shape wheeld runs in a container from `docker/Dockerfile.wheeld`, and **it cannot replace its own binary**:
+Native `wheeld` under systemd is the default production shape going forward, with Docker demoted.
+That is the shape this lane builds for, and it is the one `infra/vps/install.sh --updatable` already
+creates: `/opt/wheel/src` (checkout), `/opt/wheel/bin` (binaries), `/var/cache/wheel/update`
+(staging, off the data directory).
 
-- `USER 10001`, while `/usr/local/bin/wheeld` and `/usr/local/bin/wheel` are root-owned.
-- Only `/data` is a volume. A binary swapped anywhere else would not survive `docker compose up --build`,
-  which is what `infra/vps/deploy.sh` runs.
+**The split with `api/wheeld-production` (PR #67), agreed with that lane:**
 
-So on the compose path v1 **refuses to start the updater** rather than half-working: `WHEEL_UPDATE_BIN_DIR`
-must contain `wheeld` and `wheel` and must not be writable by other users, and a container that cannot meet
-that fails boot with a message naming the variable. That is the honest answer, and it is the same posture
-`WHEEL_TOOL_ALLOW_HOST` takes in production.
+| | `api/wheeld-production` | this lane |
+|---|---|---|
+| Owns | the **operator-initiated** lifecycle: first install, a deliberate `--ref` upgrade, and rolling that back. Runs as root, from outside the daemon. | the **daemon-initiated** lifecycle: noticing `main` moved, the CI gate, the drain, the swap, the health check and the rollback. |
+| Files | `infra/vps/**`, `docs/proposals/wheeld-native-production.md` | `crates/**`, `docs/proposals/auto-update.md` |
 
-Two ways to give that box self-update, for the infra owner to choose (**R8**) — both are `infra/` and
-`docker/` changes, which this lane does not own and has not made:
+No file is touched by both. The seam is a filesystem and process contract, and both sides now pin it
+with tests:
 
-1. **Systemd, no Docker** — `infra/vps/install.sh --updatable` already creates exactly the layout v1 wants.
-   This is the shortest path to a self-updating box and needs no new code at all.
-2. **Keep compose, add a bin volume** — mount a `wheel-bin` volume at `/opt/wheel/bin`, seed it from the
-   image on first boot, point the entrypoint at it, and mount the host checkout read-write. Then the same
-   source driver works in the container, which already ships git, cargo and rustc for Wheel-on-Wheel agents.
-   A later `docker compose up --build` supersedes a self-applied update with a build of main, which is the
-   safe direction, but it must be understood rather than discovered.
+- `/opt/wheel/src`, `/opt/wheel/bin`, `/var/cache/wheel/update`, and the `WHEEL_UPDATE_*` names.
+- **`.prev` is one artefact with one meaning**, written the same way by both: `.new`, hard-link the
+  current generation to `.prev`, `rename(2)` over. (That lane's `install.sh` used to `mv -f` and keep
+  no `.prev`, which silently destroyed this lane's rollback point; it adopts the swap shape above.)
+- **Exit 75** restarts the unit (`Restart=on-failure`, no `SuccessExitStatus=`).
+- **Neither lane writes `WHEEL_AUTO_UPDATE`.** It is the operator's, in `wheeld.local.env`, off
+  unless set.
+- `StartLimitIntervalSec=300` / `StartLimitBurst=10` is a **shared constant**. One update attempt
+  costs at most two restarts (install, and a rollback if the health check fails), or three in the
+  crash case; `WHEEL_UPDATE_COOLDOWN_SECS` (default 600) bounds attempts to one per ten minutes for
+  `auto` and agent requests. So a legitimate sequence cannot approach ten restarts in five minutes,
+  and the limit does its intended job of catching a crashloop.
+
+**Docker/compose is refused rather than half-supported.** In `docker/Dockerfile.wheeld` the daemon
+runs `USER 10001` while `/usr/local/bin/wheeld` is root-owned, so it cannot replace its own binary,
+and only `/data` is a volume so a swap elsewhere would not survive `docker compose up --build`. v1
+therefore fails boot there with a message naming the variable (`WHEEL_UPDATE_BIN_DIR` must contain
+both binaries and not be writable by other users) instead of appearing to work. Giving the compose
+path self-update needs a bin volume and an entrypoint change — an `infra/`/`docker/` decision, not
+this lane's (**R8**).
+
+### A live credential refresh, and why quiescence is what protects it
+
+Self-hosted deployments authenticate the harness with **OAuth plus refresh, not API keys**. The
+refreshed credential is written by the harness child itself, into the node's own config dir, and it
+happens **during a turn** — that is when the harness is making requests.
+
+So the protection is not a lock, it is the wait:
+
+- An update proceeds only when **no agent is mid-turn**, so there is no turn in which a refresh
+  could be in flight. A plain `systemctl restart` has no such guarantee; this is a property an
+  update has and a restart does not.
+- Nothing in the update path reads, writes, moves or revokes a harness credential. The swap touches
+  `WHEEL_UPDATE_BIN_DIR` only; credentials live under the data directory and are never staged,
+  archived or rolled back.
+- `git archive` builds from the target commit's tree alone, so no file from the checkout — and
+  nothing from any credential store — reaches the build.
+- Sessions survive: #63's shutdown leaves every agent **parked** with its `session_id`, and boot
+  resumes it, so an agent authenticates after an update exactly as it did before one.
+
+A test asserts the stored credential is byte-identical across a pause that waits out a turn.
 
 ### Also out of scope for v1
 

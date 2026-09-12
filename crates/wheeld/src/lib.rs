@@ -26,12 +26,20 @@ use std::sync::Arc;
 /// can provision anything, and the API must know the host's address, which is only assigned once
 /// its listener is bound. So the host listener comes first, then the environment the API reads.
 pub async fn run(settings: Settings) -> Result<()> {
+    run_with_updates(settings, None).await
+}
+
+/// As [`run`], with the update lane already settled by [`cli_main`].
+///
+/// The lane is built BEFORE the runtime, not here: see `cli_main` for why a rollback that waited
+/// until this function could not undo a binary that crashes on its way to it.
+pub async fn run_with_updates(
+    settings: Settings,
+    lane: Option<Arc<update::Lane>>,
+) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
-    // Before anything serves: a build installed by the last update either proves itself here or is
-    // rolled back before it can touch a board (docs/proposals/auto-update.md).
-    let lane = update::Lane::start(&data_dir)?.map(Arc::new);
     let host = start_host(&data_dir, &keys, lane.as_ref().map(|l| l.hook())).await?;
 
     // An update that has passed every gate and waited for the board to go quiet arrives here. The
@@ -125,11 +133,24 @@ where
     if matches!(action, config::Action::Run(_)) {
         init_tracing();
     }
+    // Settled before the runtime exists, and before anything else can fail. A build the last
+    // update installed that never proved healthy is rolled back HERE, so the window in which a
+    // broken binary cannot undo itself is only argument parsing and this call — not the tokio
+    // runtime, the data directory, the API's configuration or its migrations, every one of which
+    // can fail on a bad build and none of which could then reach a rollback
+    // (docs/proposals/auto-update.md, "Rollback").
+    let lane = match &action {
+        config::Action::Run(settings) => {
+            let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
+            update::Lane::start(&data_dir)?.map(Arc::new)
+        }
+        _ => None,
+    };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(dispatch(action))
+        .block_on(dispatch_with(action, lane))
 }
 
 fn init_tracing() {
@@ -146,6 +167,14 @@ fn init_tracing() {
 /// Here rather than in `main` so it can be tested: `--help` and `--version` must print and exit
 /// cleanly, and neither may start a server or touch a data directory as a side effect.
 pub async fn dispatch(action: config::Action) -> Result<()> {
+    dispatch_with(action, None).await
+}
+
+/// [`dispatch`], carrying the update lane `cli_main` already settled.
+pub async fn dispatch_with(
+    action: config::Action,
+    lane: Option<Arc<update::Lane>>,
+) -> Result<()> {
     match action {
         config::Action::PrintUsage => {
             print!("{}", config::USAGE);
@@ -161,7 +190,7 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
             );
             Ok(())
         }
-        config::Action::Run(settings) => run(settings).await,
+        config::Action::Run(settings) => run_with_updates(settings, lane).await,
         config::Action::Update {
             data_dir,
             status_only,

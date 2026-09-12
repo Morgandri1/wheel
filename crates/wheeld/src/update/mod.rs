@@ -890,8 +890,17 @@ impl Lane {
         );
         let updater = Updater::new(policy, running, driver, ci, store, Arc::new(SystemClock));
 
+        // Acted on, not merely computed: a rollback that restored the previous binaries and then let
+        // THIS process carry on serving would leave the running code and the installed code
+        // disagreeing until something else restarted it. `restart_process` does not return.
+        let action = updater.settle_boot()?;
+        if action == BootAction::Restart {
+            tracing::error!("rolled back to the previous build; restarting onto it");
+            restart_process(restart, &bin_dir);
+        }
+
         let lane = Lane {
-            probation: matches!(updater.settle_boot()?, BootAction::Probation),
+            probation: action == BootAction::Probation,
             updater,
             registry: Arc::new(Registry::default()),
             restart,
