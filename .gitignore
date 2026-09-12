@@ -15,10 +15,15 @@ qa/.artifacts/
 __pycache__/
 .pytest_cache/
 
-# Test-only RSA key fixture is intentionally committed (see crates/wheel-api/tests/support.rs);
-# it signs nothing real. Everything else key-shaped stays out.
+# Test-only key fixtures are intentionally committed (see crates/wheel-api/tests/support.rs); they
+# sign nothing real and guard nothing. Everything else key-shaped stays out.
+#
+# The exception is per-directory rather than per-file: naming each fixture individually is a list
+# somebody has to remember to extend, and forgetting is silent locally — the file exists on the
+# machine that made it, so only CI ever sees the `include_str!` fail. That is exactly how the
+# Ed25519 fixture reached a green local build and a red CI.
 *.pem
-!crates/wheel-api/tests/fixtures/test_rsa_key.pem
+!crates/wheel-api/tests/fixtures/*.pem
 
 # PM hand-off copies, not part of the tree
 /external.rs
