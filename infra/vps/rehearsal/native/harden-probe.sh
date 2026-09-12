@@ -28,6 +28,13 @@
 # "I could not check" must never read as "the check passed".
 set -uo pipefail
 
+# By default a SKIP makes this exit non-zero, because a check that could not run must never read as
+# a check that passed. --allow-skips is for the one caller that legitimately causes its own skips:
+# rehearse-native.sh --only harden, the fast standalone path, where no Rust toolchain has been
+# installed. It never applies to a full rehearsal, where install.sh has put a real one on the box.
+allow_skips=0
+[ "${1:-}" != "--allow-skips" ] || allow_skips=1
+
 here="$(cd "$(dirname "$0")" && pwd)"
 vps="$(cd "$here/../.." && pwd)"
 unit="$vps/systemd/wheeld.service"
@@ -341,4 +348,9 @@ fi
 
 echo
 echo "harden-probe: $pass passed, $fail failed, $skip skipped"
-[ "$fail" = 0 ] && [ "$skip" = 0 ]
+[ "$fail" = 0 ] || exit 1
+[ "$skip" = 0 ] || [ "$allow_skips" = 1 ] || {
+    echo "harden-probe: $skip check(s) could not run, and a check that could not run is not a check that passed. Install what they need, or pass --allow-skips if you are deliberately running the reduced set." >&2
+    exit 1
+}
+exit 0

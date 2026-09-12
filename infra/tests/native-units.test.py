@@ -258,6 +258,20 @@ check(any("wheeld.local.env" in v for v in gate.get("EnvironmentFile", [])),
       "the operator's override is read second by wheeld and would be invisible to the gate, so an "
       "operator who opened signup would get a gate that disagrees with the daemon")
 
+# ---------------------------------------------------------------- systemd does NOT expand Environment=
+#
+# `Environment=FOO=http://${BAR}` is passed through LITERALLY -- systemd performs variable
+# expansion in ExecStart= and friends, not in Environment= values. It reads like it would work,
+# which is why it shipped: the signup gate ended up probing a host named "${BIND_ADDR}", curl
+# answered "URL rejected: Bad hostname", and because wheel-web Requires= the gate the board would
+# not start at all. Caught by the install rehearsal; pinned here so it costs milliseconds next time.
+for unit_name, parsed in (("wheeld.service", wheeld), ("wheel-web.service", web),
+                          ("wheel-signup-gate.service", gate)):
+    for value in parsed.get("Environment", []):
+        check("${" not in value, f"{unit_name} Environment= has no ${{...}} to expand",
+              f"systemd passes Environment= values through verbatim, so {value!r} reaches the "
+              "process with the braces intact rather than the variable's value")
+
 # ---------------------------------------------------------------- wheel-web is the tight one
 check("SystemCallFilter" in web, "wheel-web HAS a SystemCallFilter",
       "it runs one known Node program that spawns nothing, so the filter wheeld had to refuse is "

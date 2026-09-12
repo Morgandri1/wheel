@@ -43,13 +43,15 @@ DynamicUser=yes
 # exists to check. Same files, same order, so the resolution is identical by construction.
 EnvironmentFile=/etc/wheel/wheeld.env
 EnvironmentFile=-/etc/wheel/wheeld.local.env
-# Built from BIND_ADDR, which the EnvironmentFiles above supply, rather than hardcoded: wheeld's
-# --bind is interpolated from the same variable, so an operator who moves the port in
-# wheeld.local.env would otherwise have this gate probe a closed port, fail, and -- because
-# wheel-web Requires= it -- keep the board from ever starting. install.sh always writes
-# BIND_ADDR=127.0.0.1:8080, so the fallback is belt and braces.
-Environment=BIND_ADDR=127.0.0.1:8080
-Environment=WHEEL_GATE_BASE=http://${BIND_ADDR}
+# NO WHEEL_GATE_BASE HERE, deliberately. The obvious thing -- Environment=WHEEL_GATE_BASE=http://
+# ${BIND_ADDR} -- does not work: systemd does not expand variables inside Environment=, only in
+# ExecStart= and friends, so the gate probed a host literally named "${BIND_ADDR}" and curl said
+# "URL rejected: Bad hostname". The gate then blocked the board, correctly but for the wrong
+# reason. Caught by rehearse-native.sh's install phase; native-units.test.py now refuses any
+# Environment= value containing ${...} so it cannot come back.
+#
+# verify-signup-gate.sh derives the URL from BIND_ADDR itself, which the EnvironmentFiles above
+# supply -- the same single source of truth wheeld's --bind uses.
 ExecStart=/opt/wheel/libexec/verify-signup-gate.sh
 SyslogIdentifier=wheel-signup-gate
 

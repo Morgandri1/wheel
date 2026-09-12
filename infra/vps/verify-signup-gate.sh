@@ -53,7 +53,23 @@ set -eu
 # this really wheeld, and does it really enforce its own signup gate", exercised by both
 # deployments — so neither can drift into being the only tested one, which is exactly what happened
 # while the native check was a block of shell inside install.sh that ran once at install time.
-base="${WHEEL_GATE_BASE:-http://wheeld:8080}"
+# Resolution order, most explicit first. The native unit deliberately does NOT pass a URL: an
+# earlier version had `Environment=WHEEL_GATE_BASE=http://${BIND_ADDR}` in the unit file, and
+# systemd does NOT expand variables inside Environment= (only ExecStart= and friends get that), so
+# the gate probed the literal host `${BIND_ADDR}` and curl answered "URL rejected: Bad hostname".
+# The gate then correctly refused to let the board start -- a real failure, honestly reported, for
+# a reason that had nothing to do with signup. Deriving it here keeps one source of truth and takes
+# systemd's expansion rules out of the picture entirely.
+if [ -n "${WHEEL_GATE_BASE:-}" ]; then
+    base="$WHEEL_GATE_BASE"
+elif [ -n "${BIND_ADDR:-}" ]; then
+    # Always dial loopback, whatever wheeld was told to bind: an operator who set 0.0.0.0 still has
+    # a daemon reachable on 127.0.0.1, and this probe has no business leaving the machine.
+    base="http://127.0.0.1:${BIND_ADDR##*:}"
+else
+    # The Docker path: compose's service name, on its own network.
+    base="http://wheeld:8080"
+fi
 
 # Control: proves this really is wheeld, answering normally, before trusting anything it says
 # about signup specifically. /healthz needs no auth and no signup opinion; if THIS is not a plain

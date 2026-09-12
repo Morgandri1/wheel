@@ -15,11 +15,14 @@
 #
 # PHASES, fastest first, because only the first two are worth running often:
 #
-#   harden    the shipped unit's directives with a real agent workload under them (~2 min)
-#   oom       a runaway child in a too-small cgroup, with and without OOMPolicy=continue (~1 min)
 #   install   install.sh --no-proxy end to end. COMPILES THE RUST WORKSPACE AND THE BOARD, so on a
 #             laptop this is tens of minutes. It is the heaviest moment in a real server's life too
 #             (infra/vps/README.md says so), and rehearsing it is the point.
+#   harden    the shipped unit's directives with a real agent workload under them. Runs AFTER
+#             install in a full run, so the Rust toolchain the probe's heaviest tier needs is the
+#             one install.sh actually put there. `--only harden` runs it standalone in ~2 min and
+#             skips that tier, saying so.
+#   oom       a runaway child in a too-small cgroup, with and without OOMPolicy=continue (~1 min)
 #   serve     the guarantees, against what install.sh actually produced
 #   upgrade   an upgrade that fails its health check must roll back and still be serving
 #   migrate   a Docker volume's state arrives intact, and the volume is untouched
@@ -107,31 +110,6 @@ src=/root
 
 run_phase() { [ -z "$only" ] || [ "$only" = "$1" ]; }
 
-# ---------------------------------------------------------------- harden
-if run_phase harden; then
-    echo
-    echo "=== harden: the shipped unit's directives, with a real agent workload under them ==="
-    dex bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1
-        apt-get install -y -q --no-install-recommends util-linux iproute2 >/dev/null 2>&1
-        command -v node >/dev/null || { curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/ns.sh && bash /tmp/ns.sh >/dev/null 2>&1 && apt-get install -y -q nodejs >/dev/null 2>&1; }'
-    if dex "$src/infra/vps/rehearsal/native/harden-probe.sh"; then
-        record harden-probe 0
-    else
-        record harden-probe 1
-    fi
-fi
-
-# ---------------------------------------------------------------- oom
-if run_phase oom; then
-    echo
-    echo "=== oom: does a runaway agent kill the daemon, or does the daemon outlive the agent? ==="
-    if dex "$src/infra/vps/rehearsal/native/oom-containment.sh"; then
-        record oom-containment 0
-    else
-        record oom-containment 1
-    fi
-fi
-
 # ---------------------------------------------------------------- install
 installed=0
 if run_phase install; then
@@ -151,6 +129,38 @@ if run_phase install; then
         say FAIL install "install.sh failed; the checks below cannot run"
         record install 1
         keep=1
+    fi
+fi
+
+# ---------------------------------------------------------------- harden
+if run_phase harden; then
+    echo
+    echo "=== harden: the shipped unit's directives, with a real agent workload under them ==="
+    dex bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1
+        apt-get install -y -q --no-install-recommends util-linux iproute2 >/dev/null 2>&1
+        command -v node >/dev/null || { curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/ns.sh && bash /tmp/ns.sh >/dev/null 2>&1 && apt-get install -y -q nodejs >/dev/null 2>&1; }'
+    # --allow-skips ONLY on the standalone fast path. In a full run install.sh has already put a
+    # Rust toolchain on the box, so the probe's cargo tier is real and a skip there would be a gap
+    # worth failing on. Run with `--only harden` there is no toolchain, the skip is this runner's
+    # own doing, and failing on it would punish the user for taking the fast path -- so it is
+    # reported as a skip of the phase instead of a failure of the product.
+    allow=""
+    [ "$only" != harden ] || allow="--allow-skips"
+    if dex "$src/infra/vps/rehearsal/native/harden-probe.sh" $allow; then
+        record harden-probe 0
+    else
+        record harden-probe 1
+    fi
+fi
+
+# ---------------------------------------------------------------- oom
+if run_phase oom; then
+    echo
+    echo "=== oom: does a runaway agent kill the daemon, or does the daemon outlive the agent? ==="
+    if dex "$src/infra/vps/rehearsal/native/oom-containment.sh"; then
+        record oom-containment 0
+    else
+        record oom-containment 1
     fi
 fi
 
