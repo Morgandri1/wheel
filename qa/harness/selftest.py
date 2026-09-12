@@ -337,6 +337,43 @@ def t_text_mode():
     check("text mode plain output", p.returncode == 0 and "hello there" in p.stdout)
     check("text mode emits no JSON", not p.stdout.strip().startswith("{"))
 
+def t_builder_board():
+    """`<<FAKE:BOARD>>` is the Workflow Builder's confirm turn: prose, then one markered board."""
+    p = run(["-p", "--input-format", "text", "--output-format", "text"], "design it <<FAKE:BOARD>>")
+    out = p.stdout
+    check("board: exits 0", p.returncode == 0, p.stderr[:200])
+    check("board: exactly one START and one END",
+          out.count("---START-WORKFLOW---") == 1 and out.count("---END-WORKFLOW---") == 1, out[:300])
+    body = out.split("---START-WORKFLOW---", 1)[-1].split("---END-WORKFLOW---", 1)[0]
+    try:
+        board = json.loads(body)
+    except ValueError as e:
+        board = None
+        check("board: the block is JSON", False, repr(e))
+    if board is not None:
+        wires = [w for n in board["nodes"] for w in n.get("wires", [])]
+        ids = {n["id"] for n in board["nodes"]}
+        check("board: wires are nested on nodes and addressed by id",
+              wires and all(w["to"] in ids for w in wires))
+    check("board: the directive itself is not echoed", "<<FAKE" not in out)
+    p = run(["-p", "--output-format", "text"], "two please <<FAKE:BOARD=2>>")
+    check("board: BOARD=2 emits two blocks", p.stdout.count("---START-WORKFLOW---") == 2)
+
+def t_partial_messages():
+    args = ["-p", "--input-format", "text", "--output-format", "stream-json", "--verbose"]
+    p = run(args + ["--include-partial-messages", "--tools", ""], "stream me a long enough reply to chunk")
+    evs = events(p.stdout)
+    deltas = [e["event"]["delta"]["text"] for e in evs if e.get("type") == "stream_event"
+              and e["event"].get("type") == "content_block_delta"]
+    full = next((e for e in evs if e.get("type") == "assistant"), None)
+    text = "".join(b.get("text", "") for b in (full or {}).get("message", {}).get("content", []))
+    check("partial: deltas were emitted", len(deltas) > 1, str(len(deltas)))
+    check("partial: deltas concatenate to the assistant text", "".join(deltas) == text)
+    check("partial: the flag did not swallow the next argument", evs and evs[-1].get("type") == "result")
+    p = run(args, "no partials")
+    check("partial: none without the flag",
+          not any(e.get("type") == "stream_event" for e in events(p.stdout)))
+
 def t_codex():
     p = run(["exec", "--json"], '{"message":"hi codex"}\n', binary=CODEX)
     evs = events(p.stdout)
