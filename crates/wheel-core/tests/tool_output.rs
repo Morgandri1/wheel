@@ -144,7 +144,10 @@ fn map_json_strings_and_keys_transforms_keys_too() {
     assert_eq!(out["[status]"], 200, "numbers still pass through untouched");
     // The old top-level keys are gone -- they were transformed, not merely
     // also present alongside originals.
-    assert!(out.get("nested").is_none(), "the key itself must be mapped: {out}");
+    assert!(
+        out.get("nested").is_none(),
+        "the key itself must be mapped: {out}"
+    );
     assert_eq!(out["[nested]"]["[weird key]"], "[one]");
     assert_eq!(out["[nested]"]["[another]"][0], "[two]");
 }

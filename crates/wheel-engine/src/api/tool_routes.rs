@@ -419,8 +419,7 @@ pub async fn run_operation(
     // where keys are the node's own developer-chosen schema, not attacker
     // content -- this is deliberately the other function, not a change to
     // that one's contract.
-    let body =
-        wheel_core::map_json_strings_and_keys(&outcome.body, &wheel_core::wrap_tool_output);
+    let body = wheel_core::map_json_strings_and_keys(&outcome.body, &wheel_core::wrap_tool_output);
     let headers = wheel_core::map_json_strings_and_keys(
         &serde_json::Value::Object(outcome.headers),
         &wheel_core::wrap_tool_output,
