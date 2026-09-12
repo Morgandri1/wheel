@@ -13,6 +13,7 @@ import { useBoardStore } from "@/store/board";
 import { Canvas } from "@/components/board/canvas";
 import { Inspector } from "@/components/inspector";
 import { AgentDrawer } from "@/components/drawer/agent-drawer";
+import { BuilderSession } from "@/components/builder/builder-session";
 import { StatusBar } from "@/components/board/status-bar";
 import { Header } from "@/components/header";
 import { Button, Empty, Skeleton } from "@/components/ui";
@@ -74,7 +75,20 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
     });
   }, [projectId, running, applyEvents, refetchBoard, setConnection]);
 
-  const nodes = board.data?.nodes ?? [];
+  const nodes = useMemo(() => board.data?.nodes ?? [], [board.data]);
+  /**
+   * A new project lands in a conversation rather than an empty grid: an empty board is the moment
+   * someone most needs help, and the least useful thing to show them is a blank canvas. They can
+   * still dismiss it and place nodes by hand.
+   */
+  const [skipBuilder, setSkipBuilder] = useState(false);
+  const [improving, setImproving] = useState(false);
+  const builderForEmptyBoard = nodes.length === 0 && !skipBuilder;
+  // What the builder is shown and what an improve proposal is read against.
+  const known = useMemo(
+    () => nodes.map((n) => ({ id: n.id, name: n.name, type: n.type })),
+    [nodes],
+  );
 
   /** Agents worth stopping: anything holding a process. Parked and stopped already cost nothing. */
   const parkable = nodes.filter(
@@ -136,6 +150,15 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
               {/* The mockup's top-bar actions. Export is a real thing you can do with what the
                   board already returns; parking every agent at once is the one bulk action worth
                   having, because the reason you want it is a bill. */}
+              {nodes.length ? (
+                <Button
+                  size="sm"
+                  data-testid="btn-improve-with-builder"
+                  onClick={() => setImproving((open) => !open)}
+                >
+                  {improving ? "Close the builder" : "Improve with the builder"}
+                </Button>
+              ) : null}
               <Button
                 size="sm"
                 data-testid="btn-export-board"
@@ -212,7 +235,24 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
       ) : (
         <>
           <div className="flex min-h-0 flex-1">
-            <Canvas nodes={nodes} api={api} onChanged={refetchBoard} />
+            {builderForEmptyBoard ? (
+              <div className="flex min-h-0 flex-1 flex-col border-r border-rule">
+                <div className="flex items-center justify-between border-b border-rule px-4 py-2">
+                  <span className="text-meta text-ink">Let&apos;s build your workflow</span>
+                  <Button size="sm" tone="ghost" data-testid="btn-skip-builder" onClick={() => setSkipBuilder(true)}>
+                    Start with an empty board
+                  </Button>
+                </div>
+                <BuilderSession projectId={projectId} mode="new" known={known} onApplied={refetchBoard} />
+              </div>
+            ) : (
+              <Canvas nodes={nodes} api={api} onChanged={refetchBoard} />
+            )}
+            {improving && nodes.length ? (
+              <div className="flex w-[420px] min-h-0 shrink-0 flex-col border-l border-rule" data-testid="builder-improve">
+                <BuilderSession projectId={projectId} mode="improve" known={known} onApplied={refetchBoard} />
+              </div>
+            ) : null}
             <Inspector
               node={selected}
               nodes={nodes}

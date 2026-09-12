@@ -369,6 +369,30 @@ supports that has now been **verified: it does not**, by two mechanisms — see
 `infra/railway/README.md`. So `build` reading `"unknown"` in production is the honest end state
 rather than a gap awaiting a fix.
 
+### `POST /v1/projects/{id}/builder/turns` — the Workflow Builder, streamed
+
+Owner-scoped, like every project route. Forwards the conversation to the project's engine
+(`docs/PROTOCOL.md` §"Workflow Builder") and streams its Server-Sent Events back verbatim.
+
+```jsonc
+POST /v1/projects/{id}/builder/turns
+{ "mode": "new" | "improve",
+  "turns": [ {"role": "user"|"builder", "text": "…"} ],
+  "credential": {"source": "builder"} }        // or agent/vault, see PROTOCOL
+```
+
+A route of its own rather than the `/engine/{*rest}` wildcard for a measured reason: the shared
+upstream client carries a 30s whole-request timeout (`proxy_timeout_secs`), which would cut a turn
+off mid-answer. This route allows the turn the engine's own 240s ceiling plus the hops, so what a
+caller sees is the engine's `timeout` frame rather than a severed connection. `cache-control:
+no-transform` and `x-accel-buffering: no` travel with it so no hop buffers the stream into one late
+response.
+
+Frames are `delta`, then `done` or `error` — the engine's contract, passed through unchanged. A
+refusal that happens **before** the stream opens is ordinary JSON with its status (`409 needs_auth`
+carrying the credential sources, `403 policy`, `429 builder_busy`, `400`, `413`), because there is
+nothing to stream yet and the caller has to answer it.
+
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
 

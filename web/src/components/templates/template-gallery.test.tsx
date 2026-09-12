@@ -49,7 +49,7 @@ const created: InstantiateOutcome = {
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   },
-  report: { created_nodes: ["notes", "researcher"], patched_nodes: [], created_wires: [], failures: [] },
+  report: { created_nodes: ["notes", "researcher"], patched_nodes: [], created_wires: [], deleted_nodes: [], deleted_wires: [], failures: [] },
 };
 
 async function openFirstCard(loadTemplate: TemplateLoader, instantiate: TemplateInstantiator) {
@@ -137,7 +137,7 @@ describe("TemplateGallery — nothing exists until confirmed", () => {
     const rolledBack: InstantiateOutcome = {
       kind: "rolled_back",
       cleanedUp: true,
-      report: { created_nodes: ["notes"], patched_nodes: [], created_wires: [], failures: [{ step: "capabilities", error: "boom" }] },
+      report: { created_nodes: ["notes"], patched_nodes: [], created_wires: [], deleted_nodes: [], deleted_wires: [], failures: [{ step: "capabilities", error: "boom" }] },
     };
     await openFirstCard(loaderOf(file()), vi.fn(async () => rolledBack));
     fireEvent.click(screen.getByTestId("btn-use-template"));
@@ -153,7 +153,7 @@ describe("TemplateGallery — nothing exists until confirmed", () => {
       kind: "rolled_back",
       cleanedUp: false,
       projectId: "p9",
-      report: { created_nodes: [], patched_nodes: [], created_wires: [], failures: [] },
+      report: { created_nodes: [], patched_nodes: [], created_wires: [], deleted_nodes: [], deleted_wires: [], failures: [] },
     };
     await openFirstCard(loaderOf(file()), vi.fn(async () => failedRollback));
     fireEvent.click(screen.getByTestId("btn-use-template"));

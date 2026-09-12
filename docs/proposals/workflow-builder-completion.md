@@ -379,30 +379,43 @@ Residuals, stated so nobody reads a stronger claim into this:
 - **Not atomic.** The engine-side batch route is still the only true atomicity. This change
   makes the destructive half conditional, so a partial apply cannot also destroy.
 
-## 5. The web runner, and the server-side branch
+## 5. The web runner (built against the merged server-side app)
 
-- **New modules, leaving `api.ts`/`events.ts`/`local-auth.ts` mostly untouched:**
-  - `src/lib/builder-stream.ts`: a pure SSE frame parser plus classification of pre-stream error
-    bodies. It encodes rules, so it is in the vitest coverage include.
-  - `src/lib/builder-client.ts`: transport, `makeBuilderRunner`, and the builder credential
-    calls. **This one function is the only thing that changes when the server-side branch
-    lands.** Today it sends `x-auth-token` to `${apiBaseUrl()}`; after, it sends a same-origin
-    `/api/wheel/v1/projects/{id}/builder/turns` with the session cookie.
-  - `src/components/builder/builder-session.tsx`: the runner, credential handling and mode.
-- **`api.ts` changes by one parameter.** `applyBoard` takes the grants and `expect_plan`.
-- **Mounting:**
-  - A running project with an **empty** board shows the builder conversation instead of the
-    empty grid, with a "start with an empty board" escape.
-  - A populated board gets **Improve with the builder**, which opens the same session in improve
-    mode.
-  - Creating a project now navigates to its board.
-- **Depends on `web/server-side-api`** (not pushed at the time of writing, checked with
-  `git fetch`):
-  - The Next `/api/wheel/[...path]` proxy must **stream** `text/event-stream` bodies. It must not
-    buffer them, and must not apply a short total timeout: builder turns run up to 240s.
-  - Both `builder-client.ts` and `applyBoard` switch to the cookie transport.
+PR #62 landed while this was being built: **the browser never calls the API.** Every request goes
+through a Next route handler on this origin, the session is an httpOnly cookie, the address is
+`WHEEL_API_URL` (server-side only), and the proxy carries a positive route allowlist, a JSON
+content-type requirement, body caps and a per-session SSE cap. A client that talked to the API
+directly would simply be refused — so the builder's conversation is a **server-side route**, like
+everything else.
 
-  I will rebase onto that branch when it is pushed; until then the transport is one function.
+- **`POST /api/wheel/projects/:id/builder`** (`src/app/api/wheel/projects/[id]/builder/route.ts`,
+  logic in `src/lib/builder-relay.ts`). It mirrors the events relay: refuse cross-origin, resolve
+  the session server-side, size-check the body, then stream the API's SSE back.
+  - Its own route rather than the generic `/api/wheel/v1/...` proxy for two reasons that proxy
+    cannot give it: a turn streams for as long as the model takes (the engine caps it at 240s,
+    well past the proxy's shared timeout), and a held-open stream is a resource to bound. It takes
+    a `StreamSlots` permit — **2 per session**, fewer than the board-event cap, because a builder
+    turn costs money and a person is not having four at once.
+  - **Pull-based**, so the reader's backpressure reaches the API and the slot is released when the
+    browser is done rather than when the upstream happened to finish.
+- **The builder's credential** needs no new route: `GET`/`PUT`/`DELETE` on
+  `/api/wheel/v1/projects/:id/engine/v1/builder/credential` is already on the proxy's allowlist
+  under its `engine/v1/*` rule. Paths are built by `projectPath`, which encodes each segment; a
+  UUID encodes to itself, so nothing arrives pre-encoded for the traversal hotfix to refuse. A
+  test pins that the built path contains no `%`.
+- **New client modules**, leaving `api.ts`, `events.ts` and `local-auth.ts` essentially untouched:
+  - `src/lib/builder-stream.ts` — the SSE grammar and refusal reading, pure and covered.
+  - `src/lib/builder-client.ts` — the transport, and the builder-credential calls.
+  - `src/components/builder/builder-session.tsx` — the panel plus the one question the panel
+    cannot answer: which credential this project's builder runs on.
+  - `api.ts` changes by one optional parameter: `applyBoard` carries the consents and the plan
+    digest.
+- **Mounting.** A running project with an empty board opens the conversation instead of an empty
+  grid (with "start with an empty board" to leave it); a populated board gets **Improve with the
+  builder**, which opens the same session in improve mode beside the canvas; creating a project
+  now lands on its board rather than the list.
+
+Nothing here depends on an unmerged branch any more.
 
 ## 6. RULINGS requested
 
