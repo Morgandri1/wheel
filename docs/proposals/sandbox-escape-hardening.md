@@ -313,6 +313,18 @@ have suggested — because the two pieces of work were never actually independen
   `DockerSandbox` already does today for the cloud deployment — a per-project uid becomes
   defense-in-depth on top of an already-isolated boundary, not the load-bearing mechanism. Cheap to
   add given the primitive already exists and is tested; not the critical path either way.
+  **Hard boundary on this claim, so it does not read as more solved than it is (ADVERSARY): this is
+  "per-PROJECT uid differentiation becomes redundant [confirmed, for cross-project separation
+  specifically]," not "uid-based isolation is no longer needed anywhere."** Once a project has its own
+  container/VM, that sandbox still runs MULTIPLE agents/nodes inside it — the new outer boundary does
+  nothing for the layer BETWEEN nodes in the same project, same reason Shape 1's hardening today does
+  nothing for cross-project reach (same shared boundary, different scope, argued twice now for two
+  different pairs). Without per-NODE differentiation inside that now-isolated project, F007's exact
+  problem just moves down one level: "any agent in any project reads any other project's vault secret"
+  (today) becomes "any agent within one project reads any sibling agent's vault secret, inside that
+  project's isolated sandbox." Per-node isolation is Morgan's own already-deprioritized F007, not
+  automatically answered by this convergence — this document does not change that ranking, only notes
+  that the redundancy claim above is scoped to cross-project separation and should not be read wider.
 - **The cleanest shape this convergence can take: `wheeld` stops being a distinct architecture from
   `wheel-host` and becomes a THIN configuration of it.** `wheeld` already proxies each project over
   its own unix socket, the exact pattern `wheel-host` uses (`crates/wheeld/src/embedded.rs`'s own doc
