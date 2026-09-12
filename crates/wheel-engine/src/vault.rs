@@ -452,21 +452,32 @@ pub fn env_for_agent(
             let Some(v) = get(conn, vk, id, &key)? else {
                 continue;
             };
-            if key == wheel_core::CLAUDE_OAUTH_SESSION {
-                // The access token only. The refresh token stays with the
-                // engine: a child that held it would be a second refresher
-                // racing the first for a single-use token.
-                let session = crate::auth::OauthSession::from_vault_value(&v)?;
-                let token = session
-                    .access_token()
-                    .ok_or_else(|| anyhow::anyhow!("the stored login has no access token"))?;
-                env.push((slot(&key).to_string(), token.to_string()));
-            } else {
-                env.push((key, v));
-            }
+            env.push(env_pair(&key, v)?);
         }
     }
     Ok(env)
+}
+
+/// Turn one stored `(key, value)` into what actually reaches a child's
+/// environment. Shared by every spawn-env builder so the OAuth-session
+/// unpacking cannot re-diverge between them — `env_for_spawn` shipped without
+/// it once already, exporting a raw `CLAUDE_OAUTH_SESSION` (the whole stored
+/// session JSON, refresh token included) instead of the access token under
+/// `CLAUDE_CODE_OAUTH_TOKEN`, which every vault-authenticated spawn on that
+/// path silently failed to log in with (QA, tracing the refresh.rs hangs).
+fn env_pair(key: &str, value: String) -> Result<(String, String)> {
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        // The access token only. The refresh token stays with the engine: a
+        // child that held it would be a second refresher racing the first
+        // for a single-use token.
+        let session = crate::auth::OauthSession::from_vault_value(&value)?;
+        let token = session
+            .access_token()
+            .ok_or_else(|| anyhow::anyhow!("the stored login has no access token"))?;
+        Ok((slot(key).to_string(), token.to_string()))
+    } else {
+        Ok((key.to_string(), value))
+    }
 }
 
 /// Milliseconds since the epoch, as the credential stores speak, to the
@@ -617,7 +628,7 @@ pub fn env_for_spawn(
                 continue;
             }
             if let Some(v) = get(conn, vk, id, &key)? {
-                env.push((key, v));
+                env.push(env_pair(&key, v)?);
             }
         }
     }
@@ -1274,6 +1285,49 @@ mod tests {
         );
         assert_eq!(session_vault_for(&c, a.id).unwrap(), Some(v.id));
         assert_eq!(session_vaults(&c).unwrap(), vec![v.id]);
+    }
+
+    /// QA, tracing the refresh.rs test hangs to their root cause: `env_for_spawn` is the function
+    /// every REAL spawn actually calls (`supervisor/mod.rs`'s `self.vault_key` branch), and it
+    /// shipped without `env_for_agent`'s OAuth-session unpacking -- a vault-stored login reached the
+    /// child as a raw `CLAUDE_OAUTH_SESSION` env var (the whole session JSON, refresh token
+    /// included) instead of the access token under `CLAUDE_CODE_OAUTH_TOKEN`. The harness found no
+    /// usable token, reported "please run /login", and the engine correctly (but permanently, since
+    /// nothing was ever actually wrong with the login) parked the agent on `NeedsAuth`.
+    ///
+    /// Same property as `a_vaulted_login_reaches_a_child_as_its_access_token_only`, on the function
+    /// that actually ships to a real child. Mutation-checked: reverting `env_for_spawn` to push
+    /// `(key, v)` directly (its shape before this fix) makes this fail with the raw session JSON
+    /// under the literal key `CLAUDE_OAUTH_SESSION` instead of the token under
+    /// `CLAUDE_CODE_OAUTH_TOKEN`.
+    #[test]
+    fn a_real_spawns_env_unpacks_the_oauth_session_too() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        board::create(&c, &v).unwrap();
+        board::create(&c, &a).unwrap();
+        board::add_wire(&c, a.id, v.id, WireType::Read, None).unwrap();
+        put_session(
+            &c,
+            v.id,
+            &session("sk-ant-oat01-access", "sk-ant-ort01-refresh"),
+        );
+
+        let env = env_for_spawn(&c, &key(), a.id, None, false).unwrap();
+        assert_eq!(
+            env,
+            vec![(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "sk-ant-oat01-access".to_string()
+            )],
+            "a real spawn must see the unpacked access token, not the raw session: {env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, v)| v.contains("sk-ant-ort") || k == wheel_core::CLAUDE_OAUTH_SESSION),
+            "the refresh token must never be exported: {env:?}"
+        );
     }
 
     /// The login and a bare token are the same variable in the child, so two
