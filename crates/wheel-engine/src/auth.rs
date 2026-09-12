@@ -443,7 +443,10 @@ fn read_regular(path: &Path, cap: u64) -> Result<Option<String>> {
         bail!("{} is not a regular file", path.display());
     }
     if meta.len() > cap {
-        bail!("{} is larger than a credential store can be", path.display());
+        bail!(
+            "{} is larger than a credential store can be",
+            path.display()
+        );
     }
     let mut out = String::new();
     file.take(cap).read_to_string(&mut out)?;
@@ -522,7 +525,8 @@ pub fn check_refresh(
     if next.scopes().iter().any(|s| !allowed.contains(s)) {
         return Err(R::ScopeEscalation);
     }
-    let differs = |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(x), Some(y)) if x != y);
+    let differs =
+        |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(x), Some(y)) if x != y);
     if differs(&prev.account.account_uuid, &next.account.account_uuid)
         || differs(
             &prev.account.organization_uuid,

@@ -404,4 +404,109 @@ mod tests {
         .expect_err("a second vault actually holding the same key must still be refused");
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
+
+    /// A renewable login only ever comes from a sign-in the engine ran: one
+    /// pasted in here has another live holder (a laptop's own Claude Code)
+    /// that will spend the same single-use refresh token, and the loser of
+    /// that race has its store wiped.
+    #[tokio::test]
+    async fn a_renewable_login_cannot_be_written_directly() {
+        let state = crate::api::test_state();
+        let v = {
+            let conn = state.db.lock().unwrap();
+            mk(
+                &conn,
+                "creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            )
+        };
+        let err = put_value(
+            State(state),
+            Path((v, wheel_core::CLAUDE_OAUTH_SESSION.to_string())),
+            Json(PutValue {
+                value: r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}"#.into(),
+            }),
+        )
+        .await
+        .expect_err("a login is saved by signing in, not by PUT");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "not_writable");
+    }
+
+    /// An agent can export whatever it can read, so the policy is on the
+    /// VALUE, under any key name it arrives under.
+    ///
+    /// Mutation-checked: drop the check and a cloud project holds an OAuth
+    /// token under a name nothing looks at.
+    #[tokio::test]
+    async fn api_key_only_refuses_an_oauth_token_under_any_key_name() {
+        let state =
+            crate::api::test_state_with(crate::config::HarnessAuthPolicy::ApiKeyOnly, None, |_| {});
+        let v = {
+            let conn = state.db.lock().unwrap();
+            mk(
+                &conn,
+                "creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            )
+        };
+        for key in ["CLAUDE_CODE_OAUTH_TOKEN", "SOMETHING_ELSE"] {
+            let err = put_value(
+                State(state.clone()),
+                Path((v, key.to_string())),
+                Json(PutValue {
+                    value: "sk-ant-oat01-durable".into(),
+                }),
+            )
+            .await
+            .expect_err("{key} carried an OAuth token into an api-key-only project");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "policy_denied");
+        }
+        // An API key under the same name is exactly what this deployment is for.
+        put_value(
+            State(state),
+            Path((v, "ANTHROPIC_API_KEY".to_string())),
+            Json(PutValue {
+                value: "sk-ant-api03-real".into(),
+            }),
+        )
+        .await
+        .expect("an api key is not refused");
+    }
+
+    /// Two keys in ONE vault that reach a child as the same variable are the
+    /// same coin-flip the ambiguity rule refuses everywhere else.
+    #[tokio::test]
+    async fn one_vault_may_not_hold_a_login_and_a_bare_token_for_the_same_variable() {
+        let state = crate::api::test_state();
+        let v = {
+            let conn = state.db.lock().unwrap();
+            let v = mk(
+                &conn,
+                "creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            );
+            crate::vault::put(
+                &conn,
+                state.supervisor.vault_key().unwrap(),
+                v,
+                wheel_core::CLAUDE_OAUTH_SESSION,
+                r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}"#,
+            )
+            .unwrap();
+            v
+        };
+        let err = put_value(
+            State(state),
+            Path((v, "CLAUDE_CODE_OAUTH_TOKEN".to_string())),
+            Json(PutValue {
+                value: "sk-ant-oat01-second".into(),
+            }),
+        )
+        .await
+        .expect_err("two values for one variable must be refused, not resolved");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "ambiguous_credential");
+    }
 }

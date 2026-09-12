@@ -1,10 +1,23 @@
 # Proposal: harness OAuth with real refresh (self-hosted Wheel)
 
-Status: **draft for PM ruling. REQUIRES ADVERSARY review before merge** (ARCHITECTURE.md,
+Status: **implemented on `sdk/harness-oauth`; REQUIRES ADVERSARY review before merge** (ARCHITECTURE.md,
 "Credential-distribution rule": this changes `save_to_vault`, the credential lookup, the vault export
 and expiry). Author: SDK (harness-oauth lane). Date: 2026-09-11. Branch `sdk/harness-oauth`.
 
 Closes docs/handoff/sdk.md NEXT #1 (P1, the operator re-authenticates every 8 h).
+
+**Operator ruling, 2026-09-11: "we aren't going to do an API key worker, only oauth tokens and the
+8 h oauth flow."** For self-hosted Wheel there is now no API-key fallback, so this is not a
+convenience: it is the only way an agent runs at all on the VPS. Two consequences the design already
+had to meet, now load-bearing rather than nice-to-have:
+
+* a failed renewal has no second credential to fall back on, so it must WARN while the current token
+  still works (§5.6) and then PARK rather than spend the queue against a dead token (§5.7);
+* the whole flow must be headless — the VPS has no browser and is reached through an SSH tunnel — so
+  it is `auth/begin` → the operator opens the URL on their own machine → `auth/complete` with the
+  pasted code, and the engine never opens anything (§5.1).
+
+Cloud (`wheel-host`) is unchanged and stays API-key only.
 
 ## 0. Policy this does not move
 
@@ -169,8 +182,12 @@ own. It stays supported unchanged, apart from the capture hardening in §5.1.
 | Logins | 1 | 1 | **1** | N (once) |
 | New moving parts | lease + harvest + gate | HTTP client | mutex + timer + CLI call + gate | none |
 
-**Recommendation:** (b′) for vault-shared sessions, and (c) unchanged for per-node logins. If PM rules
-(b′) out, the fallback is (a) with a lease. The extra state is sketched in §7.
+**Decision: (b′)**, for vault-shared logins, with (c) unchanged for per-node logins. Built and
+merged into this branch; §11 records what implementation changed. The VPS case does not move the
+choice — it sharpens it. With no API-key fallback, (a)'s rotation race is not a degraded mode but a
+bricked board: the loser of a race has its store wiped by the CLI itself (§2), and on a VPS reached
+through an SSH tunnel the recovery is a person with a browser. (b′) has one refresher per credential
+source, so the race cannot happen. If PM rules (b′) out, the fallback is (a) with a lease (§7).
 
 ## 5. Design (b′)
 
@@ -313,25 +330,36 @@ the token server, which mints access/refresh pairs with a short lifetime, rotate
 | TH7 | the refresh token is never in argv and never in a log line |
 | inversion | `is_long_lived` is true only when the route asserted durability; a store entry with no expiry is *unknown* |
 
-## 9. What the operator does on the VPS (after merge)
+## 9. What the operator does on the VPS
 
-1. Upgrade `wheeld`, and make sure the host's `claude` is ≥ 2.1.269 (`claude --version`).
-2. Create one vault (e.g. `anthropic-me`) and draw a `read` wire from every agent that should use the
-   account.
-3. **Sign in once** through the web Authenticate panel on any one of those agents, with "save to vault"
-   = `anthropic-me`. That is the only human step. `GET auth` on any reader then shows
-   `refreshable: true` and an `expires_at`, and that value moves forward on its own about 30 min before
-   each expiry.
-4. Do **not** paste a laptop's `~/.claude/.credentials.json` into Wheel. The laptop's own Claude Code would
-   refresh the same refresh token and the two would race (TH2). The engine refuses a PUT of the session
-   key for this reason.
-5. `claude setup-token` into a vault (`auth/complete {setup_token}`) remains the alternative with no
-   refresh machinery: a long-lived token, no broker. Either works; a login is simpler if the web panel
-   is in use.
-6. **One-time live check** (the part §2 could not prove offline): after step 3, wait for the first
-   refresh, or restart `wheeld` with less than 30 min left, and confirm `expires_at` advanced and the
-   agents kept answering. If it did not, the engine log line `oauth refresh failed` carries the CLI's
-   own words.
+The board is reached through the SSH tunnel, so every step below is an API call to the engine (or the
+same thing through wheeld's UI). Nothing opens a browser on the server.
+
+1. **Once per host:** the VPS needs `claude` ≥ 2.1.269 on PATH (`claude --version`). That is the
+   build whose headless refresh this depends on (§2).
+2. **Create one vault** — say `anthropic` — and draw a `read` wire from every agent that should use
+   the account. One vault per account (M1.6); agents wired to it share that login.
+3. **Start the sign-in** on any ONE of those agents:
+   `POST /v1/agents/<agent>/auth/begin` → `{mode: "paste_code", url, session}`.
+4. **Open that URL on their own laptop**, sign in to Anthropic, and copy the code it shows.
+5. **Finish it**, naming the vault:
+   `POST /v1/agents/<agent>/auth/complete {"code": "<pasted>", "session": "<from begin>",
+   "save_to_vault": "anthropic"}`.
+   The response carries `vault.key = CLAUDE_OAUTH_SESSION`, `vault.refreshable = true` and the
+   current token's `expires_at`.
+6. **That is the last human step.** From then on the engine renews the login about 30 minutes before
+   each expiry, and every agent wired to that vault picks the new token up at its next turn
+   boundary. `GET /v1/agents/<agent>/auth` shows `refreshable: true`, an `expires_at` that moves
+   forward on its own, and a `warning` if a renewal ever fails.
+7. **If something is wrong**, the operator sees it BEFORE the board stops: the `warning` on
+   `GET auth` and a `node.state` event carrying it, while agents keep running on the current token.
+   Only when the token really lapses do the agents park `needs_auth` with their messages still
+   queued — and signing in again (step 3-5) resumes every one of them.
+
+What NOT to do: do not paste a laptop's own `~/.claude/.credentials.json` into the vault. That
+laptop's Claude Code holds the same single-use refresh token and will rotate it, and whichever side
+loses that race has its store wiped. `PUT /v1/vault/:id/CLAUDE_OAUTH_SESSION` is refused for exactly
+this reason — a login only ever enters a vault through a sign-in the engine ran itself.
 
 ## 10. Residuals (tracked, not closed here)
 
@@ -341,3 +369,45 @@ the token server, which mints access/refresh pairs with a short lifetime, rotate
 - **Old tokens.** Whether an old access token dies at refresh is unknown. §5.5 recycles either way.
 - **Refresh-token lifetime** (`refresh_token_expires_in`) is unknown. Proactive refresh keeps R in use.
 - **macOS local without the Desktop profile** (§0).
+
+## 11. As built (what implementation changed, and what it found)
+
+Design unchanged; these are the corrections the work itself produced. Each has a mutation-checked
+test.
+
+1. **AgentGrid contract.** `GET /v1/engine` (PR #58) gains the feature id **`oauth_refresh`**: the
+   engine renews a vault-held login itself, and `GET auth` reports `refreshable`, `expires_at` and
+   `warning`. Both OAuth ids are absent on `api-key-only`, so a client feature-detects rather than
+   guesses. Documented in PROTOCOL.md's discovery table.
+2. **`api-key-only` was never enforced on the routes.** The policy doc claimed `auth/complete`
+   refused OAuth credentials; no such check existed, and `auth/begin` would run a whole login whose
+   product the spawn gate then refused. Now `auth/begin` answers `403 policy_denied` before any
+   child exists, `auth/complete` refuses `code`/`setup_token`/an OAuth-shaped `api_key`, vault `PUT`
+   refuses an `sk-ant-oat` value under any key, and spawn refuses what a VAULT supplies as well as
+   what is in the node's own dir. `config.rs`'s doc now says what is true.
+3. **"Idle" in the database is not "not busy".** `init` sets `idle` even when a turn is already in
+   flight, so adoption judged by status recycled a child mid-turn. Busy is now the supervisor's own
+   `in_flight`, per §3c#15.
+4. **A recycled child's turn was stranded.** Recycling takes the slot, so `reap` will not settle the
+   child it kills; the in-flight message sat `delivered` for ever. It is requeued by the recycle.
+5. **`live_agents` counted agents that had ever started**, not agents holding a process — and
+   `api::stalled_agents` reads it to tell a turn in progress from a wedge, so the one state the
+   system cannot leave on its own was invisible to the healthcheck. Fixed, with a test.
+6. **A renewal has to be pending for every login**, not only after a renewal or a restart: a spawn
+   that finds the login still fresh arms the next one, or a board that never restarts never
+   schedules its first.
+7. **A failed renewal parks the agent.** Without it a warm child spends one turn per queued message
+   being told the same thing; `pump_queue` also refuses to write to an agent in `needs_auth`.
+8. **The schema drift test compares file NAMES, not contents**, so `docs/schema` was stale while the
+   gate was green. Regenerated in this change; worth a QA ticket of its own.
+
+### Still true, and still residual
+
+* Local macOS **without** the Desktop profile stores the login in the Keychain, not in a file, so
+  neither the capture nor the renewal here applies to it (§0). The bundle shows secure storage with
+  a plaintext fallback and no env var that forces the file, so this is a boundary, not a fix — the
+  Desktop profile (PR #58) is where local-macOS OAuth belongs.
+* The single-uid residual (037) is unchanged: until per-node uids, an agent can read
+  `WHEEL_VAULT_KEY` from `/proc` and decrypt the vault directly. The write-back path is
+  structurally correct for the day that lands — nothing agent-writable is read back — which is the
+  property this design was chosen for.

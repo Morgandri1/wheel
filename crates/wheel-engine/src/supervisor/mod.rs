@@ -672,9 +672,7 @@ impl Supervisor {
         // the reason, and the message that woke the agent stays queued.
         let session_vault = {
             let conn = self.db.lock().unwrap();
-            crate::vault::session_vault_for(&conn, agent)
-                .ok()
-                .flatten()
+            crate::vault::session_vault_for(&conn, agent).ok().flatten()
         };
         let credential_gen = match session_vault {
             Some(vault) => {
@@ -1011,7 +1009,18 @@ impl Supervisor {
     /// intended, this map records what is actually running. The stall report
     /// needs both to tell a turn in progress from a wedge.
     pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
-        self.agents.lock().await.keys().copied().collect()
+        // Slots that HOLD a process, not slots that exist. An agent keeps its
+        // slot for ever once it has started one, so counting keys reported a
+        // parked agent as live -- and `stalled_agents` reads this to tell a
+        // turn in progress from a wedge, so the one state the system cannot
+        // leave on its own was the one it could not see.
+        let mut live = std::collections::HashSet::new();
+        for (agent, slot) in self.agents.lock().await.iter() {
+            if slot.lock().await.is_some() {
+                live.insert(*agent);
+            }
+        }
+        live
     }
 
     /// Stop an idle agent's process, keeping its session so the next message
@@ -1383,6 +1392,11 @@ impl Supervisor {
         if self.closing.load(Ordering::SeqCst) {
             return Ok(()); // shutting down: what is queued waits for the next start
         }
+        // Credentials failed: the queue waits for a person, and is not spent a
+        // turn at a time discovering the same dead token.
+        if current_status(&self.db, agent) == AgentStatus::NeedsAuth {
+            return Ok(());
+        }
 
         let next = {
             let conn = self.db.lock().unwrap();
@@ -1634,7 +1648,12 @@ impl Supervisor {
                             // requeue every message in turn for no reason --
                             // unless the vault already holds a newer login, or
                             // this one merely ran out and can be renewed once.
-                            self.recover_from_auth_failure(agent, gen).await;
+                            if !self.recover_from_auth_failure(agent, gen).await {
+                                // Nothing to run on: hold the process's place
+                                // rather than spending a turn per queued
+                                // message to be told the same thing again.
+                                self.park_needs_auth(agent).await;
+                            }
                             continue;
                         }
 
@@ -2075,15 +2094,23 @@ fn set_status_db(
     status: AgentStatus,
     err: Option<String>,
 ) {
+    // A credential warning outlives the next status change. It says something
+    // about the login rather than about this transition, and it has to still be
+    // there when the operator looks -- otherwise the one warning they get
+    // before their agents stop is erased by the agent starting normally.
     let _ = conn.execute(
         "INSERT INTO agent_state (node_id,status,last_activity,last_error)
          VALUES (?1,?2,?3,?4)
-         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error =
+             CASE WHEN ?4 IS NOT NULL THEN ?4
+                  WHEN last_error LIKE ?5 || '%' THEN last_error
+                  ELSE NULL END",
         rusqlite::params![
             agent.to_string(),
             status.as_str(),
             wheel_core::Timestamp::now().to_rfc3339(),
             err,
+            refresh::WARNING_PREFIX,
         ],
     );
 }

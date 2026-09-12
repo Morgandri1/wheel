@@ -1166,7 +1166,11 @@ mod tests {
         board::create(&c, &v).unwrap();
         board::create(&c, &a).unwrap();
         board::add_wire(&c, a.id, v.id, WireType::Read, None).unwrap();
-        put_session(&c, v.id, &session("sk-ant-oat01-access", "sk-ant-ort01-refresh"));
+        put_session(
+            &c,
+            v.id,
+            &session("sk-ant-oat01-access", "sk-ant-ort01-refresh"),
+        );
 
         let env = env_for_agent(&c, &key(), a.id).unwrap();
         assert_eq!(
@@ -1177,8 +1181,8 @@ mod tests {
             )]
         );
         assert!(
-            !env.iter().any(|(k, v)| v.contains("sk-ant-ort")
-                || k == wheel_core::CLAUDE_OAUTH_SESSION),
+            !env.iter()
+                .any(|(k, v)| v.contains("sk-ant-ort") || k == wheel_core::CLAUDE_OAUTH_SESSION),
             "the refresh token must never be exported: {env:?}"
         );
         assert_eq!(session_vault_for(&c, a.id).unwrap(), Some(v.id));
@@ -1198,7 +1202,14 @@ mod tests {
             board::create(&c, n).unwrap();
         }
         put_session(&c, login.id, &session("sk-ant-oat01-a", "sk-ant-ort01-a"));
-        put(&c, &key(), bare.id, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-b").unwrap();
+        put(
+            &c,
+            &key(),
+            bare.id,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "sk-ant-oat01-b",
+        )
+        .unwrap();
         board::add_wire(&c, a.id, login.id, WireType::Read, None).unwrap();
 
         let clash = find_ambiguity(&c, a.id, Some(bare.id)).unwrap();
@@ -1223,10 +1234,7 @@ mod tests {
 
         let renewed = session("sk-ant-oat01-2", "sk-ant-ort01-2");
         assert!(replace_session_if(&c, &key(), v.id, "sk-ant-ort01-1", &renewed).unwrap());
-        assert_eq!(
-            get_session(&c, &key(), v.id).unwrap().unwrap(),
-            renewed
-        );
+        assert_eq!(get_session(&c, &key(), v.id).unwrap().unwrap(), renewed);
 
         // The operator signs in again mid-renewal...
         let operators = session("sk-ant-oat01-op", "sk-ant-ort01-op");

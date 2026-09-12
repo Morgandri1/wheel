@@ -922,9 +922,7 @@ fn save_credential_to_vault(
 
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
-    let expires_at = found
-        .expires_at
-        .and_then(crate::vault::millis_to_timestamp);
+    let expires_at = found.expires_at.and_then(crate::vault::millis_to_timestamp);
     let declared_overlap = crate::api::vault_routes::store_in_vault_until(
         s,
         &conn,
@@ -1081,6 +1079,7 @@ pub async fn auth_clear(State(s): State<AppState>, Path(id): Path<Uuid>) -> ApiR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use wheel_core::{AgentConfig, Node, NodeConfig, Position, VaultConfig, WireType};
 
     fn mk(conn: &rusqlite::Connection, name: &str, config: NodeConfig) -> Uuid {
@@ -1158,6 +1157,329 @@ mod tests {
         assert!(
             warning.contains(" / "),
             "the two warnings must be joined with \" / \", not concatenated or replaced: {warning}"
+        );
+    }
+
+    // --- the headless sign-in, end to end (docs/proposals/harness-oauth-refresh.md) -----
+
+    const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
+
+    /// An engine whose `claude` is the QA fake, with a fake token store behind
+    /// it, so `auth/begin` + `auth/complete` run the REAL two-call flow — a
+    /// live child between them — without a browser or an account.
+    struct Signin {
+        state: AppState,
+        dir: std::path::PathBuf,
+        agent: Uuid,
+        vault: Uuid,
+    }
+
+    impl Signin {
+        fn new(name: &str, policy: crate::config::HarnessAuthPolicy) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!(
+                "wheel-signin-{name}-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = dir.join("token-store.json");
+            std::fs::write(
+                &store,
+                serde_json::json!({
+                    "access": {}, "refresh": {},
+                    "lifetime_ms": 8 * 3_600_000i64, "rotate": true,
+                    "refreshes": 0, "counter": 0,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let fake_cfg = dir.join("fake.json");
+            std::fs::write(
+                &fake_cfg,
+                serde_json::json!({
+                    "token_store": store.display().to_string(),
+                    "login_account": "acct-A",
+                    "login_code": "fake-auth-code",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let program = dir.join("claude.sh");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nexport WHEEL_FAKE_CONFIG='{}'\nexec python3 '{FAKE}' \"$@\"\n",
+                    fake_cfg.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let program = program.display().to_string();
+            let state = crate::api::test_state_with(
+                policy,
+                Some(Arc::new(crate::harness::claude::ProgramDriver(
+                    program.clone(),
+                ))),
+                |sup| sup.broker.program = Some(program),
+            );
+            let mut cfg = (*state.cfg).clone();
+            cfg.data_dir = dir.clone();
+            let state = AppState {
+                cfg: Arc::new(cfg),
+                ..state
+            };
+
+            let (agent, vault) = {
+                let conn = state.db.lock().unwrap();
+                let agent = mk(&conn, "worker", NodeConfig::Agent(AgentConfig::default()));
+                let vault = mk(
+                    &conn,
+                    "anthropic",
+                    NodeConfig::Vault(VaultConfig { keys: vec![] }),
+                );
+                board::add_wire(&conn, agent, vault, WireType::Read, None).unwrap();
+                (agent, vault)
+            };
+            Self {
+                state,
+                dir,
+                agent,
+                vault,
+            }
+        }
+
+        async fn begin(&self) -> ApiResult<wheel_core::AuthBegin> {
+            auth_begin(State(self.state.clone()), Path(self.agent))
+                .await
+                .map(|j| j.0)
+        }
+
+        async fn complete(&self, body: serde_json::Value) -> ApiResult<serde_json::Value> {
+            auth_complete(
+                State(self.state.clone()),
+                Path(self.agent),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await
+            .map(|j| j.0)
+        }
+
+        fn session(&self) -> Option<crate::auth::OauthSession> {
+            let conn = self.state.db.lock().unwrap();
+            crate::vault::get_session(
+                &conn,
+                self.state.supervisor.vault_key().unwrap(),
+                self.vault,
+            )
+            .unwrap()
+        }
+
+        fn node_dir(&self) -> std::path::PathBuf {
+            self.state.cfg.creds_dir().join(self.agent.to_string())
+        }
+    }
+
+    impl Drop for Signin {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The VPS case: no browser, an SSH tunnel, and a login that has to be
+    /// completed by pasting a code back. What the vault ends up holding is the
+    /// WHOLE login — refresh token included — so the engine can renew it.
+    #[tokio::test]
+    async fn a_headless_sign_in_saves_a_renewable_login_to_the_vault() {
+        let rig = Signin::new("headless", crate::config::HarnessAuthPolicy::OauthToken);
+
+        let begun = rig.begin().await.expect("a paste-code login starts");
+        assert_eq!(begun.mode, wheel_core::AuthMode::PasteCode);
+        assert!(
+            begun
+                .url
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("https://"),
+            "the operator needs a URL to open on their own machine: {begun:?}"
+        );
+
+        let body = rig
+            .complete(serde_json::json!({
+                "code": "fake-auth-code",
+                "session": begun.session,
+                "save_to_vault": "anthropic",
+            }))
+            .await
+            .expect("the pasted code completes the login");
+
+        assert_eq!(body["vault"]["key"], wheel_core::CLAUDE_OAUTH_SESSION);
+        assert_eq!(body["vault"]["refreshable"], true);
+        assert_eq!(body["vault"]["exports_as"], "CLAUDE_CODE_OAUTH_TOKEN");
+        assert!(
+            body["vault"].get("warning").is_none(),
+            "a renewable login needs no expiry warning: {}",
+            body["vault"]
+        );
+
+        let session = rig.session().expect("the vault holds the login");
+        assert!(
+            session.is_refreshable(),
+            "refresh token and scopes included"
+        );
+        assert!(session.refresh_token().unwrap().starts_with("sk-ant-ort"));
+        assert_eq!(session.account().account_uuid.as_deref(), Some("acct-A"));
+
+        // The login never lands in the agent's own HOME, and the staging dir
+        // it was captured in is gone.
+        assert!(!rig.node_dir().join(".credentials.json").exists());
+        assert!(!login_staging(&rig.state, rig.agent).exists());
+
+        // ...and what the agent will actually run with is the access token.
+        let env = {
+            let conn = rig.state.db.lock().unwrap();
+            crate::vault::env_for_agent(&conn, rig.state.supervisor.vault_key().unwrap(), rig.agent)
+                .unwrap()
+        };
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(Some(env[0].1.as_str()), session.access_token());
+    }
+
+    /// TH1 at the capture. An agent is untrusted code whose HOME is its own
+    /// config dir: it plants another account's credentials there, in both
+    /// layouts, while the operator is signing in. The login is read from the
+    /// engine's own staging dir, so the planted one is never what is saved.
+    ///
+    /// Mutation-checked: read the session from the node's config dir instead
+    /// and the planted account is what every peer agent gets.
+    #[tokio::test]
+    async fn a_credential_planted_in_the_agents_home_is_not_what_a_sign_in_saves() {
+        let rig = Signin::new("planted", crate::config::HarnessAuthPolicy::OauthToken);
+        let begun = rig.begin().await.unwrap();
+
+        let planted = serde_json::json!({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-PLANTED",
+            "refreshToken": "sk-ant-ort01-PLANTED",
+            "expiresAt": 4_102_444_800_000i64,
+            "scopes": ["user:inference"],
+        }})
+        .to_string();
+        let home = rig.node_dir();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        for p in [
+            home.join(".credentials.json"),
+            home.join(".claude/.credentials.json"),
+        ] {
+            std::fs::write(p, &planted).unwrap();
+        }
+
+        rig.complete(serde_json::json!({
+            "code": "fake-auth-code",
+            "session": begun.session,
+            "save_to_vault": "anthropic",
+        }))
+        .await
+        .unwrap();
+
+        let session = rig.session().unwrap();
+        assert!(
+            !session.access_token().unwrap().contains("PLANTED"),
+            "an agent-planted credential was promoted to the vault: {:?}",
+            session.access_token()
+        );
+        assert!(!session.refresh_token().unwrap().contains("PLANTED"));
+    }
+
+    /// A sign-in with no vault keeps the login for that one agent, in its own
+    /// config dir — option (c), the per-agent login, still works.
+    #[tokio::test]
+    async fn a_sign_in_without_a_vault_installs_the_login_in_the_agents_own_dir() {
+        let rig = Signin::new("pernode", crate::config::HarnessAuthPolicy::OauthToken);
+        let begun = rig.begin().await.unwrap();
+        rig.complete(serde_json::json!({ "code": "fake-auth-code", "session": begun.session }))
+            .await
+            .unwrap();
+
+        let installed = crate::auth::read_session(&rig.node_dir()).expect("its own store");
+        assert!(installed.is_refreshable());
+        assert!(rig.session().is_none(), "nothing was put in the vault");
+        assert!(!login_staging(&rig.state, rig.agent).exists());
+    }
+
+    /// The orchestrator's ask, and wheel-harness-auth.md's enforcement points
+    /// 1 and 2: on an api-key-only deployment no OAuth credential may be
+    /// created, and no login child may even be started.
+    ///
+    /// Mutation-checked: remove either policy check and this fails — the
+    /// begin case by returning a URL, the complete cases by storing.
+    #[tokio::test]
+    async fn api_key_only_refuses_every_oauth_way_in_before_a_login_exists() {
+        let rig = Signin::new("policy", crate::config::HarnessAuthPolicy::ApiKeyOnly);
+
+        let refused = rig.begin().await.expect_err("no OAuth sign-in here");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1, "policy_denied");
+        assert!(
+            !login_staging(&rig.state, rig.agent).exists(),
+            "no login may be started at all"
+        );
+
+        for body in [
+            serde_json::json!({"code": "fake-auth-code"}),
+            serde_json::json!({"setup_token": "sk-ant-oat01-durable"}),
+            serde_json::json!({"api_key": "sk-ant-oat01-smuggled"}),
+        ] {
+            let err = rig
+                .complete(body.clone())
+                .await
+                .expect_err("an OAuth credential is refused");
+            assert_eq!(err.0, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(err.1, "policy_denied", "{body}");
+        }
+
+        // An API key is what this deployment is for, and it still works.
+        rig.complete(serde_json::json!({"api_key": "sk-ant-api03-real"}))
+            .await
+            .expect("an api key is the point of api-key-only");
+    }
+
+    /// A renewable login and a bare token are the same variable in the child,
+    /// so one vault cannot hold both: the login supersedes the token it
+    /// replaces rather than leaving two values for one slot.
+    #[tokio::test]
+    async fn a_saved_login_supersedes_a_bare_token_in_the_same_vault() {
+        let rig = Signin::new("supersede", crate::config::HarnessAuthPolicy::OauthToken);
+        {
+            let conn = rig.state.db.lock().unwrap();
+            crate::api::vault_routes::store_in_vault(
+                &rig.state,
+                &conn,
+                rig.vault,
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "sk-ant-oat01-older",
+            )
+            .unwrap();
+        }
+
+        let begun = rig.begin().await.unwrap();
+        rig.complete(serde_json::json!({
+            "code": "fake-auth-code",
+            "session": begun.session,
+            "save_to_vault": "anthropic",
+        }))
+        .await
+        .unwrap();
+
+        let keys = {
+            let conn = rig.state.db.lock().unwrap();
+            crate::vault::list_keys(&conn, rig.vault).unwrap()
+        };
+        assert_eq!(
+            keys,
+            vec![wheel_core::CLAUDE_OAUTH_SESSION.to_string()],
+            "the bare token it replaces must be gone, not left beside it"
         );
     }
 }
