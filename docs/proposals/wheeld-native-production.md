@@ -100,7 +100,7 @@ to be careful.** One row per guarantee, and one row is honestly marked WEAKER.
 |---|---|---|---|
 | Nothing published to the network | `ports: "127.0.0.1:8080:8080"`, and Caddy exists only under `COMPOSE_PROFILES=tls` | `DEFAULT_BIND` in the binary (`crates/wheeld/src/config.rs:37`), `--bind 127.0.0.1:8080` in `ExecStart`, **`ExecStartPre` refuses a non-loopback bind** unless the operator sets `WHEEL_ALLOW_EXPOSED_BIND=1`, **`ExecStartPost` measures the listening socket** with `ss` and fails the unit if anything but loopback is bound | **STRONGER.** Docker's version shipped with a hole the README documents at length: `ufw` does not see Docker's published ports, because Docker writes iptables rules ahead of ufw's chain. Native has no docker-proxy and no rules nobody wrote; `ufw` is authoritative. And the check is now a measurement of the real socket rather than a statement about a compose file. |
 | Signup closed | wheeld's own default, plus a Caddy matcher, plus the `verify-signup-gate` service | wheeld's own default (unchanged), the same Caddy matcher in TLS mode, plus **`wheel-signup-gate.service`**, a `Type=oneshot` running the same `verify-signup-gate.sh` | **EQUAL, and better than `install.sh` has today** — see the next row. |
-| The gate runs *before* the board starts | `depends_on: { verify-signup-gate: service_completed_successfully }` | `wheel-web.service` gains `Requires=wheel-signup-gate.service` + `After=` | **EQUAL — and this fixes a real native regression.** Today the gate is a block of shell inside `install.sh`, so it runs once at install time and never again. Reboot the box and the board comes up in front of an unverified wheeld with nothing having checked. A systemd dependency re-runs on every boot, which is what compose's version always did. |
+| The gate runs *before* the board starts | `depends_on: { verify-signup-gate: service_completed_successfully }` | `wheel-web.service` gains `Requires=wheel-signup-gate.service` + `After=` | **EQUAL — and this fixes a real native regression.** Today the gate is a block of shell inside `install.sh`, so it runs once at install time and never again. Reboot the box and the board comes up in front of an unverified wheeld with nothing having checked. A systemd dependency re-runs on every boot, which is what compose's version always did. **The exact dependency shape is subtler than it looks — see §4b.** |
 | Operator-token bootstrap | wheeld writes `/data/operator-token` `0600`; read it with `docker compose exec` | identical file at `/var/lib/wheel/operator-token`; read it with `sudo cat` | EQUAL, and one less moving part |
 | Body limits, HSTS, security headers, `Cookie` stripped to wheeld, forged `X-Forwarded-*` overwritten | Caddy | the same Caddy, the same `Caddyfile`, installed from Caddy's own apt repository by `install.sh` — this is already true and needs nothing | EQUAL |
 | Honest client attribution behind the proxy | `WHEEL_TRUSTED_PROXIES=<the Caddy container's IP>` — one address on an internal network that no agent can send from | `WHEEL_TRUSTED_PROXIES=127.0.0.1/32` — **every local process, agents included** | **WEAKER. Cannot be reproduced.** See below. |
@@ -270,6 +270,35 @@ breaks each layer on purpose and exits 0 only if the checks guarding it come bac
 - `sandbox` removes `ProtectHome`, `ProtectSystem` and `ProtectProc` and requires the three
   host-protection checks to fail.
 - `oom` removes `OOMPolicy=continue` and requires `oom-containment.sh` to fail.
+
+### 4b. The gate's dependency shape, which took a rehearsal to get right
+
+The obvious wiring is `wheel-web` `Requires=` the gate, and the gate `Requires=` `wheeld`. It is
+wrong, and it fails in the worst possible way: **every upgrade drops the board permanently.**
+
+`systemctl restart wheeld` stops `wheeld` on its way back up. `Requires=` propagates a stop, so the
+gate — a `Type=oneshot` with `RemainAfterExit=yes` — was stopped too, and `wheel-web`, which
+`Requires=` the gate, was stopped with it. Nothing brought either back, because the restart job was
+`wheeld`'s alone. Measured: `rehearse-native.sh`'s `restart-no-cascade` check went red with
+*"wheel-web went inactive when wheeld restarted"*.
+
+I had convinced myself otherwise beforehand with a stand-in experiment using three toy units, where
+a restart genuinely did not cascade. The toy daemon restarted in milliseconds; `wheeld` takes long
+enough (`ExecStartPost` blocks until `/healthz` answers) for systemd to act on the dependency. **A
+model of the system agreed with me and the system did not**, which is the entire argument for
+rehearsing the real units rather than a sketch of them.
+
+The fix is to weaken the gate's dependency on `wheeld` from `Requires=` to `Wants=`, keeping
+`After=`. Nothing is lost: the gate does not need systemd to promise `wheeld` is running, because
+it makes a real HTTP call and fails by itself if `wheeld` is not answering — which is the correct
+outcome and the whole purpose of `verify-signup-gate.sh`. `wheel-web` keeps `Requires=` on the
+gate, so a failing gate still blocks the board, and the rehearsal asserts that separately by
+actually breaking the gate rather than by reading the unit file.
+
+**What this costs, stated because it is a real trade:** if `wheeld` stops, the board now stays up
+and serves errors instead of stopping too. That is worse than stopping cleanly. It is much better
+than a board that never returns from an upgrade, and it recovers unattended when `wheeld` comes
+back.
 
 ## 5. Resource limits on a 2 vCPU, 3.8 GB box
 
