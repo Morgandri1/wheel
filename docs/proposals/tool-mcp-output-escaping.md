@@ -227,3 +227,23 @@ string/object `value` through verbatim — both match §1's claims.
 (no further doc revision required per ADVERSARY — "your call whether that needs a doc revision first or
 can be decided in the implementation PR"; folded in above since it changes the shape of what gets built).
 Related, tracked separately, not blocking: `redteam/findings/053` (§5).
+
+## 7. Testing discipline for the implementation PR (ADVERSARY, prompted by API's PR #78)
+
+API's defect #4 fix (percent-encoding a `.`/`..` path segment) turned out not to work: `reqwest::Url`
+collapses `%2E%2E` exactly like a literal `..` per the WHATWG spec's own definition of a dot-segment,
+which API caught by testing against the real `url` crate before shipping rather than trusting the
+reasoning. ADVERSARY checked whether §4(b)'s self-escaping wrapper has an analogous "looks closed, isn't"
+failure and concluded it does not — a URL goes through a real, spec-defined structural normalization
+layer before an app-level check ever runs; text reaching a model has no equivalent formal denormalization
+step to be caught out by. But that cuts the other way too: there is no written spec to test the wrapper
+against the way API tested against WHATWG's, so the only way to catch an equivalent mistake here is an
+end-to-end test against the real thing, not a unit test of the escaping function in isolation (which only
+proves the function does what it says, not that what it says survives contact with a harness).
+
+**Binding for the implementation PR**: at least one test must prove the *escaped* form of a forged marker
+survives as inert text through whatever actually consumes it — the fake harness end to end (mirroring
+`supervisor::refresh::tests`' pattern of spawning the real fake-claude CLI rather than mocking the
+boundary), not only a `wheel-core`-level unit test on the escaping function by itself. A unit test on the
+escaper is still worth having (fast, precise about the exact transform); it is necessary but not
+sufficient.
