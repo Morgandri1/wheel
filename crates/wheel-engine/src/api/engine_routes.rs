@@ -27,6 +27,8 @@ const FEATURES: &[&str] = &[
     "budgets",
     "oauth_paste_code",
     "oauth_refresh",
+    "interrupt",
+    "script_run",
 ];
 
 pub async fn engine_info(State(s): State<AppState>) -> Json<EngineInfo> {
@@ -205,6 +207,8 @@ mod tests {
                 "budgets",
                 "oauth_paste_code",
                 "oauth_refresh",
+                "interrupt",
+                "script_run",
             ]
         );
     }
@@ -326,6 +330,13 @@ mod tests {
             // The engine renews a vaulted login itself; `GET auth` is where a
             // client reads that (`refreshable`, `expires_at`, `warning`).
             "oauth_refresh" => Routes(&[("GET", "/v1/agents/{id}/auth")]),
+            "interrupt" => Routes(&[("POST", "/v1/agents/{id}/interrupt")]),
+            // Reachable and routed at every policy -- whether a given call actually runs a
+            // script is the WHEEL_SCRIPT_EXEC/uid-isolation gate's job (script_routes.rs), a
+            // per-deployment fact this feature id says nothing about. The id promises "this
+            // build has the route," matching every other entry here, not "this deployment has
+            // opted in."
+            "script_run" => Routes(&[("POST", "/v1/scripts/{id}/run")]),
             other => panic!("{other:?} is advertised with no evidence that it exists"),
         }
     }

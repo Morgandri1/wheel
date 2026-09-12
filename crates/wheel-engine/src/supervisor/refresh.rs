@@ -964,6 +964,7 @@ mod tests {
                 tool_allow_hosts: Vec::new(),
                 startup_deadline_secs: DEFAULT_STARTUP_DEADLINE_SECS,
                 harness_auth: spec.policy,
+                script_execution_enabled: false,
             });
             let mut sup = Supervisor::with_harness(
                 cfg,

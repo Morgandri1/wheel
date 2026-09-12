@@ -95,6 +95,24 @@ pub async fn stop(
     Ok(Json(status_body(&s, id, status)))
 }
 
+/// `POST /v1/agents/:id/interrupt` (§3c#12, PROTOCOL.md M2) — cancel the turn
+/// this agent is in the middle of, without losing its session. `stop` also
+/// cancels it, but takes the ability to resume with it; this is the smaller,
+/// explicit action for "stop talking, something more important arrived",
+/// distinct from `send`, which never interrupts a turn in progress.
+pub async fn interrupt(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_agent(&s, id)?;
+    let status = s
+        .supervisor
+        .interrupt(id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(status_body(&s, id, status)))
+}
+
 /// `POST /v1/agents/:id/restart`
 pub async fn restart(
     State(s): State<AppState>,

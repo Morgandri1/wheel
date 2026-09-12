@@ -23,7 +23,7 @@ too — this is the index, not the only warning.
 
 | Capability | State today | Milestone |
 |---|---|---|
-| `script` nodes — execution | Types, validation, wire matrix and the capability gate are all done. There is no runtime, no `POST /v1/cli/run`, and **no `wheel run` subcommand** (it exits 1, "unknown command"). The agent preamble already advertises it, so agents will try it and fail. | M2 |
+| `script` nodes — execution | The runtime and an operator-only route (`POST /v1/scripts/:id/run`) exist but are **gated off by default** (`WHEEL_SCRIPT_EXEC`) pending F007 — see § Script nodes. The AGENT-facing half is still entirely missing: no `POST /v1/cli/run`, and **no `wheel run` subcommand** (it exits 1, "unknown command"). The agent preamble already advertises it, so agents will try it and fail. | M2 |
 | `chest` nodes — blob storage | Types, key normalisation and the sqlite index table exist; no blob I/O, no `/v1/chests/*` routes. All four CLI verbs answer an honest 400. | M2 |
 | `mcp` nodes — per-node servers | `McpConfig` is validated and stored, but wiring `agent → mcp` attaches nothing to the harness. It is accepted and silently does nothing. The `--mcp-config` the engine passes is the built-in `wheel mcp-serve` server, unrelated to these nodes. | M2 |
 | Size ceilings for the two above | `MAX_BLOB_BYTES` and `MAX_SCRIPT_OUTPUT_BYTES` are constants with no call sites. | with the above |
@@ -180,6 +180,8 @@ a `400`, not an ignored key: check `features` first.
 | `budgets` | `AgentConfig.budget` `{max_turns?, max_usd?}` |
 | `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. Headless by construction: the engine never opens a browser, the client shows the URL and posts the code back. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**, where both routes answer `403 policy_denied` |
 | `oauth_refresh` | The engine RENEWS a vault-held claude.ai login before it expires, so an 8-hour token does not become an 8-hour board. `GET /v1/agents/:id/auth` reports `refreshable: true`, the `expires_at` of the current token, and a `warning` when the last renewal failed. **Absent on `api-key-only`** |
+| `interrupt` | `POST /v1/agents/:id/interrupt` exists on this build |
+| `script_run` | `POST /v1/scripts/:id/run` exists on this build. **The route existing is not the same as a call succeeding**: it answers `503 config` on any deployment that has not proven per-node uid isolation (F007) — see § "Script nodes". This id promises the route, not that a call will run anything |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.
@@ -563,6 +565,7 @@ an exit code.
 | `GET /v1/chests/:id/ls?prefix` | → `{entries:[{key,bytes,modified_at}]}` | M2 |
 | `GET /v1/chests/:id/blob?key` | → raw bytes | M2 |
 | `PUT /v1/chests/:id/blob?key` | raw body → `204` | M2 |
+| `POST /v1/scripts/:id/run` | `{args?: string[]}` → `{stdout, stderr, exit_code, timed_out, stdout_truncated, stderr_truncated}` | M2, **gated off** |
 
 #### Table nodes
 
@@ -606,6 +609,26 @@ Each of these alone would be an argument; together they are the boundary:
 
 `ATTACH`, `DETACH`, `PRAGMA`, every write verb, and `load_extension` are all rejected. Refusals name the object
 sqlite blocked and add why.
+
+#### Script nodes
+
+`POST /v1/scripts/:id/run` runs the node's **current** `config.source` as the project owner, from the board —
+not by way of a wire, the same way `POST /v1/tables/:id/query` needs none for the owner. It writes `source` to
+a fresh directory under `scripts_dir()/<node_id>/`, picks the interpreter from `language` (`python3`; `node`;
+`node --experimental-strip-types` for `ts` — Node 22 strips TypeScript types natively rather than needing a
+second interpreter), and runs it through `child_command` (§ Isolation gap below) in its own process group so a
+`timeout_secs` kill reaches whatever the script itself started. `stdout`/`stderr` are each capped at 1 MiB
+(`stdout_truncated`/`stderr_truncated` say so); a run that outlives `timeout_secs` is killed and reported with
+`timed_out: true`, `exit_code: null`.
+
+**Gated off by default** (`WHEEL_SCRIPT_EXEC`, unset/`0`): `docs/proposals/script-execution-scope.md` records
+PM's ruling that per-node uid isolation (F007, the §0 isolation gap above) is a precondition of *running* a
+script, not later hardening — every child on a project shares one uid today, so a script can read every sibling
+node's 0600 token file and reach whatever the host's network can, with no SSRF policy of its own (`validate.rs`'s
+`host_is_denied` governs `tool`/`mcp` URLs only). A deployment that has not closed that gap and had ADVERSARY
+review the resulting egress gets `503 config` naming both. This route is the operator-only half of the gap in
+§0's status table; the agent-facing half (`wheel run`, `/v1/cli/run`, the MCP `run` tool) remains **not built** —
+see the CLI grammar below and `wheel-engine/src/mcp.rs`'s test pinning `run` absent from the MCP surface.
 
 ### Events — `GET /v1/events` (WebSocket)
 

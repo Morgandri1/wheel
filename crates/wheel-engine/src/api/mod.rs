@@ -34,6 +34,7 @@ pub mod cli_routes;
 mod engine_routes;
 pub mod events_route;
 pub mod ingress;
+pub mod script_routes;
 mod table_routes;
 pub mod tool_routes;
 pub mod vault_routes;
@@ -182,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/agents/{id}/start", post(agent_routes::start))
         .route("/agents/{id}/stop", post(agent_routes::stop))
         .route("/agents/{id}/restart", post(agent_routes::restart))
+        .route("/agents/{id}/interrupt", post(agent_routes::interrupt))
         .route("/agents/{id}/clear", post(agent_routes::clear))
         .route("/agents/{id}/send", post(agent_routes::send))
         .route("/agents/{id}/log", get(agent_routes::log))
@@ -210,6 +212,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tools/{id}/import", post(tool_routes::reimport))
         .route("/tools/{id}/ops", get(tool_routes::ops))
         .route("/tools/{id}/call", post(tool_routes::call))
+        .route("/scripts/{id}/run", post(script_routes::run))
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -443,6 +446,9 @@ pub(crate) fn test_state_with(
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
         harness_auth,
+        // The runtime is buildable and testable ahead of F007 (docs/proposals/
+        // script-execution-scope.md); only PRODUCTION defaults this off.
+        script_execution_enabled: true,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());
