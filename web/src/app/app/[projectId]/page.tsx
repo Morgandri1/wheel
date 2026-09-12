@@ -57,22 +57,48 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
     void qc.invalidateQueries({ queryKey: ["board", projectId] });
   }, [qc, projectId]);
 
+  // The WS carries no replay (docs/API.md § "Reconnecting"): a lagged or resynced socket means
+  // the board query above is stale, and separately, every open drawer tab's log has a gap the
+  // socket cannot backfill. `since` is the last seq we already hold per tab, so this asks the
+  // engine for exactly the gap rather than re-seeding from zero.
+  const replayOpenLogs = useCallback(() => {
+    const { drawerTabs, logs, appendLog } = useBoardStore.getState();
+    for (const id of drawerTabs) {
+      const held = logs[id];
+      if (!held?.length) continue; // never backfilled yet; the drawer's own seed effect covers it
+      const since = held[held.length - 1]!.seq;
+      void api
+        .agent(id)
+        .log({ since })
+        .then((r) => appendLog(id, r.lines))
+        .catch(() => {
+          // Best-effort: this tab's log stays stale until the next lagged/resync tick.
+        });
+    }
+  }, [api]);
+
   // One socket per open board. State ticks refresh the board; the rest lands in the store.
   useEffect(() => {
     if (!running) return;
     return connectEvents(projectId, {
       onStatus: setConnection,
-      onResync: refetchBoard,
+      onResync: () => {
+        refetchBoard();
+        replayOpenLogs();
+      },
       onBatch: (events) => {
         const { stateChanged, boardChanged, lagged } = applyEvents(events);
         if (stateChanged || boardChanged) refetchBoard();
         // The engine dropped frames rather than let this tab stall its delivery loop. The socket
         // is healthy and what we hold is stale, so say so plainly instead of leaving someone to
         // wonder why the board went quiet.
-        if (lagged) toast("Reconnected to a busy board — refreshing what you can see.");
+        if (lagged) {
+          toast("Reconnected to a busy board — refreshing what you can see.");
+          replayOpenLogs();
+        }
       },
     });
-  }, [projectId, running, applyEvents, refetchBoard, setConnection]);
+  }, [projectId, running, applyEvents, refetchBoard, replayOpenLogs, setConnection]);
 
   const nodes = board.data?.nodes ?? [];
 

@@ -52,6 +52,12 @@ interface BoardState {
   /** Node ids whose runtime state changed in the last batch — consumers re-read the board query. */
   applyEvents: (events: EngineFrame[]) => { stateChanged: boolean; boardChanged: boolean; lagged: boolean };
   seedLog: (nodeId: string, lines: LogLine[]) => void;
+  /**
+   * The socket carries no replay (docs/API.md § "Reconnecting"): on `lagged`/resync, a caller
+   * refetches `GET /v1/agents/:id/log?since=<last seq we have>` per open tab and appends the
+   * result here, rather than `seedLog`'s replace-everything shape.
+   */
+  appendLog: (nodeId: string, lines: LogLine[]) => void;
   reset: () => void;
 }
 
@@ -97,6 +103,14 @@ export const useBoardStore = create<BoardState>((set, get) => ({
 
   seedLog: (nodeId, lines) =>
     set((s) => ({ logs: { ...s.logs, [nodeId]: lines.slice(-LOG_CAP) } })),
+
+  appendLog: (nodeId, lines) =>
+    set((s) => {
+      if (!lines.length) return {};
+      const prev = s.logs[nodeId] ?? [];
+      const next = prev.concat(lines);
+      return { logs: { ...s.logs, [nodeId]: next.length > LOG_CAP ? next.slice(-LOG_CAP) : next } };
+    }),
 
   applyEvents: (events) => {
     let stateChanged = false;
