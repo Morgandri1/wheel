@@ -956,11 +956,12 @@ impl Lane {
 
     /// Install what the drain made safe, then restart onto it. Never returns
     /// when the restart works.
-    pub fn install_and_restart(&self, ready: &Ready) -> Result<()> {
+    /// Returns only if the install failed: on success this process becomes the
+    /// new binary, or exits for the supervisor to start it.
+    pub fn install_and_restart(&self, ready: &Ready) -> Result<std::convert::Infallible> {
         self.updater.install(ready)?;
         tracing::info!(to = %ready.candidate.target, "installed; restarting onto it");
-        restart_process(self.restart, &self.bin_dir);
-        Ok(())
+        restart_process(self.restart, &self.bin_dir)
     }
 }
 

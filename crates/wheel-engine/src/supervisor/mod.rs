@@ -306,6 +306,11 @@ pub struct Supervisor {
     events: Arc<crate::events::Bus>,
     /// Set when shutdown begins: from then on nothing starts and no new message is written.
     closing: AtomicBool,
+    /// Why `closing` is set, and NOTHING else. The gate on starting a turn stays exactly one flag
+    /// (`closing`, checked in `start` and `pump_queue`); this only decides what a caller is told.
+    /// A shutdown is going away, so `deliver` errors and the sender hears it; an update pause is
+    /// temporary, so `deliver` is quiet and the message simply waits.
+    paused_for_update: AtomicBool,
     shutdown_drain_ms: AtomicU64,
 }
 
@@ -356,6 +361,7 @@ impl Supervisor {
             harness,
             events,
             closing: AtomicBool::new(false),
+            paused_for_update: AtomicBool::new(false),
             shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
         }
     }
@@ -963,6 +969,7 @@ impl Supervisor {
     /// `start` and `pump_queue`, and the first time they disagreed a turn would
     /// start inside a drain.
     pub fn pause_turns(&self) {
+        self.paused_for_update.store(true, Ordering::SeqCst);
         self.closing.store(true, Ordering::SeqCst);
     }
 
@@ -978,6 +985,7 @@ impl Supervisor {
     /// there, the flag is terminal.
     pub async fn resume_turns(self: &Arc<Self>) {
         self.closing.store(false, Ordering::SeqCst);
+        self.paused_for_update.store(false, Ordering::SeqCst);
         let waiting = {
             let conn = self.db.lock().unwrap();
             messages::recipients_with_queued(&conn).unwrap_or_default()
@@ -1987,11 +1995,11 @@ impl Supervisor {
     /// resume its messages would sit in the queue looking delivered-any-moment
     /// forever.
     pub async fn deliver(self: &Arc<Self>, agent: Uuid) -> Result<()> {
-        // Quietly, not as an error: while turns are paused for an update or a
-        // shutdown, `start` refuses, and a sender whose message merely has to
-        // wait should not be told its send failed. The row stays `queued` and
-        // goes out when turns resume or the next boot delivers it.
-        if self.turns_paused() {
+        // Quietly, and ONLY for an update: the board is not going away, the row stays `queued`,
+        // and it goes out when turns resume. A shutdown falls through to `start`, which errors —
+        // a sender whose daemon is stopping should hear that, which is what
+        // `nothing_starts_once_shutdown_has_begun` fixes in place.
+        if self.paused_for_update.load(Ordering::SeqCst) {
             return Ok(());
         }
         let (status, waiting) = {

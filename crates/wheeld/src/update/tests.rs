@@ -468,7 +468,8 @@ async fn a_wait_that_runs_out_resumes_delivery_and_reports_who_was_busy() {
 
 #[tokio::test]
 async fn a_build_or_smoke_failure_stops_the_attempt_and_tells_the_requester() {
-    let pick: [(fn(&FakeDriver) -> &AtomicBool, Outcome); 2] = [
+    type Breaks = fn(&FakeDriver) -> &AtomicBool;
+    let pick: [(Breaks, Outcome); 2] = [
         (|d| &d.build_fails, Outcome::BuildFailed),
         (|d| &d.smoke_fails, Outcome::SmokeFailed),
     ];
