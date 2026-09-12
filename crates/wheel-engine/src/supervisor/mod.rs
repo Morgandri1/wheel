@@ -785,6 +785,20 @@ impl Supervisor {
             cwd: None,
             failures: Vec::new(),
         });
+        // The only other await in this guarded span (ADVERSARY, tracing the
+        // same lock #64 added the check above for): `stop`'s `note_stop` bumps
+        // the epoch before it ever needs the slot lock, same as the renewal
+        // case, but a stop landing HERE would otherwise sail past a check that
+        // already happened before this await started. Without this, `stop`
+        // still wins eventually -- it blocks on the slot lock until this
+        // function stores `Running` and kills it a moment later -- but only
+        // after a process was spawned and a token was minted for an agent the
+        // operator had already told to stop, exactly what the comment above
+        // says the check exists to prevent.
+        if self.stop_epoch(agent) != stops_before {
+            tracing::info!(%agent, "a stop landed while this start was materialising its workspace; not spawning");
+            return Ok(AgentStatus::Stopped);
+        }
         // The agent still starts without a workspace it could not have — but on
         // its own log stream, next to whatever it does next, rather than only in
         // an engine log nobody is reading during a wake.
@@ -2663,6 +2677,118 @@ mod tests {
             !env.lines().any(|l| l.starts_with("WHEEL_WORKSPACE=")),
             "WHEEL_WORKSPACE must be ABSENT, not empty, when no workspace was materialised"
         );
+    }
+
+    /// ADVERSARY, tracing the same stop-epoch lock #64 added the check in
+    /// `start` for: `workspace::materialise`'s `.await` is the ONLY other
+    /// yield point in that guarded span, and it predates #64 -- `stop`'s
+    /// `note_stop` bumps the epoch before it ever needs the slot lock, same as
+    /// the OAuth-renewal case, but `start`'s recheck ran BEFORE this await
+    /// started, so a stop landing during materialisation sailed past it. The
+    /// process does not escape supervision forever -- `stop` still blocks on
+    /// the slot lock until `start` stores `Running` and kills it moments later
+    /// -- but a process gets spawned and a token gets minted for an agent the
+    /// operator already told to stop, which is exactly what the epoch check
+    /// exists to prevent (see the comment on the first check, above).
+    ///
+    /// Mutation-checked: drop the second check and this fails with a spawn.
+    /// Same shape as refresh.rs's `a_stop_during_a_renewal_actually_stops_the_
+    /// agent`, one guarded window over -- a slow `git` on PATH stands in for
+    /// that test's slow fake OAuth CLI.
+    #[tokio::test]
+    async fn a_stop_during_workspace_materialisation_actually_stops_the_agent() {
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(!real_git.is_empty(), "this test needs a real git on PATH");
+
+        // A real, tiny local repo to clone from -- seeded with the REAL git,
+        // before the slow shim below is anywhere near PATH.
+        let origin = std::env::temp_dir().join(format!(
+            "wheel-ws-race-origin-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&origin).unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new(&real_git)
+                .args(args)
+                .current_dir(&origin)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("README"), "hello").unwrap();
+        run_git(&["add", "README"]);
+        run_git(&["commit", "-qm", "first"]);
+        let url = format!("file://{}", origin.display());
+
+        let (sup, id, dir) = shim_supervisor_cfg("ws-stop-race", ECHO_HARNESS, |cfg| {
+            cfg.workspaces = vec![wheel_core::Workspace {
+                path: "wheel".into(),
+                git: Some(wheel_core::GitSource {
+                    url,
+                    git_ref: None,
+                    vault_ref: None,
+                }),
+            }];
+        });
+
+        // A `git` on PATH that sleeps before the bare clone, so there is a
+        // real window to land a stop in.
+        let shim_dir = dir.join("shim");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *'clone --bare'*) sleep 1.5 ;;\nesac\nexec {real_git} \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let path_before = std::env::var("PATH").unwrap_or_default();
+        let _env = EnvGuard::set(&[("PATH", &format!("{}:{path_before}", shim_dir.display()))]);
+
+        let sup2 = sup.clone();
+        let starting = tokio::spawn(async move { sup2.start(id).await });
+        // Long enough to be inside the slow clone, which holds the slot lock
+        // the whole time -- `stop` below queues on it rather than racing it.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        sup.stop(id).await.unwrap();
+        let started = starting.await.unwrap().unwrap();
+
+        assert_eq!(
+            started,
+            AgentStatus::Stopped,
+            "a start that was materialising a workspace when the operator stopped the agent must not spawn"
+        );
+        assert_eq!(status_of(&sup, id), AgentStatus::Stopped);
+        assert!(
+            !sup.live_agents().await.contains(&id),
+            "the operator's stop must leave no process behind"
+        );
+        assert_eq!(
+            runs(&dir),
+            0,
+            "no harness process may be spawned after a stop"
+        );
+
+        std::fs::remove_dir_all(&origin).ok();
     }
 
     /// (b) §3c#14, and the reason this project exists rather than YOKE.
