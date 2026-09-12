@@ -1026,15 +1026,7 @@ mod usage_tests {
             let id = node.id;
             let conn = state.db.lock().unwrap();
             board::create(&conn, &node).unwrap();
-            crate::db::wires::add(
-                &conn,
-                &wheel_core::WireSpec {
-                    from,
-                    to: id,
-                    wire_type: wheel_core::WireType::Send,
-                },
-            )
-            .unwrap();
+            board::add_wire(&conn, from, id, wheel_core::WireType::Send, None).unwrap();
             id
         };
 

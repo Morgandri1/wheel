@@ -124,6 +124,72 @@ pub async fn announce(db: &Db, events: &MembershipEvents, change: AccessChanged)
     }
 }
 
+/// Feed [`MembershipEvents`] from Postgres `LISTEN`, so a revocation reaches **every** replica.
+///
+/// Returns `None` on SQLite, where there is nothing to listen for: `announce` publishes straight to
+/// the in-process bus, which is complete when there is one process.
+///
+/// # If this task dies, revocation still works
+///
+/// It reconnects with a backoff, and every failure is logged — but the thing that makes it safe to
+/// have a task that can die at all is that it is not the guarantee. The bridge's periodic re-check
+/// is. Losing this listener costs revocation *latency* (up to one re-check interval), not
+/// correctness, which is why it fails loudly and carries on rather than taking the process down.
+#[cfg(feature = "postgres")]
+pub fn spawn_listener(db: &Db, events: MembershipEvents) -> Option<tokio::task::JoinHandle<()>> {
+    let pool = db.as_pg()?.clone();
+    Some(tokio::spawn(async move {
+        // Bounded backoff: a database that is briefly unreachable must not become a reconnect
+        // storm aimed at it, and one that is gone for a while must not stop trying.
+        let mut backoff = std::time::Duration::from_millis(250);
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+        loop {
+            match listen_once(&pool, &events).await {
+                Ok(()) => {
+                    tracing::warn!("membership listener ended cleanly; reconnecting");
+                    backoff = std::time::Duration::from_millis(250);
+                }
+                Err(e) => tracing::error!(
+                    error = ?e,
+                    "membership listener failed; revocation falls back to the periodic re-check \
+                     until it reconnects"
+                ),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }))
+}
+
+#[cfg(feature = "postgres")]
+async fn listen_once(pool: &sqlx::PgPool, events: &MembershipEvents) -> anyhow::Result<()> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    listener.listen(CHANNEL).await?;
+    tracing::info!(channel = CHANNEL, "listening for membership changes");
+    loop {
+        let notification = listener.recv().await?;
+        match AccessChanged::decode(notification.payload()) {
+            Some(change) => {
+                events.publish(change);
+            }
+            // A payload we could not have written. Logged rather than dropped silently, because
+            // the only ways to produce one are a bug on our side or somebody else issuing NOTIFY
+            // on our channel, and both are worth seeing.
+            None => tracing::warn!(
+                payload = notification.payload(),
+                "discarding an unreadable membership notification"
+            ),
+        }
+    }
+}
+
+/// No Postgres in this build, so there is nothing to listen to.
+#[cfg(not(feature = "postgres"))]
+pub fn spawn_listener(_db: &Db, _events: MembershipEvents) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
 // ---------------------------------------------------------------------------- members
 
 #[derive(Debug, Clone, Serialize)]

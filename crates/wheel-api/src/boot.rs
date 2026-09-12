@@ -100,6 +100,12 @@ pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState
     let orch = build_orchestrator(&cfg, http.clone());
     let ingress_limiter = crate::http::ratelimit::RateLimiter::new(cfg.ingress_rate_per_min);
 
+    // On Postgres this carries a revocation to every replica within milliseconds. It is the *fast*
+    // path only: the guarantee is the bridge's own periodic re-check, so a listener that fails to
+    // start costs latency rather than correctness.
+    let membership = crate::membership::MembershipEvents::new();
+    crate::membership::spawn_listener(&db, membership.clone());
+
     AppState::new(Inner {
         cfg,
         db,
@@ -108,7 +114,7 @@ pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState
         http,
         orch,
         ingress_limiter,
-        membership: crate::membership::MembershipEvents::new(),
+        membership,
         bridges: crate::http::bridges::BridgeCounter::new(),
         auth_limiter: crate::http::authlimit::AuthLimiter::new(10, 50),
         engine_base_override: None,
