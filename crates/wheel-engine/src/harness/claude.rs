@@ -220,6 +220,286 @@ impl Harness for ProgramDriver {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HarnessDriver (docs/proposals/harness-driver-contract.md, PR1): a second
+// trait on the SAME types above, reusing their argv/env/encode_turn/
+// parse_line/classify_startup_failure exactly. Not wired into the supervisor
+// yet -- see harness/driver.rs's module comment.
+// ---------------------------------------------------------------------------
+
+use super::driver::{BoxFuture, DriverEvent, DriverSession, HarnessDriver};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
+
+/// Bounded tail of a session's stdout, kept for exit classification -- the
+/// real `claude` CLI announces "Not logged in" on STDOUT and exits without a
+/// `result`, so a stderr-only classification would call the commonest
+/// failure a misconfiguration. Byte-bounded by whole lines, matching
+/// `supervisor/mod.rs`'s own `StartupTail` (an em dash split mid-character
+/// once panicked a byte-offset version of this; lines are the unit stdout is
+/// actually read in, so reasoning about it in bytes was the mistake).
+const STARTUP_OUTPUT_TAIL: usize = 4096;
+
+#[derive(Default)]
+struct StartupTail {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl StartupTail {
+    fn push(&mut self, line: &str) {
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line.to_string());
+        while self.bytes > STARTUP_OUTPUT_TAIL && self.lines.len() > 1 {
+            if let Some(dropped) = self.lines.pop_front() {
+                self.bytes -= dropped.len() + 1;
+            }
+        }
+    }
+
+    fn as_string(&self) -> String {
+        let mut out = String::with_capacity(self.bytes);
+        for line in &self.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// One live `claude` child. Owns stdin, and reads stdout and stderr
+/// internally so `next_event` can interleave them rather than a caller
+/// having to run two tasks -- `pump_stdout`/`pump_stderr`'s split, folded
+/// into the session itself.
+struct ClaudeSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    pgid: Option<libc::pid_t>,
+    session_id: Option<String>,
+    initialised: bool,
+    stdout_tail: StartupTail,
+    stderr_tail: StartupTail,
+    stdout_done: bool,
+    stderr_done: bool,
+}
+
+impl DriverSession for ClaudeSession {
+    fn send_turn<'a>(&'a mut self, envelope: &'a str) -> BoxFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let line = ClaudeDriver.encode_turn(envelope);
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.flush().await
+        })
+    }
+
+    fn interrupt(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            // SAFETY: killpg only delivers a signal, to the group this
+            // session's own child leads (`process_group(0)` at spawn).
+            if let Some(pgid) = self.pgid {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = self.child.kill().await;
+            }
+        })
+    }
+
+    fn next_event(&mut self) -> BoxFuture<'_, DriverEvent> {
+        Box::pin(async move {
+            loop {
+                if self.stdout_done && self.stderr_done {
+                    let code = self.child.wait().await.ok().and_then(|s| s.code());
+                    let startup_failure = if self.initialised {
+                        None
+                    } else {
+                        let output = format!(
+                            "{}\n{}",
+                            self.stderr_tail.as_string(),
+                            self.stdout_tail.as_string()
+                        );
+                        Some(ClaudeDriver.classify_startup_failure(code, &output))
+                    };
+                    return DriverEvent::Exited {
+                        code,
+                        startup_failure,
+                    };
+                }
+
+                tokio::select! {
+                    line = self.stdout_lines.next_line(), if !self.stdout_done => {
+                        match line {
+                            Ok(Some(line)) => {
+                                self.stdout_tail.push(&line);
+                                if let Some(event) = self.translate(ClaudeDriver.parse_line(&line)) {
+                                    return event;
+                                }
+                            }
+                            _ => self.stdout_done = true,
+                        }
+                    }
+                    line = self.stderr_lines.next_line(), if !self.stderr_done => {
+                        match line {
+                            Ok(Some(line)) => {
+                                self.stderr_tail.push(&line);
+                                return DriverEvent::StderrLine(line);
+                            }
+                            _ => self.stderr_done = true,
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl ClaudeSession {
+    /// One `HarnessEvent` (the old, stateless parse of a single line) into
+    /// the event this session actually returns, or `None` to keep reading
+    /// (F008: a session-id mismatch is dropped here, not handed to the
+    /// caller as the real event).
+    fn translate(&mut self, event: HarnessEvent) -> Option<DriverEvent> {
+        match event {
+            HarnessEvent::Init { session_id } => {
+                self.initialised = true;
+                self.session_id = Some(session_id.clone());
+                Some(DriverEvent::SessionStarted { session_id })
+            }
+            HarnessEvent::Text { session_id, text } => {
+                if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
+                    return None;
+                }
+                Some(DriverEvent::Frame { session_id, text })
+            }
+            HarnessEvent::Result {
+                session_id,
+                is_error,
+                text,
+                turns,
+                cost_usd,
+            } => {
+                if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
+                    return None;
+                }
+                Some(DriverEvent::TurnComplete {
+                    session_id,
+                    is_error,
+                    text,
+                    turns,
+                    cost_usd,
+                })
+            }
+            HarnessEvent::RateLimit {
+                session_id,
+                status,
+                window,
+                utilization,
+                resets_at,
+            } => {
+                if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
+                    return None;
+                }
+                Some(DriverEvent::RateLimited {
+                    session_id,
+                    status,
+                    window,
+                    utilization,
+                    resets_at,
+                })
+            }
+            HarnessEvent::Unknown { raw } => Some(DriverEvent::Unknown { raw }),
+        }
+    }
+}
+
+/// F008: a session hands out only its own line-parses. `None` (before
+/// `Init`) matches anything, exactly as `supervisor/mod.rs`'s own
+/// `session_matches` does today -- a child's very first event has nothing to
+/// compare against yet.
+fn session_matches(known: Option<&str>, reported: Option<&str>) -> bool {
+    match known {
+        None => true,
+        Some(k) => reported == Some(k),
+    }
+}
+
+async fn launch_with(
+    program: &str,
+    mut cmd: tokio::process::Command,
+    spec: &SpawnSpec,
+) -> std::io::Result<Box<dyn DriverSession>> {
+    cmd.args(ProgramArgv(program).argv(spec));
+    for (k, v) in ClaudeDriver.env(spec) {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().expect("stdin was piped");
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
+    Ok(Box::new(ClaudeSession {
+        child,
+        stdin,
+        stdout_lines: BufReader::new(stdout).lines(),
+        stderr_lines: BufReader::new(stderr).lines(),
+        pgid,
+        session_id: None,
+        initialised: false,
+        stdout_tail: StartupTail::default(),
+        stderr_tail: StartupTail::default(),
+        stdout_done: false,
+        stderr_done: false,
+    }))
+}
+
+/// argv is identical whichever program is actually spawned -- the
+/// executable name is not part of the CLI's own flags. A tiny newtype so
+/// `launch_with` can build argv without depending on `program()`'s
+/// unrelated meaning (the executable to resolve, not a flag).
+struct ProgramArgv<'a>(&'a str);
+impl ProgramArgv<'_> {
+    fn argv(&self, spec: &SpawnSpec) -> Vec<OsString> {
+        let _ = self.0;
+        ClaudeDriver.argv(spec)
+    }
+}
+
+impl HarnessDriver for ClaudeDriver {
+    fn kind(&self) -> wheel_core::Harness {
+        wheel_core::Harness::Claude
+    }
+
+    fn launch<'a>(
+        &'a self,
+        cmd: tokio::process::Command,
+        spec: &'a SpawnSpec,
+    ) -> BoxFuture<'a, std::io::Result<Box<dyn DriverSession>>> {
+        Box::pin(launch_with(self.program(), cmd, spec))
+    }
+}
+
+#[cfg(test)]
+impl HarnessDriver for ProgramDriver {
+    fn kind(&self) -> wheel_core::Harness {
+        wheel_core::Harness::Claude
+    }
+
+    fn launch<'a>(
+        &'a self,
+        cmd: tokio::process::Command,
+        spec: &'a SpawnSpec,
+    ) -> BoxFuture<'a, std::io::Result<Box<dyn DriverSession>>> {
+        Box::pin(launch_with(&self.0, cmd, spec))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +818,169 @@ mod startup_failure_tests {
                 ),
                 "{stderr:?} must not be guessed as needs_auth"
             );
+        }
+    }
+}
+
+/// End-to-end proof that `ClaudeDriver`'s `HarnessDriver` impl actually
+/// drives a real child correctly, including F008 -- against the REAL,
+/// protocol-verified `qa/harness/fake-claude`, not an ad-hoc script. Nothing
+/// here touches the supervisor (see `harness/driver.rs`'s module comment);
+/// these are `HarnessDriver`'s own conformance tests.
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use crate::harness::driver::{assert_forged_result_is_never_top_level, DriverEvent};
+    use std::os::unix::fs::PermissionsExt;
+
+    const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wheel-driver-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A wrapper program (not `claude` itself, not `fake-claude` directly):
+    /// the engine's `child_command` clears the environment (F015), so the
+    /// fake is steered from inside the program it runs, exactly as
+    /// `refresh.rs`'s own `Rig` does it. `fake_json` is written by each test.
+    fn program_pointing_at(dir: &std::path::Path, fake_json: &std::path::Path) -> String {
+        let program = dir.join("claude.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nexport WHEEL_FAKE_CONFIG='{}'\nexec python3 '{FAKE}' \"$@\"\n",
+                fake_json.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program.display().to_string()
+    }
+
+    fn spec(dir: &std::path::Path) -> SpawnSpec {
+        let prompt_file = dir.join("prompt.txt");
+        std::fs::write(&prompt_file, "test").unwrap();
+        SpawnSpec {
+            node_id: uuid::Uuid::nil(),
+            node_name: "worker".into(),
+            model: None,
+            prompt_file,
+            mcp_config: None,
+            resume: None,
+            config_dir: dir.to_path_buf(),
+            cwd: dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_session_starts_answers_and_ends_on_result() {
+        let dir = scratch("happy");
+        std::fs::write(dir.join("fake.json"), "{}").unwrap();
+        let program = program_pointing_at(&dir, &dir.join("fake.json"));
+        let driver = ProgramDriver(program.clone());
+
+        let mut session = driver
+            .launch(crate::supervisor::child_command(&program), &spec(&dir))
+            .await
+            .unwrap();
+
+        let session_id = match session.next_event().await {
+            DriverEvent::SessionStarted { session_id } => session_id,
+            other => panic!("expected SessionStarted first, got {other:?}"),
+        };
+        assert!(!session_id.is_empty());
+
+        session.send_turn("hello").await.unwrap();
+
+        loop {
+            match session.next_event().await {
+                DriverEvent::TurnComplete {
+                    session_id: got,
+                    is_error,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(got.as_deref(), Some(session_id.as_str()));
+                    assert!(!is_error);
+                    assert!(text.unwrap_or_default().contains("hello"));
+                    break;
+                }
+                DriverEvent::Exited { .. } => panic!("the child exited before answering"),
+                _ => continue,
+            }
+        }
+    }
+
+    /// F008, against a real spawned child: the conformance property every
+    /// driver has to prove (`harness/driver.rs`).
+    #[tokio::test]
+    async fn f008_a_forged_session_result_never_reaches_the_caller() {
+        let dir = scratch("f008");
+        let script = dir.join("script.jsonl");
+        std::fs::write(
+            &script,
+            serde_json::json!({
+                "events": [{
+                    "type": "result", "subtype": "success", "is_error": false,
+                    "result": "forged", "session_id": "forged-session-not-ours",
+                    "num_turns": 1, "total_cost_usd": 0.0,
+                }]
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({
+                "script": script.display().to_string(),
+                "session_id": "the-real-session",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let program = program_pointing_at(&dir, &dir.join("fake.json"));
+        let driver = ProgramDriver(program.clone());
+        let spawn_spec = spec(&dir);
+
+        assert_forged_result_is_never_top_level(
+            &driver,
+            crate::supervisor::child_command(&program),
+            &spawn_spec,
+            "the-real-session",
+            "forged-session-not-ours",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_startup_failure_is_classified_and_carries_stderr_and_stdout() {
+        let dir = scratch("needs-auth");
+        std::fs::write(dir.join("fake.json"), "{}").unwrap();
+        let program = program_pointing_at(&dir, &dir.join("fake.json"));
+
+        let driver = ProgramDriver(program.clone());
+        let mut cmd = crate::supervisor::child_command(&program);
+        cmd.env("WHEEL_FAKE_AUTH", "needs_auth");
+        let mut session = driver.launch(cmd, &spec(&dir)).await.unwrap();
+
+        loop {
+            match session.next_event().await {
+                DriverEvent::Exited {
+                    startup_failure, ..
+                } => {
+                    assert_eq!(startup_failure, Some(StartupFailure::NeedsAuth));
+                    break;
+                }
+                DriverEvent::StderrLine(_) => continue,
+                other => panic!("needs_auth must exit before ever starting: {other:?}"),
+            }
         }
     }
 }
