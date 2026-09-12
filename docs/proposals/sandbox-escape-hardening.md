@@ -19,15 +19,91 @@ right now. This document does not change F007's status; it is a different bounda
 endpoint node delivers an untrusted webhook body as an agent prompt (§3, the `<AgentPrompt
 type="endpoint">` envelope). Agents execute code **by design** — that is the product. So the
 threat model this document assumes, per Morgan's framing, is: **the attacker already reaches
-"agent runs attacker-chosen code" inside a project's container.** Nothing here is about preventing
-that — the wire matrix, ingress rate limits and body caps are what bound what an agent can reach
-from inside its own project, and F007 is what would stop it presenting as a sibling node. This
-document is about the layer *after* that: what stops attacker-chosen code, once running, from
-leaving the container it is confined to and reaching the host, another tenant's container, or the
-private network the host sits on (§5b, F003).
+"agent runs attacker-chosen code."** Nothing here is about preventing that — the wire matrix,
+ingress rate limits and body caps are what bound what an agent can reach through the *board*, and
+F007 is what would stop it presenting as a sibling *node*. This document is about the layer
+*after* that: given a shell inside one agent's context (ADVERSARY's framing, exact) — no tampering
+assumed beyond what an untrusted, possibly prompt-injected agent already legitimately has under
+`bypassPermissions` — what's reachable from there that shouldn't be?
+
+**Two distinct bad outcomes, not one**, per ADVERSARY: escaping the container to reach the host is
+the headline case, but reaching **another project's** data or process on the same machine, without
+ever leaving any container, is itself bad and explicitly in scope — Morgan deprioritized per-NODE
+isolation *within* a project (F007), not per-PROJECT isolation between them. The rest of this
+document has to answer both, and — the finding that reshapes everything below — **they are not the
+same question on this deployment**, because of which container topology `wheeld` actually runs.
 
 Everything below is measured against `main`/`dev` as of this commit, with `file:line`, the same
 discipline `script-execution-scope.md` used.
+
+## The framing question this has to answer before the numbers mean anything (ADVERSARY)
+
+Wheel has two deployment topologies, and they are not equally isolated today:
+
+- **`wheel-host` + `DockerSandbox`** (the cloud, multi-tenant deployment, §5b) already runs **one
+  container per project** (`crates/wheel-host/src/sandbox/docker.rs`). Escape-hardening this one is
+  close to a pure "hard config" job: a given project's container is already its own isolation unit,
+  so `cap_drop`/`no-new-privileges`/a stronger runtime (gVisor/Firecracker, see below) each apply
+  per-project automatically, for free, because the boundary they'd reinforce already exists at the
+  right granularity.
+- **`wheeld`** (the VPS/self-hosted deployment — `infra/vps/compose.yml`, the actual container
+  Morgan audited, `wheel-wheeld-1`) is a **single process, single container, running every
+  project's engine and every project's agent children together**, all as the same uid (10001),
+  sharing one filesystem and one kernel namespace. Confirmed independently by both ADVERSARY and
+  me: `crates/wheeld/src/embedded.rs` has no `setuid`, `unshare`, or any privilege-dropping call
+  anywhere — `EmbeddedSandbox` spawns each project's engine as a plain `tokio::spawn` task in the
+  SAME process (§ "Isolation gap" in `script-execution-scope.md`'s §0 table already says as much
+  for per-node; this is the same absence one level up, at per-PROJECT granularity, which nothing
+  else in the codebase currently states this plainly). **There is no isolation unit smaller than
+  "the whole `wheeld` container" today, at all** — not per-project, let alone per-node.
+
+That absence means the compose-level hardening in §§1–2 below (what ships in this PR) raises the
+cost of escaping `wheeld`'s ONE container to the host. It does **nothing** for project-to-project
+reach *within* that container, because there is no boundary there for `cap_drop`/AppArmor/a
+stronger runtime to reinforce — an attacker with code execution in project A's agent reads project
+B's `/data/projects/B/...` over an ordinary file read, same uid, same mount namespace, no escape of
+any kind required. This is true **regardless of whether §§5–6 (userns-remap, read-only rootfs) or
+gVisor/Firecracker ship** — every one of those hardens the same single boundary, and project B is
+inside it exactly as much as project A is.
+
+**So the actual decision is not "which sandboxing technology" — it is which of two architectures
+`wheeld` is:**
+
+- **Option A — harden the one container.** Everything in §§1–2, 4–6 below, plus optionally
+  wrapping the whole `wheeld` container in gVisor/Firecracker. Materially raises the cost of a
+  VPS-host escape. Does not touch project-to-project reach; that stays exactly as open as it is
+  today, at every layer of hardening this option can add.
+- **Option B — `wheeld` becomes a supervisor of per-project sandboxes**, structurally the same
+  shape `wheel-host` already is. This is NOT a small change: `wheeld` would move from "one process
+  hosting every engine as an async task" to "one process that spawns and supervises N sandboxed
+  children," which is a different architecture, not a config flag. The good news: **this
+  mechanism already exists and is already tested** — `wheel-host`'s `process` sandbox backend
+  (`crates/wheel-host/src/sandbox/process.rs`) does real per-project `setuid`/`setgid` via
+  `pre_exec` (`drop_privileges`, line 231/395 — `libc::setuid`, `setgid` before `setuid`,
+  `setgroups([])`, `no_new_privs`), allocates a distinct uid range per project (`allocate_uid`),
+  and is covered by its own test suite. The natural shape of Option B is **converging `wheeld` on
+  that existing backend** rather than inventing a second, parallel isolation mechanism — `wheeld`
+  already proxies each project over a unix socket the same way `wheel-host` does
+  (`crates/wheeld/src/embedded.rs`'s own doc comment: "the host still proxies over a unix socket
+  per project, so the API's engine proxy and events bridge run exactly the code they run in
+  production"), so the control-plane side of this is already shared; what's missing is the process
+  boundary underneath it. Under Option B, gVisor/Firecracker would wrap EACH per-project sandbox,
+  which is where a stronger-than-namespaces runtime actually buys project-to-project isolation, not
+  just VPS-host escape resistance.
+
+**Not deciding between them here.** Option A is what this PR ships (it is strictly good regardless
+of which way B goes, and costs little). Option B is a real project, sized closer to a milestone
+than a hardening pass, and the deciding fact is one this document does not have: whether a given
+`wheeld` deployment is actually single-tenant. It is NOT single-tenant by construction — `WHEEL_
+SIGNUP=open` (`infra/vps/compose.yml`'s own comment: "lets anyone who reaches this server create an
+account and run agents on it") lets any number of distinct people sign up, and even under the
+`closed` default the owner can add more accounts via `POST /v1/auth/users` (`docs/API.md`). So
+"every project belongs to the same person" is a fact about how a *specific* deployment is being
+used, not a guarantee this codebase makes — project-to-project reach on a `WHEEL_SIGNUP=open` (or
+multi-account `closed`) `wheeld` is a genuine cross-TENANT confidentiality breach, not a
+self-inflicted one. Whether that risk is acceptable for THIS deployment, and therefore whether
+Option B is worth its cost, is Morgan's call to make with that fact in hand — not mine to assume
+away.
 
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
@@ -214,6 +290,19 @@ by different mechanisms. Neither has been benchmarked against Wheel's actual wor
 document — the figures below are the mechanisms' own published characteristics, presented so Morgan
 can weigh them against what Wheel needs, not a substitute for a real spike if either is chosen.
 
+**Which topology this table is costing, tying back to the framing question above:** the
+integration story below (`--runtime=runsc`, `HostConfig.Runtime`) is written against
+`wheel-host`'s `DockerSandbox` — which already runs one container per project, so gVisor/Firecracker
+slot in per-project for free there, under EITHER option. Applied to `wheeld` as it exists today
+(Option A, the one container), either technology would wrap the SINGLE `wheeld` container and
+raise the cost of a VPS-host escape — it would do nothing for project-to-project reach, for the
+same reason §§1–2/5–6 don't: there is no per-project boundary inside that container for a stronger
+runtime to reinforce. Getting project-to-project isolation from either technology on `wheeld`
+specifically requires Option B first (a sandbox per project) — the runtime choice below then
+applies to EACH of those, which is exactly where the startup-latency number in this table starts
+compounding: N parked agents across N projects each paying gVisor/Firecracker's per-sandbox resume
+cost independently, not once.
+
 **Why startup latency and memory are the two numbers that matter here, specifically:** Wheel's
 whole compute-cost story is idle parking (§3c#14) — an agent's process stops after
 `idle_timeout_secs` and the NEXT message pays a resume cost before the agent can answer. Today that
@@ -248,12 +337,20 @@ answered first, before any integration work.
 
 ## Summary — what's asked of whoever reads this next
 
+- **The framing question, first**: is `wheeld` staying "one hardened container" (Option A) or
+  becoming "a supervisor of per-project sandboxes" (Option B, converging on `wheel-host`'s existing
+  `process` backend)? Everything else here is Option A — real, worth shipping, but it does not
+  touch project-to-project reach, which is currently unbounded on any `wheeld` deployment with more
+  than one tenant. This is the one decision that changes the shape of the rest of the work, not
+  just its size.
 - Items 1–3: code changes exist (this PR + #83). **Needs a `rehearse.sh` run with docker access**
   before merge — not yet done, called out explicitly above rather than assumed.
 - Item 4: needs someone with production shell access to run the two `docker inspect`/`/proc`
   commands above against `wheel-wheeld-1` and record the actual result.
 - Items 5–6: proposed, not implemented, with the specific breakage each would need to survive
-  (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved.
-- The real boundary: gVisor vs. Firecracker costed above, for Morgan to choose between (or defer)
-  — sandbox escape prevention is paramount, but a decision this consequential and this expensive to
-  reverse is his to make with the numbers in front of him, not mine to preempt.
+  (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved. Both are Option-A
+  shaped — they harden the single container, not project-to-project reach within it.
+- The real boundary: gVisor vs. Firecracker costed above, explicitly tied to which option they're
+  wrapping — for Morgan to choose between (or defer). Sandbox escape prevention is paramount, but a
+  decision this consequential and this expensive to reverse is his to make with the numbers and the
+  A/B framing in front of him, not mine to preempt.
