@@ -1,0 +1,14 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Layered on compose.yml by rehearse.sh. Limits only, never topology.
+#
+# The per-project ingress limit is raised above the engine's per-caller one (60 a minute), so the
+# limit a burst of forged X-Forwarded-For values runs into is the one keyed on the caller's
+# address. If a forged value were believed, every hit would be a new caller and none would be 429.
+
+services:
+  wheeld:
+    environment:
+      INGRESS_RATE_PER_MIN: "1000"
