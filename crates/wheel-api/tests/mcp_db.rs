@@ -32,16 +32,19 @@ const HOST_SECRET: &str = "host-secret-the-caller-never-sees";
 
 // ---------------------------------------------------------------- mock engine
 
+/// One call the mock engine saw: method, path (query included), body.
+type Call = (String, String, Option<Value>);
+
 #[derive(Clone, Default)]
 struct Seen {
-    calls: Arc<Mutex<Vec<(String, String, Option<Value>)>>>,
+    calls: Arc<Mutex<Vec<Call>>>,
 }
 
 impl Seen {
-    fn calls(&self) -> Vec<(String, String, Option<Value>)> {
+    fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
-    fn last(&self) -> (String, String, Option<Value>) {
+    fn last(&self) -> Call {
         self.calls().last().cloned().expect("the engine was called")
     }
 }
