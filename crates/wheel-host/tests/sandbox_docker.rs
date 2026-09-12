@@ -119,12 +119,12 @@ async fn provision_is_idempotent_and_creates_the_container() {
         let hc = c.host_config.expect("host config");
 
         assert_eq!(hc.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
-        let cap_add = hc.cap_add.unwrap_or_default();
-        assert!(cap_add.contains(&"SETUID".to_string()) && cap_add.contains(&"SETGID".to_string()));
-        assert_eq!(
-            cap_add.len(),
-            2,
-            "only SETUID and SETGID may be granted (F007)"
+        // Nothing is granted back. F007 (per-node uid isolation) is not yet implemented, so
+        // SETUID/SETGID would be unused capability surface on a container that treats its own
+        // tenant as hostile — add it back in the same commit that lands the setuid/setgid calls.
+        assert!(
+            hc.cap_add.unwrap_or_default().is_empty(),
+            "no capability may be granted back until F007 lands and actually uses it"
         );
         assert!(hc
             .security_opt
