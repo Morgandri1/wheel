@@ -39,6 +39,9 @@ enum Engine {
 struct EngineState {
     behaviour: Engine,
     nodes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// What the engine was asked to destroy, so a test can assert that a refused board reached it
+    /// with nothing at all — the "nothing was created" guarantee is about calls, not just status.
+    deleted: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 async fn mock_engine(behaviour: Engine) -> String {
@@ -47,6 +50,7 @@ async fn mock_engine(behaviour: Engine) -> String {
     let state = EngineState {
         behaviour,
         nodes: Arc::new(std::sync::Mutex::new(Vec::new())),
+        deleted: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let app =
         Router::new()
@@ -67,6 +71,7 @@ async fn mock_engine(behaviour: Engine) -> String {
                             "id": id,
                             "name": body["name"],
                             "type": body["type"],
+                            "config": body["config"],
                             "wires": [],
                         }));
                         (StatusCode::CREATED, axum::Json(json!({"id": id}))).into_response()
@@ -74,15 +79,64 @@ async fn mock_engine(behaviour: Engine) -> String {
                 ),
             )
             .route(
+                "/v1/nodes/{id}",
+                axum::routing::delete(
+                    |State(s): State<EngineState>,
+                     axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        s.deleted.lock().unwrap().push(id.clone());
+                        s.nodes
+                            .lock()
+                            .unwrap()
+                            .retain(|n| n["id"].as_str() != Some(id.as_str()));
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .route(
                 "/v1/wires",
-                post(|State(s): State<EngineState>| async move {
-                    match s.behaviour {
-                        Engine::Accepts => StatusCode::NO_CONTENT.into_response(),
-                        Engine::RefusesWires => {
-                            (StatusCode::BAD_REQUEST, "wire refused by the engine").into_response()
+                axum::routing::delete(
+                    |State(s): State<EngineState>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        let from = body["from"].as_str().unwrap_or_default().to_string();
+                        let mut nodes = s.nodes.lock().unwrap();
+                        for node in nodes.iter_mut() {
+                            if node["id"].as_str() == Some(from.as_str()) {
+                                if let Some(wires) = node["wires"].as_array_mut() {
+                                    wires.retain(|w| {
+                                        w["to"] != body["to"] || w["type"] != body["type"]
+                                    });
+                                }
+                            }
                         }
-                    }
-                }),
+                        s.deleted.lock().unwrap().push(format!("wire:{from}"));
+                        StatusCode::NO_CONTENT
+                    },
+                )
+                .post(
+                    |State(s): State<EngineState>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        match s.behaviour {
+                            Engine::Accepts => {
+                                let from = body["from"].as_str().unwrap_or_default().to_string();
+                                let mut nodes = s.nodes.lock().unwrap();
+                                for node in nodes.iter_mut() {
+                                    if node["id"].as_str() == Some(from.as_str()) {
+                                        if let Some(wires) = node["wires"].as_array_mut() {
+                                            wires.push(
+                                                json!({"to": body["to"], "type": body["type"]}),
+                                            );
+                                        }
+                                    }
+                                }
+                                StatusCode::NO_CONTENT.into_response()
+                            }
+                            Engine::RefusesWires => {
+                                (StatusCode::BAD_REQUEST, "wire refused by the engine")
+                                    .into_response()
+                            }
+                        }
+                    },
+                ),
             )
             .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -430,5 +484,219 @@ async fn an_illegal_wire_offers_no_consent_to_grant() {
     assert!(
         body["consent"].is_null(),
         "offered a toggle for an illegal wire: {body}"
+    );
+}
+
+/// The builder's OWN board shape, end to end: wires nested on the node and addressed by id. This
+/// is the shape every builder turn emits, and before it was normalised the wires were dropped in
+/// silence and the apply reported success.
+#[tokio::test]
+async fn a_board_in_the_builders_own_shape_applies_with_its_wires() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {
+            "project": {"id": "3f1a2b9c-0d4e-4a6b-8c1d-2e3f4a5b6c7d"},
+            "nodes": [
+                {"id": "11111111-1111-4111-8111-111111111111", "name": "brief", "type": "ctx",
+                 "position": {"x": 0, "y": 0}, "config": {"markdown": "# Brief"},
+                 "wires": [{"to": "22222222-2222-4222-8222-222222222222", "type": "send"}]},
+                {"id": "22222222-2222-4222-8222-222222222222", "name": "worker", "type": "agent",
+                 "position": {"x": 240, "y": 0},
+                 "config": {"harness": "claude", "system_prompt": "do the work"}, "wires": []}
+            ]
+        }}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["report"]["created_nodes"].as_array().unwrap().len(), 2);
+    let wires = body["report"]["created_wires"].as_array().unwrap();
+    assert_eq!(
+        wires.len(),
+        1,
+        "the builder's nested wire was dropped: {body}"
+    );
+    assert_eq!(wires[0]["from"], "brief");
+    assert_eq!(wires[0]["to"], "worker");
+}
+
+/// A board carrying a codex agent is refused whole. The engine rejects that node at creation, so
+/// without this the preview looked clean and the apply died halfway through.
+#[tokio::test]
+async fn a_codex_board_is_refused_before_anything_is_created() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {"nodes": [
+            {"name": "worker", "type": "agent", "config": {"harness": "codex", "system_prompt": "p"}}
+        ]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["refusals"][0]["refusal"]["code"], "unsupported_harness",
+        "{body}"
+    );
+    assert!(
+        body["consent"].is_null(),
+        "no toggle can make codex runnable: {body}"
+    );
+}
+
+/// A board that is not a board answers in the same shape as one that is illegal, with a reason —
+/// rather than the framework's plain-text 422, which the confirm step cannot render at all.
+#[tokio::test]
+async fn a_malformed_board_is_refused_with_a_reason_it_can_show() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let (status, body) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {"nodes": [{"name": "nameless"}]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["refusals"][0]["refusal"]["code"], "malformed_board",
+        "{body}"
+    );
+    assert!(
+        body["refusals"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"),
+        "{body}"
+    );
+}
+
+/// Removing is its own consent, and the 422 says exactly what it would destroy.
+#[tokio::test]
+async fn removing_a_node_is_refused_until_it_is_granted_and_says_what_it_costs() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+    let (status, _) = apply(&app, &token, &id, legal_board()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let removal = json!({"board": {"nodes": [], "remove": {"nodes": ["notes"]}}});
+    let (status, body) = apply(&app, &token, &id, removal.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["consent"]["would_delete"][0]["name"], "notes",
+        "{body}"
+    );
+    assert_eq!(body["consent"]["would_delete"][0]["type"], "ctx", "{body}");
+    assert!(
+        body["consent"]["would_delete"][0]["destroys"]
+            .as_str()
+            .unwrap()
+            .contains("markdown"),
+        "the UI has to be able to say what is lost: {body}"
+    );
+    assert_eq!(body["consent"]["grant"][0], "allow_delete", "{body}");
+
+    // Granting the OTHER consents is not granting this one.
+    let mut wrong_grant = removal.clone();
+    wrong_grant["allow_patch"] = json!(true);
+    wrong_grant["allow_wire"] = json!(true);
+    let (status, body) = apply(&app, &token, &id, wrong_grant).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "patching is not destroying: {body}"
+    );
+}
+
+/// Destruction is bound to the plan the user saw. Without that confirmation it does not happen,
+/// and a board that moved underneath gets the new plan rather than a silent substitution.
+#[tokio::test]
+async fn a_removal_must_confirm_the_plan_it_was_shown() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+    apply(&app, &token, &id, legal_board()).await;
+
+    let granted = json!({
+        "board": {"nodes": [], "remove": {"nodes": ["notes"]}},
+        "allow_delete": true
+    });
+
+    // Dry run first: this is what the user reads, and it carries the digest.
+    let mut dry = granted.clone();
+    dry["dry_run"] = json!(true);
+    let (status, plan) = apply(&app, &token, &id, dry).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["plan"]["delete_nodes"][0]["name"], "notes", "{plan}");
+    let digest = plan["plan_digest"]
+        .as_str()
+        .expect("a digest to confirm")
+        .to_string();
+
+    // No confirmation: refused, and nothing removed.
+    let (status, body) = apply(&app, &token, &id, granted.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "plan_confirmation_required", "{body}");
+    assert_eq!(body["applied"], false);
+
+    // A digest from some other plan: refused as changed, still nothing removed.
+    let mut stale = granted.clone();
+    stale["expect_plan"] =
+        json!("0000000000000000000000000000000000000000000000000000000000000000");
+    let (status, body) = apply(&app, &token, &id, stale).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "plan_changed", "{body}");
+
+    // The plan the user actually confirmed goes through, and reports what went.
+    let mut confirmed = granted;
+    confirmed["expect_plan"] = json!(digest);
+    let (status, body) = apply(&app, &token, &id, confirmed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["applied"], true, "{body}");
+    assert_eq!(body["report"]["deleted_nodes"][0], "notes", "{body}");
+}
+
+/// An improve that changes one field must not rewrite the rest. The engine stores the config, so
+/// this asserts on what the apply SENT: a patch carrying only what changed.
+#[tokio::test]
+async fn an_improve_patches_only_the_field_it_changed() {
+    let app = app(Engine::Accepts).await;
+    let (token, id) = project(&app).await;
+
+    let (status, _) = apply(
+        &app,
+        &token,
+        &id,
+        json!({"board": {"nodes": [{"name": "researcher", "type": "agent", "config": {
+            "harness": "claude", "system_prompt": "first", "run_on_startup": true
+        }}]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let improve = json!({
+        "board": {"nodes": [{"name": "researcher", "type": "agent", "config": {
+            "harness": "claude", "system_prompt": "second"
+        }}]},
+        "allow_patch": true,
+        "dry_run": true
+    });
+    let (status, body) = apply(&app, &token, &id, improve).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = &body["plan"]["patch_details"][0];
+    assert_eq!(detail["name"], "researcher", "{body}");
+    assert_eq!(
+        detail["fields"].as_array().unwrap(),
+        &vec![json!("system_prompt")],
+        "only the field that changed may be written: {body}"
     );
 }

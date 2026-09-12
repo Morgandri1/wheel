@@ -26,6 +26,9 @@ const FEATURES: &[&str] = &[
     "ephemeral_context",
     "budgets",
     "oauth_paste_code",
+    // The Workflow Builder conversation route, so a client can tell a build that has it from
+    // one that does not before offering the panel at all.
+    "builder",
     "oauth_refresh",
 ];
 
@@ -204,6 +207,7 @@ mod tests {
                 "ephemeral_context",
                 "budgets",
                 "oauth_paste_code",
+                "builder",
                 "oauth_refresh",
             ]
         );
@@ -319,6 +323,12 @@ mod tests {
             "idle_parking" => AgentField("idle_timeout_secs", "60"),
             "ephemeral_context" => AgentField("ephemeral_context", "true"),
             "budgets" => AgentField("budget", r#"{"max_turns": 3, "max_usd": 1.5}"#),
+            "builder" => Routes(&[
+                ("POST", "/v1/builder/turns"),
+                ("GET", "/v1/builder/credential"),
+                ("PUT", "/v1/builder/credential"),
+                ("DELETE", "/v1/builder/credential"),
+            ]),
             "oauth_paste_code" => Routes(&[
                 ("POST", "/v1/agents/{id}/auth/begin"),
                 ("POST", "/v1/agents/{id}/auth/complete"),

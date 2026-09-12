@@ -165,6 +165,8 @@ export function templateToProposal(board: TemplateBoard): Proposal {
       wires: [],
     })),
     wires: board.wires.map((w) => ({ from: w.from, to: w.to, type: w.type })),
+    // A template only ever creates: it has no board to remove anything from.
+    remove: { nodes: [], wires: [] },
   };
 }
 
@@ -191,6 +193,10 @@ function normaliseReport(r: unknown): ApplyReport {
     created_nodes: Array.isArray(c.created_nodes) ? c.created_nodes.filter((n) => typeof n === "string") : [],
     patched_nodes: Array.isArray(c.patched_nodes) ? c.patched_nodes.filter((n) => typeof n === "string") : [],
     created_wires: Array.isArray(c.created_wires) ? c.created_wires.filter(isPlanWire) : [],
+    // A template only ever creates, so these are always empty here — present because the report
+    // shape is one shape, and a reader that special-cases this route would drift from it.
+    deleted_nodes: Array.isArray(c.deleted_nodes) ? c.deleted_nodes.filter((n) => typeof n === "string") : [],
+    deleted_wires: Array.isArray(c.deleted_wires) ? c.deleted_wires.filter(isPlanWire) : [],
     failures: Array.isArray(c.failures) ? (c.failures as ApplyReport["failures"]) : [],
   };
 }

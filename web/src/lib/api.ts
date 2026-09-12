@@ -17,7 +17,7 @@
 import { ApiError, notifyUnauthorized } from "@/lib/auth";
 import { projectPath, withQuery } from "@/lib/api-paths";
 import type { LogStreamName } from "@/lib/schema";
-import { readOutcome, type ApplyOutcome } from "@/lib/board-apply";
+import { readOutcome, type ApplyGrants, type ApplyOutcome } from "@/lib/board-apply";
 import { readInstantiateOutcome, type InstantiateOutcome, type TemplateBoard } from "@/lib/templates";
 import type {
   AuthBegin,
@@ -137,6 +137,8 @@ export async function applyBoard(
   projectId: string,
   board: unknown,
   dryRun: boolean,
+  /** The consents the user granted, and the plan they granted them against. */
+  options: { grants?: ApplyGrants; expectPlan?: string | null } = {},
 ): Promise<ApplyOutcome> {
   const path = projectPath(projectId, "board", "apply");
   if (path === null) throw refusedPath();
@@ -144,7 +146,14 @@ export async function applyBoard(
     method: "POST",
     headers: { "x-project-id": projectId, "content-type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ board, dry_run: dryRun }),
+    body: JSON.stringify({
+      board,
+      dry_run: dryRun,
+      ...(options.grants ?? {}),
+      // Sent whenever we have one: the server requires it for anything destructive, and sending it
+      // on every apply means a board that moved is caught rather than quietly re-planned.
+      ...(options.expectPlan ? { expect_plan: options.expectPlan } : {}),
+    }),
   });
   if (res.status === 401) notifyUnauthorized();
   let body: unknown = null;

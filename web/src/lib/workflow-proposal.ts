@@ -22,6 +22,15 @@ export interface Proposal {
   nodes: ProposedNode[];
   /** Flattened for rendering and for the apply step, which creates nodes before wires. */
   wires: { from: string; to: string; type: WireType }[];
+  /** What the builder asks to take away. Never inferred from what it left out. */
+  remove: { nodes: string[]; wires: { from: string; to: string; type: WireType }[] };
+}
+
+/** A node already on the board, so an improve proposal can be read against it. */
+export interface KnownNode {
+  id: string;
+  name: string;
+  type: NodeType;
 }
 
 export type ProposalResult =
@@ -51,7 +60,11 @@ export function extractBlock(text: string): { status: "none" | "unterminated" } 
   return { status: "ok", json: text.slice(after, end).trim() };
 }
 
-export function parseProposal(text: string): ProposalResult {
+/**
+ * @param known Nodes already on the board. An improve proposal emits only what it CHANGES, and
+ * wires at existing nodes by id, so without this every such wire reads as pointing at nothing.
+ */
+export function parseProposal(text: string, known: KnownNode[] = []): ProposalResult {
   const block = extractBlock(text);
   if (block.status !== "ok") return { status: block.status };
 
@@ -69,6 +82,11 @@ export function parseProposal(text: string): ProposalResult {
   const nodes: ProposedNode[] = [];
   const byId = new Map<string, ProposedNode>();
   const names = new Set<string>();
+  // Existing nodes are addressable but not re-declared: a wire may name one, and a name that is
+  // already taken is a CHANGE to that node rather than a duplicate.
+  const existingById = new Map(known.map((n) => [n.id, n]));
+  const existingByName = new Map(known.map((n) => [n.name, n]));
+  const typeOf = (ref: ProposedNode | KnownNode) => ref.type;
 
   parsed.nodes.forEach((raw: unknown, i: number) => {
     const where = `node ${i + 1}`;
@@ -86,7 +104,10 @@ export function parseProposal(text: string): ProposalResult {
       problems.push(`${where} has an unknown type "${String(raw.type)}".`);
       return;
     }
-    const nameProblem = validateNodeName(name, [...names]);
+    // A name that belongs to an existing node is that node; only a collision WITHIN the proposal
+    // is a duplicate.
+    const taken = existingByName.has(name) ? [...names] : [...names, ...existingByName.keys()];
+    const nameProblem = validateNodeName(name, taken.filter((n) => n !== name).concat([...names]));
     if (nameProblem) problems.push(`${where} ("${name}"): ${nameProblem}`);
     names.add(name);
 
@@ -116,7 +137,8 @@ export function parseProposal(text: string): ProposalResult {
         problems.push(`node ${i + 1} has a wire that is not an object.`);
         return;
       }
-      const to = byId.get(typeof w.to === "string" ? w.to : "");
+      const id = typeof w.to === "string" ? w.to : "";
+      const to = byId.get(id) ?? existingById.get(id);
       const type = w.type as WireType;
       if (!to) {
         problems.push(`"${from.name}" has a wire to an id that is not in this workflow.`);
@@ -124,9 +146,9 @@ export function parseProposal(text: string): ProposalResult {
       }
       // The same default-DENY matrix the engine enforces. Catching it here means the user sees the
       // refusal in the preview instead of a half-applied board.
-      if (!isWireAllowed(from.type, to.type, type)) {
+      if (!isWireAllowed(from.type, typeOf(to), type)) {
         problems.push(
-          `"${from.name}" (${from.type}) → "${to.name}" (${to.type}) as \`${String(type)}\` is not an allowed wire.`,
+          `"${from.name}" (${from.type}) → "${to.name}" (${typeOf(to)}) as \`${String(type)}\` is not an allowed wire.`,
         );
         return;
       }
@@ -135,9 +157,61 @@ export function parseProposal(text: string): ProposalResult {
     });
   });
 
+  const remove = readRemovals(parsed.remove, known, problems);
+
   if (problems.length) return { status: "invalid", problems };
 
-  return { status: "ok", proposal: { nodes, wires }, warnings: capabilityWarnings(nodes) };
+  return {
+    status: "ok",
+    proposal: { nodes, wires, remove },
+    warnings: capabilityWarnings(nodes).concat(removalWarnings(remove, known)),
+  };
+}
+
+/**
+ * The `remove` block, which is the ONLY way a proposal takes something away — a node the builder
+ * simply stopped mentioning is left alone, here and at the server.
+ */
+function readRemovals(
+  raw: unknown,
+  known: KnownNode[],
+  problems: string[],
+): Proposal["remove"] {
+  const empty = { nodes: [] as string[], wires: [] as Proposal["wires"] };
+  if (raw === undefined) return empty;
+  if (!isRecord(raw)) {
+    problems.push("`remove` is not an object.");
+    return empty;
+  }
+  const names = new Set(known.map((n) => n.name));
+  const nodes = (Array.isArray(raw.nodes) ? raw.nodes : []).flatMap((n: unknown) => {
+    if (typeof n !== "string") {
+      problems.push("`remove.nodes` must name nodes.");
+      return [];
+    }
+    if (!names.has(n)) {
+      problems.push(`The builder asks to remove "${n}", which is not on this board.`);
+      return [];
+    }
+    return [n];
+  });
+  const wires = (Array.isArray(raw.wires) ? raw.wires : []).flatMap((w: unknown) => {
+    if (!isRecord(w) || typeof w.from !== "string" || typeof w.to !== "string") {
+      problems.push("`remove.wires` must name wires as {from, to, type}.");
+      return [];
+    }
+    return [{ from: w.from, to: w.to, type: w.type as WireType }];
+  });
+  return { nodes, wires };
+}
+
+/** Removals are shown as warnings in the preview too: the plan is the gate, this is the heads-up. */
+function removalWarnings(remove: Proposal["remove"], known: KnownNode[]): string[] {
+  const typeOf = new Map(known.map((n) => [n.name, n.type]));
+  return remove.nodes.map((name) => {
+    const type = typeOf.get(name);
+    return `"${name}"${type ? ` (${type})` : ""} would be REMOVED, and what it holds is destroyed.`;
+  });
 }
 
 /**
@@ -153,11 +227,20 @@ export function capabilityWarnings(
 ): string[] {
   const warnings: string[] = [];
   for (const n of nodes) {
+    // Verified against the engine, not assumed: a codex node is REFUSED at creation
+    // (`reject_unsupported_harness`), so this board will not apply at all rather than apply and
+    // sit idle. The others are creatable but inert.
     if (n.type === "agent" && n.config.harness === "codex") {
-      warnings.push(`"${n.name}" uses the codex harness, which is not runnable yet.`);
+      warnings.push(`"${n.name}" uses the codex harness, which the engine refuses — this board will not apply.`);
     }
     if (n.type === "script") {
-      warnings.push(`"${n.name}" is a script node; script execution is not live yet.`);
+      warnings.push(`"${n.name}" is a script node; nothing executes scripts yet, so it will sit there.`);
+    }
+    if (n.type === "chest") {
+      warnings.push(`"${n.name}" is a chest; its storage is not implemented yet, so nothing can read or write it.`);
+    }
+    if (n.type === "mcp") {
+      warnings.push(`"${n.name}" is an mcp node; wiring it to an agent does not attach its tools yet.`);
     }
   }
   return warnings;

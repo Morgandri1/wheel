@@ -30,6 +30,7 @@ use crate::{config::Config, db};
 
 pub mod agent_routes;
 pub mod board_routes;
+pub mod builder_routes;
 pub mod cli_routes;
 mod engine_routes;
 pub mod events_route;
@@ -57,6 +58,8 @@ pub struct AppState {
     /// Logins waiting for a pasted code. Each holds a live child process, so
     /// this is state with a cost and a TTL, not a cache.
     pub logins: Arc<crate::oauth::LoginSessions>,
+    /// Runs Workflow Builder turns, one at a time per project.
+    pub builder: Arc<crate::builder::Builder>,
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
@@ -210,6 +213,13 @@ pub fn router(state: AppState) -> Router {
         .route("/tools/{id}/import", post(tool_routes::reimport))
         .route("/tools/{id}/ops", get(tool_routes::ops))
         .route("/tools/{id}/call", post(tool_routes::call))
+        .route("/builder/turns", post(builder_routes::turns))
+        .route(
+            "/builder/credential",
+            get(builder_routes::credential_status)
+                .put(builder_routes::credential_put)
+                .delete(builder_routes::credential_delete),
+        )
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -460,6 +470,7 @@ pub(crate) fn test_state_with(
         events,
         logins: Arc::new(crate::oauth::LoginSessions::default()),
         ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
+        builder: Arc::new(crate::builder::Builder::default()),
     }
 }
 

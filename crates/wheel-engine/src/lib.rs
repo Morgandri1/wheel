@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod api;
 pub mod auth;
+pub mod builder;
 pub mod caps;
 pub mod config;
 pub mod db;
@@ -105,6 +106,7 @@ pub async fn serve_until(
         events,
         logins: Arc::new(oauth::LoginSessions::default()),
         ingress_rate: Arc::new(api::ingress::RateLimiter::default()),
+        builder: Arc::new(builder::Builder::default()),
     };
     // Before serving: agents configured to run on startup come up parked, and
     // any message left queued by the previous run resumes exactly the agents

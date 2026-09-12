@@ -8,7 +8,7 @@
 //! that do not exist, wire types the matrix forbids, duplicate names, or a node to itself — so
 //! everything here is validation first and creation second.
 //!
-//! Two rules shape the whole module:
+//! Three rules shape the whole module:
 //!
 //! **A refusal is never a drop.** If one wire is illegal the caller is told which wire and why, by
 //! name. Silently skipping it would hand back a board that looks applied and is not what was asked
@@ -22,40 +22,125 @@
 //! decides at creation time — which is why the apply result reports what landed rather than
 //! promising atomicity we cannot deliver here.
 //!
-//! **There is no per-project node cap at any layer today.** An earlier version of this comment said
-//! this step "does not cover per-project caps", which implied a backstop that does not exist:
-//! nothing in the engine counts a project's nodes, and §3e's default-50 is unimplemented and queued
-//! with SDK. `MAX_NODES`/`MAX_WIRES` below bound ONE REQUEST, not a project total, so a caller can
-//! still grow a board without limit an apply at a time. Corrected because a comment promising a
-//! guard that is not there is worse than no comment — it tells the next reader to stop looking.
+//! **Omission never destroys.** A node or wire this board does not mention is left exactly as it
+//! is; removing something requires naming it in `remove`. An LLM that abbreviates ("…the rest is
+//! unchanged") or is talked into leaving a node out by text on the board it is reading would
+//! otherwise be proposing a deletion, and it would read as an innocent updated board.
+//!
+//! **There is no per-project node cap at any layer today.** `MAX_NODES`/`MAX_WIRES` below bound
+//! ONE REQUEST, not a project total, so a caller can still grow a board without limit an apply at
+//! a time.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 use wheel_core::{
-    validate_config_with, validate_name, validate_table_name, wire_allowed, NodeConfig, NodeType,
-    Position, WireType,
+    validate_config_with, validate_name, validate_table_name, wire_allowed, Harness, NodeConfig,
+    NodeType, Position, WireType,
 };
 
 /// A board exactly as the builder emits it.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Both shapes are accepted, because two callers write it two ways and neither is wrong: the
+/// builder nests `wires` on the source node addressed by id (`BUILDER_PROMPT.md`'s contract),
+/// while a template file lists them flat by name. They are normalised to one thing here — before
+/// this, a nested wire was silently ignored and a builder board applied as nodes with NO wires,
+/// reported as a complete success.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EmittedBoard {
     #[serde(default)]
     pub nodes: Vec<EmittedNode>,
     #[serde(default)]
     pub wires: Vec<EmittedWire>,
+    /// What to take away. Never inferred from what the board leaves out.
+    #[serde(default)]
+    pub remove: Removals,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Removals {
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    #[serde(default)]
+    pub wires: Vec<EmittedWire>,
+}
+
+/// A node as emitted, keeping BOTH the typed config (for validation) and the raw one (for the
+/// patch).
+///
+/// The raw copy is load-bearing. Typed deserialisation turns a field the board never wrote into
+/// an explicit default — `run_on_startup: false` — and a merge patch built from that would write
+/// that `false` over a stored `true`. The board's own words are the only safe thing to send.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmittedNode {
     pub name: String,
-    #[serde(flatten)]
     pub config: NodeConfig,
-    #[serde(default)]
+    pub raw_config: serde_json::Value,
     pub position: Position,
+    /// The builder gives every node an id and rewires by it; a template has none.
+    pub id: Option<String>,
+    /// Outgoing wires, addressed by node id.
+    pub wires: Vec<NestedWire>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NestedWire {
+    pub to: String,
+    #[serde(rename = "type")]
+    pub wire_type: WireType,
+}
+
+impl<'de> Deserialize<'de> for EmittedNode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        EmittedNode::from_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl EmittedNode {
+    fn from_value(value: &serde_json::Value) -> Result<Self, String> {
+        let object = value.as_object().ok_or("a node must be a json object")?;
+        let name = object
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or("a node needs a name")?
+            .to_string();
+        let raw_config = object
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let typed = serde_json::json!({
+            "type": object.get("type").cloned().unwrap_or(serde_json::Value::Null),
+            "config": raw_config.clone(),
+        });
+        let config: NodeConfig = serde_json::from_value(typed)
+            .map_err(|e| format!("{name:?} is not a node this board can hold: {e}"))?;
+        let position = match object.get("position") {
+            Some(p) => serde_json::from_value(p.clone())
+                .map_err(|e| format!("{name:?} has an unreadable position: {e}"))?,
+            None => Position::default(),
+        };
+        let wires = match object.get("wires") {
+            Some(w) => serde_json::from_value(w.clone())
+                .map_err(|e| format!("{name:?} has an unreadable wire: {e}"))?,
+            None => Vec::new(),
+        };
+        Ok(Self {
+            name,
+            config,
+            raw_config,
+            position,
+            id: object
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(str::to_string),
+            wires,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EmittedWire {
     pub from: String,
     pub to: String,
@@ -67,6 +152,8 @@ pub struct EmittedWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum Refusal {
+    /// The board could not be read at all.
+    MalformedBoard { reason: String },
     /// Two emitted nodes share a name, so a wire naming it is ambiguous.
     DuplicateNodeName { name: String },
     /// A wire names a node that is neither emitted nor already on the board.
@@ -78,40 +165,27 @@ pub enum Refusal {
     /// A node wired to itself.
     SelfWire { node: String },
     /// An emitted node reuses the name of an existing node of a DIFFERENT type.
-    ///
-    /// Refused rather than resolved. Treating it as a patch was silently false — the engine rejects
-    /// a type change, so the apply died mid-way with a confusing partial board; and either
-    /// precedence rule (emitted wins / existing wins) silently validates the board's wires against
-    /// a type one side does not agree with. There is no answer here that is not a guess about what
-    /// the builder meant, so the caller is told.
     NodeTypeMismatch {
         name: String,
         existing_type: NodeType,
         emitted_type: NodeType,
     },
-    /// The board names a node that already exists, and this apply may only create.
+    /// The board keeps an existing node's id but gives it another name.
     ///
-    /// The default is create-only on purpose. A builder-emitted board that merely MENTIONS an
-    /// existing node would otherwise modify it, and "the LLM named it" is not consent. Patching is
-    /// opt-in per apply, and the refusal names every node it would have touched so the caller can
-    /// show the user exactly what they are being asked to allow.
+    /// Refused rather than guessed. By id it is a rename; by name it is a new node beside an
+    /// orphan, and one of those two readings quietly abandons whatever the old name held.
+    RenameNotSupported {
+        id: String,
+        existing_name: String,
+        emitted_name: String,
+    },
+    /// The board names a node that already exists, and this apply may only create.
     PatchNotPermitted { name: String },
     /// The wire attaches to a node that already exists, and this apply may not rewire.
-    ///
-    /// A WIRE IS THE CAPABILITY. Wiring an existing node changes what it can do — or what can reach
-    /// it — without touching a byte of its config, so create-only protected the wrong half until
-    /// ADVERSARY 050. `ctx -> agent (send)` injects into that agent's prompt permanently;
-    /// `agent -> vault (read)` hands it secrets it did not have; an `auth:none` endpoint wired to an
-    /// agent puts the public internet on its inbox. None of those edit the node.
-    ///
-    /// Both directions count: an inbound wire adds a channel into the node, an outbound one grants
-    /// it a new reach. Only a wire between two nodes this same board is CREATING is consent-free,
-    /// because nothing pre-existing is being changed.
     WireTouchesExistingNode {
         from: String,
         to: String,
         wire_type: WireType,
-        /// The endpoint(s) that already exist — what the user is being asked to allow.
         existing: Vec<String>,
     },
     /// The board is larger than the apply step will attempt.
@@ -129,23 +203,47 @@ pub enum Refusal {
         to_type: NodeType,
         wire_type: WireType,
     },
-    /// A node's name fails the §3 name contract — charset, length, a reserved word, or, for a
-    /// `table` node specifically, the stricter table-name rule (it becomes `t_<name>` in sqlite).
-    ///
-    /// The engine enforces this on create; before now this step did not, so a bad name passed
-    /// pre-validation and only failed live, at the actual engine call — the exact
-    /// "looks-validated-but-isn't" gap this module otherwise exists to close.
+    /// A node's name fails the §3 name contract.
     InvalidName { name: String, reason: String },
-    /// A node's config fails `wheel_core::validate_config_with` — an SSRF-denied tool `base_url`,
-    /// an over-long agent system prompt, a malformed vault key, and so on. Same gap as
-    /// `InvalidName`: the engine already refuses these at create, this step did not until now.
+    /// A node's config fails `wheel_core::validate_config_with`.
     InvalidConfig { name: String, reason: String },
+    /// The harness this build cannot run. The engine refuses a `codex` node at creation, so
+    /// without this the board passed the preview and then died halfway through applying.
+    UnsupportedHarness { name: String, harness: String },
+    /// `remove` names a node that is not on the board.
+    RemoveUnknownNode { name: String },
+    /// `remove` names a wire that is not on the board.
+    RemoveUnknownWire {
+        from: String,
+        to: String,
+        wire_type: WireType,
+    },
+    /// The same node is both changed and removed.
+    ConflictingChange { name: String },
+    /// A wire would attach to a node this same board removes.
+    WireToRemovedNode {
+        from: String,
+        to: String,
+        wire_type: WireType,
+        removed: String,
+    },
+    /// Removing a node destroys what it holds, and this apply was not given that consent.
+    DeleteNotPermitted { name: String, node_type: NodeType },
+    /// Removing a wire takes a capability away, and this apply was not given that consent.
+    UnwireNotPermitted {
+        from: String,
+        to: String,
+        wire_type: WireType,
+    },
 }
 
 impl Refusal {
     /// One line a person can act on, naming the node or wire at fault.
     pub fn message(&self) -> String {
         match self {
+            Refusal::MalformedBoard { reason } => {
+                format!("the board could not be read: {reason}")
+            }
             Refusal::DuplicateNodeName { name } => {
                 format!("two nodes are both named {name:?}; names must be unique on a board")
             }
@@ -159,6 +257,11 @@ impl Refusal {
                  rename one of them — a node's type cannot be changed",
                 existing_type.as_str(),
                 emitted_type.as_str()
+            ),
+            Refusal::RenameNotSupported { id, existing_name, emitted_name } => format!(
+                "the board keeps node {id}'s id but calls it {emitted_name:?} instead of \
+                 {existing_name:?}; renaming is not something this step can apply — keep the \
+                 existing name, or add a new node and remove the old one"
             ),
             Refusal::PatchNotPermitted { name } => format!(
                 "{name:?} is already on the board and this apply may only create nodes; \
@@ -191,81 +294,174 @@ impl Refusal {
             Refusal::InvalidConfig { name, reason } => {
                 format!("{name:?}'s config is invalid: {reason}")
             }
+            Refusal::UnsupportedHarness { name, harness } => format!(
+                "{name:?} uses the {harness:?} harness, which this engine refuses to create; \
+                 use claude"
+            ),
+            Refusal::RemoveUnknownNode { name } => format!(
+                "the board asks to remove {name:?}, which is not on this board"
+            ),
+            Refusal::RemoveUnknownWire { from, to, wire_type } => format!(
+                "the board asks to remove the wire {from:?} -> {to:?} ({}), which is not on this \
+                 board",
+                wire_type.as_str()
+            ),
+            Refusal::ConflictingChange { name } => format!(
+                "the board both changes and removes {name:?}; it can do one or the other"
+            ),
+            Refusal::WireToRemovedNode { from, to, wire_type, removed } => format!(
+                "the wire {from:?} -> {to:?} ({}) attaches to {removed:?}, which this same board \
+                 removes",
+                wire_type.as_str()
+            ),
+            Refusal::DeleteNotPermitted { name, node_type } => format!(
+                "removing the {} {name:?} destroys what it holds, and this apply may not remove \
+                 anything; allow removals to do it",
+                node_type.as_str()
+            ),
+            Refusal::UnwireNotPermitted { from, to, wire_type } => format!(
+                "removing the wire {from:?} -> {to:?} ({}) takes a capability away, and this apply \
+                 may not remove wires; allow unwiring to do it",
+                wire_type.as_str()
+            ),
         }
     }
 }
 
-/// What applying the board would do, once it is known to be legal.
+/// An existing node whose config a patch is diffed against.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Plan {
-    /// Nodes that do not exist yet.
-    pub create_nodes: Vec<EmittedNode>,
-    /// Nodes that exist and whose config the board changes. Sent as a MERGE patch, so fields the
-    /// board does not mention keep their current values (RFC 7386, enforced engine-side).
-    pub patch_nodes: Vec<EmittedNode>,
-    /// Wires the board adds. Wires that already exist are not re-created.
-    pub create_wires: Vec<EmittedWire>,
-}
-
-impl Plan {
-    pub fn is_empty(&self) -> bool {
-        self.create_nodes.is_empty() && self.patch_nodes.is_empty() && self.create_wires.is_empty()
-    }
-}
-
-/// A node already on the board, as the apply step needs to see it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExistingNode {
     pub id: Uuid,
     pub node_type: NodeType,
+    /// The node's CURRENT config, so a patch can be the difference rather than a rewrite.
+    pub config: serde_json::Value,
+}
+
+impl ExistingNode {
+    /// An existing node whose config is not known — used where only identity matters.
+    pub fn new(id: Uuid, node_type: NodeType) -> Self {
+        Self {
+            id,
+            node_type,
+            config: serde_json::Value::Null,
+        }
+    }
 }
 
 /// What is already on the board, as the apply step needs to see it.
 #[derive(Debug, Clone, Default)]
 pub struct ExistingBoard {
-    /// name -> id and type. The id is why this is not just a type map: wires are created by id, and
-    /// an existing node is patched by id.
     pub nodes: HashMap<String, ExistingNode>,
-    /// Wires already present, so applying the same board twice adds nothing.
     pub wires: Vec<(String, String, WireType)>,
+}
+
+impl ExistingBoard {
+    fn name_of(&self, id: &str) -> Option<&String> {
+        self.nodes
+            .iter()
+            .find(|(_, node)| node.id.to_string() == id)
+            .map(|(name, _)| name)
+    }
+}
+
+/// A node the plan will change, with the patch it will send.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PatchNode {
+    pub name: String,
+    #[serde(skip)]
+    pub id: Uuid,
+    /// The minimal merge patch: only the top-level keys whose value actually changes.
+    pub config: serde_json::Value,
+    /// Which fields those are, so the confirm step can say what changes rather than "it changes".
+    pub fields: Vec<String>,
+    /// Fields where a whole list is replaced. RFC 7386 has no element-wise array merge, so this is
+    /// the one shape a user has to see coming: `workspaces` going from two entries to one is a
+    /// loss, and it looks identical to an edit in every other respect.
+    pub replaced_arrays: Vec<String>,
+}
+
+/// A node the plan will remove, and what goes with it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeleteNode {
+    pub name: String,
+    #[serde(skip)]
+    pub id: Uuid,
+    #[serde(rename = "type")]
+    pub node_type: NodeType,
+    /// Wires that go when the node does. Shown under the node rather than as separate unwires,
+    /// because they are a consequence of the deletion and not a second decision.
+    pub wires: Vec<WireRef>,
+}
+
+/// What applying the board would do, once it is known to be legal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    pub create_nodes: Vec<EmittedNode>,
+    pub patch_nodes: Vec<PatchNode>,
+    pub create_wires: Vec<EmittedWire>,
+    pub delete_wires: Vec<EmittedWire>,
+    pub delete_nodes: Vec<DeleteNode>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.create_nodes.is_empty()
+            && self.patch_nodes.is_empty()
+            && self.create_wires.is_empty()
+            && self.delete_wires.is_empty()
+            && self.delete_nodes.is_empty()
+    }
+
+    pub fn destroys(&self) -> bool {
+        !self.delete_nodes.is_empty() || !self.delete_wires.is_empty()
+    }
+
+    /// A fingerprint of exactly what this plan would do, so consent can be bound to it.
+    ///
+    /// The board can change between the preview a user approved and the apply they pressed — by
+    /// another tab, an agent, or the builder running again. Without this, the apply would go ahead
+    /// with a plan recomputed against a board nobody looked at, and for a deletion that is the
+    /// difference between removing what was shown and removing something else.
+    pub fn digest(&self) -> String {
+        let shape = serde_json::json!({
+            "create_nodes": self.create_nodes.iter().map(|n| &n.name).collect::<Vec<_>>(),
+            "patch_nodes": self.patch_nodes,
+            "create_wires": self.create_wires,
+            "delete_wires": self.delete_wires,
+            "delete_nodes": self.delete_nodes,
+        });
+        format!("{:x}", Sha256::digest(shape.to_string().as_bytes()))
+    }
 }
 
 /// What an apply is permitted to do, beyond being legal.
 ///
-/// Separate from validity: a board can be perfectly well-formed and still ask for more authority
-/// than the caller granted. Defaults to the conservative answer, so a caller that forgets to think
-/// about it gets create-only rather than "modify whatever this board happens to name".
+/// Four separate consents over four different risks. "You may rewrite this agent's prompt", "you
+/// may put a public endpoint on its inbox", "you may take this capability away" and "you may
+/// destroy this table's rows" are not the same permission, and granting one must not grant another.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApplyPolicy {
-    /// Allow the board to modify the CONFIG of nodes that already exist. Off by default.
     pub allow_patch: bool,
-    /// Allow the board to WIRE nodes that already exist. Off by default.
-    ///
-    /// Deliberately separate from `allow_patch` rather than folded into it. They are different
-    /// consents over different risks — "you may rewrite this agent's prompt" is not "you may put a
-    /// public endpoint on its inbox" — and a user granting one should not silently grant the other.
-    /// It also lets the confirm step name them apart: these nodes will be MODIFIED, these existing
-    /// nodes will be WIRED.
     pub allow_wire: bool,
+    /// Allow removing NODES. Destroys what they hold.
+    pub allow_delete: bool,
+    /// Allow removing WIRES. Reversible, but takes a capability away.
+    pub allow_unwire: bool,
 }
 
-/// The most this step will attempt in one apply.
-///
-/// A bound on ONE REQUEST, and — measured, not assumed — the only bound that exists anywhere.
-///
-/// This used to claim "the authoritative per-project limit is engine-side". There is no such limit:
-/// SDK and ADVERSARY both grepped and nothing counts a project's nodes, so §3e's default-50 is
-/// documented rather than implemented. That makes these numbers load-bearing in a way they were not
-/// written to be, and it is worth being plain about what they do NOT do: they cap a single apply,
-/// so a caller may still grow a board indefinitely one apply at a time.
-///
-/// What they do buy: realising a board is one engine call per node and per wire, so an unbounded
-/// board is an unbounded burst at a single project's engine, arriving as a slow partial apply
-/// rather than a refusal anyone can read.
-///
-/// The values are a judgement — generous but bounded — not a measurement.
 pub const MAX_NODES: usize = 200;
 pub const MAX_WIRES: usize = 1000;
+
+/// Read a board that arrived as arbitrary JSON.
+///
+/// A parse failure is a refusal with a reason, not a framework-level 422 with a plain-text body:
+/// the confirm step renders refusals, and "the board was refused" with nothing in it is the shape
+/// that leaves a user with no idea what the builder got wrong.
+pub fn read_board(value: serde_json::Value) -> Result<EmittedBoard, Refusal> {
+    serde_json::from_value(value).map_err(|e| Refusal::MalformedBoard {
+        reason: e.to_string(),
+    })
+}
 
 /// Check an emitted board against the matrix and the current board.
 ///
@@ -279,11 +475,16 @@ pub fn validate(
     let mut refusals = Vec::new();
 
     // Size first, and returned alone: every later check is per-node or per-wire, so an oversized
-    // board would otherwise produce thousands of refusals nobody can read.
-    if board.nodes.len() > MAX_NODES || board.wires.len() > MAX_WIRES {
+    // board would otherwise produce thousands of refusals nobody can read. Removals count — they
+    // are engine calls too.
+    let wire_count = board.wires.len()
+        + board.nodes.iter().map(|n| n.wires.len()).sum::<usize>()
+        + board.remove.wires.len();
+    let node_count = board.nodes.len() + board.remove.nodes.len();
+    if node_count > MAX_NODES || wire_count > MAX_WIRES {
         return Err(vec![Refusal::BoardTooLarge {
-            nodes: board.nodes.len(),
-            wires: board.wires.len(),
+            nodes: node_count,
+            wires: wire_count,
             max_nodes: MAX_NODES,
             max_wires: MAX_WIRES,
         }]);
@@ -301,10 +502,7 @@ pub fn validate(
             });
         }
     }
-    // Name and config, per node. Same checks the engine runs on create (§3), run here first so a
-    // bad name or an SSRF-denied tool base_url is refused before anything exists rather than only
-    // failing live at the engine — the CI gate that validates template files offline
-    // (docs/proposals/wow-templates.md §3) depends on this to be authoritative.
+
     for node in &board.nodes {
         let name_check = if node.config.node_type() == NodeType::Table {
             validate_table_name(&node.name)
@@ -318,19 +516,37 @@ pub fn validate(
             });
         }
         // `allow_hosts: &[]` matches production: the engine always runs with an empty SSRF
-        // allowlist (`validate_config_with`'s own doc), so this is the same answer the live
-        // create call would give, not an approximation of it.
+        // allowlist, so this is the same answer the live create call would give.
         if let Err(e) = validate_config_with(&node.config, &[]) {
             refusals.push(Refusal::InvalidConfig {
                 name: node.name.clone(),
                 reason: e.to_string(),
             });
         }
+        // The engine refuses a codex node outright (`reject_unsupported_harness`), so a board
+        // carrying one is refused here rather than allowed to fail halfway through applying.
+        if let NodeConfig::Agent(agent) = &node.config {
+            if agent.harness != Harness::Claude {
+                refusals.push(Refusal::UnsupportedHarness {
+                    name: node.name.clone(),
+                    harness: agent.harness.as_str().to_string(),
+                });
+            }
+        }
+        // An id that belongs to an existing node names THAT node, so the name must agree.
+        if let Some(id) = &node.id {
+            if let Some(existing_name) = existing.name_of(id) {
+                if existing_name != &node.name {
+                    refusals.push(Refusal::RenameNotSupported {
+                        id: id.clone(),
+                        existing_name: existing_name.clone(),
+                        emitted_name: node.name.clone(),
+                    });
+                }
+            }
+        }
     }
 
-    // A name on both sides must agree. Refused above as a guess nobody can justify; and because it
-    // is refused, the resolution order below cannot matter — existing wins, which is the
-    // conservative half of ADVERSARY 049 and makes the invariant obvious rather than incidental.
     for node in &board.nodes {
         if let Some(present) = existing.nodes.get(&node.name) {
             let emitted_type = node.config.node_type();
@@ -347,10 +563,40 @@ pub fn validate(
         types.insert(name.as_str(), node.node_type);
     }
 
-    for wire in &board.wires {
+    // Nested wires are addressed by id; everything below works in names.
+    let (mut wires, mut unresolved) = flatten_wires(board, existing);
+    refusals.append(&mut unresolved);
+    wires.extend(board.wires.iter().cloned());
+
+    // Removals, before wires are judged: a wire to something this board removes is a different
+    // mistake from a wire to something that never existed.
+    let mut removed_nodes: Vec<String> = Vec::new();
+    for name in &board.remove.nodes {
+        match existing.nodes.get(name) {
+            Some(_) => removed_nodes.push(name.clone()),
+            None => refusals.push(Refusal::RemoveUnknownNode { name: name.clone() }),
+        }
+        if board.nodes.iter().any(|n| &n.name == name) {
+            refusals.push(Refusal::ConflictingChange { name: name.clone() });
+        }
+    }
+
+    for wire in &wires {
         if wire.from == wire.to {
             refusals.push(Refusal::SelfWire {
                 node: wire.from.clone(),
+            });
+            continue;
+        }
+        if let Some(removed) = [&wire.from, &wire.to]
+            .into_iter()
+            .find(|n| removed_nodes.contains(n))
+        {
+            refusals.push(Refusal::WireToRemovedNode {
+                from: wire.from.clone(),
+                to: wire.to.clone(),
+                wire_type: wire.wire_type,
+                removed: removed.clone(),
             });
             continue;
         }
@@ -378,23 +624,23 @@ pub fn validate(
         }
     }
 
-    if !refusals.is_empty() {
-        return Err(refusals);
-    }
-
-    let mut create_nodes = Vec::new();
-    let mut patch_nodes = Vec::new();
-    for node in &board.nodes {
-        if existing.nodes.contains_key(&node.name) {
-            if !policy.allow_patch {
-                refusals.push(Refusal::PatchNotPermitted {
-                    name: node.name.clone(),
-                });
-                continue;
-            }
-            patch_nodes.push(node.clone());
-        } else {
-            create_nodes.push(node.clone());
+    // Wires to remove must be wires that exist. Ones that a node deletion already takes are folded
+    // into that deletion rather than attempted twice.
+    let mut delete_wires = Vec::new();
+    for wire in &board.remove.wires {
+        let present = existing
+            .wires
+            .iter()
+            .any(|(f, t, ty)| f == &wire.from && t == &wire.to && *ty == wire.wire_type);
+        let cascaded = removed_nodes.contains(&wire.from) || removed_nodes.contains(&wire.to);
+        if !present {
+            refusals.push(Refusal::RemoveUnknownWire {
+                from: wire.from.clone(),
+                to: wire.to.clone(),
+                wire_type: wire.wire_type,
+            });
+        } else if !cascaded {
+            delete_wires.push(wire.clone());
         }
     }
 
@@ -402,8 +648,79 @@ pub fn validate(
         return Err(refusals);
     }
 
-    let create_wires: Vec<EmittedWire> = board
-        .wires
+    let mut create_nodes = Vec::new();
+    let mut patch_nodes = Vec::new();
+    for node in &board.nodes {
+        match existing.nodes.get(&node.name) {
+            Some(present) => {
+                // Read before write: the patch is the DIFFERENCE against what is stored, and a
+                // node the board re-emits unchanged is not a change at all — so it neither needs
+                // consent nor appears in the plan.
+                let (config, fields, replaced_arrays) =
+                    minimal_patch(&present.config, &node.raw_config);
+                if fields.is_empty() {
+                    continue;
+                }
+                if !policy.allow_patch {
+                    refusals.push(Refusal::PatchNotPermitted {
+                        name: node.name.clone(),
+                    });
+                    continue;
+                }
+                patch_nodes.push(PatchNode {
+                    name: node.name.clone(),
+                    id: present.id,
+                    config,
+                    fields,
+                    replaced_arrays,
+                });
+            }
+            None => create_nodes.push(node.clone()),
+        }
+    }
+
+    let mut delete_nodes = Vec::new();
+    for name in &removed_nodes {
+        let present = &existing.nodes[name];
+        if !policy.allow_delete {
+            refusals.push(Refusal::DeleteNotPermitted {
+                name: name.clone(),
+                node_type: present.node_type,
+            });
+            continue;
+        }
+        delete_nodes.push(DeleteNode {
+            name: name.clone(),
+            id: present.id,
+            node_type: present.node_type,
+            wires: existing
+                .wires
+                .iter()
+                .filter(|(f, t, _)| f == name || t == name)
+                .map(|(f, t, ty)| WireRef {
+                    from: f.clone(),
+                    to: t.clone(),
+                    wire_type: *ty,
+                })
+                .collect(),
+        });
+    }
+
+    if !policy.allow_unwire {
+        for wire in &delete_wires {
+            refusals.push(Refusal::UnwireNotPermitted {
+                from: wire.from.clone(),
+                to: wire.to.clone(),
+                wire_type: wire.wire_type,
+            });
+        }
+    }
+
+    if !refusals.is_empty() {
+        return Err(refusals);
+    }
+
+    let create_wires: Vec<EmittedWire> = wires
         .iter()
         .filter(|w| {
             !existing
@@ -415,12 +732,8 @@ pub fn validate(
         .collect();
 
     // ADVERSARY 050: a wire is the capability. Attaching one to a node that already exists changes
-    // what that node can do, or what can reach it, without editing its config — so it needs the
-    // same consent that editing it does. Only a wire between two nodes THIS board is creating is
-    // consent-free, because nothing pre-existing is altered.
-    //
-    // Checked after the duplicate filter on purpose: re-applying an unchanged board must stay a
-    // no-op rather than demanding consent for wires that are already there.
+    // what that node can do without editing its config, so it needs the same consent that editing
+    // it does. Checked after the duplicate filter, so re-applying an unchanged board stays a no-op.
     if !policy.allow_wire {
         for wire in &create_wires {
             let touched: Vec<String> = [&wire.from, &wire.to]
@@ -446,24 +759,116 @@ pub fn validate(
         create_nodes,
         patch_nodes,
         create_wires,
+        delete_wires,
+        delete_nodes,
     })
 }
 
-/// The board operations the apply step needs. Narrow on purpose: the `Orchestrator` trait is about
-/// sandbox lifecycle, and a fake of four methods is what makes the executor testable without an
-/// engine.
+/// Nested, id-addressed wires as flat, name-addressed ones.
+///
+/// An id may name a node this board creates or one already on the board — the builder rewires an
+/// existing node by its id. An id that names neither is a refusal, never a dropped wire.
+fn flatten_wires(
+    board: &EmittedBoard,
+    existing: &ExistingBoard,
+) -> (Vec<EmittedWire>, Vec<Refusal>) {
+    let mut by_id: HashMap<&str, &str> = HashMap::new();
+    for node in &board.nodes {
+        if let Some(id) = &node.id {
+            by_id.insert(id.as_str(), node.name.as_str());
+        }
+    }
+
+    let mut wires = Vec::new();
+    let mut refusals = Vec::new();
+    for node in &board.nodes {
+        for wire in &node.wires {
+            let target = by_id
+                .get(wire.to.as_str())
+                .map(|n| (*n).to_string())
+                .or_else(|| existing.name_of(&wire.to).cloned());
+            match target {
+                Some(to) => wires.push(EmittedWire {
+                    from: node.name.clone(),
+                    to,
+                    wire_type: wire.wire_type,
+                }),
+                None => refusals.push(Refusal::UnknownNode {
+                    wire_from: node.name.clone(),
+                    wire_to: wire.to.clone(),
+                    missing: wire.to.clone(),
+                }),
+            }
+        }
+    }
+    (wires, refusals)
+}
+
+/// RFC 7386, the same merge the engine applies, so what is planned is what will be stored.
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(patch_map) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = target.as_object_mut().expect("just made it an object");
+    for (k, v) in patch_map {
+        if v.is_null() {
+            map.remove(k);
+        } else {
+            merge_patch(map.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+        }
+    }
+}
+
+/// The smallest patch that turns `current` into what the board asks for, and what it changes.
+///
+/// Only the top-level keys whose merged value actually differs are sent. A field the board never
+/// mentioned is not in the patch at all, so it keeps its stored value — which is the whole
+/// difference between an improve that edits one prompt and one that resets an agent's config.
+fn minimal_patch(
+    current: &serde_json::Value,
+    emitted: &serde_json::Value,
+) -> (serde_json::Value, Vec<String>, Vec<String>) {
+    let mut desired = current.clone();
+    merge_patch(&mut desired, emitted);
+
+    let mut patch = serde_json::Map::new();
+    let mut fields = Vec::new();
+    let mut replaced_arrays = Vec::new();
+    let empty = serde_json::Map::new();
+    let emitted_keys = emitted.as_object().unwrap_or(&empty);
+
+    for key in emitted_keys.keys() {
+        let before = current.get(key).unwrap_or(&serde_json::Value::Null);
+        let after = desired.get(key).unwrap_or(&serde_json::Value::Null);
+        if before == after {
+            continue;
+        }
+        fields.push(key.clone());
+        if before.is_array() && after.is_array() {
+            replaced_arrays.push(key.clone());
+        }
+        patch.insert(key.clone(), emitted_keys[key].clone());
+    }
+    fields.sort();
+    replaced_arrays.sort();
+    (serde_json::Value::Object(patch), fields, replaced_arrays)
+}
+
+/// The board operations the apply step needs.
 #[async_trait::async_trait]
 pub trait BoardClient: Send + Sync {
     async fn create_node(&self, node: &EmittedNode) -> Result<Uuid, String>;
     async fn patch_config(&self, id: Uuid, config: &serde_json::Value) -> Result<(), String>;
     async fn add_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String>;
+    async fn delete_node(&self, id: Uuid) -> Result<(), String>;
+    async fn delete_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String>;
 }
 
 /// A wire, as a consumer needs it: addressable, not a sentence.
-///
-/// These are rendered on a canvas and highlighted when they fail, so the shape is structured and
-/// the caller formats. An earlier version returned "notes -> researcher (send)" — readable in a log
-/// and useless to a UI that has to find the edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WireRef {
     pub from: String,
@@ -473,7 +878,6 @@ pub struct WireRef {
 }
 
 impl WireRef {
-    /// From an emitted wire, for a preview built outside this module.
     pub fn of_emitted(w: &EmittedWire) -> Self {
         Self::of(w)
     }
@@ -485,7 +889,7 @@ impl WireRef {
             wire_type: w.wire_type,
         }
     }
-    /// The human form, for a `step` label.
+
     fn label(&self) -> String {
         format!("{} -> {} ({})", self.from, self.to, self.wire_type.as_str())
     }
@@ -496,10 +900,8 @@ impl WireRef {
 pub struct Failure {
     pub step: String,
     pub error: String,
-    /// The node this step was about, when it was about one — so a UI can mark it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// The wire this step was about, when it was about one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wire: Option<WireRef>,
 }
@@ -522,9 +924,6 @@ impl Failure {
         }
     }
 
-    /// A step this module does not itself run, reported through the same shape rather than a
-    /// second one — `routes::instantiate` uses these for its capability-patch and sandbox-liveness
-    /// steps, so one failure list, one rendering path, whatever stage a failure came from.
     pub fn step(step: impl Into<String>, error: impl Into<String>) -> Self {
         Self {
             step: step.into(),
@@ -534,13 +933,10 @@ impl Failure {
         }
     }
 
-    /// The sandbox never became reachable, so attempting an apply against it would only produce a
-    /// confusing `engine_unreachable` rather than a useful failure.
     pub fn sandbox_did_not_start() -> Self {
         Self::step("sandbox", "the project engine did not become healthy")
     }
 
-    /// The capability patch (step 4 of the instantiate sequence) failed.
     pub fn capabilities(error: impl Into<String>) -> Self {
         Self::step("capabilities", error)
     }
@@ -552,6 +948,8 @@ pub struct ApplyReport {
     pub created_nodes: Vec<String>,
     pub patched_nodes: Vec<String>,
     pub created_wires: Vec<WireRef>,
+    pub deleted_nodes: Vec<String>,
+    pub deleted_wires: Vec<WireRef>,
     pub failures: Vec<Failure>,
 }
 
@@ -565,14 +963,20 @@ impl ApplyReport {
 
 /// Realise a validated plan.
 ///
-/// Nodes first, then wires, because a wire needs both endpoints to exist. A node that fails to
-/// create takes its wires with it — they are recorded as failures naming the missing endpoint
-/// rather than attempted and rejected by the engine, so the report says why rather than echoing a
-/// 404 the user cannot interpret.
+/// The order is deliberate, and it is the safety property this step can actually offer:
 ///
-/// This is NOT atomic and does not pretend to be: there is no batch route and no transaction across
-/// these calls (see `docs/proposals/apply-step-constraints.md`). What it guarantees is that nothing
-/// ILLEGAL was attempted — `validate` ran first — and that the report names every step that failed.
+/// 1. **unwire**, so capability is taken away before any is added;
+/// 2. **create**, then **patch**, then **wire**, so a wire always has both endpoints;
+/// 3. **delete nodes LAST, and only if everything above succeeded.**
+///
+/// Step 3's condition is the one that matters. Deleting is the only irreversible thing here, and a
+/// half-applied improve that ALSO destroyed what it was replacing is the worst outcome available:
+/// the user would be left with neither the old board nor the new one. So if anything earlier
+/// failed, each planned deletion is reported as a failure that says nothing was destroyed.
+///
+/// This is NOT atomic and does not pretend to be. What it guarantees is that nothing ILLEGAL was
+/// attempted, that the report names every step that failed, and that a failure never escalates
+/// into data loss.
 pub async fn execute(
     plan: &Plan,
     existing: &ExistingBoard,
@@ -584,6 +988,29 @@ pub async fn execute(
         .iter()
         .map(|(name, n)| (name.clone(), n.id))
         .collect();
+
+    for wire in &plan.delete_wires {
+        let reference = WireRef::of(wire);
+        let (Some(from), Some(to)) = (ids.get(&wire.from).copied(), ids.get(&wire.to).copied())
+        else {
+            report.failures.push(Failure {
+                step: format!("remove wire {}", reference.label()),
+                error: "one end of this wire is no longer on the board".into(),
+                node: None,
+                wire: Some(reference),
+            });
+            continue;
+        };
+        match client.delete_wire(from, to, wire.wire_type).await {
+            Ok(()) => report.deleted_wires.push(reference),
+            Err(error) => report.failures.push(Failure {
+                step: format!("remove wire {}", reference.label()),
+                error,
+                node: None,
+                wire: Some(reference),
+            }),
+        }
+    }
 
     for node in &plan.create_nodes {
         match client.create_node(node).await {
@@ -600,21 +1027,10 @@ pub async fn execute(
     }
 
     for node in &plan.patch_nodes {
-        let Some(id) = ids.get(&node.name).copied() else {
-            report.failures.push(Failure::node(
-                &node.name,
-                format!("patch node {:?}", node.name),
-                "the node is no longer on the board".into(),
-            ));
-            continue;
-        };
-        // Only `config` is sent, so the merge leaves name and position alone; and because the
-        // engine merges rather than replaces, fields this board never mentioned keep their values.
-        let config = serde_json::json!({ "config": serde_json::to_value(&node.config)
-            .ok()
-            .and_then(|v| v.get("config").cloned())
-            .unwrap_or(serde_json::Value::Null) });
-        match client.patch_config(id, &config).await {
+        // Only `config` is sent, so the merge leaves name and position alone; and the body is the
+        // difference computed against what was stored, not a re-serialised whole.
+        let body = serde_json::json!({ "config": node.config });
+        match client.patch_config(node.id, &body).await {
             Ok(()) => report.patched_nodes.push(node.name.clone()),
             Err(error) => report.failures.push(Failure::node(
                 &node.name,
@@ -645,9 +1061,28 @@ pub async fn execute(
         }
     }
 
+    let something_failed = !report.failures.is_empty();
+    for node in &plan.delete_nodes {
+        if something_failed {
+            report.failures.push(Failure::node(
+                &node.name,
+                format!("remove node {:?}", node.name),
+                "not removed: an earlier step failed, so nothing was destroyed".into(),
+            ));
+            continue;
+        }
+        match client.delete_node(node.id).await {
+            Ok(()) => report.deleted_nodes.push(node.name.clone()),
+            Err(error) => report.failures.push(Failure::node(
+                &node.name,
+                format!("remove node {:?}", node.name),
+                error,
+            )),
+        }
+    }
+
     report
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +1110,9 @@ mod tests {
         fail_wire: bool,
         created: std::sync::Mutex<Vec<String>>,
         patched: std::sync::Mutex<Vec<Uuid>>,
+        patch_bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+        deleted_nodes: std::sync::Mutex<Vec<Uuid>>,
+        deleted_wires: std::sync::Mutex<Vec<(Uuid, Uuid, WireType)>>,
     }
     impl FakeClient {
         fn new() -> Self {
@@ -683,6 +1121,9 @@ mod tests {
                 fail_wire: false,
                 created: std::sync::Mutex::new(Vec::new()),
                 patched: std::sync::Mutex::new(Vec::new()),
+                patch_bodies: std::sync::Mutex::new(Vec::new()),
+                deleted_nodes: std::sync::Mutex::new(Vec::new()),
+                deleted_wires: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -695,8 +1136,17 @@ mod tests {
             self.created.lock().unwrap().push(node.name.clone());
             Ok(Uuid::new_v4())
         }
-        async fn patch_config(&self, id: Uuid, _c: &serde_json::Value) -> Result<(), String> {
+        async fn patch_config(&self, id: Uuid, c: &serde_json::Value) -> Result<(), String> {
             self.patched.lock().unwrap().push(id);
+            self.patch_bodies.lock().unwrap().push(c.clone());
+            Ok(())
+        }
+        async fn delete_node(&self, id: Uuid) -> Result<(), String> {
+            self.deleted_nodes.lock().unwrap().push(id);
+            Ok(())
+        }
+        async fn delete_wire(&self, f: Uuid, t: Uuid, w: WireType) -> Result<(), String> {
+            self.deleted_wires.lock().unwrap().push((f, t, w));
             Ok(())
         }
         async fn add_wire(&self, _f: Uuid, _t: Uuid, _w: WireType) -> Result<(), String> {
@@ -720,6 +1170,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -745,6 +1196,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -778,6 +1230,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -810,6 +1263,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -832,17 +1286,11 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: researcher,
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(researcher, NodeType::Agent),
         );
         existing.nodes.insert(
             "untouched".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Ctx,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Ctx),
         );
 
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
@@ -852,6 +1300,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -877,10 +1326,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "notes".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         // The board calls "notes" a ctx; the board already has an AGENT by that name.
         let b = board(serde_json::json!({"nodes": [ctx("notes")], "wires": []}));
@@ -907,10 +1353,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
 
@@ -920,6 +1363,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("same type is legal");
@@ -937,10 +1381,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "secrets".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Vault,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Vault),
         );
         // Emitted as a ctx, so ctx->agent send would LOOK legal if the emitted type won.
         let b = board(serde_json::json!({
@@ -1008,10 +1449,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
 
@@ -1037,10 +1475,7 @@ mod tests {
         for name in ["a", "b"] {
             existing.nodes.insert(
                 name.into(),
-                ExistingNode {
-                    id: Uuid::new_v4(),
-                    node_type: NodeType::Agent,
-                },
+                ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
             );
         }
         let b = board(serde_json::json!({"nodes": [agent("a"), agent("b")], "wires": []}));
@@ -1062,10 +1497,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({"nodes": [agent("researcher")], "wires": []}));
 
@@ -1075,6 +1507,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("opted in");
@@ -1092,10 +1525,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "pm".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         // The escalation from the finding: a new ctx, wired into an existing agent's prompt.
         let b = board(serde_json::json!({
@@ -1124,10 +1554,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "pm".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({
             "nodes": [vault("secrets")],
@@ -1162,10 +1589,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "pm".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({
             "nodes": [ctx("evil")],
@@ -1177,6 +1601,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: false,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("opted in");
@@ -1190,10 +1615,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "pm".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({
             "nodes": [ctx("evil")],
@@ -1205,6 +1627,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: false,
+                ..Default::default()
             },
         )
         .expect_err("allow_patch must not imply allow_wire");
@@ -1221,17 +1644,11 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "notes".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Ctx,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Ctx),
         );
         existing.nodes.insert(
             "pm".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         existing
             .wires
@@ -1416,10 +1833,7 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         let b = board(serde_json::json!({
             "nodes": [ctx("notes")],
@@ -1431,6 +1845,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: false,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal against the current board, once wiring is permitted");
@@ -1446,17 +1861,11 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         existing.nodes.insert(
             "untouched".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Ctx,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Ctx),
         );
 
         let b = board(serde_json::json!({
@@ -1469,6 +1878,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -1477,13 +1887,15 @@ mod tests {
         assert_eq!(plan.patch_nodes[0].name, "researcher");
         assert_eq!(plan.create_nodes.len(), 1);
         assert_eq!(plan.create_nodes[0].name, "new-notes");
+        let named: Vec<&str> = plan
+            .create_nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .chain(plan.patch_nodes.iter().map(|n| n.name.as_str()))
+            .collect();
         assert!(
-            !plan
-                .create_nodes
-                .iter()
-                .chain(&plan.patch_nodes)
-                .any(|n| n.name == "untouched"),
-            "a node the board never mentioned appeared in the plan"
+            !named.contains(&"untouched"),
+            "a node the board never mentioned appeared in the plan: {named:?}"
         );
     }
 
@@ -1493,17 +1905,11 @@ mod tests {
         let mut existing = ExistingBoard::default();
         existing.nodes.insert(
             "notes".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Ctx,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Ctx),
         );
         existing.nodes.insert(
             "researcher".into(),
-            ExistingNode {
-                id: Uuid::new_v4(),
-                node_type: NodeType::Agent,
-            },
+            ExistingNode::new(Uuid::new_v4(), NodeType::Agent),
         );
         existing
             .wires
@@ -1519,6 +1925,7 @@ mod tests {
             ApplyPolicy {
                 allow_patch: true,
                 allow_wire: true,
+                ..Default::default()
             },
         )
         .expect("legal");
@@ -1537,6 +1944,590 @@ mod tests {
             validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
                 .expect("legal")
                 .is_empty()
+        );
+    }
+
+    // --- the builder's own board shape -------------------------------------
+
+    /// The defect this whole path was built on: the builder nests wires on the node, addressed by
+    /// id (`BUILDER_PROMPT.md`), and a flat-only reader ignored them silently. Every builder board
+    /// applied as nodes with NO wires and reported `applied: true`.
+    #[test]
+    fn a_builders_nested_wires_reach_the_plan() {
+        let b = board(serde_json::json!({
+            "project": {"id": "3f1a2b9c-0d4e-4a6b-8c1d-2e3f4a5b6c7d"},
+            "nodes": [
+                {"id": "11111111-1111-4111-8111-111111111111", "name": "notes", "type": "ctx",
+                 "config": {"markdown": "n"},
+                 "wires": [{"to": "22222222-2222-4222-8222-222222222222", "type": "send"}]},
+                {"id": "22222222-2222-4222-8222-222222222222", "name": "worker", "type": "agent",
+                 "config": {"harness": "claude", "system_prompt": "p"}, "wires": []}
+            ]
+        }));
+        let plan = validate(&b, &ExistingBoard::default(), ApplyPolicy::default()).expect("legal");
+        assert_eq!(plan.create_nodes.len(), 2);
+        assert_eq!(
+            plan.create_wires.len(),
+            1,
+            "the nested wire was dropped: {plan:?}"
+        );
+        assert_eq!(plan.create_wires[0].from, "notes");
+        assert_eq!(plan.create_wires[0].to, "worker");
+    }
+
+    /// A nested wire naming an id that is nowhere is a REFUSAL. Dropping it would hand back a
+    /// board that looks applied and is missing a connection nobody mentioned.
+    #[test]
+    fn a_nested_wire_to_an_unknown_id_is_refused_rather_than_dropped() {
+        let b = board(serde_json::json!({
+            "nodes": [{"id": "11111111-1111-4111-8111-111111111111", "name": "notes", "type": "ctx",
+                       "config": {"markdown": "n"},
+                       "wires": [{"to": "99999999-9999-4999-8999-999999999999", "type": "send"}]}]
+        }));
+        let refusals = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("an unresolvable wire must be refused");
+        assert!(
+            matches!(refusals[0], Refusal::UnknownNode { .. }),
+            "{:?}",
+            refusals[0]
+        );
+    }
+
+    /// Improve rewires an EXISTING node by the id the builder was shown.
+    #[test]
+    fn a_nested_wire_may_name_a_node_already_on_the_board_by_its_id() {
+        let existing_id = Uuid::new_v4();
+        let mut existing = ExistingBoard::default();
+        existing
+            .nodes
+            .insert("pm".into(), ExistingNode::new(existing_id, NodeType::Agent));
+
+        let b = board(serde_json::json!({
+            "nodes": [{"id": "11111111-1111-4111-8111-111111111111", "name": "notes", "type": "ctx",
+                       "config": {"markdown": "n"},
+                       "wires": [{"to": existing_id.to_string(), "type": "send"}]}]
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_wire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal once wiring an existing node is permitted");
+        assert_eq!(plan.create_wires.len(), 1);
+        assert_eq!(plan.create_wires[0].to, "pm");
+    }
+
+    // --- read before write --------------------------------------------------
+
+    fn existing_agent(config: serde_json::Value) -> (Uuid, ExistingBoard) {
+        let id = Uuid::new_v4();
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "researcher".into(),
+            ExistingNode {
+                id,
+                node_type: NodeType::Agent,
+                config,
+            },
+        );
+        (id, existing)
+    }
+
+    /// The clobber this step used to cause. A typed re-serialisation turns an OMITTED
+    /// `run_on_startup` into an explicit `false`, and the merge writes it over the stored `true`.
+    /// The patch has to be the board's own words, diffed against what is stored.
+    #[test]
+    fn a_patch_never_writes_a_field_the_board_did_not_mention() {
+        let (_, existing) = existing_agent(serde_json::json!({
+            "harness": "claude",
+            "system_prompt": "old",
+            "run_on_startup": true,
+            "ephemeral_context": true,
+        }));
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "researcher", "type": "agent",
+                       "config": {"harness": "claude", "system_prompt": "new"}}]
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_patch: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+
+        let patch = &plan.patch_nodes[0];
+        assert_eq!(patch.fields, vec!["system_prompt".to_string()]);
+        assert_eq!(patch.config["system_prompt"], "new");
+        assert!(
+            patch.config.get("run_on_startup").is_none(),
+            "a field the board never wrote is in the patch: {}",
+            patch.config
+        );
+        assert!(
+            patch.config.get("ephemeral_context").is_none(),
+            "{}",
+            patch.config
+        );
+    }
+
+    /// An improve that re-states a node unchanged is not a change: it must not appear in the plan
+    /// and must not demand the consent that changing one does.
+    #[test]
+    fn a_node_re_emitted_unchanged_is_not_a_patch_at_all() {
+        let (_, existing) = existing_agent(serde_json::json!({
+            "harness": "claude", "system_prompt": "same", "run_on_startup": true,
+        }));
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "researcher", "type": "agent",
+                       "config": {"harness": "claude", "system_prompt": "same"}}]
+        }));
+        // Create-only: an unchanged node must not be refused for wanting to modify something.
+        let plan =
+            validate(&b, &existing, ApplyPolicy::default()).expect("an unchanged node is a no-op");
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    /// RFC 7386 replaces a whole array, so the one thing a user must see coming is a list getting
+    /// shorter — it looks exactly like any other edit otherwise.
+    #[test]
+    fn replacing_a_whole_list_is_called_out_as_such() {
+        let (_, existing) = existing_agent(serde_json::json!({
+            "harness": "claude",
+            "system_prompt": "p",
+            "workspaces": [{"path": "a", "git": {"url": "https://example.test/a.git"}},
+                           {"path": "b", "git": {"url": "https://example.test/b.git"}}],
+        }));
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "researcher", "type": "agent", "config": {
+                "harness": "claude", "system_prompt": "p",
+                "workspaces": [{"path": "a", "git": {"url": "https://example.test/a.git"}}]
+            }}]
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_patch: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        assert_eq!(
+            plan.patch_nodes[0].replaced_arrays,
+            vec!["workspaces".to_string()]
+        );
+    }
+
+    // --- capability truth ---------------------------------------------------
+
+    /// The engine refuses a codex node at creation, so a board carrying one must be refused here —
+    /// otherwise it previews cleanly and then dies half-applied.
+    #[test]
+    fn a_codex_agent_is_refused_before_anything_is_created() {
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "worker", "type": "agent",
+                       "config": {"harness": "codex", "system_prompt": "p"}}]
+        }));
+        let refusals = validate(&b, &ExistingBoard::default(), ApplyPolicy::default())
+            .expect_err("codex is not runnable");
+        let message = refusals[0].message();
+        assert!(
+            matches!(refusals[0], Refusal::UnsupportedHarness { .. }),
+            "{:?}",
+            refusals[0]
+        );
+        assert!(
+            message.contains("worker") && message.contains("claude"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn keeping_an_existing_id_under_a_new_name_is_refused_rather_than_guessed() {
+        let id = Uuid::new_v4();
+        let mut existing = ExistingBoard::default();
+        existing
+            .nodes
+            .insert("old".into(), ExistingNode::new(id, NodeType::Ctx));
+        let b = board(serde_json::json!({
+            "nodes": [{"id": id.to_string(), "name": "new", "type": "ctx", "config": {"markdown": "m"}}]
+        }));
+        let refusals = validate(&b, &existing, ApplyPolicy::default()).expect_err("a rename");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::RenameNotSupported { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    // --- removals -----------------------------------------------------------
+
+    fn board_with_two() -> ExistingBoard {
+        let mut existing = ExistingBoard::default();
+        existing.nodes.insert(
+            "notes".into(),
+            ExistingNode::new(Uuid::new_v4(), NodeType::Ctx),
+        );
+        existing.nodes.insert(
+            "results".into(),
+            ExistingNode::new(Uuid::new_v4(), NodeType::Table),
+        );
+        existing
+            .wires
+            .push(("notes".into(), "results".into(), WireType::Write));
+        existing
+    }
+
+    /// Omission is not a deletion. A board that simply stops mentioning a node — an LLM
+    /// abbreviating, or one talked into leaving it out — must change nothing.
+    #[test]
+    fn a_node_the_board_stops_mentioning_is_left_alone() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({"nodes": [], "wires": []}));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        assert!(plan.is_empty(), "omission proposed a change: {plan:?}");
+    }
+
+    #[test]
+    fn removing_a_node_needs_its_own_consent_and_names_what_it_destroys() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({"nodes": [], "remove": {"nodes": ["results"]}}));
+
+        let refusals =
+            validate(&b, &existing, ApplyPolicy::default()).expect_err("removing must not be free");
+        match &refusals[0] {
+            Refusal::DeleteNotPermitted { name, node_type } => {
+                assert_eq!(name, "results");
+                assert_eq!(
+                    *node_type,
+                    NodeType::Table,
+                    "the UI says what a table loses"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Granting patching or wiring is NOT granting destruction.
+        assert!(validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_patch: true,
+                allow_wire: true,
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                ..Default::default()
+            },
+        )
+        .expect("with consent");
+        assert_eq!(plan.delete_nodes.len(), 1);
+        assert_eq!(plan.delete_nodes[0].node_type, NodeType::Table);
+        assert_eq!(
+            plan.delete_nodes[0].wires.len(),
+            1,
+            "the wires that go with it are shown under it"
+        );
+    }
+
+    #[test]
+    fn removing_a_wire_needs_its_own_consent_too() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [],
+            "remove": {"wires": [{"from": "notes", "to": "results", "type": "write"}]}
+        }));
+        let refusals = validate(&b, &existing, ApplyPolicy::default()).expect_err("consent");
+        assert!(
+            matches!(refusals[0], Refusal::UnwireNotPermitted { .. }),
+            "{:?}",
+            refusals[0]
+        );
+
+        // Being allowed to DESTROY a node does not imply being allowed to unwire, and vice versa.
+        assert!(validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect("with consent");
+        assert_eq!(plan.delete_wires.len(), 1);
+    }
+
+    #[test]
+    fn a_removal_of_something_that_is_not_there_is_refused() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [],
+            "remove": {"nodes": ["ghost"],
+                       "wires": [{"from": "results", "to": "notes", "type": "read"}]}
+        }));
+        let refusals = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("neither exists");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::RemoveUnknownNode { .. })),
+            "{refusals:?}"
+        );
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::RemoveUnknownWire { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_that_both_changes_and_removes_a_node_is_refused() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "notes", "type": "ctx", "config": {"markdown": "changed"}}],
+            "remove": {"nodes": ["notes"]}
+        }));
+        let refusals = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_patch: true,
+                allow_delete: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("one or the other");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::ConflictingChange { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    #[test]
+    fn a_wire_to_a_node_this_board_removes_is_refused() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "brief", "type": "ctx", "config": {"markdown": "b"}}],
+            "wires": [{"from": "brief", "to": "results", "type": "write"}],
+            "remove": {"nodes": ["results"]}
+        }));
+        let refusals = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                allow_wire: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("wiring something on its way out");
+        assert!(
+            refusals
+                .iter()
+                .any(|r| matches!(r, Refusal::WireToRemovedNode { .. })),
+            "{refusals:?}"
+        );
+    }
+
+    /// A wire that a node deletion already takes must not be attempted twice: the engine cascades
+    /// it, so a second call would fail and turn a clean apply into a reported partial.
+    #[test]
+    fn a_wire_that_the_node_deletion_takes_is_not_removed_twice() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [],
+            "remove": {"nodes": ["results"],
+                       "wires": [{"from": "notes", "to": "results", "type": "write"}]}
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        assert!(plan.delete_wires.is_empty(), "{:?}", plan.delete_wires);
+        assert_eq!(
+            plan.delete_nodes[0].wires.len(),
+            1,
+            "it is shown under the node instead"
+        );
+    }
+
+    // --- execution order ----------------------------------------------------
+
+    async fn plan_with_removals() -> (Plan, ExistingBoard) {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "brief", "type": "ctx", "config": {"markdown": "b"}}],
+            "remove": {"nodes": ["results"]}
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_delete: true,
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        (plan, existing)
+    }
+
+    #[tokio::test]
+    async fn a_removal_that_lands_is_reported_as_one() {
+        let (plan, existing) = plan_with_removals().await;
+        let client = FakeClient::new();
+        let report = execute(&plan, &existing, &client).await;
+        assert!(report.is_complete(), "{report:?}");
+        assert_eq!(report.deleted_nodes, vec!["results".to_string()]);
+        assert_eq!(client.deleted_nodes.lock().unwrap().len(), 1);
+    }
+
+    /// The property that makes removals safe to offer at all: if anything earlier failed, nothing
+    /// is destroyed. A half-applied improve that ALSO deleted what it was replacing would leave
+    /// the user with neither the old board nor the new one.
+    #[tokio::test]
+    async fn nothing_is_destroyed_when_an_earlier_step_failed() {
+        let (plan, existing) = plan_with_removals().await;
+        let mut client = FakeClient::new();
+        client.fail_node = Some("brief".into());
+        let report = execute(&plan, &existing, &client).await;
+
+        assert!(!report.is_complete());
+        assert!(
+            report.deleted_nodes.is_empty(),
+            "a node was destroyed anyway"
+        );
+        assert!(
+            client.deleted_nodes.lock().unwrap().is_empty(),
+            "the delete call was made despite an earlier failure"
+        );
+        let skipped = report
+            .failures
+            .iter()
+            .find(|f| f.node.as_deref() == Some("results"))
+            .expect("the deletion that did not happen is still reported");
+        assert!(
+            skipped.error.contains("nothing was destroyed"),
+            "{skipped:?}"
+        );
+    }
+
+    /// Capability comes off before any goes on, so a failure part-way leaves the board with less
+    /// reach rather than more.
+    #[tokio::test]
+    async fn wires_are_removed_before_anything_is_added() {
+        let existing = board_with_two();
+        let b = board(serde_json::json!({
+            "nodes": [{"name": "brief", "type": "ctx", "config": {"markdown": "b"}}],
+            "remove": {"wires": [{"from": "notes", "to": "results", "type": "write"}]}
+        }));
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_unwire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        let mut client = FakeClient::new();
+        client.fail_node = Some("brief".into());
+        let report = execute(&plan, &existing, &client).await;
+
+        assert_eq!(
+            report.deleted_wires.len(),
+            1,
+            "the unwire must already have happened when the create failed"
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn a_board_that_cannot_be_read_is_refused_with_a_reason() {
+        let refusal = crate::apply::read_board(serde_json::json!({"nodes": [{"name": 7}]}))
+            .expect_err("a node with no type is not a board");
+        assert!(
+            matches!(refusal, Refusal::MalformedBoard { .. }),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.message().contains("could not be read"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// Consent is bound to a plan, so the digest has to move when the plan does and stay put when
+    /// it does not.
+    #[test]
+    fn the_digest_follows_the_plan() {
+        let existing = board_with_two();
+        let remove_one = board(serde_json::json!({"nodes": [], "remove": {"nodes": ["results"]}}));
+        let policy = ApplyPolicy {
+            allow_delete: true,
+            allow_unwire: true,
+            ..Default::default()
+        };
+
+        let first = validate(&remove_one, &existing, policy).unwrap().digest();
+        let again = validate(&remove_one, &existing, policy).unwrap().digest();
+        assert_eq!(first, again, "the same plan must have the same digest");
+
+        let remove_other = board(serde_json::json!({"nodes": [], "remove": {"nodes": ["notes"]}}));
+        let different = validate(&remove_other, &existing, policy).unwrap().digest();
+        assert_ne!(
+            first, different,
+            "removing a different node is a different plan"
         );
     }
 }

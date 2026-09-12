@@ -5,6 +5,7 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { projects as api } from "@/lib/api";
@@ -22,6 +23,7 @@ const STATUS: Record<ProjectStatus, { label: string; color: string; pulse: boole
 
 export default function ProjectsPage() {
   const qc = useQueryClient();
+  const router = useRouter();
   const { data, isPending, error } = useQuery({
     queryKey: ["projects"],
     queryFn: api.list,
@@ -53,6 +55,9 @@ export default function ProjectsPage() {
       setName("");
       invalidate();
       toast(`Created ${p.name}.`);
+      // Straight to the board, where an empty one opens the builder: the point of creating a
+      // project is the workflow, and the list is not where anyone builds one.
+      router.push(`/app/${p.id}`);
     },
     onError: (e) => toastError(e, "Couldn't create that project."),
     onSettled: () => setSlowCreate(false),

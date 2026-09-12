@@ -89,12 +89,43 @@ describe("parseProposal — the builder's output is untrusted", () => {
     expect(parseProposal(`${START}\nnull\n${END}`).status).toBe("invalid");
   });
 
+  /**
+   * Read out of the engine rather than believed: a codex node is REFUSED at creation
+   * (`reject_unsupported_harness`), so this board does not apply at all — it does not apply and
+   * sit idle. Script, chest and mcp nodes are creatable but inert, which is a different warning.
+   */
   it("warns about what the board can hold but cannot run, without refusing it", () => {
     const r = parseProposal(
       wrap({ nodes: [{ ...agent("i1", "coder"), config: { harness: "codex", system_prompt: "p" } }] }),
     );
     expect(r.status).toBe("ok");
-    if (r.status === "ok") expect(r.warnings[0] ?? "").toMatch(/codex.*not runnable yet/i);
+    if (r.status === "ok") expect(r.warnings[0] ?? "").toMatch(/codex.*engine refuses/i);
+  });
+
+  it("says which of the inert node types will not do anything yet", () => {
+    const inert = (id: string, name: string, type: string, config: Record<string, unknown>) => ({
+      id,
+      name,
+      type,
+      position: { x: 0, y: 0 },
+      config,
+      wires: [],
+    });
+    const r = parseProposal(
+      wrap({
+        nodes: [
+          inert("i1", "runner", "script", { language: "python", source: "x" }),
+          inert("i2", "files", "chest", {}),
+          inert("i3", "server", "mcp", { transport: "stdio", command: "c" }),
+        ],
+      }),
+    );
+    expect(r.status).toBe("ok");
+    if (r.status !== "ok") return;
+    const warnings = r.warnings.join(" ");
+    expect(warnings).toMatch(/nothing executes scripts yet/i);
+    expect(warnings).toMatch(/storage is not implemented/i);
+    expect(warnings).toMatch(/does not attach its tools yet/i);
   });
 
   it("defaults a missing position rather than rejecting the board over it", () => {

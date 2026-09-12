@@ -32,7 +32,9 @@ use wheel_core::WireType;
 
 #[derive(Debug, Deserialize)]
 pub struct ApplyRequest {
-    pub board: EmittedBoard,
+    /// Read as arbitrary JSON, so a board that cannot be parsed is a REFUSAL naming the reason
+    /// rather than a framework 422 with a plain-text body the confirm step cannot render.
+    pub board: serde_json::Value,
     /// Plan only: say what applying would do, and change nothing.
     #[serde(default)]
     pub dry_run: bool,
@@ -52,6 +54,22 @@ pub struct ApplyRequest {
     /// exists — which is what the confirm step shows as "this will wire these existing nodes".
     #[serde(default)]
     pub allow_wire: bool,
+    /// Allow the board to REMOVE nodes. Off unless asked for, and asked for separately from
+    /// everything else: removing a node destroys what it holds — a table's rows, a vault's
+    /// secrets, an agent's messages and logs — and that is not the same decision as editing one.
+    #[serde(default)]
+    pub allow_delete: bool,
+    /// Allow the board to REMOVE wires. Off unless asked for. Reversible, unlike a node, but it
+    /// takes a capability away, so it is still the user's call rather than the builder's.
+    #[serde(default)]
+    pub allow_unwire: bool,
+    /// The digest of the plan the user actually confirmed.
+    ///
+    /// Required for an apply that removes anything: the board can change between the preview and
+    /// the press — another tab, an agent, the builder run again — and a deletion recomputed
+    /// against a board nobody looked at is not the deletion anyone consented to.
+    #[serde(default)]
+    pub expect_plan: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +78,28 @@ pub struct PlanPreview {
     pub patch_nodes: Vec<String>,
     /// Structured, not formatted: the confirm step draws these on a canvas.
     pub create_wires: Vec<WireRef>,
+    /// What each patch actually changes, so the confirm step can say which fields — and which
+    /// whole lists get replaced, since RFC 7386 has no element-wise array merge.
+    pub patch_details: Vec<PatchDetail>,
+    /// Removals, kept as their own kinds so the UI can show them apart from everything else.
+    pub delete_wires: Vec<WireRef>,
+    pub delete_nodes: Vec<DeletePreview>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PatchDetail {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub replaced_arrays: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeletePreview {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub node_type: wheel_core::NodeType,
+    /// Wires that go with the node. A consequence of the deletion, not a second decision.
+    pub wires: Vec<WireRef>,
 }
 
 impl From<&Plan> for PlanPreview {
@@ -68,6 +108,25 @@ impl From<&Plan> for PlanPreview {
             create_nodes: p.create_nodes.iter().map(|n| n.name.clone()).collect(),
             patch_nodes: p.patch_nodes.iter().map(|n| n.name.clone()).collect(),
             create_wires: p.create_wires.iter().map(WireRef::of_emitted).collect(),
+            patch_details: p
+                .patch_nodes
+                .iter()
+                .map(|n| PatchDetail {
+                    name: n.name.clone(),
+                    fields: n.fields.clone(),
+                    replaced_arrays: n.replaced_arrays.clone(),
+                })
+                .collect(),
+            delete_wires: p.delete_wires.iter().map(WireRef::of_emitted).collect(),
+            delete_nodes: p
+                .delete_nodes
+                .iter()
+                .map(|n| DeletePreview {
+                    name: n.name.clone(),
+                    node_type: n.node_type,
+                    wires: n.wires.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -91,6 +150,12 @@ struct Consent {
     /// Wires that would attach to an existing node. Unblocked by `allow_wire`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     would_wire: Vec<WireRef>,
+    /// Nodes that would be REMOVED, with what each one destroys. Unblocked by `allow_delete`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    would_delete: Vec<DeleteConsent>,
+    /// Wires that would be removed. Unblocked by `allow_unwire`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    would_unwire: Vec<WireRef>,
     /// The flags that, together, would let this exact board through.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     grant: Vec<&'static str>,
@@ -112,6 +177,22 @@ impl Consent {
                     to: to.clone(),
                     wire_type: *wire_type,
                 }),
+                Refusal::DeleteNotPermitted { name, node_type } => {
+                    c.would_delete.push(DeleteConsent {
+                        name: name.clone(),
+                        node_type: *node_type,
+                        destroys: destroys(*node_type),
+                    })
+                }
+                Refusal::UnwireNotPermitted {
+                    from,
+                    to,
+                    wire_type,
+                } => c.would_unwire.push(WireRef {
+                    from: from.clone(),
+                    to: to.clone(),
+                    wire_type: *wire_type,
+                }),
                 // Everything else is a board the user cannot consent their way out of.
                 _ => return None,
             }
@@ -122,11 +203,44 @@ impl Consent {
         if !c.would_wire.is_empty() {
             c.grant.push("allow_wire");
         }
+        if !c.would_delete.is_empty() {
+            c.grant.push("allow_delete");
+        }
+        if !c.would_unwire.is_empty() {
+            c.grant.push("allow_unwire");
+        }
         if c.grant.is_empty() {
             None
         } else {
             Some(c)
         }
+    }
+}
+
+/// A node the board would remove, and what removing it costs.
+#[derive(Debug, Serialize)]
+struct DeleteConsent {
+    name: String,
+    #[serde(rename = "type")]
+    node_type: wheel_core::NodeType,
+    /// Said plainly, because "delete node" does not read as "lose the rows".
+    destroys: &'static str,
+}
+
+/// What is gone for good when this node is. Written per type rather than as one warning, because
+/// a ctx node and a vault are not the same loss and a single sentence for both teaches people to
+/// skim it.
+fn destroys(node_type: wheel_core::NodeType) -> &'static str {
+    use wheel_core::NodeType as T;
+    match node_type {
+        T::Table => "its rows are dropped and cannot be recovered",
+        T::Vault => "the secrets it holds are destroyed",
+        T::Chest => "the files it holds are destroyed",
+        T::Agent => "its messages, logs and stored credential go with it",
+        T::Ctx => "the markdown it injects is lost",
+        T::Script => "its source is lost",
+        T::Endpoint => "its public URL stops answering",
+        T::Mcp | T::Tool => "the agents wired to it lose that capability",
     }
 }
 
@@ -223,6 +337,35 @@ impl BoardClient for HttpBoardClient {
         }
         Ok(())
     }
+
+    async fn delete_node(&self, id: Uuid) -> Result<(), String> {
+        let resp = self
+            .http
+            .delete(format!("{}/v1/nodes/{id}", self.base))
+            .header("Authorization", &self.bearer)
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the engine: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::failure(resp).await);
+        }
+        Ok(())
+    }
+
+    async fn delete_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String> {
+        let resp = self
+            .http
+            .delete(format!("{}/v1/wires", self.base))
+            .header("Authorization", &self.bearer)
+            .json(&serde_json::json!({"from": from, "to": to, "type": wire_type}))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the engine: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::failure(resp).await);
+        }
+        Ok(())
+    }
 }
 
 /// Read the current board into the shape the apply step validates against.
@@ -258,9 +401,16 @@ async fn read_board(client: &HttpBoardClient) -> ApiResult<ExistingBoard> {
             continue;
         };
         by_id.insert(id, name.to_string());
-        existing
-            .nodes
-            .insert(name.to_string(), ExistingNode { id, node_type });
+        existing.nodes.insert(
+            name.to_string(),
+            ExistingNode {
+                id,
+                node_type,
+                // What the node holds NOW. Without it a patch is a rewrite, and a field the board
+                // never mentioned would be reset to whatever a typed default happens to be.
+                config: node["config"].clone(),
+            },
+        );
     }
     // Wires are stored on the source node as outgoing, addressed by id; the apply step compares by
     // name, so they are translated here rather than in the pure logic.
@@ -291,37 +441,71 @@ pub async fn apply_board(
     scope: ProjectScope,
     Json(req): Json<ApplyRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    // A board that cannot be read is refused in the same shape as one that is illegal, so the
+    // confirm step has something to show either way.
+    let board = match crate::apply::read_board(req.board) {
+        Ok(board) => board,
+        Err(refusal) => return Ok(refused(vec![refusal])),
+    };
+
     let client = HttpBoardClient::new(&state, &scope.project.id);
     let existing = read_board(&client).await?;
 
     let policy = ApplyPolicy {
         allow_patch: req.allow_patch,
         allow_wire: req.allow_wire,
+        allow_delete: req.allow_delete,
+        allow_unwire: req.allow_unwire,
     };
-    let plan = match validate(&req.board, &existing, policy) {
+    let plan = match validate(&board, &existing, policy) {
         Ok(plan) => plan,
-        Err(refusals) => {
-            let listed: Vec<_> = refusals
-                .iter()
-                .map(|r| serde_json::json!({"refusal": r, "message": r.message()}))
-                .collect();
-            let mut body = serde_json::json!({
-                "applied": false,
-                "refusals": listed,
-                "message": "the board was refused; nothing was created",
-            });
-            if let Some(consent) = Consent::of(&refusals) {
-                body["consent"] = serde_json::to_value(consent).unwrap_or_default();
-            }
-            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(body)));
-        }
+        Err(refusals) => return Ok(refused(refusals)),
     };
 
+    let digest = plan.digest();
     if req.dry_run {
         return Ok((
             StatusCode::OK,
-            Json(serde_json::json!({"applied": false, "plan": PlanPreview::from(&plan)})),
+            Json(serde_json::json!({
+                "applied": false,
+                "plan": PlanPreview::from(&plan),
+                "plan_digest": digest,
+            })),
         ));
+    }
+
+    // Destroying anything takes the plan the user SAW, not whatever this recomputed. A board that
+    // moved underneath is answered with the new plan and nothing applied.
+    if plan.destroys() {
+        match req.expect_plan.as_deref() {
+            None => {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "applied": false,
+                        "code": "plan_confirmation_required",
+                        "message": "this apply removes things, so it must confirm the plan it was \
+                                    shown; re-check the plan and send its plan_digest",
+                        "plan": PlanPreview::from(&plan),
+                        "plan_digest": digest,
+                    })),
+                ))
+            }
+            Some(confirmed) if confirmed != digest => {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "applied": false,
+                        "code": "plan_changed",
+                        "message": "the board changed since this plan was shown; nothing was \
+                                    applied. Check the new plan and confirm it",
+                        "plan": PlanPreview::from(&plan),
+                        "plan_digest": digest,
+                    })),
+                ))
+            }
+            Some(_) => {}
+        }
     }
 
     let report: ApplyReport = execute(&plan, &existing, &client).await;
@@ -335,4 +519,21 @@ pub async fn apply_board(
         status,
         Json(serde_json::json!({"applied": complete, "report": report})),
     ))
+}
+
+/// 422 with every refusal, and — when consent is all that stands in the way — what to grant.
+fn refused(refusals: Vec<Refusal>) -> (StatusCode, Json<serde_json::Value>) {
+    let listed: Vec<_> = refusals
+        .iter()
+        .map(|r| serde_json::json!({"refusal": r, "message": r.message()}))
+        .collect();
+    let mut body = serde_json::json!({
+        "applied": false,
+        "refusals": listed,
+        "message": "the board was refused; nothing was created",
+    });
+    if let Some(consent) = Consent::of(&refusals) {
+        body["consent"] = serde_json::to_value(consent).unwrap_or_default();
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body))
 }

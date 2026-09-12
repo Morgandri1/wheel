@@ -38,6 +38,12 @@ export default defineConfig({
         "src/lib/password.ts",
         "src/components/board/sidebar-rail.tsx",
         "src/components/builder/builder-panel.tsx",
+        "src/components/builder/builder-session.tsx",
+        // The builder's own rules: the stream grammar, the transport's refusals, and the relay
+        // that is the trust boundary for a turn.
+        "src/lib/builder-stream.ts",
+        "src/lib/builder-client.ts",
+        "src/lib/builder-relay.ts",
         "src/lib/board-apply.ts",
         "src/lib/endpoint-probe.ts",
         "src/lib/workflow-proposal.ts",

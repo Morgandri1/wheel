@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod board_apply;
+pub mod builder;
 pub mod health;
 pub mod ingress;
 pub mod instantiate;
