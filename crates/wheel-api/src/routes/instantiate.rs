@@ -70,7 +70,6 @@ pub async fn instantiate(
     };
 
     let mut project = create_project(&state, &user, req.name).await?;
-    let owner_id = user.id();
 
     // The sandbox never coming up makes an apply attempt pointless (it can only fail with a
     // confusing `engine_unreachable`) — treat it as a synthetic failed step and roll back the same
@@ -83,7 +82,7 @@ pub async fn instantiate(
             failures: vec![Failure::sandbox_did_not_start()],
             ..Default::default()
         };
-        return rollback(&state, project.id, owner_id, report).await;
+        return rollback(&state, project.id, report).await;
     }
 
     if let Some(caps) = req.capabilities {
@@ -91,7 +90,7 @@ pub async fn instantiate(
             name: None,
             capabilities: Some(caps),
         };
-        match update_project(&state, project.id, owner_id, patch).await {
+        match update_project(&state, project.id, patch).await {
             // The patch is authoritative for what the caller asked for; the response must reflect
             // it, not the pre-patch project `create_project` returned.
             Ok(patched) => project = patched,
@@ -100,12 +99,13 @@ pub async fn instantiate(
                     failures: vec![Failure::capabilities(e.to_string())],
                     ..Default::default()
                 };
-                return rollback(&state, project.id, owner_id, report).await;
+                return rollback(&state, project.id, report).await;
             }
         }
     }
 
-    let client = HttpBoardClient::new(&state, &project.id);
+    // The caller created this project a moment ago, so they are its admin.
+    let client = HttpBoardClient::new(&state, &project.id, &user, crate::auth::Tier::Admin);
     let report = execute(&plan, &ExistingBoard::default(), &client).await;
 
     if report.is_complete() {
@@ -119,7 +119,7 @@ pub async fn instantiate(
         ));
     }
 
-    rollback(&state, project.id, owner_id, report).await
+    rollback(&state, project.id, report).await
 }
 
 /// Tear the just-created project back down and report honestly.
@@ -132,10 +132,9 @@ pub async fn instantiate(
 async fn rollback(
     state: &AppState,
     project_id: uuid::Uuid,
-    owner_id: &str,
     report: ApplyReport,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let rolled_back = destroy_project(state, project_id, owner_id).await.is_ok();
+    let rolled_back = destroy_project(state, project_id).await.is_ok();
     let mut body = serde_json::json!({
         "applied": false,
         "rolled_back": rolled_back,

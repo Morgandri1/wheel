@@ -139,6 +139,13 @@ export interface Project {
   created_at: string;
   updated_at: string;
   ingress_base_url?: string;
+  /**
+   * The *calling* user's tier. A property of the response, not of the row, so it is absent wherever
+   * there was no caller to speak of. Compare it with `tierAtLeast` from `@/lib/tiers` rather than
+   * by string equality — `tier === "admin"` silently denies an admin nothing, but
+   * `tier === "prompter"` silently denies an admin everything.
+   */
+  tier?: import("../tiers").Tier;
 }
 
 export interface Board {

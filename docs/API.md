@@ -232,6 +232,74 @@ Every error, on every route:
 { "error": { "code": "not_found", "message": "The requested resource does not exist." } }
 ```
 
+## Access tiers
+
+Every project-scoped route requires exactly one tier, and **anything unlisted is refused**. Full
+table and reasoning: `docs/proposals/shared-projects.md` §5.
+
+| Tier | What it is |
+|---|---|
+| **admin** | Everything. Board structure, members and invites, vault, project lifecycle, settings. |
+| **prompter** | Manage context, and prompt agents: read the board, write ctx content, send messages, start/stop/restart agents. |
+| **guest** | View only. Board, transcripts, logs, events. Sends nothing. |
+
+**The project's creator is always an admin** and cannot be demoted or removed: that is
+`projects.owner_id`, not a `project_members` row, so there is only ever one answer to who owns a
+project. An admin may make another admin.
+
+This replaces the old `project.owner_id == jwt.sub` check. Non-members still get **404**, never 403 —
+the check is a `WHERE` predicate, so "does not exist" and "not yours" stay one code path and cannot
+become an enumeration oracle. A member at too low a tier gets **403**, because they have already
+proved the project exists to them and an honest answer lets a UI say why.
+
+Notable boundaries, each with a reason:
+
+* **Agent lifecycle is prompter; *project* lifecycle is admin.** A prompter who cannot start an agent
+  cannot prompt it, since a message never starts a process. Stopping the *sandbox* destroys other
+  members' running work. Consequence: a prompter arriving at a stopped project must ask an admin.
+* **The vault is admin only, including listing key names.** Per ADVERSARY 037 a vault value is
+  readable by every agent in the project, so sharing a project must not share the creator's
+  third-party credentials. Attaching or clearing an agent's LLM credential, and invoking a tool that
+  spends one, are admin for the same reason.
+* **`/v1/cli/*` is refused to every tier, admins included**, when reached through the proxy. It is the
+  node-token realm; the API cannot attribute an actor there, so it declines to carry one.
+* **Writing ctx content uses `PUT /v1/nodes/{id}/content`**, not `PATCH /v1/nodes/{id}`. The patch
+  route also carries agent config, and a tier may not have powers that depend on a request body.
+* **`/p/` public ingress is outside the tier system entirely** — see below. A tier is never a way
+  into it, and it is never a way around a tier: a hit arrives as `type=endpoint`, carries no actor,
+  and a guest cannot use it to do what `POST .../agents/{id}/send` would have refused them.
+
+Known gap: **a prompter cannot write table rows in v1.** There is no structured control-plane
+row-write route for anyone — `POST /v1/tables/{id}/query` is read-only SQL by design — so granting it
+means designing one. Named rather than quietly dropped.
+
+## Membership and invites
+
+```
+GET    /v1/projects/{id}/members                    → { creator, members: [Member] }   (guest)
+POST   /v1/projects/{id}/members  {user_id, role}   → Member                           (admin)
+DELETE /v1/projects/{id}/members/{user_id}          → 204                              (admin)
+
+GET    /v1/projects/{id}/invites                    → [InviteInfo]                     (admin)
+POST   /v1/projects/{id}/invites                    → InviteInfo + token               (admin)
+       {role, email?, expires_in_days?, max_uses?}
+DELETE /v1/projects/{id}/invites/{invite_id}        → 204                              (admin)
+
+POST   /v1/invites/accept  {token}                  → { project_id, role }             (any account)
+```
+
+An invite token is `wi_` plus 32 random bytes; only its SHA-256 is stored, so a copy of the database
+is not a copy of anyone's invitations. It expires (7 days by default), has a use count (1 by
+default), and may be locked to an email — checked against the account's *verified* address, never
+against a claim in the request.
+
+Accepting is idempotent and **never lowers an existing tier**, so a stale guest link cannot be used
+to demote a prompter. Unknown, expired, revoked and exhausted invites are one indistinguishable
+answer: the link is a credential, so the response must not say which links exist.
+
+Listing invites is admin, not guest: an invite's existence and tier are facts about who is about to
+gain access.
+
 ## Routes
 
 ### `GET /healthz`
@@ -419,6 +487,29 @@ Failure cases:
 Counting happens only after the project is known to exist, so traffic aimed at random UUIDs cannot
 make us write unbounded counter rows.
 
+## What bounds a live WebSocket
+
+The events socket is long-lived by design, which is exactly why an established bridge needs bounds
+that a request-time check cannot give it (ADVERSARY 011). Four things end one:
+
+* **A per-project cap** (`WS_MAX_BRIDGES_PER_PROJECT`) refuses a new bridge before it is opened, so a
+  project at its ceiling cannot make the API open sockets to the host to find that out. On the
+  production `process` backend every tenant shares one machine and one file-descriptor budget, so
+  this bounds the blast radius regardless of the idle story. **Per replica** — see the table above.
+* **A keepalive with a pong deadline.** The server pings every 30 s; a peer that does not answer
+  within the interval is closed. A plain idle-read timeout cannot tell a dead peer from a
+  legitimately idle one on a channel that is silent whenever nothing is happening.
+* **A membership re-check**, every 30 s and on notification. A revoked *or downgraded* member's
+  socket closes rather than surviving until it happens to end. On Postgres a `NOTIFY` makes that
+  near-immediate across replicas; the periodic check is what makes it certain when the notification
+  is missed, and it works on both backends.
+* **An absolute lifetime cap** (`WS_MAX_LIFETIME_SECS`). Defence in depth: it bounds how long a
+  missed revocation can persist even if the notification and the re-check both fail.
+
+Not closed here, and worth knowing: **the authenticated HTTP proxy still has no rate limit** — only
+public ingress does. One authenticated tenant can flood proxy → host → engine. That is the second
+half of ADVERSARY 011 and needs a shared per-project counter like the ingress limiter.
+
 ## Rate limiting across replicas
 
 The limiter is a fixed-window counter in Postgres, not an in-process bucket. With N replicas behind
@@ -452,6 +543,8 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `WHEEL_SIGNUP` | no | `closed` | `closed` or `open`, local auth only. Unset or empty is closed. See [Signup policy](#signup-policy-wheel_signup). |
 | `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
+| `WS_MAX_BRIDGES_PER_PROJECT` | no | `16` | Live WebSocket bridges one project may hold **on this replica**. Per replica, not global: with N replicas the effective ceiling is N times this. It is a blast-radius bound, not a quota (ADVERSARY 011). |
+| `WS_MAX_LIFETIME_SECS` | no | `3600` | Absolute lifetime of a bridge; the client then takes a new ws-ticket. |
 
 ### Running `AUTH_MODE=jwks` without a provider account
 

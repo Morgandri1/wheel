@@ -11,6 +11,10 @@
 //!
 //! Keeping them disjoint is the point: a child process that somehow reached the
 //! control-plane port still cannot use its own token there.
+//!
+//! The realms also decide attribution: `x-wheel-actor-id` is read on `/v1/*` and
+//! ignored everywhere else, so an agent cannot claim to be acting for a person.
+//! See [`actor`].
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +32,7 @@ use wheel_core::{ErrorBody, NodeConfig, NodeName, Position};
 
 use crate::{config::Config, db};
 
+pub mod actor;
 pub mod agent_routes;
 pub mod board_routes;
 pub mod cli_routes;
@@ -177,6 +182,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/nodes/{id}",
             axum::routing::patch(board_routes::patch_node).delete(board_routes::delete_node),
+        )
+        // The narrow content door: a prompter writes ctx content here, while the general node
+        // patch above stays admin. See `board_routes::put_content` for why it is a separate path
+        // rather than a condition on the patch.
+        .route(
+            "/nodes/{id}/content",
+            axum::routing::put(board_routes::put_content),
         )
         .route("/wires", post(board_routes::add_wire))
         .route("/wires", delete(board_routes::remove_wire))
@@ -559,6 +571,7 @@ mod tests {
                 wheel_core::MessageSender::User,
                 id,
                 "work".into(),
+                None,
                 None,
             )
             .unwrap()

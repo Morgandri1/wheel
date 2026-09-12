@@ -3,6 +3,7 @@ pub mod board_apply;
 pub mod health;
 pub mod ingress;
 pub mod instantiate;
+pub mod members;
 pub mod projects;
 pub mod proxy;
 pub mod tokens;

@@ -145,6 +145,20 @@ pub struct Message {
     /// Threading (§3c#9): the message this one replies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<Uuid>,
+    /// The Wheel principal who asked for this message, when a person did.
+    ///
+    /// Set only on the engine control plane, from the `x-wheel-actor-id` header the API adds after
+    /// stripping anything the client sent under that namespace. It is `None` on the node-token
+    /// plane and on public ingress, deliberately: an agent cannot assert an actor, and an
+    /// anonymous webhook has none.
+    ///
+    /// **Known limit (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the
+    /// engine's environ can call the control plane as the host and set this to anything. That is
+    /// forged attribution and it closes with per-node uids, not here. An agent that merely steals a
+    /// *sibling's node token* reaches the CLI plane, where the header is ignored — so that failure
+    /// is missing attribution rather than forged, which is the better of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     pub created_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<Timestamp>,
@@ -278,18 +292,35 @@ impl Message {
     /// <body>
     /// </AgentPrompt>
     /// ```
-    /// `reply_to="<id>"` is added when the message is a reply (§3c#9).
+    /// `reply_to="<id>"` is added when the message is a reply (§3c#9), and
+    /// `on_behalf_of="<principal>"` when a person asked for it.
+    ///
+    /// Both optional attributes are **appended after `type`**, never inserted among the three that
+    /// were always there. Everything that reads an envelope — the engine's own tests, QA's
+    /// independently-written oracle, the red team's parser — anchors on the opening
+    /// `<AgentPrompt id="…" from="…" type="…"` prefix, so appending keeps them all reading the same
+    /// thing while inserting would break each of them differently.
+    ///
+    /// The value cannot close the attribute: a principal's charset excludes quotes, control
+    /// characters and whitespace, and the engine re-applies that check rather than trusting the API
+    /// (ADVERSARY 001 attack shape 5, and finding 009's lesson about single-layer validation). The
+    /// body is still never parsed for framing — every attribute here is generated.
     pub fn envelope(&self) -> String {
         let reply = match self.reply_to {
             Some(r) => format!(" reply_to=\"{r}\""),
             None => String::new(),
         };
+        let on_behalf_of = match &self.on_behalf_of {
+            Some(actor) => format!(" on_behalf_of=\"{actor}\""),
+            None => String::new(),
+        };
         format!(
-            "<AgentPrompt id=\"{}\" from=\"{}\" type=\"{}\"{}>\n{}\n</AgentPrompt>",
+            "<AgentPrompt id=\"{}\" from=\"{}\" type=\"{}\"{}{}>\n{}\n</AgentPrompt>",
             self.id,
             self.from.name(),
             self.from.sender_type(),
             reply,
+            on_behalf_of,
             escape_envelope_body(&self.body)
         )
     }
