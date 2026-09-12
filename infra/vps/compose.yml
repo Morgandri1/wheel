@@ -25,6 +25,10 @@ services:
     network_mode: none
     restart: "no"
     entrypoint: ["/bin/sh", "/preflight.sh"]
+    # A shell script reading environment variables and exiting: no capability does anything for
+    # it, and no setuid binary it might invoke should be allowed to regain one either.
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - ./preflight.sh:/preflight.sh:ro
     environment:
@@ -45,6 +49,13 @@ services:
     depends_on:
       preflight:
         condition: service_completed_successfully
+    # wheeld runs as a fixed non-root uid (10001, Dockerfile.wheeld) and never calls setuid/setgid
+    # itself — the embedded sandbox backend runs every agent as ITS OWN uid too (single-tenant by
+    # design here; see docs/proposals/script-execution-scope.md and crates/wheeld/src/embedded.rs
+    # for why that is a stated, accepted boundary rather than an oversight). Nothing in this
+    # container's own process tree needs a Linux capability to do its job, so none is granted.
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     environment:
       # Bare (no `=`) so an unset one is OMITTED, not passed through empty: wheeld's own default
       # (derived from its bind address) applies only when the key is absent entirely. Resolved by
@@ -75,6 +86,9 @@ services:
     image: curlimages/curl:8.11.0
     restart: "no"
     entrypoint: ["/bin/sh", "/verify-signup-gate.sh"]
+    # A shell script making one curl call: no capability does anything for it either.
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - ./verify-signup-gate.sh:/verify-signup-gate.sh:ro
     environment:
@@ -108,6 +122,10 @@ services:
       - WHEEL_PUBLIC_ORIGIN=${WHEEL_PUBLIC_ORIGIN:-http://localhost:3000}
       - WHEEL_TRUST_PROXY
     read_only: true
+    # As wheeld: fixed non-root uid (Dockerfile.web), a plain `node server.js`, no privileged port,
+    # nothing that needs a Linux capability.
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     tmpfs:
       - /tmp:size=16m,mode=1777
     ports:
@@ -130,6 +148,14 @@ services:
     image: caddy:2
     profiles: ["tls"]
     restart: unless-stopped
+    # The one service on this stack that genuinely needs something: the official image runs as
+    # root to bind :80/:443, and dropping every capability from root removes CAP_NET_BIND_SERVICE
+    # along with it, so binding those ports fails outright without adding it back explicitly.
+    # Nothing else here — ACME (HTTP-01/TLS-ALPN both use the same two ports), writing certs to
+    # its own `caddy-data`/`caddy-config` volumes — needs a capability beyond that.
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       preflight:
         condition: service_completed_successfully
