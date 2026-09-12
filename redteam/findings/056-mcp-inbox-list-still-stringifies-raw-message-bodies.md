@@ -1,4 +1,4 @@
-# 054 — A bare `wheel inbox` over MCP still shows raw, unescaped message bodies in the list view
+# 056 — A bare `wheel inbox` over MCP still shows raw, unescaped message bodies in the list view
 
 - **Severity:** Low (narrow, and the single-message path this same PR fixed already closes the
   higher-value case)

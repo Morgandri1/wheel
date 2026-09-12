@@ -17,7 +17,7 @@ the exact failure text with the live unescaped key.
 **Left open, tracked, not fixed here:** a bare `wheel inbox` (no `id`) called over MCP still shows raw,
 unescaped message bodies in the list view — the list response has no top-level `value` for
 `mcp.rs::render()` to pick up, so it falls to stringifying the whole `messages[]` array, raw `body`
-fields included, right next to the unused per-item wrapped `value`. `redteam/findings/054-mcp-inbox-list-
+fields included, right next to the unused per-item wrapped `value`. `redteam/findings/056-mcp-inbox-list-
 still-stringifies-raw-message-bodies.md` has the full trace and a concrete recommendation (drop `body`
 from the list response, or restructure so the top-level shape is itself a pre-rendered `value` the way
 ctx/table reads already answer). A successor picking this up should also close the assertion gap that
