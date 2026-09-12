@@ -15,7 +15,8 @@ configuration, not code.
 |---|---|---|
 | `local` (built in) | HS256, issued by this API | `SESSION_SECRET`, plus a live row in `sessions` |
 | `jwks` | RS256, issued by an external provider | the provider's JWKS |
-| either | `wht_…` API token, issued by this API | its SHA-256 in `api_tokens`, not revoked (see [API tokens](#api-tokens-every-auth_mode)) |
+| `external` | a JWT from the **deployer's** issuer, or an assertion from a proxy they run | see [External authentication](#external-authentication-auth_modeexternal) |
+| any | `wht_…` API token, issued by this API | its SHA-256 in `api_tokens`, not revoked (see [API tokens](#api-tokens-every-auth_mode)) |
 
 `AUTH_MODE` must be set explicitly in production — an unset value refuses to boot rather than
 defaulting, because guessing wrong either rejects every real user or accepts tokens from the wrong
@@ -23,8 +24,121 @@ issuer. Under `jwks`, empty `CLERK_JWKS_URL`/`CLERK_ISSUER` also refuse to boot:
 looks like configuration is worse than a missing one, since it starts and then rejects every token
 for a reason nobody can see.
 
-A token minted under one mode is rejected under the other. They are different algorithms verified
-with different keys, so this needs no special case — it falls out of the design.
+A token minted under one mode is rejected under the others. They are different algorithms verified
+with different keys, and the issuer is pinned per mode, so this needs no special case — it falls out
+of the design.
+
+## External authentication (`AUTH_MODE=external`)
+
+The deployer brings an identity system and Wheel verifies and maps it. Full design and threat model:
+`docs/proposals/external-auth.md`.
+
+**There is no account unification with any other product.** An external identity is a *Wheel*
+principal created by this deployment; it confers nothing anywhere else, and no other product's
+account confers anything here.
+
+Two verifiers:
+
+* **`jwks`** — a JWT from the deployer's OIDC issuer, verified against keys they publish. No
+  outbound call per request; no credential held by Wheel.
+* **`proxy_header`** — a reverse proxy has already authenticated the user and names them in a
+  header. Wheel verifies *nothing* about the assertion, so the network requirement below is the
+  whole control.
+
+Token introspection (RFC 7662), static keys in configuration, mTLS and shared-secret tokens are
+deliberately **not** supported; `external-auth.md` §1 gives the reason for each.
+
+### Verification is configuration
+
+| Variable | Required | Notes |
+|---|---|---|
+| `WHEEL_EXTERNAL_VERIFIER` | yes | `jwks` or `proxy_header`. No default. |
+| `WHEEL_EXTERNAL_ISSUER` | yes | Exact `iss` to pin. May not equal `CLERK_ISSUER` or `PUBLIC_BASE_URL`. |
+| `WHEEL_EXTERNAL_AUDIENCE` | yes | Comma-separated. **Exact string equality**, never a prefix. |
+| `WHEEL_EXTERNAL_ALGS` | yes (`jwks`) | `RS256`, `EdDSA`, or both. A symmetric algorithm is refused by name. |
+| `WHEEL_EXTERNAL_JWKS_URL` | yes (`jwks`) | `https://` and non-loopback in production. |
+| `WHEEL_EXTERNAL_PROVISION` | yes | `auto` creates a Wheel account for any subject the issuer vouches for; `linked` refuses until an operator links one. No default — if your issuer lets anyone sign up, `auto` lets anyone into Wheel. |
+| `WHEEL_EXTERNAL_PROVIDER` | no | Display label. The identity key is the issuer, not this. |
+| `WHEEL_EXTERNAL_TOKEN_HEADER` | no | Read the credential from a named header instead, e.g. `cf-access-jwt-assertion`. |
+| `WHEEL_EXTERNAL_SUBJECT_CLAIM` | no | Default `sub`. Point at a better immutable id where the IdP has one. |
+| `WHEEL_EXTERNAL_AZP` | no | `azp` allowlist. |
+| `WHEEL_EXTERNAL_MAX_TTL_SECS` | no | When set, the token must carry `iat` and live no longer than this. Unset means no cap — and no cap means revocation latency equals token lifetime. |
+| `WHEEL_EXTERNAL_SOLE_AUDIENCE` | no | `1` requires our audience be the only one. |
+| `WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER` | yes (`proxy_header`) | e.g. `x-forwarded-user`. |
+| `WHEEL_EXTERNAL_PROXY_EMAIL_HEADER` | no | Display only; never a link key. |
+
+Setting any `WHEEL_EXTERNAL_*` variable while `AUTH_MODE` is not `external` **refuses to boot**. A
+knob that looks configured and is never read is how a deployer comes to believe they pinned an
+audience.
+
+### Two properties worth stating outright
+
+**The algorithm comes from the key, not from the token.** The `kid` resolves to a key, the key set
+declares what that key is for, the token's `alg` header must agree, and the result must be in
+`WHEEL_EXTERNAL_ALGS`. An attacker therefore chooses only which key is tried. Symmetric keys are
+never imported from a JWKS, and an `OKP` key on any curve but Ed25519 is refused.
+
+**`aud` is mandatory.** A token with no audience claim is rejected. This is not decoration: with
+`validate_aud = true` and an audience configured, `jsonwebtoken` 9 still *accepts* a token whose
+`aud` is absent — validation applies only to an audience that is present. Multi-valued `aud` is
+accepted when ours is among them (RFC 7519 §4.1.3, and what real providers emit); set
+`WHEEL_EXTERNAL_SOLE_AUDIENCE=1` if you do not extend trust to the other parties your IdP names.
+
+### Principal mapping
+
+A foreign subject is never a Wheel principal. On first verification Wheel creates a local account and
+records the link in `external_identities`, keyed on **(issuer, subject)**; from then on
+`projects.owner_id`, `project_members.user_id` and message attribution all name the Wheel uuid.
+
+The provider's `email` claim is stored for display and is **never** a lookup key — an IdP that lets a
+user set an unverified address would otherwise be a one-step takeover of any local account whose
+address an attacker can guess. Accounts created this way get a synthetic `@external.invalid`
+address for the same reason.
+
+Three consequences an operator should know before switching a deployment over:
+
+* **A user deleted at the provider is invisible to Wheel.** There is no back-channel logout and no
+  SCIM in v1. Their Wheel account, projects and memberships persist; access ends only because the
+  IdP stops issuing tokens. The lever is `DELETE /v1/auth/external-identities/{id}`.
+* **If the provider reuses a subject, the new person inherits the old one's account, and Wheel
+  cannot detect it.** OIDC Core §2 forbids reassigning `sub`, so this is a provider defect — but
+  confirm it, and use `WHEEL_EXTERNAL_SUBJECT_CLAIM` if a better immutable id exists.
+* **Changing `WHEEL_EXTERNAL_ISSUER` creates new, empty principals.** Deliberately: inheriting an
+  account because a URL changed would be account takeover triggered by a config edit. Re-link
+  explicitly through the admin route.
+
+### `proxy_header`: the network requirement
+
+If Wheel believes a header, anything that can reach Wheel directly can be anyone. Wheel must be
+reachable **only** through the authenticating proxy.
+
+* Boot **refuses** `proxy_header` when `WHEEL_TRUSTED_PROXIES` is empty.
+* Per request the **TCP peer** — not `X-Forwarded-For` — must be inside `WHEEL_TRUSTED_PROXIES`, or
+  the request is 401 whatever its headers say. If the `client_ip` middleware is not installed, every
+  such request fails closed.
+* The subject header never crosses the proxy hop to the host or engine.
+* The credential is *ambient*, so cross-origin requests are a CSRF risk that CORS alone does not
+  cover. A trusted proxy list is not a firewall.
+
+### External identity administration
+
+Only the token-only owner account (the one `wheeld` creates on first boot) may call these, and they
+404 unless `AUTH_MODE=external`.
+
+```
+GET    /v1/auth/external-identities                 → [Identity]
+POST   /v1/auth/external-identities  {subject, user_id, email?}   → Identity
+DELETE /v1/auth/external-identities/{id}            → 204 (disables; the link stays visible)
+```
+
+The issuer is not a parameter — it comes from configuration, because it is what was or will be
+cryptographically asserted.
+
+### An external session may not mint API tokens
+
+`POST /v1/auth/tokens` is **403** for a caller authenticated by the external plane. A `wht_` token is
+long-lived and revoked only by Wheel; allowing the trade would let anyone with five minutes of access
+buy an indefinite credential the deployer's identity system can no longer take away.
 
 ## Local auth routes (`AUTH_MODE=local`)
 
@@ -232,6 +346,74 @@ Every error, on every route:
 { "error": { "code": "not_found", "message": "The requested resource does not exist." } }
 ```
 
+## Access tiers
+
+Every project-scoped route requires exactly one tier, and **anything unlisted is refused**. Full
+table and reasoning: `docs/proposals/shared-projects.md` §5.
+
+| Tier | What it is |
+|---|---|
+| **admin** | Everything. Board structure, members and invites, vault, project lifecycle, settings. |
+| **prompter** | Manage context, and prompt agents: read the board, write ctx content, send messages, start/stop/restart agents. |
+| **guest** | View only. Board, transcripts, logs, events. Sends nothing. |
+
+**The project's creator is always an admin** and cannot be demoted or removed: that is
+`projects.owner_id`, not a `project_members` row, so there is only ever one answer to who owns a
+project. An admin may make another admin.
+
+This replaces the old `project.owner_id == jwt.sub` check. Non-members still get **404**, never 403 —
+the check is a `WHERE` predicate, so "does not exist" and "not yours" stay one code path and cannot
+become an enumeration oracle. A member at too low a tier gets **403**, because they have already
+proved the project exists to them and an honest answer lets a UI say why.
+
+Notable boundaries, each with a reason:
+
+* **Agent lifecycle is prompter; *project* lifecycle is admin.** A prompter who cannot start an agent
+  cannot prompt it, since a message never starts a process. Stopping the *sandbox* destroys other
+  members' running work. Consequence: a prompter arriving at a stopped project must ask an admin.
+* **The vault is admin only, including listing key names.** Per ADVERSARY 037 a vault value is
+  readable by every agent in the project, so sharing a project must not share the creator's
+  third-party credentials. Attaching or clearing an agent's LLM credential, and invoking a tool that
+  spends one, are admin for the same reason.
+* **`/v1/cli/*` is refused to every tier, admins included**, when reached through the proxy. It is the
+  node-token realm; the API cannot attribute an actor there, so it declines to carry one.
+* **Writing ctx content uses `PUT /v1/nodes/{id}/content`**, not `PATCH /v1/nodes/{id}`. The patch
+  route also carries agent config, and a tier may not have powers that depend on a request body.
+* **`/p/` public ingress is outside the tier system entirely** — see below. A tier is never a way
+  into it, and it is never a way around a tier: a hit arrives as `type=endpoint`, carries no actor,
+  and a guest cannot use it to do what `POST .../agents/{id}/send` would have refused them.
+
+Known gap: **a prompter cannot write table rows in v1.** There is no structured control-plane
+row-write route for anyone — `POST /v1/tables/{id}/query` is read-only SQL by design — so granting it
+means designing one. Named rather than quietly dropped.
+
+## Membership and invites
+
+```
+GET    /v1/projects/{id}/members                    → { creator, members: [Member] }   (guest)
+POST   /v1/projects/{id}/members  {user_id, role}   → Member                           (admin)
+DELETE /v1/projects/{id}/members/{user_id}          → 204                              (admin)
+
+GET    /v1/projects/{id}/invites                    → [InviteInfo]                     (admin)
+POST   /v1/projects/{id}/invites                    → InviteInfo + token               (admin)
+       {role, email?, expires_in_days?, max_uses?}
+DELETE /v1/projects/{id}/invites/{invite_id}        → 204                              (admin)
+
+POST   /v1/invites/accept  {token}                  → { project_id, role }             (any account)
+```
+
+An invite token is `wi_` plus 32 random bytes; only its SHA-256 is stored, so a copy of the database
+is not a copy of anyone's invitations. It expires (7 days by default), has a use count (1 by
+default), and may be locked to an email — checked against the account's *verified* address, never
+against a claim in the request.
+
+Accepting is idempotent and **never lowers an existing tier**, so a stale guest link cannot be used
+to demote a prompter. Unknown, expired, revoked and exhausted invites are one indistinguishable
+answer: the link is a credential, so the response must not say which links exist.
+
+Listing invites is admin, not guest: an invite's existence and tier are facts about who is about to
+gain access.
+
 ## Routes
 
 ### `GET /healthz`
@@ -408,6 +590,29 @@ Failure cases:
 Counting happens only after the project is known to exist, so traffic aimed at random UUIDs cannot
 make us write unbounded counter rows.
 
+## What bounds a live WebSocket
+
+The events socket is long-lived by design, which is exactly why an established bridge needs bounds
+that a request-time check cannot give it (ADVERSARY 011). Four things end one:
+
+* **A per-project cap** (`WS_MAX_BRIDGES_PER_PROJECT`) refuses a new bridge before it is opened, so a
+  project at its ceiling cannot make the API open sockets to the host to find that out. On the
+  production `process` backend every tenant shares one machine and one file-descriptor budget, so
+  this bounds the blast radius regardless of the idle story. **Per replica** — see the table above.
+* **A keepalive with a pong deadline.** The server pings every 30 s; a peer that does not answer
+  within the interval is closed. A plain idle-read timeout cannot tell a dead peer from a
+  legitimately idle one on a channel that is silent whenever nothing is happening.
+* **A membership re-check**, every 30 s and on notification. A revoked *or downgraded* member's
+  socket closes rather than surviving until it happens to end. On Postgres a `NOTIFY` makes that
+  near-immediate across replicas; the periodic check is what makes it certain when the notification
+  is missed, and it works on both backends.
+* **An absolute lifetime cap** (`WS_MAX_LIFETIME_SECS`). Defence in depth: it bounds how long a
+  missed revocation can persist even if the notification and the re-check both fail.
+
+Not closed here, and worth knowing: **the authenticated HTTP proxy still has no rate limit** — only
+public ingress does. One authenticated tenant can flood proxy → host → engine. That is the second
+half of ADVERSARY 011 and needs a shared per-project counter like the ingress limiter.
+
 ## Rate limiting across replicas
 
 The limiter is a fixed-window counter in Postgres, not an in-process bucket. With N replicas behind
@@ -441,6 +646,8 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `WHEEL_SIGNUP` | no | `closed` | `closed` or `open`, local auth only. Unset or empty is closed. See [Signup policy](#signup-policy-wheel_signup). |
 | `WHEEL_TRUSTED_PROXIES` | no | none | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is believed. See [Behind a reverse proxy](#behind-a-reverse-proxy). A malformed entry refuses to boot. |
 | `HOST_CONNECT_TIMEOUT_SECS` | no | `3` | How long to wait for a TCP connection to the host before calling it unreachable. Separate from `PROXY_TIMEOUT_SECS` on purpose — see below. |
+| `WS_MAX_BRIDGES_PER_PROJECT` | no | `16` | Live WebSocket bridges one project may hold **on this replica**. Per replica, not global: with N replicas the effective ceiling is N times this. It is a blast-radius bound, not a quota (ADVERSARY 011). |
+| `WS_MAX_LIFETIME_SECS` | no | `3600` | Absolute lifetime of a bridge; the client then takes a new ws-ticket. |
 
 ### Running `AUTH_MODE=jwks` without a provider account
 

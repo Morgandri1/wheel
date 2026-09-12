@@ -17,6 +17,63 @@ use std::sync::Arc;
 pub const KID: &str = "test-key-1";
 pub const ISSUER: &str = "https://clerk.example.test";
 
+/// The external plane's fixtures. A *different* issuer from `ISSUER` on purpose: `Config` refuses
+/// to boot with two verifiers pinned to one issuer, because two token populations that can stand in
+/// for each other is the confusion the pin exists to prevent.
+pub const ED_KID: &str = "test-ed25519-1";
+pub const EXTERNAL_ISSUER: &str = "https://idp.example.test";
+pub const EXTERNAL_AUDIENCE: &str = "wheel-test";
+
+const TEST_ED25519_KEY_PEM: &str = include_str!("fixtures/test_ed25519_key.pem");
+/// base64url of the raw 32-byte public key belonging to the PEM above. Hardcoded because nothing
+/// here parses an Ed25519 PEM; a wrong value fails every signature check loudly, so it cannot rot
+/// silently.
+pub const ED_PUBLIC_X: &str = "AmUKDFwwuIqAcFP-b5FYLoZLhrxLKWJTY4rBGsL4HJs";
+
+/// The Ed25519 JWK, as a provider publishes it.
+pub fn ed25519_jwk() -> serde_json::Value {
+    json!({
+        "kty": "OKP",
+        "use": "sig",
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": ED_KID,
+        "x": ED_PUBLIC_X,
+    })
+}
+
+/// A key set holding both algorithms — which is the point: the external verifier resolves an
+/// algorithm from the key, so a set with only one in it cannot demonstrate that it does.
+pub fn external_jwks(key: &TestKey) -> serde_json::Value {
+    let rsa = key.jwks["keys"][0].clone();
+    json!({ "keys": [rsa, ed25519_jwk()] })
+}
+
+/// Sign with Ed25519. `kid` is a parameter so a test can present a token whose `kid` names a key of
+/// the *other* type, which is the algorithm-confusion shape this design is built to refuse.
+pub fn sign_eddsa<T: serde::Serialize>(kid: &str, c: &T) -> String {
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(kid.to_string());
+    jsonwebtoken::encode(
+        &header,
+        c,
+        &EncodingKey::from_ed_pem(TEST_ED25519_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Sign with RS256, over any claim shape rather than only [`Claims`].
+pub fn sign_rs256_value<T: serde::Serialize>(key: &TestKey, kid: &str, c: &T) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_string());
+    jsonwebtoken::encode(
+        &header,
+        c,
+        &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
 fn b64u(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

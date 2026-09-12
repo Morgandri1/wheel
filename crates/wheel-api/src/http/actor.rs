@@ -9,8 +9,9 @@
 //! **Strip the whole `x-wheel-` namespace, then set our own.** In that order, always. The ingress
 //! route has done this since it was written (`routes/ingress.rs`); the authenticated engine proxy
 //! did not, which is the defect this module exists to close — see the finding in
-//! `redteam/findings/052-*`. `wheel-host` relays anything it is given, so a header the API fails to
-//! strip reaches the engine looking exactly like one the API set.
+//! `redteam/findings/052-authenticated-proxy-does-not-strip-x-wheel-namespace.md`.
+//! `wheel-host` relays anything it is given, so a header the API fails to strip reaches the
+//! engine looking exactly like one the API set.
 //!
 //! There are three places the API reaches an engine — the HTTP proxy, the WebSocket bridge, and
 //! `HttpBoardClient` — and they build their outbound headers in three different ways. So the

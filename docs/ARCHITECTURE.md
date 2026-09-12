@@ -575,6 +575,7 @@ Every command prints a one-line human result (and `--json` for machine output). 
 </AgentPrompt>
 ```
 Messages from the UI use `from="user" type="user"`. Ingress hits use `from="<endpoint name>" type="endpoint"` and a JSON body `{method, path, headers, body}`.
+`reply_to="<uuid>"` and `on_behalf_of="<principal>"` are appended, in that order, after `type` when present — see `docs/PROTOCOL.md` for which plane sets `on_behalf_of` and for the attribution limit that stands until per-node uids land (ADVERSARY 037).
 
 
 ### Any shared MUTABLE name is a clobber hazard, not just a branch (PM ruling, 2026-09-06)
@@ -836,8 +837,13 @@ binary and entrypoint (`wheel-host` by default; `wheel-engine` when `WHEEL_ROLE=
 ## 5. Public API (api.wheel.dev, stateless, horizontally scaled) — API owns
 
 - Every project-scoped request carries `x-auth-token: <Clerk session JWT>` and `x-project-id: <uuid>`.
-  Order of operations, always: verify JWT → load project by id → **assert `project.owner_id == jwt.sub`** → then anything else.
-  Non-owned / non-existent projects return **404** (no enumeration). Missing/invalid token → 401.
+  Order of operations, always: verify the credential → load project by id → **assert the caller's access tier** → then anything else.
+  Non-member / non-existent projects return **404** (no enumeration); a member at too low a tier gets **403**. Missing/invalid token → 401.
+  *(Amended 2026-09-11 for multiplayer M1. The original text said `project.owner_id == jwt.sub`, which the code no longer does:
+  a project has members in one of three tiers — admin, prompter, guest — resolved by `auth::extractor::load_member`. The creator is
+  still `projects.owner_id` and is always admin. Design and full route table: `docs/proposals/shared-projects.md`; the auth side is
+  `docs/proposals/external-auth.md`. Recorded here rather than left stale because a decision document is read as fact by whoever
+  arrives next — §0b. PM to ratify or amend.)*
 - Routes:
 ```
 POST   /v1/projects                     {name}                       → Project

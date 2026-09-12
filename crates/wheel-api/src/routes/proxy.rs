@@ -13,7 +13,8 @@
 //!     any `x-wheel-*` header and it reached the engine untouched (`wheel-host` relays anything it
 //!     is not explicitly told to drop). Nothing consumed those headers on this path, so it was
 //!     latent rather than live — but the actor markers below are exactly the thing that would have
-//!     made it identity forgery. See `redteam/findings/052-*`.
+//!     made it identity forgery. See
+//!     `redteam/findings/052-authenticated-proxy-does-not-strip-x-wheel-namespace.md`.
 //!   * `WHEEL_HOST_SECRET` is attached here and never travels back to the client. The client's own
 //!     credentials are stripped by `sanitize_for_upstream` — the host authenticates *us*, not the
 //!     user, and relaying a user token downstream is how replay bugs start.

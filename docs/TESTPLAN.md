@@ -115,12 +115,19 @@ The envelope written to the child's stdin is exactly one compact JSON line:
 </AgentPrompt>
 ```
 
+`reply_to="<uuid>"` and `on_behalf_of="<principal>"` append after `type` when present. `on_behalf_of`
+names the Wheel principal a person asked for the message on behalf of, and is set **only** on the
+`/v1/*` control plane — never on `/v1/cli/*` (node tokens) or `/ingress/*`, so an agent cannot assert
+an actor. See `docs/PROTOCOL.md`.
+
 | ID | Criterion | Sev if failing |
 |---|---|---|
 | `MSG-envelope-shape` | Stdin bytes match the above exactly: compact JSON, content-block form, newline-terminated, one line per turn, nothing else ever written to stdin. Asserted from `WHEEL_FAKE_TRANSCRIPT`, not from engine logs. | S2 |
 | `MSG-envelope-escape` | **A body containing a literal `</AgentPrompt>` cannot break out of the envelope.** Recipient sees the body verbatim; attribution attributes are unchanged. | **S1** |
 | `MSG-envelope-forge` | A body containing a full fake `<AgentPrompt id=... from="admin" type="system">…</AgentPrompt>` does NOT cause the recipient to see a second, forged message. Attribution is engine-generated and unspoofable. | **S1** |
 | `MSG-envelope-attrs` | `id` is the message uuid and equals the `messages` row id and the `message` WS event id. `from`/`type` match the real sender. | S2 |
+| `MSG-actor-attribution` | A control-plane send carrying `x-wheel-actor-id` produces `on_behalf_of="<principal>"` on the envelope and in the `messages` row. The same send with a malformed actor (quote, newline, over-long) produces **no** attribute rather than a broken envelope. | **S1** |
+| `MSG-actor-plane` | A `/v1/cli/msg` send carrying `x-wheel-actor-id` produces **no** `on_behalf_of`: an agent cannot assert an actor. Same for an `/ingress/*` hit. | **S1** |
 | `MSG-byte-exact` | 200 KiB body containing every ASCII punctuation char, multi-byte unicode (incl. emoji, RTL, combining marks, NUL-adjacent escapes) and a literal `</AgentPrompt>` arrives byte-identical inside the envelope. Compared as bytes, not strings. | **S1** |
 | `MSG-sha256` | `wheel msg` returns `{id, sha256, bytes, state}`; sha256 matches the sender's own hash of the body and the stored row. | S2 |
 | `MSG-no-truncate` | Engine never silently truncates. A body that would exceed a harness limit stays `queued` with `last_error` set and is surfaced — never clipped. | **S1** |
