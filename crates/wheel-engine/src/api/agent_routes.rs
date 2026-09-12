@@ -27,7 +27,20 @@ pub struct SendBody {
     pub body: String,
     #[serde(default)]
     pub reply_to: Option<Uuid>,
+    /// Wait up to this many seconds for the turn that consumes this message,
+    /// and answer with how it ended. The operator's half of `--await-reply`
+    /// (docs/proposals/agentgrid-parity.md §2), and what the API's MCP `ask`
+    /// tool is built on. Clamped to [`wheel_core::MAX_AWAIT_SECS`].
+    #[serde(default)]
+    pub await_secs: Option<u64>,
 }
+
+/// The waiter a user-lane wait is recorded under.
+///
+/// Not a node, and no node can name it: an agent's wait can never form a cycle
+/// with the operator's, because the operator has no turn to block. It exists
+/// so operator waits share the same concurrency cap as everyone else's.
+const OPERATOR: Uuid = Uuid::nil();
 
 #[derive(Debug, Deserialize)]
 pub struct LogQuery {
@@ -160,7 +173,7 @@ pub async fn send(
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
     Json(body): Json<SendBody>,
-) -> ApiResult<(StatusCode, Json<MessageReceipt>)> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     require_agent(&s, id)?;
     // Who asked. Present on this plane, absent on the CLI plane and on ingress — see
     // `super::actor`. `headers` sits before `Json` because an axum body extractor must be last.
@@ -175,6 +188,18 @@ pub async fn send(
             ),
         ));
     }
+
+    // Registered before anything is enqueued, so a caller past the cap is
+    // refused without having sent a message it will not wait for.
+    let wait = match body.await_secs {
+        None => None,
+        Some(secs) => Some((
+            secs.clamp(1, wheel_core::MAX_AWAIT_SECS),
+            s.supervisor
+                .begin_await(OPERATOR, id)
+                .map_err(await_refused)?,
+        )),
+    };
 
     let msg = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
@@ -193,7 +218,45 @@ pub async fn send(
     // the message simply waits — it is never dropped and never truncated.
     let _ = s.supervisor.deliver(id).await;
 
-    Ok((StatusCode::ACCEPTED, Json(MessageReceipt::from(&msg))))
+    let receipt = MessageReceipt::from(&msg);
+    let Some((secs, guard)) = wait else {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::to_value(&receipt).unwrap_or_default()),
+        ));
+    };
+    guard.set_message(msg.id);
+    // No lock is held across this, and no wire gates it: on this realm the
+    // caller already holds the engine secret, which cannot be revoked mid-call
+    // the way a wire can (the §2 re-check exists for the node-token realm).
+    let settled = s.supervisor.await_settlement(msg.id, secs).await;
+    drop(guard);
+    Ok((
+        StatusCode::OK,
+        Json(super::cli_routes::with_outcome(
+            &receipt,
+            settled.as_ref(),
+            true,
+        )),
+    ))
+}
+
+fn await_refused(r: crate::supervisor::awaits::AwaitRefused) -> ApiError {
+    use crate::supervisor::awaits::{AwaitRefused, MAX_CONCURRENT_AWAITS};
+    match r {
+        AwaitRefused::TooMany => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_awaits",
+            format!("there are already {MAX_CONCURRENT_AWAITS} operator waits open"),
+        ),
+        // Unreachable while `OPERATOR` is un-nameable by a node, and answered
+        // rather than unwrapped so that staying true is not load-bearing here.
+        AwaitRefused::Cycle { .. } => ApiError::new(
+            StatusCode::CONFLICT,
+            "await_cycle",
+            "that agent is already waiting on this caller",
+        ),
+    }
 }
 
 /// `GET /v1/agents/:id/log?since=&stream=&limit=`
@@ -1162,6 +1225,49 @@ mod tests {
         );
         board::create(conn, &n).unwrap();
         n.id
+    }
+
+    /// The operator's half of §2: a user send can wait for the turn that
+    /// consumes it, which is what the API's MCP `ask` tool is built on.
+    #[tokio::test]
+    async fn a_user_send_can_wait_for_the_turn_that_consumes_it() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state, parked};
+        let (s, _dir) = fake_state("operator-ask");
+        let (b, _) = agent(&s, "b");
+        parked(&s, b);
+
+        let (status, Json(v)) = send(
+            State(s.clone()),
+            Path(b),
+            Json(SendBody {
+                body: "what is six times seven <<FAKE:REPLY=forty-two>>".into(),
+                reply_to: None,
+                await_secs: Some(60),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["outcome"], "consumed", "{v}");
+        assert_eq!(v["result"], "forty-two");
+
+        // Without a wait it is the receipt it has always been, at 202: an
+        // existing client must not have to learn a new shape.
+        let (status, Json(v)) = send(
+            State(s.clone()),
+            Path(b),
+            Json(SendBody {
+                body: "<<FAKE:REPLY=noted>>".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(v.get("outcome").is_none(), "{v}");
+        assert!(v["sha256"].is_string() && v["id"].is_string(), "{v}");
+        s.supervisor.stop(b).await.ok();
     }
 
     #[test]

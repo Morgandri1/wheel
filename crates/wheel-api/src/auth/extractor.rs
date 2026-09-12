@@ -229,6 +229,25 @@ impl ProjectScope {
     }
 }
 
+impl ProjectScope {
+    /// The body-parameter form, for a caller whose project id is not in the
+    /// path: the operator MCP server names a project in each tool call.
+    ///
+    /// Same predicate, same `NotFound`, deliberately routed through the same
+    /// `load_owned` — this is a second CALLER, never a second rule.
+    pub(crate) async fn for_target(
+        state: &AppState,
+        user: &AuthUser,
+        id: Uuid,
+    ) -> Result<Self, ApiError> {
+        let project = load_owned(state, &id, user.id()).await?;
+        Ok(ProjectScope {
+            user: user.clone(),
+            project,
+        })
+    }
+}
+
 impl FromRequestParts<AppState> for ProjectScope {
     type Rejection = ApiError;
 

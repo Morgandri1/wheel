@@ -581,7 +581,7 @@ fn await_refused(conn: &rusqlite::Connection, r: AwaitRefused) -> ApiError {
 /// A receipt plus how the message's turn ended: `consumed` with its `result`,
 /// `error`/`undeliverable` with its `error`, or `timeout`/`pending` when it is
 /// still on its way.
-fn with_outcome(
+pub(crate) fn with_outcome(
     receipt: &MessageReceipt,
     settled: Option<&messages::Settlement>,
     waited: bool,
@@ -1196,13 +1196,13 @@ mod storage_err_tests {
 /// route handlers, a real supervisor, and `qa/harness/fake-claude` as the
 /// recipient's harness.
 #[cfg(test)]
-mod await_tests {
+pub(crate) mod await_tests {
     use super::*;
     use axum::http::HeaderValue;
     use std::sync::{Arc, Mutex};
     use wheel_core::{AgentConfig, AgentStatus, Node, NodeConfig, Position};
 
-    fn fake_state(name: &str) -> (AppState, std::path::PathBuf) {
+    pub(crate) fn fake_state(name: &str) -> (AppState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "wheel-await-{name}-{}-{}",
             std::process::id(),
@@ -1244,7 +1244,7 @@ mod await_tests {
     }
 
     /// An agent node with a token, so it can call the cli routes.
-    fn agent(s: &AppState, name: &str) -> (uuid::Uuid, HeaderMap) {
+    pub(crate) fn agent(s: &AppState, name: &str) -> (uuid::Uuid, HeaderMap) {
         let node = Node::new(
             uuid::Uuid::new_v4(),
             name.parse().unwrap(),
@@ -1268,7 +1268,7 @@ mod await_tests {
     }
 
     /// `deliver` starts a parked agent and never a stopped one (§3c#13).
-    fn parked(s: &AppState, id: uuid::Uuid) {
+    pub(crate) fn parked(s: &AppState, id: uuid::Uuid) {
         let conn = s.db.lock().unwrap();
         board::set_status(&conn, id, AgentStatus::Parked, None);
     }

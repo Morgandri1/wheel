@@ -17,7 +17,7 @@ Today two things stop that:
 - An agent that delegates work gets a receipt back, not an answer.
 
 Items 1 and 2 fix those two and are **implemented in this PR**. Items 3 to 5 are **design only**:
-- Item 3 needs API tokens from `api/headless-first`.
+- Item 3 needed API tokens from `api/headless-first`; that merged (`95cba53`), so it is now built (§3).
 - Items 4 and 5 overlap the Phase 1 list in `docs/proposals/agent-grid-engine.md` (branch `sdk/agent-grid-engine`, PR #58). They are referenced here, not repeated.
 
 **Anchors.** Every `file:line` below was read at `origin/main` 94dea07, before this PR's changes. Where this PR moves a line, the anchor names the function as well.
@@ -26,7 +26,7 @@ Items 1 and 2 fix those two and are **implemented in this PR**. Items 3 to 5 are
 |---|---|---|---|
 | 1 | Park on quota, resume at reset, credential fallback | implemented | **yes, the fallback half** (credential-distribution rule) |
 | 2 | `--await-reply` / MCP `ask`, and `--notify` | implemented | no (review welcome: §2.6) |
-| 3 | Operator MCP over Streamable HTTP | design | yes (new external auth surface) |
+| 3 | Operator MCP over Streamable HTTP | implemented | yes (new external auth surface) |
 | 4 | Roles and `wheel place agent --role` | design | yes (finding 006) |
 | 5 | Interrupt-and-redirect, runtime model/effort switch | design | partly (§5) |
 
@@ -104,6 +104,35 @@ The limit requeue rests on the same two facts, and it is bounded in ways the aut
 3. **It cannot loop hot.** Each redelivery waits for a real window reset, or for a backoff of at least 15 min. A misclassified message therefore costs at most one attempt per reset window.
 4. **It cannot loop for ever.** After `MAX_LIMIT_REQUEUES = 12` it is consumed with `error=true` and `last_error` naming the cap. With `--notify`, the sender is told. The cap is mutation-checked.
 5. **It is never silent.** Every requeue sets `last_error` ("rate limited: the turn did not complete; requeued for <resume_at>") and publishes a `message` event.
+
+### 1.3b A closed window and a dead credential are different states (2026-09-11 policy change)
+
+The operator has since ruled out API keys for self-hosted Wheel: harness auth is **OAuth with refresh**,
+and an OAuth credential lasts about eight hours. Engine-managed serialized refresh is being built on
+`sdk/harness-oauth`. That lane owns refresh; this one owns `rate_limited`. The two must not be
+confused, because the recovery differs:
+
+| | `rate_limited` | an expired credential |
+|---|---|---|
+| what happened | the account's window is closed; the credential is fine | the credential lapsed; the account may have plenty of window left |
+| who fixes it | nobody: time does | a refresh (or, failing that, a person) |
+| when to retry | at `resets_at`, hours away | as soon as the refresh lands, seconds away |
+| retrying early costs | a spawn and a rejected request | nothing — it is the fix |
+
+So the classifier must keep them apart, and it does: a limit needs `is_error` **and** either a
+session-matched `rejected` event or limit wording, while `needs_auth` keeps its own existing path
+(`classify_turn_end`, §1.2). A credential that lapses mid-turn is `NeedsAuth`, requeues, and waits for
+the refresh lane's machinery — it must never park an agent for five hours on a lapse that a refresh
+would clear in a second. Two things follow, and both are asked for as rulings:
+
+- **R7.** The refresh lane should treat `rate_limited` as a state it does not clear: a refreshed
+  credential does not reopen a closed window, and resuming early spends a turn to be told so again.
+- **R8.** `fallback_vault` (§1.4) is worth much less under an OAuth-only policy, because the canonical
+  pair it was designed for — subscription OAuth failing over to a pay-as-you-go API key — no longer
+  exists. Two OAuth accounts are the remaining case, and the ambiguity rule refuses them. **R3 is
+  therefore load-bearing rather than hypothetical**: without it, `fallback_vault` is dead config on an
+  OAuth-only deployment. It stays shipped and off by default; the ADVERSARY review should decide R3
+  with this in mind.
 
 ### 1.4 Optional credential fallback: `fallback_vault` (ADVERSARY-gated)
 
@@ -369,58 +398,90 @@ A non-blocking `wheel msg` from B to A is always allowed. It queues behind A's t
 
 ---
 
-## 3. Operator MCP server over Streamable HTTP (design only)
+## 3. Operator MCP server over Streamable HTTP (implemented)
 
-**Rationale.** AgentGrid masters and a developer's own Claude Code should be able to drive a board as tools, as AgentGrid's own master MCP does (#972), without a Wheel-specific client. The board MCP already exists, but it runs over stdio, per agent, with a node token (§3c#1). The operator's equivalent belongs on the **API**, authenticated as a *person*.
+**Rationale.** An AgentGrid master, or a developer's own Claude Code, should be able to drive a board
+as tools without a Wheel-specific client (AgentGrid #972). The board MCP already exists, but it runs
+over stdio, per agent, with a node token (§3c#1). The operator's equivalent belongs on the **API**,
+authenticated as a person.
 
-**Depends on:** `wht_` API tokens from `api/headless-first`. Nothing below is buildable before they land.
+**Unblocked by `api/headless-first`** (`95cba53`): `wht_` tokens exist, with `POST`/`GET`/`DELETE
+/v1/auth/tokens`, an operator token written to `<data-dir>/operator-token` on first boot, and
+revocation that cascades to tokens a revoked token minted. This builds on that and adds no second
+auth path.
 
-**Design.**
+### 3.1 What is built
 
-- **Transport.** `POST /v1/mcp` and `GET /v1/mcp` on `wheel-api`, speaking MCP Streamable HTTP:
-  - JSON-RPC over POST;
-  - an optional SSE stream for server-to-client notifications;
-  - `Mcp-Session-Id`.
-- **Auth.** `Authorization: Bearer wht_…` resolves a user.
-- **Project scoping.** Every tool takes `project`, and every call runs §5's order unchanged: verify the token, load the project, assert that the user owns it, then proxy. A project the user does not own is `not_found`.
-- **Tools** are thin wrappers over existing `/v1/projects/:id/engine/v1/*` routes:
-  - `projects`, `board`;
-  - `send` (as `from=user`, `on_behalf_of` the token's user once multiplayer attribution lands);
-  - `ask`, which reuses item 2's wait, as the operator;
-  - `start`, `stop`, `log_tail`, `usage`.
-- **Later:** `place` and `grant`, after item 4.
+- **`POST /v1/mcp`** — MCP over Streamable HTTP, JSON-RPC 2.0: `initialize`, `ping`, `tools/list`,
+  `tools/call`. A notification (no `id`) is answered `202` with no body, as the transport requires.
+  `GET`/`DELETE /v1/mcp` answer `405`: this server keeps no session and opens no server-initiated
+  stream, and the spec permits saying so.
+- **Auth is the ordinary `AuthUser` extractor**, so a `wht_` token and a browser session both work
+  and neither gets a new door. A request with no token never reaches a tool.
+- **Every tool that names a project re-runs the ownership predicate for that call**
+  (`ProjectScope::for_target`, the same `load_owned` every other route uses). A session is not a
+  scope: authorising once per connection is how a confused-deputy bug gets written.
+- **Tools**, each a thin call onto a route that already exists:
 
-**Threat model.**
+  | tool | engine/API route |
+  |---|---|
+  | `projects` | the caller's own projects |
+  | `board` | `GET /v1/board` |
+  | `send` | `POST /v1/agents/:id/send` |
+  | `ask` | the same, with `await_secs` (§2) — the operator's `--await-reply` |
+  | `start`, `stop` | `POST /v1/agents/:id/start`/`stop` |
+  | `logs` | `GET /v1/agents/:id/log` |
 
-**Token theft.**
-- `wht_` tokens are bearer credentials and must be scoped:
-  - `read` means board and log only;
-  - `operate` adds send, ask, start and stop;
-  - nothing can write a vault.
-- They must be revocable and stored hashed (the `db/tokens.rs` pattern). They must never appear in a URL.
+- **`ask` needed one engine addition**: `POST /v1/agents/:id/send` gains `await_secs`, reusing item
+  2's `await_settlement` and its concurrency cap. There is no cycle to guard against — the operator
+  has no turn to block — so the wait registers under the nil node id, which no tool can target.
+- **Agent-authored output is labelled.** `ask` results and `logs` lines are another agent's text
+  arriving in an operator model's context. They are returned with an explicit untrusted-input note,
+  the same reasoning as §2.4's notification.
+- **`Origin` is validated.** A request carrying an `Origin` the deployment does not allow is refused
+  before anything else. The MCP spec requires this of HTTP transports, because a loopback bind is not
+  an auth boundary: a page in the operator's browser can otherwise reach a local `wheeld`.
 
-**DNS rebinding and CSRF against a local `wheeld`.**
-- Validate `Origin` and refuse unknown origins, as the MCP spec requires for HTTP transports.
-- A loopback bind is not an auth boundary.
+### 3.2 What is deliberately NOT built
 
-**Prompt injection into the operator's model.**
-- Tool results carry agent-authored text: logs, results, messages.
-- Label it untrusted in the tool output, and never render it as instructions.
+- **Token scopes.** `wht_` tokens carry no scope today, so MCP grants *nothing* a token could not
+  already do by calling the same routes directly. Adding `read` / `operate` scopes is a change to the
+  token model, which is API-owned: ruling **R9**.
+- **A server-initiated SSE stream.** Board events already have a WebSocket. A second push channel with
+  its own auth is not worth it until something needs it.
+- **`place` and `grant` tools**, which wait on item 4.
+
+### 3.3 Threat model (item 3)
 
 **Confused deputy across projects.**
-- `project` is a parameter, so authorisation must run per call, never once per session.
-- Test: a token for user A cannot address user B's project, even inside a session that was opened on A's.
+- **Attack:** a token for user A names user B's project in a tool call, possibly after opening the
+  session against a project A does own.
+- **Mitigation:** authorisation is per call, never per session, and runs the same `load_owned`
+  predicate; a project the caller does not own is `not_found`, with no existence oracle.
+- **Test:** a second user's project id is `not_found` through every project-scoped tool.
 
-**Cost amplification.**
-- `ask` with long waits holds API replicas.
-- Cap concurrent waits per token, and forward the engine's own caps.
+**DNS rebinding / a browser page driving a local `wheeld`.**
+- **Mitigation:** `Origin` is checked against the deployment's allowlist; an unknown origin is
+  refused. A non-browser client sends no `Origin` and is unaffected.
+- **Test:** a disallowed `Origin` is refused before the tool runs.
 
-**Audit.**
-- Every mutating tool call is attributed: the token id, the user, the tool, and the target.
+**Prompt injection into the operator's own model.**
+- **Attack:** an agent writes text designed to be read as instructions by whoever calls `ask`/`logs`.
+- **Mitigation:** the label. The engine cannot sanitise instructions out of prose, and pretending
+  otherwise would be worse than saying plainly where the text came from.
 
-**ADVERSARY-gated**, because it is a new externally reachable auth surface.
+**Cost and hold amplification.**
+- **Attack:** many `ask` calls with long timeouts, holding API and engine tasks.
+- **Mitigation:** the engine's own cap (8 concurrent waits) and the clamp on `await_secs` apply
+  unchanged, because `ask` is the same code path.
 
----
+**Token theft.**
+- Unchanged from headless-first: hashed at rest, revocable, cascading revocation. MCP adds no new
+  storage and no new minting path.
+
+**Unauthenticated reconnaissance.**
+- A request with no token is refused before the body is parsed, so the tool list is not readable
+  anonymously.
 
 ## 4. Roles and `wheel place agent --role` (design only)
 
@@ -491,7 +552,11 @@ Only the delta is proposed here:
   - the §3e `--budget` and status rows.
 
   ARCHITECTURE is PM-owned and this PR does not edit it.
-- **R5.** Item 3 is sequenced after `api/headless-first` lands.
+- **R5.** Item 3 was sequenced after `api/headless-first`, which has landed; §3 is now built.
+- **R7 / R8.** §1.3b: the refresh lane does not clear `rate_limited`, and R3 decides whether
+  `fallback_vault` is usable at all under an OAuth-only policy.
+- **R9.** Scopes on `wht_` tokens (`read` vs `operate`). Today a token is all-or-nothing, so the MCP
+  server grants nothing new; scopes would let an operator hand out a read-only board tool.
 - **R6.** Item 4 storage: a `role` node type (visible and wireable on the board) or a project `roles` table. SDK recommends the node type, because a role you cannot see on the board is a capability bundle nobody reviews.
 
 ## 7. ADVERSARY-gated items in this PR

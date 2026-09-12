@@ -68,6 +68,14 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// What a client is told. The MCP server reports a refusal inside a
+    /// successful JSON-RPC response (a tool error the model can act on), so it
+    /// needs the same words the HTTP body would have carried — including
+    /// `NotFound`'s deliberately uninformative one.
+    pub fn message(&self) -> String {
+        self.parts().2
+    }
+
     fn parts(&self) -> (StatusCode, &'static str, String) {
         match self {
             // Note the message: it does not distinguish "no token" from "bad token" from
