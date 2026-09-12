@@ -28,6 +28,19 @@ pub const ENV_TRUSTED_PROXIES: &str = "WHEEL_TRUSTED_PROXIES";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// Marker: this request's **TCP peer** is inside `WHEEL_TRUSTED_PROXIES`.
+///
+/// The peer, deliberately — not `X-Forwarded-For`, which a client writes itself. Proxy-header
+/// authentication believes a header, so the only thing standing between that header and anyone on
+/// the internet is that the connection came from the proxy.
+///
+/// It is a request *extension*, set here on the server side, so no client can present one. And its
+/// absence — including when this middleware is not installed at all — reads as "not trusted", so a
+/// deployment that forgets the layer refuses every proxy-authenticated request instead of
+/// accepting every forged one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedPeer;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -104,6 +117,11 @@ impl TrustedProxies {
         self.0.is_empty()
     }
 
+    /// Is this address one of the operator's proxies?
+    pub fn trusts_peer(&self, ip: IpAddr) -> bool {
+        self.trusts(ip)
+    }
+
     fn trusts(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|c| c.contains(ip))
     }
@@ -145,6 +163,9 @@ pub async fn resolve(
     if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() {
         let client = trusted.client(peer.ip(), req.headers());
         req.extensions_mut().insert(ClientIp(client));
+        if trusted.trusts_peer(peer.ip()) {
+            req.extensions_mut().insert(TrustedPeer);
+        }
     }
     next.run(req).await
 }

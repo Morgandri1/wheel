@@ -44,11 +44,18 @@ pub async fn verify(
                 .kid
                 .as_deref()
                 .ok_or(ApiError::Unauthorized("jwt header has no kid"))?;
-            let key = jwks
+            let entry = jwks
                 .key_for(kid)
                 .await
                 .ok_or(ApiError::Unauthorized("unknown or unavailable signing key"))?;
-            decode_with(token, &key, cfg, Algorithm::RS256)?
+            // The key set says what this key is for. A `kid` that resolves to anything other than
+            // an RSA key is refused here rather than verified with whatever the header asked for —
+            // the same rule `auth::external` is built on, applied to this path too so the two
+            // cannot drift.
+            if entry.alg != Algorithm::RS256 {
+                return Err(ApiError::Unauthorized("key is not an RS256 signing key"));
+            }
+            decode_with(token, &entry.key, cfg, Algorithm::RS256)?
         }
 
         // The dev bypass. Reachable only when the process booted with WHEEL_ENV=dev *and* a secret
@@ -78,9 +85,10 @@ pub async fn verify(
         }
     }
 
-    if claims.sub.is_empty() {
-        return Err(ApiError::Unauthorized("token has empty sub"));
-    }
+    // The subject becomes `projects.owner_id`, an `x-wheel-actor-id` header and an envelope
+    // attribute. What it may contain is decided once, here, rather than sanitised at each use.
+    super::principal::validate(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("token subject is not a usable principal"))?;
 
     Ok(VerifiedUser {
         user_id: claims.sub,

@@ -31,12 +31,18 @@ fn sender_columns(from: &MessageSender) -> (&'static str, Option<String>) {
 }
 
 /// Persist a new message in `queued`. Returns the stored row.
+///
+/// `on_behalf_of` is the Wheel principal who asked for it, when a person did. It reaches here only
+/// from the control plane — see [`crate::api::actor`]. The value is re-validated there rather than
+/// trusted from the API, because "the layer above already checked" is how single-layer validation
+/// becomes no validation (ADVERSARY 009).
 pub fn enqueue(
     conn: &Connection,
     from: MessageSender,
     to: Uuid,
     body: String,
     reply_to: Option<Uuid>,
+    on_behalf_of: Option<String>,
 ) -> Result<Message> {
     let msg = Message {
         id: Uuid::new_v4(),
@@ -47,6 +53,7 @@ pub fn enqueue(
         body,
         state: MessageState::Queued,
         reply_to,
+        on_behalf_of,
         created_at: Timestamp::now(),
         delivered_at: None,
         consumed_at: None,
@@ -55,8 +62,8 @@ pub fn enqueue(
     let (kind, from_id) = sender_columns(&msg.from);
 
     conn.execute(
-        "INSERT INTO messages (id,from_kind,from_id,to_id,body,sha256,bytes,reply_to,state,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9)",
+        "INSERT INTO messages (id,from_kind,from_id,to_id,body,sha256,bytes,reply_to,on_behalf_of,state,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10)",
         params![
             msg.id.to_string(),
             kind,
@@ -66,6 +73,7 @@ pub fn enqueue(
             msg.sha256,
             msg.bytes as i64,
             msg.reply_to.map(|r| r.to_string()),
+            msg.on_behalf_of,
             msg.created_at.to_rfc3339(),
         ],
     )?;
@@ -115,6 +123,12 @@ fn row_to_message(conn: &Connection, row: &rusqlite::Row<'_>) -> rusqlite::Resul
         bytes: row.get::<_, i64>("bytes")? as u64,
         state: serde_json::from_value(serde_json::Value::String(state)).unwrap_or_default(),
         reply_to: reply_to.and_then(|r| r.parse().ok()),
+        // Re-checked on the way OUT as well as on the way in. The column is plain text in a file
+        // that a same-uid sibling can open (ADVERSARY 037 item 4), so a value that reached the
+        // table by some route other than `enqueue` must not become an envelope attribute.
+        on_behalf_of: row
+            .get::<_, Option<String>>("on_behalf_of")?
+            .filter(|a| crate::api::actor::is_valid_principal(a)),
         created_at: Timestamp::parse_rfc3339(&created).map_err(|e| conv(Box::new(e)))?,
         delivered_at: delivered.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),
         consumed_at: consumed.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),

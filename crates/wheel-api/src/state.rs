@@ -19,9 +19,17 @@ pub struct Inner {
     pub cfg: Config,
     pub db: Db,
     pub jwks: JwksCache,
+    /// Keys for the deployer's issuer under `AUTH_MODE=external`. A *separate* cache from `jwks`
+    /// on purpose: two key sets sharing one map would let a `kid` published by one issuer satisfy
+    /// a token claiming the other, which is issuer confusion delivered by a cache.
+    pub external_jwks: Option<JwksCache>,
     pub http: reqwest::Client,
     pub orch: Arc<dyn Orchestrator>,
     pub ingress_limiter: RateLimiter,
+    /// Fan-out of membership changes to live connections. See `membership`.
+    pub membership: crate::membership::MembershipEvents,
+    /// Per-project ceiling on live WebSocket bridges (ADVERSARY 011).
+    pub bridges: crate::http::bridges::BridgeCounter,
     pub auth_limiter: crate::http::authlimit::AuthLimiter,
     /// Test hook: when set, every project's engine resolves to this base URL instead of the
     /// docker-network hostname. Only ever populated by the test harness.

@@ -158,6 +158,23 @@ pub async fn create_token_only_user(db: &Db, email: &str) -> ApiResult<User> {
     insert_user(db, &email, TOKEN_ONLY).await
 }
 
+/// A Wheel account for an externally-authenticated subject.
+///
+/// The address is synthetic, always, in the RFC 2606 reserved `.invalid` TLD. Two reasons, and the
+/// second is the one that matters:
+///
+///   * It can never be deliverable, so it cannot collide with a real user's address.
+///   * **An external provider's `email` claim never becomes a Wheel account address.** If it did,
+///     an IdP that lets a user set an unverified address would be a one-step takeover of any local
+///     account whose address an attacker can guess. The provider's claim is kept on the
+///     `external_identities` row instead, where it is display only and is not a lookup key.
+///
+/// The password hash is [`TOKEN_ONLY`], so no password verifies against it.
+pub async fn create_external_user(db: &Db) -> ApiResult<User> {
+    let email = format!("external-{}@external.invalid", Uuid::new_v4());
+    insert_user(db, &email, TOKEN_ONLY).await
+}
+
 pub async fn find_token_only_user(db: &Db, email: &str) -> ApiResult<Option<User>> {
     let Ok(email) = validate_email(email) else {
         return Ok(None);

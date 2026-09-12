@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod board_apply;
+pub mod external_identities;
 pub mod health;
 pub mod ingress;
 pub mod instantiate;
+pub mod members;
 pub mod projects;
 pub mod proxy;
 pub mod tokens;

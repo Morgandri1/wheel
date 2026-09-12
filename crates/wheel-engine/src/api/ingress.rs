@@ -357,7 +357,11 @@ pub(crate) fn deliver(
         // `enqueue` is the ONLY delivery path. It is what makes the body reach
         // the child through `Message::envelope` — so `type="endpoint"` and the
         // escaping are properties of the message type, not of this module.
-        if crate::db::messages::enqueue(&conn, sender.clone(), wire.to, body.clone(), None).is_ok()
+        // No actor, by design. An ingress hit is anonymous and arrives as `type=endpoint`; a tier
+        // must never become a way into this route, and this route must never become a way to
+        // attribute a message to a person who did not send it.
+        if crate::db::messages::enqueue(&conn, sender.clone(), wire.to, body.clone(), None, None)
+            .is_ok()
         {
             queued += 1;
             let supervisor = state.supervisor.clone();

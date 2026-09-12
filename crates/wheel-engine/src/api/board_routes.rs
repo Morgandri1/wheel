@@ -9,6 +9,7 @@ use uuid::Uuid;
 use wheel_core::{Event, Node, NodeState, NodeType, NodeWithState, Timestamp, WireSpec};
 
 use axum::extract::Path;
+use serde::Deserialize;
 
 use super::{ApiError, ApiResult, AppState, CreateNode, PatchNode};
 use crate::db::board;
@@ -81,6 +82,74 @@ pub async fn create_node(
         at: Timestamp::now(),
     });
     Ok((StatusCode::CREATED, Json(node)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeContent {
+    pub markdown: String,
+}
+
+/// `PUT /v1/nodes/:id/content` — replace a ctx node's markdown, and nothing else.
+///
+/// # Why this route exists rather than a rule about `PATCH /v1/nodes/:id`
+///
+/// A prompter's job is to "manage context, and prompt agents" (operator ruling, 2026-09-11), while
+/// the board's *shape* — creating, deleting, rewiring, and agent config such as model, budget and
+/// harness — is admin. `PATCH /v1/nodes/:id` carries `name`, `position` and `config` in one body,
+/// so ctx content and agent config arrive through the same door.
+///
+/// Letting a prompter through that door conditionally would mean the API authorising on a request
+/// *body* — parsing node config to decide permissions, duplicating engine knowledge, and deciding
+/// about one thing while the engine acts on another. That is the confusion `extractor.rs` refuses
+/// for `x-project-id`, and it is how a tier acquires the conditional powers the ruling forbids.
+///
+/// So the narrow door is a separate path, and `auth::policy` stays a pure `(method, path)` table.
+/// Same idiom as `PUT /v1/vault/:id/:key`, and the same principle `table_routes` states: the
+/// operator gets exactly the same box an agent does — this is `wheel write` against a ctx node,
+/// minus the wire check, because the caller is not a node and has no wires.
+pub async fn put_content(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<NodeContent>,
+) -> ApiResult<Json<Node>> {
+    if body.markdown.len() > wheel_core::MAX_VALUE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            format!(
+                "content is {} bytes; the limit is {}",
+                body.markdown.len(),
+                wheel_core::MAX_VALUE_BYTES
+            ),
+        ));
+    }
+
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = board::get(&conn, id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+
+    // Only a ctx node has operator-editable content. Refusing by node *type* rather than by
+    // ignoring the field keeps the route's meaning narrow: it can never become a second way to
+    // patch something a prompter is not allowed to patch.
+    if !matches!(node.config, wheel_core::NodeConfig::Ctx(_)) {
+        return Err(ApiError::invalid(format!(
+            "{} is {} {}, and only a ctx node has editable content",
+            node.name,
+            node.node_type().article(),
+            node.node_type()
+        )));
+    }
+
+    let mut updated = node;
+    updated.config = wheel_core::NodeConfig::Ctx(wheel_core::CtxConfig {
+        markdown: body.markdown,
+    });
+    board::update(&conn, &updated)?;
+    s.events.publish(Event::BoardChanged {
+        at: Timestamp::now(),
+    });
+    Ok(Json(updated))
 }
 
 /// `PATCH /v1/nodes/:id` — partial update of name, position and/or config.

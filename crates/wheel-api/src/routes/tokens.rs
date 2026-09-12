@@ -41,6 +41,25 @@ pub async fn create(
     let mint = match user.credential() {
         Credential::ApiToken(parent) => api_token::Mint::Token(parent),
         Credential::Session(session) => api_token::Mint::Session(session),
+        // An external credential may not mint a `wht_` token, and this is the control that keeps
+        // the whole external lifetime story from being decorative. A deployer's token is
+        // short-lived and revoked by their IdP; a `wht_` token is neither. Allowing the trade
+        // would let anyone with five minutes of access buy an indefinite credential that the
+        // deployer's identity system can no longer take away. An external user who wants one logs
+        // in to Wheel by some other means, deliberately.
+        Credential::External => {
+            return Err(crate::error::ApiError::Forbidden(
+                "an externally-authenticated session may not mint API tokens",
+            ))
+        }
+        // A ws-ticket is a one-shot credential for opening one socket. It is never presented to
+        // this route — the events route is the only redeemer — so this arm is unreachable by
+        // construction, and says no rather than relying on that.
+        Credential::WsTicket => {
+            return Err(crate::error::ApiError::Forbidden(
+                "a websocket ticket may not mint API tokens",
+            ))
+        }
     };
     let issued = api_token::issue(&state.db, user.id(), &body.name, mint).await?;
     Ok((

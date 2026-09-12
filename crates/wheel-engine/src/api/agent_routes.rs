@@ -140,9 +140,13 @@ pub async fn clear(
 pub async fn send(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SendBody>,
 ) -> ApiResult<(StatusCode, Json<MessageReceipt>)> {
     require_agent(&s, id)?;
+    // Who asked. Present on this plane, absent on the CLI plane and on ingress — see
+    // `super::actor`. `headers` sits before `Json` because an axum body extractor must be last.
+    let on_behalf_of = super::actor::from_headers(&headers);
     if body.body.len() > MAX_MESSAGE_BODY {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -156,8 +160,15 @@ pub async fn send(
 
     let msg = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        messages::enqueue(&conn, MessageSender::User, id, body.body, body.reply_to)
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        messages::enqueue(
+            &conn,
+            MessageSender::User,
+            id,
+            body.body,
+            body.reply_to,
+            on_behalf_of,
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?
     };
 
     // Nudge the loop. If the agent is stopped or mid-turn this is a no-op and

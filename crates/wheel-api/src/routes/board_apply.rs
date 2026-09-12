@@ -138,15 +138,38 @@ pub(crate) struct HttpBoardClient {
     http: reqwest::Client,
     base: String,
     bearer: String,
+    /// The actor markers, built once and attached to every call.
+    ///
+    /// This client **bypasses `routes::proxy` entirely**, so nothing in that module applies to it.
+    /// Without this, `board/apply` and `instantiate` — the two routes that create whole boards —
+    /// would reach the engine with no actor at all, which is the place attribution matters most.
+    actor: axum::http::HeaderMap,
 }
 
 impl HttpBoardClient {
-    pub(crate) fn new(state: &AppState, project: &Uuid) -> Self {
+    pub(crate) fn new(
+        state: &AppState,
+        project: &Uuid,
+        user: &crate::auth::AuthUser,
+        tier: crate::auth::Tier,
+    ) -> Self {
+        let mut actor = axum::http::HeaderMap::new();
+        crate::http::actor::set_actor(&mut actor, user, tier);
         Self {
             http: state.http.clone(),
             base: state.engine_base_url(project),
             bearer: format!("Bearer {}", state.cfg.host_secret.expose()),
+            actor,
         }
+    }
+
+    /// A request builder carrying the host bearer and the actor markers. Every engine call goes
+    /// through here, so none of them can be the one that forgot.
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            .header("Authorization", &self.bearer)
+            .headers(self.actor.clone())
     }
 
     /// The engine's error body if it sent one, else the status. Passed through rather than
@@ -173,9 +196,7 @@ impl BoardClient for HttpBoardClient {
             body.extend(cfg);
         }
         let resp = self
-            .http
-            .post(format!("{}/v1/nodes", self.base))
-            .header("Authorization", &self.bearer)
+            .request(reqwest::Method::POST, format!("{}/v1/nodes", self.base))
             .json(&serde_json::Value::Object(body))
             .send()
             .await
@@ -196,9 +217,7 @@ impl BoardClient for HttpBoardClient {
 
     async fn patch_config(&self, id: Uuid, config: &serde_json::Value) -> Result<(), String> {
         let resp = self
-            .http
-            .patch(format!("{}/v1/nodes/{id}", self.base))
-            .header("Authorization", &self.bearer)
+            .request(reqwest::Method::PATCH, format!("{}/v1/nodes/{id}", self.base))
             .json(config)
             .send()
             .await
@@ -211,9 +230,7 @@ impl BoardClient for HttpBoardClient {
 
     async fn add_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String> {
         let resp = self
-            .http
-            .post(format!("{}/v1/wires", self.base))
-            .header("Authorization", &self.bearer)
+            .request(reqwest::Method::POST, format!("{}/v1/wires", self.base))
             .json(&serde_json::json!({"from": from, "to": to, "type": wire_type}))
             .send()
             .await
@@ -291,7 +308,9 @@ pub async fn apply_board(
     scope: ProjectScope,
     Json(req): Json<ApplyRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let client = HttpBoardClient::new(&state, &scope.project.id);
+    // Applying a board creates, patches and wires nodes: it is board structure, which is admin.
+    scope.require(crate::auth::Tier::Admin)?;
+    let client = HttpBoardClient::new(&state, &scope.project.id, &scope.user, scope.tier);
     let existing = read_board(&client).await?;
 
     let policy = ApplyPolicy {

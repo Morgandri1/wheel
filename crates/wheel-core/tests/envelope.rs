@@ -21,6 +21,7 @@ fn msg(body: &str, from: MessageSender) -> Message {
         body: body.to_string(),
         state: MessageState::Queued,
         reply_to: None,
+        on_behalf_of: None,
         created_at: Timestamp::parse_rfc3339("2026-09-05T00:21:00Z").unwrap(),
         delivered_at: None,
         consumed_at: None,
@@ -44,6 +45,55 @@ fn envelope_is_byte_exact() {
         "<AgentPrompt id=\"abababab-abab-abab-abab-ababababab\
          ab\" from=\"researcher\" type=\"agent\">\nhello there\n</AgentPrompt>"
     );
+}
+
+/// The attribute is appended AFTER `type`, never inserted among the three that were always there.
+/// Everything that reads an envelope anchors on that opening prefix — the engine's tests, QA's
+/// independently written oracle, the red team's parser — so appending keeps them all reading the
+/// same thing, and inserting would break each of them differently.
+#[test]
+fn on_behalf_of_appears_only_when_set_and_always_after_type() {
+    let plain = msg("hi", agent_sender("researcher"));
+    assert!(
+        !plain.envelope().contains("on_behalf_of"),
+        "an unattributed message must not carry the attribute at all"
+    );
+
+    let mut attributed = msg("hi", MessageSender::User);
+    attributed.on_behalf_of = Some("alice@example.com".into());
+    assert_eq!(
+        attributed.envelope(),
+        "<AgentPrompt id=\"abababab-abab-abab-abab-ababababab\
+         ab\" from=\"user\" type=\"user\" on_behalf_of=\"alice@example.com\">\nhi\n</AgentPrompt>"
+    );
+
+    // With a reply_to as well, the order is id, from, type, reply_to, on_behalf_of.
+    let mut both = msg("hi", MessageSender::User);
+    both.reply_to = Some(Uuid::from_bytes([2; 16]));
+    both.on_behalf_of = Some("alice".into());
+    let env = both.envelope();
+    let reply_at = env.find("reply_to=").expect("reply_to present");
+    let actor_at = env.find("on_behalf_of=").expect("on_behalf_of present");
+    assert!(
+        env.starts_with("<AgentPrompt id=\"abababab-abab-abab-abab-ababababab\
+         ab\" from=\"user\" type=\"user\""),
+        "the three original attributes keep their place and order: {env}"
+    );
+    assert!(reply_at < actor_at, "optional attributes append in a fixed order: {env}");
+}
+
+/// The value can never close the attribute, because a principal cannot contain a quote — enforced
+/// at `wheel-api`'s verification boundary and re-enforced by `wheel-engine`'s `api::actor`. This
+/// test states the property the envelope depends on, so that if either check were relaxed the
+/// consequence would be visible here rather than in production.
+#[test]
+fn an_attributed_envelope_still_has_exactly_one_opening_tag() {
+    let mut m = msg("a body mentioning <AgentPrompt and </AgentPrompt>", MessageSender::User);
+    m.on_behalf_of = Some("alice".into());
+    let env = m.envelope();
+    assert_eq!(env.matches("<AgentPrompt ").count(), 1, "{env}");
+    assert!(env.starts_with("<AgentPrompt id="), "{env}");
+    assert!(env.ends_with("</AgentPrompt>"), "{env}");
 }
 
 #[test]
