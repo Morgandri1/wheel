@@ -186,6 +186,30 @@ already in hand).
   choice compounds per project: N parked-agent populations, each independently paying whichever
   runtime's per-sandbox resume cost, not one payment for the whole box.
 
+**Why Shapes 1/2's lack of project-to-project isolation is not a self-inflicted risk to wave away —
+two independent reasons, confirmed rather than assumed, both pointing at Shape 3:**
+
+1. **Confidentiality: `wheeld` is not single-tenant by construction, whatever a specific deployment's
+   own conventions assume.** `WHEEL_SIGNUP=open` (`infra/vps/compose.yml`'s own comment: "lets anyone
+   who reaches this server create an account and run agents on it") lets any number of distinct
+   people sign up, and even the `closed` default lets the owner add more accounts via `POST
+   /v1/auth/users` (`docs/API.md`). "Every project belongs to the same person" is a fact about how a
+   *specific* deployment happens to be used, not a guarantee the codebase makes — project-to-project
+   reach on a `WHEEL_SIGNUP=open` (or multi-account `closed`) `wheeld` is a genuine cross-TENANT
+   confidentiality breach, not a self-inflicted one.
+2. **Availability — a DIFFERENT axis, ADVERSARY's addition, independently confirmed** (`compose.yml`
+   on this branch still has no `mem_limit`/`pids_limit`/`cpus` on `wheeld` at all — not this PR's
+   scope to add, a fact worth stating next to the shape decision regardless). Under Shapes 1/2
+   (however hardened the single container/process gets), one project's runaway workload — a
+   memory-hungry `npm install`, a build storm, anything a legitimate coding-agent task can produce —
+   can OOM or exhaust the WHOLE box, taking down every OTHER project's board simultaneously, not just
+   the offending one. This is not fixed by `cap_drop`/AppArmor/a stronger runtime wrapping the single
+   container either, for the same reason project-to-project confidentiality isn't: those all harden
+   the SAME shared boundary every project sits inside equally. Only Shape 3 (real per-project
+   processes/sandboxes) makes PER-PROJECT resource limits possible at all, not just per-project
+   confidentiality — the two reasons point the same direction independently, and Morgan should have
+   both in front of him when this decision gets made, not just the confidentiality one.
+
 **A related, narrower finding for Shape 2, from the same reuse angle:** the "unix-socket-only, no
 TCP" pattern above is a partial answer to Shape 2's network-namespace gap — for the CONTROL PLANE
 specifically. It does not fix the gap as a whole: an agent's own outbound work (`git`, `npm`, tool
