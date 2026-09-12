@@ -30,6 +30,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// How long a `stop()` gives the engine's own SIGTERM handler before SIGKILL.
+///
+/// The §4b spawn contract now gives the engine up to ~25s to shut down cleanly on its own (a 2s
+/// HTTP drain, up to 20s waiting for turns already running, then a 3s SIGTERM grace for its
+/// agents) before it stops on its own initiative — a shorter timeout here would SIGKILL an engine
+/// that was already finishing exactly the drain this contract asks for, mid-write to sqlite
+/// (review round 2, finding 2).
+const ENGINE_STOP_GRACE_SECS: u64 = 30;
+
 pub struct ProcessSandbox {
     cfg: Config,
     store: Arc<Store>,
@@ -120,6 +129,13 @@ impl ProcessSandbox {
             ("WHEEL_PROJECT_ID", id.to_string()),
             ("WHEEL_ENGINE_SECRET", secrets.engine_secret.clone()),
             ("WHEEL_VAULT_KEY", secrets.vault_key.clone()),
+            // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
+            // fail-secure per project, computed by wheel-host itself — never a value a project's
+            // own owner can influence.
+            (
+                "WHEEL_HARNESS_AUTH",
+                self.cfg.harness_auth_for(id).to_string(),
+            ),
             ("WHEEL_DATA_DIR", self.project_dir(id).display().to_string()),
             ("WHEEL_LISTEN", format!("unix://{}", socket.display())),
             ("WHEEL_LOG", "json".to_string()),
@@ -418,8 +434,11 @@ impl Sandbox for ProcessSandbox {
         let Some(mut child) = self.children.lock().await.remove(id) else {
             return Ok(()); // already stopped; stop must converge
         };
-        // SIGTERM first: the engine's contract is a clean shutdown within 15s (children stopped,
-        // sqlite flushed). Killing outright would risk a torn database.
+        // SIGTERM first: the engine's contract is a clean shutdown within ENGINE_STOP_GRACE_SECS
+        // (agents drained and stopped, sqlite flushed). Killing outright would risk a torn
+        // database, or a replayed turn (review round 2, finding 2 — SIGKILLing an engine that is
+        // still inside its own drain is exactly the mid-turn kill the shutdown redesign exists to
+        // avoid).
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             // SAFETY: pid came from a child we spawned.
@@ -428,7 +447,8 @@ impl Sandbox for ProcessSandbox {
             }
         }
 
-        let graceful = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+        let graceful =
+            tokio::time::timeout(Duration::from_secs(ENGINE_STOP_GRACE_SECS), child.wait()).await;
         if graceful.is_err() {
             tracing::warn!(project = %id, "engine ignored SIGTERM; killing");
             let _ = child.kill().await;
@@ -543,6 +563,20 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Review round 2, finding 2: the engine's own shutdown sequence can legitimately take close
+    /// to 25s (a 2s HTTP drain, up to 20s for turns in flight, a 3s SIGTERM grace for its agents),
+    /// so a SIGKILL budget shorter than that would cut off exactly the drain the redesign asks the
+    /// engine to do.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_engine_stop_grace_covers_its_own_shutdown_budget() {
+        assert!(
+            ENGINE_STOP_GRACE_SECS >= 30,
+            "ENGINE_STOP_GRACE_SECS is {ENGINE_STOP_GRACE_SECS}s, which is not enough room for a \
+             ~25s engine shutdown to finish before being SIGKILLed"
+        );
+    }
+
     /// Serve one HTTP response on a unix socket, then close.
     async fn socket_answering(path: std::path::PathBuf, response: &'static str) {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -648,12 +682,49 @@ mod tests {
                 "TMPDIR",
                 "WHEEL_DATA_DIR",
                 "WHEEL_ENGINE_SECRET",
+                "WHEEL_HARNESS_AUTH",
                 "WHEEL_LISTEN",
                 "WHEEL_LOG",
                 "WHEEL_PROJECT_ID",
                 "WHEEL_ROLE",
                 "WHEEL_VAULT_KEY",
             ]
+        );
+    }
+
+    /// `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS` (wow-agent-brief task 4): the value that actually reaches
+    /// the child is `harness_auth_for`'s, not a fixed constant — an allowlisted project gets
+    /// `oauth-token`, everything else (including an empty allowlist) gets the fail-secure default.
+    #[test]
+    fn the_engine_child_gets_the_allowlist_derived_harness_auth_value() {
+        let dir = tempdir();
+        let mut cfg = Config::for_tests(&dir.display().to_string());
+        let allowed = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        cfg.oauth_allowed_projects = vec![allowed];
+        let store = Arc::new(Store::open(&dir.join("host.db").display().to_string()).unwrap());
+        let sb = ProcessSandbox::new(cfg, store);
+        let secrets = Secrets {
+            engine_secret: "s".into(),
+            vault_key: "k".into(),
+        };
+
+        let allowed_env: std::collections::HashMap<_, _> = sb
+            .engine_env(&allowed, &secrets, std::path::Path::new("/run/x.sock"))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            allowed_env.get("WHEEL_HARNESS_AUTH").map(String::as_str),
+            Some("oauth-token")
+        );
+
+        let other_env: std::collections::HashMap<_, _> = sb
+            .engine_env(&other, &secrets, std::path::Path::new("/run/x.sock"))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            other_env.get("WHEEL_HARNESS_AUTH").map(String::as_str),
+            Some("api-key-only")
         );
     }
 

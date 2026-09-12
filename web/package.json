@@ -5,7 +5,7 @@
   "packageManager": "pnpm@9.15.4",
   "scripts": {
     "dev": "next dev --port 3000",
-    "dev:mock": "concurrently -n mock,next -c magenta,cyan \"pnpm mock\" \"next dev --port 3000\"",
+    "dev:mock": "concurrently -n mock,next -c magenta,cyan \"pnpm mock\" \"WHEEL_API_URL=${WHEEL_API_URL:-http://127.0.0.1:8787} next dev --port 3000\"",
     "mock": "tsx mock/server.ts",
     "build": "next build",
     "start": "next start",
@@ -18,7 +18,7 @@
     "copy:monaco": "node scripts/copy-monaco.mjs",
     "prebuild": "node scripts/copy-monaco.mjs",
     "predev": "node scripts/copy-monaco.mjs",
-    "build:pkg": "WHEEL_STANDALONE=1 NEXT_PUBLIC_AUTH_MODE=local NEXT_DIST_DIR=.next-pkg next build",
+    "build:pkg": "WHEEL_STANDALONE=1 NEXT_DIST_DIR=.next-pkg next build",
     "pack:pkg": "NEXT_DIST_DIR=.next-pkg node scripts/pack-standalone.mjs",
     "check:auth-mode": "node --experimental-strip-types scripts/check-auth-mode.mjs"
   },
@@ -34,6 +34,8 @@
     "react-markdown": "^9.0.1",
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.0",
+    "server-only": "^0.0.1",
+    "ws": "^8.21.3",
     "zustand": "^5.0.2"
   },
   "devDependencies": {
@@ -56,8 +58,7 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8",
-    "ws": "^8.18.0"
+    "vitest": "^2.1.8"
   },
   "engines": {
     "node": "22.x"

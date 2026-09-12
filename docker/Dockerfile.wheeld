@@ -1,0 +1,102 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# wheeld: all of Wheel in one headless container (docs/proposals/headless-first.md).
+#
+#   docker build -f docker/Dockerfile.wheeld -t wheeld .
+#   docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
+#   docker exec wheeld cat /data/operator-token
+#
+# --stop-timeout 30: `docker stop`'s own default is 10s, shorter than the ~25s a clean shutdown
+# can take (drain, wait for turns in flight, signal the agents) -- review round 2, finding 2/3.
+#
+# The build, runtime and toolchain stages are docker/Dockerfile.host's, instruction for
+# instruction: agents in here get the environment a hosted engine gives them, and the two images
+# share those layers from cache. Keep them identical until they share one base.
+
+# --- build ------------------------------------------------------------------
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+
+ARG GIT_SHA=unknown
+ENV WHEEL_BUILD_SHA=$GIT_SHA
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked --bin wheeld \
+    && cargo build --release --locked --bin wheel
+
+# --- runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git python3 python3-venv procps \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm i -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- dev toolchain ----------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libssl-dev make \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && npm i -g pnpm && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+          --component clippy --component rustfmt \
+    && chmod -R a+rX /opt/rust
+
+RUN python3 -c "import sys; assert sys.version_info[0] == 3" \
+    && node --version && claude --version && codex --version \
+    && git --version && gh --version && make --version | head -1 \
+    && pnpm --version && cargo --version && rustc --version \
+    && cargo clippy --version && cargo fmt --version && cc --version | head -1
+
+RUN useradd --create-home --uid 10001 --shell /bin/bash agent
+ENV IS_SANDBOX=1
+
+# --- wheeld -----------------------------------------------------------------
+# tini is PID 1: it forwards SIGTERM to wheeld, which stops every engine and agent, and it reaps
+# any descendant that outlives its parent. wheeld as PID 1 would leave those as zombies.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/wheeld /usr/local/bin/wheeld
+COPY --from=build /src/target/release/wheel /usr/local/bin/wheel
+RUN wheeld --version && wheel --help >/dev/null
+
+# Owned by the agent uid before the volume is declared, so a new named volume starts out
+# writable by it. 0700: master.key, the operator token and every board live here.
+RUN mkdir -p /data && chown agent:agent /data && chmod 0700 /data
+VOLUME ["/data"]
+
+# 0.0.0.0 is the container's own network namespace. Publish it on the host's loopback only:
+# `-p 127.0.0.1:8080:8080`. wheeld warns about the exposure at boot either way.
+ENV WHEEL_DATA_DIR=/data \
+    BIND_ADDR=0.0.0.0:8080
+EXPOSE 8080
+
+# Non-root, and it must be: agents run with bypassPermissions, which the harness refuses as root,
+# and the embedded backend runs them as wheeld's own uid.
+USER 10001
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/wheeld"]

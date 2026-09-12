@@ -34,11 +34,27 @@ use anyhow::Context;
 pub use config::Config;
 use wheel_core::ListenAddr;
 
-/// Run an engine until it is asked to stop.
+/// How long the HTTP server drains open requests after the shutdown signal. An event stream or a
+/// half-sent request would otherwise hold it open forever, and every agent with it.
+const HTTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run an engine until SIGTERM or SIGINT.
 ///
 /// The caller owns the runtime, so an embedder can host this alongside other
 /// work rather than being handed a process.
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {
+    serve_until(cfg, shutdown_signal()).await
+}
+
+/// Run an engine until `shutdown` resolves, then stop every agent before
+/// returning.
+///
+/// For an embedder that owns the process's signals: `wheeld` runs many engines
+/// and stops each one itself, so none of them may install a handler of its own.
+pub async fn serve_until(
+    cfg: Config,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     // Logging belongs to whoever owns the PROCESS, not to each engine in it.
     // `wheeld` runs several of these together; if serve() installed a global
     // subscriber, the second engine would panic on a logging detail. The
@@ -94,15 +110,54 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // any message left queued by the previous run resumes exactly the agents
     // that have work waiting.
     state.supervisor.start_configured_agents().await;
+    // Renewals are timers, and timers do not survive a restart: every vault
+    // holding a refreshable login gets its next renewal scheduled again.
+    state.supervisor.arm_all_refresh_timers();
 
+    let supervisor = state.supervisor.clone();
     let app = api::router(state);
+    // Whatever serving ends in — a clean stop or a bind that failed after startup resumed agents
+    // with queued work — no agent outlives the engine that owns it.
+    let (asked, stop_asked) = tokio::sync::oneshot::channel::<()>();
+    let signal = async move {
+        shutdown.await;
+        let _ = asked.send(());
+    };
+    let serving = serve_on(listen, app, signal);
+    tokio::pin!(serving);
+    let served = tokio::select! {
+        result = &mut serving => result,
+        () = drain_deadline(stop_asked) => {
+            tracing::warn!("requests were still open {HTTP_DRAIN:?} after the shutdown signal; stopping without them");
+            Ok(())
+        }
+    };
+    supervisor.shutdown().await;
+    served?;
 
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+/// Resolves `HTTP_DRAIN` after the shutdown signal fired, and never if serving ended first.
+async fn drain_deadline(stop_asked: tokio::sync::oneshot::Receiver<()>) {
+    match stop_asked.await {
+        Ok(()) => tokio::time::sleep(HTTP_DRAIN).await,
+        Err(_) => std::future::pending().await,
+    }
+}
+
+async fn serve_on(
+    listen: ListenAddr,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     match listen {
         ListenAddr::Tcp(addr) => {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!(%addr, "listening");
             axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown)
                 .await?;
         }
         ListenAddr::Unix(path) => {
@@ -140,13 +195,11 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 
             tracing::info!(path = %path.display(), mode = "0600", "listening");
             axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(shutdown)
                 .await?;
             let _ = std::fs::remove_file(&path);
         }
     }
-
-    tracing::info!("shutdown complete");
     Ok(())
 }
 

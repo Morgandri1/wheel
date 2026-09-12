@@ -548,6 +548,13 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
         )
         .unwrap_or(0);
 
+    // The node's own config, for `budget_status` below -- not on the
+    // `agent_state` row, which only ever holds what the engine OBSERVES.
+    // Computed here, once, so every caller of `agent_state` (the board, the
+    // stall report, `/v1/cli/usage`) reads the identical number rather than
+    // each joining spend against budget itself and risking the two drifting.
+    let budget = get(conn, node_id)?.and_then(|n| n.config.as_agent().and_then(|a| a.budget));
+
     let s = conn
         .prepare(
             "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd
@@ -556,6 +563,10 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
         .query_row(params![node_id.to_string()], |r| {
             let status: String = r.get(0)?;
             let last_activity: Option<String> = r.get(2)?;
+            let spend = wheel_core::Spend {
+                turns: r.get::<_, i64>(5)? as u64,
+                usd: r.get(6)?,
+            };
             Ok(AgentState {
                 status: serde_json::from_value(serde_json::Value::String(status))
                     .unwrap_or_default(),
@@ -565,10 +576,8 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
                 last_error: r.get(3)?,
                 hosted_on: r.get(4)?,
                 queued_messages: queued as u32,
-                spend: Some(wheel_core::Spend {
-                    turns: r.get::<_, i64>(5)? as u64,
-                    usd: r.get(6)?,
-                }),
+                budget_status: wheel_core::BudgetStatus::compute(spend, budget),
+                spend: Some(spend),
             })
         })
         .optional()?;
@@ -594,6 +603,16 @@ pub fn set_status(
             Timestamp::now().to_rfc3339(),
             err
         ],
+    );
+}
+
+/// Set or clear an agent's `last_error` without touching its status or its
+/// `last_activity`: a warning about its credential must not also reset the
+/// idle clock that decides when it parks.
+pub fn set_last_error(conn: &Connection, node: Uuid, err: Option<&str>) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET last_error = ?2 WHERE node_id = ?1",
+        params![node.to_string(), err],
     );
 }
 

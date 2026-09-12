@@ -25,6 +25,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin},
@@ -122,6 +123,7 @@ impl StartupTail {
 
 pub mod git_creds;
 mod prompt;
+mod refresh;
 pub mod workspace;
 pub use prompt::compose_prompt;
 
@@ -134,6 +136,9 @@ struct Running {
     session_id: Option<String>,
     stdin: ChildStdin,
     child: Child,
+    /// The agent leads its own process group (see `start`), so this is also the id of everything
+    /// it spawned. Kept apart from `child.id()`, which is gone once the leader is reaped.
+    pgid: Option<libc::pid_t>,
     /// The message currently occupying the child, if any. Exactly one at a
     /// time: the next is written only after this turn's `result`.
     in_flight: Option<Uuid>,
@@ -145,6 +150,41 @@ struct Running {
     /// board's `turns` a triangular series — three turns would read as six.
     counted_turns: u64,
     counted_usd: f64,
+    /// The vault login this child was started on, if it runs on one. A renewal
+    /// since then means it holds a token on its way out.
+    credential_gen: Option<refresh::CredentialGen>,
+}
+
+/// How long an agent gets to exit on SIGTERM when the engine shuts down, before SIGKILL.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long turns already running get to finish when the engine shuts down. With the SIGTERM grace
+/// and the engine's HTTP drain it fits inside the 30 s a container is given to stop.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a turn still running when the drain ran out is consumed with. Never requeued: see
+/// [`Supervisor::shutdown`].
+pub const INTERRUPTED_BY_SHUTDOWN: &str = "interrupted by engine shutdown";
+
+impl Running {
+    /// SIGKILL the agent's whole process group, then reap the leader.
+    ///
+    /// The group, not the leader: an agent's tool shells and MCP servers are its descendants, and
+    /// killing only the process we spawned orphaned every one of them.
+    async fn kill(&mut self) -> std::io::Result<()> {
+        self.signal_group(libc::SIGKILL);
+        match self.child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            _ => self.child.kill().await,
+        }
+    }
+
+    fn signal_group(&self, signal: libc::c_int) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: killpg only delivers a signal. The id is our child's own group.
+            unsafe { libc::killpg(pgid, signal) };
+        }
+    }
 }
 
 /// One agent's slot. `None` means "not running"; the mutex is held ACROSS the
@@ -268,6 +308,15 @@ pub struct Supervisor {
     agents: AgentSlots,
     harness: Arc<dyn Harness>,
     events: Arc<crate::events::Bus>,
+    /// Set when shutdown begins: from then on nothing starts and no new message is written.
+    closing: AtomicBool,
+    shutdown_drain_ms: AtomicU64,
+    pub(crate) broker: refresh::Broker,
+    /// Bumped by every `stop`. `start` releases the slot across a renewal, so
+    /// without this a stop that lands in that window takes the empty slot, sets
+    /// `stopped`, and the renewal then spawns a child anyway: the operator's
+    /// stop returns success and the agent keeps running.
+    stops: Mutex<HashMap<Uuid, u64>>,
 }
 
 impl Supervisor {
@@ -316,7 +365,21 @@ impl Supervisor {
             agents: Arc::new(AsyncMutex::new(HashMap::new())),
             harness,
             events,
+            closing: AtomicBool::new(false),
+            shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
+            broker: refresh::Broker::default(),
+            stops: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How many times this agent has been stopped. Read before a start gives
+    /// up the slot and again when it takes it back.
+    fn stop_epoch(&self, agent: Uuid) -> u64 {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0)
+    }
+
+    fn note_stop(&self, agent: Uuid) {
+        *self.stops.lock().unwrap().entry(agent).or_insert(0) += 1;
     }
 
     fn startup_deadline(&self) -> std::time::Duration {
@@ -484,14 +547,43 @@ impl Supervisor {
     /// an agent whose credential is fine.
     fn lapsed_credential(&self, agent: Uuid, harness: wheel_core::Harness) -> Option<String> {
         let conn = self.db.lock().ok()?;
-        let (vault, _key, expires_at) =
+        let (vault, key, expires_at) =
             crate::vault::credential_detail(&conn, agent, harness).ok()??;
+        // A refreshable login's expiry is a renewal deadline, not a lapse:
+        // `start` renews it instead of refusing on it.
+        if key == wheel_core::CLAUDE_OAUTH_SESSION {
+            return None;
+        }
         let expires_at = expires_at?;
         (expires_at.into_inner() <= time::OffsetDateTime::now_utc()).then(|| {
             format!(
                 "the credential from vault {vault} expired at {expires_at}; \
                  sign in again, or store a `claude setup-token` token which does not expire"
             )
+        })
+    }
+
+    /// Does a wired vault hand this agent an OAuth credential of any shape: a
+    /// refreshable login, a `CLAUDE_CODE_OAUTH_TOKEN`, or an `sk-ant-oat` value
+    /// under any other name (an agent can export any key it can read)?
+    fn vault_supplies_oauth(&self, agent: Uuid) -> bool {
+        let conn = self.db.lock().unwrap();
+        if crate::vault::session_vault_for(&conn, agent)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+        let Some(vk) = self.vault_key() else {
+            return false;
+        };
+        crate::vault::env_for_agent(&conn, vk, agent).is_ok_and(|env| {
+            env.iter().any(|(k, v)| {
+                k == "CLAUDE_CODE_OAUTH_TOKEN"
+                    || crate::auth::classify_token(v, wheel_core::Harness::Claude)
+                        == wheel_core::CredentialKind::OauthToken
+            })
         })
     }
 
@@ -510,12 +602,19 @@ impl Supervisor {
     /// a no-op that returns the existing session (§3c#13).
     pub async fn start(self: &Arc<Self>, agent: Uuid) -> Result<AgentStatus> {
         let slot = self.slot(agent).await;
-        let mut guard = slot.lock().await;
-
-        if let Some(r) = guard.as_ref() {
-            // Already running. Do NOT spawn a second process.
-            let _ = r.session_id;
-            return Ok(AgentStatus::Running);
+        let stops_before = self.stop_epoch(agent);
+        {
+            // Checked under the slot lock: shutdown takes every slot after setting the flag, so a
+            // start either finishes first and is stopped with the rest, or sees the flag and refuses.
+            let guard = slot.lock().await;
+            if self.closing.load(Ordering::SeqCst) {
+                anyhow::bail!("the engine is shutting down; nothing starts now");
+            }
+            if let Some(r) = guard.as_ref() {
+                // Already running. Do NOT spawn a second process.
+                let _ = r.session_id;
+                return Ok(AgentStatus::Running);
+            }
         }
 
         let (node, resume) = {
@@ -542,11 +641,12 @@ impl Supervisor {
         // a hardcoded ClaudeDriver. Starting a codex node would therefore spawn
         // `claude` with codex credentials and never say so — a silent harness
         // substitution the operator cannot see. Refuse instead, and say why.
-        if agent_cfg.harness == wheel_core::Harness::Codex {
-            let reason =
-                "harness \"codex\" is not supported by this build (M2): there is no codex \
-                          driver, so starting this node would silently run claude instead"
-                    .to_string();
+        if !crate::harness::has_driver(agent_cfg.harness) {
+            let h = agent_cfg.harness;
+            let reason = format!(
+                "harness \"{h}\" is not supported by this build (M2): there is no {h} \
+                 driver, so starting this node would silently run claude instead"
+            );
             self.set_status(agent, AgentStatus::Error, Some(reason));
             return Ok(AgentStatus::Error);
         }
@@ -562,8 +662,9 @@ impl Supervisor {
         }
 
         // docs/proposals/wheel-harness-auth.md, enforcement point 4: the gate
-        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT` (API's
-        // half) can refuse an OAuth-shaped credential before it is ever
+        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT`
+        // (api/agent_routes.rs, api/vault_routes.rs) refuse an OAuth-shaped
+        // credential before it is ever
         // stored, but an agent is untrusted code with a shell and can write
         // one itself (`claude auth login`/`claude setup-token`) without going
         // through any of those routes. Spawn is the one point that inspects
@@ -571,13 +672,56 @@ impl Supervisor {
         // the point that cannot be bypassed.
         if self.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly {
             let config_dir = self.cfg.creds_dir().join(agent.to_string());
-            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness) {
+            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness)
+                || self.vault_supplies_oauth(agent)
+            {
                 let reason = "this project is api-key-only: an OAuth-shaped credential is not \
                                permitted here, store an API key instead"
                     .to_string();
                 self.set_status(agent, AgentStatus::Error, Some(reason));
                 return Ok(AgentStatus::Error);
             }
+        }
+
+        // A refreshable vault login is renewed BEFORE the child starts if it is
+        // near its end, so no child is ever handed a token about to die. If it
+        // cannot be renewed and has already lapsed, this is `needs_auth` with
+        // the reason, and the message that woke the agent stays queued.
+        let session_vault = {
+            let conn = self.db.lock().unwrap();
+            crate::vault::session_vault_for(&conn, agent).ok().flatten()
+        };
+        // Deliberately NOT under the slot lock: renewing runs the CLI on a
+        // 60-second budget, and this agent's slot is taken for every delivery
+        // to it -- and `live_agents` walks every slot for `/healthz`. Holding
+        // it across the renewal made one agent's renewal everyone's problem.
+        let credential_gen = match session_vault {
+            Some(vault) => {
+                if let Err(reason) = self.ensure_fresh(vault, None).await {
+                    self.set_status(agent, AgentStatus::NeedsAuth, Some(reason));
+                    return Ok(AgentStatus::NeedsAuth);
+                }
+                Some((vault, self.session_generation(vault)))
+            }
+            None => None,
+        };
+
+        // Re-taken for the spawn itself, which is what §3c#13 requires: one
+        // process per agent, decided under this lock. A start that won the race
+        // while we were renewing has already spawned on the same fresh login.
+        let mut guard = slot.lock().await;
+        if self.closing.load(Ordering::SeqCst) {
+            anyhow::bail!("the engine is shutting down; nothing starts now");
+        }
+        if guard.is_some() {
+            return Ok(AgentStatus::Running);
+        }
+        // Someone stopped this agent while the renewal ran. They took an empty
+        // slot and got `stopped`; spawning now would hand them a running agent
+        // they just stopped, with a token minted after they stopped it.
+        if self.stop_epoch(agent) != stops_before {
+            tracing::info!(%agent, "a stop landed while this start was renewing its login; not spawning");
+            return Ok(AgentStatus::Stopped);
         }
 
         let run_dir = self.cfg.node_run_dir(agent);
@@ -697,7 +841,9 @@ impl Supervisor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Its own process group, so stopping the agent can reach everything it started.
+            .process_group(0);
         for (k, v) in self.harness.env(&spec) {
             cmd.env(k, v);
         }
@@ -801,15 +947,18 @@ impl Supervisor {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let run_id = Uuid::new_v4();
+        let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
         *guard = Some(Running {
             run_id,
             session_id: None,
             stdin,
             child,
+            pgid,
             in_flight: None,
             consecutive_user: 0,
             counted_turns: 0,
             counted_usd: 0.0,
+            credential_gen,
         });
         drop(guard);
 
@@ -899,7 +1048,34 @@ impl Supervisor {
     /// intended, this map records what is actually running. The stall report
     /// needs both to tell a turn in progress from a wedge.
     pub async fn live_agents(&self) -> std::collections::HashSet<Uuid> {
-        self.agents.lock().await.keys().copied().collect()
+        // Slots that HOLD a process, not slots that exist. An agent keeps its
+        // slot for ever once it has started one, so counting keys reported a
+        // parked agent as live -- and `stalled_agents` reads this to tell a
+        // turn in progress from a wedge, so the one state the system cannot
+        // leave on its own was the one it could not see.
+        //
+        // The handles are cloned and the MAP lock released before any slot is
+        // touched, and each slot is taken with `try_lock`. Both matter: a slot
+        // can be held for as long as a spawn takes, and the map lock is what
+        // every start, park and delivery needs. Awaiting a slot while holding
+        // the map would let one `/healthz` freeze the whole board.
+        let slots: Vec<(Uuid, AgentSlot)> = {
+            let map = self.agents.lock().await;
+            map.iter().map(|(id, slot)| (*id, slot.clone())).collect()
+        };
+        let mut live = std::collections::HashSet::new();
+        for (agent, slot) in slots {
+            // A slot we cannot take this instant is mid-spawn or mid-kill,
+            // which is a process in transition rather than an absent one.
+            let holding = match slot.try_lock() {
+                Ok(guard) => guard.is_some(),
+                Err(_) => true,
+            };
+            if holding {
+                live.insert(agent);
+            }
+        }
+        live
     }
 
     /// Stop an idle agent's process, keeping its session so the next message
@@ -967,7 +1143,7 @@ impl Supervisor {
             // scope, so the process does die; what was missing was anyone ever
             // hearing that the direct kill did not work. (ADVERSARY, on the
             // risk I flagged as #2 in the review request.)
-            if let Err(e) = r.child.kill().await {
+            if let Err(e) = r.kill().await {
                 tracing::warn!(
                     %agent,
                     error = %e,
@@ -1130,7 +1306,7 @@ impl Supervisor {
         // a live process while the board says otherwise. `kill_on_drop(true)`
         // still reaps `r` when it drops, so the process does die either way;
         // what matters is that a failure here is heard.
-        if let Err(e) = r.child.kill().await {
+        if let Err(e) = r.kill().await {
             tracing::warn!(
                 %agent,
                 error = %e,
@@ -1164,12 +1340,15 @@ impl Supervisor {
     }
 
     pub async fn stop(&self, agent: Uuid) -> Result<AgentStatus> {
+        // Before the slot, so a start that is mid-renewal sees this even
+        // though it holds nothing right now.
+        self.note_stop(agent);
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         if let Some(mut r) = guard.take() {
             // Same reasoning as `park`: kill_on_drop reaps it either way, but a
             // failure that nobody hears is a process the board thinks is gone.
-            if let Err(e) = r.child.kill().await {
+            if let Err(e) = r.kill().await {
                 tracing::warn!(%agent, error = %e, "killing a stopped agent's process failed");
             }
         }
@@ -1181,6 +1360,77 @@ impl Supervisor {
         }
         self.set_status(agent, AgentStatus::Stopped, None);
         Ok(AgentStatus::Stopped)
+    }
+
+    /// Stop every agent before the engine exits, without losing a turn or running one twice.
+    ///
+    /// Nothing starts and no new message is written once this begins. Turns already running get up
+    /// to [`SHUTDOWN_DRAIN`] to finish, and are consumed as usual. A turn still running after that is
+    /// consumed with [`INTERRUPTED_BY_SHUTDOWN`] rather than requeued: a turn killed mid-flight may
+    /// already have committed or pushed, and running it again would do that twice.
+    ///
+    /// Then SIGTERM to every agent's process group at once, and SIGKILL for whatever is left after
+    /// the grace period. Each agent is left `parked`, not `stopped`: its session is kept, and the
+    /// first message after a restart resumes it.
+    pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        let drain = std::time::Duration::from_millis(self.shutdown_drain_ms.load(Ordering::SeqCst));
+        let drain_until = tokio::time::Instant::now() + drain;
+        while self.turns_in_flight().await > 0 && tokio::time::Instant::now() < drain_until {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut stopping = Vec::new();
+        for (agent, slot) in self.all_slots().await {
+            if let Some(running) = slot.lock().await.take() {
+                running.signal_group(libc::SIGTERM);
+                stopping.push((agent, running));
+            }
+        }
+        {
+            let conn = self.db.lock().unwrap();
+            for mid in stopping.iter().filter_map(|(_, running)| running.in_flight) {
+                messages::mark_error(&conn, mid, INTERRUPTED_BY_SHUTDOWN).ok();
+                publish_message(&self.events, &conn, mid);
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        for (agent, mut running) in stopping {
+            let _ = tokio::time::timeout_at(deadline, running.child.wait()).await;
+            if let Err(e) = running.kill().await {
+                tracing::warn!(%agent, error = %e, "killing an agent at shutdown failed");
+            }
+            {
+                let conn = self.db.lock().unwrap();
+                let _ = crate::db::tokens::revoke(&conn, agent);
+            }
+            self.set_status(agent, AgentStatus::Parked, None);
+        }
+    }
+
+    async fn all_slots(&self) -> Vec<(Uuid, AgentSlot)> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect()
+    }
+
+    async fn turns_in_flight(&self) -> usize {
+        let mut n = 0;
+        for (_, slot) in self.all_slots().await {
+            if slot
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|r| r.in_flight.is_some())
+            {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Deliver the next queued message if the agent is idle.
@@ -1196,6 +1446,14 @@ impl Supervisor {
         };
         if running.in_flight.is_some() {
             return Ok(()); // mid-turn
+        }
+        if self.closing.load(Ordering::SeqCst) {
+            return Ok(()); // shutting down: what is queued waits for the next start
+        }
+        // Credentials failed: the queue waits for a person, and is not spent a
+        // turn at a time discovering the same dead token.
+        if current_status(&self.db, agent) == AgentStatus::NeedsAuth {
+            return Ok(());
         }
 
         let next = {
@@ -1360,6 +1618,7 @@ impl Supervisor {
                             r.counted_usd += du;
                             (dt, du)
                         });
+                        let gen = g.as_ref().and_then(|r| r.credential_gen);
                         drop(g);
 
                         let over_budget = if let Some((dt, du)) = spend {
@@ -1444,7 +1703,15 @@ impl Supervisor {
                         if environmental {
                             // Nothing more can run until credentials exist, and
                             // draining the queue into the same failure would
-                            // requeue every message in turn for no reason.
+                            // requeue every message in turn for no reason --
+                            // unless the vault already holds a newer login, or
+                            // this one merely ran out and can be renewed once.
+                            if !self.recover_from_auth_failure(agent, gen).await {
+                                // Nothing to run on: hold the process's place
+                                // rather than spending a turn per queued
+                                // message to be told the same thing again.
+                                self.park_needs_auth(agent).await;
+                            }
                             continue;
                         }
 
@@ -1456,6 +1723,12 @@ impl Supervisor {
                             if let Err(e) = self.clear_context(agent).await {
                                 tracing::warn!(agent = %agent, error = %e, "ephemeral restart failed");
                             }
+                        } else if !is_error && self.credential_stale(gen.as_ref()) {
+                            // Between turns is the one moment a child can be
+                            // swapped without losing work: the vault's login
+                            // was renewed while this turn ran, so the next
+                            // message goes to a child holding the new token.
+                            self.recycle(agent).await;
                         } else {
                             let _ = self.pump_queue(agent).await;
                             // Nothing left to do: start counting down. If the
@@ -1591,17 +1864,37 @@ impl Supervisor {
 
         {
             let conn = self.db.lock().unwrap();
-            // Anything written to the dying child never ran a turn, so it goes
-            // back on the queue rather than being lost as though it had been
-            // handled.
-            let n = messages::requeue_all_undelivered(
-                &conn,
-                agent,
-                "the harness exited before this message could be processed",
-            )
-            .unwrap_or(0);
-            if n > 0 {
-                tracing::info!(agent = %agent, requeued = n, in_flight = ?in_flight, "returned in-flight messages to the queue");
+            // Anything written to the dying child never ran a turn, so ordinarily it goes back on
+            // the queue rather than being lost as though it had been handled. But if the engine is
+            // shutting down, this exit may not be the supervisor's own doing — a cgroup-wide kill
+            // (review round 2, finding 1: `KillMode=control-group` sends SIGTERM to the agent
+            // process at the same instant as to wheeld, well before `shutdown`'s own drain and
+            // signal sequence reaches it) — and a turn killed mid-flight may already have taken an
+            // effect the process never reported. Requeuing it there would run that turn again,
+            // which is the replay `Supervisor::shutdown`'s own drain-timeout branch already refuses.
+            if self.closing.load(Ordering::SeqCst) {
+                let n = messages::consume_all_delivered_as_interrupted(
+                    &conn,
+                    agent,
+                    INTERRUPTED_BY_SHUTDOWN,
+                )
+                .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(agent = %agent, interrupted = n, "consumed in-flight message(s) as interrupted by shutdown rather than replaying them");
+                }
+                if let Some(mid) = in_flight {
+                    publish_message(&self.events, &conn, mid);
+                }
+            } else {
+                let n = messages::requeue_all_undelivered(
+                    &conn,
+                    agent,
+                    "the harness exited before this message could be processed",
+                )
+                .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(agent = %agent, requeued = n, in_flight = ?in_flight, "returned in-flight messages to the queue");
+                }
             }
             // A token outliving its process is a credential with no owner.
             let _ = crate::db::tokens::revoke(&conn, agent);
@@ -1677,7 +1970,7 @@ impl Supervisor {
             let slot = self.slot(agent).await;
             let mut guard = slot.lock().await;
             if let Some(mut r) = guard.take() {
-                if let Err(e) = r.child.kill().await {
+                if let Err(e) = r.kill().await {
                     tracing::warn!(%agent, error = %e, "killing a cleared agent's process failed");
                 }
             }
@@ -1859,21 +2152,34 @@ fn set_status_db(
     status: AgentStatus,
     err: Option<String>,
 ) {
+    // A credential warning outlives the next status change. It says something
+    // about the login rather than about this transition, and it has to still be
+    // there when the operator looks -- otherwise the one warning they get
+    // before their agents stop is erased by the agent starting normally.
     let _ = conn.execute(
         "INSERT INTO agent_state (node_id,status,last_activity,last_error)
          VALUES (?1,?2,?3,?4)
-         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error =
+             CASE WHEN ?4 IS NOT NULL THEN ?4
+                  WHEN last_error LIKE ?5 || '%' THEN last_error
+                  ELSE NULL END",
         rusqlite::params![
             agent.to_string(),
             status.as_str(),
             wheel_core::Timestamp::now().to_rfc3339(),
             err,
+            refresh::WARNING_PREFIX,
         ],
     );
 }
 
 /// Forget the resumable session, so the next start is a NEW context rather
 /// than a `--resume` of the one being discarded.
+fn current_status(db: &Mutex<rusqlite::Connection>, agent: Uuid) -> AgentStatus {
+    let conn = db.lock().unwrap();
+    board::agent_state(&conn, agent).unwrap_or_default().status
+}
+
 fn clear_session(conn: &rusqlite::Connection, agent: Uuid) {
     let _ = conn.execute(
         "UPDATE agent_state SET session_id = NULL WHERE node_id = ?1",
@@ -4404,5 +4710,193 @@ done
         );
         sup.stop(id).await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Answers each message after the number of seconds in `turn_secs` beside it (default 1).
+    /// Writes its own pid to `pid`, so a test can end it from outside the supervisor entirely --
+    /// the shape of a cgroup-wide kill, which reaches the agent without going through
+    /// `Supervisor::shutdown`'s own `signal_group`/`kill` path at all.
+    const SLOW_TURN_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+echo $$ > "$dir/pid"
+echo '{"type":"system","subtype":"init","session_id":"s1"}'
+while IFS= read -r line; do
+  sleep "$(cat "$dir/turn_secs" 2>/dev/null || echo 1)"
+  echo '{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"ok"}'
+done
+"#;
+
+    fn send_user(sup: &Supervisor, to: Uuid, body: &str) -> Uuid {
+        let conn = sup.db.lock().unwrap();
+        messages::enqueue(
+            &conn,
+            wheel_core::MessageSender::User,
+            to,
+            body.to_string(),
+            None,
+        )
+        .unwrap()
+        .id
+    }
+
+    fn state_and_error(sup: &Supervisor, mid: Uuid) -> (MessageState, Option<String>) {
+        let conn = sup.db.lock().unwrap();
+        let m = messages::get(&conn, mid).unwrap().unwrap();
+        (m.state, m.last_error)
+    }
+
+    async fn deliver_one(sup: &Arc<Supervisor>, id: Uuid, body: &str) -> Uuid {
+        sup.start(id).await.unwrap();
+        until("the agent to come up", || {
+            !matches!(status_of(sup, id), AgentStatus::Starting)
+        })
+        .await;
+        let mid = send_user(sup, id, body);
+        sup.deliver(id).await.unwrap();
+        until("the message to be in flight", || {
+            state_and_error(sup, mid).0 == MessageState::Delivered
+        })
+        .await;
+        mid
+    }
+
+    /// Review round 1, finding 5: shutdown took the slot out from under a turn, so the result never
+    /// landed and the message sat `delivered` for ever. A turn that can finish inside the drain must
+    /// be consumed as any other.
+    #[tokio::test]
+    async fn shutdown_lets_a_turn_in_flight_finish() {
+        let (sup, id, dir) = shim_supervisor("drain-finishes", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "1").unwrap();
+        let mid = deliver_one(&sup, id, "finish me").await;
+
+        sup.shutdown().await;
+
+        assert_eq!(state_and_error(&sup, mid), (MessageState::Consumed, None));
+    }
+
+    /// The other half of finding 5, under the operator's ruling: a turn still running when the drain
+    /// runs out is consumed with a reason, never requeued. Replaying a turn that was killed mid-flight
+    /// can commit or push twice.
+    #[tokio::test]
+    async fn a_turn_that_outlasts_the_drain_is_consumed_as_interrupted_and_never_rerun() {
+        let (sup, id, dir) = shim_supervisor("drain-expires", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        sup.shutdown_drain_ms.store(300, Ordering::SeqCst);
+        let mid = deliver_one(&sup, id, "never finishes").await;
+
+        sup.shutdown().await;
+
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (
+                MessageState::Consumed,
+                Some(INTERRUPTED_BY_SHUTDOWN.to_string())
+            )
+        );
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            !messages::has_queued(&conn, id).unwrap(),
+            "the interrupted turn was put back to run again"
+        );
+    }
+
+    /// Finding 6: once shutdown has begun, nothing may start again, whether asked directly or
+    /// resumed by a message arriving for a parked agent.
+    #[tokio::test]
+    async fn nothing_starts_once_shutdown_has_begun() {
+        let (sup, id, dir) = shim_supervisor("closing", ECHO_HARNESS);
+        sup.shutdown().await;
+
+        assert!(
+            sup.start(id).await.is_err(),
+            "an agent started after shutdown"
+        );
+        sup.set_status(id, AgentStatus::Parked, None);
+        send_user(&sup, id, "wake up");
+        assert!(sup.deliver(id).await.is_err());
+        assert_eq!(runs(&dir), 0, "a process was spawned after shutdown");
+    }
+
+    /// Review round 2, finding 1, reproduced live by the security reviewer against
+    /// `KillMode=control-group`: that setting SIGTERMs the agent process at the same instant as
+    /// wheeld, so the agent can die well before `shutdown`'s own drain-wait even finishes -- its
+    /// death is caught by `reap`, not by `shutdown`'s own signal/kill loop, and `reap` must still
+    /// refuse to replay the turn. Before this fix `reap` always requeued, so the message came back
+    /// `queued` and was redelivered (re-running the turn) the next time the agent started.
+    #[tokio::test]
+    async fn a_process_killed_out_of_band_during_the_drain_is_interrupted_not_replayed() {
+        let (sup, id, dir) = shim_supervisor("killed-during-drain", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        let mid = deliver_one(&sup, id, "never finishes").await;
+
+        // Long enough that this test's own SIGKILL, not `shutdown`'s SHUTDOWN_GRACE-then-kill
+        // sequence, is what ends the process.
+        sup.shutdown_drain_ms.store(5000, Ordering::SeqCst);
+        let shutting_down = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.shutdown().await }
+        });
+
+        until("shutdown to set the closing flag", || {
+            sup.closing.load(Ordering::SeqCst)
+        })
+        .await;
+        // Past the moment `shutdown` has read `in_flight` for its own drain check, so the kill
+        // below is unambiguously the thing that ends the process, not a race with it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let pid: i32 = until_present(&dir.join("pid"))
+            .await
+            .trim()
+            .parse()
+            .expect("the harness wrote a pid");
+        // The whole process GROUP, not just the leader: the shell forks a real child to run
+        // `sleep`, which inherits the same stdout pipe fd, and killing only the leader leaves that
+        // child holding the write end open forever, so the reader never sees EOF. A cgroup-wide
+        // kill (`KillMode=control-group`) does not have that gap -- it reaches every process in
+        // the tree at once -- and `-pid` is the closest a test gets to reproducing that without a
+        // real cgroup.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+
+        until("the interrupted message to be consumed", || {
+            state_and_error(&sup, mid).0 == MessageState::Consumed
+        })
+        .await;
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (
+                MessageState::Consumed,
+                Some(INTERRUPTED_BY_SHUTDOWN.to_string())
+            ),
+            "the turn was replayed instead of being marked interrupted"
+        );
+
+        shutting_down.await.expect("shutdown itself must not panic");
+
+        // "Not redelivered after a restart": consumed, not queued, so the ordinary
+        // resume-on-message path finds nothing waiting for this agent.
+        let conn = sup.db.lock().unwrap();
+        assert!(
+            !messages::has_queued(&conn, id).unwrap(),
+            "the interrupted message was put back in the queue"
+        );
+    }
+
+    /// Waits for a file to exist and returns its contents, for a value a background process
+    /// writes at an unpredictable moment (its own pid, here).
+    async fn until_present(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.trim().is_empty() {
+                    return s;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {}", path.display());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

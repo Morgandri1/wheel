@@ -23,7 +23,7 @@ const standalone = join(built, "standalone");
 
 if (!existsSync(standalone)) {
   console.error(`pack: no standalone build at ${standalone}`);
-  console.error("Run: WHEEL_STANDALONE=1 NEXT_PUBLIC_AUTH_MODE=local NEXT_DIST_DIR=.next-pkg next build");
+  console.error("Run: WHEEL_STANDALONE=1 NEXT_DIST_DIR=.next-pkg next build");
   process.exit(1);
 }
 

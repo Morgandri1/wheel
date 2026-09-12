@@ -16,12 +16,14 @@
 //! JSON shape here you must regenerate `docs/schema/` in the same commit and
 //! tell PM, because Web regenerates its TypeScript types from it.
 
+pub mod engine;
 pub mod event;
 pub mod host;
 pub mod message;
 pub mod name;
 pub mod node;
 pub mod preamble;
+pub mod proxy_path;
 pub mod spawn;
 pub mod state;
 pub mod timestamp;
@@ -29,6 +31,7 @@ pub mod tool;
 pub mod validate;
 pub mod wire;
 
+pub use engine::EngineInfo;
 pub use event::{Event, LogLine, LogStream, WireDenial, LAGGED_HINT};
 pub use host::{
     Capabilities, ErrorBody, ErrorDetail, HostHealth, SandboxBackend, SandboxInfo, SandboxStatus,
@@ -50,8 +53,8 @@ pub use node::{
 pub use preamble::{compose_system_prompt, orchestration_block, PreambleInput, WireLine};
 pub use spawn::{ListenAddr, ListenAddrError};
 pub use state::{
-    is_credential_key, AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, CredentialKind,
-    NodeState, NodeWithState, Spend, CREDENTIAL_KEYS,
+    is_credential_key, AgentState, AgentStatus, AuthBegin, AuthMode, AuthStatus, BudgetStatus,
+    CredentialKind, NodeState, NodeWithState, Spend, CLAUDE_OAUTH_SESSION, CREDENTIAL_KEYS,
 };
 pub use timestamp::Timestamp;
 pub use tool::{

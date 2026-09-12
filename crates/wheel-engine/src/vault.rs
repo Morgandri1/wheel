@@ -139,7 +139,11 @@ pub fn credential_detail(
     harness: wheel_core::Harness,
 ) -> Result<Option<(String, String, Option<wheel_core::Timestamp>)>> {
     let recognised: &[&str] = match harness {
-        wheel_core::Harness::Claude => &["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        wheel_core::Harness::Claude => &[
+            wheel_core::CLAUDE_OAUTH_SESSION,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ],
         wheel_core::Harness::Codex => &["CODEX_API_KEY"],
     };
     for (id, name) in wired_vaults(conn, agent)? {
@@ -296,11 +300,22 @@ pub fn supplies_key(
         if id == exclude {
             continue;
         }
-        if list_keys(conn, id)?.iter().any(|k| k == key) {
+        if list_keys(conn, id)?.iter().any(|k| slot(k) == slot(key)) {
             return Ok(Some(name));
         }
     }
     Ok(None)
+}
+
+/// The environment variable a vault key ends up as in a child. Two keys with
+/// the same slot are the same credential as far as the harness can tell, so
+/// ambiguity is judged on the slot, not the name.
+pub fn slot(key: &str) -> &str {
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        "CLAUDE_CODE_OAUTH_TOKEN"
+    } else {
+        key
+    }
 }
 
 /// The name of a vault, other than `exclude`, that DECLARES `key` for this
@@ -364,6 +379,7 @@ fn find_ambiguity_by(
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (id, name) in vaults {
         for key in keys_of(conn, id)? {
+            let key = slot(&key).to_string();
             if let Some(first) = seen.get(&key) {
                 return Ok(Some(Ambiguity {
                     what: if wheel_core::is_credential_key(&key) {
@@ -428,12 +444,97 @@ pub fn env_for_agent(
     let mut env = Vec::new();
     for (id, _) in wired_vaults(conn, agent)? {
         for key in list_keys(conn, id)? {
-            if let Some(v) = get(conn, vk, id, &key)? {
+            let Some(v) = get(conn, vk, id, &key)? else {
+                continue;
+            };
+            if key == wheel_core::CLAUDE_OAUTH_SESSION {
+                // The access token only. The refresh token stays with the
+                // engine: a child that held it would be a second refresher
+                // racing the first for a single-use token.
+                let session = crate::auth::OauthSession::from_vault_value(&v)?;
+                let token = session
+                    .access_token()
+                    .ok_or_else(|| anyhow::anyhow!("the stored login has no access token"))?;
+                env.push((slot(&key).to_string(), token.to_string()));
+            } else {
                 env.push((key, v));
             }
         }
     }
     Ok(env)
+}
+
+/// Milliseconds since the epoch, as the credential stores speak, to the
+/// RFC3339 this API speaks. Out of range is `None`, never a wrong time.
+pub fn millis_to_timestamp(ms: i64) -> Option<wheel_core::Timestamp> {
+    time::OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
+        .ok()
+        .map(wheel_core::Timestamp::from)
+}
+
+/// The vault supplying this agent a refreshable login, if one does.
+pub fn session_vault_for(conn: &Connection, agent: Uuid) -> Result<Option<Uuid>> {
+    for (id, _) in wired_vaults(conn, agent)? {
+        if list_keys(conn, id)?
+            .iter()
+            .any(|k| k == wheel_core::CLAUDE_OAUTH_SESSION)
+        {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Every vault holding a refreshable login, for re-arming renewals at boot.
+pub fn session_vaults(conn: &Connection) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT node_id FROM vault_values WHERE key = ?1")?;
+    let ids = stmt
+        .query_map(params![wheel_core::CLAUDE_OAUTH_SESSION], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids
+        .into_iter()
+        .filter_map(|s| Uuid::parse_str(&s).ok())
+        .collect())
+}
+
+pub fn get_session(
+    conn: &Connection,
+    vk: &VaultKey,
+    vault: Uuid,
+) -> Result<Option<crate::auth::OauthSession>> {
+    get(conn, vk, vault, wheel_core::CLAUDE_OAUTH_SESSION)?
+        .map(|raw| crate::auth::OauthSession::from_vault_value(&raw))
+        .transpose()
+}
+
+/// Store a renewed login, but only if the vault still holds the refresh token
+/// it was renewed FROM.
+///
+/// If the operator signed in again while the renewal was in flight, theirs is
+/// the login that counts; writing ours over it would put back a lineage they
+/// just replaced. Returns whether it wrote.
+pub fn replace_session_if(
+    conn: &Connection,
+    vk: &VaultKey,
+    vault: Uuid,
+    renewed_from: &str,
+    next: &crate::auth::OauthSession,
+) -> Result<bool> {
+    let current = get_session(conn, vk, vault)?;
+    if current.as_ref().and_then(|c| c.refresh_token()) != Some(renewed_from) {
+        return Ok(false);
+    }
+    put_with_expiry(
+        conn,
+        vk,
+        vault,
+        wheel_core::CLAUDE_OAUTH_SESSION,
+        &next.to_vault_value(),
+        next.expires_at().and_then(millis_to_timestamp),
+    )?;
+    Ok(true)
 }
 
 /// Blank out any secret that appears in a line bound for a log or transcript.
@@ -1031,6 +1132,117 @@ mod tests {
 
         let env = env_for_agent(&c, &vk, a.id).unwrap();
         assert_eq!(env, vec![("MINE".to_string(), "m".to_string())]);
+    }
+
+    fn session(access: &str, refresh: &str) -> crate::auth::OauthSession {
+        crate::auth::OauthSession::for_tests(
+            access,
+            refresh,
+            4_102_444_800_000,
+            &["user:inference"],
+            Some("acct-A"),
+        )
+    }
+
+    fn put_session(c: &Connection, vault: Uuid, s: &crate::auth::OauthSession) {
+        put(
+            c,
+            &key(),
+            vault,
+            wheel_core::CLAUDE_OAUTH_SESSION,
+            &s.to_vault_value(),
+        )
+        .unwrap();
+    }
+
+    /// A child gets the access token and nothing else. The refresh token in
+    /// a child is a second refresher of a single-use token, and a place it
+    /// can be stolen from.
+    #[test]
+    fn a_vaulted_login_reaches_a_child_as_its_access_token_only() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        board::create(&c, &v).unwrap();
+        board::create(&c, &a).unwrap();
+        board::add_wire(&c, a.id, v.id, WireType::Read, None).unwrap();
+        put_session(
+            &c,
+            v.id,
+            &session("sk-ant-oat01-access", "sk-ant-ort01-refresh"),
+        );
+
+        let env = env_for_agent(&c, &key(), a.id).unwrap();
+        assert_eq!(
+            env,
+            vec![(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "sk-ant-oat01-access".to_string()
+            )]
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, v)| v.contains("sk-ant-ort") || k == wheel_core::CLAUDE_OAUTH_SESSION),
+            "the refresh token must never be exported: {env:?}"
+        );
+        assert_eq!(session_vault_for(&c, a.id).unwrap(), Some(v.id));
+        assert_eq!(session_vaults(&c).unwrap(), vec![v.id]);
+    }
+
+    /// The login and a bare token are the same variable in the child, so two
+    /// vaults supplying one each is the same coin-flip the ambiguity rule
+    /// exists to refuse.
+    #[test]
+    fn a_vaulted_login_and_a_bare_token_elsewhere_are_ambiguous() {
+        let c = crate::db::open_memory().unwrap();
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let login = vault("login", &[]);
+        let bare = vault("bare", &[]);
+        for n in [&a, &login, &bare] {
+            board::create(&c, n).unwrap();
+        }
+        put_session(&c, login.id, &session("sk-ant-oat01-a", "sk-ant-ort01-a"));
+        put(
+            &c,
+            &key(),
+            bare.id,
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "sk-ant-oat01-b",
+        )
+        .unwrap();
+        board::add_wire(&c, a.id, login.id, WireType::Read, None).unwrap();
+
+        let clash = find_ambiguity(&c, a.id, Some(bare.id)).unwrap();
+        assert_eq!(
+            clash.map(|x| x.key),
+            Some("CLAUDE_CODE_OAUTH_TOKEN".to_string())
+        );
+        assert_eq!(
+            supplies_key(&c, a.id, "CLAUDE_CODE_OAUTH_TOKEN", bare.id).unwrap(),
+            Some("login".to_string())
+        );
+    }
+
+    /// ADVERSARY TH4: a renewal that finishes after the operator signed in
+    /// again must not put back the login they replaced.
+    #[test]
+    fn a_renewal_writes_only_over_the_login_it_renewed() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        board::create(&c, &v).unwrap();
+        put_session(&c, v.id, &session("sk-ant-oat01-1", "sk-ant-ort01-1"));
+
+        let renewed = session("sk-ant-oat01-2", "sk-ant-ort01-2");
+        assert!(replace_session_if(&c, &key(), v.id, "sk-ant-ort01-1", &renewed).unwrap());
+        assert_eq!(get_session(&c, &key(), v.id).unwrap().unwrap(), renewed);
+
+        // The operator signs in again mid-renewal...
+        let operators = session("sk-ant-oat01-op", "sk-ant-ort01-op");
+        put_session(&c, v.id, &operators);
+        // ...and the renewal of the login they replaced lands afterwards.
+        let late = session("sk-ant-oat01-3", "sk-ant-ort01-3");
+        assert!(!replace_session_if(&c, &key(), v.id, "sk-ant-ort01-2", &late).unwrap());
+        assert_eq!(get_session(&c, &key(), v.id).unwrap().unwrap(), operators);
     }
 
     #[test]

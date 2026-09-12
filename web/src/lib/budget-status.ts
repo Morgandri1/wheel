@@ -3,21 +3,9 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import type { AgentNode } from "@/lib/schema";
+import type { BudgetStatus } from "@/lib/schema/generated";
 
-/**
- * `wheel_core::BudgetStatus`, from SDK's `GET /v1/board` follow-up to wow-agent-brief.md #6
- * (PR #56, not yet merged/regenerated into `schema/generated.ts` as of this file). Hand-typed
- * here rather than in the generated file on purpose: `pnpm gen:types` will add the real field to
- * `NodeState` once #56 lands, and `readBudgetStatus` below is the ONE place that needs updating
- * then — delete the cast, keep the accessor. Everything downstream (the component, its tests)
- * reads through that accessor rather than the raw field, so nothing else has to change.
- */
-export interface BudgetStatus {
-  max_turns?: number;
-  pct_of_max_turns?: number;
-  max_usd?: number;
-  pct_of_max_usd?: number;
-}
+export type { BudgetStatus };
 
 /**
  * `undefined` (no field), `null` (present but empty) and a real object all mean the same thing
@@ -47,7 +35,7 @@ const fmtUsd = (n: number) => `$${n.toFixed(2)}`;
  */
 export function budgetLines(status: BudgetStatus, spendTurns: number, spendUsd: number): BudgetLine[] {
   const lines: BudgetLine[] = [];
-  if (status.max_turns !== undefined) {
+  if (status.max_turns != null) {
     const pct = status.pct_of_max_turns ?? 0;
     lines.push({
       kind: "turns",
@@ -56,7 +44,7 @@ export function budgetLines(status: BudgetStatus, spendTurns: number, spendUsd: 
       near: pct >= 90,
     });
   }
-  if (status.max_usd !== undefined) {
+  if (status.max_usd != null) {
     const pct = status.pct_of_max_usd ?? 0;
     lines.push({
       kind: "usd",

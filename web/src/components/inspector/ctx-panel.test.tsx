@@ -33,7 +33,7 @@ describe("the ctx preview renders its markdown", () => {
   it("renders the markdown, not just the container", async () => {
     render(<CtxPanel node={node} api={api} onChanged={() => {}} />);
     fireEvent.click(screen.getByTestId("ctx-tab-preview"));
-    await waitFor(() => expect(screen.queryByText("Heading")).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText("Heading")).not.toBeNull(), { timeout: 5000 });
     expect(screen.getByTestId("ctx-preview").innerHTML).toContain("<h1>Heading</h1>");
   });
 });

@@ -1,0 +1,38 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+#
+# Installed by infra/vps/install.sh. Settings: /etc/wheel/web.env and /etc/wheel/web.local.env.
+# A throwaway user per run: the web server holds no data and must not be able to read wheeld's.
+
+[Unit]
+Description=Wheel web app (Next.js standalone server)
+Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/README.md
+After=network-online.target wheeld.service
+Wants=wheeld.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+# install.sh points /opt/wheel/web/.next/cache here: the only place Next may write.
+CacheDirectory=wheel-web
+EnvironmentFile=/etc/wheel/web.env
+EnvironmentFile=-/etc/wheel/web.local.env
+Environment=NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=127.0.0.1 PORT=3000
+WorkingDirectory=/opt/wheel/web
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

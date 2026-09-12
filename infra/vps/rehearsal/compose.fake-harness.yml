@@ -1,0 +1,12 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# REHEARSE_FAKE_HARNESS=1 layers this on. QA's fake `claude` shadows the real one (/usr/local/bin
+# precedes /usr/bin on the image's PATH), so a message can reach `delivered` without a credential
+# and no model is ever called. Without it the real CLI has no login and the message stays `queued`.
+
+services:
+  wheeld:
+    volumes:
+      - ../../qa/harness/fake-claude:/usr/local/bin/claude:ro

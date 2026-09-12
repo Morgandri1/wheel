@@ -8,9 +8,9 @@
  * `npx wheel-web` — run the prebuilt board against a Wheel API.
  *
  * There is no build step here: the package ships Next's standalone output, and this only points
- * it at an API and starts it. The API URL is read at RUN time (see src/lib/runtime-config.ts);
- * baking it in would make this flag decorative, since NEXT_PUBLIC_* values are frozen when the
- * bundle is compiled.
+ * it at an API and starts it. The browser never talks to that API — this server proxies every
+ * call (src/lib/api-proxy.ts) — so the API can listen on loopback only, and the URL is read by
+ * the server when it starts rather than baked into a bundle.
  */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -26,14 +26,16 @@ if (args.includes("--help") || args.includes("-h")) {
   wheel-web — the Wheel board, served locally.
 
   Usage
-    npx wheel-web [--port <n>] [--api <url>]
+    npx wheel-web [--port <n>] [--api <url>] [--public-origin <url>]
 
   Options
-    --port <n>   Port to listen on.              (default 3000, or PORT)
-    --api <url>  The Wheel API to talk to.       (default http://localhost:8080, or WHEEL_API_URL)
+    --port <n>             Port to listen on.                   (default 3000, or PORT)
+    --api <url>            The Wheel API this server talks to.  (default http://127.0.0.1:8080, or WHEEL_API_URL)
+    --public-origin <url>  The address browsers use, if not localhost (or WHEEL_PUBLIC_ORIGIN).
+                           Without it the server answers on localhost only.
 
-  The API URL is read when the server starts, so one prebuilt package works against any API.
-  Sign-in is the API's own email/password: this build has no third-party identity provider in it.
+  The browser only ever talks to this server; the API can stay on loopback or a private network.
+  Sign-in is the API's own email/password (WHEEL_AUTH_MODE=local) unless WHEEL_AUTH_MODE says otherwise.
 `);
   process.exit(0);
 }
@@ -45,11 +47,13 @@ function flag(name) {
 }
 
 const port = flag("--port") ?? process.env.PORT ?? "3000";
-const apiUrl = flag("--api") ?? process.env.WHEEL_API_URL ?? "http://localhost:8080";
+// 127.0.0.1, not localhost: Node may resolve localhost to ::1 while the API listens on IPv4 only.
+const apiUrl = flag("--api") ?? process.env.WHEEL_API_URL ?? "http://127.0.0.1:8080";
+const authMode = process.env.WHEEL_AUTH_MODE || "local";
+const publicOrigin = flag("--public-origin") ?? process.env.WHEEL_PUBLIC_ORIGIN;
 
 try {
-  // Fail on a malformed URL now, with a sentence, rather than letting every request in the
-  // browser fail later with a CSP violation that names nothing.
+  // Fail on a malformed URL now, with a sentence, rather than on every request later.
   new URL(apiUrl);
 } catch {
   console.error(`wheel-web: --api must be a URL, got ${JSON.stringify(apiUrl)}`);
@@ -62,7 +66,7 @@ if (!existsSync(server)) {
   process.exit(1);
 }
 
-console.log(`wheel-web on http://localhost:${port}  →  API ${apiUrl}`);
+console.log(`wheel-web on http://localhost:${port}  →  API ${apiUrl} (reached from this server, never the browser)`);
 
 const child = spawn(process.execPath, [server], {
   stdio: "inherit",
@@ -71,7 +75,8 @@ const child = spawn(process.execPath, [server], {
     PORT: String(port),
     HOSTNAME: process.env.HOSTNAME ?? "0.0.0.0",
     WHEEL_API_URL: apiUrl,
-    NEXT_PUBLIC_AUTH_MODE: "local",
+    WHEEL_AUTH_MODE: authMode,
+    ...(publicOrigin ? { WHEEL_PUBLIC_ORIGIN: publicOrigin } : {}),
   },
 });
 

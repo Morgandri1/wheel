@@ -18,6 +18,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Seconds Docker gives the container's own SIGTERM handler before SIGKILL.
+///
+/// Docker's own default is 10s. The §4b spawn contract gives the engine up to ~25s to shut down on
+/// its own (drain, wait for turns in flight, signal its agents), so the unadorned default would
+/// SIGKILL an engine mid-drain — the same mistake as the process backend's timeout, before it was
+/// raised (review round 2, finding 2).
+const ENGINE_STOP_GRACE_SECS: i32 = 30;
+
 pub struct DockerSandbox {
     docker: Docker,
     cfg: Config,
@@ -141,6 +149,10 @@ impl DockerSandbox {
                 format!("WHEEL_PROJECT_ID={id}"),
                 format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret),
                 format!("WHEEL_VAULT_KEY={}", secrets.vault_key),
+                // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
+                // fail-secure per project, computed by wheel-host itself — never a value a project's
+                // own owner can influence.
+                format!("WHEEL_HARNESS_AUTH={}", self.cfg.harness_auth_for(id)),
                 format!("WHEEL_LISTEN=tcp://0.0.0.0:{}", self.cfg.engine_port),
                 "WHEEL_DATA_DIR=/data".to_string(),
                 "WHEEL_LOG=json".to_string(),
@@ -218,7 +230,10 @@ impl Sandbox for DockerSandbox {
             .docker
             .stop_container(
                 &self.cfg.container_name(id),
-                None::<qp::StopContainerOptions>,
+                Some(qp::StopContainerOptions {
+                    signal: None,
+                    t: Some(ENGINE_STOP_GRACE_SECS),
+                }),
             )
             .await
         {
@@ -294,6 +309,19 @@ impl Sandbox for DockerSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review round 2, finding 2: Docker's own default stop timeout (10s) is shorter than an
+    /// engine's own ~25s shutdown budget (2s HTTP drain + up to 20s draining turns + 3s SIGTERM
+    /// grace for its agents), so leaving it at the default would SIGKILL the container mid-drain.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_engine_stop_grace_covers_its_own_shutdown_budget() {
+        assert!(
+            ENGINE_STOP_GRACE_SECS >= 30,
+            "ENGINE_STOP_GRACE_SECS is {ENGINE_STOP_GRACE_SECS}s, which is not enough room for a \
+             ~25s engine shutdown to finish before being SIGKILLed"
+        );
+    }
 
     fn docker_404() -> bollard::errors::Error {
         bollard::errors::Error::DockerResponseServerError {

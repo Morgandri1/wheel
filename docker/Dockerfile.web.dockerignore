@@ -1,0 +1,19 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Build context for docker/Dockerfile.web. BuildKit uses this file instead of the root
+# .dockerignore (which excludes web/ entirely). Only web/ goes in, minus everything the build
+# regenerates — above all the host's node_modules, which are built for the host's OS — and any
+# local env file, which may hold a real credential.
+*
+!web/
+web/node_modules/
+web/.next/
+web/.next-*/
+web/dist-pkg/
+web/coverage/
+web/public/monaco/
+web/.env*
+web/*.tsbuildinfo
+**/.DS_Store

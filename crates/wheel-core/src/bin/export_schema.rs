@@ -64,6 +64,7 @@ fn export(dir: &Path) -> std::io::Result<()> {
     write::<Message>(dir, "message")?;
     write::<Event>(dir, "event")?;
     write::<LogLine>(dir, "log-line")?;
+    write::<EngineInfo>(dir, "engine-info")?;
     // Host / API surface.
     write::<Capabilities>(dir, "capabilities")?;
     write::<HostHealth>(dir, "host-health")?;

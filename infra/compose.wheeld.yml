@@ -1,0 +1,49 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Wheel, headless, in one container (docs/proposals/headless-first.md).
+#
+#   docker compose -f infra/compose.wheeld.yml up -d --build
+#   docker compose -f infra/compose.wheeld.yml exec wheeld cat /data/operator-token
+#
+# The board UI is an optional add-on, on http://127.0.0.1:3000:
+#
+#   docker compose -f infra/compose.wheeld.yml --profile web up -d --build
+#
+# Every published port is on this machine's loopback only. Nothing here is reachable from the
+# network, and nothing here needs to be.
+
+name: wheeld
+
+services:
+  wheeld:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.wheeld
+    environment:
+      # The web service calls wheeld by its service name, and wheeld refuses any Host it was not
+      # told about, which is what stops a DNS-rebinding page from reaching it.
+      WHEEL_ALLOWED_HOSTS: wheeld
+    volumes: ["wheel-data:/data"]
+    ports: ["127.0.0.1:8080:8080"]
+    restart: unless-stopped
+    # SIGTERM stops every engine and its agents; give that time to finish before docker's SIGKILL.
+    stop_grace_period: 30s
+
+  web:
+    profiles: ["web"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    environment:
+      # Read by the web server at runtime. The browser never talks to the API.
+      WHEEL_API_URL: http://wheeld:8080
+      WHEEL_AUTH_MODE: local
+    depends_on:
+      wheeld: { condition: service_healthy }
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  wheel-data:

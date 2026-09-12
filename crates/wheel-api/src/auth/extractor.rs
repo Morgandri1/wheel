@@ -22,16 +22,30 @@ use axum::extract::{FromRequestParts, RawPathParams};
 use axum::http::request::Parts;
 use uuid::Uuid;
 
+/// How a request proved who it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// A login: a local session JWT (by session id), or the identity provider's token (none).
+    Session(Option<Uuid>),
+    /// A long-lived `wht_` API token, by id.
+    ApiToken(Uuid),
+}
+
 /// Proof that the request carried a valid token. Field is private to this module's constructor
 /// path — the only way to obtain one is extraction.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     user_id: String,
+    credential: Credential,
 }
 
 impl AuthUser {
     pub fn id(&self) -> &str {
         &self.user_id
+    }
+
+    pub fn credential(&self) -> Credential {
+        self.credential
     }
 }
 
@@ -46,24 +60,38 @@ impl FromRequestParts<AppState> for AuthUser {
         // above all — cannot tell which one ran, which is what makes swapping them configuration
         // rather than a rewrite. A token minted by the mode we are *not* in fails: local sessions
         // are HS256 against our own secret, jwks tokens are RS256 against the provider's keys.
-        let user_id = match state.cfg.auth_mode {
+        // API tokens are this API's own credential, whichever provider signs sessions, so a
+        // desktop client authenticates the same way against a laptop and against the cloud.
+        if crate::auth::api_token::is_api_token(token) {
+            let v = crate::auth::api_token::verify(&state.db, token).await?;
+            return Ok(AuthUser {
+                user_id: v.user_id,
+                credential: Credential::ApiToken(v.token_id),
+            });
+        }
+        let (user_id, credential) = match state.cfg.auth_mode {
             crate::config::AuthMode::Local => {
-                crate::auth::local::verify_session(
+                let live = crate::auth::local::verify_session(
                     &state.db,
                     token,
                     state.cfg.session_secret.expose(),
                     &state.cfg.public_base_url,
                 )
-                .await?
+                .await?;
+                (live.user_id, Credential::Session(Some(live.session_id)))
             }
-            crate::config::AuthMode::Jwks => {
+            crate::config::AuthMode::Jwks => (
                 crate::auth::claims::verify(token, &state.cfg, &state.jwks)
                     .await?
-                    .user_id
-            }
+                    .user_id,
+                Credential::Session(None),
+            ),
         };
 
-        Ok(AuthUser { user_id })
+        Ok(AuthUser {
+            user_id,
+            credential,
+        })
     }
 }
 

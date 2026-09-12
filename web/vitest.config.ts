@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+      "server-only": fileURLToPath(new URL("./test/server-only.ts", import.meta.url)),
+    },
   },
   test: {
     environment: "jsdom",
@@ -43,6 +46,22 @@ export default defineConfig({
         "src/lib/templates.ts",
         "src/components/templates/template-gallery.tsx",
         "src/lib/budget-status.ts",
+        // The server-side trust boundary: which paths, headers and bodies reach the API, which
+        // requests count as same-origin, the session cookie's flags and lifetime, which credential
+        // each mode presents, and the SSE relay. A wrong branch in any of these is silent.
+        "src/lib/runtime-config.ts",
+        "src/lib/same-origin.ts",
+        "src/lib/session-cookie.ts",
+        "src/lib/proxy-rules.ts",
+        "src/lib/upstream.ts",
+        "src/lib/api-proxy.ts",
+        "src/lib/session-routes.ts",
+        "src/lib/ingress-probe.ts",
+        "src/lib/event-relay.ts",
+        "src/lib/session-user.ts",
+        // Which ids may become an API path, and where sign-in may send you: both silent when wrong.
+        "src/lib/api-paths.ts",
+        "src/lib/next-path.ts",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },
     },

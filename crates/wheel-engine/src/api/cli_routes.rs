@@ -304,6 +304,19 @@ pub async fn secret_get(
     let me = caller(&s, &headers)?;
     let (name, key) = split_address(&q.addr);
     let key = key.ok_or_else(|| ApiError::invalid("secret get needs <vault>/<key>"))?;
+    // The refresh token stays with the engine: an agent holding it would be a
+    // second refresher of a single-use token, and a place it can be stolen
+    // from. Agents already receive the access token as CLAUDE_CODE_OAUTH_TOKEN.
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_readable",
+            format!(
+                "{key} is a sign-in the engine renews; agents receive it as \
+                 CLAUDE_CODE_OAUTH_TOKEN in their environment instead"
+            ),
+        ));
+    }
 
     let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
@@ -797,36 +810,27 @@ pub async fn usage(
         return Err(ApiError::invalid("only an agent has usage to report"));
     }
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    let spend = board::agent_state(&conn, me.node.id)
-        .unwrap_or_default()
-        .spend
-        .unwrap_or_default();
+    // `board::agent_state` computes `budget_status` from the same
+    // `BudgetStatus::compute` this route used to duplicate inline, so this
+    // and `GET /v1/board` can never disagree about what "80% of budget"
+    // means. Budget is optional config (§3); an agent with none configured
+    // gets its raw spend back and nothing to divide by, which is not an
+    // error.
+    let state = board::agent_state(&conn, me.node.id).unwrap_or_default();
+    let spend = state.spend.unwrap_or_default();
 
     let mut out = serde_json::json!({ "turns": spend.turns, "usd": spend.usd });
-    // Budget is optional config (§3); an agent with none configured gets its
-    // raw spend back and nothing to divide by, which is not an error.
-    if let Some(budget) = me.node.config.as_agent().and_then(|a| a.budget) {
+    if let Some(budget) = state.budget_status {
         if let Some(max) = budget.max_turns {
             out["max_turns"] = serde_json::json!(max);
-            out["pct_of_max_turns"] = serde_json::json!(pct(spend.turns as f64, max as f64));
+            out["pct_of_max_turns"] = serde_json::json!(budget.pct_of_max_turns);
         }
         if let Some(max) = budget.max_usd {
             out["max_usd"] = serde_json::json!(max);
-            out["pct_of_max_usd"] = serde_json::json!(pct(spend.usd, max));
+            out["pct_of_max_usd"] = serde_json::json!(budget.pct_of_max_usd);
         }
     }
     Ok(Json(out))
-}
-
-/// A ceiling of zero would divide by zero; treated as "already at the limit"
-/// rather than NaN or infinity reaching the caller as JSON (which `serde_json`
-/// cannot even represent — it would silently become `null`).
-fn pct(spend: f64, max: f64) -> f64 {
-    if max <= 0.0 {
-        100.0
-    } else {
-        ((spend / max) * 100.0 * 10.0).round() / 10.0
-    }
 }
 
 #[cfg(test)]
@@ -1124,7 +1128,94 @@ mod usage_tests {
     /// divide-by-zero `NaN` that `serde_json` would silently turn into `null`.
     #[test]
     fn a_zero_ceiling_reports_100_percent_rather_than_dividing_by_zero() {
-        assert_eq!(pct(5.0, 0.0), 100.0);
-        assert_eq!(pct(0.0, 0.0), 100.0);
+        let status = wheel_core::BudgetStatus::compute(
+            wheel_core::Spend { turns: 5, usd: 0.0 },
+            Some(wheel_core::Budget {
+                max_turns: Some(0),
+                max_usd: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(status.pct_of_max_turns, Some(100.0));
+    }
+
+    /// The refresh token stays with the engine. An agent holding one would be
+    /// a second refresher of a single-use token — and a place to steal it
+    /// from. What an agent gets is the access token, in its environment.
+    ///
+    /// Mutation-checked: drop the refusal and `wheel secret get` hands an
+    /// agent the whole login, refresh token included.
+    #[tokio::test]
+    async fn an_agent_cannot_read_the_refresh_token_of_a_vaulted_login() {
+        use axum::http::HeaderValue;
+        let state = crate::api::test_state();
+        let (agent, token) = {
+            let conn = state.db.lock().unwrap();
+            let worker = wheel_core::Node::new(
+                uuid::Uuid::new_v4(),
+                "worker".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            );
+            crate::db::board::create(&conn, &worker).unwrap();
+            let agent = worker.id;
+            let vault = wheel_core::Node::new(
+                uuid::Uuid::new_v4(),
+                "anthropic".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Vault(wheel_core::VaultConfig { keys: vec![] }),
+            );
+            crate::db::board::create(&conn, &vault).unwrap();
+            crate::db::board::add_wire(&conn, agent, vault.id, WireType::Read, None).unwrap();
+            let vk = state.supervisor.vault_key().unwrap();
+            crate::vault::put(
+                &conn,
+                vk,
+                vault.id,
+                wheel_core::CLAUDE_OAUTH_SESSION,
+                r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-a","refreshToken":"sk-ant-ort01-secret"}}"#,
+            )
+            .unwrap();
+            crate::vault::put(&conn, vk, vault.id, "OTHER", "an ordinary secret").unwrap();
+            (
+                agent,
+                crate::db::tokens::mint(&conn, agent).unwrap().plaintext,
+            )
+        };
+        let _ = agent;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let err = secret_get(
+            State(state.clone()),
+            headers.clone(),
+            axum::extract::Query(AddrQuery {
+                addr: format!("anthropic/{}", wheel_core::CLAUDE_OAUTH_SESSION),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect_err("an agent must not be able to read the login");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "not_readable");
+
+        // An ordinary secret in the same vault still works, so this is the one
+        // key that is refused and not the wire.
+        let ok = secret_get(
+            State(state),
+            headers,
+            axum::extract::Query(AddrQuery {
+                addr: "anthropic/OTHER".into(),
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("the wire still grants everything else");
+        assert_eq!(ok.0["value"], "an ordinary secret");
     }
 }

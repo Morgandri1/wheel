@@ -5,33 +5,54 @@
 import { describe, expect, it, vi } from "vitest";
 import { errorCode, probeEndpoint, probeVerdict, unreadableReason } from "@/lib/endpoint-probe";
 
-const respond = (status: number, body = "", statusText = "") =>
-  vi.fn().mockResolvedValue(new Response(body, { status, statusText })) as unknown as typeof fetch;
+const reading = (status: number, body = "", statusText = "", truncated = false) =>
+  vi.fn().mockResolvedValue(Response.json({ status, status_text: statusText, body, truncated })) as unknown as typeof fetch;
+const answering = (res: unknown) => vi.fn().mockResolvedValue(res) as unknown as typeof fetch;
+const target = { projectId: "p1", path: "/hook", method: "POST" };
 
-describe("probing an endpoint's public URL", () => {
-  it("reports the status and body verbatim, so the panel measures instead of claiming", async () => {
-    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: respond(404, "no route") });
-    expect(probe).toMatchObject({ kind: "answered", status: 404, body: "no route" });
+describe("probing an endpoint through this app's server", () => {
+  it("reports the reading the server took, verbatim, so the panel measures instead of claiming", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: reading(404, "no route", "Not Found") });
+    expect(probe).toEqual({
+      kind: "answered",
+      status: 404,
+      statusText: "Not Found",
+      body: "no route",
+      truncated: false,
+      code: null,
+    });
   });
 
-  it("never sends credentials to a URL that is public by definition", async () => {
-    const f = respond(200);
-    await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
-    expect(f).toHaveBeenCalledWith(
-      "https://api.example/p/1/hook",
-      expect.objectContaining({ credentials: "omit", cache: "no-store" }),
-    );
+  it("asks this app's server — never the ingress or the API directly", async () => {
+    const f = reading(202);
+    await probeEndpoint(target, { fetchImpl: f });
+    const [url, init] = (f as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/wheel/probe");
+    expect(init).toMatchObject({ method: "POST", credentials: "same-origin", cache: "no-store" });
+    expect(JSON.parse(init.body as string)).toEqual({ project_id: "p1", method: "POST", path: "/hook" });
+  });
+
+  it("probes with GET when no method is given", async () => {
+    const f = reading(200);
+    await probeEndpoint({ projectId: "p1", path: "/hook" }, { fetchImpl: f });
+    const [, init] = (f as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).method).toBe("GET");
   });
 
   it("truncates a body that would take the panel over, and says that it did", async () => {
-    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: respond(200, "x".repeat(5000)) });
+    const probe = await probeEndpoint(target, { fetchImpl: reading(200, "x".repeat(5000)) });
     expect(probe).toMatchObject({ kind: "answered", truncated: true });
     if (probe.kind === "answered") expect(probe.body.length).toBe(2000);
   });
 
-  it("does not call a blocked read a failure — the browser refuses to say which it was", async () => {
+  it("keeps the server's own word that it truncated", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: reading(200, "short", "", true) });
+    expect(probe).toMatchObject({ kind: "answered", truncated: true, body: "short" });
+  });
+
+  it("does not call a test that never ran a dead endpoint", async () => {
     const f = vi.fn().mockRejectedValue(new TypeError("Failed to fetch")) as unknown as typeof fetch;
-    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
+    const probe = await probeEndpoint(target, { fetchImpl: f });
     expect(probe.kind).toBe("unreadable");
     if (probe.kind === "unreadable") {
       expect(probe.reason).toMatch(/not evidence that the endpoint is down/i);
@@ -39,17 +60,67 @@ describe("probing an endpoint's public URL", () => {
     }
   });
 
+  it("says the test did not run, in the server's words, when the server refuses it", async () => {
+    const probe = await probeEndpoint(target, {
+      fetchImpl: answering(Response.json({ error: { code: "not_found", message: "That's gone" } }, { status: 404 })),
+    });
+    expect(probe.kind).toBe("unreadable");
+    if (probe.kind === "unreadable") {
+      expect(probe.reason).toMatch(/did not run: That's gone/);
+      expect(probe.reason).toMatch(/not evidence that the endpoint is down/i);
+    }
+  });
+
+  it("names the status when a refusal carries no words", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: answering(new Response("", { status: 500 })) });
+    expect(probe.kind === "unreadable" && probe.reason).toMatch(/HTTP 500/);
+  });
+
+  it("signs the UI out when the server says the session is dead", async () => {
+    const { setUnauthorizedHandler } = await import("@/lib/auth");
+    const unauthorized = vi.fn();
+    setUnauthorizedHandler(unauthorized);
+    await probeEndpoint(target, { fetchImpl: answering(new Response("{}", { status: 401 })) });
+    expect(unauthorized).toHaveBeenCalledOnce();
+    setUnauthorizedHandler(() => {});
+  });
+
+  it.each([
+    ["no status", JSON.stringify({ body: "x" })],
+    ["no body", JSON.stringify({ status: 200 })],
+    ["not JSON", "<html>"],
+  ])("has no reading when the server's answer has %s", async (_label, text) => {
+    const probe = await probeEndpoint(target, { fetchImpl: answering(new Response(text)) });
+    expect(probe.kind).toBe("unreadable");
+  });
+
   it("survives a response whose body cannot be read", async () => {
     const bad = {
+      ok: true,
       status: 200,
       statusText: "OK",
       text: () => Promise.reject(new Error("stream already consumed")),
     };
-    const f = vi.fn().mockResolvedValue(bad) as unknown as typeof fetch;
-    await expect(probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f })).resolves.toMatchObject({
-      kind: "answered",
-      body: "",
-    });
+    await expect(probeEndpoint(target, { fetchImpl: answering(bad) })).resolves.toMatchObject({ kind: "unreadable" });
+  });
+});
+
+/**
+ * QA review round 2: a script endpoint that outlives the server's own hit deadline is delivered,
+ * not failed, so it must read as "sent" — never as "unreadable" (which the panel would show as
+ * "the test did not run") and never as "answered" with an invented status code.
+ */
+describe("a hit that has not answered yet", () => {
+  const sent = (timeoutMs = 30_000) => answering(Response.json({ sent: true, timeout_ms: timeoutMs }));
+
+  it("reads the server's sent outcome as its own kind, not answered or unreadable", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: sent(30_000) });
+    expect(probe).toEqual({ kind: "sent", timeoutMs: 30_000 });
+  });
+
+  it("falls back to a default timeout if the server omits it, rather than failing to read the answer", async () => {
+    const probe = await probeEndpoint(target, { fetchImpl: answering(Response.json({ sent: true })) });
+    expect(probe).toEqual({ kind: "sent", timeoutMs: 30_000 });
   });
 });
 
@@ -185,12 +256,8 @@ describe("reading the API's error envelope", () => {
   });
 
   it("carries the code through a real probe, so the panel can prefer it over the status", async () => {
-    const f = vi
-      .fn()
-      .mockResolvedValue(
-        new Response('{"error":{"code":"ingress_unavailable","message":"not built"}}', { status: 501 }),
-      ) as unknown as typeof fetch;
-    const probe = await probeEndpoint("https://api.example/p/1/hook", { fetchImpl: f });
+    const f = reading(501, '{"error":{"code":"ingress_unavailable","message":"not built"}}');
+    const probe = await probeEndpoint(target, { fetchImpl: f });
     expect(probe).toMatchObject({ kind: "answered", status: 501, code: "ingress_unavailable" });
   });
 });

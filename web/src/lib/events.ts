@@ -5,18 +5,20 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 /**
- * One WebSocket per open board, to the API's proxy of the engine event stream.
+ * One EventSource per open board, to this app's own relay of the engine event stream.
  *
- * Browsers cannot set headers on a WebSocket handshake, and the session JWT must never appear
- * in a URL. §5 answers both: mint a single-use ticket bound to (user, project) that expires in
- * 30 seconds, and put that in the query string instead. A fresh ticket is minted per attempt,
- * so a reconnect after a long backoff never replays a stale one.
+ * The relay (`/api/wheel/projects/:id/events`, `src/lib/event-relay.ts`) opens the engine socket
+ * server-side with the session in a header, so the browser holds no ticket, no token and no API
+ * address. EventSource shows the page no status code, so the relay names two events: `wheel-open`
+ * once the upstream socket is really connected, and `wheel-error` carrying the upstream status.
+ *
+ * Reconnection is ours, not the browser's. EventSource's built-in retry has no backoff and no idea
+ * that a 401 is final, so every error closes it and the schedule below decides what happens next.
  *
  * Frames are buffered and flushed once per animation frame, so a chatty agent cannot drive one
  * React commit per log line.
  */
-import { projects } from "@/lib/api";
-import { apiBaseUrl } from "@/lib/runtime-config";
+import { notifyUnauthorized } from "@/lib/auth";
 import type { EngineFrame } from "@/lib/schema";
 
 export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed";
@@ -24,12 +26,31 @@ export type ConnectionStatus = "connecting" | "open" | "reconnecting" | "closed"
 interface Handlers {
   onBatch: (events: EngineFrame[]) => void;
   onStatus: (status: ConnectionStatus) => void;
+  /**
+   * The stream reopened after a gap. The relay has no replay and drops a reader that falls behind,
+   * so whatever was sent while it was down is gone and what the page holds is stale — the same
+   * situation as the engine's own `lagged`, and it wants the same answer: refetch.
+   */
+  onResync?: () => void;
 }
 
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000] as const;
 
+export function eventsPath(projectId: string): string {
+  return `/api/wheel/projects/${encodeURIComponent(projectId)}/events`;
+}
+
+function upstreamStatus(event: Event): number | null {
+  try {
+    const status = (JSON.parse((event as MessageEvent<string>).data) as { status?: unknown })?.status;
+    return typeof status === "number" ? status : null;
+  } catch {
+    return null;
+  }
+}
+
 export function connectEvents(projectId: string, handlers: Handlers): () => void {
-  let ws: WebSocket | null = null;
+  let source: EventSource | null = null;
   let closed = false;
   let attempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -52,42 +73,32 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
     if (frame === null) frame = requestAnimationFrame(flush);
   };
 
-  const wsUrl = (ticket: string) => {
-    const base = apiBaseUrl().replace(/^http/, "ws");
-    return `${base}/v1/projects/${projectId}/engine/v1/events?ticket=${encodeURIComponent(ticket)}`;
+  const drop = () => {
+    source?.close();
+    source = null;
   };
 
-  const open = async () => {
+  const open = () => {
     if (closed) return;
     handlers.onStatus(attempt === 0 ? "connecting" : "reconnecting");
 
-    let ticket: string;
+    let es: EventSource;
     try {
-      ({ ticket } = await projects.wsTicket(projectId));
-    } catch (e) {
-      // An expired session is terminal; anything else is worth another attempt.
-      if ((e as { status?: number })?.status === 401) {
-        handlers.onStatus("closed");
-        return;
-      }
-      scheduleRetry();
-      return;
-    }
-    if (closed) return;
-
-    try {
-      ws = new WebSocket(wsUrl(ticket));
+      es = new EventSource(eventsPath(projectId));
     } catch {
       scheduleRetry();
       return;
     }
+    source = es;
 
-    ws.onopen = () => {
+    es.addEventListener("wheel-open", () => {
+      const resumed = attempt > 0;
       attempt = 0;
       handlers.onStatus("open");
-    };
+      if (resumed) handlers.onResync?.();
+    });
 
-    ws.onmessage = (ev) => {
+    es.onmessage = (ev) => {
       try {
         enqueue(JSON.parse(ev.data as string) as EngineFrame);
       } catch {
@@ -95,11 +106,20 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
       }
     };
 
-    ws.onerror = () => ws?.close();
+    es.addEventListener("wheel-error", (ev) => {
+      drop();
+      // An expired session is terminal; anything else is worth another attempt.
+      if (upstreamStatus(ev) === 401) {
+        notifyUnauthorized();
+        handlers.onStatus("closed");
+        return;
+      }
+      scheduleRetry();
+    });
 
-    ws.onclose = () => {
-      ws = null;
-      if (closed) return;
+    es.onerror = () => {
+      if (source !== es) return;
+      drop();
       scheduleRetry();
     };
   };
@@ -111,18 +131,17 @@ export function connectEvents(projectId: string, handlers: Handlers): () => void
     handlers.onStatus("reconnecting");
     retryTimer = setTimeout(() => {
       retryTimer = null;
-      void open();
+      open();
     }, wait + Math.random() * 250);
   };
 
-  void open();
+  open();
 
   return () => {
     closed = true;
     if (retryTimer) clearTimeout(retryTimer);
     if (frame !== null) cancelAnimationFrame(frame);
     handlers.onStatus("closed");
-    ws?.close();
-    ws = null;
+    drop();
   };
 }

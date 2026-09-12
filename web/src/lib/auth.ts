@@ -5,48 +5,33 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 /**
- * Token provider shim.
+ * The browser's view of auth: which mode the server is running, and what to do when the API says
+ * the session is over.
  *
- * NEXT_PUBLIC_AUTH_MODE=mock  → a constant dev token, no Clerk instance needed.
- * NEXT_PUBLIC_AUTH_MODE=dev   → a pre-minted HS256 token from NEXT_PUBLIC_DEV_TOKEN, for running
- *                               the board against the real API before Clerk exists. The secret
- *                               that mints it stays on the server side; only the token is passed.
- * NEXT_PUBLIC_AUTH_MODE=local → an email/password session issued by the API itself, held by
- *                               src/lib/local-auth.ts, which registers the getter below.
- * NEXT_PUBLIC_AUTH_MODE=clerk → Clerk's session JWT, fetched per request so it can rotate.
+ * The browser holds no token in any mode. This app's server attaches the credential to each API
+ * call (`src/lib/upstream.ts`) — the local session cookie, Clerk's server-side token, or the
+ * dev/mock token from server-only env — which keeps every token out of reach of page script.
  *
- * Everything else in the app calls getAuthToken(); swapping modes touches only this file and the
- * provider that registers a getter. The token itself is opaque here on purpose — a session JWT is
- * a session JWT whether the API minted it or an identity provider did.
+ * The mode is decided by the server at run time (WHEEL_AUTH_MODE) and recorded here by
+ * <RuntimeConfig> before anything below it renders, so one prebuilt bundle follows its environment.
  */
 export type AuthMode = "mock" | "dev" | "local" | "clerk";
 
-export const AUTH_MODE: AuthMode =
-  (process.env.NEXT_PUBLIC_AUTH_MODE as AuthMode | undefined) ?? "mock";
+let mode: AuthMode = "mock";
 
-const MOCK_TOKEN = "mock-session-token";
-const DEV_TOKEN = process.env.NEXT_PUBLIC_DEV_TOKEN ?? "";
-
-type TokenGetter = () => Promise<string | null>;
-
-let getter: TokenGetter = async () => (AUTH_MODE === "mock" ? MOCK_TOKEN : null);
-
-function staticToken(): string | null {
-  if (AUTH_MODE === "mock") return MOCK_TOKEN;
-  if (AUTH_MODE === "dev") return DEV_TOKEN || null;
-  return null;
+export function setAuthMode(next: AuthMode) {
+  mode = next;
 }
 
-/** Called once by whichever provider owns sessions, so plain functions can reach the token. */
-export function setTokenGetter(fn: TokenGetter) {
-  getter = fn;
+export function authMode(): AuthMode {
+  return mode;
 }
 
 let onUnauthorized: () => void = () => {};
 
 /**
  * Registered by the session owner. A 401 from ANY route — not only the auth ones — means the
- * token the app is holding is no longer worth anything, so the app stops holding it.
+ * session is no longer worth anything, so the app stops acting as if it had one.
  */
 export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn;
@@ -54,20 +39,6 @@ export function setUnauthorizedHandler(fn: () => void) {
 
 export function notifyUnauthorized() {
   onUnauthorized();
-}
-
-export async function getAuthToken(): Promise<string> {
-  const token = staticToken() ?? (await getter());
-  if (!token) {
-    throw new ApiError(
-      401,
-      "unauthenticated",
-      AUTH_MODE === "dev"
-        ? "Set NEXT_PUBLIC_DEV_TOKEN to a token the API will accept."
-        : "You're signed out. Sign in again.",
-    );
-  }
-  return token;
 }
 
 export class ApiError extends Error {

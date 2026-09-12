@@ -347,6 +347,30 @@ pub fn requeue_all_undelivered(conn: &Connection, node: Uuid, reason: &str) -> R
     )?)
 }
 
+/// Consume every `delivered`-but-unconsumed message for an agent as an error, instead of
+/// returning it to the queue (review round 2, finding 1).
+///
+/// `requeue_all_undelivered` is right when a child dies on its own: nothing else is going on, and
+/// redelivering on the next start is the correct recovery. It is wrong for a child killed while the
+/// engine is shutting down, because a turn killed mid-flight may already have taken an effect the
+/// process never got to report — a commit, a push, a sent email — and requeuing it would run that
+/// turn again. This is the same rule `Supervisor::shutdown`'s own drain-timeout already applies; this
+/// function is for the child that dies on a signal the supervisor did not send itself (a
+/// `KillMode=control-group`-style cgroup-wide kill lands on the agent process directly, independent of
+/// and possibly before the supervisor's own shutdown sequence gets to it).
+pub fn consume_all_delivered_as_interrupted(
+    conn: &Connection,
+    node: Uuid,
+    reason: &str,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE messages
+         SET state = 'consumed', consumed_at = ?3, is_error = 1, last_error = ?2
+         WHERE to_id = ?1 AND state = 'delivered'",
+        params![node.to_string(), reason, Timestamp::now().to_rfc3339()],
+    )?)
+}
+
 /// Set a message aside permanently, with the reason visible on the row.
 ///
 /// The delivery loop calls this when a body cannot be encoded. `next_for_delivery`

@@ -112,13 +112,29 @@ pub fn hash_password(password: &str) -> ApiResult<String> {
 
 fn verify_password(password: &str, encoded: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(encoded) else {
-        // A row we cannot parse is a corrupt hash, not a match.
+        // A corrupt hash or a token-only account: never a match, and never faster than a real
+        // one, or login timing would say which accounts cannot be logged into.
+        burn_argon2(password);
         return false;
     };
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
 }
+
+/// Spend the work a real verification costs, for the paths that have nothing real to verify.
+fn burn_argon2(password: &str) {
+    if let Ok(dummy) = PasswordHash::new(dummy_hash()) {
+        let _ = Argon2::default().verify_password(password.as_bytes(), &dummy);
+    }
+}
+
+/// The stored "hash" of an account that authenticates only with API tokens.
+///
+/// Not a PHC string, so no password verifies against it; and signup always stores a real argon2
+/// hash, so no account a signup created can carry it. That second property is what lets the owner
+/// be found by email *and* this value without a remote signup ever standing in for it.
+pub const TOKEN_ONLY: &str = "!token-only";
 
 /// A hash to verify against when the account does not exist.
 ///
@@ -133,7 +149,68 @@ fn dummy_hash() -> &'static str {
 pub async fn create_user(db: &Db, email: &str, password: &str) -> ApiResult<User> {
     let email = validate_email(email).map_err(ApiError::BadRequest)?;
     validate_password(password).map_err(ApiError::BadRequest)?;
-    let hash = hash_password(password)?;
+    insert_user(db, &email, &hash_password(password)?).await
+}
+
+/// An account with no password: it exists to own API tokens. See [`TOKEN_ONLY`].
+pub async fn create_token_only_user(db: &Db, email: &str) -> ApiResult<User> {
+    let email = validate_email(email).map_err(ApiError::BadRequest)?;
+    insert_user(db, &email, TOKEN_ONLY).await
+}
+
+pub async fn find_token_only_user(db: &Db, email: &str) -> ApiResult<Option<User>> {
+    let Ok(email) = validate_email(email) else {
+        return Ok(None);
+    };
+    let row: Option<UserRow> = crate::db_fetch_optional!(
+        db,
+        "SELECT id, email, password_hash, created_at FROM users \
+         WHERE email = $1 AND password_hash = $2",
+        &email,
+        TOKEN_ONLY
+    )?;
+    Ok(row.map(UserRow::into_user))
+}
+
+pub async fn find_user_by_email(db: &Db, email: &str) -> ApiResult<Option<User>> {
+    let Ok(email) = validate_email(email) else {
+        return Ok(None);
+    };
+    let row: Option<UserRow> = crate::db_fetch_optional!(
+        db,
+        "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
+        &email
+    )?;
+    Ok(row.map(UserRow::into_user))
+}
+
+pub async fn count_users(db: &Db) -> ApiResult<i64> {
+    Ok(crate::db_scalar!(db, "SELECT COUNT(*) FROM users")?)
+}
+
+/// Is this the token-only owner: the account `wheeld` creates on first boot, which no signup can
+/// ever produce?
+pub async fn is_token_only(db: &Db, id: &Uuid) -> ApiResult<bool> {
+    let n: i64 = crate::db_scalar!(
+        db,
+        "SELECT COUNT(*) FROM users WHERE id = $1 AND password_hash = $2",
+        id,
+        TOKEN_ONLY
+    )?;
+    Ok(n > 0)
+}
+
+impl UserRow {
+    fn into_user(self) -> User {
+        User {
+            id: self.id,
+            email: self.email,
+            created_at: self.created_at,
+        }
+    }
+}
+
+async fn insert_user(db: &Db, email: &str, hash: &str) -> ApiResult<User> {
     let id = Uuid::new_v4();
 
     let row: Result<UserRow, _> = crate::db_fetch_one!(
@@ -141,8 +218,8 @@ pub async fn create_user(db: &Db, email: &str, password: &str) -> ApiResult<User
         "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3) \
          RETURNING id, email, password_hash, created_at",
         id,
-        &email,
-        &hash
+        email,
+        hash
     );
     let row = row.map_err(|e| match &e {
         // A conflict the caller caused rather than a 500 — but see the note in the signup handler
@@ -185,8 +262,7 @@ pub async fn authenticate(db: &Db, email: &str, password: &str) -> Option<User> 
         }),
         Some(_) => None,
         None => {
-            // Burn the same argon2 work we would have spent on a real account.
-            let _ = verify_password(password, dummy_hash());
+            burn_argon2(password);
             None
         }
     }
@@ -222,7 +298,8 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
 
     let hash = hash_password(new)?;
 
-    // Both statements or neither. Every other session dies with the old password — if it was
+    // All of it or none. Every other session dies with the old password, and so does every token
+    // those sessions minted — if it was
     // changed because it was compromised, leaving the old sessions alive defeats the point — and a
     // new password whose revocation did not commit would be exactly that failure, silently.
     //
@@ -243,6 +320,10 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
                 .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query(crate::auth::api_token::REVOKE_SESSION_MINTED_PG)
+                .bind(user_id.to_string())
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         #[cfg(feature = "sqlite")]
@@ -255,6 +336,10 @@ pub async fn change_password(db: &Db, user_id: &Uuid, current: &str, new: &str) 
                 .await?;
             sqlx::query(REVOKE_SESSIONS)
                 .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(crate::auth::api_token::REVOKE_SESSION_MINTED_SQLITE)
+                .bind(user_id.to_string())
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -309,12 +394,19 @@ pub async fn issue_session(
 ///
 /// Signature and claims are checked first, then the session row: a stateless JWT alone cannot be
 /// logged out, and "log out" that leaves the token working is not a logout.
+/// A local session that verified: who it is, and which session, so what it mints can be ended with
+/// the password it was opened with.
+pub struct LiveSession {
+    pub user_id: String,
+    pub session_id: Uuid,
+}
+
 pub async fn verify_session(
     db: &Db,
     token: &str,
     secret: &str,
     issuer: &str,
-) -> Result<String, ApiError> {
+) -> Result<LiveSession, ApiError> {
     let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     v.set_issuer(&[issuer]);
     v.validate_exp = true;
@@ -341,7 +433,10 @@ pub async fn verify_session(
     let live = live.map(|r| r.0);
 
     match live {
-        Some(user_id) if user_id.to_string() == data.claims.sub => Ok(data.claims.sub),
+        Some(user_id) if user_id.to_string() == data.claims.sub => Ok(LiveSession {
+            user_id: data.claims.sub,
+            session_id: sid,
+        }),
         // A valid signature over a revoked session, or one whose subject was tampered with.
         _ => Err(ApiError::Unauthorized("session is no longer valid")),
     }
@@ -435,6 +530,27 @@ mod tests {
     fn a_corrupt_hash_never_verifies() {
         assert!(!verify_password("anything", "not-a-phc-string"));
         assert!(!verify_password("anything", ""));
+        assert!(!verify_password("anything", TOKEN_ONLY));
+    }
+
+    /// Refusing a token-only account must cost what refusing a real one costs, or login timing
+    /// names the accounts that cannot be logged into. Unburned, the ratio is ~1e-4; burned, ~1.
+    #[test]
+    fn refusing_a_token_only_account_takes_as_long_as_a_real_check() {
+        let real = hash_password("correct horse battery").unwrap();
+        let time = |encoded: &str| {
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                verify_password("wrong horse battery", encoded);
+            }
+            t.elapsed()
+        };
+        let genuine = time(&real);
+        let token_only = time(TOKEN_ONLY);
+        assert!(
+            token_only * 10 >= genuine,
+            "token-only refusal took {token_only:?} against {genuine:?} for a real hash"
+        );
     }
 
     #[test]

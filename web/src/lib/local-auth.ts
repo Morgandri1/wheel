@@ -5,66 +5,47 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import { useSyncExternalStore } from "react";
-import { AUTH_MODE, ApiError, setTokenGetter, setUnauthorizedHandler } from "@/lib/auth";
-import { apiBaseUrl } from "@/lib/runtime-config";
+import { ApiError, setUnauthorizedHandler } from "@/lib/auth";
+import { readUser, type SessionUser } from "@/lib/session-user";
+
+export type { SessionUser };
 
 /**
- * Local email/password sessions (NEXT_PUBLIC_AUTH_MODE=local).
+ * Local email/password sessions (WHEEL_AUTH_MODE=local), as the browser sees them. The cookie holds
+ * the token; this module holds only WHO is signed in (web/DEPLOY.md, "The trust model").
  *
- * The API owns the auth boundary: it issues an HS256 session JWT from /v1/auth/login|signup and
- * every project-scoped call carries it as `x-auth-token`, exactly as a Clerk or Privy token would.
- * This file is the whole difference between providers — it holds the token, hands it to the API
- * client through the same shim Clerk uses, and throws it away the moment the API says it is dead.
+ * QA's `E2E-local-session-shape` signs in for real and compares the cookie that lands against
+ * `SEEDED_SHAPE` in `qa/e2e/session.ts`. Changing the cookie's name or flags turns it red ON
+ * PURPOSE: update the fake, do not route around it.
  *
- * WHERE THE TOKEN LIVES, and the tradeoff, stated plainly because it is a real one:
- * in memory, mirrored to localStorage so a reload does not sign you out. localStorage is readable
- * by ANY script running on this origin, so an XSS anywhere in the app is a stolen session — a
- * token in memory alone would die with the tab, and an httpOnly SameSite=None cookie would be
- * unreadable by script entirely. We are not using the cookie today because the API and the web
- * are on different origins, which makes a cookie a CSRF surface the API must then defend, and
- * because it is the API's call to make, not the web's. The exposure is bounded by what the token
- * can do (one user's own projects) and by its expiry. Documented for ADVERSARY in web/DEPLOY.md;
- * if the API ships a cookie, this file switches to credentials:"include" and drops the mirror.
- *
- * SIGNED IN IS NOT THE SAME AS NOT-YET-KNOWN. The snapshot starts `loading` and only becomes
- * `anon` after we have actually looked in storage, because a gate that cannot tell those apart
- * bounces every returning user to the sign-in page for one frame.
+ * FIVE STATES, and the differences are the point. `loading` has not asked yet; `anon` means the
+ * server said `{user: null}`; `unreachable` means a 5xx, a timeout or a network failure — retried,
+ * because that kind of failure passes; `error` means the server answered but refused the request
+ * (most often 403 `public_origin_required` from a deployment missing `WHEEL_PUBLIC_ORIGIN`) — a
+ * config problem retrying will not fix, so its message is shown instead of "can't reach the
+ * server"; `authed` names the user.
  */
-
-export interface SessionUser {
-  id: string;
-  email: string;
-}
-
-interface StoredSession {
-  token: string;
-  user: SessionUser;
-}
 
 export type SessionState =
   | { status: "loading"; user: null }
   | { status: "anon"; user: null }
+  | { status: "unreachable"; user: null }
+  | { status: "error"; user: null; message: string }
   | { status: "authed"; user: SessionUser };
 
-/**
- * The persisted session's key and shape: `{ token, user: { id, email } }`.
- *
- * QA's E2E suite fakes this shape in `qa/e2e/session.ts` to skip the sign-in form, and
- * `E2E-local-session-shape` signs in for real and compares the keys and types of what actually
- * lands here against that fake. So changing the shape — adding a field, nesting the user,
- * renaming the token — turns that test red ON PURPOSE. Update the fake; do not route around it.
- * A seeded session that has drifted from what the app writes is a mock nobody compares against
- * the real thing, which is the failure mode the whole arrangement exists to prevent.
- */
-const STORAGE_KEY = "wheel.session";
+const SESSION_ROUTE = "/api/session";
 /** The API is the authority on this; the client check exists so the round trip is not the teacher. */
 export const MIN_PASSWORD_LENGTH = 10;
+const RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
 
 const LOADING: SessionState = { status: "loading", user: null };
 const ANON: SessionState = { status: "anon", user: null };
+const UNREACHABLE: SessionState = { status: "unreachable", user: null };
 
-let session: StoredSession | null = null;
 let state: SessionState = LOADING;
+let asking: Promise<void> | null = null;
+let retries = 0;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
 const listeners = new Set<() => void>();
 
 function publish(next: SessionState) {
@@ -72,46 +53,79 @@ function publish(next: SessionState) {
   for (const listener of listeners) listener();
 }
 
-function persist(next: StoredSession | null) {
-  session = next;
-  try {
-    if (next) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    else window.localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // Private mode, or storage full. The session still works for this tab; it just will not survive
-    // a reload, which is a worse experience and not a broken one.
-  }
-  publish(next ? { status: "authed", user: next.user } : ANON);
-}
+const unsettled = () => state.status === "loading" || state.status === "unreachable" || state.status === "error";
 
-function readStored(): StoredSession | null {
+/**
+ * The server's verdict, or null when this attempt learned nothing and should be retried: a 5xx, a
+ * timeout, or the fetch itself failing. Only an explicit `{user: null}` means signed out, and only
+ * a 4xx becomes `error` — that is the server refusing the request outright, not a blip, so it is
+ * shown rather than swallowed into "can't reach the server" and retried forever.
+ */
+async function askServer(): Promise<SessionState | null> {
+  let res: Response;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredSession>;
-    if (typeof parsed?.token !== "string" || !parsed.token) return null;
-    if (typeof parsed.user?.id !== "string" || typeof parsed.user?.email !== "string") return null;
-    return { token: parsed.token, user: { id: parsed.user.id, email: parsed.user.email } };
+    res = await fetch(SESSION_ROUTE, { cache: "no-store", credentials: "same-origin" });
   } catch {
     return null;
   }
+  if (res.status >= 500) return null;
+  if (!res.ok) return { status: "error", user: null, message: await readErrorMessage(res) };
+  const body = (await res.json().catch(() => null)) as { user?: unknown } | null;
+  if (body?.user === null) return ANON;
+  const user = readUser(body?.user);
+  return user ? { status: "authed", user } : null;
 }
 
-/** Called once, client-side, by the local-mode gate. Safe to call again. */
-export function hydrateSession() {
-  if (state !== LOADING) return;
-  const stored = readStored();
-  session = stored;
-  publish(stored ? { status: "authed", user: stored.user } : ANON);
+async function readErrorMessage(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: { message?: unknown } };
+    if (typeof body?.error?.message === "string" && body.error.message) return body.error.message;
+  } catch {
+    /* fall through to the generic line below */
+  }
+  return `The server refused this request (HTTP ${res.status}).`;
+}
+
+/**
+ * Asks the server who the cookie belongs to. Called by the local-mode gate; safe to call again.
+ * A sign-in that lands while this is in flight wins.
+ */
+export function hydrateSession(): Promise<void> {
+  if (!unsettled()) return Promise.resolve();
+  asking ??= askServer().then((verdict) => {
+    asking = null;
+    if (!unsettled()) return;
+    if (verdict) {
+      retries = 0;
+      publish(verdict);
+      return;
+    }
+    publish(UNREACHABLE);
+    scheduleRetry();
+  });
+  return asking;
+}
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  const wait = RETRY_MS[Math.min(retries, RETRY_MS.length - 1)]!;
+  retries += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void hydrateSession();
+  }, wait);
+}
+
+/** The gate's "try now": ask immediately instead of waiting out the backoff. */
+export function retrySession(): Promise<void> {
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = null;
+  return hydrateSession();
 }
 
 export function clearSession() {
-  if (session === null && state !== LOADING) return;
-  persist(null);
-}
-
-export function sessionToken(): string | null {
-  return session?.token ?? null;
+  if (state === ANON) return;
+  publish(ANON);
 }
 
 export function subscribeSession(listener: () => void) {
@@ -119,36 +133,26 @@ export function subscribeSession(listener: () => void) {
   return () => listeners.delete(listener);
 }
 
-const snapshot = () => state;
+export const sessionSnapshot = (): SessionState => state;
 const serverSnapshot = () => LOADING;
 
 export function useSession(): SessionState {
-  return useSyncExternalStore(subscribeSession, snapshot, serverSnapshot);
+  return useSyncExternalStore(subscribeSession, sessionSnapshot, serverSnapshot);
 }
 
-// ── talking to the API ──────────────────────────────────────────────────────
+// ── talking to the session routes ───────────────────────────────────────────
 
-/**
- * Every response shape the auth routes can return is read here and nowhere else, so correcting a
- * guess about the API's wire format is a change to one function rather than a hunt.
- */
-function readSession(payload: unknown): StoredSession {
-  const body = payload as { token?: unknown; user?: { id?: unknown; email?: unknown } };
-  if (typeof body?.token !== "string" || typeof body.user?.id !== "string" || typeof body.user?.email !== "string") {
-    throw new ApiError(502, "bad_auth_response", "The API answered the sign-in with something this app can't read.");
-  }
-  return { token: body.token, user: { id: body.user.id, email: body.user.email } };
-}
-
-async function authRequest(path: string, body: unknown, token?: string): Promise<unknown> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (token) headers["x-auth-token"] = token;
-
+async function sessionRequest(action: string, body: unknown = {}): Promise<unknown> {
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl()}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+    res = await fetch(`${SESSION_ROUTE}/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(body),
+    });
   } catch {
-    throw new ApiError(0, "offline", "Can't reach the API. Check that it's running.");
+    throw new ApiError(0, "offline", "Can't reach this app's server. Check your connection.");
   }
 
   if (!res.ok) throw await authError(res);
@@ -156,6 +160,7 @@ async function authRequest(path: string, body: unknown, token?: string): Promise
   return await res.json().catch(() => undefined);
 }
 
+/** The server passes the API's status, envelope and `retry-after` through untouched, so this reads the API's words. */
 async function authError(res: Response): Promise<ApiError> {
   let code = `http_${res.status}`;
   let message = "";
@@ -204,62 +209,48 @@ export function emailProblem(email: string): string | null {
   return null;
 }
 
-export async function signUp(email: string, password: string): Promise<SessionUser> {
-  const next = readSession(await authRequest("/v1/auth/signup", { email: email.trim(), password }));
-  persist(next);
-  return next.user;
+async function startSession(action: "login" | "signup", email: string, password: string): Promise<SessionUser> {
+  const payload = await sessionRequest(action, { email: email.trim(), password });
+  const user = readUser((payload as { user?: unknown } | undefined)?.user);
+  if (!user) throw new ApiError(502, "bad_auth_response", "The server answered the sign-in with something this app can't read.");
+  publish({ status: "authed", user });
+  return user;
 }
 
-export async function signIn(email: string, password: string): Promise<SessionUser> {
-  const next = readSession(await authRequest("/v1/auth/login", { email: email.trim(), password }));
-  persist(next);
-  return next.user;
+export function signUp(email: string, password: string): Promise<SessionUser> {
+  return startSession("signup", email, password);
+}
+
+export function signIn(email: string, password: string): Promise<SessionUser> {
+  return startSession("login", email, password);
 }
 
 /**
  * Change the password, then end the local session — because the API has already ended every one.
- *
- * `POST /v1/auth/password` revokes EVERY session including the caller's own (docs/API.md), which is
- * the point: a password changed because it leaked must not leave the leaked sessions alive. So the
- * only honest thing the client can do afterwards is forget its token and send the user to sign in.
- * Keeping them on the board would leave a UI that looks authenticated and 401s on every action.
- *
- * The current password is required even though the caller is authenticated, so a stolen token
+ * The current password is required even though the caller is authenticated, so a hijacked page
  * cannot be turned into a permanent takeover.
  */
 export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
-  const token = session?.token;
-  if (!token) throw new Error("You are not signed in.");
-  await authRequest(
-    "/v1/auth/password",
-    { current_password: currentPassword, new_password: newPassword },
-    token,
-  );
-  persist(null);
+  if (state.status !== "authed") throw new Error("You are not signed in.");
+  await sessionRequest("password", { current_password: currentPassword, new_password: newPassword });
+  publish(ANON);
 }
 
 /**
- * Tell the API first, then forget locally — but forget locally even if the API call fails, because
- * a sign-out that leaves the token in the browser because the network blipped is not a sign-out.
+ * The server clears the cookie whether or not the API answers, and the UI is signed out whether
+ * or not the server does. The cookie is cleared FIRST, so a navigation that follows sign-out can
+ * never race an in-flight request still carrying it.
  */
 export async function signOut(): Promise<void> {
-  const token = session?.token;
-  persist(null);
-  if (!token) return;
   try {
-    await authRequest("/v1/auth/logout", {}, token);
+    await sessionRequest("logout");
   } catch {
-    /* the local session is already gone; that is the part the user asked for */
+    /* the UI still signs out below; that is the part the user asked for */
+  } finally {
+    publish(ANON);
   }
 }
 
-// The API client reaches the token through the same shim Clerk uses, and any 401 from anywhere
-// means this session is over — including one from a route that has nothing to do with auth.
-//
-// Guarded, because this module is imported by the /app gate in every mode: registering
-// unconditionally would let it overwrite the getter Clerk installs from its own effect, and the
-// board would go quietly unauthenticated in the one mode we cannot test locally.
-if (AUTH_MODE === "local") {
-  setTokenGetter(async () => sessionToken());
-  setUnauthorizedHandler(clearSession);
-}
+// Any 401 from anywhere means this session is over — including one from a route that has nothing
+// to do with auth. In the other modes nothing reads this state, so registering it is harmless.
+setUnauthorizedHandler(clearSession);

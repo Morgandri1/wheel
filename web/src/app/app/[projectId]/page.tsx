@@ -62,6 +62,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
     if (!running) return;
     return connectEvents(projectId, {
       onStatus: setConnection,
+      onResync: refetchBoard,
       onBatch: (events) => {
         const { stateChanged, boardChanged, lagged } = applyEvents(events);
         if (stateChanged || boardChanged) refetchBoard();

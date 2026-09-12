@@ -5,7 +5,7 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import Link from "next/link";
-import { AUTH_MODE } from "@/lib/auth";
+import { authMode } from "@/lib/auth";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui";
@@ -83,7 +83,7 @@ export function Header({ children }: { children?: React.ReactNode }) {
       </Link>
       <div className="flex-1">{children}</div>
       <ThemeSwitch />
-      {AUTH_MODE === "mock" ? (
+      {authMode() === "mock" ? (
         <span className="text-micro text-ink-faint" data-testid="auth-mode">
           mock auth
         </span>
@@ -100,7 +100,7 @@ export function Header({ children }: { children?: React.ReactNode }) {
 function SessionBadge() {
   const session = useSession();
   const router = useRouter();
-  if (AUTH_MODE !== "local" || session.status !== "authed") return null;
+  if (authMode() !== "local" || session.status !== "authed") return null;
   return (
     <div className="flex items-center gap-2" data-testid="session-badge">
       <Link

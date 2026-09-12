@@ -1,0 +1,23 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# Mutation: signup is genuinely open, but wheeld's Host-guard is misconfigured (WHEEL_ALLOWED_HOSTS
+# does not include "wheeld", the address verify-signup-gate and web actually address it as), so it
+# blanket-403s every request — including verify-signup-gate's own control request. This is the
+# exact case N2 named: a gate that matches on "403 + forbidden" alone would pass here, having never
+# reached the signup route at all. WHEEL_SIGNUP=open on verify-signup-gate too, matching wheeld's,
+# is the same sync rule 6021d83 established for the config mutation — this mutation is not testing
+# that sync, it is testing the Host-guard case specifically.
+#
+# Unlike edge/config, "correct" here is docker compose up FAILING before rehearse.sh's checks ever
+# run at all — verify-signup-gate is what blocks it, which is the point.
+
+services:
+  wheeld:
+    environment:
+      WHEEL_ALLOWED_HOSTS: nonexistent.invalid
+      WHEEL_SIGNUP: open
+  verify-signup-gate:
+    environment:
+      WHEEL_SIGNUP: open

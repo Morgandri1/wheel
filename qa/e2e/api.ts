@@ -10,7 +10,7 @@
  * failure of whatever the test was actually about. So state is built over HTTP and the
  * browser is used only for what only a browser can check.
  */
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
+const API = process.env.WHEEL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8787";
 const TOKEN = process.env.WHEEL_E2E_TOKEN ?? "dev";
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {

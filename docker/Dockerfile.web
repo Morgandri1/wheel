@@ -1,0 +1,50 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# wheel-web — the board, as a standalone Next server. Settings and the trust model: web/DEPLOY.md.
+#
+#   docker build -f docker/Dockerfile.web -t wheel-web .
+#   docker run --rm --read-only -p 3000:3000 -e WHEEL_API_URL=http://api:8080 wheel-web
+#
+# The build context is the repo root, like the other images; docker/Dockerfile.web.dockerignore
+# (BuildKit reads it in place of the root .dockerignore, which excludes web/) narrows it to web/.
+
+FROM node:22-bookworm-slim AS build
+WORKDIR /web
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm install -g pnpm@9.15.4
+COPY web/package.json web/pnpm-lock.yaml ./
+# --prod=false: typescript is a devDependency, and without it Next never reads tsconfig's "@/*"
+# alias and the build dies on "Module not found" — a path error that is really a missing package.
+RUN pnpm install --frozen-lockfile --prod=false
+COPY web/ ./
+# The checks are the guard that this is a runnable server, not merely a finished build.
+RUN WHEEL_STANDALONE=1 pnpm build \
+    && test -f .next/standalone/server.js \
+    && test -d .next/standalone/node_modules/ws \
+    && test -d .next/static/chunks
+
+FROM node:22-bookworm-slim
+RUN groupadd --system --gid 10001 wheel \
+    && useradd --system --uid 10001 --gid wheel --no-create-home wheel
+WORKDIR /app
+# HOSTNAME is set because Docker sets it to the container id, and Next's server binds to it.
+# There is deliberately no WHEEL_API_URL default: 127.0.0.1 inside a container is the container
+# itself, so an unset value is refused at start (CMD) instead of aiming every call at nothing.
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    HOSTNAME=0.0.0.0 \
+    PORT=3000 \
+    WHEEL_AUTH_MODE=local
+# Root-owned and never written: the server needs no write access, so the container can run with
+# a read-only root filesystem. Standalone output leaves out .next/static and public/ (a CDN usually
+# serves them), so they are copied beside it, or every chunk 404s and the page never hydrates.
+COPY --from=build /web/.next/standalone ./
+COPY --from=build /web/.next/static ./.next/static
+COPY --from=build /web/public ./public
+USER 10001
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/version.json').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+CMD ["sh", "-c", "if [ -z \"$WHEEL_API_URL\" ]; then echo 'wheel-web: set WHEEL_API_URL to the API as this container reaches it, e.g. http://wheeld:8080 (127.0.0.1 would be the container itself).' >&2; exit 64; fi; exec node server.js"]

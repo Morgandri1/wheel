@@ -94,12 +94,25 @@ describe("turning public HTTP on", () => {
  * The operator hit a bare 404 on `/tg` and read it as a typo. It was not: endpoint ingress does
  * not exist engine-side yet. Everything here is about not letting the panel repeat that mistake.
  */
+const reading = (status: number, body = "", statusText = "") =>
+  Response.json({ status, status_text: statusText, body, truncated: false });
+
 describe("testing the public URL", () => {
+  it("asks this app's server to probe the endpoint's saved path with its own method", async () => {
+    const f = vi.fn().mockResolvedValue(reading(202, '{"queued":1}'));
+    vi.stubGlobal("fetch", f);
+    renderPanel(true);
+    fireEvent.click(screen.getByTestId("btn-endpoint-test"));
+
+    await waitFor(() => expect(screen.getByTestId("endpoint-probe-status").textContent).toBe("202"));
+    const [url, init] = f.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/wheel/probe");
+    expect(JSON.parse(init.body as string)).toEqual({ project_id: "p1", method: "POST", path: "/tg" });
+    vi.unstubAllGlobals();
+  });
+
   it("shows the status and body verbatim rather than a summary of them", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(new Response("nope", { status: 404, statusText: "Not Found" })),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(reading(404, "nope", "Not Found")));
     renderPanel(true);
     fireEvent.click(screen.getByTestId("btn-endpoint-test"));
 
@@ -109,7 +122,7 @@ describe("testing the public URL", () => {
   });
 
   it("does not let a bare 404 read as a bad path", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(reading(404, "")));
     renderPanel(true);
     fireEvent.click(screen.getByTestId("btn-endpoint-test"));
 
@@ -125,9 +138,7 @@ describe("testing the public URL", () => {
   it("uses the engine's own words when the API sends ingress_unavailable", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        new Response('{"error":{"code":"ingress_unavailable","message":"no ingress"}}', { status: 501 }),
-      ),
+      vi.fn().mockResolvedValue(reading(501, '{"error":{"code":"ingress_unavailable","message":"no ingress"}}')),
     );
     renderPanel(true);
     fireEvent.click(screen.getByTestId("btn-endpoint-test"));
@@ -140,7 +151,7 @@ describe("testing the public URL", () => {
     vi.unstubAllGlobals();
   });
 
-  it("reports a blocked read as unreadable, not as a dead endpoint", async () => {
+  it("reports a test that could not run as unreadable, not as a dead endpoint", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
     renderPanel(true);
     fireEvent.click(screen.getByTestId("btn-endpoint-test"));
@@ -155,6 +166,20 @@ describe("testing the public URL", () => {
   it("shows no reading at all until one has been taken", () => {
     renderPanel(true);
     expect(screen.queryByTestId("endpoint-probe")).toBeNull();
+  });
+
+  // QA review round 2: a script endpoint outliving the server's own deadline is delivered, not
+  // failed, so it must read as sent — never alongside "did not run" or an invented status code.
+  it("reads a script endpoint that has not answered yet as sent, not as a failure", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ sent: true, timeout_ms: 30_000 })));
+    renderPanel(true);
+    fireEvent.click(screen.getByTestId("btn-endpoint-test"));
+
+    await waitFor(() => expect(screen.getByTestId("endpoint-probe-sent")).toBeDefined());
+    expect(screen.getByTestId("endpoint-probe-sent").textContent).toMatch(/sent.*30s/i);
+    expect(screen.queryByTestId("endpoint-probe-unreadable")).toBeNull();
+    expect(screen.queryByTestId("endpoint-probe-status")).toBeNull();
+    vi.unstubAllGlobals();
   });
 });
 

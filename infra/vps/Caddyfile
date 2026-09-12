@@ -1,0 +1,114 @@
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# The only public listener in front of Wheel. One file for every mode, driven by environment
+# variables that compose.yml (or /etc/wheel/caddy.env on bare metal) derives from .env. This
+# container only runs at all with COMPOSE_PROFILES=tls (compose.yml), which lib/derive-env.sh sets
+# only alongside WHEEL_DOMAIN — there is no plain-HTTP-publicly mode. CADDY_SITE has deliberately
+# no fallback: an empty site address is a Caddyfile syntax error (measured — "server block without
+# any key is global configuration"), so Caddy refuses to start rather than silently binding :80,
+# if this is ever run by hand without WHEEL_DOMAIN set.
+#
+#   CADDY_SITE          wheel.example.com — automatic HTTPS via ACME. Never empty; see above.
+#   CADDY_EMAIL_OPTION  "email you@example.com", or blank.
+#   CADDY_TLS_OPTION    "tls internal" for Caddy's own CA (LAN, rehearsal), or blank.
+#   WHEEL_API_UPSTREAM  wheeld:8080 in compose, 127.0.0.1:8080 on bare metal.
+#   WHEEL_WEB_UPSTREAM  web:3000 in compose, 127.0.0.1:3000 on bare metal.
+#   WHEEL_SIGNUP        "open" lifts the edge block on sign-up. Anything else keeps it.
+{
+	admin off
+	{$CADDY_EMAIL_OPTION}
+}
+
+# Caddy trusts no proxy in front of it, so {client_ip} is the TCP peer, and for an untrusted peer
+# it already replaces X-Forwarded-Proto and X-Forwarded-Host. The rest are SET here rather than
+# appended: a forwarding value the client sent never reaches wheeld or the web server.
+#
+# X-Forwarded-Port is not one Caddy replaces on its own — measured directly, a client-sent
+# X-Forwarded-Port passes straight through reverse_proxy unmodified, unlike -Proto/-Host. Neither
+# wheeld nor the web app reads it, so it is deleted rather than reconstructed.
+(forwarded) {
+	header_up X-Forwarded-For {client_ip}
+	header_up X-Real-IP {client_ip}
+	header_up -Forwarded
+	header_up -X-Forwarded-Port
+}
+
+{$CADDY_SITE} {
+	{$CADDY_TLS_OPTION}
+
+	header {
+		-Server
+		?X-Content-Type-Options nosniff
+		?Referrer-Policy strict-origin-when-cross-origin
+		?X-Frame-Options DENY
+		?Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+	}
+	@tls protocol https
+	header @tls Strict-Transport-Security "max-age=31536000"
+
+	# Belt to wheeld's WHEEL_SIGNUP braces: the edge refuses sign-up, direct or through the web
+	# app's session route, even from a build that ignores the flag. wheeld's flag is the binding one.
+	# A `handle`, and the first one: handle blocks run before a bare `respond` would.
+	@signup {
+		# Wildcarded, not exact: measured that /v1/auth/signup/ and /v1/auth/signup;foo pass an
+		# exact-match `path` straight to the backend (a trailing slash or a path parameter is not
+		# the same string). wheeld 404s the former and refuses signup either way today, but this
+		# line's own comment claims the edge blocks it "even from a build that ignores the flag" —
+		# that claim needs the wildcard to be true.
+		path /v1/auth/signup* /api/session/signup*
+		expression `"{$WHEEL_SIGNUP:closed}" != "open"`
+	}
+	handle @signup {
+		respond `{"error":{"code":"signup_closed","message":"Sign-up is closed on this server. Ask its operator for an account."}}` 403
+	}
+
+	# Wheel's own limits. An ingress body becomes a message: 256 KiB. wheeld and the web app's API
+	# proxy each buffer at most 5 MiB. A chest blob is 50 MiB by contract; no route stores one yet.
+	@ingress path /p/*
+	@blob {
+		path_regexp /chests/[^/]+/blob$
+		not path /p/*
+	}
+	@other {
+		not path /p/*
+		not path_regexp /chests/[^/]+/blob$
+	}
+	request_body @ingress {
+		max_size 256KiB
+	}
+	request_body @blob {
+		max_size 50MiB
+	}
+	request_body @other {
+		max_size 5MiB
+	}
+
+	# The web session cookie is scoped to this origin, so browsers send it here too. The API never
+	# authenticates by cookie; it should never see one either.
+	@api path /v1/* /p/*
+	handle @api {
+		reverse_proxy {$WHEEL_API_UPSTREAM:wheeld:8080} {
+			import forwarded
+			header_up -Cookie
+		}
+	}
+	@events path /api/wheel/projects/*/events
+	handle @events {
+		reverse_proxy {$WHEEL_WEB_UPSTREAM:web:3000} {
+			import forwarded
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy {$WHEEL_WEB_UPSTREAM:web:3000} {
+			import forwarded
+		}
+	}
+
+	handle_errors 413 {
+		header Content-Type application/json
+		respond `{"error":{"code":"payload_too_large","message":"the request body is over this route's limit at the proxy"}}` 413
+	}
+}

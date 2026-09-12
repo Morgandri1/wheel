@@ -9,10 +9,10 @@ import { defineConfig, devices } from "@playwright/test";
  * and could fail for reasons that have nothing to do with the package. One config per set of
  * servers is the only arrangement where `--project` means what it looks like it means.
  *
- * The package is pointed at a mock on :8789 while its build-time default is :8787. That gap
- * is the test: if `--api` were decorative — the natural outcome, since NEXT_PUBLIC_* values
- * freeze when the bundle compiles — the board would talk to 8787 and every assertion fails
- * on an empty page rather than passing quietly.
+ * The package is pointed at a mock on :8789 while its own default is 127.0.0.1:8080, where
+ * nothing listens. That gap is the test: if `--api` were decorative, the package's server
+ * would reach nothing and signing up would fail with "can't reach the API" rather than
+ * passing quietly.
  *
  * Requires the package to exist: `make test-pkg` builds, packs and runs it.
  */

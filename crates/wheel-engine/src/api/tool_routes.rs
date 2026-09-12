@@ -450,6 +450,20 @@ fn resolve_vault_fills(
                 ),
             ));
         }
+        // The same refusal `wheel secret get` makes (api/cli_routes.rs): a
+        // renewable login is the engine's to hold, and a tool fill puts its
+        // value on the wire to a third party. The wire to the vault is a
+        // capability over secrets, not over this one.
+        if key == wheel_core::CLAUDE_OAUTH_SESSION {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "not_readable",
+                format!(
+                    "{key} is a sign-in the engine renews; it cannot be sent as a tool \
+                     parameter"
+                ),
+            ));
+        }
         let value = crate::vault::get(&conn, vk, vault.id, key)
             .map_err(|e| ApiError::internal(e.to_string()))?
             .ok_or_else(|| ApiError::not_found(format!("{vault_name} has no key {key:?}")))?;
@@ -770,5 +784,85 @@ mod tests {
             operations: vec![o],
         };
         assert!(agent_view("t", &cfg).is_empty());
+    }
+
+    /// A tool node wired to the vault could put the whole renewable login —
+    /// refresh token included — into an outbound request. `wheel secret get`
+    /// refuses that key (api/cli_routes.rs); this path must refuse it too, or
+    /// the refusal is only as good as which door you knock on.
+    ///
+    /// Mutation-checked: drop the gate and the fill resolves to the login.
+    #[tokio::test]
+    async fn a_tool_fill_cannot_put_the_vaulted_login_on_the_wire() {
+        let state = crate::api::test_state();
+        let (tool, _vault_id) = {
+            let conn = state.db.lock().unwrap();
+            let v = wheel_core::Node::new(
+                Uuid::new_v4(),
+                "anthropic".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Vault(wheel_core::VaultConfig { keys: vec![] }),
+            );
+            board::create(&conn, &v).unwrap();
+            let vk = state.supervisor.vault_key().unwrap();
+            crate::vault::put(
+                &conn,
+                vk,
+                v.id,
+                wheel_core::CLAUDE_OAUTH_SESSION,
+                r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-a","refreshToken":"sk-ant-ort01-secret"}}"#,
+            )
+            .unwrap();
+            crate::vault::put(&conn, vk, v.id, "UPSTREAM_KEY", "ordinary-secret").unwrap();
+
+            let tool = wheel_core::Node::new(
+                Uuid::new_v4(),
+                "upstream".parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Tool(wheel_core::ToolConfig {
+                    kind: wheel_core::ToolKind::Http,
+                    source: wheel_core::ToolSource {
+                        format: wheel_core::ToolFormat::Manual,
+                        raw: String::new(),
+                        imported_at: wheel_core::Timestamp::now(),
+                    },
+                    base_url: "https://example.com".into(),
+                    operations: vec![],
+                }),
+            );
+            board::create(&conn, &tool).unwrap();
+            board::add_wire(&conn, tool.id, v.id, wheel_core::WireType::Read, None).unwrap();
+            (board::get(&conn, tool.id).unwrap().unwrap(), v.id)
+        };
+
+        let refused = resolve_vault_fills(
+            &state,
+            &tool,
+            &op(
+                "send",
+                "/x",
+                vec![param(
+                    "authorization",
+                    vault(&format!("anthropic/{}", wheel_core::CLAUDE_OAUTH_SESSION)),
+                )],
+            ),
+        )
+        .expect_err("a tool must not be able to send the login upstream");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1, "not_readable");
+
+        // An ordinary secret in the same vault still resolves, so this is the
+        // one key that is refused and not the wire.
+        let ok = resolve_vault_fills(
+            &state,
+            &tool,
+            &op(
+                "send",
+                "/x",
+                vec![param("authorization", vault("anthropic/UPSTREAM_KEY"))],
+            ),
+        )
+        .expect("the wire still grants everything else");
+        assert_eq!(ok["anthropic/UPSTREAM_KEY"], "ordinary-secret");
     }
 }
