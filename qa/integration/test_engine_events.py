@@ -198,9 +198,9 @@ def main():
                        % (len(log_frames), json.dumps(log_frames[0])[:200] if log_frames else "")):
             return R.report("engine-events")
 
-        R.check("ENG-log-stream-parity", want <= seen,
-                "recorded %s but broadcast only %s — missing: %s"
-                % (sorted(want), sorted(seen), sorted(want - seen)))
+        R.check("ENG-log-stream-parity", want == seen,
+                "recorded %s but broadcast %s — missing: %s, extra: %s"
+                % (sorted(want), sorted(seen), sorted(want - seen), sorted(seen - want)))
 
         # BUG-009 named this stream specifically, so it is asserted by name AS WELL as by
         # the set comparison. The set catches the next one; the name catches a regression
