@@ -204,6 +204,44 @@ pub fn has_queued(conn: &Connection, agent: Uuid) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Every recipient still holding a `queued` message: what a drain left waiting.
+pub fn recipients_with_queued(conn: &Connection) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT to_id FROM messages WHERE state = 'queued'")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod recipients_tests {
+    use super::*;
+
+    #[test]
+    fn only_recipients_with_queued_work_are_named_and_each_once() {
+        let conn = crate::db::open_memory().unwrap();
+        let agent = |name: &str| {
+            let n = wheel_core::Node::new(
+                Uuid::new_v4(),
+                name.parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            );
+            crate::db::board::create(&conn, &n).unwrap();
+            n.id
+        };
+        let (waiting, done) = (agent("waiting"), agent("done"));
+        enqueue(&conn, MessageSender::User, waiting, "a".into(), None).unwrap();
+        enqueue(&conn, MessageSender::User, waiting, "b".into(), None).unwrap();
+        let m = enqueue(&conn, MessageSender::User, done, "c".into(), None).unwrap();
+        advance(&conn, m.id, MessageState::Delivered).unwrap();
+
+        assert_eq!(recipients_with_queued(&conn).unwrap(), vec![waiting]);
+    }
+}
+
 pub fn next_for_delivery(
     conn: &Connection,
     agent: Uuid,

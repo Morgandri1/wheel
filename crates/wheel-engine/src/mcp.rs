@@ -28,6 +28,26 @@ pub fn tools_for(conn: &Connection, me: &Caller) -> Vec<Value> {
     tools
 }
 
+/// Offered only where the deployment updates itself (`cli_routes::mcp_tools`).
+pub fn update_tool() -> Value {
+    json!({
+        "name": "update",
+        "description": "Ask this deployment to apply its pending Wheel runtime update at the next \
+            point where no agent is mid-turn, or show what is pending. Returns at once; your turn \
+            is never interrupted, and a system message tells you when it is done.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["request", "status"],
+                    "description": "request (the default) or status"
+                }
+            }
+        }
+    })
+}
+
 /// A node's name and what may be done with it, for a description.
 fn names_of(reachable: &[(Node, WireType)], f: impl Fn(&Node, WireType) -> bool) -> Vec<String> {
     reachable

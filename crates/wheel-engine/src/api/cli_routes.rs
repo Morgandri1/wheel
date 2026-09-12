@@ -744,9 +744,84 @@ pub async fn mcp_tools(
 ) -> ApiResult<Json<serde_json::Value>> {
     let me = caller(&s, &headers)?;
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    Ok(Json(serde_json::json!({
-        "tools": crate::mcp::tools_for(&conn, &me),
-    })))
+    let mut tools = crate::mcp::tools_for(&conn, &me);
+    // Only where the deployment updates itself: a tool that can only ever
+    // refuse teaches a model the board is unreliable.
+    if s.update.is_some() {
+        tools.push(crate::mcp::update_tool());
+    }
+    Ok(Json(serde_json::json!({ "tools": tools })))
+}
+
+/// `GET /v1/cli/update` — what this deployment's updater would say right now.
+pub async fn update_status(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    caller(&s, &headers)?;
+    let hook = s.update.as_ref().ok_or_else(update_disabled)?;
+    Ok(Json(serde_json::json!({ "update": hook.notice() })))
+}
+
+/// `POST /v1/cli/update` — record a request to apply the pending runtime update
+/// at the next quiescent point (docs/proposals/auto-update.md).
+///
+/// Returns at once: the caller is mid-turn, and the update waits for that turn
+/// to end. The caller names nothing: the target is always the CI-green tip of
+/// `main`, so a request can move the runtime only where it would go anyway.
+pub async fn update_request(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    use crate::update::RequestOutcome;
+
+    let me = caller(&s, &headers)?;
+    let hook = s.update.as_ref().ok_or_else(update_disabled)?;
+    if me.node.node_type() != NodeType::Agent {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "update_denied",
+            "only an agent may request a runtime update: an endpoint can start a script, so a \
+             request from one would hand the internet a restart lever",
+        ));
+    }
+    let from = crate::update::Requester {
+        project: s.cfg.project_id,
+        node: me.node.id,
+        name: me.node.name.to_string(),
+    };
+    let accepted = |notice, again: bool| {
+        let body = serde_json::json!({
+            "requested": true,
+            "already_requested": again,
+            "update": notice,
+        });
+        (StatusCode::ACCEPTED, Json(body))
+    };
+    match hook.request(from) {
+        RequestOutcome::Accepted(n) => Ok(accepted(n, false)),
+        RequestOutcome::AlreadyRequested(n) => Ok(accepted(n, true)),
+        RequestOutcome::NothingToDo => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "requested": false,
+                "reason": "nothing pertinent to update",
+            })),
+        )),
+        RequestOutcome::Refused(why) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "update_refused",
+            why,
+        )),
+    }
+}
+
+fn update_disabled() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "update_disabled",
+        "auto-update is off on this deployment (WHEEL_AUTO_UPDATE is unset or off); ask the operator",
+    )
 }
 
 /// `POST /v1/cli/ctx/clear` — an agent clearing its own context (§3 grammar).
@@ -1124,5 +1199,155 @@ mod usage_tests {
         )
         .unwrap();
         assert_eq!(status.pct_of_max_turns, Some(100.0));
+    }
+}
+
+/// docs/proposals/auto-update.md: the request surface an agent reaches, and the
+/// refusals that make `WHEEL_AUTO_UPDATE=off` mean off.
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::update::{EngineControl, RequestOutcome, Requester, UpdateHook};
+    use axum::http::HeaderValue;
+    use std::sync::{Arc, Mutex, Weak};
+    use wheel_core::{AgentConfig, Node, NodeConfig, Position, UpdateNotice};
+
+    struct FakeHook {
+        outcome: RequestOutcome,
+        asked: Mutex<Vec<Requester>>,
+    }
+
+    impl UpdateHook for FakeHook {
+        fn notice(&self) -> Option<UpdateNotice> {
+            None
+        }
+        fn request(&self, from: Requester) -> RequestOutcome {
+            self.asked.lock().unwrap().push(from);
+            self.outcome.clone()
+        }
+        fn attach(&self, _: uuid::Uuid, _: Weak<dyn EngineControl>) {}
+    }
+
+    fn with_hook(outcome: RequestOutcome) -> (AppState, Arc<FakeHook>) {
+        let hook = Arc::new(FakeHook {
+            outcome,
+            asked: Mutex::new(Vec::new()),
+        });
+        let mut state = crate::api::test_state();
+        state.update = Some(hook.clone());
+        (state, hook)
+    }
+
+    fn node_with_token(state: &AppState, name: &str, config: NodeConfig) -> (uuid::Uuid, HeaderMap) {
+        let node = Node::new(uuid::Uuid::new_v4(), name.parse().unwrap(), Position::default(), config);
+        let id = node.id;
+        let token = {
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &node).unwrap();
+            crate::db::tokens::mint(&conn, id).unwrap().plaintext
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        (id, headers)
+    }
+
+    fn agent(state: &AppState) -> (uuid::Uuid, HeaderMap) {
+        node_with_token(state, "asker", NodeConfig::Agent(AgentConfig::default()))
+    }
+
+    fn lists_update(tools: &serde_json::Value) -> bool {
+        tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "update")
+    }
+
+    #[tokio::test]
+    async fn with_the_policy_off_every_update_surface_refuses() {
+        let state = crate::api::test_state();
+        let (_, h) = agent(&state);
+
+        let e = update_request(State(state.clone()), h.clone())
+            .await
+            .unwrap_err();
+        assert_eq!((e.0, e.1), (StatusCode::FORBIDDEN, "update_disabled"));
+        assert!(e.2.contains("WHEEL_AUTO_UPDATE"), "name the variable: {}", e.2);
+
+        let e = update_status(State(state.clone()), h.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(e.1, "update_disabled");
+
+        let tools = mcp_tools(State(state), h).await.unwrap().0;
+        assert!(!lists_update(&tools), "an off deployment must not offer the tool");
+    }
+
+    #[tokio::test]
+    async fn an_agents_request_is_recorded_with_who_asked_and_answered_at_once() {
+        let (state, hook) = with_hook(RequestOutcome::Accepted(None));
+        let (id, h) = agent(&state);
+
+        let (status, body) = update_request(State(state.clone()), h.clone())
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body.0["requested"], true);
+        assert_eq!(body.0["already_requested"], false);
+        assert_eq!(
+            *hook.asked.lock().unwrap(),
+            vec![Requester {
+                project: state.cfg.project_id,
+                node: id,
+                name: "asker".into(),
+            }]
+        );
+
+        let tools = mcp_tools(State(state.clone()), h.clone()).await.unwrap().0;
+        assert!(lists_update(&tools));
+        let status = update_status(State(state), h).await.unwrap().0;
+        assert!(status["update"].is_null(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn every_outcome_maps_to_its_own_answer() {
+        let (state, _) = with_hook(RequestOutcome::AlreadyRequested(None));
+        let (_, h) = agent(&state);
+        let (status, body) = update_request(State(state), h).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body.0["already_requested"], true);
+
+        let (state, _) = with_hook(RequestOutcome::NothingToDo);
+        let (_, h) = agent(&state);
+        let (status, body) = update_request(State(state), h).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["requested"], false);
+
+        let (state, _) = with_hook(RequestOutcome::Refused("suspended".into()));
+        let (_, h) = agent(&state);
+        let e = update_request(State(state), h).await.unwrap_err();
+        assert_eq!((e.0, e.1, e.2.as_str()), (StatusCode::CONFLICT, "update_refused", "suspended"));
+    }
+
+    /// An endpoint can start a script, so a script that could ask would hand
+    /// the public internet a restart lever.
+    #[tokio::test]
+    async fn a_script_may_not_request_an_update() {
+        let (state, hook) = with_hook(RequestOutcome::Accepted(None));
+        let (_, h) = node_with_token(
+            &state,
+            "hook-script",
+            NodeConfig::Script(wheel_core::ScriptConfig {
+                language: wheel_core::ScriptLanguage::Python,
+                source: "print('hi')".into(),
+                timeout_secs: None,
+            }),
+        );
+        let e = update_request(State(state), h).await.unwrap_err();
+        assert_eq!((e.0, e.1), (StatusCode::FORBIDDEN, "update_denied"));
+        assert!(hook.asked.lock().unwrap().is_empty(), "nothing may be recorded");
     }
 }

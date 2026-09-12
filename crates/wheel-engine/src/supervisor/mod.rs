@@ -954,6 +954,59 @@ impl Supervisor {
         self.agents.lock().await.keys().copied().collect()
     }
 
+    /// Stop starting turns, so the board can reach a quiescent point.
+    ///
+    /// Deliberately the SAME flag [`Supervisor::shutdown`] sets, not a second
+    /// one: an update pauses delivery, waits for the turns already running to
+    /// end, and then hands over to the very shutdown path that stops agents. A
+    /// separate "draining" flag would be another thing to keep in step with
+    /// `start` and `pump_queue`, and the first time they disagreed a turn would
+    /// start inside a drain.
+    pub fn pause_turns(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub fn turns_paused(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Let turns start again, and hand every agent the work that queued while
+    /// they could not.
+    ///
+    /// The abort path, and only that: an update whose drain ran out of time must
+    /// leave the board exactly as it found it. `shutdown` never calls this —
+    /// there, the flag is terminal.
+    pub async fn resume_turns(self: &Arc<Self>) {
+        self.closing.store(false, Ordering::SeqCst);
+        let waiting = {
+            let conn = self.db.lock().unwrap();
+            messages::recipients_with_queued(&conn).unwrap_or_default()
+        };
+        for agent in waiting {
+            if let Err(e) = self.deliver(agent).await {
+                tracing::warn!(%agent, error = %e, "could not resume delivery after a paused update");
+            }
+        }
+    }
+
+    /// Agents that are mid-turn, plus any whose slot is locked right now: a
+    /// spawn or a write is in progress, and neither is a quiet moment.
+    ///
+    /// A different question from [`Supervisor::turns_in_flight`], which counts
+    /// turns for the shutdown drain. This one decides whether it is safe to
+    /// stop at all, so an in-progress spawn counts against it.
+    pub async fn busy_agents(&self) -> Vec<Uuid> {
+        self.all_slots()
+            .await
+            .into_iter()
+            .filter(|(_, slot)| match slot.try_lock() {
+                Ok(guard) => guard.as_ref().is_some_and(|r| r.in_flight.is_some()),
+                Err(_) => true,
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// Stop an idle agent's process, keeping its session so the next message
     /// resumes it (§3c#14).
     ///
@@ -1007,7 +1060,7 @@ impl Supervisor {
             return Some(left);
         }
 
-        let Some(mut r) = guard.take() else {
+        let Some(r) = guard.take() else {
             // No process to stop: nothing to park, and marking it Parked would
             // claim a saving that was never made.
             return None;
@@ -1875,35 +1928,48 @@ impl Supervisor {
     /// project exists to avoid. An agent that is never messaged therefore
     /// never spawns — that is the intended trade, not an oversight.
     pub async fn start_configured_agents(self: &Arc<Self>) {
-        let agents: Vec<Uuid> = {
+        let (on_startup, parked_with_work): (Vec<Uuid>, Vec<Uuid>) = {
             let conn = self.db.lock().unwrap();
-            board::list(&conn)
+            let agents: Vec<(Uuid, bool)> = board::list(&conn)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|n| {
-                    n.config
-                        .as_agent()
-                        .map(|a| a.run_on_startup)
-                        .unwrap_or(false)
+                .filter_map(|n| n.config.as_agent().map(|a| (n.id, a.run_on_startup)))
+                .collect();
+            // Parked by a drain or an idle timer with work queued behind it —
+            // a message that arrived while an update waited for quiet. Nothing
+            // else would ever address it: `deliver` runs on enqueue, and the
+            // enqueue already happened. Only `queued` rows count, so a
+            // `delivered` headstone is never replayed (the effectively-once
+            // ruling in deploy-resume-and-drain.md).
+            let parked_with_work = agents
+                .iter()
+                .filter(|(id, on_startup)| {
+                    !on_startup
+                        && board::agent_state(&conn, *id).unwrap_or_default().status
+                            == AgentStatus::Parked
+                        && messages::has_queued(&conn, *id).unwrap_or(false)
                 })
-                .map(|n| n.id)
-                .collect()
+                .map(|(id, _)| *id)
+                .collect();
+            let on_startup = agents
+                .into_iter()
+                .filter(|(_, on_startup)| *on_startup)
+                .map(|(id, _)| id)
+                .collect();
+            (on_startup, parked_with_work)
         };
-        if agents.is_empty() {
-            return;
-        }
-        {
+        if !on_startup.is_empty() {
             let conn = self.db.lock().unwrap();
-            for id in &agents {
+            for id in &on_startup {
                 set_status_db(&conn, *id, AgentStatus::Parked, None);
                 publish_state(&self.events, &conn, *id);
             }
+            tracing::info!(count = on_startup.len(), "agents parked on startup");
         }
-        tracing::info!(count = agents.len(), "agents parked on startup");
 
         // Anything already queued from a previous run is addressed to them
         // now, which resumes exactly the agents that have work.
-        for id in agents {
+        for id in on_startup.into_iter().chain(parked_with_work) {
             let _ = self.deliver(id).await;
         }
     }
@@ -1921,6 +1987,13 @@ impl Supervisor {
     /// resume its messages would sit in the queue looking delivered-any-moment
     /// forever.
     pub async fn deliver(self: &Arc<Self>, agent: Uuid) -> Result<()> {
+        // Quietly, not as an error: while turns are paused for an update or a
+        // shutdown, `start` refuses, and a sender whose message merely has to
+        // wait should not be told its send failed. The row stays `queued` and
+        // goes out when turns resume or the next boot delivers it.
+        if self.turns_paused() {
+            return Ok(());
+        }
         let (status, waiting) = {
             let conn = self.db.lock().unwrap();
             let status = board::agent_state(&conn, agent).unwrap_or_default().status;
@@ -4203,6 +4276,7 @@ done
             events: sup.events().clone(),
             ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
             logins: Arc::new(crate::oauth::LoginSessions::default()),
+            update: None,
         };
 
         let matched = MatchedEndpoint {

@@ -28,9 +28,11 @@ pub mod oauth;
 pub mod peercred;
 pub mod supervisor;
 pub mod tools;
+pub mod update;
 pub mod vault;
 
 use anyhow::Context;
+pub use api::build_id;
 pub use config::Config;
 use wheel_core::ListenAddr;
 
@@ -54,6 +56,20 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 pub async fn serve_until(
     cfg: Config,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    serve_until_with(cfg, shutdown, None).await
+}
+
+/// As [`serve_until`], on a deployment that updates itself
+/// (docs/proposals/auto-update.md).
+///
+/// The hook is how this engine reaches the updater — to carry its notice on
+/// `/v1/cli/*` and to record a request — and how the updater reaches this
+/// engine to pause delivery while it waits for quiet.
+pub async fn serve_until_with(
+    cfg: Config,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    update: Option<Arc<dyn update::UpdateHook>>,
 ) -> anyhow::Result<()> {
     // Logging belongs to whoever owns the PROCESS, not to each engine in it.
     // `wheeld` runs several of these together; if serve() installed a global
@@ -105,7 +121,17 @@ pub async fn serve_until(
         events,
         logins: Arc::new(oauth::LoginSessions::default()),
         ingress_rate: Arc::new(api::ingress::RateLimiter::default()),
+        update: update.clone(),
     };
+    // The updater holds only a weak handle; this binding is what keeps it
+    // alive, so an engine that has stopped cannot be drained or messaged.
+    let control: Arc<dyn update::EngineControl> = Arc::new(update::SupervisorControl::new(
+        state.supervisor.clone(),
+        state.db.clone(),
+    ));
+    if let Some(hook) = &update {
+        hook.attach(state.cfg.project_id, Arc::downgrade(&control));
+    }
     // Before serving: agents configured to run on startup come up parked, and
     // any message left queued by the previous run resumes exactly the agents
     // that have work waiting.

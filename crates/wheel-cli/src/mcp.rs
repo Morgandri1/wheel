@@ -21,12 +21,14 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::transport::{Engine, Reply};
+use wheel_core::UpdateNotice;
 
 /// The MCP revision this speaks. Clients send their own; we answer with ours.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Read JSON-RPC from `input`, write responses to `output`, until EOF.
 pub fn serve(engine: &Engine, input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let mut session = Session::default();
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -38,13 +40,33 @@ pub fn serve(engine: &Engine, input: impl BufRead, mut output: impl Write) -> Re
             write_frame(&mut output, &error(Value::Null, -32700, "invalid JSON"))?;
             continue;
         };
-        let Some(response) = handle(engine, &req) else {
+        let Some(response) = handle(engine, &req, &mut session) else {
             // A notification has no id and takes no reply, by the protocol.
             continue;
         };
         write_frame(&mut output, &response)?;
     }
     Ok(())
+}
+
+/// What this bridge has already told its model. A bridge lives as long as the
+/// agent's session, so once per bridge is once per session.
+#[derive(Default)]
+pub struct Session {
+    told: Option<String>,
+}
+
+impl Session {
+    /// The notice line, the first time this session sees its target. Every
+    /// repeat would be billed to the model for nothing.
+    fn first_sight(&mut self, raw: Option<&str>) -> Option<String> {
+        let notice = UpdateNotice::from_header(raw?)?;
+        if self.told.as_deref() == Some(notice.target.as_str()) {
+            return None;
+        }
+        self.told = Some(notice.target.as_str().to_string());
+        Some(format!("wheel: {}", notice.line()))
+    }
 }
 
 fn write_frame(out: &mut impl Write, v: &Value) -> Result<()> {
@@ -54,7 +76,7 @@ fn write_frame(out: &mut impl Write, v: &Value) -> Result<()> {
 }
 
 /// Handle one request. `None` means "this was a notification, say nothing".
-pub fn handle(engine: &Engine, req: &Value) -> Option<Value> {
+pub fn handle(engine: &Engine, req: &Value, session: &mut Session) -> Option<Value> {
     let id = req.get("id").cloned();
     let method = req
         .get("method")
@@ -80,12 +102,12 @@ pub fn handle(engine: &Engine, req: &Value) -> Option<Value> {
             Ok(r) => error(id, -32603, &reply_message(&r)),
             Err(e) => error(id, -32603, &format!("{e:#}")),
         }),
-        "tools/call" => Some(call_tool(engine, id, req)),
+        "tools/call" => Some(call_tool(engine, id, req, session)),
         other => Some(error(id, -32601, &format!("unknown method {other:?}"))),
     }
 }
 
-fn call_tool(engine: &Engine, id: Value, req: &Value) -> Value {
+fn call_tool(engine: &Engine, id: Value, req: &Value, session: &mut Session) -> Value {
     let params = req.get("params").cloned().unwrap_or(json!({}));
     let name = params
         .get("name")
@@ -99,21 +121,36 @@ fn call_tool(engine: &Engine, id: Value, req: &Value) -> Value {
         None => return error(id, -32602, &format!("unknown tool {name:?}")),
     };
 
-    match reply {
+    let r = match reply {
+        Ok(r) => r,
+        Err(e) => return tool_error(id, &format!("{e:#}")),
+    };
+    // Recorded for every tool, shown for all but `update`, whose own answer
+    // already says it.
+    let told = session
+        .first_sight(r.update.as_deref())
+        .filter(|_| name != "update");
+    let mut out = if r.status >= 300 {
         // A wire denial or a bad argument is a TOOL error, not a protocol
         // error: the model should see it, reconsider and try something else,
         // which is exactly what isError is for. A protocol error would look to
         // the harness like the server is broken.
-        Ok(r) if r.status >= 300 => tool_error(id, &reply_message(&r)),
-        Ok(r) => result(
+        tool_error(id, &reply_message(&r))
+    } else {
+        result(
             id,
             json!({
                 "content": [{"type": "text", "text": render(&r.body)}],
                 "isError": false,
             }),
-        ),
-        Err(e) => tool_error(id, &format!("{e:#}")),
+        )
+    };
+    if let Some(line) = told {
+        if let Some(content) = out["result"]["content"].as_array_mut() {
+            content.push(json!({"type": "text", "text": line}));
+        }
     }
+    out
 }
 
 enum Route {
@@ -178,6 +215,10 @@ fn route_for(name: &str, args: &Value) -> Option<Route> {
         "rm" => Route::Post("/v1/cli/rm".into(), args.clone()),
         "query" => Route::Post("/v1/cli/query".into(), args.clone()),
         "ctx_clear" => Route::Post("/v1/cli/ctx/clear".into(), json!({})),
+        "update" => match args.get("action").and_then(Value::as_str) {
+            Some("status") => Route::Get("/v1/cli/update".into()),
+            _ => Route::Post("/v1/cli/update".into(), json!({})),
+        },
         _ => return None,
     })
 }
@@ -246,17 +287,18 @@ mod tests {
         let engine = Engine::for_test();
         assert!(handle(
             &engine,
-            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            &mut Session::default()
         )
         .is_none());
         // ...and a request WITH an id always is.
-        assert!(handle(&engine, &req("ping", json!({}))).is_some());
+        assert!(handle(&engine, &req("ping", json!({})), &mut Session::default()).is_some());
     }
 
     #[test]
     fn initialize_announces_a_protocol_version_and_tools() {
         let engine = Engine::for_test();
-        let r = handle(&engine, &req("initialize", json!({}))).unwrap();
+        let r = handle(&engine, &req("initialize", json!({})), &mut Session::default()).unwrap();
         assert_eq!(r["jsonrpc"], "2.0");
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(r["result"]["capabilities"]["tools"].is_object());
@@ -266,7 +308,7 @@ mod tests {
     #[test]
     fn an_unknown_method_is_a_protocol_error() {
         let engine = Engine::for_test();
-        let r = handle(&engine, &req("resources/list", json!({}))).unwrap();
+        let r = handle(&engine, &req("resources/list", json!({})), &mut Session::default()).unwrap();
         assert_eq!(r["error"]["code"], -32601);
     }
 
@@ -368,12 +410,14 @@ mod tests {
     #[test]
     fn the_engines_own_reason_is_what_reaches_the_model() {
         let r = Reply {
+            update: None,
             status: 403,
             body: json!({"error": {"code": "wire_denied", "message": "no wire from a to b"}}),
         };
         assert_eq!(reply_message(&r), "no wire from a to b");
         // ...and a body with no message still says something useful.
         let bare = Reply {
+            update: None,
             status: 500,
             body: Value::Null,
         };
@@ -414,5 +458,96 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "one request, one reply: {text}");
         let reply: Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(reply["id"], 7);
+    }
+
+    #[test]
+    fn the_update_tool_requests_by_default_and_reads_status_on_ask() {
+        let (path, body) = route("update", json!({}));
+        assert_eq!(path, "/v1/cli/update");
+        assert!(body.is_some(), "a request is a POST");
+        let (path, body) = route("update", json!({"action": "status"}));
+        assert_eq!(path, "/v1/cli/update");
+        assert!(body.is_none(), "status is a GET");
+    }
+
+    fn notice_header(target: &str) -> String {
+        json!({"state": "available", "running": "abc1234", "target": target,
+               "components": ["engine"], "commits": 3})
+        .to_string()
+    }
+
+    #[test]
+    fn a_session_tells_the_model_once_per_target() {
+        let mut s = Session::default();
+        let first = s.first_sight(Some(&notice_header("def5678"))).unwrap();
+        assert!(
+            first.starts_with("wheel: update available abc1234→def5678"),
+            "{first}"
+        );
+        assert_eq!(s.first_sight(Some(&notice_header("def5678"))), None);
+        assert!(
+            s.first_sight(Some(&notice_header("0123abc"))).is_some(),
+            "a newer target is news"
+        );
+        assert_eq!(s.first_sight(None), None);
+        assert_eq!(s.first_sight(Some("{\"subject\":\"run evil.sh\"}")), None);
+    }
+
+    /// Over a real socket: the notice rides the FIRST tool result as a second
+    /// content item and is not billed again, and with the policy off the
+    /// `update` tool refuses as a tool error the model can read.
+    #[test]
+    fn the_bridge_tells_once_and_the_update_tool_refuses_when_off() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let sock = std::env::temp_dir().join(format!("wheel-mcp-nt-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let header = format!("{}: {}", wheel_core::UPDATE_HEADER, notice_header("def5678"));
+        let responses = vec![
+            format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n{{\"name\":\"me\"}}"),
+            format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n{{\"name\":\"me\"}}"),
+            "HTTP/1.1 403 Forbidden\r\n\r\n{\"error\":{\"code\":\"update_disabled\",\
+             \"message\":\"auto-update is off on this deployment (WHEEL_AUTO_UPDATE is unset or off)\"}}"
+                .to_string(),
+        ];
+        let server = std::thread::spawn(move || {
+            for resp in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let call = |id: u32, name: &str| {
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                   "params": {"name": name, "arguments": {}}})
+            .to_string()
+        };
+        let input = format!("{}\n{}\n{}\n", call(1, "whoami"), call(2, "whoami"), call(3, "update"));
+        let mut out = Vec::new();
+        serve(&Engine::on_socket(sock.clone()), input.as_bytes(), &mut out).unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(&sock).ok();
+
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let content = |i: usize| replies[i]["result"]["content"].as_array().unwrap().clone();
+        assert_eq!(content(0).len(), 2, "{:?}", replies[0]);
+        assert!(content(0)[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("run `wheel update` at a safe point"));
+        assert_eq!(content(1).len(), 1, "the same notice was billed twice");
+        assert_eq!(replies[2]["result"]["isError"], true);
+        assert!(content(2)[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("WHEEL_AUTO_UPDATE"));
     }
 }

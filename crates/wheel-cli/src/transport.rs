@@ -33,6 +33,9 @@ enum Target {
 pub struct Reply {
     pub status: u16,
     pub body: serde_json::Value,
+    /// The `x-wheel-update` header, raw. Parsed only by whoever renders it, so
+    /// a malformed one is dropped rather than half-shown.
+    pub update: Option<String>,
 }
 
 impl Engine {
@@ -58,6 +61,14 @@ impl Engine {
     pub fn for_test() -> Self {
         Self {
             target: Target::Http("http://127.0.0.1:1".into()),
+            token: "test-token".into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn on_socket(sock: PathBuf) -> Self {
+        Self {
+            target: Target::Unix(sock),
             token: "test-token".into(),
         }
     }
@@ -92,15 +103,14 @@ impl Engine {
         };
         // A 4xx is an ANSWER, not a transport failure: the CLI turns it into an
         // exit code, so it must not be flattened into an error here.
+        let reply = |status: u16, r: ureq::Response| Reply {
+            status,
+            update: r.header(wheel_core::UPDATE_HEADER).map(str::to_string),
+            body: r.into_json().unwrap_or(serde_json::Value::Null),
+        };
         match resp {
-            Ok(r) => Ok(Reply {
-                status: r.status(),
-                body: r.into_json().unwrap_or(serde_json::Value::Null),
-            }),
-            Err(ureq::Error::Status(status, r)) => Ok(Reply {
-                status,
-                body: r.into_json().unwrap_or(serde_json::Value::Null),
-            }),
+            Ok(r) => Ok(reply(r.status(), r)),
+            Err(ureq::Error::Status(status, r)) => Ok(reply(status, r)),
             Err(e) => Err(e).context("reaching the engine"),
         }
     }
@@ -145,12 +155,18 @@ impl Engine {
             .and_then(|s| s.parse().ok())
             .with_context(|| format!("unparseable status line {status_line:?}"))?;
 
-        // Skip headers; Connection: close means the body runs to EOF, so no
-        // chunked decoding is needed.
+        // Connection: close means the body runs to EOF, so no chunked decoding
+        // is needed; the only header the CLI reads is the update notice.
+        let mut update = None;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
                 break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case(wheel_core::UPDATE_HEADER) {
+                    update = Some(value.trim().to_string());
+                }
             }
         }
         let mut raw = String::new();
@@ -159,6 +175,7 @@ impl Engine {
         Ok(Reply {
             status,
             body: serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null),
+            update,
         })
     }
 }
@@ -303,6 +320,23 @@ mod tests {
         let reply = engine_on(sock.clone()).get("/v1/cli/ls").unwrap();
         assert_eq!(reply.status, 204);
         assert_eq!(reply.body, serde_json::Value::Null);
+        std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn the_update_notice_header_is_handed_back_raw_and_only_when_sent() {
+        let sock = tmp_sock("nt");
+        let _server = serve_once(
+            &sock,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Wheel-Update: {\"state\":\"x\"}\r\n\r\n{}",
+        );
+        let reply = engine_on(sock.clone()).get("/v1/cli/whoami").unwrap();
+        assert_eq!(reply.update.as_deref(), Some("{\"state\":\"x\"}"));
+        std::fs::remove_file(&sock).ok();
+
+        let sock = tmp_sock("nn");
+        let _server = serve_once(&sock, "HTTP/1.1 200 OK\r\n\r\n{}");
+        assert_eq!(engine_on(sock.clone()).get("/v1/cli/whoami").unwrap().update, None);
         std::fs::remove_file(&sock).ok();
     }
 
@@ -515,6 +549,28 @@ mod http_tests {
         let _ = server.join();
         assert_eq!(reply.status, 500);
         assert_eq!(reply.body, serde_json::Value::Null);
+    }
+
+    /// Over HTTP too, and on a refusal as well as a success: an agent denied
+    /// something still deserves to hear that its runtime is stale.
+    #[test]
+    fn the_update_notice_rides_http_answers_of_either_kind() {
+        let (port, server) = serve_raw(
+            "HTTP/1.1 200 OK\r\nx-wheel-update: n1\r\nContent-Length: 2\r\n\r\n{}".to_string(),
+        );
+        assert_eq!(
+            engine_on(port).get("/v1/cli/whoami").unwrap().update.as_deref(),
+            Some("n1")
+        );
+        let _ = server.join();
+
+        let (port, server) = serve_raw(
+            "HTTP/1.1 403 Forbidden\r\nx-wheel-update: n2\r\nContent-Length: 2\r\n\r\n{}"
+                .to_string(),
+        );
+        let reply = engine_on(port).get("/v1/cli/read?addr=b").unwrap();
+        let _ = server.join();
+        assert_eq!((reply.status, reply.update.as_deref()), (403, Some("n2")));
     }
 
     #[test]

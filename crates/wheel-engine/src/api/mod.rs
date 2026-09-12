@@ -57,6 +57,9 @@ pub struct AppState {
     /// Logins waiting for a pasted code. Each holds a live child process, so
     /// this is state with a cost and a TTL, not a cache.
     pub logins: Arc<crate::oauth::LoginSessions>,
+    /// The deployment's updater, if it has one. `None` is policy `off`, and
+    /// every update surface refuses (docs/proposals/auto-update.md).
+    pub update: Option<Arc<dyn crate::update::UpdateHook>>,
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
@@ -144,6 +147,25 @@ async fn require_engine_secret(
     next.run(req).await
 }
 
+/// Every `/v1/cli/*` answer carries the deployment's update notice while there
+/// is one. Not on a 401: a caller without a token learns nothing about what
+/// this deployment runs.
+async fn attach_update_notice(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        return resp;
+    }
+    let notice = state.update.as_ref().and_then(|hook| hook.notice());
+    if let Some(value) = notice.and_then(|n| header::HeaderValue::from_str(&n.to_header()).ok()) {
+        resp.headers_mut().insert(wheel_core::UPDATE_HEADER, value);
+    }
+    resp
+}
+
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -226,7 +248,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/ctx/clear", post(cli_routes::ctx_clear))
         .route("/usage", get(cli_routes::usage))
-        .route("/mcp/tools", get(cli_routes::mcp_tools));
+        .route("/mcp/tools", get(cli_routes::mcp_tools))
+        .route(
+            "/update",
+            get(cli_routes::update_status).post(cli_routes::update_request),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            attach_update_notice,
+        ));
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -369,7 +399,7 @@ fn stalled_agents(
 /// spawned the process, and travels with the artefact rather than beside it.
 /// `unknown` when nothing stamped the build, which is honest: an unstamped
 /// build is exactly where an operator must conclude nothing.
-fn build_id() -> &'static str {
+pub fn build_id() -> &'static str {
     option_env!("WHEEL_BUILD_SHA").unwrap_or("unknown")
 }
 
@@ -432,6 +462,7 @@ pub(crate) fn test_state() -> AppState {
         events,
         logins: Arc::new(crate::oauth::LoginSessions::default()),
         ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
+        update: None,
     }
 }
 
@@ -635,6 +666,90 @@ mod tests {
         );
     }
 
+    /// Watched on the wire, not in the handler: the header is added by a layer,
+    /// and the only proof a layer runs is a response that went through it.
+    #[tokio::test]
+    async fn every_cli_answer_carries_the_update_notice_and_a_401_does_not() {
+        use wheel_core::{Component, Sha, UpdateNotice, UpdateState, UPDATE_HEADER};
+
+        struct Noticing;
+        impl crate::update::UpdateHook for Noticing {
+            fn notice(&self) -> Option<UpdateNotice> {
+                Some(UpdateNotice {
+                    state: UpdateState::Available,
+                    running: Sha::parse("abc1234").unwrap(),
+                    target: Sha::parse("def5678").unwrap(),
+                    components: vec![Component::Engine],
+                    commits: 2,
+                    reason: None,
+                })
+            }
+            fn request(&self, _: crate::update::Requester) -> crate::update::RequestOutcome {
+                crate::update::RequestOutcome::NothingToDo
+            }
+            fn attach(&self, _: uuid::Uuid, _: std::sync::Weak<dyn crate::update::EngineControl>) {}
+        }
+
+        async fn serve(state: AppState) -> (String, String) {
+            let token = {
+                let conn = state.db.lock().unwrap();
+                let node = wheel_core::Node::new(
+                    uuid::Uuid::new_v4(),
+                    "caller".parse().unwrap(),
+                    wheel_core::Position::default(),
+                    NodeConfig::Agent(wheel_core::AgentConfig::default()),
+                );
+                db::board::create(&conn, &node).unwrap();
+                db::tokens::mint(&conn, node.id).unwrap().plaintext
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, router(state)).await });
+            (base, token)
+        }
+
+        let client = reqwest::Client::new();
+        let mut state = test_state();
+        state.update = Some(Arc::new(Noticing));
+        let (base, token) = serve(state).await;
+
+        let ok = client
+            .get(format!("{base}/v1/cli/whoami"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let raw = ok
+            .headers()
+            .get(UPDATE_HEADER)
+            .expect("an authenticated cli answer carries the notice")
+            .to_str()
+            .unwrap();
+        assert_eq!(UpdateNotice::from_header(raw).unwrap().commits, 2);
+
+        let anonymous = client
+            .get(format!("{base}/v1/cli/whoami"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), 401);
+        assert!(
+            anonymous.headers().get(UPDATE_HEADER).is_none(),
+            "a caller with no token must learn nothing about what this deployment runs"
+        );
+
+        let (base, token) = serve(test_state()).await;
+        let off = client
+            .get(format!("{base}/v1/cli/whoami"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(off.status(), 200);
+        assert!(off.headers().get(UPDATE_HEADER).is_none(), "policy off says nothing");
+    }
+
     #[test]
     fn constant_time_eq_matches_normal_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));
@@ -699,6 +814,7 @@ mod tests {
             "/ctx/clear",
             "/usage",
             "/mcp/tools",
+            "/update",
         ] {
             assert!(
                 router.contains(&format!("\"{path}\"")),
