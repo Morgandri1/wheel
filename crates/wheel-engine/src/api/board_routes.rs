@@ -697,3 +697,100 @@ mod budget_status_tests {
         );
     }
 }
+
+/// ADVERSARY #1: `validate_config_with`'s `Ctx` size check is exercised directly by
+/// `wheel-core`'s own tests, and by `POST /v1/cli/write`'s tests in `cli_routes.rs` -- but never,
+/// until now, through the route that was the actual gap: `PATCH /v1/nodes/:id`. Belt and braces
+/// (PM's ask, not blocking #82's merge): a REAL HTTP request through the full router, so a future
+/// change that reroutes or rewires `patch_node` without going through `board::update` would fail
+/// here even if `validate_config_with`'s own unit tests still passed.
+#[cfg(test)]
+mod ctx_patch_size_limit_tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+    use wheel_core::{CtxConfig, Node, NodeConfig, Position};
+
+    use crate::db::board;
+
+    fn mk_ctx(conn: &rusqlite::Connection, name: &str, markdown: &str) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Ctx(CtxConfig {
+                markdown: markdown.to_string(),
+            }),
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    #[tokio::test]
+    async fn patching_a_ctx_node_past_the_byte_ceiling_is_refused_over_real_http() {
+        let state = crate::api::test_state();
+        let secret = state.cfg.engine_secret.clone();
+        let id = {
+            let conn = state.db.lock().unwrap();
+            mk_ctx(&conn, "notes", "small")
+        };
+        let app = crate::api::router(state);
+
+        let oversized = "x".repeat(wheel_core::MAX_VALUE_BYTES + 1);
+        let body = serde_json::json!({"config": {"markdown": oversized}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/v1/nodes/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH /v1/nodes/:id must refuse an oversized ctx, not just validate_config_with in isolation"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: wheel_core::ErrorBody = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            err.error.message.contains("too long"),
+            "the refusal must say why: {}",
+            err.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn patching_a_ctx_node_at_the_byte_ceiling_is_accepted_over_real_http() {
+        let state = crate::api::test_state();
+        let secret = state.cfg.engine_secret.clone();
+        let id = {
+            let conn = state.db.lock().unwrap();
+            mk_ctx(&conn, "notes", "small")
+        };
+        let app = crate::api::router(state);
+
+        let at_limit = "x".repeat(wheel_core::MAX_VALUE_BYTES);
+        let body = serde_json::json!({"config": {"markdown": at_limit}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/v1/nodes/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the limit is inclusive, matching wheel-core's own boundary test"
+        );
+    }
+}
