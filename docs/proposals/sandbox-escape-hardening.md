@@ -278,10 +278,73 @@ before native-in-Firecracker has actually been tried. **Recommend against mergin
 default deployment keep a namespace boundary, and is that boundary
 worth more than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
 
-Shape 1's compose hardening (§§1–2 below) is a different decision: it improves Shape 1 without
-foreclosing anything, costs little, and is worth shipping regardless of which shape ends up
-default. That is why it proceeds in this PR while the shape question stays open, per PM's explicit
-instruction not to pause it.
+Shape 1's compose hardening (§§1–2 below) is a different decision from the shape question above: it
+improves the CURRENT deployment without foreclosing anything, costs little, and shipped in this PR
+regardless. That framing needs one addition below — Morgan's ruling changes what "regardless" means.
+
+## Combining Shape 1 and Shape 3, per Morgan's ruling: try the converged fix first
+
+Morgan's instruction, exactly: adopt Shape 1 in a way that ALSO fixes the cross-project data-leak
+gap, if possible — assess whether the same hardening mechanism (once landed on) can be applied
+PER-PROJECT instead of to the one shared `wheeld` container, converging Shape 1 and Shape 3 into one
+effort rather than "harden the shared container now, isolate projects later." Try the combined fix
+first; if genuinely prohibitive, say so plainly with the real cost difference rather than defaulting
+to the easier answer.
+
+**Assessed: this converges, and it converges more cleanly than "Shape 1 now, Shape 3 later" would
+have suggested — because the two pieces of work were never actually independent.**
+
+- **The container/VM-hardening decision (which mechanism, gVisor/Kata/Firecracker/plain
+  `cap_drop`+AppArmor) and the per-project architecture change are the SAME decision, not two.**
+  Whatever mechanism the KVM check and the three spikes above land on has to be applied to SOME
+  sandbox boundary. Today that boundary is "the one shared `wheeld` container" (Shape 1 as scoped).
+  Converging with Shape 3 means the boundary is instead "each project's own sandbox" — the exact same
+  directives (`cap_drop: [ALL]`, `no-new-privileges`, AppArmor confirmation, or a stronger runtime)
+  apply verbatim, just N times instead of once. **Nothing already shipped in this PR (items 1–2) is
+  wasted by converging** — it is the validated template that gets applied per-project once `wheeld`
+  spawns per-project sandboxes, not a separate phase to redo.
+- **The per-project uid/spawn primitive (Shape 3's own cost, already assessed above as porting from
+  `wheel-host`'s `process.rs`, not inventing) and the container/VM mechanism are complementary, not
+  sequential either — and one of them may turn out to be REDUNDANT with the other, worth stating
+  plainly.** `process.rs`'s uid-drop exists specifically because Railway's `process` backend has NO
+  container boundary at all — uid is the ONLY isolation it has. If Shape 3's per-project sandboxes
+  each get a REAL container/VM boundary (Docker, gVisor, Kata, or Firecracker), that boundary is
+  already doing the separating between projects on its own, the way `wheel-host`'s existing
+  `DockerSandbox` already does today for the cloud deployment — a per-project uid becomes
+  defense-in-depth on top of an already-isolated boundary, not the load-bearing mechanism. Cheap to
+  add given the primitive already exists and is tested; not the critical path either way.
+- **The cleanest shape this convergence can take: `wheeld` stops being a distinct architecture from
+  `wheel-host` and becomes a THIN configuration of it.** `wheeld` already proxies each project over
+  its own unix socket, the exact pattern `wheel-host` uses (`crates/wheeld/src/embedded.rs`'s own doc
+  comment, cited above) — the control-plane side already converged before this ruling. What's
+  different today is only `EmbeddedSandbox` (`tokio::spawn` per project, no isolation boundary at
+  all) versus `wheel-host`'s real `Sandbox` implementations (`DockerSandbox`, `process.rs`, and
+  whichever `FirecrackerSandbox` the spikes above justify). Converging Shape 1 into Shape 3 means
+  retiring `EmbeddedSandbox` in favor of `wheeld` driving ONE OF THOSE SAME `Sandbox` implementations
+  — reusing `wheel-host`'s own crate rather than building a parallel one. This is a real, larger
+  architecture change (retiring a sandbox backend, not tuning a compose file), but it is not new
+  invention: every piece (the trait, the uid-drop primitive, the Docker backend, and — per the spikes
+  above — potentially a Firecracker backend) already exists or is already scoped.
+
+**Where this leaves the shape/mechanism decisions above, restated with the convergence folded in
+rather than treated as a later phase:**
+
+1. The KVM check and the three spikes (resume latency at the correct parking granularity, storage
+   mechanism, per-project networking cost at scale) are now gating the CONVERGED effort directly, not
+   a separate "Shape 3, eventually" track — their results decide what `wheeld`'s per-project sandbox
+   actually looks like, which is the same question as "what does Shape 1's hardening apply to."
+2. Items 1–2 (this PR, already shipped) remain correct and worth keeping merged as-is: they harden
+   the CURRENT single-container deployment while the convergence work above is scoped and built, and
+   the same directives carry forward into the per-project template once `EmbeddedSandbox` is retired
+   — nothing here is thrown away by converging, restated because it is the part most likely to be
+   misread as wasted effort if the convergence proceeds.
+3. **Honest sizing, since "genuinely prohibitive" was the bar Morgan set for saying no:** this is NOT
+   prohibitive — every primitive it needs already exists in this codebase (the `Sandbox` trait, the
+   uid-drop code, at least one working backend) — but it is a real architecture change to `wheeld`
+   (retiring `EmbeddedSandbox`), not a config change, and it should be scoped and sequenced as its own
+   piece of work once the mechanism spikes land, not squeezed into this PR's remaining scope. The
+   convergence is the target; this PR is the first, already-shipped step toward it, not a competing
+   "harden the shared container instead" path that needs to be walked back.
 
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
@@ -656,7 +719,18 @@ whether Shape 2 becomes the default.
 
 ## Summary — what's asked of whoever reads this next
 
-- **The shape question, first, and it now has three answers instead of two**: Shape 1 (`wheeld` in
+- **Morgan's ruling, first, since it reframes everything below: converge Shape 1 into Shape 3 rather
+  than sequence them.** Assessed and NOT genuinely prohibitive — every primitive the converged effort
+  needs already exists in this codebase (`wheel-host`'s `Sandbox` trait, its uid-drop primitive, its
+  Docker backend). The container/VM-hardening mechanism decided by the KVM check + three spikes below
+  and the per-project architecture change are the same decision, not two phases: whatever mechanism
+  wins gets applied per-project instead of to the one shared container, and items 1–2 (already
+  shipped) are the validated template for that, not wasted work. The real, honestly-stated cost: this
+  is a genuine architecture change to `wheeld` (retiring `EmbeddedSandbox` for one of `wheel-host`'s
+  real `Sandbox` implementations), not a config change — sized as its own piece of work once the
+  mechanism spikes land, not squeezed into this PR. See § "Combining Shape 1 and Shape 3" above for
+  the full assessment.
+- **The shape question, and it now has three answers instead of two**: Shape 1 (`wheeld` in
   Docker, live today), Shape 2 (`wheeld` native via systemd, PR #67, proposed as the new default),
   or Shape 3 (`wheeld` as a per-project sandbox supervisor, converging on `wheel-host`'s existing
   `process` backend — hypothetical, unbuilt). Shapes 1 and 2 both leave project-to-project reach
@@ -668,8 +742,10 @@ whether Shape 2 becomes the default.
   namespace question specifically** — see the dedicated section above. Recommend Morgan decide this
   explicitly before either #67 merges or Shape 3 work starts, rather than have it settled by
   whichever ships first.
-- Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83), proceeding regardless
-  of the shape decision per PM's instruction not to pause them. **Needs a `rehearse.sh` run with
+- Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
+  instruction not to pause them — reframed by the ruling above as the validated per-project template
+  for the converged effort, not a separate track that could later turn out to have been wasted work.
+  **Needs a `rehearse.sh` run with
   docker access** before merge — not yet done, called out explicitly above rather than assumed —
   **including a headless-Chromium launch under `cap_drop: [ALL]`** (ADVERSARY: browser automation is
   a real, anticipated agent workload per #67's own `RestrictNamespaces=` exception for exactly this),
