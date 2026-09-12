@@ -621,3 +621,79 @@ mod wire_warning_tests {
         );
     }
 }
+
+/// Web's follow-up to wow-agent-brief.md #6: the same budget-proximity
+/// numbers `GET /v1/cli/usage` gives an agent about itself, also reachable
+/// from `GET /v1/board` for the inspector, without a second per-agent fetch.
+#[cfg(test)]
+mod budget_status_tests {
+    use super::*;
+    use wheel_core::{AgentConfig, Budget, NodeConfig, Position};
+
+    fn mk(conn: &rusqlite::Connection, name: &str, config: NodeConfig) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_a_budget_carries_its_proximity_on_the_board() {
+        let state = crate::api::test_state();
+        let agent = {
+            let conn = state.db.lock().unwrap();
+            let id = mk(
+                &conn,
+                "agent",
+                NodeConfig::Agent(AgentConfig {
+                    budget: Some(Budget {
+                        max_turns: Some(10),
+                        max_usd: None,
+                    }),
+                    ..Default::default()
+                }),
+            );
+            board::add_spend(&conn, id, 3, 0.0).unwrap();
+            id
+        };
+
+        let resp = get_board(State(state)).await.unwrap().0;
+        let node = resp["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == agent.to_string())
+            .unwrap();
+        assert_eq!(node["state"]["budget_status"]["max_turns"], 10);
+        assert_eq!(node["state"]["budget_status"]["pct_of_max_turns"], 30.0);
+        assert!(
+            node["state"]["budget_status"].get("max_usd").is_none(),
+            "an unconfigured ceiling must not appear: {node}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_budget_carries_no_budget_status_at_all() {
+        let state = crate::api::test_state();
+        let agent = {
+            let conn = state.db.lock().unwrap();
+            mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()))
+        };
+
+        let resp = get_board(State(state)).await.unwrap().0;
+        let node = resp["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == agent.to_string())
+            .unwrap();
+        assert!(
+            node["state"].get("budget_status").is_none(),
+            "no budget configured means no budget_status key at all: {node}"
+        );
+    }
+}

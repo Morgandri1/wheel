@@ -797,36 +797,27 @@ pub async fn usage(
         return Err(ApiError::invalid("only an agent has usage to report"));
     }
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    let spend = board::agent_state(&conn, me.node.id)
-        .unwrap_or_default()
-        .spend
-        .unwrap_or_default();
+    // `board::agent_state` computes `budget_status` from the same
+    // `BudgetStatus::compute` this route used to duplicate inline, so this
+    // and `GET /v1/board` can never disagree about what "80% of budget"
+    // means. Budget is optional config (§3); an agent with none configured
+    // gets its raw spend back and nothing to divide by, which is not an
+    // error.
+    let state = board::agent_state(&conn, me.node.id).unwrap_or_default();
+    let spend = state.spend.unwrap_or_default();
 
     let mut out = serde_json::json!({ "turns": spend.turns, "usd": spend.usd });
-    // Budget is optional config (§3); an agent with none configured gets its
-    // raw spend back and nothing to divide by, which is not an error.
-    if let Some(budget) = me.node.config.as_agent().and_then(|a| a.budget) {
+    if let Some(budget) = state.budget_status {
         if let Some(max) = budget.max_turns {
             out["max_turns"] = serde_json::json!(max);
-            out["pct_of_max_turns"] = serde_json::json!(pct(spend.turns as f64, max as f64));
+            out["pct_of_max_turns"] = serde_json::json!(budget.pct_of_max_turns);
         }
         if let Some(max) = budget.max_usd {
             out["max_usd"] = serde_json::json!(max);
-            out["pct_of_max_usd"] = serde_json::json!(pct(spend.usd, max));
+            out["pct_of_max_usd"] = serde_json::json!(budget.pct_of_max_usd);
         }
     }
     Ok(Json(out))
-}
-
-/// A ceiling of zero would divide by zero; treated as "already at the limit"
-/// rather than NaN or infinity reaching the caller as JSON (which `serde_json`
-/// cannot even represent — it would silently become `null`).
-fn pct(spend: f64, max: f64) -> f64 {
-    if max <= 0.0 {
-        100.0
-    } else {
-        ((spend / max) * 100.0 * 10.0).round() / 10.0
-    }
 }
 
 #[cfg(test)]
@@ -1124,7 +1115,14 @@ mod usage_tests {
     /// divide-by-zero `NaN` that `serde_json` would silently turn into `null`.
     #[test]
     fn a_zero_ceiling_reports_100_percent_rather_than_dividing_by_zero() {
-        assert_eq!(pct(5.0, 0.0), 100.0);
-        assert_eq!(pct(0.0, 0.0), 100.0);
+        let status = wheel_core::BudgetStatus::compute(
+            wheel_core::Spend { turns: 5, usd: 0.0 },
+            Some(wheel_core::Budget {
+                max_turns: Some(0),
+                max_usd: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(status.pct_of_max_turns, Some(100.0));
     }
 }
