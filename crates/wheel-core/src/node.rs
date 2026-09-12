@@ -200,6 +200,11 @@ pub struct AgentConfig {
     /// The child's cwd is the first one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<Workspace>,
+    /// A vault this agent already has a `read` wire to, whose credential it
+    /// runs on while its own credential's usage window is closed. Refused at
+    /// config time if the wire is missing, and re-checked at every spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_vault: Option<Uuid>,
 }
 
 /// One working copy for an agent, materialised by the engine.

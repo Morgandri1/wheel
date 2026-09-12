@@ -23,6 +23,13 @@ use crate::{name::NodeName, node::NodeType, timestamp::Timestamp};
 /// (§3c#6).
 pub const MAX_MESSAGE_BODY: usize = 256 * 1024;
 
+/// How long `wheel msg --await-reply` / MCP `ask` waits when no time is given.
+pub const DEFAULT_AWAIT_SECS: u64 = 600;
+
+/// The longest any wait for a reply may be. A request for longer is clamped:
+/// an unbounded wait is how two agents asking each other hang for ever.
+pub const MAX_AWAIT_SECS: u64 = 3600;
+
 /// Who sent a message. The `type` rendered into the envelope comes from here
 /// and is **engine-generated** — a body can never forge it (§3c#5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

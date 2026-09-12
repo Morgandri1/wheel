@@ -33,7 +33,11 @@ wheel — talk to your Wheel board
   wheel query <table> \"<SELECT ...>\"  read-only SQL, scoped to that one table
   wheel tool ls   <tool>            operations I can call, and the fields to fill
   wheel tool call <tool> <op> '<json>' [--curl]   invoke one; --curl prints it instead
-  wheel msg   <agent> <text>|--file <path>|--stdin
+  wheel msg   <agent> [--await-reply[=SECS]] [--notify] <text>|--file <path>|--stdin
+                                    --await-reply prints the answer: the final text of
+                                    the turn that handled it. --notify sends me one
+                                    system message when that turn ends.
+  wheel sent  <message-id> [--wait[=SECS]]  how a message I sent ended, and its answer
   wheel inbox [<message-id>]        re-read what I was sent
   wheel ctx clear                   discard my context and start a fresh session
   wheel usage                       my own turn/spend total, and proximity to my budget
@@ -127,12 +131,30 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
 
         "msg" => {
             let to = rest.first().ok_or_else(|| usage("msg needs <agent>"))?;
-            let body = read_value(&rest[1..])?;
-            show(
-                engine.post("/v1/cli/msg", serde_json::json!({ "to": to, "body": body }))?,
-                json_out,
-                render_receipt,
-            )
+            let (opts, source) = msg_options(&rest[1..])?;
+            let body = read_value(&source)?;
+            let mut req = serde_json::json!({ "to": to, "body": body });
+            if opts.notify {
+                req["notify"] = true.into();
+            }
+            match opts.await_secs {
+                None => show(engine.post("/v1/cli/msg", req)?, json_out, render_receipt),
+                Some(secs) => {
+                    req["await_secs"] = secs.into();
+                    awaited(engine.post("/v1/cli/msg", req)?, json_out)
+                }
+            }
+        }
+
+        "sent" => {
+            let id = rest
+                .first()
+                .ok_or_else(|| usage("sent needs <message-id>"))?;
+            let mut path = format!("/v1/cli/sent?id={}", urlencode(id));
+            if let Some(secs) = wait_option(&rest[1..])? {
+                path.push_str(&format!("&wait={secs}"));
+            }
+            awaited(engine.get(&path)?, json_out)
         }
 
         "secret" => {
@@ -349,6 +371,116 @@ fn read_value(rest: &[String]) -> Result<String> {
             Ok(joined)
         }
         None => Err(usage("expected a value, or --file <path> / --stdin")),
+    }
+}
+
+/// `wheel msg` options.
+#[derive(Debug, Default, PartialEq)]
+struct MsgOptions {
+    await_secs: Option<u64>,
+    notify: bool,
+}
+
+/// Split `wheel msg` options from the body source.
+///
+/// Options are read only BEFORE the body, or after a `--file <path>` /
+/// `--stdin` source. An argv body is taken whole, so a literal `--notify` in
+/// the middle of a sentence is text, not a flag.
+fn msg_options(args: &[String]) -> Result<(MsgOptions, Vec<String>)> {
+    let mut opts = MsgOptions::default();
+    let mut i = 0;
+    while i < args.len() && msg_flag(&args[i], &mut opts)? {
+        i += 1;
+    }
+    let rest = &args[i..];
+    let source_len = match rest.first().map(String::as_str) {
+        Some("--file") => rest.len().min(2),
+        Some("--stdin") => 1,
+        _ => return Ok((opts, rest.to_vec())),
+    };
+    for arg in &rest[source_len..] {
+        msg_flag(arg, &mut opts)?;
+    }
+    Ok((opts, rest[..source_len].to_vec()))
+}
+
+fn msg_flag(arg: &str, opts: &mut MsgOptions) -> Result<bool> {
+    if arg == "--notify" {
+        opts.notify = true;
+        return Ok(true);
+    }
+    Ok(match wait_flag(arg, "--await-reply")? {
+        Some(secs) => {
+            opts.await_secs = Some(secs);
+            true
+        }
+        None => false,
+    })
+}
+
+/// `--<name>` is the default wait, `--<name>=SECS` a given one.
+fn wait_flag(arg: &str, name: &str) -> Result<Option<u64>> {
+    if arg == name {
+        return Ok(Some(wheel_core::DEFAULT_AWAIT_SECS));
+    }
+    let Some(secs) = arg.strip_prefix(name).and_then(|r| r.strip_prefix('=')) else {
+        return Ok(None);
+    };
+    secs.parse()
+        .map(Some)
+        .map_err(|_| usage(&format!("{name} takes a number of seconds, not {secs:?}")))
+}
+
+fn wait_option(args: &[String]) -> Result<Option<u64>> {
+    match args {
+        [] => Ok(None),
+        [one] => wait_flag(one, "--wait")?
+            .map(Some)
+            .ok_or_else(|| usage(&format!("unexpected argument {one:?}"))),
+        _ => Err(usage("sent takes a message id and at most --wait[=SECS]")),
+    }
+}
+
+/// Exit status for an awaited message: 0 consumed, 5 the turn failed or it
+/// could not be delivered, 6 not finished yet (the wait ran out, or it is
+/// still pending). Error replies keep the ordinary mapping.
+fn awaited(r: Reply, json_out: bool) -> Result<u8> {
+    if r.status >= 300 {
+        return show(r, json_out, render_ok);
+    }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&r.body)?);
+    } else {
+        render_awaited(&r.body);
+    }
+    Ok(match r.body["outcome"].as_str().unwrap_or_default() {
+        "consumed" => 0,
+        "error" | "undeliverable" => 5,
+        "timeout" | "pending" => 6,
+        _ => 2,
+    })
+}
+
+/// The answer goes to stdout raw, so `$(wheel msg b --await-reply …)` IS the
+/// answer. Anything else is said on stderr.
+fn render_awaited(v: &serde_json::Value) {
+    let id = v["id"].as_str().unwrap_or("?");
+    match v["outcome"].as_str().unwrap_or("?") {
+        "consumed" => {
+            let answer = v["result"].as_str().unwrap_or("");
+            print!("{answer}");
+            if !answer.ends_with('\n') {
+                println!();
+            }
+        }
+        "timeout" | "pending" => eprintln!(
+            "wheel: message {id} is still {}; `wheel sent {id} --wait` collects the answer",
+            v["state"].as_str().unwrap_or("on its way")
+        ),
+        other => eprintln!(
+            "wheel: message {id} {other}: {}",
+            v["error"].as_str().unwrap_or("no detail")
+        ),
     }
 }
 
@@ -671,7 +803,8 @@ mod tests {
             serde_json::json!({"wires": [{"to": {}}]}),
         ];
         type Renderer = fn(&serde_json::Value);
-        let renderers: [(&str, Renderer); 13] = [
+        let renderers: [(&str, Renderer); 14] = [
+            ("awaited", render_awaited),
             ("whoami", render_whoami),
             ("connections", render_connections),
             ("list", render_list),
@@ -742,6 +875,7 @@ mod tests {
     fn every_renderer_survives_a_payload_it_did_not_expect() {
         type Renderer = fn(&serde_json::Value);
         let renderers: Vec<(&str, Renderer)> = vec![
+            ("awaited", render_awaited),
             ("whoami", render_whoami),
             ("connections", render_connections),
             ("list", render_list),
@@ -948,6 +1082,146 @@ mod tests {
                 "{bad:?} must not report success"
             );
         }
+
+        std::env::remove_var(wheel_core::spawn::ENV_ENGINE_URL);
+        std::env::remove_var(wheel_core::spawn::ENV_TOKEN_FILE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn opts(await_secs: Option<u64>, notify: bool) -> MsgOptions {
+        MsgOptions { await_secs, notify }
+    }
+
+    #[test]
+    fn msg_options_come_before_the_body_or_after_its_source() {
+        let (o, body) = msg_options(&s(&["--await-reply", "hello", "there"])).unwrap();
+        assert_eq!(o, opts(Some(wheel_core::DEFAULT_AWAIT_SECS), false));
+        assert_eq!(body, s(&["hello", "there"]));
+
+        let (o, body) = msg_options(&s(&["--notify", "--await-reply=30", "hi"])).unwrap();
+        assert_eq!(o, opts(Some(30), true));
+        assert_eq!(body, s(&["hi"]));
+
+        let (o, body) = msg_options(&s(&["--file", "b.md", "--notify"])).unwrap();
+        assert_eq!(o, opts(None, true));
+        assert_eq!(body, s(&["--file", "b.md"]));
+
+        let (o, body) = msg_options(&s(&["--stdin", "--await-reply=5"])).unwrap();
+        assert_eq!(o, opts(Some(5), false));
+        assert_eq!(body, s(&["--stdin"]));
+    }
+
+    /// A body is the sender's text. A word in it that happens to look like a
+    /// flag must reach the recipient, not reconfigure the send.
+    #[test]
+    fn a_flag_inside_an_argv_body_is_body_text() {
+        let (o, body) = msg_options(&s(&["please", "--notify", "me"])).unwrap();
+        assert_eq!(o, MsgOptions::default());
+        assert_eq!(read_value(&body).unwrap(), "please --notify me");
+    }
+
+    #[test]
+    fn a_wait_that_is_not_a_number_is_a_usage_error() {
+        assert!(msg_options(&s(&["--await-reply=soon", "x"])).is_err());
+        assert!(wait_option(&s(&["--wait=later"])).is_err());
+        assert!(wait_option(&s(&["extra"])).is_err());
+        assert_eq!(
+            wait_option(&s(&["--wait"])).unwrap(),
+            Some(wheel_core::DEFAULT_AWAIT_SECS)
+        );
+        assert_eq!(wait_option(&[]).unwrap(), None);
+    }
+
+    /// The exit codes a script branches on (PROTOCOL.md §5): the answer, a
+    /// failed turn, or not finished yet — and an engine refusal keeps its own.
+    #[test]
+    fn an_awaited_outcome_maps_to_its_exit_status() {
+        let ok = |outcome: &str| {
+            reply(
+                200,
+                serde_json::json!({"id": "m", "outcome": outcome, "state": "queued", "result": "r"}),
+            )
+        };
+        assert_eq!(awaited(ok("consumed"), true).unwrap(), 0);
+        assert_eq!(awaited(ok("error"), true).unwrap(), 5);
+        assert_eq!(awaited(ok("undeliverable"), true).unwrap(), 5);
+        assert_eq!(awaited(ok("timeout"), true).unwrap(), 6);
+        assert_eq!(awaited(ok("pending"), true).unwrap(), 6);
+        assert_eq!(awaited(ok("something new"), true).unwrap(), 2);
+        assert_eq!(awaited(err_reply(403, "wire_denied"), true).unwrap(), 3);
+        assert_eq!(awaited(err_reply(409, "await_cycle"), true).unwrap(), 2);
+    }
+
+    /// The await verbs reach the routes that implement them, carrying the
+    /// flags in the body rather than dropping them.
+    #[test]
+    fn await_commands_address_their_routes_with_their_flags() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("wheel-await-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("engine.sock");
+        let token = dir.join("token");
+        let body_file = dir.join("body.md");
+        std::fs::write(&token, "t").unwrap();
+        std::fs::write(&body_file, "from a file").unwrap();
+        let _ = std::fs::remove_file(&sock);
+
+        let cases: Vec<Vec<String>> = vec![
+            s(&["msg", "peer", "--await-reply=30", "hello"]),
+            s(&[
+                "msg",
+                "peer",
+                "--notify",
+                "--file",
+                body_file.to_str().unwrap(),
+            ]),
+            s(&["sent", "abc", "--wait=5"]),
+        ];
+        let listener = UnixListener::bind(&sock).unwrap();
+        let n = cases.len();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\n\r\n{\"id\":\"m\",\"outcome\":\"consumed\",\"result\":\"x\"}",
+                );
+                let _ = stream.flush();
+            }
+            seen
+        });
+        std::env::set_var(
+            wheel_core::spawn::ENV_ENGINE_URL,
+            format!("unix://{}", sock.display()),
+        );
+        std::env::set_var(wheel_core::spawn::ENV_TOKEN_FILE, &token);
+        std::env::remove_var(wheel_core::spawn::ENV_TOKEN);
+
+        for argv in &cases {
+            assert_eq!(run(argv, true).unwrap(), 0, "{argv:?}");
+        }
+        let seen = server.join().unwrap();
+        let body = |raw: &str| -> serde_json::Value {
+            serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or("null")).unwrap()
+        };
+        assert!(seen[0].starts_with("POST /v1/cli/msg HTTP/1.1"));
+        assert_eq!(body(&seen[0])["await_secs"], 30);
+        assert_eq!(body(&seen[0])["body"], "hello");
+        assert!(body(&seen[0]).get("notify").is_none());
+        assert_eq!(body(&seen[1])["notify"], true);
+        assert_eq!(body(&seen[1])["body"], "from a file");
+        assert!(body(&seen[1]).get("await_secs").is_none());
+        assert!(
+            seen[2].starts_with("GET /v1/cli/sent?id=abc&wait=5 HTTP/1.1"),
+            "{}",
+            seen[2]
+        );
 
         std::env::remove_var(wheel_core::spawn::ENV_ENGINE_URL);
         std::env::remove_var(wheel_core::spawn::ENV_TOKEN_FILE);

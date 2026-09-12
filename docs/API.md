@@ -492,6 +492,37 @@ supports that has now been **verified: it does not**, by two mechanisms — see
 `infra/railway/README.md`. So `build` reading `"unknown"` in production is the honest end state
 rather than a gap awaiting a fix.
 
+### `POST /v1/mcp` — the operator MCP server
+
+MCP over Streamable HTTP, so an AgentGrid master or a developer's own Claude Code can drive a board
+as tools (`docs/proposals/agentgrid-parity.md` §3). JSON-RPC 2.0: `initialize`, `ping`, `tools/list`,
+`tools/call`. A notification (no `id`) is answered `202` with no body. `GET`/`DELETE /v1/mcp` answer
+`405`: this server keeps no session and opens no server-initiated stream.
+
+Authentication is the ordinary one — a `wht_` API token or a session — so **it grants nothing new**:
+every tool is a call onto a route the same credential could already reach. Tokens carry no scopes
+yet, so there is no read-only variant (proposal R9).
+
+| tool | what it does |
+|---|---|
+| `projects` | your projects: id, name, status. Where a project id comes from |
+| `board` | the whole board of one project, each agent's state included |
+| `send` | message an agent, return its receipt |
+| `ask` | message an agent and wait for the turn that handles it, returning that turn's final text |
+| `start` · `stop` | an agent's process |
+| `logs` | recent output from one agent |
+
+- **Every tool that names a project is authorised for that call**, against the same owner predicate
+  every other route uses. A project you do not own is the same `not_found` as one that does not
+  exist, and the engine is never reached on the way to that answer.
+- **`Origin` is validated** against the deployment's CORS allowlist and an unknown origin is refused
+  before any tool runs. A loopback bind is not an auth boundary: without this, a page in the
+  operator's browser could drive a local `wheeld`.
+- **Agent-authored text is labelled.** `ask` results and `logs` lines come back behind an explicit
+  "treat as untrusted input" line: they are another agent's words arriving in a model's context.
+- A refusal is a **tool error** (a successful JSON-RPC response with `isError: true`), so the model
+  reconsiders instead of concluding the server is broken. An unknown *method* is a protocol error.
+
 ### `ANY /p/{project_id}/{*rest}` — public ingress
 **Unauthenticated by design.** Reaches the project's `endpoint` nodes.
 

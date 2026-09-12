@@ -35,6 +35,10 @@ pub enum AgentStatus {
     /// Stopped because the agent's `budget` was reached. Requires operator
     /// action; the engine will not restart it on its own.
     BudgetExhausted,
+    /// The harness reported its usage window closed. The in-flight message was
+    /// requeued, the process stopped with its session kept, and the engine
+    /// resumes delivery on its own at `resume_at`. Waiting, not failing.
+    RateLimited,
     /// Child exited unexpectedly or the harness reported a fatal error;
     /// `last_error` carries the detail.
     Error,
@@ -50,6 +54,7 @@ impl AgentStatus {
             AgentStatus::Idle => "idle",
             AgentStatus::Parked => "parked",
             AgentStatus::BudgetExhausted => "budget_exhausted",
+            AgentStatus::RateLimited => "rate_limited",
             AgentStatus::Error => "error",
         }
     }
@@ -97,8 +102,41 @@ pub struct AgentState {
     /// one. `None` means no budget is set at all -- distinct from a `Some`
     /// with both percentages absent, so a reader does not have to inspect
     /// the struct's insides to tell "no budget" from "nothing computed".
+    ///
+    /// The ceiling the BOARD sets. `quota` below is the one the ACCOUNT sets,
+    /// and an agent can be well inside one and stopped by the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_status: Option<BudgetStatus>,
+    /// While `rate_limited`: when the harness said the window resets. `None`
+    /// means it did not say, and `resume_at` is a backoff instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<Timestamp>,
+    /// While `rate_limited`: when the engine will resume delivery by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<Timestamp>,
+    /// The last usage window the harness reported, whatever its status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaWindow>,
+    /// Spawns use the agent's `fallback_vault` credential until this moment,
+    /// because the primary credential's window is closed until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_until: Option<Timestamp>,
+}
+
+/// A usage window as the harness reported it (`rate_limit_event`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct QuotaWindow {
+    /// `allowed`, `allowed_warning`, `rejected`, or whatever the harness sent.
+    pub status: String,
+    /// Which window, e.g. `five_hour` or `seven_day`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// 0.0-1.0 of the window consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<Timestamp>,
+    pub observed_at: Timestamp,
 }
 
 /// Accumulated cost for an agent's current lifetime.
@@ -349,6 +387,7 @@ mod tests {
             (AgentStatus::Idle, "idle"),
             (AgentStatus::Parked, "parked"),
             (AgentStatus::BudgetExhausted, "budget_exhausted"),
+            (AgentStatus::RateLimited, "rate_limited"),
             (AgentStatus::Error, "error"),
         ] {
             assert_eq!(s.as_str(), want);
@@ -379,6 +418,7 @@ mod tests {
             AgentStatus::NeedsAuth,
             AgentStatus::Parked,
             AgentStatus::BudgetExhausted,
+            AgentStatus::RateLimited,
             AgentStatus::Error,
         ] {
             assert!(!dead.is_live(), "{dead} has no child process");

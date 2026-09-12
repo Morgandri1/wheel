@@ -132,5 +132,6 @@ const BLOCKED_BY_AGENT: Partial<Record<AgentStatus, string>> = {
   needs_auth: "Held safely until this agent has credentials — nothing is lost.",
   stopped: "Held until the agent is started.",
   budget_exhausted: "Held until this agent's budget is raised or reset.",
+  rate_limited: "Held until the account's usage window reopens; the agent resumes by itself.",
   error: "Held until the agent recovers or is restarted.",
 };

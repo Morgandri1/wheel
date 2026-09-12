@@ -121,8 +121,10 @@ impl StartupTail {
     }
 }
 
+pub mod awaits;
 pub mod git_creds;
 mod prompt;
+mod quota;
 mod refresh;
 pub mod workspace;
 pub use prompt::compose_prompt;
@@ -153,6 +155,11 @@ struct Running {
     /// The vault login this child was started on, if it runs on one. A renewal
     /// since then means it holds a token on its way out.
     credential_gen: Option<refresh::CredentialGen>,
+    /// A `rejected` rate-limit event seen during the current turn, already
+    /// matched to this session. Taken when the turn's `result` arrives.
+    limit_seen: Option<quota::LimitSignal>,
+    /// This spawn runs on the agent's `fallback_vault` credential.
+    on_fallback: bool,
 }
 
 /// How long an agent gets to exit on SIGTERM when the engine shuts down, before SIGKILL.
@@ -321,6 +328,10 @@ pub struct Supervisor {
     /// `stopped`, and the renewal then spawns a child anyway: the operator's
     /// stop returns success and the agent keeps running.
     stops: Mutex<HashMap<Uuid, u64>>,
+    /// Who is blocked awaiting a reply from whom (parity proposal §2.5).
+    awaits: Arc<Mutex<awaits::AwaitGraph>>,
+    /// Spread, in seconds, over which agents return after a window reset.
+    limit_jitter: std::ops::RangeInclusive<u64>,
 }
 
 impl Supervisor {
@@ -373,6 +384,8 @@ impl Supervisor {
             shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
             broker: refresh::Broker::default(),
             stops: Mutex::new(HashMap::new()),
+            awaits: Arc::default(),
+            limit_jitter: quota::JITTER_SECS,
         }
     }
 
@@ -384,6 +397,13 @@ impl Supervisor {
 
     fn note_stop(&self, agent: Uuid) {
         *self.stops.lock().unwrap().entry(agent).or_insert(0) += 1;
+    }
+
+    /// Tests resume at the reset itself rather than up to a minute after it.
+    #[cfg(test)]
+    fn with_limit_jitter(mut self, jitter: std::ops::RangeInclusive<u64>) -> Self {
+        self.limit_jitter = jitter;
+        self
     }
 
     fn startup_deadline(&self) -> std::time::Duration {
@@ -621,7 +641,7 @@ impl Supervisor {
             }
         }
 
-        let (node, resume) = {
+        let (node, resume, fallback_until) = {
             let conn = self.db.lock().unwrap();
             let node =
                 board::get(&conn, agent)?.ok_or_else(|| anyhow::anyhow!("no such node {agent}"))?;
@@ -632,7 +652,7 @@ impl Supervisor {
             );
             // Idle parking keeps the session id so a resume is transparent.
             let state = board::agent_state(&conn, agent).unwrap_or_default();
-            (node, state.session_id)
+            (node, state.session_id, state.fallback_until)
         };
 
         let agent_cfg = node
@@ -852,6 +872,7 @@ impl Supervisor {
         };
 
         self.set_status(agent, AgentStatus::Starting, None);
+        let (fallback, use_fallback) = self.credential_plan(agent, &agent_cfg, fallback_until);
 
         let mut cmd = child_command(self.harness.program());
         cmd.args(self.harness.argv(&spec))
@@ -935,8 +956,14 @@ impl Supervisor {
         // Stored credentials, if any. Absent is not an error: the harness may
         // hold OAuth credentials in its own config dir, and the authoritative
         // answer is its probe rather than our guess.
-        for (k, v) in crate::auth::credential_env(&spec.config_dir, agent_cfg.harness) {
-            cmd.env(k, v);
+        //
+        // Not on a fallback spawn: that runs as the fallback vault's account
+        // and nothing else, so a token the agent planted in its own config dir
+        // cannot ride along into it (credential-distribution rule).
+        if !use_fallback {
+            for (k, v) in crate::auth::credential_env(&spec.config_dir, agent_cfg.harness) {
+                cmd.env(k, v);
+            }
         }
 
         // Wired vaults, last, so a vault-supplied credential wins over a
@@ -950,7 +977,13 @@ impl Supervisor {
         let vault_env = match &self.vault_key {
             Some(vk) => {
                 let conn = self.db.lock().unwrap();
-                crate::vault::env_for_agent(&conn, vk, agent)?
+                crate::vault::env_for_spawn(
+                    &conn,
+                    vk,
+                    agent,
+                    fallback.as_ref().map(|(id, _)| *id),
+                    use_fallback,
+                )?
             }
             None => Vec::new(),
         };
@@ -977,6 +1010,8 @@ impl Supervisor {
             counted_turns: 0,
             counted_usd: 0.0,
             credential_gen,
+            limit_seen: None,
+            on_fallback: use_fallback,
         });
         drop(guard);
 
@@ -1503,7 +1538,7 @@ impl Supervisor {
     /// The ONLY path that writes to a child's stdin. Strictly one message per
     /// turn: while `in_flight` is set nothing further is written, so the
     /// operator's chat and inbound agent traffic can never interleave.
-    pub async fn pump_queue(&self, agent: Uuid) -> Result<()> {
+    pub async fn pump_queue(self: &Arc<Self>, agent: Uuid) -> Result<()> {
         let slot = self.slot(agent).await;
         let mut guard = slot.lock().await;
         let Some(running) = guard.as_mut() else {
@@ -1545,8 +1580,17 @@ impl Supervisor {
                     agent = %agent,
                     "quarantined a message whose body panicked the encoder"
                 );
-                let conn = self.db.lock().unwrap();
-                messages::quarantine(&conn, msg.id, reason).ok();
+                let notify_to = {
+                    let conn = self.db.lock().unwrap();
+                    messages::quarantine(&conn, msg.id, reason).ok();
+                    // A waiting sender learns of it now, not at its timeout.
+                    publish_message(&self.events, &conn, msg.id);
+                    notify_sender(&conn, &self.events, msg.id)
+                };
+                drop(guard);
+                if let Some(sender) = notify_to {
+                    self.deliver_soon(sender);
+                }
                 return Ok(());
             }
         };
@@ -1675,6 +1719,9 @@ impl Supervisor {
                             continue;
                         }
                         let finished = g.as_mut().and_then(|r| r.in_flight.take());
+                        // A limit belongs to the turn it arrived in, never a later one.
+                        let limit_seen = g.as_mut().and_then(|r| r.limit_seen.take());
+                        let on_fallback = g.as_ref().is_some_and(|r| r.on_fallback);
                         // Deltas, not totals: see `Running::counted_turns`.
                         let spend = g.as_mut().map(|r| {
                             let (dt, du) =
@@ -1696,6 +1743,73 @@ impl Supervisor {
                             None
                         };
 
+                        // A harness error is not automatically the MESSAGE's
+                        // fault. "Not logged in" arrives as a perfectly normal
+                        // `result` with is_error, and consuming the message on
+                        // that basis loses the operator's work to a setup
+                        // problem they are about to fix. Environmental
+                        // failures -- no credentials, a closed usage window --
+                        // requeue; genuine task errors are consumed, because
+                        // poison must not loop.
+                        let needs_auth = is_error
+                            && matches!(
+                                harness.classify_startup_failure(
+                                    None,
+                                    text.as_deref().unwrap_or_default()
+                                ),
+                                StartupFailure::NeedsAuth
+                            );
+                        let end = quota::classify_turn_end(
+                            is_error,
+                            text.as_deref(),
+                            limit_seen.as_ref(),
+                            needs_auth,
+                        );
+
+                        if let quota::TurnEnd::Limited(signal) = &end {
+                            self.on_limit(
+                                agent,
+                                finished,
+                                signal.clone(),
+                                on_fallback,
+                                over_budget,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        // Settled BEFORE the budget check. A turn that ran is
+                        // consumed whether or not it was the last one the
+                        // budget allows; stopping first stranded it delivered.
+                        let notify_to = {
+                            // Scoped so the sqlite guard cannot be held across
+                            // the awaits below: a rusqlite Connection is not
+                            // Send, and holding its guard would make this task
+                            // unspawnable.
+                            let conn = db.lock().unwrap();
+                            let notify_to = finished.and_then(|mid| {
+                                settle_turn(&conn, &bus, mid, &end, text.as_deref())
+                            });
+                            if over_budget.is_none() {
+                                let (status, detail) = match &end {
+                                    quota::TurnEnd::NeedsAuth => (
+                                        AgentStatus::NeedsAuth,
+                                        Some("the harness has no usable credentials".to_string()),
+                                    ),
+                                    quota::TurnEnd::TaskError => {
+                                        (AgentStatus::Error, Some(text.clone().unwrap_or_default()))
+                                    }
+                                    _ => (AgentStatus::Idle, None),
+                                };
+                                set_status_db(&conn, agent, status, detail);
+                                publish_state(&bus, &conn, agent);
+                            }
+                            notify_to
+                        };
+                        if let Some(sender) = notify_to {
+                            let _ = self.deliver(sender).await;
+                        }
+
                         // §3e: the ceiling is enforced here because here is
                         // where the total changes. Stop first — `stop` writes
                         // `stopped` unconditionally — then record WHY, which
@@ -1708,64 +1822,7 @@ impl Supervisor {
                             continue;
                         }
 
-                        // Scoped so the sqlite guard cannot be held across the
-                        // await below: a rusqlite Connection is not Send, and
-                        // holding its guard would make this task unspawnable.
-                        // A harness error is not automatically the MESSAGE's
-                        // fault. "Not logged in" arrives as a perfectly normal
-                        // `result` with is_error, and consuming the message on
-                        // that basis loses the operator's work to a setup
-                        // problem they are about to fix. Environmental
-                        // failures requeue; genuine task errors are consumed,
-                        // because poison must not loop.
-                        let environmental = is_error
-                            && matches!(
-                                harness.classify_startup_failure(
-                                    None,
-                                    text.as_deref().unwrap_or_default()
-                                ),
-                                StartupFailure::NeedsAuth
-                            );
-
-                        {
-                            let conn = db.lock().unwrap();
-                            if let Some(mid) = finished {
-                                if environmental {
-                                    messages::requeue_undelivered(
-                                        &conn,
-                                        mid,
-                                        text.as_deref()
-                                            .unwrap_or("the harness could not run this turn"),
-                                    )
-                                    .ok();
-                                    publish_message(&bus, &conn, mid);
-                                } else if is_error {
-                                    messages::mark_error(
-                                        &conn,
-                                        mid,
-                                        text.as_deref().unwrap_or("harness reported an error"),
-                                    )
-                                    .ok();
-                                } else {
-                                    messages::advance(&conn, mid, MessageState::Consumed).ok();
-                                    publish_message(&bus, &conn, mid);
-                                }
-                            }
-                            let (status, detail) = if environmental {
-                                (
-                                    AgentStatus::NeedsAuth,
-                                    Some("the harness has no usable credentials".to_string()),
-                                )
-                            } else if is_error {
-                                (AgentStatus::Error, Some(text.clone().unwrap_or_default()))
-                            } else {
-                                (AgentStatus::Idle, None)
-                            };
-                            set_status_db(&conn, agent, status, detail);
-                            publish_state(&bus, &conn, agent);
-                        }
-
-                        if environmental {
+                        if end == quota::TurnEnd::NeedsAuth {
                             // Nothing more can run until credentials exist, and
                             // draining the queue into the same failure would
                             // requeue every message in turn for no reason --
@@ -1803,11 +1860,11 @@ impl Supervisor {
                         }
                     }
                     HarnessEvent::RateLimit {
+                        session_id,
                         status,
                         window,
                         utilization,
                         resets_at,
-                        ..
                     } => {
                         // The operator pays for this window and is the person
                         // who most needs to know it is closing. It used to be
@@ -1822,10 +1879,49 @@ impl Supervisor {
                                 .map(|t| format!(", resets at unix {t}"))
                                 .unwrap_or_default()
                         );
+                        {
+                            let mut g = slot.lock().await;
+                            // F008, as for `result`: an event we cannot bind
+                            // to the session we started must not park the
+                            // agent or move it onto the fallback credential.
+                            let known = g.as_ref().and_then(|r| r.session_id.clone());
+                            if !session_matches(known.as_deref(), session_id.as_deref()) {
+                                drop(g);
+                                let conn = db.lock().unwrap();
+                                log_line(
+                                    &conn,
+                                    agent,
+                                    "engine",
+                                    &format!(
+                                        "ignored a rate_limit_event with a mismatched session_id: {session_id:?}"
+                                    ),
+                                );
+                                continue;
+                            }
+                            if status == "rejected" {
+                                if let Some(r) = g.as_mut() {
+                                    r.limit_seen = Some(quota::LimitSignal {
+                                        resets_at,
+                                        window: window.clone(),
+                                    });
+                                }
+                            }
+                        }
                         if status != "allowed" {
                             tracing::warn!(agent = %agent, %line, "harness reported a rate limit");
                         }
                         let conn = db.lock().unwrap();
+                        board::set_quota(
+                            &conn,
+                            agent,
+                            &wheel_core::QuotaWindow {
+                                status,
+                                window,
+                                utilization,
+                                resets_at: resets_at.and_then(quota::timestamp),
+                                observed_at: wheel_core::Timestamp::now(),
+                            },
+                        );
                         log_line_bus(&bus, &conn, agent, "engine", &line);
                     }
                     HarnessEvent::Unknown { raw } => {
@@ -2087,6 +2183,9 @@ impl Supervisor {
     /// project exists to avoid. An agent that is never messaged therefore
     /// never spawns — that is the intended trade, not an oversight.
     pub async fn start_configured_agents(self: &Arc<Self>) {
+        // The resume timers died with the last process; their resume times
+        // did not, because they are in agent_state.
+        self.rearm_quota_timers();
         let agents: Vec<Uuid> = {
             let conn = self.db.lock().unwrap();
             board::list(&conn)
@@ -2097,6 +2196,12 @@ impl Supervisor {
                         .as_agent()
                         .map(|a| a.run_on_startup)
                         .unwrap_or(false)
+                })
+                // Parking it would erase its reset time and resume it
+                // straight into the closed window.
+                .filter(|n| {
+                    board::agent_state(&conn, n.id).unwrap_or_default().status
+                        != AgentStatus::RateLimited
                 })
                 .map(|n| n.id)
                 .collect()
@@ -2153,6 +2258,360 @@ impl Supervisor {
         set_status_db(&conn, agent, status, err);
         publish_state(&self.events, &conn, agent);
     }
+
+    /// `deliver` on its own task, for a caller already inside one agent's
+    /// delivery. Awaiting it there would nest one agent's slot lock inside
+    /// another's, and an async fn reaching itself cannot be proven Send.
+    fn deliver_soon(self: &Arc<Self>, agent: Uuid) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = me.deliver(agent).await;
+        });
+    }
+
+    /// Which account this spawn runs as: the usable fallback vault, if any,
+    /// and whether to run on it now.
+    fn credential_plan(
+        &self,
+        agent: Uuid,
+        cfg: &wheel_core::AgentConfig,
+        fallback_until: Option<wheel_core::Timestamp>,
+    ) -> (Option<(Uuid, String)>, bool) {
+        let conn = self.db.lock().unwrap();
+        let fallback = crate::vault::fallback_vault(&conn, agent).ok().flatten();
+        if fallback.is_none() && cfg.fallback_vault.is_some() {
+            log_line_bus(
+                &self.events,
+                &conn,
+                agent,
+                "engine",
+                "fallback_vault is set, but this agent no longer has a read wire to it, so it \
+                 will not be used",
+            );
+        }
+        let until = fallback_until.filter(|t| *t > wheel_core::Timestamp::now());
+        let use_fallback = match (&fallback, until) {
+            (Some((_, vault)), Some(until)) => {
+                log_line_bus(
+                    &self.events,
+                    &conn,
+                    agent,
+                    "engine",
+                    &format!(
+                        "starting on the fallback credential from vault {vault} until {until}"
+                    ),
+                );
+                true
+            }
+            _ => false,
+        };
+        (fallback, use_fallback)
+    }
+
+    /// A turn ended on a closed usage window (parity proposal §1.2): requeue
+    /// what it was carrying, stop the child, then either restart on the
+    /// fallback credential or park until the window reopens.
+    async fn on_limit(
+        self: &Arc<Self>,
+        agent: Uuid,
+        finished: Option<Uuid>,
+        signal: quota::LimitSignal,
+        on_fallback: bool,
+        over_budget: Option<String>,
+    ) {
+        let now = time::OffsetDateTime::now_utc();
+        let (strikes, notify_to) = {
+            let conn = self.db.lock().unwrap();
+            requeue_limited(&conn, &self.events, finished)
+        };
+        if let Some(sender) = notify_to {
+            let _ = self.deliver(sender).await;
+        }
+        self.halt_child(agent).await;
+
+        if let Some(reason) = over_budget {
+            self.set_status(agent, AgentStatus::BudgetExhausted, Some(reason));
+            return;
+        }
+
+        let resume = quota::resume_at(now, signal.resets_at, strikes, self.jitter());
+        let (fallback, fallback_until) = {
+            let conn = self.db.lock().unwrap();
+            (
+                crate::vault::fallback_vault(&conn, agent).ok().flatten(),
+                board::agent_state(&conn, agent)
+                    .unwrap_or_default()
+                    .fallback_until,
+            )
+        };
+
+        // Once per closed window: a limit ON the fallback parks rather than
+        // bouncing back, so two limited accounts cannot become a loop.
+        if let (false, Some((_, vault))) = (on_fallback, &fallback) {
+            {
+                let conn = self.db.lock().unwrap();
+                board::set_fallback_until(&conn, agent, Some(resume.into()));
+                log_line_bus(
+                    &self.events,
+                    &conn,
+                    agent,
+                    "engine",
+                    &format!(
+                        "the usage window closed on this agent's own credential; restarting on \
+                         the fallback credential from vault {vault} until {}",
+                        wheel_core::Timestamp::from(resume)
+                    ),
+                );
+            }
+            self.set_status(agent, AgentStatus::Parked, None);
+            let _ = self.deliver(agent).await;
+            return;
+        }
+
+        let resume = match (on_fallback, fallback_until) {
+            (true, Some(until)) => resume.min(until.into_inner()),
+            _ => resume,
+        };
+        let reason = format!(
+            "the {} usage window is closed; the in-flight message was requeued and delivery \
+             resumes at {}",
+            signal.window.as_deref().unwrap_or("harness"),
+            wheel_core::Timestamp::from(resume)
+        );
+        {
+            let conn = self.db.lock().unwrap();
+            board::set_rate_limited(
+                &conn,
+                agent,
+                signal.resets_at.and_then(quota::timestamp),
+                resume.into(),
+                &reason,
+            );
+            publish_state(&self.events, &conn, agent);
+            log_line_bus(&self.events, &conn, agent, "engine", &reason);
+        }
+        tracing::warn!(%agent, %reason, "agent parked on a closed usage window");
+        self.arm_resume_timer(agent, resume);
+    }
+
+    /// Kill an agent's child and revoke its token, leaving the status to the
+    /// caller. The dying child's reaper then finds the slot empty and settles
+    /// nothing, exactly as after `stop`.
+    async fn halt_child(&self, agent: Uuid) {
+        let slot = self.slot(agent).await;
+        let taken = slot.lock().await.take();
+        if let Some(mut r) = taken {
+            if let Err(e) = r.child.kill().await {
+                tracing::warn!(%agent, error = %e, "killing a rate-limited agent's process failed; kill_on_drop is the backstop");
+            }
+        }
+        let conn = self.db.lock().unwrap();
+        let _ = crate::db::tokens::revoke(&conn, agent);
+    }
+
+    /// One sleep, then one check. No polling (§2): a limited agent costs a
+    /// sleeping task and nothing else.
+    fn arm_resume_timer(self: &Arc<Self>, agent: Uuid, at: time::OffsetDateTime) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let wait = (at - time::OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+            tokio::time::sleep(wait.unsigned_abs()).await;
+            me.resume_after_limit(agent).await;
+        });
+    }
+
+    /// The resume timer firing. Inert unless the agent is still parked on a
+    /// window that is now due: an operator's start or stop, or a newer limit
+    /// with a later resume, win without any cancellation bookkeeping.
+    async fn resume_after_limit(self: &Arc<Self>, agent: Uuid) {
+        let due = {
+            let conn = self.db.lock().unwrap();
+            let state = board::agent_state(&conn, agent).unwrap_or_default();
+            let slack = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+            state.status == AgentStatus::RateLimited
+                && state.resume_at.is_none_or(|t| t.into_inner() <= slack)
+        };
+        if !due {
+            return;
+        }
+        // Parked, so `deliver` resumes it only if work is waiting: a timer
+        // firing on an empty queue costs no process.
+        self.set_status(agent, AgentStatus::Parked, None);
+        let _ = self.deliver(agent).await;
+    }
+
+    fn rearm_quota_timers(self: &Arc<Self>) {
+        let limited = {
+            let conn = self.db.lock().unwrap();
+            board::rate_limited_agents(&conn).unwrap_or_default()
+        };
+        for (agent, at) in limited {
+            let at = at.map_or_else(time::OffsetDateTime::now_utc, |t| t.into_inner());
+            self.arm_resume_timer(agent, at);
+        }
+    }
+
+    fn jitter(&self) -> u64 {
+        use rand::Rng;
+        rand::thread_rng().gen_range(self.limit_jitter.clone())
+    }
+
+    /// Record `waiter` as blocked on `target` until the guard drops, or refuse
+    /// because that would close a cycle of waits (parity proposal §2.5).
+    pub fn begin_await(
+        &self,
+        waiter: Uuid,
+        target: Uuid,
+    ) -> Result<awaits::AwaitGuard, awaits::AwaitRefused> {
+        awaits::begin(&self.awaits, waiter, target)
+    }
+
+    /// Wait until message `id` settles or `secs` pass, then say where it
+    /// stands. No lock is held while waiting: delivery, reaping and every
+    /// other agent carry on underneath.
+    ///
+    /// Subscribed BEFORE the first read, so a turn finishing between the two
+    /// is still seen. A lagged subscriber re-reads rather than trusting that
+    /// it saw every event.
+    pub async fn await_settlement(&self, id: Uuid, secs: u64) -> Option<messages::Settlement> {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut rx = self.events.subscribe();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let now = self.settlement_of(id);
+            if now.as_ref().is_none_or(messages::Settlement::is_terminal) {
+                return now;
+            }
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Err(_) | Ok(Err(RecvError::Closed)) => return self.settlement_of(id),
+                    Ok(Ok(wheel_core::Event::Message { message })) if message.id == id => break,
+                    Ok(Err(RecvError::Lagged(_))) => break,
+                    Ok(Ok(_)) => {}
+                }
+            }
+        }
+    }
+
+    fn settlement_of(&self, id: Uuid) -> Option<messages::Settlement> {
+        let conn = self.db.lock().unwrap();
+        messages::settlement(&conn, id).ok().flatten()
+    }
+}
+
+/// Settle the message a finished turn consumed. Returns the agent to deliver a
+/// completion notification to, when one was asked for and enqueued.
+fn settle_turn(
+    conn: &rusqlite::Connection,
+    bus: &crate::events::Bus,
+    mid: Uuid,
+    end: &quota::TurnEnd,
+    text: Option<&str>,
+) -> Option<Uuid> {
+    match end {
+        quota::TurnEnd::NeedsAuth => {
+            messages::requeue_undelivered(
+                conn,
+                mid,
+                text.unwrap_or("the harness could not run this turn"),
+            )
+            .ok();
+            publish_message(bus, conn, mid);
+            None
+        }
+        quota::TurnEnd::TaskError => {
+            messages::mark_error(conn, mid, text.unwrap_or("harness reported an error")).ok();
+            publish_message(bus, conn, mid);
+            notify_sender(conn, bus, mid)
+        }
+        quota::TurnEnd::Completed => {
+            messages::complete(conn, mid, text).ok();
+            publish_message(bus, conn, mid);
+            notify_sender(conn, bus, mid)
+        }
+        quota::TurnEnd::Limited(_) => None,
+    }
+}
+
+/// Requeue a limited turn's message within the cap, or consume it with an
+/// error past the cap. Returns the strike count for the backoff and, past the
+/// cap, the sender to notify.
+fn requeue_limited(
+    conn: &rusqlite::Connection,
+    bus: &crate::events::Bus,
+    finished: Option<Uuid>,
+) -> (u32, Option<Uuid>) {
+    let Some(mid) = finished else {
+        return (1, None);
+    };
+    let reason = "rate limited: the turn did not complete, so the message was requeued until the \
+                  usage window reopens";
+    match messages::requeue_for_limit(conn, mid, reason, quota::MAX_LIMIT_REQUEUES) {
+        Ok(messages::LimitRequeue::Requeued(n)) => {
+            publish_message(bus, conn, mid);
+            (n, None)
+        }
+        Ok(messages::LimitRequeue::CapReached(n)) => {
+            messages::mark_error(
+                conn,
+                mid,
+                &format!(
+                    "the usage window closed on this message's turn {} times; it was consumed \
+                     with an error rather than requeued again, so it cannot come back for ever",
+                    n + 1
+                ),
+            )
+            .ok();
+            publish_message(bus, conn, mid);
+            (n, notify_sender(conn, bus, mid))
+        }
+        _ => (1, None),
+    }
+}
+
+/// Enqueue the one completion notification a settled message asked for.
+///
+/// Once only: [`messages::claim_notification`] lets exactly one caller past.
+/// The detail is withheld when the sender no longer holds a send wire to the
+/// recipient (046: the capability must hold at the moment of disclosure).
+/// Returns the sender, who needs a `deliver`.
+fn notify_sender(conn: &rusqlite::Connection, bus: &crate::events::Bus, mid: Uuid) -> Option<Uuid> {
+    if !messages::claim_notification(conn, mid).unwrap_or(false) {
+        return None;
+    }
+    let msg = messages::get(conn, mid).ok()??;
+    let wheel_core::MessageSender::Node {
+        id: sender,
+        node_type: NodeType::Agent,
+        ..
+    } = msg.from
+    else {
+        return None;
+    };
+    let settled = messages::settlement(conn, mid).ok()??;
+    let recipient = board::get(conn, msg.to)
+        .ok()
+        .flatten()
+        .map(|n| n.name.to_string())
+        .unwrap_or_else(|| msg.to.to_string());
+    let still_wired = board::wires_from(conn, sender)
+        .map(|ws| {
+            ws.iter()
+                .any(|w| w.to == msg.to && w.wire_type == wheel_core::WireType::Send)
+        })
+        .unwrap_or(false);
+    let body = awaits::notification_body(mid, &recipient, &settled, still_wired);
+    let note = messages::enqueue(
+        conn,
+        wheel_core::MessageSender::System,
+        sender,
+        body,
+        Some(mid),
+        None,
+    )
+    .ok()?;
+    bus.publish(wheel_core::Event::Message { message: note });
+    Some(sender)
 }
 
 /// Turn the harness's CUMULATIVE session figures into the deltas to add to an
@@ -2227,7 +2686,8 @@ fn set_status_db(
          ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error =
              CASE WHEN ?4 IS NOT NULL THEN ?4
                   WHEN last_error LIKE ?5 || '%' THEN last_error
-                  ELSE NULL END",
+                  ELSE NULL END,
+             resets_at=NULL, resume_at=NULL",
         rusqlite::params![
             agent.to_string(),
             status.as_str(),
@@ -2528,17 +2988,20 @@ mod tests {
             harness_auth,
             script_execution_enabled: false,
         });
-        let sup = Arc::new(Supervisor::with_harness(
-            cfg,
-            Arc::new(Mutex::new(conn)),
-            Arc::new(crate::events::Bus::new()),
-            match driver {
-                Some(make) => make(program.display().to_string()),
-                None => Arc::new(ShimDriver {
-                    program: program.display().to_string(),
-                }),
-            },
-        ));
+        let sup = Arc::new(
+            Supervisor::with_harness(
+                cfg,
+                Arc::new(Mutex::new(conn)),
+                Arc::new(crate::events::Bus::new()),
+                match driver {
+                    Some(make) => make(program.display().to_string()),
+                    None => Arc::new(ShimDriver {
+                        program: program.display().to_string(),
+                    }),
+                },
+            )
+            .with_limit_jitter(0..=0),
+        );
         (sup, id, dir)
     }
 
@@ -3235,6 +3698,604 @@ done
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    // --- usage windows (parity proposal §1), against the real fake-claude ----
+
+    fn now_unix() -> i64 {
+        time::OffsetDateTime::now_utc().unix_timestamp()
+    }
+
+    /// A supervisor whose child is `qa/harness/fake-claude`, steered by `fake`
+    /// (its config file), on a board of one agent with a usable vault key.
+    fn fake_supervisor(
+        name: &str,
+        fake: serde_json::Value,
+        tweak: impl FnOnce(&mut wheel_core::AgentConfig),
+    ) -> (Arc<Supervisor>, Uuid, std::path::PathBuf) {
+        use base64::Engine;
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-fake-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("fake.json");
+        std::fs::write(&config, fake.to_string()).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let mut agent_cfg = wheel_core::AgentConfig {
+            system_prompt: "test".into(),
+            ..Default::default()
+        };
+        tweak(&mut agent_cfg);
+        let node = wheel_core::Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Agent(agent_cfg),
+        );
+        board::create(&conn, &node).unwrap();
+
+        let cfg = Arc::new(Config {
+            project_id: Uuid::new_v4(),
+            engine_secret: "0123456789abcdef".into(),
+            vault_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
+            data_dir: dir.clone(),
+            listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+            json_logs: false,
+            tool_allow_hosts: Vec::new(),
+            startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            harness_auth: crate::config::HarnessAuthPolicy::default(),
+            script_execution_enabled: false,
+        });
+        let sup = Arc::new(
+            Supervisor::with_harness(
+                cfg,
+                Arc::new(Mutex::new(conn)),
+                Arc::new(crate::events::Bus::new()),
+                Arc::new(crate::harness::fake::FakeClaude { config }),
+            )
+            .with_limit_jitter(0..=0),
+        );
+        (sup, node.id, dir)
+    }
+
+    /// `deliver` resumes a parked agent and never a stopped one (§3c#13).
+    fn parked(sup: &Supervisor, id: Uuid) {
+        let conn = sup.db.lock().unwrap();
+        set_status_db(&conn, id, AgentStatus::Parked, None);
+    }
+
+    fn state_of(sup: &Supervisor, id: Uuid) -> wheel_core::AgentState {
+        let conn = sup.db.lock().unwrap();
+        board::agent_state(&conn, id).unwrap_or_default()
+    }
+
+    fn message_to(sup: &Supervisor, id: Uuid) -> Uuid {
+        let conn = sup.db.lock().unwrap();
+        messages::inbox(&conn, id, None, 10).unwrap()[0].id
+    }
+
+    fn settled(sup: &Supervisor, mid: Uuid) -> messages::Settlement {
+        sup.settlement_of(mid).expect("the message exists")
+    }
+
+    fn limit_requeues(sup: &Supervisor, mid: Uuid) -> i64 {
+        let conn = sup.db.lock().unwrap();
+        conn.query_row(
+            "SELECT limit_requeues FROM messages WHERE id = ?1",
+            [mid.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A vault the agent reads, holding one value.
+    fn wired_vault(sup: &Supervisor, agent: Uuid, name: &str, key: &str, value: &str) -> Uuid {
+        let conn = sup.db.lock().unwrap();
+        let v = wheel_core::Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            wheel_core::Position::default(),
+            wheel_core::NodeConfig::Vault(wheel_core::VaultConfig {
+                keys: vec![key.into()],
+            }),
+        );
+        board::create(&conn, &v).unwrap();
+        board::add_wire(&conn, agent, v.id, wheel_core::WireType::Read, None).unwrap();
+        crate::vault::put(&conn, sup.vault_key().unwrap(), v.id, key, value).unwrap();
+        v.id
+    }
+
+    fn choose_fallback(sup: &Supervisor, agent: Uuid, vault: Uuid) {
+        let conn = sup.db.lock().unwrap();
+        let mut node = board::get(&conn, agent).unwrap().unwrap();
+        if let wheel_core::NodeConfig::Agent(a) = &mut node.config {
+            a.fallback_vault = Some(vault);
+        }
+        board::update(&conn, &node).unwrap();
+    }
+
+    /// One record per spawn, from the fake's credential-routing dump.
+    fn spawns(dump: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dump)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn credential_sha(spawn: &serde_json::Value, var: &str) -> Option<String> {
+        spawn["credentials"][var]["sha256"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// The whole of item 1's first half: the window closes mid-work, the
+    /// message is requeued rather than lost, the agent parks with the reset on
+    /// its state, and it comes back at the reset -- not before -- and finishes.
+    #[tokio::test]
+    async fn a_closed_usage_window_requeues_parks_and_resumes_at_the_reset() {
+        // The window is closed while a MARKER FILE exists, not until a wall
+        // clock: a clock-steered window reopens on its own while a loaded
+        // machine is still spawning, and the suite then fails for load rather
+        // than for behaviour. Here the test decides when it reopens, so the
+        // only thing timed is the engine's own resume.
+        let (sup, id, dir) = fake_supervisor("quota-park", serde_json::Value::Null, |_| {});
+        let dump = dir.join("spawns.jsonl");
+        let window_closed = dir.join("window-closed");
+        std::fs::write(&window_closed, "").unwrap();
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({
+                "limit_while_file": window_closed,
+                "limit_resets_in": 5,
+                "env_dump": dump,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        parked(&sup, id);
+        enqueue(&sup, id, "the work <<FAKE:REPLY=done after the reset>>");
+        sup.deliver(id).await.unwrap();
+
+        until("the agent to park on the closed window", || {
+            status_of(&sup, id) == AgentStatus::RateLimited
+        })
+        .await;
+        let state = state_of(&sup, id);
+        let reopens = state
+            .resets_at
+            .expect("the harness's rate_limit_event carried a reset")
+            .into_inner()
+            .unix_timestamp();
+        assert!(
+            reopens > now_unix(),
+            "the engine must record the reset the event carried, which is still ahead"
+        );
+        assert_eq!(state.resume_at, state.resets_at, "zero jitter in tests");
+        assert_eq!(
+            state.quota.as_ref().map(|q| q.status.as_str()),
+            Some("rejected")
+        );
+        let mid = message_to(&sup, id);
+        let s = settled(&sup, mid);
+        assert_eq!(
+            s.state,
+            MessageState::Queued,
+            "the turn never completed, so the message goes back rather than being consumed"
+        );
+        assert!(s.last_error.unwrap_or_default().contains("rate limited"));
+        assert_eq!(limit_requeues(&sup, mid), 1);
+        assert!(
+            !has_process(&sup, id).await,
+            "a parked agent holds no process"
+        );
+
+        // The window reopens only when this test says so, so an engine that
+        // came back before its own `resume_at` would find it still shut and
+        // spend another spawn and turn being told so.
+        std::fs::remove_file(&window_closed).unwrap();
+        until(
+            "the requeued message to be consumed after the reset",
+            || settled(&sup, mid).state == MessageState::Consumed,
+        )
+        .await;
+        assert!(
+            now_unix() >= reopens,
+            "it must not come back before the window reopens"
+        );
+        assert_eq!(
+            settled(&sup, mid).result.as_deref(),
+            Some("done after the reset")
+        );
+        assert_eq!(status_of(&sup, id), AgentStatus::Idle);
+        assert_eq!(
+            spawns(&dump).len(),
+            2,
+            "one spawn into the closed window, one after it: an agent that retried early would \
+             have spent processes and turns against a window the harness said was shut"
+        );
+        assert_eq!(limit_requeues(&sup, mid), 1);
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no `rate_limit_event`, the reset comes from the text alone.
+    #[tokio::test]
+    async fn a_limit_named_only_in_the_error_text_parks_until_the_reset_it_names() {
+        let reopens = now_unix() + 600;
+        let (sup, id, dir) = fake_supervisor(
+            "quota-text",
+            serde_json::json!({ "limit_until": reopens, "limit_style": "text" }),
+            |_| {},
+        );
+        parked(&sup, id);
+        enqueue(&sup, id, "work");
+        sup.deliver(id).await.unwrap();
+        until("the agent to park", || {
+            status_of(&sup, id) == AgentStatus::RateLimited
+        })
+        .await;
+        let state = state_of(&sup, id);
+        assert_eq!(
+            state.resume_at.map(|t| t.into_inner().unix_timestamp()),
+            Some(reopens)
+        );
+        assert!(state.quota.is_none(), "no event, so no window was reported");
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F008 for the new signal. A `rejected` event the agent could have
+    /// printed is not bound to the session, so the failed turn is an ordinary
+    /// task error: consumed, not requeued, and nothing is parked.
+    #[tokio::test]
+    async fn a_rejected_event_from_another_session_neither_parks_nor_requeues() {
+        let (sup, id, _dir) = shim_supervisor(
+            "quota-forged",
+            r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"s1"}'
+while IFS= read -r line; do
+  echo '{"type":"rate_limit_event","session_id":"forged","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}'
+  echo '{"type":"result","subtype":"error_during_execution","session_id":"s1","is_error":true,"result":"the build failed"}'
+done
+"#,
+        );
+        sup.start(id).await.unwrap();
+        enqueue(&sup, id, "build it");
+        sup.deliver(id).await.unwrap();
+        until("the turn to end", || {
+            status_of(&sup, id) == AgentStatus::Error
+        })
+        .await;
+        let s = settled(&sup, message_to(&sup, id));
+        assert_eq!(
+            s.outcome(),
+            "error",
+            "a task error is consumed: poison must not loop"
+        );
+        assert!(state_of(&sup, id).resume_at.is_none());
+        assert!(engine_log(&sup, id)
+            .iter()
+            .any(|l| l.contains("mismatched session_id")));
+        sup.stop(id).await.ok();
+    }
+
+    /// The fallback half (ADVERSARY-gated): the primary account's window
+    /// closes, the agent restarts ONCE on the fallback vault's credential and
+    /// finishes the message there. Each spawn sees exactly one account.
+    #[tokio::test]
+    async fn a_limited_agent_restarts_once_on_its_fallback_credential() {
+        let (sup, id, dir) = fake_supervisor("quota-fallback", serde_json::Value::Null, |_| {});
+        let dump = dir.join("spawns.jsonl");
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({
+                "limit_until": now_unix() + 600,
+                "limit_when_env": ["CLAUDE_CODE_OAUTH_TOKEN"],
+                "env_dump": dump,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (primary, standby) = (
+            "sk-ant-oat01-primary-account",
+            "sk-ant-api03-standby-account",
+        );
+        wired_vault(&sup, id, "primary", "CLAUDE_CODE_OAUTH_TOKEN", primary);
+        let standby_vault = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", standby);
+        choose_fallback(&sup, id, standby_vault);
+
+        parked(&sup, id);
+        enqueue(&sup, id, "<<FAKE:REPLY=carried by the fallback>>");
+        sup.deliver(id).await.unwrap();
+        let mid = message_to(&sup, id);
+        until("the message to be consumed on the fallback", || {
+            settled(&sup, mid).state == MessageState::Consumed
+        })
+        .await;
+
+        assert_eq!(
+            settled(&sup, mid).result.as_deref(),
+            Some("carried by the fallback")
+        );
+        assert!(state_of(&sup, id).fallback_until.is_some());
+        let runs = spawns(&dump);
+        assert_eq!(
+            runs.len(),
+            2,
+            "one spawn on the primary, one on the fallback"
+        );
+        let sha = |v: &str| Some(wheel_core::sha256_hex(v.as_bytes()));
+        assert_eq!(
+            credential_sha(&runs[0], "CLAUDE_CODE_OAUTH_TOKEN"),
+            sha(primary)
+        );
+        assert_eq!(
+            credential_sha(&runs[0], "ANTHROPIC_API_KEY"),
+            None,
+            "a normal spawn must not also carry the standby account"
+        );
+        assert_eq!(credential_sha(&runs[1], "ANTHROPIC_API_KEY"), sha(standby));
+        assert_eq!(
+            credential_sha(&runs[1], "CLAUDE_CODE_OAUTH_TOKEN"),
+            None,
+            "a fallback spawn carries the fallback account and nothing else"
+        );
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// "Once, then parks": two closed accounts are a park, never a bounce.
+    #[tokio::test]
+    async fn a_fallback_that_is_limited_too_parks_rather_than_bouncing() {
+        let (sup, id, dir) = fake_supervisor("quota-both", serde_json::Value::Null, |_| {});
+        let dump = dir.join("spawns.jsonl");
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({
+                "limit_until": now_unix() + 600,
+                "limit_when_env": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+                "env_dump": dump,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        wired_vault(
+            &sup,
+            id,
+            "primary",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "sk-ant-oat01-a",
+        );
+        let standby = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", "sk-ant-api03-b");
+        choose_fallback(&sup, id, standby);
+
+        parked(&sup, id);
+        enqueue(&sup, id, "work");
+        sup.deliver(id).await.unwrap();
+        until("both accounts to be tried and the agent parked", || {
+            status_of(&sup, id) == AgentStatus::RateLimited
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(spawns(&dump).len(), 2, "primary, then fallback, then park");
+        let state = state_of(&sup, id);
+        assert!(state.resume_at <= state.fallback_until);
+        assert_eq!(
+            settled(&sup, message_to(&sup, id)).state,
+            MessageState::Queued
+        );
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Credential-distribution rule: a token the agent wrote into its own
+    /// config dir must not ride along into a fallback spawn. Planted as the
+    /// OTHER credential kind, so the fallback vault's value cannot mask it by
+    /// overwriting the same variable.
+    #[tokio::test]
+    async fn a_token_planted_in_the_agents_own_dir_never_rides_a_fallback_spawn() {
+        let (sup, id, dir) = fake_supervisor("quota-planted", serde_json::Value::Null, |_| {});
+        let dump = dir.join("spawns.jsonl");
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({
+                "limit_until": now_unix() + 600,
+                "limit_when_env": ["CLAUDE_CODE_OAUTH_TOKEN"],
+                "env_dump": dump,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let planted = "sk-ant-oat01-planted-by-the-agent";
+        crate::auth::store_token(
+            &dir.join("creds").join(id.to_string()),
+            planted,
+            wheel_core::Harness::Claude,
+        )
+        .unwrap();
+        let standby = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", "sk-ant-api03-ok");
+        choose_fallback(&sup, id, standby);
+
+        parked(&sup, id);
+        enqueue(&sup, id, "<<FAKE:REPLY=clean>>");
+        sup.deliver(id).await.unwrap();
+        let mid = message_to(&sup, id);
+        until("the message to finish on the fallback", || {
+            settled(&sup, mid).state == MessageState::Consumed
+        })
+        .await;
+
+        let runs = spawns(&dump);
+        let planted_sha = wheel_core::sha256_hex(planted.as_bytes());
+        assert_eq!(
+            credential_sha(&runs[0], "CLAUDE_CODE_OAUTH_TOKEN").as_deref(),
+            Some(planted_sha.as_str()),
+            "premise: a normal spawn does carry the node's stored token"
+        );
+        let fallback_values: Vec<&str> = runs[1]["env_digests"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !fallback_values.contains(&planted_sha.as_str()),
+            "the planted token reached the fallback spawn: {:?}",
+            runs[1]["credential_vars_set"]
+        );
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Config time is one door; a wire removed afterwards walks past it. The
+    /// spawn re-check is the one that always runs.
+    #[tokio::test]
+    async fn a_fallback_whose_wire_was_removed_is_not_used() {
+        let (sup, id, dir) = fake_supervisor("quota-unwired", serde_json::Value::Null, |_| {});
+        let dump = dir.join("spawns.jsonl");
+        std::fs::write(
+            dir.join("fake.json"),
+            serde_json::json!({ "limit_until": now_unix() + 600, "env_dump": dump }).to_string(),
+        )
+        .unwrap();
+        let standby = wired_vault(&sup, id, "standby", "ANTHROPIC_API_KEY", "sk-ant-api03-x");
+        choose_fallback(&sup, id, standby);
+        {
+            let conn = sup.db.lock().unwrap();
+            board::remove_wire(&conn, id, standby, wheel_core::WireType::Read).unwrap();
+        }
+
+        parked(&sup, id);
+        enqueue(&sup, id, "work");
+        sup.deliver(id).await.unwrap();
+        until("the agent to park without a fallback", || {
+            status_of(&sup, id) == AgentStatus::RateLimited
+        })
+        .await;
+        assert_eq!(
+            spawns(&dump).len(),
+            1,
+            "no second spawn on an unwired vault"
+        );
+        assert!(engine_log(&sup, id)
+            .iter()
+            .any(|l| l.contains("no longer has a read wire")));
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bound on the requeue (proposal §1.3): past the cap the message is
+    /// consumed with an error, even though the window is still closed.
+    #[tokio::test]
+    async fn past_the_requeue_cap_a_limited_message_is_consumed_with_an_error() {
+        let (sup, id, dir) = fake_supervisor(
+            "quota-cap",
+            serde_json::json!({ "limit_until": now_unix() + 600 }),
+            |_| {},
+        );
+        parked(&sup, id);
+        enqueue(&sup, id, "work");
+        let mid = message_to(&sup, id);
+        {
+            let conn = sup.db.lock().unwrap();
+            conn.execute(
+                "UPDATE messages SET limit_requeues = ?2 WHERE id = ?1",
+                rusqlite::params![mid.to_string(), quota::MAX_LIMIT_REQUEUES],
+            )
+            .unwrap();
+        }
+        sup.deliver(id).await.unwrap();
+        until("the message to be given up on", || {
+            settled(&sup, mid).is_terminal()
+        })
+        .await;
+        let s = settled(&sup, mid);
+        assert_eq!(s.outcome(), "error");
+        assert!(s.last_error.unwrap_or_default().contains("13 times"));
+        until("the agent to park", || {
+            status_of(&sup, id) == AgentStatus::RateLimited
+        })
+        .await;
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The timer lives in memory and the resume time in the database, so a
+    /// restart re-arms from the database -- and does not "helpfully" park a
+    /// run_on_startup agent whose window is still closed.
+    #[tokio::test]
+    async fn an_engine_restart_rearms_the_resume_and_keeps_a_closed_window_closed() {
+        let (sup, id, dir) = fake_supervisor("quota-boot", serde_json::json!({}), |a| {
+            a.run_on_startup = true
+        });
+        let (later, later_id, later_dir) =
+            fake_supervisor("quota-boot-later", serde_json::json!({}), |a| {
+                a.run_on_startup = true
+            });
+        let ago = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let ahead = time::OffsetDateTime::now_utc() + time::Duration::seconds(600);
+        {
+            let conn = sup.db.lock().unwrap();
+            board::set_rate_limited(&conn, id, None, ago.into(), "closed");
+        }
+        {
+            let conn = later.db.lock().unwrap();
+            board::set_rate_limited(&conn, later_id, None, ahead.into(), "closed");
+        }
+        enqueue(&sup, id, "<<FAKE:REPLY=back after the restart>>");
+        enqueue(&later, later_id, "not yet");
+
+        sup.start_configured_agents().await;
+        later.start_configured_agents().await;
+
+        let mid = message_to(&sup, id);
+        until("the overdue agent to resume and finish", || {
+            settled(&sup, mid).state == MessageState::Consumed
+        })
+        .await;
+        assert_eq!(
+            settled(&sup, mid).result.as_deref(),
+            Some("back after the restart")
+        );
+        assert_eq!(
+            status_of(&later, later_id),
+            AgentStatus::RateLimited,
+            "boot must not park an agent whose window is still closed"
+        );
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&later_dir).ok();
+    }
+
+    /// An operator's stop wins over a timer already armed: no cancellation,
+    /// just a check when it fires.
+    #[tokio::test]
+    async fn a_stopped_agent_is_not_resumed_by_its_old_timer() {
+        let (sup, id, dir) = fake_supervisor("quota-stale", serde_json::json!({}), |_| {});
+        let soon = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        {
+            let conn = sup.db.lock().unwrap();
+            board::set_rate_limited(&conn, id, None, soon.into(), "closed");
+        }
+        enqueue(&sup, id, "must wait for an operator start");
+        sup.arm_resume_timer(id, soon);
+        sup.stop(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(status_of(&sup, id), AgentStatus::Stopped);
+        assert!(!has_process(&sup, id).await, "nothing was spawned");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The slot, not `live_agents`: that lists every slot ever touched,
+    /// empty ones included.
+    async fn has_process(sup: &Supervisor, id: Uuid) -> bool {
+        let slot = sup.slot(id).await;
+        let held = slot.lock().await.is_some();
+        held
     }
 
     /// The operator's actual first session: start, discover the agent needs

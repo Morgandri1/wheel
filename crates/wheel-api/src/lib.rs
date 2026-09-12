@@ -81,6 +81,16 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         // Redeeming an invite takes AuthUser, not ProjectScope: the caller is not a member yet.
         // Outside `/v1/projects/{id}` for the same reason — the invite names the project.
         .route("/v1/invites/accept", post(routes::members::accept))
+        // The operator MCP server. Its own tiny router so the origin allowlist
+        // reaches the handler as an Extension; merged before the CORS layer, so
+        // it is covered by the same policy as everything else.
+        .merge(
+            Router::new()
+                .route("/v1/mcp", post(routes::mcp::post))
+                .layer(axum::Extension(routes::mcp::AllowedOrigins(
+                    std::sync::Arc::new(allowed_origins.to_vec()),
+                ))),
+        )
         .route("/v1/projects", post(routes::projects::create))
         .route("/v1/projects", get(routes::projects::list))
         // Create + capability-patch + apply + rollback-on-failure, one atomic server sequence —

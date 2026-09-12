@@ -25,6 +25,9 @@ const FEATURES: &[&str] = &[
     "idle_parking",
     "ephemeral_context",
     "budgets",
+    "quota_parking",
+    "credential_fallback",
+    "await_reply",
     "oauth_paste_code",
     "oauth_refresh",
     "interrupt",
@@ -76,6 +79,7 @@ mod tests {
     struct Engine {
         app: Router,
         secret: String,
+        state: crate::api::AppState,
     }
 
     impl Engine {
@@ -90,6 +94,7 @@ mod tests {
             state.cfg = Arc::new(cfg);
             Self {
                 secret: state.cfg.engine_secret.clone(),
+                state: state.clone(),
                 app: router(state),
             }
         }
@@ -205,6 +210,9 @@ mod tests {
                 "idle_parking",
                 "ephemeral_context",
                 "budgets",
+                "quota_parking",
+                "credential_fallback",
+                "await_reply",
                 "oauth_paste_code",
                 "oauth_refresh",
                 "interrupt",
@@ -287,6 +295,13 @@ mod tests {
         AgentField(&'static str, &'static str),
         /// Public ingress answers a hit on an endpoint node's path.
         Ingress,
+        /// A runtime state an agent can be IN, proven by putting an agent
+        /// there the way the supervisor does and reading `/v1/board` back. A
+        /// status the board cannot carry is a capability a client cannot see.
+        AgentStatus,
+        /// `fallback_vault` names a vault the agent already reads, so the
+        /// evidence has to build that: vault, agent, wire, then the field.
+        CredentialFallback,
     }
 
     fn evidence(feature: &str) -> Evidence {
@@ -323,6 +338,9 @@ mod tests {
             "idle_parking" => AgentField("idle_timeout_secs", "60"),
             "ephemeral_context" => AgentField("ephemeral_context", "true"),
             "budgets" => AgentField("budget", r#"{"max_turns": 3, "max_usd": 1.5}"#),
+            "quota_parking" => AgentStatus,
+            "credential_fallback" => CredentialFallback,
+            "await_reply" => Routes(&[("GET", "/v1/cli/sent")]),
             "oauth_paste_code" => Routes(&[
                 ("POST", "/v1/agents/{id}/auth/begin"),
                 ("POST", "/v1/agents/{id}/auth/complete"),
@@ -381,6 +399,83 @@ mod tests {
                 assert_eq!(
                     node["config"][field], value,
                     "{feature}: `{field}` was accepted but not kept"
+                );
+            }
+            Evidence::AgentStatus => {
+                let (status, node) = engine
+                    .create_node(
+                        "quota",
+                        "agent",
+                        json!({"harness": "claude", "system_prompt": ""}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{feature}: {node}");
+                let id: uuid::Uuid = node["id"].as_str().unwrap().parse().unwrap();
+                let reset = wheel_core::Timestamp::from(
+                    time::OffsetDateTime::now_utc() + time::Duration::seconds(900),
+                );
+                {
+                    let conn = engine.state.db.lock().unwrap();
+                    crate::db::board::set_rate_limited(
+                        &conn,
+                        id,
+                        Some(reset),
+                        reset,
+                        "the usage window is closed",
+                    );
+                }
+                let (status, body) = engine.authed("GET", "/v1/board", None).await;
+                assert_eq!(status, StatusCode::OK);
+                let board: Value = serde_json::from_slice(&body).unwrap();
+                let state = board["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["id"] == node["id"])
+                    .map(|n| n["state"].clone())
+                    .unwrap_or(Value::Null);
+                assert_eq!(
+                    state["status"], "rate_limited",
+                    "{feature}: the board cannot carry the state this id advertises: {state}"
+                );
+                assert!(
+                    state["resets_at"].is_string() && state["resume_at"].is_string(),
+                    "{feature}: a parked-on-quota agent must say when it is due back: {state}"
+                );
+            }
+            Evidence::CredentialFallback => {
+                let (status, vault) = engine
+                    .create_node("standby", "vault", json!({"keys": ["ANTHROPIC_API_KEY"]}))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{feature}: {vault}");
+                let (status, agent) = engine
+                    .create_node(
+                        "failover",
+                        "agent",
+                        json!({"harness": "claude", "system_prompt": ""}),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{feature}: {agent}");
+                let wire = json!({"from": agent["id"], "to": vault["id"], "type": "read"});
+                let (status, body) = engine.authed("POST", "/v1/wires", Some(wire)).await;
+                assert!(
+                    status.is_success(),
+                    "{feature}: the read wire the field requires was refused: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let patch = json!({"config": {"fallback_vault": vault["id"]}});
+                let uri = format!("/v1/nodes/{}", agent["id"].as_str().unwrap());
+                let (status, body) = engine.authed("PATCH", &uri, Some(patch)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{feature}: a wired fallback vault was refused: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let node: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    node["config"]["fallback_vault"], vault["id"],
+                    "{feature}: the field was accepted but not kept"
                 );
             }
             Evidence::Ingress => {

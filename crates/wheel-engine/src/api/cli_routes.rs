@@ -17,13 +17,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use wheel_core::{
     Event, LogStream, Message, MessageReceipt, MessageSender, NodeType, Timestamp, WireDenial,
-    WireType, MAX_MESSAGE_BODY,
+    WireType, MAX_AWAIT_SECS, MAX_MESSAGE_BODY,
 };
 
 use super::{ApiError, ApiResult, AppState};
 use crate::{
     caps::{split_address, Caller, Denial},
     db::{board, messages, tables},
+    supervisor::awaits::AwaitRefused,
 };
 
 /// Map a capability denial onto HTTP, preserving the code the CLI turns into an
@@ -539,9 +540,75 @@ pub struct MsgBody {
     pub body: String,
     #[serde(default)]
     pub reply_to: Option<uuid::Uuid>,
+    /// Wait up to this many seconds for the turn that consumes the message,
+    /// and return how it ended. Clamped to [`wheel_core::MAX_AWAIT_SECS`].
+    #[serde(default)]
+    pub await_secs: Option<u64>,
+    /// Send one `system` message back to me when that turn ends.
+    #[serde(default)]
+    pub notify: bool,
 }
 
-/// `POST /v1/cli/msg` → `{id, sha256, bytes, state}` (§3c#3).
+/// Why a wait was refused, as the caller sees it.
+fn await_refused(conn: &rusqlite::Connection, r: AwaitRefused) -> ApiError {
+    match r {
+        AwaitRefused::Cycle { waiting, message } => {
+            let name = board::get(conn, waiting)
+                .ok()
+                .flatten()
+                .map(|n| n.name.to_string())
+                .unwrap_or_else(|| waiting.to_string());
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "await_cycle",
+                format!(
+                    "{name} is already waiting on you (message {message}); waiting on it back \
+                     would hang both turns. Finish your turn, or send without waiting."
+                ),
+            )
+        }
+        AwaitRefused::TooMany => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_awaits",
+            format!(
+                "you already have {} waits open; wait on fewer at once",
+                crate::supervisor::awaits::MAX_CONCURRENT_AWAITS
+            ),
+        ),
+    }
+}
+
+/// A receipt plus how the message's turn ended: `consumed` with its `result`,
+/// `error`/`undeliverable` with its `error`, or `timeout`/`pending` when it is
+/// still on its way.
+pub(crate) fn with_outcome(
+    receipt: &MessageReceipt,
+    settled: Option<&messages::Settlement>,
+    waited: bool,
+) -> serde_json::Value {
+    let mut out = serde_json::to_value(receipt).unwrap_or_default();
+    let Some(settled) = settled else {
+        out["outcome"] = "undeliverable".into();
+        out["error"] = "the message no longer exists; its recipient was removed".into();
+        return out;
+    };
+    out["state"] = serde_json::json!(settled.state);
+    let outcome = match (settled.is_terminal(), waited) {
+        (true, _) => settled.outcome(),
+        (false, true) => "timeout",
+        (false, false) => "pending",
+    };
+    out["outcome"] = outcome.into();
+    if outcome == "consumed" {
+        out["result"] = serde_json::json!(settled.result);
+    } else if let Some(e) = &settled.last_error {
+        out["error"] = e.clone().into();
+    }
+    out
+}
+
+/// `POST /v1/cli/msg` → `{id, sha256, bytes, state}` (§3c#3), plus
+/// `{outcome, result?, error?}` when `await_secs` is given.
 ///
 /// The sender is derived from the token and never taken from the request, which
 /// is what makes attribution unforgeable.
@@ -549,9 +616,14 @@ pub async fn msg(
     State(s): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<MsgBody>,
-) -> ApiResult<(StatusCode, Json<MessageReceipt>)> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let me = caller(&s, &headers)?;
 
+    if body.notify && me.node.node_type() != NodeType::Agent {
+        return Err(ApiError::invalid(
+            "only an agent can be notified: nothing else has a process to deliver it to",
+        ));
+    }
     if body.body.len() > MAX_MESSAGE_BODY {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -563,11 +635,22 @@ pub async fn msg(
         ));
     }
 
-    let msg = {
+    let (msg, wait) = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
         let target = me
             .require(&conn, &body.to, WireType::Send)
             .map_err(|d| deny(&s, Some(&me), d))?;
+
+        // Before anything is enqueued, so a refused wait sends nothing.
+        let wait = match body.await_secs {
+            None => None,
+            Some(secs) => Some((
+                secs.clamp(1, MAX_AWAIT_SECS),
+                s.supervisor
+                    .begin_await(me.node.id, target.id)
+                    .map_err(|r| await_refused(&conn, r))?,
+            )),
+        };
 
         let from = MessageSender::Node {
             id: me.node.id,
@@ -577,7 +660,7 @@ pub async fn msg(
         // `None`, always: this is the node-token plane. An agent holding a token — its own, or a
         // sibling's under the single-uid gap (ADVERSARY 037) — cannot claim to be acting for a
         // person. The header is not read here, so there is nothing to ignore.
-        messages::enqueue(
+        let msg = messages::enqueue(
             &conn,
             from,
             target.id,
@@ -585,7 +668,12 @@ pub async fn msg(
             body.reply_to,
             None,
         )
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        if body.notify {
+            messages::request_notification(&conn, msg.id)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        }
+        (msg, wait)
     };
 
     s.events.publish(Event::Message {
@@ -595,7 +683,97 @@ pub async fn msg(
     // running agent to drain.
     let _ = s.supervisor.deliver(msg.to).await;
 
-    Ok((StatusCode::ACCEPTED, Json(MessageReceipt::from(&msg))))
+    let receipt = MessageReceipt::from(&msg);
+    let Some((secs, guard)) = wait else {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::to_value(&receipt).unwrap_or_default()),
+        ));
+    };
+    guard.set_message(msg.id);
+    let settled = s.supervisor.await_settlement(msg.id, secs).await;
+    drop(guard);
+
+    // ADVERSARY 046: the result was produced after the lock was released, so
+    // it is disclosed only if the send wire still holds NOW.
+    {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        me.require(&conn, &body.to, WireType::Send)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(with_outcome(&receipt, settled.as_ref(), true)),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SentQuery {
+    /// Optional at EXTRACTION, required in the handler: a query the extractor
+    /// rejects is a 400 answered before the caller is authenticated, which
+    /// breaks this realm's "no token, no answer" contract and tells an
+    /// anonymous caller the route's shape.
+    #[serde(default)]
+    pub id: Option<uuid::Uuid>,
+    /// Wait up to this many seconds for it to settle first.
+    #[serde(default)]
+    pub wait: Option<u64>,
+}
+
+/// `GET /v1/cli/sent?id=<id>[&wait=<secs>]` — a message I sent, and how the
+/// turn that consumed it ended, result included.
+///
+/// Only a message whose sender is the caller, which the token decides: anyone
+/// else's is `not_found`, with no hint that it exists.
+pub async fn sent(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<SentQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let me = caller(&s, &headers)?;
+    let id =
+        q.id.ok_or_else(|| ApiError::invalid("sent needs the id of a message you sent"))?;
+    let (receipt, peer, guard) = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        let msg = messages::get(&conn, id)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .filter(|m| matches!(&m.from, MessageSender::Node { id, .. } if *id == me.node.id))
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+        let peer = board::get(&conn, msg.to)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?
+            .name
+            .to_string();
+        me.require(&conn, &peer, WireType::Send)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+        let guard = match q.wait {
+            Some(_) => Some(
+                s.supervisor
+                    .begin_await(me.node.id, msg.to)
+                    .map_err(|r| await_refused(&conn, r))?,
+            ),
+            None => None,
+        };
+        (MessageReceipt::from(&msg), peer, guard)
+    };
+    if let Some(g) = &guard {
+        g.set_message(receipt.id);
+    }
+    let secs = q.wait.map_or(0, |w| w.clamp(1, MAX_AWAIT_SECS));
+    let settled = s.supervisor.await_settlement(receipt.id, secs).await;
+    drop(guard);
+
+    // As `msg`: disclosed only while the send wire still holds.
+    {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        me.require(&conn, &peer, WireType::Send)
+            .map_err(|d| deny(&s, Some(&me), d))?;
+    }
+    Ok(Json(with_outcome(
+        &receipt,
+        settled.as_ref(),
+        q.wait.is_some(),
+    )))
 }
 
 /// `GET /v1/cli/inbox` — re-read my own messages (§3c#2).
@@ -820,16 +998,34 @@ pub async fn usage(
         return Err(ApiError::invalid("only an agent has usage to report"));
     }
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let state = board::agent_state(&conn, me.node.id).unwrap_or_default();
+    let spend = state.spend.unwrap_or_default();
+
+    let mut out = serde_json::json!({
+        "turns": spend.turns,
+        "usd": spend.usd,
+        "status": state.status.as_str(),
+    });
+    // The usage window, which is a ceiling too: one the account sets rather
+    // than the board. Only what the harness actually reported is shown.
+    if let Some(quota) = &state.quota {
+        out["quota"] = serde_json::json!(quota);
+    }
+    for (key, at) in [
+        ("resets_at", state.resets_at),
+        ("resume_at", state.resume_at),
+        ("fallback_until", state.fallback_until),
+    ] {
+        if let Some(at) = at {
+            out[key] = serde_json::json!(at);
+        }
+    }
     // `board::agent_state` computes `budget_status` from the same
     // `BudgetStatus::compute` this route used to duplicate inline, so this
     // and `GET /v1/board` can never disagree about what "80% of budget"
     // means. Budget is optional config (§3); an agent with none configured
     // gets its raw spend back and nothing to divide by, which is not an
     // error.
-    let state = board::agent_state(&conn, me.node.id).unwrap_or_default();
-    let spend = state.spend.unwrap_or_default();
-
-    let mut out = serde_json::json!({ "turns": spend.turns, "usd": spend.usd });
     if let Some(budget) = state.budget_status {
         if let Some(max) = budget.max_turns {
             out["max_turns"] = serde_json::json!(max);
@@ -878,10 +1074,11 @@ mod toctou_tests {
         ("query", true),
         // makes an external HTTP call of up to 30s, then returns the response
         ("tool_call", true),
-        // enqueues UNDER the lock; the post-lock await is delivery, which
-        // returns nothing to the caller but a receipt for work already
-        // authorised. Nothing to withhold.
-        ("msg", false),
+        // with `await_secs`, waits outside the lock and then returns the
+        // recipient's result: produced after the release, so re-checked.
+        ("msg", true),
+        // the same wait and the same disclosure, for a message already sent.
+        ("sent", true),
     ];
 
     /// ADVERSARY 046, generalised so the NEXT one is caught rather than filed.
@@ -995,6 +1192,431 @@ mod storage_err_tests {
     }
 }
 
+/// Delegation that returns the reply (parity proposal §2), end to end: real
+/// route handlers, a real supervisor, and `qa/harness/fake-claude` as the
+/// recipient's harness.
+#[cfg(test)]
+pub(crate) mod await_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use std::sync::{Arc, Mutex};
+    use wheel_core::{AgentConfig, AgentStatus, Node, NodeConfig, Position};
+
+    pub(crate) fn fake_state(name: &str) -> (AppState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "wheel-await-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("fake.json");
+        std::fs::write(&config, "{}").unwrap();
+        let cfg = Arc::new(crate::config::Config {
+            project_id: uuid::Uuid::new_v4(),
+            engine_secret: "0123456789abcdef".into(),
+            vault_key: None,
+            data_dir: dir.clone(),
+            listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+            json_logs: false,
+            tool_allow_hosts: Vec::new(),
+            startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            harness_auth: crate::config::HarnessAuthPolicy::default(),
+            script_execution_enabled: false,
+        });
+        let db = Arc::new(Mutex::new(crate::db::open_memory().unwrap()));
+        let events = Arc::new(crate::events::Bus::new());
+        let supervisor = Arc::new(crate::supervisor::Supervisor::with_harness(
+            cfg.clone(),
+            db.clone(),
+            events.clone(),
+            Arc::new(crate::harness::fake::FakeClaude { config }),
+        ));
+        (
+            AppState {
+                cfg,
+                supervisor,
+                db,
+                events,
+                ingress_rate: Arc::default(),
+                logins: Arc::default(),
+            },
+            dir,
+        )
+    }
+
+    /// An agent node with a token, so it can call the cli routes.
+    pub(crate) fn agent(s: &AppState, name: &str) -> (uuid::Uuid, HeaderMap) {
+        let node = Node::new(
+            uuid::Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let conn = s.db.lock().unwrap();
+        board::create(&conn, &node).unwrap();
+        let token = crate::db::tokens::mint(&conn, node.id).unwrap().plaintext;
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        (node.id, h)
+    }
+
+    fn wire(s: &AppState, from: uuid::Uuid, to: uuid::Uuid) {
+        let conn = s.db.lock().unwrap();
+        board::add_wire(&conn, from, to, WireType::Send, None).unwrap();
+    }
+
+    /// `deliver` starts a parked agent and never a stopped one (§3c#13).
+    pub(crate) fn parked(s: &AppState, id: uuid::Uuid) {
+        let conn = s.db.lock().unwrap();
+        board::set_status(&conn, id, AgentStatus::Parked, None);
+    }
+
+    fn ask(to: &str, body: &str, await_secs: Option<u64>, notify: bool) -> Json<MsgBody> {
+        Json(MsgBody {
+            to: to.into(),
+            body: body.into(),
+            reply_to: None,
+            await_secs,
+            notify,
+        })
+    }
+
+    fn messages_to(s: &AppState, to: uuid::Uuid) -> Vec<Message> {
+        let conn = s.db.lock().unwrap();
+        messages::inbox(&conn, to, None, 100).unwrap()
+    }
+
+    async fn stop_all(s: &AppState, ids: &[uuid::Uuid]) {
+        for id in ids {
+            s.supervisor.stop(*id).await.ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn await_reply_returns_the_result_of_the_turn_that_consumed_it() {
+        let (s, _dir) = fake_state("result");
+        let (a, ha) = agent(&s, "a");
+        let (b, _) = agent(&s, "b");
+        wire(&s, a, b);
+        parked(&s, b);
+
+        let (status, Json(v)) = msg(
+            State(s.clone()),
+            ha,
+            ask(
+                "b",
+                "what is six times seven <<FAKE:REPLY=forty-two>>",
+                Some(60),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["outcome"], "consumed", "{v}");
+        assert_eq!(v["state"], "consumed");
+        assert_eq!(v["result"], "forty-two");
+        assert!(v.get("error").is_none());
+        // The receipt is still all there (§3c#3).
+        assert_eq!(
+            v["bytes"],
+            "what is six times seven <<FAKE:REPLY=forty-two>>".len()
+        );
+        stop_all(&s, &[b]).await;
+    }
+
+    /// A timeout ends the WAIT, not the message: it is still delivered, and
+    /// its answer can be collected later with `sent`.
+    #[tokio::test]
+    async fn await_reply_times_out_cleanly_and_the_answer_can_be_collected_later() {
+        let (s, _dir) = fake_state("timeout");
+        let (a, ha) = agent(&s, "a");
+        let (b, _) = agent(&s, "b");
+        wire(&s, a, b);
+        parked(&s, b);
+
+        let started = std::time::Instant::now();
+        let (_, Json(v)) = msg(
+            State(s.clone()),
+            ha.clone(),
+            ask("b", "<<FAKE:SLEEP=4>><<FAKE:REPLY=late>>", Some(1), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["outcome"], "timeout", "{v}");
+        assert_ne!(v["state"], "consumed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the wait must end at its own deadline"
+        );
+
+        let id: uuid::Uuid = v["id"].as_str().unwrap().parse().unwrap();
+        let Json(later) = sent(
+            State(s.clone()),
+            ha,
+            axum::extract::Query(SentQuery {
+                id: Some(id),
+                wait: Some(30),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(later["outcome"], "consumed", "{later}");
+        assert_eq!(later["result"], "late");
+        stop_all(&s, &[b]).await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_failed_is_reported_as_error_not_consumed() {
+        let (s, _dir) = fake_state("error");
+        let (a, ha) = agent(&s, "a");
+        let (b, _) = agent(&s, "b");
+        wire(&s, a, b);
+        parked(&s, b);
+        let (_, Json(v)) = msg(
+            State(s.clone()),
+            ha,
+            ask("b", "<<FAKE:ERROR=it broke>>", Some(60), false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["outcome"], "error", "{v}");
+        assert_eq!(v["error"], "it broke");
+        assert!(v.get("result").is_none());
+        stop_all(&s, &[b]).await;
+    }
+
+    /// Exactly one `system` message, threaded to the original, and none for a
+    /// message that did not ask.
+    #[tokio::test]
+    async fn notify_delivers_exactly_one_system_message_to_the_sender() {
+        let (s, _dir) = fake_state("notify");
+        let (a, ha) = agent(&s, "a");
+        let (b, _) = agent(&s, "b");
+        wire(&s, a, b);
+        parked(&s, b);
+
+        let (status, Json(receipt)) = msg(
+            State(s.clone()),
+            ha.clone(),
+            ask("b", "<<FAKE:REPLY=all done>>", None, true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let id: uuid::Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
+        let (_, Json(quiet)) = msg(
+            State(s.clone()),
+            ha,
+            ask("b", "<<FAKE:REPLY=no news>>", None, false),
+        )
+        .await
+        .unwrap();
+        let quiet_id: uuid::Uuid = quiet["id"].as_str().unwrap().parse().unwrap();
+
+        for m in [id, quiet_id] {
+            let done = s.supervisor.await_settlement(m, 60).await.unwrap();
+            assert!(done.is_terminal());
+        }
+        let notes: Vec<Message> = messages_to(&s, a)
+            .into_iter()
+            .filter(|m| m.from == MessageSender::System)
+            .collect();
+        assert_eq!(notes.len(), 1, "exactly one notification: {notes:?}");
+        assert_eq!(
+            notes[0].reply_to,
+            Some(id),
+            "threaded to the message it is about"
+        );
+        assert!(
+            notes[0].body.contains("to b finished: consumed"),
+            "{}",
+            notes[0].body
+        );
+        assert!(notes[0].body.contains("all done"));
+        assert!(!notes[0].body.contains("no news"));
+        stop_all(&s, &[b]).await;
+    }
+
+    /// A waits on B; B, in its turn, asks A back. Without the wait-for graph
+    /// both turns hang until their timeouts. With it B is refused at once,
+    /// nothing is sent, and A's own wait still ends by itself.
+    #[tokio::test]
+    async fn two_agents_awaiting_each_other_do_not_deadlock() {
+        let (s, _dir) = fake_state("cycle");
+        let (a, ha) = agent(&s, "a");
+        let (b, hb) = agent(&s, "b");
+        wire(&s, a, b);
+        wire(&s, b, a);
+        // B is stopped, so A's message is never delivered: A waits for real.
+        let a_waits = tokio::spawn(msg(State(s.clone()), ha, ask("b", "hello", Some(3), false)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while messages_to(&s, b).is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let started = std::time::Instant::now();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            msg(
+                State(s.clone()),
+                hb,
+                ask("a", "back at you", Some(60), false),
+            ),
+        )
+        .await
+        .expect("B's ask must be answered at once, not hang")
+        .expect_err("a cycle of waits must be refused");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert_eq!(refused.1, "await_cycle");
+        assert!(
+            refused.2.contains("a is already waiting on you"),
+            "{}",
+            refused.2
+        );
+        assert!(messages_to(&s, a).is_empty(), "a refused ask sends nothing");
+
+        let (_, Json(v)) = a_waits.await.unwrap().unwrap();
+        assert_eq!(v["outcome"], "timeout");
+        assert!(
+            s.supervisor.begin_await(b, a).is_ok(),
+            "once A's wait is over, B may ask A"
+        );
+    }
+
+    /// ADVERSARY 046 for results: the wire is re-checked at disclosure.
+    #[tokio::test]
+    async fn a_wire_revoked_while_waiting_withholds_the_result() {
+        let (s, _dir) = fake_state("revoke");
+        let (a, ha) = agent(&s, "a");
+        let (b, _) = agent(&s, "b");
+        wire(&s, a, b);
+        parked(&s, b);
+        let waiting = tokio::spawn(msg(
+            State(s.clone()),
+            ha,
+            ask(
+                "b",
+                "<<FAKE:SLEEP=2>><<FAKE:REPLY=the secret plan>>",
+                Some(60),
+                false,
+            ),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !messages_to(&s, b)
+            .iter()
+            .any(|m| m.state == wheel_core::MessageState::Delivered)
+        {
+            assert!(std::time::Instant::now() < deadline, "never delivered");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        {
+            let conn = s.db.lock().unwrap();
+            board::remove_wire(&conn, a, b, WireType::Send).unwrap();
+        }
+        let err = waiting
+            .await
+            .unwrap()
+            .expect_err("the result must be withheld");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(!err.2.contains("the secret plan"));
+        stop_all(&s, &[b]).await;
+    }
+
+    #[tokio::test]
+    async fn sent_answers_only_the_node_that_sent_the_message() {
+        let (s, _dir) = fake_state("sent");
+        let (a, ha) = agent(&s, "a");
+        let (b, hb) = agent(&s, "b");
+        wire(&s, a, b);
+        wire(&s, b, a);
+        let (_, Json(receipt)) = msg(State(s.clone()), ha.clone(), ask("b", "hi", None, false))
+            .await
+            .unwrap();
+        let id: uuid::Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
+        let q = || {
+            axum::extract::Query(SentQuery {
+                id: Some(id),
+                wait: None,
+            })
+        };
+
+        let Json(mine) = sent(State(s.clone()), ha, q()).await.unwrap();
+        assert_eq!(mine["outcome"], "pending", "B is stopped: {mine}");
+        let err = sent(State(s.clone()), hb, q())
+            .await
+            .expect_err("the recipient did not send it");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// The realm answers "no token" before it answers "bad request": an
+    /// extractor that rejects first would 400 an anonymous caller, which both
+    /// breaks the realm's contract and describes the route to someone who
+    /// presented nothing.
+    #[tokio::test]
+    async fn sent_is_unauthorized_before_it_is_invalid() {
+        let (s, _dir) = fake_state("sent-auth");
+        let empty = axum::extract::Query(SentQuery {
+            id: None,
+            wait: None,
+        });
+        let err = sent(State(s.clone()), HeaderMap::new(), empty)
+            .await
+            .expect_err("no token, no answer");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        // ...and once a token IS presented, the missing id is a plain 400.
+        let (_a, ha) = agent(&s, "a");
+        let err = sent(
+            State(s),
+            ha,
+            axum::extract::Query(SentQuery {
+                id: None,
+                wait: None,
+            }),
+        )
+        .await
+        .expect_err("a message id is required");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn only_an_agent_can_ask_to_be_notified() {
+        let (s, _dir) = fake_state("notify-script");
+        let (b, _) = agent(&s, "b");
+        let script = Node::new(
+            uuid::Uuid::new_v4(),
+            "cron".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Script(wheel_core::ScriptConfig {
+                language: wheel_core::ScriptLanguage::Python,
+                source: "print('hi')".into(),
+                timeout_secs: None,
+            }),
+        );
+        let token = {
+            let conn = s.db.lock().unwrap();
+            board::create(&conn, &script).unwrap();
+            board::add_wire(&conn, script.id, b, WireType::Send, None).unwrap();
+            crate::db::tokens::mint(&conn, script.id).unwrap().plaintext
+        };
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let err = msg(State(s.clone()), h, ask("b", "x", None, true))
+            .await
+            .expect_err("a script has no process to notify");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(messages_to(&s, b).is_empty());
+    }
+}
+
 /// docs/wow-agent-brief.md #6: nothing above `db::board::budget_exceeded`'s own
 /// unit layer ever called this handler before this, so a route that dropped a
 /// field or leaked another agent's spend would have shipped green.
@@ -1063,13 +1685,16 @@ mod usage_tests {
                 to: "peer".into(),
                 body: "hello".into(),
                 reply_to: None,
+                await_secs: None,
+                notify: false,
             }),
         )
         .await
         .expect("the send is accepted");
 
+        let receipt_id: uuid::Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
         let conn = state.db.lock().unwrap();
-        let stored = crate::db::messages::get(&conn, receipt.id)
+        let stored = crate::db::messages::get(&conn, receipt_id)
             .unwrap()
             .expect("the row exists");
         assert_eq!(

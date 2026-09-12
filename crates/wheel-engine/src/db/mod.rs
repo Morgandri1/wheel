@@ -91,6 +91,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     // already exists.
     add_column(conn, "vault_values", "expires_at TEXT")?;
     add_column(conn, "messages", "on_behalf_of TEXT")?;
+    add_column(conn, "agent_state", "resets_at TEXT")?;
+    add_column(conn, "agent_state", "resume_at TEXT")?;
+    add_column(conn, "agent_state", "quota TEXT")?;
+    add_column(conn, "agent_state", "fallback_until TEXT")?;
+    add_column(
+        conn,
+        "messages",
+        "limit_requeues INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // 0 = not requested, 1 = requested, 2 = sent. See messages::claim_notification.
+    add_column(conn, "messages", "notify INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "messages", "result TEXT")?;
     snap_positions_to_cells(conn)?;
     Ok(())
 }
