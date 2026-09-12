@@ -127,14 +127,35 @@ measured (not re-derived here — citing rather than duplicating):
   1's zero — Shape 1 at least confines the blast radius of "sees and can signal every process" to
   one container's pid namespace; Shape 2 has no pid namespace at all, so that blast radius is the
   whole host.
-- **gVisor/Firecracker: structurally does not apply, and adopting either would partially undo
-  "native."** Both are container/VM runtimes — something has to hand them a container or a VM
-  boundary to enforce. A bare `systemd` unit running a process tree is neither. Wrapping `wheeld`
-  itself in a gVisor/Firecracker sandbox to get this protection back would mean running it as (or
-  inside) a container again — which is most of what "go native" was for. This is not a cost line in
-  a table; it is a **structural incompatibility** between Shape 2 as designed and "wrap execution in
-  a stronger-than-namespaces sandbox" as a mitigation. Worth stating plainly rather than leaving a
-  blank cell that reads as "not costed yet."
+- **gVisor structurally does not apply, and adopting it would partially undo "native"** — this half
+  of the original claim holds without qualification. gVisor needs an OCI runtime slot
+  (`--runtime=runsc`) to invoke it at all; there is no container being created for it to attach to
+  once `wheeld` is just `exec`'d directly by systemd. Wrapping `wheeld` in a gVisor sandbox to get
+  this protection back means running it AS a container again, undoing most of what "go native" was
+  for.
+- **Firecracker is a genuinely different case — ADVERSARY's correction, not fully "does not apply."**
+  "Native" and "no VM boundary" got merged into one claim above, and only one of them is actually
+  forced. #67's real value isn't "no container" in the abstract — it is systemd's OWN mechanisms
+  (`OOMPolicy=continue`, real cgroup resource limits, `wheeld` updating its own root-owned binary,
+  `ufw` being authoritative), and none of that requires bare metal specifically — it requires systemd
+  running AS PID 1 with real cgroups v2 underneath it. **A Firecracker microVM gives exactly that**:
+  it boots a real guest kernel, so `#67`'s entire measured systemd directive set
+  (`ProtectKernelModules`, `ProtectClock`, the empty `CapabilityBoundingSet=`, all of it) works
+  unmodified inside the guest — from `wheeld`'s own perspective it IS native, because a real kernel
+  is what "native" was ever asking for. **"Native-in-Firecracker"** keeps `#67`'s systemd wins AND
+  gets Firecracker's escape-resistance argument applied to the whole thing, rather than the two being
+  mutually exclusive. Contingent on the SAME KVM-availability question that already gates plain
+  Firecracker (§"Recommendation" below) — this does not remove that blocker, it changes what's on the
+  other side of it if KVM is present. **Not yet verified by anyone actually booting it** — this
+  document can name the reconciliation, it cannot confirm systemd-as-PID-1 inside a Kata/Firecracker
+  guest behaves identically to bare metal for every directive #67 measured; that needs a real boot,
+  not a reading of either codebase.
+- **The same reconciliation does NOT confidently extend to gVisor — named, not leaned on.** gVisor's
+  Sentry is a partial userspace reimplementation of the syscall surface, and a full init system
+  running its own service manager with real cgroups v2 device/resource controllers is much shakier
+  compatibility ground than "run one containerized process," which is gVisor's actual design center.
+  A real unknown, not a claim either way — someone would have to try booting `wheeld`-under-`systemd`
+  inside `runsc` to know, and this document does not have that answer.
 
 ### Shape 3 — `wheeld` converges on `wheel-host`'s per-project sandbox architecture (hypothetical)
 
@@ -226,27 +247,35 @@ per-project sandbox if it earns one).
 ### The tension Morgan should see stated, not discover after (PM's ask, directly)
 
 **PR #67 and "sandbox escape prevention is paramount" pull in opposite directions on ONE specific
-axis, and agree on another.** They agree that Shape 1 as currently deployed is under-hardened (no
-resource limits at all; #67's own §1 says so) and that both proposals' compose/systemd-level
-hardening are real, cheap wins worth taking regardless of which shape wins. They disagree on the
-namespace question: promoting Shape 2 to the default, as #67 proposes, is **a downgrade on the
-escape-to-host axis specifically** — trading a real pid/network/mount namespace boundary (Shape 1)
-for systemd directives that recover most of the filesystem story and, by #67's OWN admission, none
-of the process-visibility or network-reachability story. It is simultaneously an upgrade on other
-axes that matter (resource limits that prevent one agent from taking the whole box down; a cleaner,
-measured, honestly-scored hardening posture; less operational surprise from Docker's iptables
-interaction with `ufw`). And it forecloses gVisor/Firecracker as an escape-hardening path outright,
-structurally, not as a matter of cost.
+axis IF Shape 2 means bare metal — but that may not be forced (ADVERSARY's later correction, see
+§"Shape 2" above).** They agree that Shape 1 as currently deployed is under-hardened (no resource
+limits at all; #67's own §1 says so) and that both proposals' compose/systemd-level hardening are
+real, cheap wins worth taking regardless of which shape wins. Read strictly — `wheeld` as a bare
+`systemd`-managed process on the host's own kernel — promoting Shape 2 to the default is **a
+downgrade on the escape-to-host axis specifically**: trading a real pid/network/mount namespace
+boundary (Shape 1) for systemd directives that recover most of the filesystem story and, by #67's
+OWN admission, none of the process-visibility or network-reachability story, while gaining real
+resource limits Shape 1 lacks entirely. **"Native-in-Firecracker" — running #67's entire measured
+systemd hardening pass as PID 1 inside a Firecracker guest kernel, rather than on the bare host — is
+a real reconciliation path, not a forced choice, IF Firecracker clears the same KVM-availability
+check and boot-validation this document already gates it on elsewhere.** If it works, `wheeld` keeps
+every one of #67's systemd wins (`OOMPolicy=continue`, cgroup limits, `ufw` authority) AND gains a
+genuine kernel-separation escape boundary, rather than trading one for the other. Not yet verified —
+someone has to actually boot it — so this does not resolve the tension today, it names the shape a
+resolution could take.
 
-**If "sandbox escape prevention is paramount" is the standing priority, Shape 2 becoming the
-default is a decision that trades away part of what that priority is asking for, in exchange for
-real gains on a different axis (resource limits, operational clarity).** That may still be the
-right call — a systemd-confined process with real resource limits and no runaway-agent blast radius
-is a legitimate, defensible posture, and #67's own measurement discipline is exactly what this
-document has been asking for throughout. But it is Morgan's tradeoff to make with the axis named,
-not one that should get decided by which PR merges first while the other is mid-review. **Recommend
-against merging either #67 (promoting Shape 2 to default) or a Shape-3 commitment until this
-specific question — does the default deployment keep a namespace boundary, and is that boundary
+**If "sandbox escape prevention is paramount" is the standing priority, and native-in-Firecracker
+turns out not to be viable (KVM absent, or systemd-as-PID-1 inside a guest does not actually behave
+like bare metal for #67's directive set), Shape 2 becoming the default on bare metal is a decision
+that trades away part of what that priority is asking for, in exchange for real gains on a different
+axis (resource limits, operational clarity).** That may still be the right call — a systemd-confined
+process with real resource limits and no runaway-agent blast radius is a legitimate, defensible
+posture, and #67's own measurement discipline is exactly what this document has been asking for
+throughout. But it is Morgan's tradeoff to make with the axis named, not one that should get decided
+by which PR merges first while the other is mid-review, and not one that should be treated as forced
+before native-in-Firecracker has actually been tried. **Recommend against merging either #67
+(promoting Shape 2 to default) or a Shape-3 commitment until this specific question — does the
+default deployment keep a namespace boundary, and is that boundary
 worth more than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
 
 Shape 1's compose hardening (§§1–2 below) is a different decision: it improves Shape 1 without
