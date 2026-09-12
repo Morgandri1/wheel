@@ -46,6 +46,26 @@ pub async fn put_value(
         // nothing, which is the worst of both.
         return Err(ApiError::invalid("an empty value is not a secret"));
     }
+    // A refreshable login only ever comes from a sign-in the engine ran
+    // itself. One pasted in here — a laptop's own store, say — has another
+    // live holder that will spend the same single-use refresh token, and the
+    // loser of that race is wiped.
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_writable",
+            format!(
+                "{key} is stored only by signing in (auth/complete with save_to_vault); \
+                 it cannot be written directly"
+            ),
+        ));
+    }
+    // Under any key name: an agent can export whatever it can read.
+    if s.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly
+        && body.value.contains("sk-ant-oat")
+    {
+        return Err(ApiError::policy_denied("an OAuth token"));
+    }
 
     let warning = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
@@ -112,6 +132,27 @@ pub(crate) fn store_in_vault_until(
     // returned once the write itself has succeeded.
     let known = cfg.keys.iter().any(|k| k == key);
     let mut warning = None;
+    // Two keys in ONE vault that reach a child as the same variable (a
+    // refreshable login and a bare token). The session's own save removes the
+    // bare token itself, so only the other direction is refused here.
+    if !known && key != wheel_core::CLAUDE_OAUTH_SESSION {
+        let twin = crate::vault::list_keys(conn, vault)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .into_iter()
+            .find(|k| k != key && crate::vault::slot(k) == crate::vault::slot(key));
+        if let Some(twin) = twin {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "ambiguous_credential",
+                format!(
+                    "ambiguous credential {key}: {} already holds {twin}, which reaches its \
+                     agents as {}",
+                    node.name,
+                    crate::vault::slot(&twin)
+                ),
+            ));
+        }
+    }
     if !known {
         for agent in crate::vault::agents_reading(conn, vault)
             .map_err(|e| ApiError::internal(e.to_string()))?
@@ -177,23 +218,34 @@ pub async fn delete_value(
 ) -> ApiResult<StatusCode> {
     {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let node = board::get(&conn, id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
-        let mut cfg = match node.config.clone() {
-            wheel_core::NodeConfig::Vault(v) => v,
-            _ => return Err(ApiError::invalid("not a vault node")),
-        };
-        crate::vault::delete(&conn, id, &key).map_err(|e| ApiError::internal(e.to_string()))?;
-        cfg.keys.retain(|k| k != &key);
-        let mut updated = node.clone();
-        updated.config = wheel_core::NodeConfig::Vault(cfg);
-        board::update(&conn, &updated).map_err(ApiError::from)?;
+        remove_from_vault(&conn, id, &key)?;
     }
     s.events.publish(wheel_core::Event::BoardChanged {
         at: wheel_core::Timestamp::now(),
     });
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a value and drop its name from the vault's declared keys, so the
+/// two cannot disagree about what the vault holds.
+pub(crate) fn remove_from_vault(
+    conn: &rusqlite::Connection,
+    vault: Uuid,
+    key: &str,
+) -> ApiResult<()> {
+    let node = board::get(conn, vault)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(vault.to_string()))?;
+    let mut cfg = match node.config.clone() {
+        wheel_core::NodeConfig::Vault(v) => v,
+        _ => return Err(ApiError::invalid("not a vault node")),
+    };
+    crate::vault::delete(conn, vault, key).map_err(|e| ApiError::internal(e.to_string()))?;
+    cfg.keys.retain(|k| k != key);
+    let mut updated = node.clone();
+    updated.config = wheel_core::NodeConfig::Vault(cfg);
+    board::update(conn, &updated).map_err(ApiError::from)?;
+    Ok(())
 }
 
 /// `GET /v1/vault/:id` — key NAMES only.

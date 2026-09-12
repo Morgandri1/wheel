@@ -315,6 +315,83 @@ impl LoginSessions {
     }
 }
 
+/// How long the CLI may take to renew a login before it is called failed.
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What the CLI or the token server says about a refresh token that will
+/// never work again. Anything else is treated as worth another try.
+const DEAD_REFRESH_MARKERS: &[&str] = &[
+    "invalid_grant",
+    "invalid_refresh_token",
+    "expired_refresh_token",
+    "revoked",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshFailure {
+    /// The CLI's own words, with the refresh token redacted out of them.
+    pub reason: String,
+    /// The refresh token is dead; retrying cannot help, a person must sign in.
+    pub permanent: bool,
+}
+
+/// Renew a login by having the CLI do it: `claude auth login` with
+/// `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, run in `dir`, which the CLI writes the
+/// renewed store into.
+///
+/// Claude Code performs the token exchange with its own client, exactly as it
+/// does in-process; Wheel only decides when. The refresh token travels in the
+/// environment, never argv, which any uid can read.
+pub async fn refresh_via_cli(
+    program: &str,
+    dir: &Path,
+    refresh_token: &str,
+    scopes: &[String],
+    timeout: Duration,
+) -> Result<(), RefreshFailure> {
+    let transient = |reason: String| RefreshFailure {
+        reason,
+        permanent: false,
+    };
+    let mut cmd = crate::supervisor::child_command(program);
+    cmd.args(["auth", "login"])
+        .env("CLAUDE_CONFIG_DIR", dir)
+        .env("HOME", dir)
+        .env("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", refresh_token)
+        .env("CLAUDE_CODE_OAUTH_SCOPES", scopes.join(" "))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .map_err(|e| transient(format!("could not start {program}: {e}")))?;
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => {
+            return Err(transient(format!(
+                "the CLI did not finish renewing the login within {}s",
+                timeout.as_secs()
+            )))
+        }
+        Ok(Err(e)) => return Err(transient(format!("waiting for the CLI failed: {e}"))),
+        Ok(Ok(out)) => out,
+    };
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let said = crate::vault::redact(&said, &[refresh_token.to_string()]);
+    let lower = said.to_ascii_lowercase();
+    Err(RefreshFailure {
+        permanent: DEAD_REFRESH_MARKERS.iter().any(|m| lower.contains(m)),
+        reason: clean(&said),
+    })
+}
+
 /// Decide what happened to a submitted code, without waiting for an exit that
 /// may never come.
 ///

@@ -55,10 +55,19 @@ pub enum HarnessAuthPolicy {
     /// engine binary never changes an existing board's behaviour.
     #[default]
     OauthToken,
-    /// OAuth-shaped credentials are refused on every surface (auth/complete,
-    /// vault PUT, and — the gate that actually holds, since an agent can
-    /// self-provision one via its own shell — at spawn and on the periodic
-    /// re-check while running).
+    /// OAuth-shaped credentials are refused on every surface:
+    ///
+    /// * `auth/begin` answers `403 policy_denied` before any login child
+    ///   exists;
+    /// * `auth/complete` refuses `code`, `setup_token` and an OAuth-shaped
+    ///   `api_key` (`api/agent_routes.rs`);
+    /// * vault `PUT` refuses an `sk-ant-oat` value under any key
+    ///   (`api/vault_routes.rs`);
+    /// * refreshable logins are never renewed;
+    /// * and — the gate that actually holds, since an agent can self-provision
+    ///   one via its own shell — spawn refuses one in the node's own dir or
+    ///   from a wired vault, and a periodic re-check covers the node's dir
+    ///   while it runs.
     ApiKeyOnly,
 }
 

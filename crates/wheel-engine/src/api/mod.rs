@@ -83,6 +83,19 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg)
     }
+
+    /// Refused by this deployment's `WHEEL_HARNESS_AUTH`, not by anything the
+    /// caller got wrong — so it names the policy and what to use instead.
+    pub fn policy_denied(what: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "policy_denied",
+            format!(
+                "this project is api-key-only: {what} is not permitted here; \
+                 store an API key instead"
+            ),
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -406,6 +419,18 @@ pub struct PatchNode {
 /// without also exercising `WHEEL_VAULT_KEY` parsing.
 #[cfg(test)]
 pub(crate) fn test_state() -> AppState {
+    test_state_with(crate::config::HarnessAuthPolicy::default(), None, |_| {})
+}
+
+/// As [`test_state`], on a chosen `WHEEL_HARNESS_AUTH`, optionally driving a
+/// harness other than the real `claude` (the QA fake), with a last look at the
+/// supervisor before it is shared.
+#[cfg(test)]
+pub(crate) fn test_state_with(
+    harness_auth: crate::config::HarnessAuthPolicy,
+    harness: Option<Arc<dyn crate::harness::Harness>>,
+    tweak: impl FnOnce(&mut crate::supervisor::Supervisor),
+) -> AppState {
     use base64::Engine;
 
     let cfg = Arc::new(Config {
@@ -417,16 +442,19 @@ pub(crate) fn test_state() -> AppState {
         json_logs: false,
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
-        harness_auth: crate::config::HarnessAuthPolicy::default(),
+        harness_auth,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());
+    let mut supervisor = match harness {
+        Some(h) => {
+            crate::supervisor::Supervisor::with_harness(cfg.clone(), db.clone(), events.clone(), h)
+        }
+        None => crate::supervisor::Supervisor::new(cfg.clone(), db.clone(), events.clone()),
+    };
+    tweak(&mut supervisor);
     AppState {
-        supervisor: Arc::new(crate::supervisor::Supervisor::new(
-            cfg.clone(),
-            db.clone(),
-            events.clone(),
-        )),
+        supervisor: Arc::new(supervisor),
         cfg,
         db,
         events,

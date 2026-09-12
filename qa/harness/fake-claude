@@ -85,6 +85,136 @@ SENTINELS = [d for d in (fake_opt("WHEEL_FAKE_ENV_SENTINELS", "env_sentinels") o
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
+# ------------------------------------------------------------- fake token store
+# Opt-in (`token_store` in the fake config): a JSON file standing in for the
+# token server, so refresh can be tested without a real account. It mints
+# access/refresh pairs with a short lifetime, ROTATES refresh tokens (single
+# use), and answers every turn by checking the access token the child holds --
+# the properties the engine's refresh broker has to survive. Never touches a
+# real ~/.claude: it writes only into $CLAUDE_CONFIG_DIR.
+TOKEN_STORE = fake_opt("WHEEL_FAKE_TOKEN_STORE", "token_store")
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+class _StoreLock:
+    def __enter__(self):
+        import fcntl
+        self.fh = open(TOKEN_STORE + ".lock", "a")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def store_load():
+    try:
+        with open(TOKEN_STORE) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    for k in ("access", "refresh"):
+        st.setdefault(k, {})
+    st.setdefault("lifetime_ms", 3600 * 1000)
+    st.setdefault("rotate", True)
+    st.setdefault("refreshes", 0)
+    st.setdefault("counter", 0)
+    return st
+
+
+def store_save(st):
+    tmp = TOKEN_STORE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, TOKEN_STORE)
+
+
+def store_mint(st, account, scopes):
+    st["counter"] += 1
+    n = st["counter"]
+    access = "sk-ant-oat01-fake-%s-%d" % (account, n)
+    refresh = "sk-ant-ort01-fake-%s-%d" % (account, n)
+    exp = _now_ms() + int(st["lifetime_ms"])
+    st["access"][access] = {"exp": exp, "account": account}
+    st["refresh"][refresh] = {"account": account, "scopes": scopes}
+    return access, refresh, exp
+
+
+def write_cli_store(account, access, refresh, exp, scopes, claimed_account=None):
+    """What the real CLI leaves in $CLAUDE_CONFIG_DIR after a login."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        die("CLAUDE_CONFIG_DIR is not set", 2)
+    os.makedirs(cfg, exist_ok=True)
+    cred = os.path.join(cfg, ".credentials.json")
+    with open(cred, "w") as fh:
+        json.dump({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh,
+                                     "expiresAt": exp, "scopes": scopes,
+                                     "subscriptionType": "max"}}, fh)
+    os.chmod(cred, 0o600)
+    who = claimed_account or account
+    with open(os.path.join(cfg, ".claude.json"), "w") as fh:
+        json.dump({"hasCompletedOnboarding": True,
+                   "oauthAccount": {"accountUuid": who, "organizationUuid": "org-of-" + who,
+                                    "emailAddress": who + "@wheel.test"}}, fh)
+
+
+def refresh_login(refresh_token):
+    """`CLAUDE_CODE_OAUTH_REFRESH_TOKEN=… claude auth login` — the CLI-native renewal."""
+    scopes = os.environ.get("CLAUDE_CODE_OAUTH_SCOPES")
+    if not scopes:
+        die("CLAUDE_CODE_OAUTH_SCOPES is required when using CLAUDE_CODE_OAUTH_REFRESH_TOKEN.", 1)
+    if not TOKEN_STORE:
+        die("Login failed: fake-claude has no token_store configured", 1)
+    with _StoreLock():
+        st = store_load()
+        entry = st["refresh"].get(refresh_token)
+        if entry is None:
+            sys.stderr.write("Login failed: Token refresh failed: invalid_grant\n")
+            sys.exit(1)
+        if st["rotate"]:
+            del st["refresh"][refresh_token]
+        access, refresh, exp = store_mint(st, entry["account"], scopes.split())
+        st["refreshes"] += 1
+        store_save(st)
+    # Steering for the tamper test: output claiming a different account.
+    claimed = fake_opt("WHEEL_FAKE_REFRESH_CLAIMS_ACCOUNT", "refresh_claims_account")
+    write_cli_store(entry["account"], access, refresh, exp, scopes.split(), claimed)
+    sys.stdout.write("Login successful.\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def held_access_token():
+    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if tok:
+        return tok
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    try:
+        with open(os.path.join(cfg or "", ".credentials.json")) as fh:
+            return (json.load(fh).get("claudeAiOauth") or {}).get("accessToken")
+    except (OSError, ValueError):
+        return None
+
+
+def token_rejection():
+    """The banner the real CLI prints when its login no longer works, or None."""
+    if not TOKEN_STORE:
+        return None
+    tok = held_access_token()
+    with _StoreLock():
+        entry = store_load()["access"].get(tok or "")
+    if entry is None:
+        return "OAuth token revoked · Please run /login"
+    if entry["exp"] <= _now_ms():
+        return "Login expired · Please run /login"
+    return None
+
 def emit(obj):
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -105,6 +235,9 @@ def auth_login():
     Blocking on stdin forever is deliberate — an ABANDONED login is exactly a child sitting
     here, and that is the process leak the engine's reaping is supposed to prevent.
     """
+    renewing = os.environ.get("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+    if renewing:
+        refresh_login(renewing)
     if fake_opt("WHEEL_FAKE_LOGIN_NO_URL", "login_no_url") == "1":
         die("login failed before it could print a url", 1)
 
@@ -125,7 +258,15 @@ def auth_login():
         die("OAuth error: invalid code", 1)
 
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if cfg:
+    if cfg and TOKEN_STORE:
+        account = fake_opt("WHEEL_FAKE_LOGIN_ACCOUNT", "login_account") or "acct-A"
+        scopes = ["user:inference", "user:profile"]
+        with _StoreLock():
+            st = store_load()
+            access, refresh, exp = store_mint(st, account, scopes)
+            store_save(st)
+        write_cli_store(account, access, refresh, exp, scopes)
+    elif cfg:
         try:
             os.makedirs(cfg, exist_ok=True)
             cred = os.path.join(cfg, ".credentials.json")
@@ -482,6 +623,17 @@ def run_shell(b64):
 
 
 def respond(user_text, turn, session_id, model, stream):
+    rejected = token_rejection()
+    if rejected:
+        # What the real CLI does with a dead login in stream-json mode: the turn
+        # comes back as an error result and the process keeps waiting.
+        if stream:
+            emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                  "result": rejected, "session_id": session_id, "num_turns": turn,
+                  "duration_ms": 1, "total_cost_usd": 0.0, "uuid": str(uuid.uuid4())})
+        else:
+            sys.stdout.write(rejected + "\n"); sys.stdout.flush()
+        return
     d = directives(user_text)
     if "SH_B64" in d:
         d["REPLY"] = run_shell(d["SH_B64"])

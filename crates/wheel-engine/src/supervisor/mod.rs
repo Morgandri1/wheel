@@ -123,6 +123,7 @@ impl StartupTail {
 
 pub mod git_creds;
 mod prompt;
+mod refresh;
 pub mod workspace;
 pub use prompt::compose_prompt;
 
@@ -149,6 +150,9 @@ struct Running {
     /// board's `turns` a triangular series — three turns would read as six.
     counted_turns: u64,
     counted_usd: f64,
+    /// The vault login this child was started on, if it runs on one. A renewal
+    /// since then means it holds a token on its way out.
+    credential_gen: Option<refresh::CredentialGen>,
 }
 
 /// How long an agent gets to exit on SIGTERM when the engine shuts down, before SIGKILL.
@@ -307,6 +311,7 @@ pub struct Supervisor {
     /// Set when shutdown begins: from then on nothing starts and no new message is written.
     closing: AtomicBool,
     shutdown_drain_ms: AtomicU64,
+    pub(crate) broker: refresh::Broker,
 }
 
 impl Supervisor {
@@ -357,6 +362,7 @@ impl Supervisor {
             events,
             closing: AtomicBool::new(false),
             shutdown_drain_ms: AtomicU64::new(SHUTDOWN_DRAIN.as_millis() as u64),
+            broker: refresh::Broker::default(),
         }
     }
 
@@ -525,14 +531,43 @@ impl Supervisor {
     /// an agent whose credential is fine.
     fn lapsed_credential(&self, agent: Uuid, harness: wheel_core::Harness) -> Option<String> {
         let conn = self.db.lock().ok()?;
-        let (vault, _key, expires_at) =
+        let (vault, key, expires_at) =
             crate::vault::credential_detail(&conn, agent, harness).ok()??;
+        // A refreshable login's expiry is a renewal deadline, not a lapse:
+        // `start` renews it instead of refusing on it.
+        if key == wheel_core::CLAUDE_OAUTH_SESSION {
+            return None;
+        }
         let expires_at = expires_at?;
         (expires_at.into_inner() <= time::OffsetDateTime::now_utc()).then(|| {
             format!(
                 "the credential from vault {vault} expired at {expires_at}; \
                  sign in again, or store a `claude setup-token` token which does not expire"
             )
+        })
+    }
+
+    /// Does a wired vault hand this agent an OAuth credential of any shape: a
+    /// refreshable login, a `CLAUDE_CODE_OAUTH_TOKEN`, or an `sk-ant-oat` value
+    /// under any other name (an agent can export any key it can read)?
+    fn vault_supplies_oauth(&self, agent: Uuid) -> bool {
+        let conn = self.db.lock().unwrap();
+        if crate::vault::session_vault_for(&conn, agent)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+        let Some(vk) = self.vault_key() else {
+            return false;
+        };
+        crate::vault::env_for_agent(&conn, vk, agent).is_ok_and(|env| {
+            env.iter().any(|(k, v)| {
+                k == "CLAUDE_CODE_OAUTH_TOKEN"
+                    || crate::auth::classify_token(v, wheel_core::Harness::Claude)
+                        == wheel_core::CredentialKind::OauthToken
+            })
         })
     }
 
@@ -610,8 +645,9 @@ impl Supervisor {
         }
 
         // docs/proposals/wheel-harness-auth.md, enforcement point 4: the gate
-        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT` (API's
-        // half) can refuse an OAuth-shaped credential before it is ever
+        // that actually holds. `auth/begin`/`auth/complete`/vault `PUT`
+        // (api/agent_routes.rs, api/vault_routes.rs) refuse an OAuth-shaped
+        // credential before it is ever
         // stored, but an agent is untrusted code with a shell and can write
         // one itself (`claude auth login`/`claude setup-token`) without going
         // through any of those routes. Spawn is the one point that inspects
@@ -619,7 +655,9 @@ impl Supervisor {
         // the point that cannot be bypassed.
         if self.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly {
             let config_dir = self.cfg.creds_dir().join(agent.to_string());
-            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness) {
+            if crate::auth::is_oauth_shaped(&config_dir, agent_cfg.harness)
+                || self.vault_supplies_oauth(agent)
+            {
                 let reason = "this project is api-key-only: an OAuth-shaped credential is not \
                                permitted here, store an API key instead"
                     .to_string();
@@ -627,6 +665,27 @@ impl Supervisor {
                 return Ok(AgentStatus::Error);
             }
         }
+
+        // A refreshable vault login is renewed BEFORE the child starts if it is
+        // near its end, so no child is ever handed a token about to die. If it
+        // cannot be renewed and has already lapsed, this is `needs_auth` with
+        // the reason, and the message that woke the agent stays queued.
+        let session_vault = {
+            let conn = self.db.lock().unwrap();
+            crate::vault::session_vault_for(&conn, agent)
+                .ok()
+                .flatten()
+        };
+        let credential_gen = match session_vault {
+            Some(vault) => {
+                if let Err(reason) = self.ensure_fresh(vault, None).await {
+                    self.set_status(agent, AgentStatus::NeedsAuth, Some(reason));
+                    return Ok(AgentStatus::NeedsAuth);
+                }
+                Some((vault, self.session_generation(vault)))
+            }
+            None => None,
+        };
 
         let run_dir = self.cfg.node_run_dir(agent);
         std::fs::create_dir_all(&run_dir)?;
@@ -862,6 +921,7 @@ impl Supervisor {
             consecutive_user: 0,
             counted_turns: 0,
             counted_usd: 0.0,
+            credential_gen,
         });
         drop(guard);
 
@@ -1486,6 +1546,7 @@ impl Supervisor {
                             r.counted_usd += du;
                             (dt, du)
                         });
+                        let gen = g.as_ref().and_then(|r| r.credential_gen);
                         drop(g);
 
                         let over_budget = if let Some((dt, du)) = spend {
@@ -1570,7 +1631,10 @@ impl Supervisor {
                         if environmental {
                             // Nothing more can run until credentials exist, and
                             // draining the queue into the same failure would
-                            // requeue every message in turn for no reason.
+                            // requeue every message in turn for no reason --
+                            // unless the vault already holds a newer login, or
+                            // this one merely ran out and can be renewed once.
+                            self.recover_from_auth_failure(agent, gen).await;
                             continue;
                         }
 
@@ -1582,6 +1646,12 @@ impl Supervisor {
                             if let Err(e) = self.clear_context(agent).await {
                                 tracing::warn!(agent = %agent, error = %e, "ephemeral restart failed");
                             }
+                        } else if !is_error && self.credential_stale(gen.as_ref()) {
+                            // Between turns is the one moment a child can be
+                            // swapped without losing work: the vault's login
+                            // was renewed while this turn ran, so the next
+                            // message goes to a child holding the new token.
+                            self.recycle(agent).await;
                         } else {
                             let _ = self.pump_queue(agent).await;
                             // Nothing left to do: start counting down. If the
@@ -2020,6 +2090,11 @@ fn set_status_db(
 
 /// Forget the resumable session, so the next start is a NEW context rather
 /// than a `--resume` of the one being discarded.
+fn current_status(db: &Mutex<rusqlite::Connection>, agent: Uuid) -> AgentStatus {
+    let conn = db.lock().unwrap();
+    board::agent_state(&conn, agent).unwrap_or_default().status
+}
+
 fn clear_session(conn: &rusqlite::Connection, agent: Uuid) {
     let _ = conn.execute(
         "UPDATE agent_state SET session_id = NULL WHERE node_id = ?1",

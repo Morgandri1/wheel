@@ -213,16 +213,365 @@ pub struct StoredOauth {
     /// Milliseconds since the epoch, when the store says so. `None` means the
     /// store did not say -- NOT that the token is durable.
     pub expires_at: Option<i64>,
+    /// Set only by a route that received the credential as a kind that is
+    /// durable by definition (`setup_token`, `api_key`). Nothing read out of a
+    /// store sets it: a missing expiry there is a failure to read.
+    pub durable: bool,
 }
 
 impl StoredOauth {
-    /// Long-lived tokens from `claude setup-token` carry the `oat` marker and
-    /// no expiry. A session access token is the other thing this can find, and
-    /// the caller has to be able to tell them apart before copying one into a
-    /// vault that five other agents will read.
-    pub fn is_long_lived(&self) -> bool {
-        self.expires_at.is_none() && self.token.starts_with(OAUTH_TOKEN_PREFIX)
+    pub fn durable(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            expires_at: None,
+            durable: true,
+        }
     }
+
+    /// Durable only when the caller SAID so. The caller has to tell a durable
+    /// credential from a session one before copying it into a vault five other
+    /// agents read, and "the store did not mention an expiry" is not evidence
+    /// of either.
+    pub fn is_long_lived(&self) -> bool {
+        self.durable && self.expires_at.is_none()
+    }
+}
+
+/// A directory removed when this is dropped, on every path out — an early
+/// `?` and a cancelled future included — so a captured or renewed login is
+/// never left on disk anywhere but the (encrypted) vault.
+pub struct ScratchDir(pub PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The CLI's own credential store inside a config dir it was pointed at.
+const CLI_STORE_FILE: &str = ".credentials.json";
+/// The CLI's own config file, which is where it records whose login it is.
+const CLI_CONFIG_FILE: &str = ".claude.json";
+const MAX_STORE_BYTES: u64 = 64 * 1024;
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+/// No refreshed login is trusted to last longer than this. `claude
+/// setup-token` mints a one-year token; anything past that is not a refresh.
+const MAX_HORIZON_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+
+/// Whose login a session is, as far as the CLI recorded it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub account_uuid: Option<String>,
+    pub organization_uuid: Option<String>,
+}
+
+/// A refreshable Claude login: the CLI's `claudeAiOauth` object kept WHOLE,
+/// refresh token included, plus the account it belongs to.
+///
+/// Kept as the CLI's own map rather than a struct of the fields we know, so a
+/// field the CLI adds is carried rather than silently dropped on a round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OauthSession {
+    oauth: serde_json::Map<String, serde_json::Value>,
+    account: Identity,
+}
+
+impl OauthSession {
+    fn text(&self, field: &str) -> Option<&str> {
+        self.oauth
+            .get(field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn access_token(&self) -> Option<&str> {
+        self.text("accessToken")
+    }
+
+    pub fn refresh_token(&self) -> Option<&str> {
+        self.text("refreshToken")
+    }
+
+    /// Milliseconds since the epoch, as the CLI records it.
+    pub fn expires_at(&self) -> Option<i64> {
+        self.oauth.get("expiresAt").and_then(|v| v.as_i64())
+    }
+
+    pub fn scopes(&self) -> Vec<String> {
+        self.oauth
+            .get("scopes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn account(&self) -> &Identity {
+        &self.account
+    }
+
+    /// Everything the engine needs to renew this login without a person: a
+    /// token to run on, a refresh token, the scopes it was issued with (the
+    /// CLI refuses to refresh without them), and a deadline to renew before.
+    pub fn is_refreshable(&self) -> bool {
+        self.access_token().is_some()
+            && self.refresh_token().is_some()
+            && !self.scopes().is_empty()
+            && self.expires_at().is_some()
+    }
+
+    /// What a vault stores: the CLI's object, and whose it is.
+    pub fn to_vault_value(&self) -> String {
+        let mut doc = serde_json::json!({ "claudeAiOauth": self.oauth });
+        let mut account = serde_json::Map::new();
+        if let Some(a) = &self.account.account_uuid {
+            account.insert("accountUuid".into(), a.clone().into());
+        }
+        if let Some(o) = &self.account.organization_uuid {
+            account.insert("organizationUuid".into(), o.clone().into());
+        }
+        if !account.is_empty() {
+            doc["oauthAccount"] = serde_json::Value::Object(account);
+        }
+        doc.to_string()
+    }
+
+    pub fn from_vault_value(raw: &str) -> Result<Self> {
+        let doc: serde_json::Value =
+            serde_json::from_str(raw).context("the stored session is not JSON")?;
+        let oauth = doc
+            .get("claudeAiOauth")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the stored session has no claudeAiOauth object"))?;
+        Ok(Self {
+            oauth,
+            account: identity_in(&doc),
+        })
+    }
+
+    /// The same login as a bare access token, for the paths that still hand
+    /// one out. Never durable: it came out of a store.
+    pub fn as_stored(&self) -> Option<StoredOauth> {
+        Some(StoredOauth {
+            token: self.access_token()?.to_string(),
+            expires_at: self.expires_at(),
+            durable: false,
+        })
+    }
+
+    /// Fill what a refresh legitimately leaves out from the login it renewed.
+    ///
+    /// The CLI records scopes from the token response and account identity
+    /// from a profile fetch; either can be absent without the login being any
+    /// less the same one, and dropping them would make the NEXT refresh
+    /// impossible (no scopes) or unverifiable (no identity).
+    pub fn carry_forward(&mut self, prev: &OauthSession) {
+        if self.scopes().is_empty() && !prev.scopes().is_empty() {
+            self.oauth
+                .insert("scopes".into(), serde_json::json!(prev.scopes()));
+        }
+        if self.account.account_uuid.is_none() {
+            self.account.account_uuid = prev.account.account_uuid.clone();
+        }
+        if self.account.organization_uuid.is_none() {
+            self.account.organization_uuid = prev.account.organization_uuid.clone();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_tests(
+        access: &str,
+        refresh: &str,
+        expires_at: i64,
+        scopes: &[&str],
+        account: Option<&str>,
+    ) -> Self {
+        let oauth = serde_json::json!({
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at,
+            "scopes": scopes,
+            "subscriptionType": "max",
+        });
+        Self {
+            oauth: oauth.as_object().unwrap().clone(),
+            account: Identity {
+                account_uuid: account.map(str::to_string),
+                organization_uuid: account.map(|a| format!("org-of-{a}")),
+            },
+        }
+    }
+}
+
+fn identity_in(doc: &serde_json::Value) -> Identity {
+    let field = |k: &str| {
+        doc.get("oauthAccount")
+            .and_then(|a| a.get(k))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Identity {
+        account_uuid: field("accountUuid"),
+        organization_uuid: field("organizationUuid"),
+    }
+}
+
+/// Read a file only if it is a regular file, opened without following a
+/// symlink, and no bigger than `cap`. `None` when it is not there.
+///
+/// O_NOFOLLOW at open rather than a metadata check first: checking and then
+/// opening leaves a window in which the path can become a link to another
+/// node's store.
+fn read_regular(path: &Path, cap: u64) -> Result<Option<String>> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() > cap {
+        bail!("{} is larger than a credential store can be", path.display());
+    }
+    let mut out = String::new();
+    file.take(cap).read_to_string(&mut out)?;
+    Ok(Some(out))
+}
+
+/// The login the CLI wrote into `dir`, read strictly: its own store file and
+/// nothing else, a regular file, and exactly the `claudeAiOauth` object.
+///
+/// Only ever pointed at a directory the ENGINE created for one login or one
+/// refresh — never at an agent's HOME, which untrusted code can write.
+pub fn read_session(dir: &Path) -> Result<OauthSession> {
+    let raw = read_regular(&dir.join(CLI_STORE_FILE), MAX_STORE_BYTES)?
+        .ok_or_else(|| anyhow::anyhow!("the CLI wrote no credential store"))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).context("the CLI's credential store is not JSON")?;
+    let oauth = doc
+        .get("claudeAiOauth")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the CLI's credential store holds no claude.ai login"))?;
+    let account = read_regular(&dir.join(CLI_CONFIG_FILE), MAX_CONFIG_BYTES)?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|doc| identity_in(&doc))
+        .unwrap_or_default();
+    Ok(OauthSession { oauth, account })
+}
+
+/// Why a refreshed login was not accepted as the successor of the one it
+/// claims to renew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RefreshRejected {
+    #[error("it carries no access token")]
+    NoAccessToken,
+    #[error("its access token is the one it was meant to replace")]
+    SameAccessToken,
+    #[error("it carries no refresh token")]
+    NoRefreshToken,
+    #[error("it carries no expiry")]
+    NoExpiry,
+    #[error("it does not expire later than the login it replaces")]
+    NotNewer,
+    #[error("its expiry is not a plausible one")]
+    Implausible,
+    #[error("it asks for scopes the original login did not have")]
+    ScopeEscalation,
+    #[error("it belongs to a different account")]
+    AccountChanged,
+}
+
+/// The write-back gate: is `next` a plausible renewal of `prev`, the login a
+/// vault is about to hand to every agent that reads it?
+///
+/// Pure, so each refusal is testable on its own. A missing expiry is a
+/// failure to read, never a promotion; an identity is compared wherever
+/// BOTH sides expose it.
+pub fn check_refresh(
+    prev: &OauthSession,
+    next: &OauthSession,
+    now_ms: i64,
+) -> std::result::Result<(), RefreshRejected> {
+    use RefreshRejected as R;
+    let access = next.access_token().ok_or(R::NoAccessToken)?;
+    if prev.access_token() == Some(access) {
+        return Err(R::SameAccessToken);
+    }
+    next.refresh_token().ok_or(R::NoRefreshToken)?;
+    let expires = next.expires_at().ok_or(R::NoExpiry)?;
+    if prev.expires_at().is_some_and(|p| expires <= p) {
+        return Err(R::NotNewer);
+    }
+    if expires <= now_ms || expires > now_ms.saturating_add(MAX_HORIZON_MS) {
+        return Err(R::Implausible);
+    }
+    let allowed = prev.scopes();
+    if next.scopes().iter().any(|s| !allowed.contains(s)) {
+        return Err(R::ScopeEscalation);
+    }
+    let differs = |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(x), Some(y)) if x != y);
+    if differs(&prev.account.account_uuid, &next.account.account_uuid)
+        || differs(
+            &prev.account.organization_uuid,
+            &next.account.organization_uuid,
+        )
+    {
+        return Err(R::AccountChanged);
+    }
+    Ok(())
+}
+
+/// Put a login the engine captured into a node's own config dir, as the
+/// CLI's own store, so that node signs in with it and refreshes it itself.
+///
+/// Written beside the target and renamed over it: renaming replaces a symlink
+/// an agent planted at that path instead of writing through it into whatever
+/// it points at.
+pub fn install_store(from: &Path, node_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(node_dir)?;
+    set_mode(node_dir, 0o700)?;
+    let store = read_regular(&from.join(CLI_STORE_FILE), MAX_STORE_BYTES)?
+        .ok_or_else(|| anyhow::anyhow!("the login left no credential store to install"))?;
+    replace_secret(&node_dir.join(CLI_STORE_FILE), &store)?;
+    let config_target = node_dir.join(CLI_CONFIG_FILE);
+    if std::fs::symlink_metadata(&config_target).is_err() {
+        if let Some(config) = read_regular(&from.join(CLI_CONFIG_FILE), MAX_CONFIG_BYTES)? {
+            replace_secret(&config_target, &config)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_secret(target: &Path, contents: &str) -> Result<()> {
+    let tmp = target.with_extension("wheel-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())?;
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, target).with_context(|| format!("installing {}", target.display()))?;
+    Ok(())
 }
 
 /// Pull a value usable as `CLAUDE_CODE_OAUTH_TOKEN` out of the node's own
@@ -305,6 +654,7 @@ fn find_access_token(v: &serde_json::Value) -> Option<StoredOauth> {
                         return Some(StoredOauth {
                             token: t.to_string(),
                             expires_at: expiry_in(map),
+                            durable: false,
                         });
                     }
                 }
@@ -313,6 +663,7 @@ fn find_access_token(v: &serde_json::Value) -> Option<StoredOauth> {
                     return Some(StoredOauth {
                         token: t.to_string(),
                         expires_at: expiry_in(map),
+                        durable: false,
                     });
                 }
             }
@@ -813,18 +1164,24 @@ mod vault_handoff_tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// A long-lived `claude setup-token` credential has no expiry, and that is
-    /// the difference the caller has to be able to see before handing it to
-    /// five other agents.
+    /// The inversion the handoff asked for. A store entry with an `oat` token
+    /// and no `expiresAt` used to be promoted to "durable" and vaulted for
+    /// every peer with no warning. A field the engine failed to read is not a
+    /// promise; only a route that received a `setup_token` can say durable.
     #[test]
-    fn a_durable_token_is_distinguishable_from_a_session_one() {
+    fn a_store_entry_never_certifies_its_own_durability() {
         let d = dir("durable");
         std::fs::write(
             d.join(".credentials.json"),
             r#"{"accessToken":"sk-ant-oat01-durable"}"#,
         )
         .unwrap();
-        assert!(oauth_token_from_store(&d, None).unwrap().is_long_lived());
+        let found = oauth_token_from_store(&d, None).unwrap();
+        assert_eq!(found.expires_at, None);
+        assert!(
+            !found.is_long_lived(),
+            "no expiry in a store is unknown, not durable"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -929,6 +1286,305 @@ mod vault_handoff_tests {
 }
 
 #[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000_000;
+    const HOUR: i64 = 3_600_000;
+    const SCOPES: &[&str] = &["user:inference", "user:profile"];
+
+    fn prev() -> OauthSession {
+        OauthSession::for_tests(
+            "sk-ant-oat01-old",
+            "sk-ant-ort01-old",
+            NOW + HOUR,
+            SCOPES,
+            Some("acct-A"),
+        )
+    }
+
+    fn next() -> OauthSession {
+        OauthSession::for_tests(
+            "sk-ant-oat01-new",
+            "sk-ant-ort01-new",
+            NOW + 8 * HOUR,
+            SCOPES,
+            Some("acct-A"),
+        )
+    }
+
+    fn with(mut s: OauthSession, field: &str, v: serde_json::Value) -> OauthSession {
+        if v.is_null() {
+            s.oauth.remove(field);
+        } else {
+            s.oauth.insert(field.into(), v);
+        }
+        s
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wheel-session-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_plausible_renewal_of_the_same_login_passes_the_gate() {
+        assert_eq!(check_refresh(&prev(), &next(), NOW), Ok(()));
+        // A server that does not rotate refresh tokens is still renewing.
+        let same_refresh = with(next(), "refreshToken", "sk-ant-ort01-old".into());
+        assert_eq!(check_refresh(&prev(), &same_refresh, NOW), Ok(()));
+        // Identity the refresher could not read is not a different account.
+        let mut unknown = next();
+        unknown.account = Identity::default();
+        assert_eq!(check_refresh(&prev(), &unknown, NOW), Ok(()));
+    }
+
+    /// Every way a write-back can fail to be a renewal of the login a vault is
+    /// about to hand to every peer. Each arm is the gate's only line of
+    /// defence against that shape; the list IS the spec.
+    #[test]
+    fn the_write_back_gate_refuses_everything_that_is_not_a_renewal() {
+        use RefreshRejected as R;
+        let cases: Vec<(&str, OauthSession, R)> = vec![
+            (
+                "no access token",
+                with(next(), "accessToken", serde_json::Value::Null),
+                R::NoAccessToken,
+            ),
+            (
+                "the same access token",
+                with(next(), "accessToken", "sk-ant-oat01-old".into()),
+                R::SameAccessToken,
+            ),
+            (
+                "no refresh token",
+                with(next(), "refreshToken", "".into()),
+                R::NoRefreshToken,
+            ),
+            (
+                "no expiry: a failure to read, not a promotion",
+                with(next(), "expiresAt", serde_json::Value::Null),
+                R::NoExpiry,
+            ),
+            (
+                "an expiry no later than the old one",
+                with(next(), "expiresAt", (NOW + HOUR).into()),
+                R::NotNewer,
+            ),
+            (
+                "an expiry a year and more out",
+                with(next(), "expiresAt", (NOW + 401 * 24 * HOUR).into()),
+                R::Implausible,
+            ),
+            (
+                "a scope the original never had",
+                with(
+                    next(),
+                    "scopes",
+                    serde_json::json!(["user:inference", "org:admin"]),
+                ),
+                R::ScopeEscalation,
+            ),
+            (
+                "another account",
+                OauthSession::for_tests(
+                    "sk-ant-oat01-evil",
+                    "sk-ant-ort01-evil",
+                    NOW + 8 * HOUR,
+                    SCOPES,
+                    Some("acct-EVIL"),
+                ),
+                R::AccountChanged,
+            ),
+        ];
+        for (what, candidate, want) in cases {
+            assert_eq!(
+                check_refresh(&prev(), &candidate, NOW),
+                Err(want),
+                "{what} must be refused"
+            );
+        }
+
+        // The same account in another organisation is a different login too.
+        let mut other_org = next();
+        other_org.account.organization_uuid = Some("org-EVIL".into());
+        assert_eq!(
+            check_refresh(&prev(), &other_org, NOW),
+            Err(R::AccountChanged)
+        );
+        // ...and an expiry already in the past renews nothing.
+        let lapsed = with(prev(), "expiresAt", (NOW - 2 * HOUR).into());
+        let stale_next = with(next(), "expiresAt", (NOW - HOUR).into());
+        assert_eq!(
+            check_refresh(&lapsed, &stale_next, NOW),
+            Err(R::Implausible)
+        );
+    }
+
+    #[test]
+    fn a_vaulted_login_round_trips_whole_including_fields_we_do_not_know() {
+        let s = with(next(), "someFieldAddedLater", serde_json::json!({"x": 1}));
+        let back = OauthSession::from_vault_value(&s.to_vault_value()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.refresh_token(), Some("sk-ant-ort01-new"));
+        assert_eq!(back.account().account_uuid.as_deref(), Some("acct-A"));
+        assert!(OauthSession::from_vault_value("sk-ant-oat01-bare").is_err());
+        assert!(OauthSession::from_vault_value(r#"{"other":{}}"#).is_err());
+    }
+
+    /// Scopes and identity are allowed to be missing from a renewal, but not
+    /// to be LOST by it: without scopes the next renewal is impossible, and
+    /// without identity it is unverifiable.
+    #[test]
+    fn a_renewal_keeps_what_it_left_out_from_the_login_it_renewed() {
+        let mut thin = with(next(), "scopes", serde_json::Value::Null);
+        thin.account = Identity::default();
+        thin.carry_forward(&prev());
+        assert_eq!(thin.scopes(), SCOPES);
+        assert_eq!(thin.account(), prev().account());
+
+        // What the renewal DID say wins.
+        let mut said = next();
+        said.account.account_uuid = Some("acct-A".into());
+        said.carry_forward(&prev());
+        assert_eq!(said.access_token(), Some("sk-ant-oat01-new"));
+    }
+
+    #[test]
+    fn only_a_login_with_everything_needed_to_renew_it_is_refreshable() {
+        assert!(next().is_refreshable());
+        for field in ["accessToken", "refreshToken", "scopes", "expiresAt"] {
+            assert!(
+                !with(next(), field, serde_json::Value::Null).is_refreshable(),
+                "without {field} it cannot be renewed"
+            );
+        }
+        let as_stored = next().as_stored().unwrap();
+        assert_eq!(as_stored.token, "sk-ant-oat01-new");
+        assert!(
+            !as_stored.is_long_lived(),
+            "a store entry is never durable by itself"
+        );
+    }
+
+    fn write_store(d: &Path, access: &str, account: &str) {
+        std::fs::write(
+            d.join(".credentials.json"),
+            serde_json::json!({"claudeAiOauth": {
+                "accessToken": access, "refreshToken": "sk-ant-ort01-x",
+                "expiresAt": NOW, "scopes": SCOPES }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"accountUuid": account,
+                "organizationUuid": format!("org-of-{account}")}})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_cli_store_is_read_with_the_identity_the_cli_recorded() {
+        let d = dir("read");
+        write_store(&d, "sk-ant-oat01-mine", "acct-A");
+        let s = read_session(&d).unwrap();
+        assert_eq!(s.access_token(), Some("sk-ant-oat01-mine"));
+        assert_eq!(s.account().account_uuid.as_deref(), Some("acct-A"));
+        assert_eq!(
+            s.account().organization_uuid.as_deref(),
+            Some("org-of-acct-A")
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Only the CLI's own store path counts. The HOME layout is where a
+    /// fallback write COULD land, which is exactly why a strict read must not
+    /// look there: it is a second place for something else to be.
+    #[test]
+    fn the_strict_read_looks_at_the_clis_own_store_and_nowhere_else() {
+        let d = dir("home-layout");
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        write_store(&d.join(".claude"), "sk-ant-oat01-elsewhere", "acct-A");
+        assert!(read_session(&d).is_err());
+
+        std::fs::write(
+            d.join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-flat"}"#,
+        )
+        .unwrap();
+        let err = read_session(&d).unwrap_err().to_string();
+        assert!(err.contains("no claude.ai login"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A store that is a symlink is somebody else's store. Following it would
+    /// let whoever made the link choose the login that gets read.
+    #[test]
+    fn a_symlinked_store_is_refused_not_followed() {
+        let d = dir("symlink");
+        let elsewhere = dir("symlink-target");
+        write_store(&elsewhere, "sk-ant-oat01-someone-elses", "acct-EVIL");
+        std::os::unix::fs::symlink(
+            elsewhere.join(".credentials.json"),
+            d.join(".credentials.json"),
+        )
+        .unwrap();
+        assert!(read_session(&d).is_err());
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// An agent plants a symlink where its store will go, pointing at another
+    /// node's store. Installing must replace the link, not write through it
+    /// into the other node's credentials.
+    #[test]
+    fn installing_a_login_replaces_a_planted_symlink_rather_than_writing_through_it() {
+        let from = dir("install-from");
+        let node = dir("install-node");
+        let victim = dir("install-victim");
+        write_store(&from, "sk-ant-oat01-installed", "acct-A");
+        std::fs::write(victim.join(".credentials.json"), "victim's own").unwrap();
+        std::os::unix::fs::symlink(
+            victim.join(".credentials.json"),
+            node.join(".credentials.json"),
+        )
+        .unwrap();
+
+        install_store(&from, &node).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(victim.join(".credentials.json")).unwrap(),
+            "victim's own"
+        );
+        assert!(!std::fs::symlink_metadata(node.join(".credentials.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            read_session(&node).unwrap().access_token(),
+            Some("sk-ant-oat01-installed")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(node.join(".credentials.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        for d in [&from, &node, &victim] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+}
+
+#[cfg(test)]
 mod setup_token_tests {
     use super::*;
 
@@ -989,16 +1645,21 @@ mod setup_token_tests {
     /// "this will expire" warning on the vault response.
     #[test]
     fn a_setup_token_is_reported_as_long_lived() {
-        let durable = StoredOauth {
-            token: "sk-ant-oat01-durable".into(),
-            expires_at: None,
-        };
-        assert!(durable.is_long_lived());
+        assert!(StoredOauth::durable("sk-ant-oat01-durable").is_long_lived());
 
         let session = StoredOauth {
             token: "sk-ant-oat01-session".into(),
             expires_at: Some(1799999999000),
+            durable: false,
         };
         assert!(!session.is_long_lived(), "an expiry disqualifies it");
+
+        // Same token, no expiry, but nobody SAID durable: unknown.
+        let unknown = StoredOauth {
+            token: "sk-ant-oat01-durable".into(),
+            expires_at: None,
+            durable: false,
+        };
+        assert!(!unknown.is_long_lived(), "silence is not a promise");
     }
 }

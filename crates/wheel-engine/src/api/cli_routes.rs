@@ -304,6 +304,19 @@ pub async fn secret_get(
     let me = caller(&s, &headers)?;
     let (name, key) = split_address(&q.addr);
     let key = key.ok_or_else(|| ApiError::invalid("secret get needs <vault>/<key>"))?;
+    // The refresh token stays with the engine: an agent holding it would be a
+    // second refresher of a single-use token, and a place it can be stolen
+    // from. Agents already receive the access token as CLAUDE_CODE_OAUTH_TOKEN.
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_readable",
+            format!(
+                "{key} is a sign-in the engine renews; agents receive it as \
+                 CLAUDE_CODE_OAUTH_TOKEN in their environment instead"
+            ),
+        ));
+    }
 
     let vk = s.supervisor.require_vault_key().map_err(ApiError::config)?;
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;

@@ -193,6 +193,33 @@ impl Harness for ClaudeDriver {
     }
 }
 
+/// The Claude driver pointed at another binary — the QA fake — so a test
+/// drives the real argv, env and parsing against a harness it controls.
+#[cfg(test)]
+pub(crate) struct ProgramDriver(pub String);
+
+#[cfg(test)]
+impl Harness for ProgramDriver {
+    fn program(&self) -> &str {
+        &self.0
+    }
+    fn argv(&self, spec: &SpawnSpec) -> Vec<OsString> {
+        ClaudeDriver.argv(spec)
+    }
+    fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+        ClaudeDriver.env(spec)
+    }
+    fn encode_turn(&self, envelope: &str) -> String {
+        ClaudeDriver.encode_turn(envelope)
+    }
+    fn parse_line(&self, line: &str) -> HarnessEvent {
+        ClaudeDriver.parse_line(line)
+    }
+    fn classify_startup_failure(&self, code: Option<i32>, output: &str) -> StartupFailure {
+        ClaudeDriver.classify_startup_failure(code, output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

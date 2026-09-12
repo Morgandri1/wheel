@@ -338,8 +338,27 @@ pub async fn auth_complete(
 ) -> ApiResult<Json<serde_json::Value>> {
     let harness = agent_harness(&s, id)?;
 
+    // `api-key-only`: refused at the door, before anything is stored or any
+    // login child is fed a code, so a cloud project never holds an OAuth
+    // credential even briefly. The spawn gate still backs this up.
+    if api_key_only(&s) {
+        if body.code.is_some() {
+            s.logins.cancel(id).await;
+            return Err(ApiError::policy_denied("an OAuth sign-in"));
+        }
+        if body.setup_token.is_some() {
+            return Err(ApiError::policy_denied("a `claude setup-token` credential"));
+        }
+        let oauth_shaped = body.api_key.as_deref().is_some_and(|k| {
+            crate::auth::classify_token(k, harness) == wheel_core::CredentialKind::OauthToken
+        });
+        if oauth_shaped {
+            return Err(ApiError::policy_denied("an OAuth token"));
+        }
+    }
+
     // Paste-code OAuth: the code goes to the child that `auth/begin` left
-    // waiting, and the CLI writes its own credentials into the node's dir.
+    // waiting, and the CLI writes its own credentials into the staging dir.
     if let Some(code) = body.code {
         return finish_paste_code(
             &s,
@@ -387,10 +406,7 @@ pub async fn auth_complete(
     // thing to want -- so save_to_vault applies here as well.
     let vaulted = match body.save_to_vault.as_deref() {
         Some(vault) => {
-            let found = crate::auth::StoredOauth {
-                token: key.trim().to_string(),
-                expires_at: None,
-            };
+            let found = crate::auth::StoredOauth::durable(key.trim());
             Some(save_credential_to_vault(
                 &s,
                 id,
@@ -414,6 +430,8 @@ pub async fn auth_complete(
         source: None,
         account: None,
         expires_at: None,
+        refreshable: None,
+        warning: None,
     });
     if let Some(v) = vaulted {
         out["vault"] = v;
@@ -459,12 +477,10 @@ async fn finish_setup_token(
 
     let vaulted = match save_to_vault {
         Some(vault) => {
-            // No expiry: that is the point of this credential, and it is what
-            // makes the response carry no warning.
-            let found = crate::auth::StoredOauth {
-                token: token.to_string(),
-                expires_at: None,
-            };
+            // Durable because this route was TOLD so, not because nothing
+            // mentioned an expiry: that is what makes the response carry no
+            // warning.
+            let found = crate::auth::StoredOauth::durable(token);
             Some(save_credential_to_vault(
                 s,
                 id,
@@ -488,6 +504,8 @@ async fn finish_setup_token(
         // A `claude setup-token` credential carries no expiry; saying so is
         // different from saying we do not know.
         expires_at: None,
+        refreshable: None,
+        warning: None,
     });
     if let Some(v) = vaulted {
         body["vault"] = v;
@@ -517,13 +535,51 @@ async fn resume_if_blocked(s: &AppState, id: Uuid) -> ApiResult<()> {
     Ok(())
 }
 
-/// The credential stores speak milliseconds since the epoch; this API speaks
-/// RFC3339 UTC (§2). A value that cannot be represented is dropped rather than
-/// rendered as a wrong time.
-fn millis_to_timestamp(ms: i64) -> Option<wheel_core::Timestamp> {
-    time::OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
-        .ok()
-        .map(wheel_core::Timestamp::from)
+/// A fresh login in a vault un-sticks EVERY agent that reads it, not only the
+/// one that signed in: they were all stopped by the same lapsed login.
+async fn resume_readers_if_blocked(s: &AppState, vault: Uuid) -> ApiResult<()> {
+    let blocked: Vec<Uuid> = {
+        let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+        crate::vault::agents_reading(&conn, vault)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| {
+                board::agent_state(&conn, *a).unwrap_or_default().status
+                    == wheel_core::AgentStatus::NeedsAuth
+            })
+            .collect()
+    };
+    for agent in blocked {
+        resume_if_blocked(s, agent).await?;
+    }
+    Ok(())
+}
+
+fn api_key_only(s: &AppState) -> bool {
+    s.cfg.harness_auth == crate::config::HarnessAuthPolicy::ApiKeyOnly
+}
+
+/// Where a paste-code login writes: a directory the engine made for this one
+/// login, not the node's own HOME.
+///
+/// An agent is untrusted code whose HOME is its config dir, so anything the
+/// engine reads back from there after a login might be something the agent put
+/// there instead. Nothing runs with this directory as its HOME but the login
+/// child, so what is in it afterwards is what the login produced.
+fn login_staging(s: &AppState, id: Uuid) -> std::path::PathBuf {
+    s.cfg.data_dir.join("oauth-staging").join(id.to_string())
+}
+
+fn fresh_login_staging(s: &AppState, id: Uuid) -> ApiResult<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = login_staging(s, id);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    for d in [dir.parent().unwrap_or(&dir), dir.as_path()] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    Ok(dir)
 }
 
 /// The harness an agent node is configured for, or a 404/400 that says why not.
@@ -553,6 +609,11 @@ pub async fn auth_begin(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<wheel_core::AuthBegin>> {
     let harness = agent_harness(&s, id)?;
+    // Before anything is spawned: on `api-key-only` no login session may
+    // exist at all, not one that is refused when it finishes.
+    if api_key_only(&s) {
+        return Err(ApiError::policy_denied("an OAuth sign-in"));
+    }
     if harness != wheel_core::Harness::Claude {
         // Codex signs in by device code, which is a poll rather than a submit
         // and is a different shape end to end. Saying so beats returning a
@@ -564,12 +625,12 @@ pub async fn auth_begin(
     }
 
     s.logins.evict_expired().await;
-    let config_dir = s.cfg.creds_dir().join(id.to_string());
+    let staging = fresh_login_staging(&s, id)?;
     let program = s.supervisor.harness_program().to_string();
 
     let (session, url) = s
         .logins
-        .begin(id, &program, &config_dir)
+        .begin(id, &program, &staging)
         .await
         .map_err(login_error)?;
 
@@ -596,37 +657,42 @@ async fn finish_paste_code(
     if code.trim().is_empty() {
         return Err(ApiError::invalid("the code is empty"));
     }
-    // Before the CLI runs, so anything it writes is newer than this and
-    // anything that was already there is not.
-    let login_started = std::time::SystemTime::now();
     s.logins
         .complete(id, session, code)
         .await
         .map_err(login_error)?;
 
     let harness = agent_harness(s, id)?;
-    let config_dir = s.cfg.creds_dir().join(id.to_string());
-    if !crate::auth::has_stored_credentials(&config_dir, harness) {
-        // The CLI exited happily but wrote nothing we can find. Reporting
-        // success here would leave an agent that looks signed in and fails on
-        // its first turn.
-        return Err(ApiError::new(
+    let staging = crate::auth::ScratchDir(login_staging(s, id));
+    // Read strictly, from the staging dir only: the CLI's own store file, a
+    // regular file, and exactly its claude.ai login. The CLI exiting happily
+    // with nothing readable there is a 502, not an agent that looks signed in
+    // and fails on its first turn.
+    let captured = crate::auth::read_session(&staging.0).map_err(|e| {
+        ApiError::new(
             StatusCode::BAD_GATEWAY,
             "harness_error",
-            "the login reported success but left no credentials",
-        ));
-    }
+            format!("the login reported success but left no usable credentials: {e}"),
+        )
+    })?;
 
+    let mut refreshable = None;
     let vaulted = match save_to_vault {
+        Some(vault) if captured.is_refreshable() => {
+            let (vault_id, out) = save_session_to_vault(s, id, vault, &captured, vault_key)?;
+            s.supervisor.session_saved(vault_id);
+            resume_readers_if_blocked(s, vault_id).await?;
+            refreshable = Some(true);
+            Some(out)
+        }
         Some(vault) => {
-            // Only a credential this login actually produced. The child's HOME
-            // is that directory and an agent is untrusted code, so a file that
-            // was already there is not evidence of anything -- and vaulting it
-            // would hand an agent-chosen token to every peer on the board.
-            let found = crate::auth::oauth_token_from_store(&config_dir, Some(login_started))
-                .map_err(|e| {
-                    ApiError::new(StatusCode::BAD_GATEWAY, "harness_error", e.to_string())
-                })?;
+            let found = captured.as_stored().ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "harness_error",
+                    "the login left no access token",
+                )
+            })?;
             Some(save_credential_to_vault(
                 s,
                 id,
@@ -637,8 +703,14 @@ async fn finish_paste_code(
                 allow_shared_expiry,
             )?)
         }
-        None => None,
+        None => {
+            let config_dir = s.cfg.creds_dir().join(id.to_string());
+            crate::auth::install_store(&staging.0, &config_dir)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            None
+        }
     };
+    drop(staging);
 
     resume_if_blocked(s, id).await?;
 
@@ -648,11 +720,132 @@ async fn finish_paste_code(
         source: None,
         account: None,
         expires_at: None,
+        refreshable,
+        warning: None,
     });
     if let Some(v) = vaulted {
         body["vault"] = v;
     }
     Ok(Json(body))
+}
+
+/// The vault a login may be saved to: it must exist, be a vault, and be one
+/// this agent READS. The wire is the capability here as everywhere else.
+fn target_vault(
+    conn: &rusqlite::Connection,
+    agent: Uuid,
+    vault_name: &str,
+) -> ApiResult<wheel_core::Node> {
+    let vault = board::get_by_name(conn, vault_name)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("no node named {vault_name:?}")))?;
+    if vault.node_type() != wheel_core::NodeType::Vault {
+        return Err(ApiError::invalid(format!("{vault_name} is not a vault")));
+    }
+    let me = board::get(conn, agent)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(agent.to_string()))?;
+    if !me.has_wire(
+        vault.id,
+        wheel_core::WireType::Read,
+        wheel_core::NodeType::Vault,
+    ) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "wire_denied",
+            format!(
+                "no wire from {} to {vault_name} (need: read) -- wire the agent to the vault first",
+                me.name
+            ),
+        ));
+    }
+    Ok(vault)
+}
+
+fn peers_reading(conn: &rusqlite::Connection, vault: Uuid, except: Uuid) -> Vec<String> {
+    crate::vault::agents_reading(conn, vault)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| *a != except)
+        .filter_map(|a| {
+            board::get(conn, a)
+                .ok()
+                .flatten()
+                .map(|n| n.name.to_string())
+        })
+        .collect()
+}
+
+/// Save a refreshable login — refresh token included — for the agents
+/// reading `vault_name`.
+///
+/// The whole login goes in, so the engine can renew it before it lapses
+/// (docs/proposals/harness-oauth-refresh.md). No `shared_expiry` refusal:
+/// ADVERSARY 021's blast radius was a shared expiry, and this one is renewed
+/// rather than allowed to lapse. It supersedes a bare `CLAUDE_CODE_OAUTH_TOKEN`
+/// in the same vault, which would otherwise be a second value for the same
+/// slot.
+fn save_session_to_vault(
+    s: &AppState,
+    agent: Uuid,
+    vault_name: &str,
+    session: &crate::auth::OauthSession,
+    requested_key: Option<&str>,
+) -> ApiResult<(Uuid, serde_json::Value)> {
+    const KEY: &str = wheel_core::CLAUDE_OAUTH_SESSION;
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let vault = target_vault(&conn, agent, vault_name)?;
+
+    // A confirmation, never an instruction (018). Either name the caller may
+    // know it by is accepted; anything else is a caller bug named back to it.
+    if let Some(requested) = requested_key {
+        let agrees = requested.eq_ignore_ascii_case(KEY)
+            || requested.eq_ignore_ascii_case("CLAUDE_CODE_OAUTH_TOKEN");
+        if !agrees {
+            return Err(ApiError::invalid(format!(
+                "this is a refreshable claude.ai login and is stored as {KEY} (agents receive it \
+                 as CLAUDE_CODE_OAUTH_TOKEN), not {requested:?}"
+            )));
+        }
+    }
+
+    let expires_at = session
+        .expires_at()
+        .and_then(crate::vault::millis_to_timestamp);
+    let declared_overlap = crate::api::vault_routes::store_in_vault_until(
+        s,
+        &conn,
+        vault.id,
+        KEY,
+        &session.to_vault_value(),
+        expires_at,
+    )?;
+    let superseded = crate::vault::list_keys(&conn, vault.id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .iter()
+        .any(|k| k == "CLAUDE_CODE_OAUTH_TOKEN");
+    if superseded {
+        crate::api::vault_routes::remove_from_vault(&conn, vault.id, "CLAUDE_CODE_OAUTH_TOKEN")?;
+    }
+
+    let peers = peers_reading(&conn, vault.id, agent);
+    let mut out = serde_json::json!({
+        "name": vault_name,
+        "key": KEY,
+        "exports_as": "CLAUDE_CODE_OAUTH_TOKEN",
+        "stored": true,
+        "refreshable": true,
+    });
+    if let Some(exp) = expires_at {
+        out["expires_at"] = serde_json::json!(exp);
+    }
+    if !peers.is_empty() {
+        out["shared_with"] = serde_json::json!(peers);
+    }
+    if let Some(w) = declared_overlap {
+        out["warning"] = serde_json::json!(w);
+    }
+    Ok((vault.id, out))
 }
 
 /// Copy the credential this login just produced into a vault, so the other
@@ -673,33 +866,10 @@ fn save_credential_to_vault(
     allow_shared_expiry: bool,
 ) -> ApiResult<serde_json::Value> {
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-    let vault = board::get_by_name(&conn, vault_name)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found(format!("no node named {vault_name:?}")))?;
-    if vault.node_type() != wheel_core::NodeType::Vault {
-        return Err(ApiError::invalid(format!("{vault_name} is not a vault")));
-    }
-
     // The wire is the capability here as everywhere else: an agent may only
     // put its credential in a vault it can actually read, or it would be
     // writing into a keyspace it has no relationship with.
-    let me = board::get(&conn, agent)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found(agent.to_string()))?;
-    if !me.has_wire(
-        vault.id,
-        wheel_core::WireType::Read,
-        wheel_core::NodeType::Vault,
-    ) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "wire_denied",
-            format!(
-                "no wire from {} to {vault_name} (need: read) -- wire the agent to the vault first",
-                me.name
-            ),
-        ));
-    }
+    let vault = target_vault(&conn, agent, vault_name)?;
 
     // ADVERSARY 021: a session credential in a SHARED vault strands every
     // reader at once when it lapses -- `lapsed_credential` gates each agent on
@@ -712,17 +882,7 @@ fn save_credential_to_vault(
     // an operator with no CLI cannot run `claude setup-token`, and for them
     // paste-code + save_to_vault is the only way to authenticate a board. The
     // refusal makes it a decision instead of a surprise.
-    let peers: Vec<String> = crate::vault::agents_reading(&conn, vault.id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| *a != agent)
-        .filter_map(|a| {
-            board::get(&conn, a)
-                .ok()
-                .flatten()
-                .map(|n| n.name.to_string())
-        })
-        .collect();
+    let peers = peers_reading(&conn, vault.id, agent);
     if !peers.is_empty() && !found.is_long_lived() && !allow_shared_expiry {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -762,7 +922,9 @@ fn save_credential_to_vault(
 
     // RFC3339, not the store's raw milliseconds: §2 says every time on this
     // API is RFC3339 UTC, and the UI renders this one directly.
-    let expires_at = found.expires_at.and_then(millis_to_timestamp);
+    let expires_at = found
+        .expires_at
+        .and_then(crate::vault::millis_to_timestamp);
     let declared_overlap = crate::api::vault_routes::store_in_vault_until(
         s,
         &conn,
@@ -832,11 +994,23 @@ pub async fn auth_status(
     // several accounts of the same provider. Reporting the pasted one while
     // the vault supplies the value the child actually runs with would be a lie
     // about which account is live.
-    let from_vault = {
+    let (from_vault, session_vault) = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        crate::vault::credential_detail(&conn, id, harness).unwrap_or(None)
+        (
+            crate::vault::credential_detail(&conn, id, harness).unwrap_or(None),
+            crate::vault::session_vault_for(&conn, id).unwrap_or(None),
+        )
     };
-    if let Some((source, _key, expires_at)) = from_vault {
+    if let Some((source, key, expires_at)) = from_vault {
+        // A refreshable login's `expires_at` is when the CURRENT token ends;
+        // the engine renews it before then. The warning is what the operator
+        // must act on, and it arrives before any agent is refused.
+        let (refreshable, warning) = match session_vault {
+            Some(vault) if key == wheel_core::CLAUDE_OAUTH_SESSION => {
+                (Some(true), s.supervisor.refresh_warning(vault))
+            }
+            _ => (None, None),
+        };
         return Ok(Json(serde_json::json!(wheel_core::AuthStatus {
             authenticated: true,
             mode: Some(wheel_core::CredentialKind::Env),
@@ -846,6 +1020,8 @@ pub async fn auth_status(
             // only when there is a real time to show, rather than inventing a
             // deadline for a credential nobody said anything about.
             expires_at,
+            refreshable,
+            warning,
         })));
     }
 
@@ -873,7 +1049,7 @@ pub async fn auth_status(
         crate::auth::oauth_token_from_store(&config_dir, None)
             .ok()
             .and_then(|t| t.expires_at)
-            .and_then(millis_to_timestamp)
+            .and_then(crate::vault::millis_to_timestamp)
     } else {
         None
     };
@@ -884,6 +1060,8 @@ pub async fn auth_status(
         source: None,
         account: None,
         expires_at,
+        refreshable: None,
+        warning: None,
     })))
 }
 
@@ -952,6 +1130,7 @@ mod tests {
         let found = crate::auth::StoredOauth {
             token: "sk-ant-oat01-session".into(),
             expires_at: Some(4_102_444_800_000),
+            durable: false,
         };
 
         let resp = save_credential_to_vault(
