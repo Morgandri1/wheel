@@ -404,6 +404,32 @@ by different mechanisms. Neither has been benchmarked against Wheel's actual wor
 document — the figures below are the mechanisms' own published characteristics, presented so Morgan
 can weigh them against what Wheel needs, not a substitute for a real spike if either is chosen.
 
+**Why Docker was ever in this document, and why the actual target is broader than "escape
+resistance" alone (Morgan, directly):** Docker was suggested because it was the known solution, not
+a preferred one — Morgan does not know what else fits and asked for that to be found out, not
+assumed. The real requirement, at scale, is **micro-isolation per BOARD** (a project — matches the
+per-project framing Shape 3 already uses, not per-agent or per-node), satisfying four concrete needs
+together, not escape-prevention in isolation:
+
+1. **Per-board isolation** — the property this whole section has been costing.
+2. **Networking** — agents need real outbound access (`git`, `npm`, the Anthropic/OpenAI APIs, tool
+   calls), and the control plane needs to stay reachable from `wheel-host` (today, a pathname unix
+   socket per project — §"Shape 3" above).
+3. **Persistent storage** — a board's `/data` (sqlite store, workspaces, vault ciphertext) has to
+   survive the sandbox being torn down and recreated, because that is what a parked-agent resume
+   already is at the process level, and a sandboxing layer that could not resume ITS OWN state on
+   the next message would undo the entire cost model this document keeps returning to.
+4. **Multiplayer** — PR #70 (`shared-projects`) lets more than one human hold a board open at once
+   (admin/prompter/guest tiers, concurrent connections including the live events socket). This is
+   mostly an application-layer property, not a sandbox-mechanism one — any of the options below
+   serve concurrent TCP/unix-socket connections to the engine identically — but it is worth stating
+   as a requirement explicitly, because it is one more confirmation that **per-board** (one sandbox
+   serving every member of that board) is the right granularity, not per-connection or per-human.
+
+Requirements 2 and 3 are where gVisor and Firecracker/Kata actually diverge in COST, not just in
+escape-boundary strength, and neither was priced against them in this document's first draft —
+correcting that here.
+
 **Which shape this table is costing, tying back to the three shapes above:** the integration story
 below (`--runtime=runsc`, `HostConfig.Runtime`) is written against `wheel-host`'s `DockerSandbox`,
 which already runs one container per project — this table applies to it directly, and to Shape 3
@@ -430,6 +456,8 @@ cost.
 | **Mechanism** | Userspace kernel (the "Sentry") intercepts and reimplements the guest's syscalls; no nested virtualization required in its default `ptrace` platform, or KVM-accelerated in its `kvm` platform where available | A real, minimal guest kernel + init inside a purpose-built microVM; the isolation boundary is genuine hardware virtualization (KVM), not syscall interception |
 | **Integration into `wheel-host`** | Like Firecracker/Kata, not tied to Docker specifically — `runsc` is a general OCI runtime. Drop-in under today's Docker orchestration (`--runtime=runsc`, or the per-container `HostConfig.Runtime` field `bollard` already exposes), or equally usable via `containerd`/CRI-O directly if `wheel-host` moves off `bollard` for another reason | Two equally legitimate paths, not one cost line: (a) `--runtime=kata` under today's Docker orchestration, comparable integration effort to gVisor; or (b) bypass Docker/`bollard` entirely and drive `containerd` + Kata (or `firecracker-containerd`) directly from `wheel-host` — a DIFFERENT control plane, not a worse one. Since containerization is the property that matters, not `dockerd` specifically, (b) is worth evaluating on its own terms during the spike — it removes a layer of indirection (`bollard` → `dockerd` → `containerd-shim-kata-v2` → Firecracker collapses to `wheel-host` → `containerd` → Firecracker directly) rather than adding one |
 | **Host requirement** | Works without KVM at all (ptrace platform); KVM used only if present, as an optimization | **Requires KVM** (hardware virtualization exposed to the host). This is the practical blocker worth flagging loudly: `infra/vps/README.md` targets a generic VPS, and nested virtualization is NOT universally offered by VPS/cloud providers — some budget/shared-CPU tiers explicitly disable it. This has to be confirmed for whatever host Wheel actually deploys to before Firecracker is viable at all, independent of every other tradeoff here |
+| **Networking (requirement 2)** | Free, effectively — a gVisor sandbox runs INSIDE the same container/`containerd` network setup that already exists; the outbound path, the veth pair, the bridge, the per-project unix socket for the control plane are all unchanged. gVisor intercepts syscalls, it does not replace the network stack's plumbing | NOT free, but not bespoke either **if Kata specifically is the vehicle rather than raw `firecracker-containerd`**: Kata presents a microVM to its orchestrator as a CNI-compatible container network-wise, so it gets a real virtual NIC, bridging, and outbound NAT automatically, the same shape Kubernetes/`containerd` deployments already rely on in production. Genuinely more machinery per sandbox than gVisor's "inherit what's already there," but it is Kata's problem, already solved, not `wheel-host`'s to build |
+| **Persistent storage (requirement 3)** | Free — a gVisor sandbox mounts the SAME Docker volumes/bind mounts a plain container would; nothing about resuming a parked board's `/data` changes | **The real cost this document had not priced before.** A microVM's guest kernel cannot bind-mount a host directory the way a container's shared kernel can — it needs either **virtio-fs** (a host directory shared into the guest via a `vhost-user-fs` daemon, closest in semantics to what Wheel already does, good performance with DAX, but mediated rather than a raw bind mount) or **virtio-blk** (a dedicated virtual disk image per board — stronger isolation, real operational cost: creating, growing, and backing up N per-board disk image files instead of N directories). Kata supports both; **which one fits a per-board sqlite store + workspace tree at scale is its own open question, not answered by this document** — virtio-fs is the lower-risk default (closer to today's semantics) but needs its own resume-latency and correctness spike, same as the escape-mechanism choice itself |
 | **Published startup overhead** | Modest, additive to an ordinary container start — commonly cited as tens to low-hundreds of milliseconds beyond `runc`, since it is still "start a container," just under a stricter syscall filter | Firecracker's own published figure for booting a minimal guest is ~125ms — but that is kernel+init only; a guest that then needs to bring up Wheel's actual engine+harness environment inside it adds real time on top, likely comparable to or more than gVisor's overhead once the FULL resume path (not just "a VM exists") is counted |
 | **Published memory overhead** | Roughly 10–25MB per sandbox for the Sentry process, on top of the workload's own usage | Firecracker's own design target is ~5MB per microVM for the hypervisor itself — but a full guest kernel + whatever the harness needs resident (not a shared host kernel's page cache) is the real comparison, and that is workload-dependent, not a fixed hypervisor number |
 | **Steady-state overhead** | Syscall-heavy workloads (lots of small I/O) see the most cost — often cited as a meaningful hit on syscall-bound throughput; CPU-bound work (a `cargo build` mostly compiling) is much less affected, since compute itself isn't intercepted | Near-native once running — the guest has its own real kernel, so steady-state syscall cost is not the concern the way it is for gVisor; the cost is entirely at boot and in per-VM fixed memory |
@@ -457,23 +485,41 @@ default.** The reasoning:
   inherited. Many providers offer KVM-capable tiers at a modest cost step up from the cheapest
   shared-CPU instances. Worth confirming for whichever host is actually chosen, not worth treating as
   disqualifying by default.
-- **The honest risk, and the one thing this recommendation is conditional on**, is resume latency —
-  Wheel's parked-agent model pays sandbox-startup cost on every wake, and Firecracker's published
-  ~125ms figure is kernel+init only, not "Wheel's engine and harness are answering." Neither number
-  in the table above is measured against Wheel's real resume path. **If a real spike shows
-  Firecracker's resume cost is unacceptable for the product's UX, gVisor is the correct fallback** —
-  cheaper integration, no KVM precondition, and a meaningfully better security posture than either
-  Shape 1's current cap-drop-only hardening or Shape 2's namespace-free systemd confinement. That
-  would be a real, evidenced reason to step down from the stronger mechanism, not a default settled
-  in advance.
+- **Networking (requirement 2) does not change this recommendation — Kata absorbs the cost, not
+  `wheel-host`.** gVisor's networking is cheaper because it inherits what a container already has;
+  Kata's is not free but is a solved, production-proven problem (the table above), not new
+  engineering. Neither mechanism blocks the other on this axis.
+- **Persistent storage (requirement 3) is the one place this recommendation is genuinely conditional
+  on more than latency.** gVisor's storage story is free (inherited Docker volumes); Kata's needs a
+  real choice between virtio-fs and virtio-blk, priced above, that this document does not resolve.
+  If that spike finds virtio-fs cannot give a per-board sqlite store the durability/consistency
+  guarantees Wheel's own tooling already assumes elsewhere (WAL mode plus `PRAGMA integrity_check`
+  is how #67's own migration script verifies a copied data directory, §10 of `wheeld-native-
+  production.md` — the standard this codebase already holds itself to for "did the data actually
+  survive being moved"), that is an independent, storage-specific reason the recommendation below
+  could still land on gVisor even with escape prevention weighed as paramount — worth being honest
+  that this is a second open variable, not folded silently into the latency spike.
+- **The other honest risk, and the headline condition this recommendation carries**, is resume
+  latency — Wheel's parked-agent model pays sandbox-startup cost on every wake, and Firecracker's
+  published ~125ms figure is kernel+init only, not "Wheel's engine and harness are answering, over
+  whichever storage mechanism was chosen." Neither number in the table above is measured against
+  Wheel's real resume path. **If a real spike shows Kata's resume cost is unacceptable for the
+  product's UX — inclusive of the storage mechanism's own overhead — gVisor is the correct
+  fallback** — cheaper integration, no KVM precondition, storage and networking inherited rather than
+  engineered, and a meaningfully better security posture than either Shape 1's current
+  cap-drop-only hardening or Shape 2's namespace-free systemd confinement. That would be a real,
+  evidenced reason to step down from the stronger mechanism, not a default settled in advance.
 
-**Recommendation: target Firecracker/Kata for whichever of Shape 1 or Shape 3 is chosen as the
-default deployment, contingent on a `runsc`-vs-`kata` resume-latency spike on
-`infra/vps/rehearse.sh`'s stack (or its successor) deciding between them with real numbers instead of
-published ones.** Confirm KVM availability on the target host as part of scoping that spike, not as
-a reason to skip evaluating Firecracker first. This recommendation does not apply to Shape 2 at all —
-native systemd structurally cannot use either mechanism (above), which is itself one more point in
-the tension Morgan should weigh when deciding whether Shape 2 becomes the default.
+**Recommendation: target Kata Containers (Firecracker's production vehicle, not a bespoke
+`firecracker-containerd` build) for whichever of Shape 1 or Shape 3 is chosen as the default
+deployment, contingent on TWO spikes, not one — a `runsc`-vs-`kata` resume-latency measurement on
+`infra/vps/rehearse.sh`'s stack (or its successor) that includes real per-board storage I/O under the
+chosen mechanism, and a virtio-fs-vs-virtio-blk decision for persistent storage specifically, sized
+against Wheel's actual sqlite-plus-workspace-tree access pattern rather than assumed.** Confirm KVM
+availability on the target host as part of scoping the first spike, not as a reason to skip
+evaluating Kata before running it. This recommendation does not apply to Shape 2 at all — native
+systemd structurally cannot use either mechanism (above), which is itself one more point in the
+tension Morgan should weigh when deciding whether Shape 2 becomes the default.
 
 ## Summary — what's asked of whoever reads this next
 
@@ -498,13 +544,18 @@ the tension Morgan should weigh when deciding whether Shape 2 becomes the defaul
   (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved. Both are Shape-1
   scoped — they harden the single container, not project-to-project reach within it, and (userns-
   remap specifically) would need re-deriving for Shape 2, where there is no container to remap.
-- The real boundary: gVisor vs. Firecracker costed above, explicitly tied to which shape each one
-  actually wraps — applies to Shapes 1 and 3, structurally does not apply to Shape 2. **Actual
-  recommendation, per Morgan's own instruction not to hedge toward the familiar option: target
-  Firecracker/Kata, gVisor as the evidenced fallback if a real resume-latency spike rules it out.**
-  Firecracker's hardware-virtualization boundary is the category of guarantee "paramount" is asking
-  for; gVisor's syscall-interception layer is real but has its own CVE history, a smaller surface
-  than the shared kernel and not a categorically different kind of boundary. The one open input is
-  measured resume latency against Wheel's actual engine+harness startup, not published kernel-boot
-  numbers — that spike, plus confirming KVM on whichever host is chosen, is what should decide
-  between them, not a default settled here.
+- The real boundary: gVisor vs. Kata/Firecracker costed above against the actual target — per-BOARD
+  micro-isolation plus networking, persistent storage and multiplayer (#70) together, not
+  escape-resistance alone — applies to Shapes 1 and 3, structurally does not apply to Shape 2.
+  **Actual recommendation, per Morgan's own instruction not to hedge toward Docker or the familiar
+  option: target Kata Containers, gVisor as the evidenced fallback.** Kata's hardware-virtualization
+  boundary is the category of guarantee "paramount" is asking for, and it is the vehicle — not
+  bespoke `firecracker-containerd` — because Kata is what makes a microVM satisfy networking and
+  persistent storage as solved, production-proven problems rather than new engineering; gVisor's
+  syscall-interception layer is real but has its own CVE history, and gets its networking/storage
+  cheaply only because it inherits what a container already provides. **Two open inputs, not one**:
+  a resume-latency spike against Wheel's actual engine+harness startup (not published kernel-boot
+  numbers) including real storage I/O, and a virtio-fs-vs-virtio-blk decision for per-board
+  persistent storage sized against Wheel's own sqlite-plus-workspace access pattern. Either spike
+  coming back unfavorable is a real, evidenced reason to land on gVisor instead — not a default
+  settled here.
