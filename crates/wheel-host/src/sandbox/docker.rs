@@ -310,18 +310,17 @@ impl Sandbox for DockerSandbox {
 mod tests {
     use super::*;
 
-    /// Review round 2, finding 2: Docker's own default stop timeout (10s) is shorter than an
-    /// engine's own ~25s shutdown budget (2s HTTP drain + up to 20s draining turns + 3s SIGTERM
-    /// grace for its agents), so leaving it at the default would SIGKILL the container mid-drain.
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn the_engine_stop_grace_covers_its_own_shutdown_budget() {
-        assert!(
-            ENGINE_STOP_GRACE_SECS >= 30,
-            "ENGINE_STOP_GRACE_SECS is {ENGINE_STOP_GRACE_SECS}s, which is not enough room for a \
-             ~25s engine shutdown to finish before being SIGKILLed"
-        );
-    }
+    // Review round 2, finding 2: Docker's own default stop timeout (10s) is shorter than an
+    // engine's own ~25s shutdown budget (2s HTTP drain + up to 20s draining turns + 3s SIGTERM
+    // grace for its agents), so leaving it at the default would SIGKILL the container mid-drain.
+    //
+    // This used to be covered here by a unit test that asserted only on the
+    // `ENGINE_STOP_GRACE_SECS` constant, which stayed green even after a reviewer reverted the
+    // `t:` passed to `stop_container` back to a shorter, hardcoded number — the constant was still
+    // correct, it just was not the number `stop()` used. `stop_asks_the_daemon_for_the_full_engine_
+    // shutdown_grace` in `tests/sandbox_docker_fake.rs` now asserts the value that actually reaches
+    // the daemon on the wire, which a bare unit test in this module cannot: `stop()` talks to a
+    // real (or faked) docker daemon over HTTP, not to anything this file can call directly.
 
     fn docker_404() -> bollard::errors::Error {
         bollard::errors::Error::DockerResponseServerError {

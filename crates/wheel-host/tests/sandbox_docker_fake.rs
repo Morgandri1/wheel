@@ -92,23 +92,26 @@ fn fake_daemon_with(
                 let mut parts = head.split_whitespace();
                 let method = parts.next().unwrap_or("").to_string();
                 let full = parts.next().unwrap_or("").to_string();
-                // Strip the /vX.YY version prefix bollard negotiates, and any query string.
-                let path = full.split('?').next().unwrap_or("").to_string();
                 // Strip only a real version prefix (/v1.43/...). Naively stripping "/v" also eats
                 // the "v" of "/volumes", which is the kind of thing a fake gets wrong quietly.
-                let path = match path.strip_prefix("/v") {
+                let strip_version = |s: &str| match s.strip_prefix("/v") {
                     Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => {
                         match rest.find('/') {
                             Some(i) => rest[i..].to_string(),
-                            None => path.clone(),
+                            None => s.to_string(),
                         }
                     }
-                    _ => path,
+                    _ => s.to_string(),
                 };
+                // `path` (no query string) keys state lookups and recorded bodies; `full` (query
+                // string kept) is what `requests` records, so a test can see e.g. a stop timeout
+                // that only ever travels as `?t=30`.
+                let path = strip_version(full.split('?').next().unwrap_or(""));
+                let full = strip_version(&full);
 
                 let exists = {
                     let mut r = recorder.lock().unwrap();
-                    r.requests.push(format!("{method} {path}"));
+                    r.requests.push(format!("{method} {full}"));
                     if let Some(body) = raw.split("\r\n\r\n").nth(1) {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) {
                             r.bodies.insert(path.clone(), v);
@@ -340,6 +343,32 @@ async fn stop_and_destroy_reach_the_daemon() {
     assert!(joined.contains("POST /containers/"), "stop: {joined}");
     assert!(joined.contains("DELETE /containers/"), "destroy: {joined}");
     assert!(joined.contains("DELETE /volumes/"), "volume: {joined}");
+}
+
+/// Review round 2, finding 2: docker's own default stop timeout (10s) is shorter than the engine's
+/// own ~25s shutdown budget, so `stop()` must ask for a longer one. A prior version of this
+/// coverage lived only as a unit test asserting `ENGINE_STOP_GRACE_SECS >= 30` — a bare constant
+/// that stayed true even after a reviewer reverted the call site in `stop()` back to a shorter,
+/// hardcoded number. This asserts the value that actually reaches the daemon on the wire.
+#[tokio::test]
+async fn stop_asks_the_daemon_for_the_full_engine_shutdown_grace() {
+    let (sock, rec) = fake_daemon("running");
+    let sb = sandbox(&sock);
+    let id = Uuid::new_v4();
+
+    sb.stop(&id).await.unwrap();
+
+    let r = rec.lock().unwrap();
+    let stop_request = r
+        .requests
+        .iter()
+        .find(|req| req.contains("/stop"))
+        .unwrap_or_else(|| panic!("no stop request seen: {:?}", r.requests));
+    assert!(
+        stop_request.contains("t=30"),
+        "stop must ask docker to wait out the engine's full ~25s shutdown budget before \
+         killing it, got {stop_request:?}"
+    );
 }
 
 /// Docker's container states are not our statuses, and the mapping is what the UI shows an
