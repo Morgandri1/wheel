@@ -778,6 +778,9 @@ PATCH  /v1/nodes/:id                      → name/position/config (partial). Re
                                             (its name is embedded in every peer's preamble and in its own session; stop or park it first — the UI disables
                                             rename with that reason). Non-agent nodes rename any time: `t_<name>` tables rename atomically; peers using
                                             the old name get exit 4 (missing) and re-read `wheel connections`. Wires/tokens key on id, never on name.
+PUT    /v1/nodes/:id/content              → replace a ctx node's markdown, and nothing else. The narrow door the `prompter` tier writes
+                                             context through, because PATCH above also carries agent config and a tier may not have powers
+                                             that depend on a request body (docs/proposals/shared-projects.md §2.2a). 400 for any other node type
 DELETE /v1/nodes/:id                      → cascades wires; drops t_ table / chest dir
 POST   /v1/wires      {from,to,type}      → validated against the matrix
 DELETE /v1/wires      {from,to,type}

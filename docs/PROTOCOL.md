@@ -167,7 +167,7 @@ a `400`, not an ignored key: check `features` first.
 
 | Feature id | What it guarantees |
 |---|---|
-| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id` |
+| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id`, `PUT /v1/nodes/:id/content` |
 | `wires` | `POST`/`DELETE /v1/wires` |
 | `messages` | `POST /v1/agents/:id/send` |
 | `inbox` | `GET /v1/agents/:id/inbox`, `GET /v1/agents/:id/inbox/:message_id` |
@@ -190,6 +190,7 @@ Each id is held to its row by a test that calls the routes or creates an agent c
 | `GET /v1/board` | → `{ nodes: NodeWithState[], project: {id, name, capabilities} }` | M1 |
 | `POST /v1/nodes` | `{name, type, config, position}` → `Node` | M1 |
 | `PATCH /v1/nodes/:id` | `{name?, position?, config?}` (partial) → `Node` | M1 |
+| `PUT /v1/nodes/:id/content` | `{markdown}` → `Node` | M1 |
 | `DELETE /v1/nodes/:id` | → `204` | M1 |
 | `POST /v1/wires` | `WireSpec {from,to,type}` → `204` | M1 |
 | `DELETE /v1/wires` | `WireSpec` → `204` | M1 |
