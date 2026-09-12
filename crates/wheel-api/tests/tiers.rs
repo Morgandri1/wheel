@@ -905,6 +905,141 @@ async fn an_email_locked_invite_only_opens_for_that_account() {
     assert_eq!(right, StatusCode::OK);
 }
 
+/// ADVERSARY F4 (PR #70 review verdict): `accept()` used to consume the invite's one use in the
+/// SAME statement that checked the email lock, so the check ran AFTER the use was already spent --
+/// a stranger who opened a forwarded, email-locked link burned it before ever being refused, and
+/// the person it was actually for was then told the invite was already used. Fixed in `a84893b`
+/// ("look first, consume second"), never exercised until now (that commit's own message: "NOT
+/// verified"). Proves the fix directly: a wrong-email attempt is refused AND spends nothing, so the
+/// intended recipient can still redeem the same single-use invite afterward.
+///
+/// Mutation-checked: reverting `accept()` to the single `UPDATE ... uses = uses + 1 ... RETURNING`
+/// (email/role checked on the returned row, after the increment already committed) makes the
+/// intended recipient's own redemption fail with UNAUTHORIZED instead of OK.
+#[tokio::test]
+async fn a_wrong_email_attempt_on_a_locked_invite_does_not_spend_a_use() {
+    let h = harness().await;
+    let (status, invite) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/invites", h.project),
+        Some(&h.creator),
+        Some(json!({"role": "guest", "email": "intended@example.com", "max_uses": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{invite}");
+    let token = invite["token"].as_str().unwrap().to_string();
+
+    // A stranger opens the forwarded link.
+    let (wrong, _) = call(
+        &h.app,
+        "POST",
+        "/v1/invites/accept",
+        Some(&h.outsider),
+        Some(json!({"token": token.clone()})),
+    )
+    .await;
+    assert_eq!(
+        wrong,
+        StatusCode::UNAUTHORIZED,
+        "a mismatched email must be refused"
+    );
+
+    // The one use must still be there for the person the invite was actually sent to.
+    let (intended, _) = signup(&h.app, "intended@example.com").await;
+    let (right, accepted) = call(
+        &h.app,
+        "POST",
+        "/v1/invites/accept",
+        Some(&intended),
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(
+        right,
+        StatusCode::OK,
+        "the wrong attempt must not have spent the invite's one use: {accepted}"
+    );
+}
+
+/// ADVERSARY F5 (PR #70 review verdict): without this, removing somebody from a project was
+/// cosmetic -- the invite link they originally joined with still redeemed and restored their role,
+/// so a revoked member could walk back in as often as they liked. Fixed in `a84893b` alongside F4,
+/// same "never verified" status. Proves it directly: a member joins via invite, is revoked, and
+/// re-presents the SAME still-valid (unexpired, uses remaining) token -- must be refused, and their
+/// access must stay revoked afterward.
+///
+/// Mutation-checked: removing the `was_revoked` check in `accept()` makes the second redemption
+/// succeed and restores the member's access.
+#[tokio::test]
+async fn a_revoked_member_cannot_walk_back_in_with_the_invite_they_joined_on() {
+    let h = harness().await;
+    let (_, invite) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/invites", h.project),
+        Some(&h.creator),
+        Some(json!({"role": "prompter", "max_uses": 5})),
+    )
+    .await;
+    let token = invite["token"].as_str().unwrap().to_string();
+
+    let (member, member_id) = signup(&h.app, "walkback@example.com").await;
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        "/v1/invites/accept",
+        Some(&member),
+        Some(json!({"token": token.clone()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let uri = format!("/v1/projects/{}", h.project);
+    let (status, _) = call(&h.app, "GET", &uri, Some(&member), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the invite must have granted real access"
+    );
+
+    let (status, _) = call(
+        &h.app,
+        "DELETE",
+        &format!("/v1/projects/{}/members/{member_id}", h.project),
+        Some(&h.creator),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(&h.app, "GET", &uri, Some(&member), None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the revocation must have taken"
+    );
+
+    // The SAME token, still unexpired and with uses left, must not walk them back in.
+    let (status, body) = call(
+        &h.app,
+        "POST",
+        "/v1/invites/accept",
+        Some(&member),
+        Some(json!({"token": token})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a revoked member must not be able to re-admit themselves with their old invite: {body}"
+    );
+    let (status, _) = call(&h.app, "GET", &uri, Some(&member), None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "access must still be revoked after the refused re-attempt"
+    );
+}
+
 /// Only an admin lists or creates invites — including *listing*, because an invite's existence and
 /// tier are facts about who is about to gain access.
 #[tokio::test]
