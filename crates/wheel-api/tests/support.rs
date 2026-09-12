@@ -4,6 +4,14 @@
 
 //! Test scaffolding: a throwaway RSA keypair, a JWKS server that counts fetches, and token minting
 //! helpers that can produce *deliberately malformed* tokens.
+//!
+//! `allow(dead_code)` for the same reason `ws_support.rs` carries it: this module is compiled into
+//! every test binary that says `mod support`, and no single one of them uses all of it. Without the
+//! allow, adding a helper for one suite turns every *other* suite's build into a wall of dead-code
+//! warnings — and under `clippy -D warnings` that is a failing gate about nothing.
+
+#![allow(dead_code)]
+
 
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
