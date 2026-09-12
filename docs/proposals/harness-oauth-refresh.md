@@ -512,6 +512,33 @@ test.
     code beneath it (correctly) keys on `Broker::lead` — the exact distinction the comment two
     lines below it draws. Fixed to name the right field.
 
+### Round 3, ADVERSARY's review (comment-only fix)
+
+18. **`renew()`'s "THE RULE for everything below" comment was left stale by item 14 above.** It still
+    said every non-exit-0 outcome permanently kills the refresh token with "nothing to retry into" —
+    directly above code that now retries six of the nine `check_refresh` rejections. ADVERSARY: "a
+    future reader who trusts the comment over the code will 'fix' this by reverting Round 3." Rewritten
+    to say what the code actually does: a `read_session` failure stays `permanent: false, ambiguous:
+    false` (retried on the timer, bounded by the current token's usable life, never by the attempt
+    cap — there is no server signal in a local read failure either way); a store that reads but fails
+    the content gate is split by `is_permanent()`, and even its retryable half is bounded by the
+    attempt cap rather than assumed free, because nothing here can tell whether the exchange that
+    produced it already spent R.
+
+ADVERSARY also verified item 14's mutation-check independently (dropped `ScopeDropped` from the
+permanent arm, watched the test fail, confirmed the fix) and answered a question raised while reviewing
+it: could `NotNewer`/`SameAccessToken` be attacker-influenced under the single-uid gap (037/F007)? Yes
+in principle, but not newly — `check_refresh`'s identity/scope gates run identically on every attempt
+regardless of how many happen, so retrying does not loosen what can be promoted to the vault, only
+whether the engine gives up after one bad read. If anything the OLD single-shot-permanent behavior was
+the easier target for a same-uid attacker wanting to brick a shared login (win one race); the new
+behavior needs up to `max_attempts` wins for the same outcome. Filed as a non-issue, not a residual.
+
+Also noted, pre-existing and explicitly not part of this PR: `carry_forward` backfills `next`'s missing
+account/org identity from `prev` *before* `check_refresh` runs, so `AccountChanged` only fires on a
+candidate that reports a *different* identity — one that omits identity entirely passes. Worth a line
+in the eventual per-node-uid (F007) hardening pass; not a defect #8 fix.
+
 ### Deferred to a follow-up, deliberately (they are real, and none blocks the board)
 
 - `resume_readers_if_blocked` — the documented VPS recovery path — has no test of its own.
