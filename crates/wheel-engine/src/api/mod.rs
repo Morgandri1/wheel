@@ -747,7 +747,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(off.status(), 200);
-        assert!(off.headers().get(UPDATE_HEADER).is_none(), "policy off says nothing");
+        assert!(
+            off.headers().get(UPDATE_HEADER).is_none(),
+            "policy off says nothing"
+        );
     }
 
     #[test]

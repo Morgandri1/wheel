@@ -1,8 +1,9 @@
 # Proposal: auto-update — deliberate, gated, drained runtime updates
 
-Status: **proposed; needs a PM ruling on R1–R7 below.** v1 is implemented on `sdk/auto-update` exactly as
+Status: **proposed; needs a PM ruling on R1–R8 below.** v1 is implemented on `sdk/auto-update` exactly as
 written here, so the ruling can be made against running code rather than a sketch.
-Author: SDK+API builder (auto-update). Date: 2026-09-11.
+Author: SDK+API builder (auto-update). Date: 2026-09-11, revised after #63 (headless-first) and #65 (the
+VPS kit) landed — both changed this design, and the revision is marked where they did.
 
 ## Why
 
@@ -25,11 +26,13 @@ waits for a quiescent point and never kills a turn to get one.
 | Fact | Where | Consequence for this design |
 |---|---|---|
 | The engine bakes its commit at compile time as `WHEEL_BUILD_SHA`; unstamped builds report `unknown`. | `wheel-engine/src/api/mod.rs` `build_id()` | The running SHA already exists. The updater **stamps every build it makes**, so after the first update the running SHA is exact. An unstamped first install falls back to the checkout's `HEAD` and is labelled `assumed`. `sdk/agent-grid-engine`'s `GET /v1/engine` (`EngineInfo.build`) will read the same constant; this branch makes `build_id` public rather than inventing a second one. |
-| `pump_queue` is the only thing that writes a turn to a child, one at a time, guarded by `Running.in_flight`. | `supervisor/mod.rs` | Drain is one flag checked where a turn starts. An in-flight turn is never touched; the next one just doesn't start. No new delivery path. |
+| **#63 already built the drain.** `Supervisor::shutdown` sets `closing` (nothing starts, `pump_queue` writes nothing), waits up to `SHUTDOWN_DRAIN` (20 s) for `turns_in_flight()` to reach zero, SIGTERMs each agent's process group, consumes anything still running as `INTERRUPTED_BY_SHUTDOWN` rather than requeueing it, and leaves every agent **parked** with its session. | `supervisor/mod.rs` | **The update reuses this and adds nothing of its own.** It only has to make that shutdown land on a board where nothing is in flight. So: `pause_turns()` sets the SAME `closing` flag, the updater waits for `busy_agents()` to empty with its own much longer bound, and then the daemon's ordinary shutdown runs. A second "draining" flag was written and deleted: the first time it disagreed with `closing`, a turn would start inside a drain. |
 | wheeld runs each engine as a task in its own process, and every agent child runs as wheeld's uid. | `wheeld/src/embedded.rs`, `SHARED_UID_WARNING` | The updater can reach every engine in-process (no new HTTP surface). But **an agent on wheeld can already rewrite wheeld's binary**. See the threat model: on shared-uid wheeld the controls stop confused agents and remote pushers, not a malicious local agent. |
-| `wheeld` stops on SIGTERM by ending the API; embedded engines are aborted. No drain. | `wheeld/src/lib.rs` `stop_requested`, `EmbeddedSandbox::stop` | `api/headless-first` is adding a clean shutdown (every engine and its children). Until it lands, the apply step calls a small `shutdown` seam in `wheeld` (below); rebasing onto headless-first swaps the body, not the interface. |
+| `wheeld` stops the API, then `sandbox.shutdown_all()` stops every engine, which stops every agent's process group (#63). `wheeld.service` uses `KillMode=mixed`, `TimeoutStopSec=35`; compose gives `stop_grace_period: 35s`. | `wheeld/src/lib.rs`, `infra/vps/` | The update needs no shutdown of its own: it ends serving early, and the existing path does the rest. |
 | Boot parks `run_on_startup` agents and resumes those with queued work; a **parked** agent without `run_on_startup` that has queued work is not resumed until the next message arrives. | `start_configured_agents` | A message queued during a drain would strand behind a parked agent. Boot now also resumes every `Parked` agent with **`queued`** work. It never touches a `delivered` row, so the effectively-once ruling is untouched. |
 | Railway deploys `wheel-host` on every push to main that matches its watch paths. | `infra/railway/README.md` | A Railway driver and deploy-on-push cannot both manage one runtime (see "Drivers"). |
+| **#65 pre-wired this lane's hook points.** `install.sh --updatable` creates `/opt/wheel/src` (checkout), `/opt/wheel/bin` (binaries), `/var/cache/wheel/update` (staging, off the data dir), hands the first two to the `wheel` user, adds them to `ReadWritePaths`, and documents `WHEEL_UPDATE_RESTART=exit` → exit 75 against `Restart=on-failure`. | `infra/vps/install.sh`, `systemd/wheeld.service`, `README.md` | v1 targets this layout exactly, and uses those variable names unchanged. Nothing in `infra/` needs to change for the systemd path. |
+| Self-hosted deployments authenticate the harness with **OAuth plus refresh**, and the refreshed credential is written by the harness child into the node's config dir. | `auth.rs` (`expires_at`), `docs/proposals/wheel-harness-auth.md` | A refresh happens *during a turn*. Waiting for quiescence is therefore also what keeps an update off a live credential refresh — a plain restart has no such guarantee. Nothing in the update path reads, writes or revokes a harness credential. |
 | `main` has no branch protection. | ARCHITECTURE §1 | "CI green on main" is necessary but not sufficient. See T1. |
 
 ## Design
@@ -215,32 +218,57 @@ pub trait UpdateDriver: Send + Sync {
   for that SHA. Swap is a container replace. Rollback is the previous digest. Watchtower-style auto-pull
   must be off for the same reason.
 
-### Composition with `api/headless-first`
+### Composition with #63's shutdown — one mechanism, two callers
 
-headless-first adds loopback-default wheeld, operator tokens, and clean shutdown, where SIGTERM stops every
-engine and its agent children. Apply step 6 calls `wheeld`'s `shutdown(&HostState)`.
+This is the part the implementation changed most, and it made the feature smaller.
 
-- **Today** that function stops the API listener and every embedded engine through the `Sandbox` trait.
-- **After rebase** it becomes headless-first's shutdown. The updater does not care which: by the time it
-  runs, the drain has left no turn in flight and every agent is parked, so a correct shutdown has nothing
-  left to kill.
-- Operator tokens are the natural credential for a future `POST /v1/update` operator route on wheeld's
-  API. v1 does not add one: the hand path is `wheeld update` against the local data dir, which needs no new
-  network surface.
+| | `Supervisor::shutdown` (#63) | An update (this proposal) |
+|---|---|---|
+| Sets | `closing` | the same flag, via `pause_turns()` |
+| Waits | 20 s for turns in flight | `WHEEL_UPDATE_DRAIN_SECS` (default 600 s) for `busy_agents()` to empty |
+| If the wait runs out | SIGTERM anyway; the turn is consumed `INTERRUPTED_BY_SHUTDOWN`, never requeued | **aborts the update**: `resume_turns()`, delivery comes back, the requester is told who was busy, and it is retried later |
+| Ends with | every agent parked, session kept | handing the daemon a build; the daemon then runs exactly the shutdown on the left, which now finds nothing in flight |
 
-### Out of scope for v1, and how each would work
+The two are not alternatives: an update *ends* in that shutdown. What the update adds is the guarantee that
+the shutdown arrives at a quiet board, so its 20 s drain has nothing to drain and its interrupt branch is
+never reached. **The difference in one line: a shutdown must stop, so it may interrupt a turn; an update may
+wait, so it never does.**
 
-- **wheel-web**: `npx wheel-web` pins its version to the API. It would get a `web` component notice from
-  its own check (`npm view wheel-web version` against the running version) and restart its own server. It
+`resume_turns` is the only thing that clears `closing`, and only on the abort path — `shutdown` keeps it
+terminal.
+
+### The operator's live box runs compose, and compose cannot self-update today
+
+The board being handed this feature is at `/opt/wheel-compose` (tunnel mode, wheeld on loopback). In that
+shape wheeld runs in a container from `docker/Dockerfile.wheeld`, and **it cannot replace its own binary**:
+
+- `USER 10001`, while `/usr/local/bin/wheeld` and `/usr/local/bin/wheel` are root-owned.
+- Only `/data` is a volume. A binary swapped anywhere else would not survive `docker compose up --build`,
+  which is what `infra/vps/deploy.sh` runs.
+
+So on the compose path v1 **refuses to start the updater** rather than half-working: `WHEEL_UPDATE_BIN_DIR`
+must contain `wheeld` and `wheel` and must not be writable by other users, and a container that cannot meet
+that fails boot with a message naming the variable. That is the honest answer, and it is the same posture
+`WHEEL_TOOL_ALLOW_HOST` takes in production.
+
+Two ways to give that box self-update, for the infra owner to choose (**R8**) — both are `infra/` and
+`docker/` changes, which this lane does not own and has not made:
+
+1. **Systemd, no Docker** — `infra/vps/install.sh --updatable` already creates exactly the layout v1 wants.
+   This is the shortest path to a self-updating box and needs no new code at all.
+2. **Keep compose, add a bin volume** — mount a `wheel-bin` volume at `/opt/wheel/bin`, seed it from the
+   image on first boot, point the entrypoint at it, and mount the host checkout read-write. Then the same
+   source driver works in the container, which already ships git, cargo and rustc for Wheel-on-Wheel agents.
+   A later `docker compose up --build` supersedes a self-applied update with a build of main, which is the
+   safe direction, but it must be understood rather than discovered.
+
+### Also out of scope for v1
+
+- **wheel-web**: pinned to the API's version; it would check its own npm version and restart its server. It
   has no turns, so no drain.
-- **Multi-tenant wheel-host**: one host process, many tenants' engines as separate processes under
-  separate uids.
-  - The in-process `EngineControl` becomes the same five operations as engine control-plane routes
-    (`POST/GET/DELETE /v1/drain`, `POST /v1/drain/park`, `POST /v1/agents/:id/system`), called by the host
-    with each engine's secret.
-  - The notice travels to engines the way `WHEEL_HARNESS_AUTH` does, as host-owned configuration.
-  - **Tenant agents get the notice only if the operator opts in, and never the request** (T5).
-  - The build never runs in the runtime container; on Railway, Railway builds.
+- **Multi-tenant wheel-host**: the in-process `EngineControl` becomes the same operations as engine
+  control-plane routes, called by the host with each engine's secret. Tenant agents get the notice only if
+  the operator opts in, and never the request (T5).
 
 ## Threat model (ADVERSARY)
 
@@ -281,21 +309,24 @@ self-modifying restart of production. Actors:
 - **R5**: requests only from agent nodes.
 - **R6**: required reviews plus required checks on `main` before any board runs `auto`.
 - **R7**: accept T7 as documented residual until per-node uids.
+- **R8**: which shape the operator's box should take to self-update — systemd (`install.sh --updatable`,
+  works today, no new code) or compose plus a bin volume (an `infra/` + `docker/` change this lane has not
+  made). v1 works on the first as shipped, and refuses loudly on the second.
 
 ## v1 implements vs defers
 
-**Implements:**
-- `source` driver
-- policy, check and CI gate
-- notice on `/v1/cli/*`, in the CLI (stderr and `--json`), and in the MCP bridge
-- `wheel update`, the MCP `update` tool, `POST`/`GET /v1/cli/update`, and `wheeld update [--status]`
-- engine drain (stop starting turns, report in flight, park idle, resume)
-- boot resume of parked agents with queued work
-- the full apply pipeline, the rollback watchdog and the circuit breaker
-- `system` message to the requester, and history rows
+**Implements** (all tested, each gate mutation-checked):
+- the `source` driver: fetch, fast-forward-only inspection, `git archive` build off the data volume with a
+  private `CARGO_TARGET_DIR`, smoke test that proves the built SHA, atomic swap keeping `.prev`, rollback,
+  and a fast-forward of the checkout once the new build is healthy
+- policy, path→component mapping and pertinence, and the CI gate (GitHub Actions check-runs only)
+- the notice on every `/v1/cli/*` answer, in the CLI (one stderr line, never stdout; `--json` field) and in
+  the MCP bridge (once per session per target), plus an MCP `update` tool
+- `wheel update`, `POST`/`GET /v1/cli/update`, and `wheeld update [--status]`
+- `pause_turns`/`resume_turns`/`busy_agents` on #63's `closing`, and boot resume of parked agents with
+  queued work
+- the apply pipeline, the rollback watchdog on a plain OS thread, the circuit breaker, `system` messages to
+  the requester, and history rows
 
-**Defers:**
-- Railway and Docker drivers
-- wheel-web and multi-tenant wheel-host
-- an operator HTTP route, which waits for headless-first's operator tokens
-- swapping `shutdown` for headless-first's, done at rebase
+**Defers**: the Railway and Docker drivers; wheel-web; multi-tenant wheel-host; an operator HTTP route
+(the hand path is `wheeld update`); and the compose-mode infra change in R8.

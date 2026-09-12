@@ -150,7 +150,10 @@ impl Updater {
     }
 
     pub fn status(&self) -> Status {
-        self.status.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn set_status(&self, status: Status) {
@@ -186,7 +189,9 @@ impl Updater {
             });
             (s.request.clone(), s.suspended(now), timed_out)
         });
-        let by_operator = request.as_ref().is_some_and(|r| r.by == Requester::Operator);
+        let by_operator = request
+            .as_ref()
+            .is_some_and(|r| r.by == Requester::Operator);
         if suspended && !by_operator {
             return (UpdateState::Blocked, Some(BlockReason::Suspended));
         }
@@ -239,6 +244,10 @@ impl Updater {
         if self.checking.swap(true, Ordering::SeqCst) {
             return self.status();
         }
+        // Every fetch counts against the interval, including this one: a check
+        // asked for directly still talks to the remote, and a limit that only
+        // counted the lazy path would be a limit on the wrong thing.
+        *self.last_fetch.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.clock.now());
         let status = match self.look().await {
             Ok(s) => s,
             Err(e) => {
@@ -326,14 +335,17 @@ impl Updater {
                 let final_block = c.block.filter(|b| {
                     matches!(b, BlockReason::NotFastForward | BlockReason::DirtyCheckout)
                 });
-                let refusal = final_block.or(c.touches_ci.then_some(BlockReason::CiDefinitionChanged));
+                let refusal =
+                    final_block.or(c.touches_ci.then_some(BlockReason::CiDefinitionChanged));
                 if let Some(b) = refusal {
                     return RequestOutcome::Refused(b.explain().into());
                 }
             }
         }
         let recorded = self.store.update(|s| match &s.request {
-            Some(existing) if existing.by == Requester::Operator || by != Requester::Operator => false,
+            Some(existing) if existing.by == Requester::Operator || by != Requester::Operator => {
+                false
+            }
             _ => {
                 s.request = Some(Request { by, at: now });
                 true
@@ -368,7 +380,11 @@ impl Updater {
     }
 
     /// The daemon's loop: tick now, then every [`TICK`] or when a request wakes it.
-    pub async fn run(self: Arc<Self>, rt: Arc<dyn Runtime>, restart: tokio::sync::oneshot::Sender<Ready>) {
+    pub async fn run(
+        self: Arc<Self>,
+        rt: Arc<dyn Runtime>,
+        restart: tokio::sync::oneshot::Sender<Ready>,
+    ) {
         loop {
             if let Some(ready) = self.tick(rt.as_ref()).await {
                 let _ = restart.send(ready);
@@ -411,7 +427,8 @@ impl Updater {
         if by != Requester::Operator {
             let now = self.clock.now();
             let (suspended, last) = self.store.read(|s| (s.suspended(now), s.last_attempt));
-            let cooling = last.is_some_and(|t| now.saturating_sub(t) < self.policy.cooldown.as_secs());
+            let cooling =
+                last.is_some_and(|t| now.saturating_sub(t) < self.policy.cooldown.as_secs());
             if suspended || cooling || c.touches_ci {
                 return None;
             }
@@ -446,13 +463,16 @@ impl Updater {
         let refusal = c.block.or((c.touches_ci && *by != Requester::Operator)
             .then_some(BlockReason::CiDefinitionChanged));
         if let Some(reason) = refusal {
-            self.finish(by, &c, Outcome::Refused(reason), Vec::new(), rt).await;
+            self.finish(by, &c, Outcome::Refused(reason), Vec::new(), rt)
+                .await;
             return None;
         }
 
         let (driver, target) = (self.driver.clone(), c.target.clone());
         let built = tokio::task::spawn_blocking(move || {
-            let staged = driver.build(&target).map_err(|e| (Outcome::BuildFailed, e))?;
+            let staged = driver
+                .build(&target)
+                .map_err(|e| (Outcome::BuildFailed, e))?;
             driver
                 .smoke(&staged, &target)
                 .map_err(|e| (Outcome::SmokeFailed, e))?;
@@ -468,7 +488,8 @@ impl Updater {
             }
             Err(e) => {
                 tracing::error!(error = %e, "the update build panicked");
-                self.finish(by, &c, Outcome::BuildFailed, Vec::new(), rt).await;
+                self.finish(by, &c, Outcome::BuildFailed, Vec::new(), rt)
+                    .await;
                 return None;
             }
         };
@@ -565,6 +586,16 @@ impl Updater {
         Ok(())
     }
 
+    /// Plant a marker as a finished update would have, for a boot test.
+    #[cfg(test)]
+    pub fn store_pending_for_test(&self, pending: Pending) {
+        self.store.update(|s| s.pending = Some(pending)).unwrap();
+    }
+
+    pub fn pending(&self) -> Option<Pending> {
+        self.store.read(|s| s.pending.clone())
+    }
+
     /// Step 9, before anything else runs on boot.
     pub fn settle_boot(&self) -> Result<BootAction> {
         let pending = self.store.read(|s| s.pending.clone());
@@ -635,7 +666,8 @@ impl Updater {
             .store
             .read(|s| s.history.iter().filter(|r| !r.notified).cloned().collect());
         for row in rows {
-            let told = now.saturating_sub(row.at) > NOTIFY_FOR_SECS || rt.notify(&row.by, message(&row)).await;
+            let told = now.saturating_sub(row.at) > NOTIFY_FOR_SECS
+                || rt.notify(&row.by, message(&row)).await;
             if told {
                 let _ = self.store.update(|s| {
                     for r in s.history.iter_mut().filter(|r| **r == row) {
@@ -684,7 +716,9 @@ pub fn message(row: &Row) -> String {
         }
         Outcome::SmokeFailed => format!("{not_applied}: the new binary failed its smoke test."),
         Outcome::SwapFailed => format!("{not_applied}: it could not be installed."),
-        Outcome::Interrupted => format!("{not_applied}: it was interrupted before it was installed."),
+        Outcome::Interrupted => {
+            format!("{not_applied}: it was interrupted before it was installed.")
+        }
     }
 }
 
@@ -806,6 +840,191 @@ pub fn running_sha(stamped: &str, driver: &dyn UpdateDriver) -> Result<String> {
          Every build the updater makes is stamped, so this is only true until the first update."
     );
     Ok(head)
+}
+
+/// The updater, wired to this daemon: the hook its engines carry, the registry
+/// that reaches them, and the boot decision that runs before anything serves.
+pub struct Lane {
+    updater: Arc<Updater>,
+    registry: Arc<Registry>,
+    restart: policy::Restart,
+    bin_dir: std::path::PathBuf,
+    /// Set when this boot is a new binary that has yet to prove itself.
+    probation: bool,
+    healthy: Arc<AtomicBool>,
+}
+
+impl Lane {
+    /// `None` when `WHEEL_AUTO_UPDATE` is off, which is the default.
+    ///
+    /// Settles the previous update before returning, so a binary that never
+    /// proved healthy is rolled back before it serves anything.
+    pub fn start(data_dir: &std::path::Path) -> Result<Option<Lane>> {
+        let Some(policy) = Policy::from_env(data_dir)? else {
+            return Ok(None);
+        };
+        let driver = Arc::new(driver::SourceDriver::new(&policy));
+        let repo = ci::github_repo_from_url(&driver.git().origin_url().unwrap_or_default())
+            .or_else(|| policy.github_repo.clone());
+        if policy.github_token.is_none() {
+            tracing::error!(
+                "{} is set but {} is not: the CI gate cannot be verified, so no update will be \
+                 applied. Set a token that can read this repository's check runs.",
+                policy::ENV_MODE,
+                policy::ENV_TOKEN
+            );
+        }
+        let ci = Arc::new(ci::GithubChecks::new(
+            repo,
+            policy.github_token.clone(),
+            policy.required_checks.clone(),
+        ));
+        let store = StateStore::open(&data_dir.join("update"))?;
+        let running = running_sha(wheel_engine::build_id(), driver.as_ref())?;
+        let (restart, bin_dir) = (policy.restart, policy.bin_dir.clone());
+        tracing::info!(
+            mode = policy.mode.as_str(),
+            running = %running,
+            repo = %policy.repo.display(),
+            "auto-update is on"
+        );
+        let updater = Updater::new(policy, running, driver, ci, store, Arc::new(SystemClock));
+
+        let lane = Lane {
+            probation: matches!(updater.settle_boot()?, BootAction::Probation),
+            updater,
+            registry: Arc::new(Registry::default()),
+            restart,
+            bin_dir,
+            healthy: Arc::new(AtomicBool::new(false)),
+        };
+        if lane.probation {
+            let (updater, healthy) = (lane.updater.clone(), lane.healthy.clone());
+            let (restart, bin_dir) = (lane.restart, lane.bin_dir.clone());
+            let deadline = lane.updater.policy().health_for;
+            tracing::info!(
+                ?deadline,
+                "this build is on probation until it answers /healthz"
+            );
+            boot::watchdog(deadline, healthy, move || {
+                tracing::error!("the new build did not become healthy in time; rolling back");
+                if let Some(pending) = updater.pending() {
+                    if let Err(e) = updater.roll_back(&pending) {
+                        tracing::error!(error = %format_args!("{e:#}"), "the rollback failed");
+                    }
+                }
+                restart_process(restart, &bin_dir);
+            });
+        }
+        Ok(Some(lane))
+    }
+
+    pub fn hook(&self) -> Arc<dyn wheel_engine::update::UpdateHook> {
+        Arc::new(Hook {
+            updater: self.updater.clone(),
+            registry: self.registry.clone(),
+        })
+    }
+
+    /// Run the updater until it has a build to install. Resolves only then.
+    pub async fn ready(&self) -> Ready {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let updater = self.updater.clone();
+        let registry: Arc<dyn Runtime> = self.registry.clone();
+        tokio::spawn(async move { updater.run(registry, tx).await });
+        match rx.await {
+            Ok(ready) => ready,
+            // The loop ended without a build: nothing more will come from it.
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    /// The new binary answered for itself: keep it, and call off the watchdog.
+    pub fn confirm_healthy(&self) {
+        if !self.probation {
+            return;
+        }
+        self.healthy.store(true, Ordering::SeqCst);
+        if let Err(e) = self.updater.confirm() {
+            tracing::error!(error = %format_args!("{e:#}"), "could not record the update");
+        }
+    }
+
+    pub fn on_probation(&self) -> bool {
+        self.probation
+    }
+
+    /// Install what the drain made safe, then restart onto it. Never returns
+    /// when the restart works.
+    pub fn install_and_restart(&self, ready: &Ready) -> Result<()> {
+        self.updater.install(ready)?;
+        tracing::info!(to = %ready.candidate.target, "installed; restarting onto it");
+        restart_process(self.restart, &self.bin_dir);
+        Ok(())
+    }
+}
+
+/// Become the binary in `bin_dir`, or exit 75 for whatever supervises this one.
+///
+/// `exec` keeps the pid, which is what a systemd unit with `Restart=on-failure`
+/// and a `KillMode=mixed` stop expects to see; `exit` is for a supervisor that
+/// would rather start the process itself (infra/vps/systemd/wheeld.service
+/// documents 75 for exactly this).
+fn restart_process(mode: policy::Restart, bin_dir: &std::path::Path) -> ! {
+    /// `EX_TEMPFAIL`: the exit code infra/vps/systemd/wheeld.service restarts on.
+    const RESTART_EXIT: i32 = 75;
+    if mode == policy::Restart::Exit {
+        std::process::exit(RESTART_EXIT);
+    }
+    use std::os::unix::process::CommandExt;
+    let exe = bin_dir.join("wheeld");
+    let error = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    // exec only returns when it failed, and then this process is still the old
+    // binary with everything already stopped: say so and let the supervisor
+    // start the new one.
+    tracing::error!(exe = %exe.display(), %error, "could not exec the new binary; exiting for the supervisor");
+    std::process::exit(RESTART_EXIT);
+}
+
+/// `wheeld update [--status]`: the operator's hand path, from outside the daemon.
+///
+/// It records a request rather than doing anything itself — the daemon owns the board, and only
+/// the daemon knows when no agent is mid-turn. `--status` reports what the daemon last saw.
+pub fn from_operator(
+    data_dir: &std::path::Path,
+    status_only: bool,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    let mode = policy::mode(&|k| std::env::var(k).ok())?;
+    if mode == Mode::Off {
+        anyhow::bail!(
+            "auto-update is off on this deployment ({}=off, or unset). Set it to prompt or auto \
+             in this daemon's environment (on the VPS kit: /etc/wheel/wheeld.local.env).",
+            policy::ENV_MODE
+        );
+    }
+    let dir = data_dir.join("update");
+    let state = state::peek(&dir);
+    match state.last_notice.as_ref() {
+        Some(notice) => writeln!(out, "{}", notice.line())?,
+        None if state.checked_at.is_some() => writeln!(out, "nothing pertinent to update")?,
+        None => writeln!(out, "the daemon has not checked yet")?,
+    }
+    if let Some(row) = state.history.last() {
+        writeln!(out, "last attempt: {}", message(row))?;
+    }
+    if status_only {
+        return Ok(());
+    }
+    state::write_operator_request(&dir)?;
+    writeln!(
+        out,
+        "requested — the daemon applies it at the next moment no agent is mid-turn, and rolls it \
+         back if the new build does not come up healthy"
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

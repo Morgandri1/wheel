@@ -112,7 +112,9 @@ impl EngineControl for SupervisorControl {
         Box::pin(async move {
             let queued = match self.db.lock() {
                 Ok(conn) => messages::enqueue(&conn, MessageSender::System, agent, body, None)
-                    .map_err(|e| tracing::warn!(%agent, error = %e, "could not queue an update notice"))
+                    .map_err(
+                        |e| tracing::warn!(%agent, error = %e, "could not queue an update notice"),
+                    )
                     .is_ok(),
                 Err(_) => false,
             };

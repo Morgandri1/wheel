@@ -108,7 +108,8 @@ pub struct Sha(String);
 impl Sha {
     pub fn parse(s: &str) -> Option<Sha> {
         let ok = (7..=40).contains(&s.len())
-            && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         ok.then(|| Sha(s.to_string()))
     }
 

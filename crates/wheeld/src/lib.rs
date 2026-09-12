@@ -12,6 +12,7 @@ pub mod embedded;
 pub mod guard;
 pub mod supervise;
 pub mod tokens;
+pub mod update;
 
 pub use config::Settings;
 
@@ -28,12 +29,78 @@ pub async fn run(settings: Settings) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
-    let host = start_host(&data_dir, &keys).await?;
-    let served = serve_api(&settings.bind, &data_dir).await;
+    // Before anything serves: a build installed by the last update either proves itself here or is
+    // rolled back before it can touch a board (docs/proposals/auto-update.md).
+    let lane = update::Lane::start(&data_dir)?.map(Arc::new);
+    let host = start_host(&data_dir, &keys, lane.as_ref().map(|l| l.hook())).await?;
+
+    // An update that has passed every gate and waited for the board to go quiet arrives here. The
+    // API stops serving, and then the SAME shutdown a SIGTERM runs stops every agent.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<update::Ready>();
+    let _no_update = match lane.clone() {
+        Some(lane) => {
+            tokio::spawn(async move {
+                let _ = ready_tx.send(lane.ready().await);
+            });
+            None
+        }
+        // Held, not dropped: a dropped sender resolves its receiver, which would read as "an
+        // update is ready" on a deployment that has no updater at all.
+        None => Some(ready_tx),
+    };
+    if let Some(lane) = lane.clone() {
+        confirm_health_when_serving(&settings.bind, lane);
+    }
+
+    let installing = Arc::new(std::sync::Mutex::new(None));
+    let served = {
+        let installing = installing.clone();
+        serve_api(&settings.bind, &data_dir, async move {
+            match ready_rx.await {
+                Ok(ready) => *installing.lock().unwrap() = Some(ready),
+                Err(_) => std::future::pending().await,
+            }
+        })
+        .await
+    };
     // After the API stops taking requests, before the process exits: every engine stops its
     // agents, whatever ended serving. Nothing this daemon started may outlive it.
     host.sandbox.shutdown_all().await;
+
+    let ready = installing.lock().unwrap().take();
+    if let (Some(lane), Some(ready)) = (lane, ready) {
+        // Swaps the binaries and restarts onto them; only returns if that failed.
+        lane.install_and_restart(&ready)?;
+    }
     served
+}
+
+/// Tell the lane this build works, once it answers its own health check.
+///
+/// The new binary proving itself, rather than anything outside deciding: what matters is that this
+/// process serves, and the honest test of that is a request it answers.
+fn confirm_health_when_serving(bind: &str, lane: Arc<update::Lane>) {
+    if !lane.on_probation() {
+        return;
+    }
+    let port = bind.rsplit_once(':').map(|(_, p)| p.to_string());
+    tokio::spawn(async move {
+        let Some(port) = port else { return };
+        let url = format!("http://127.0.0.1:{port}/healthz");
+        let client = reqwest::Client::new();
+        loop {
+            if client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                lane.confirm_healthy();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
 }
 
 /// The sandbox host, serving, and the engines behind it.
@@ -95,6 +162,10 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
             Ok(())
         }
         config::Action::Run(settings) => run(settings).await,
+        config::Action::Update {
+            data_dir,
+            status_only,
+        } => update::from_operator(&data_dir, status_only, &mut std::io::stdout()),
         config::Action::Token { data_dir, command } => {
             tokens::run(
                 command,
@@ -114,7 +185,11 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
 /// it exercises is the real wiring rather than a rehearsal of it.
 ///
 /// Returns the loopback URL the API should use, and the engines, which the caller stops.
-pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> Result<Host> {
+pub async fn start_host(
+    data_dir: &std::path::Path,
+    keys: &supervise::Keys,
+    update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
+) -> Result<Host> {
     // Loopback only, on a port the OS picks. Nothing outside this machine may reach the host: it
     // is the half of the process that can start and stop any project's engine.
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -125,7 +200,7 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
 
     supervise::apply_defaults(&supervise::composed_env(data_dir, keys, &host_url));
 
-    let (host_state, sandbox) = build_host_state(data_dir)?;
+    let (host_state, sandbox) = build_host_state(data_dir, update)?;
     wheel_host::reconcile_on_boot(&host_state).await;
     tokio::spawn(async move {
         if let Err(e) = wheel_host::serve_on(host_listener, host_state).await {
@@ -142,15 +217,19 @@ pub async fn start_host(data_dir: &std::path::Path, keys: &supervise::Keys) -> R
 /// The host, with engines embedded rather than spawned.
 fn build_host_state(
     data_dir: &std::path::Path,
+    update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
 ) -> Result<(wheel_host::HostState, Arc<embedded::EmbeddedSandbox>)> {
     let cfg = wheel_host::config::Config::from_env().context("host configuration")?;
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
     )?);
-    let sandbox = Arc::new(embedded::EmbeddedSandbox::for_data_dir(
-        data_dir.to_path_buf(),
-        std::time::Duration::from_secs(cfg.start_timeout_secs),
-    )?);
+    let sandbox = Arc::new(
+        embedded::EmbeddedSandbox::for_data_dir(
+            data_dir.to_path_buf(),
+            std::time::Duration::from_secs(cfg.start_timeout_secs),
+        )?
+        .with_update(update),
+    );
     let state = wheel_host::HostState {
         cfg,
         sandbox: sandbox.clone(),
@@ -196,7 +275,11 @@ fn default_public_base(bind: &str) -> String {
     }
 }
 
-async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
+async fn serve_api(
+    bind: &str,
+    data_dir: &Path,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let guard = Arc::new(guard::Guard::from_env(bind));
     let trusted = Arc::new(
         wheel_api::http::client_ip::TrustedProxies::from_env()
@@ -251,7 +334,11 @@ async fn serve_api(bind: &str, data_dir: &Path) -> Result<()> {
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            stop_requested().await;
+            // Either the operator stopping this daemon, or an update ready to replace it.
+            tokio::select! {
+                () = stop_requested() => {}
+                () = stop => tracing::info!("stopping to install an update"),
+            }
             let _ = asked.send(());
         }),
     );

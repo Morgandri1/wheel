@@ -104,7 +104,11 @@ fn json_gets_a_field_and_no_stderr_line() {
     assert_eq!(body["value"], "# exact bytes\n");
     assert_eq!(body["wheel_update"]["target"], "def5678");
     assert_eq!(body["wheel_update"]["components"][1], "cli");
-    assert_eq!(text(&out.stderr), "", "--json carries it as a field instead");
+    assert_eq!(
+        text(&out.stderr),
+        "",
+        "--json carries it as a field instead"
+    );
 }
 
 #[test]
@@ -159,7 +163,11 @@ fn wheel_update_records_a_request_and_says_so_once() {
     let fx = fixture("req");
     let requested = NOTICE.replace("available", "requested");
     let body = format!(r#"{{"requested":true,"already_requested":false,"update":{requested}}}"#);
-    let out = run(&fx, answer("202 Accepted", Some(&requested), &body), &["update"]);
+    let out = run(
+        &fx,
+        answer("202 Accepted", Some(&requested), &body),
+        &["update"],
+    );
     assert!(out.status.success(), "{out:?}");
     let stdout = text(&out.stdout);
     assert!(stdout.starts_with("requested — "), "{stdout}");

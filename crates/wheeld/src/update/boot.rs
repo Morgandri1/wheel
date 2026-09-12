@@ -82,8 +82,14 @@ mod tests {
         assert_eq!(decide(None, &new), Boot::Normal);
         assert_eq!(decide(Some(&pending(0)), &new), Boot::Probation(pending(0)));
         assert_eq!(decide(Some(&pending(1)), &new), Boot::RollBack(pending(1)));
-        assert_eq!(decide(Some(&pending(0)), &old), Boot::Interrupted(pending(0)));
-        assert_eq!(decide(Some(&pending(3)), &old), Boot::Interrupted(pending(3)));
+        assert_eq!(
+            decide(Some(&pending(0)), &old),
+            Boot::Interrupted(pending(0))
+        );
+        assert_eq!(
+            decide(Some(&pending(3)), &old),
+            Boot::Interrupted(pending(3))
+        );
     }
 
     #[test]

@@ -118,12 +118,13 @@ impl Policy {
             None => default_staging(get)?,
         };
         if !staging.is_absolute() {
-            bail!("{ENV_STAGING}={} must be an absolute path", staging.display());
+            bail!(
+                "{ENV_STAGING}={} must be an absolute path",
+                staging.display()
+            );
         }
-        let data = data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| data_dir.to_path_buf());
-        let staged = staging.canonicalize().unwrap_or_else(|_| staging.clone());
+        let data = real_path(data_dir);
+        let staged = real_path(&staging);
         if staged.starts_with(&data) {
             bail!(
                 "{ENV_STAGING}={} is inside the data directory: builds must stay off the data volume",
@@ -192,6 +193,38 @@ fn secs(get: Lookup, key: &str, default: u64) -> Result<Duration> {
             .map(Duration::from_secs)
             .with_context(|| format!("{key}={v:?} must be a whole number of seconds")),
     }
+}
+
+/// The path with every symlink resolved, even when it does not exist yet.
+///
+/// `canonicalize` fails on a path that is not there, and falling back to the raw
+/// path compares two spellings of the same directory — on macOS the data dir
+/// resolves to `/private/var/...` while a staging dir that does not exist yet
+/// stays `/var/...`, and "is it inside the data directory" answers no when the
+/// true answer is yes. Same trap as the size gate's platform key (ARCHITECTURE
+/// §0b): the comparison has to be between like and like.
+fn real_path(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let mut rest = Vec::new();
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        let name = match cursor.file_name() {
+            Some(n) => n.to_owned(),
+            None => break,
+        };
+        rest.push(name);
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
 }
 
 fn default_staging(get: Lookup) -> Result<PathBuf> {
@@ -287,9 +320,11 @@ mod tests {
             assert!(parse(&d, &[(ENV_MODE, v)]).unwrap().is_none(), "{v:?}");
         }
         let none: HashMap<String, String> = HashMap::new();
-        assert!(Policy::from_vars(&|k| none.get(k).cloned(), &d.data, &d.bin)
-            .unwrap()
-            .is_none());
+        assert!(
+            Policy::from_vars(&|k| none.get(k).cloned(), &d.data, &d.bin)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

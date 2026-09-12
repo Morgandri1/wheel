@@ -76,7 +76,10 @@ pub fn evaluate(runs: &[CheckRun], required: &[String]) -> Verdict {
         .map(String::as_str)
         .collect();
     if !missing.is_empty() {
-        return Verdict::Red(format!("required check did not pass: {}", missing.join(", ")));
+        return Verdict::Red(format!(
+            "required check did not pass: {}",
+            missing.join(", ")
+        ));
     }
     Verdict::Green
 }
@@ -115,10 +118,7 @@ impl GithubChecks {
 impl CiGate for GithubChecks {
     async fn verdict(&self, sha: &str) -> Verdict {
         let Some(token) = &self.token else {
-            return Verdict::Unverifiable(format!(
-                "{} is not set",
-                super::policy::ENV_TOKEN
-            ));
+            return Verdict::Unverifiable(format!("{} is not set", super::policy::ENV_TOKEN));
         };
         let Some(repo) = &self.repo else {
             return Verdict::Unverifiable(format!(
@@ -171,8 +171,7 @@ pub fn github_repo_from_url(url: &str) -> Option<String> {
     let (owner, name) = rest.split_once('/')?;
     let ok = |s: &str| {
         !s.is_empty()
-            && s
-                .bytes()
+            && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     };
     (ok(owner) && ok(name)).then(|| format!("{owner}/{name}"))
@@ -234,7 +233,9 @@ mod tests {
     #[test]
     fn a_required_check_that_is_missing_or_skipped_is_red() {
         let skipped = [run("make check", "completed", Some("skipped"), ACTIONS_APP)];
-        assert!(matches!(evaluate(&skipped, &required()), Verdict::Red(r) if r.contains("make check")));
+        assert!(
+            matches!(evaluate(&skipped, &required()), Verdict::Red(r) if r.contains("make check"))
+        );
         let absent = [run("lint", "completed", Some("success"), ACTIONS_APP)];
         assert!(matches!(evaluate(&absent, &required()), Verdict::Red(_)));
     }
@@ -330,7 +331,10 @@ mod tests {
         assert_eq!(gate(&api, Some("tok")).verdict(SHA).await, Verdict::Green);
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].contains(&format!("/repos/o/r/commits/{SHA}/check-runs")), "{seen:?}");
+        assert!(
+            seen[0].contains(&format!("/repos/o/r/commits/{SHA}/check-runs")),
+            "{seen:?}"
+        );
         assert!(seen[0].ends_with("Bearer tok"), "{seen:?}");
     }
 
@@ -339,24 +343,38 @@ mod tests {
     async fn no_token_is_unverifiable_and_asks_nothing() {
         let (api, seen) = github(200, r#"{"total_count":0,"check_runs":[]}"#).await;
         let v = gate(&api, None).verdict(SHA).await;
-        assert!(matches!(&v, Verdict::Unverifiable(why) if why.contains("WHEEL_UPDATE_GITHUB_TOKEN")), "{v:?}");
+        assert!(
+            matches!(&v, Verdict::Unverifiable(why) if why.contains("WHEEL_UPDATE_GITHUB_TOKEN")),
+            "{v:?}"
+        );
         assert!(seen.lock().unwrap().is_empty());
 
         let no_repo = GithubChecks::new(None, Some("tok".into()), required()).with_api(&api);
-        assert!(matches!(no_repo.verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("WHEEL_UPDATE_GITHUB_REPO")));
-        assert!(matches!(gate(&api, Some("t")).verdict("HEAD~1").await, Verdict::Unverifiable(_)));
+        assert!(
+            matches!(no_repo.verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("WHEEL_UPDATE_GITHUB_REPO"))
+        );
+        assert!(matches!(
+            gate(&api, Some("t")).verdict("HEAD~1").await,
+            Verdict::Unverifiable(_)
+        ));
     }
 
     #[tokio::test]
     async fn anything_but_a_clean_answer_is_unverifiable() {
         let (api, _) = github(403, r#"{"message":"rate limited"}"#).await;
-        assert!(matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("403")));
+        assert!(
+            matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("403"))
+        );
 
         let (api, _) = github(200, "not json").await;
-        assert!(matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("parse")));
+        assert!(
+            matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("parse"))
+        );
 
         let (api, _) = github(200, r#"{"total_count":101,"check_runs":[]}"#).await;
-        assert!(matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("101")));
+        assert!(
+            matches!(gate(&api, Some("t")).verdict(SHA).await, Verdict::Unverifiable(w) if w.contains("101"))
+        );
 
         let dead = gate("http://127.0.0.1:1", Some("t")).verdict(SHA).await;
         assert!(matches!(dead, Verdict::Unverifiable(w) if w.contains("unreachable")));

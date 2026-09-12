@@ -808,11 +808,9 @@ pub async fn update_request(
                 "reason": "nothing pertinent to update",
             })),
         )),
-        RequestOutcome::Refused(why) => Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "update_refused",
-            why,
-        )),
+        RequestOutcome::Refused(why) => {
+            Err(ApiError::new(StatusCode::CONFLICT, "update_refused", why))
+        }
     }
 }
 
@@ -1238,8 +1236,17 @@ mod update_tests {
         (state, hook)
     }
 
-    fn node_with_token(state: &AppState, name: &str, config: NodeConfig) -> (uuid::Uuid, HeaderMap) {
-        let node = Node::new(uuid::Uuid::new_v4(), name.parse().unwrap(), Position::default(), config);
+    fn node_with_token(
+        state: &AppState,
+        name: &str,
+        config: NodeConfig,
+    ) -> (uuid::Uuid, HeaderMap) {
+        let node = Node::new(
+            uuid::Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        );
         let id = node.id;
         let token = {
             let conn = state.db.lock().unwrap();
@@ -1275,7 +1282,11 @@ mod update_tests {
             .await
             .unwrap_err();
         assert_eq!((e.0, e.1), (StatusCode::FORBIDDEN, "update_disabled"));
-        assert!(e.2.contains("WHEEL_AUTO_UPDATE"), "name the variable: {}", e.2);
+        assert!(
+            e.2.contains("WHEEL_AUTO_UPDATE"),
+            "name the variable: {}",
+            e.2
+        );
 
         let e = update_status(State(state.clone()), h.clone())
             .await
@@ -1283,7 +1294,10 @@ mod update_tests {
         assert_eq!(e.1, "update_disabled");
 
         let tools = mcp_tools(State(state), h).await.unwrap().0;
-        assert!(!lists_update(&tools), "an off deployment must not offer the tool");
+        assert!(
+            !lists_update(&tools),
+            "an off deployment must not offer the tool"
+        );
     }
 
     #[tokio::test]
@@ -1329,7 +1343,10 @@ mod update_tests {
         let (state, _) = with_hook(RequestOutcome::Refused("suspended".into()));
         let (_, h) = agent(&state);
         let e = update_request(State(state), h).await.unwrap_err();
-        assert_eq!((e.0, e.1, e.2.as_str()), (StatusCode::CONFLICT, "update_refused", "suspended"));
+        assert_eq!(
+            (e.0, e.1, e.2.as_str()),
+            (StatusCode::CONFLICT, "update_refused", "suspended")
+        );
     }
 
     /// An endpoint can start a script, so a script that could ask would hand
@@ -1348,6 +1365,9 @@ mod update_tests {
         );
         let e = update_request(State(state), h).await.unwrap_err();
         assert_eq!((e.0, e.1), (StatusCode::FORBIDDEN, "update_denied"));
-        assert!(hook.asked.lock().unwrap().is_empty(), "nothing may be recorded");
+        assert!(
+            hook.asked.lock().unwrap().is_empty(),
+            "nothing may be recorded"
+        );
     }
 }

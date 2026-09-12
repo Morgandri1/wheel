@@ -29,7 +29,9 @@ async fn stopping_a_project_stops_its_agents_and_everything_they_started() {
     ));
     let dir = wheeld::supervise::prepare_data_dir(&dir).unwrap();
     let keys = wheeld::supervise::Keys::load_or_create(&dir).unwrap();
-    let host = wheeld::start_host(&dir, &keys).await.expect("host starts");
+    let host = wheeld::start_host(&dir, &keys, None)
+        .await
+        .expect("host starts");
     let secret = std::env::var("WHEEL_HOST_SECRET").unwrap();
     let http = reqwest::Client::new();
     let project = Uuid::new_v4();

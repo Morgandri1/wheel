@@ -1060,7 +1060,7 @@ impl Supervisor {
             return Some(left);
         }
 
-        let Some(r) = guard.take() else {
+        let Some(mut r) = guard.take() else {
             // No process to stop: nothing to park, and marking it Parked would
             // claim a saving that was never made.
             return None;
@@ -4812,5 +4812,236 @@ done
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// QA's fake claude (qa/harness/fake-claude): the real stream-json protocol,
+    /// with `<<FAKE:SLEEP=S>>` to hold a turn open for as long as a test needs.
+    fn fake_claude_script() -> String {
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../qa/harness/fake-claude")
+            .canonicalize()
+            .expect("qa/harness/fake-claude exists");
+        format!("#!/bin/sh\nexec python3 '{}' \"$@\"\n", fake.display())
+    }
+
+    struct FakeClaude {
+        program: String,
+    }
+
+    impl Harness for FakeClaude {
+        fn program(&self) -> &str {
+            &self.program
+        }
+        fn argv(&self, spec: &SpawnSpec) -> Vec<std::ffi::OsString> {
+            ClaudeDriver.argv(spec)
+        }
+        fn env(&self, spec: &SpawnSpec) -> Vec<(String, String)> {
+            ClaudeDriver.env(spec)
+        }
+        fn encode_turn(&self, envelope: &str) -> String {
+            ClaudeDriver.encode_turn(envelope)
+        }
+        fn parse_line(&self, line: &str) -> HarnessEvent {
+            ClaudeDriver.parse_line(line)
+        }
+        fn classify_startup_failure(&self, code: Option<i32>, stderr: &str) -> StartupFailure {
+            ClaudeDriver.classify_startup_failure(code, stderr)
+        }
+    }
+
+    async fn holds_a_process(sup: &Supervisor, agent: Uuid) -> bool {
+        sup.slot(agent).await.lock().await.is_some()
+    }
+
+    /// The whole point of applying an update at a quiescent point
+    /// (docs/proposals/auto-update.md): the turn already running finishes and is
+    /// consumed normally, no new turn starts, and the child is still alive when
+    /// the wait ends. Nothing here interrupts anything — an update that cannot
+    /// wait aborts instead, which is `resume_turns`.
+    ///
+    /// On the real harness protocol, because this is the case the fake exists
+    /// for: a turn held open long enough to observe the pause around it.
+    #[tokio::test]
+    async fn an_update_pause_waits_for_the_turn_in_flight_and_never_kills_it() {
+        let (sup, id, dir) = shim_supervisor_driver("pause", &fake_claude_script(), |program| {
+            Arc::new(FakeClaude { program })
+        });
+        // A credential exactly where the harness refreshes one, to show the wait
+        // is also what keeps an update off a live refresh.
+        let creds = sup.cfg.creds_dir().join(id.to_string());
+        std::fs::create_dir_all(&creds).unwrap();
+        let cred_file = creds.join(".credentials.json");
+        std::fs::write(&cred_file, r#"{"refresh":"before"}"#).unwrap();
+
+        let slow = send_user(&sup, id, "<<FAKE:SLEEP=2>>hold this turn open");
+        sup.start(id).await.unwrap();
+        until("the slow turn to be in flight", || {
+            state_and_error(&sup, slow).0 == MessageState::Delivered
+        })
+        .await;
+
+        sup.pause_turns();
+        let behind = send_user(&sup, id, "arrived while the update waited");
+        sup.deliver(id).await.unwrap();
+        assert_eq!(
+            sup.busy_agents().await,
+            vec![id],
+            "the turn in flight is what an update waits on"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !sup.busy_agents().await.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let (state, error) = state_and_error(&sup, slow);
+        assert_eq!(state, MessageState::Consumed, "the turn ran to completion");
+        assert_eq!(error, None, "it completed normally, not as interrupted");
+        assert_ne!(status_of(&sup, id), AgentStatus::Error);
+        assert!(
+            holds_a_process(&sup, id).await,
+            "the child that ran the turn was killed before the wait ended"
+        );
+        assert_eq!(
+            state_and_error(&sup, behind).0,
+            MessageState::Queued,
+            "no new turn starts while an update waits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cred_file).unwrap(),
+            r#"{"refresh":"before"}"#,
+            "an update must not disturb a stored credential"
+        );
+
+        // Aborting puts the board back exactly as it was found.
+        sup.resume_turns().await;
+        until(
+            "the message that waited out the pause to be handled",
+            || state_and_error(&sup, behind).0 == MessageState::Consumed,
+        )
+        .await;
+        sup.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pause is not a moment to spend a process on: a parked agent sent
+    /// something mid-pause stays parked, and the message waits.
+    #[tokio::test]
+    async fn an_update_pause_does_not_wake_a_parked_agent() {
+        let (sup, id, dir) = shim_supervisor("pausepark", ECHO_HARNESS);
+        {
+            let conn = sup.db.lock().unwrap();
+            set_status_db(&conn, id, AgentStatus::Parked, None);
+        }
+        sup.pause_turns();
+        let waiting = send_user(&sup, id, "hello");
+        sup.deliver(id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(runs(&dir), 0, "a pause spawned a process");
+        assert_eq!(state_and_error(&sup, waiting).0, MessageState::Queued);
+
+        sup.resume_turns().await;
+        until("the parked agent to resume once the pause ends", || {
+            state_and_error(&sup, waiting).0 == MessageState::Consumed
+        })
+        .await;
+        sup.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An update restart parks EVERY agent, not just the `run_on_startup` ones
+    /// (`Supervisor::shutdown`). So a message that arrived while the update
+    /// waited would strand behind a parked agent nothing addresses at boot.
+    /// Boot resumes any parked agent with queued work — `queued` rows only, so
+    /// a `delivered` headstone is never replayed.
+    #[tokio::test]
+    async fn boot_resumes_a_parked_agent_with_queued_work_even_without_run_on_startup() {
+        let (sup, id, dir) = shim_supervisor("bootpark", ECHO_HARNESS);
+        {
+            let conn = sup.db.lock().unwrap();
+            set_status_db(&conn, id, AgentStatus::Parked, None);
+        }
+        let waiting = send_user(&sup, id, "queued while the board restarted");
+
+        sup.start_configured_agents().await;
+        until("the parked agent's queued message to be handled", || {
+            state_and_error(&sup, waiting).0 == MessageState::Consumed
+        })
+        .await;
+        sup.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ...and nothing else: a parked agent with no work stays parked, so boot
+    /// costs no process it does not need.
+    #[tokio::test]
+    async fn boot_leaves_an_idle_parked_agent_alone() {
+        let (sup, id, dir) = shim_supervisor("bootidle", ECHO_HARNESS);
+        {
+            let conn = sup.db.lock().unwrap();
+            set_status_db(&conn, id, AgentStatus::Parked, None);
+        }
+        sup.start_configured_agents().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(runs(&dir), 0);
+        assert_eq!(status_of(&sup, id), AgentStatus::Parked);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// How an update tells the agent that asked for it what happened.
+    #[tokio::test]
+    async fn an_update_notice_arrives_as_a_system_message() {
+        use crate::update::EngineControl;
+
+        let (sup, id, dir) = shim_supervisor("sysmsg", ECHO_HARNESS);
+        {
+            let conn = sup.db.lock().unwrap();
+            set_status_db(&conn, id, AgentStatus::Parked, None);
+        }
+        let control = crate::update::SupervisorControl::new(sup.clone(), sup.db.clone());
+        assert!(
+            control
+                .post_system(id, "updated abc1234→def5678".into())
+                .await
+        );
+
+        let posted = {
+            let conn = sup.db.lock().unwrap();
+            messages::inbox(&conn, id, None, 10).unwrap()
+        };
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].from, wheel_core::MessageSender::System);
+        until("the notice to be delivered", || {
+            state_and_error(&sup, posted[0].id).0 == MessageState::Consumed
+        })
+        .await;
+        sup.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pause and the shutdown share one flag on purpose. If they did not,
+    /// the update's wait and the shutdown's own drain could disagree about
+    /// whether a turn may start, and a turn started in that gap would be the one
+    /// the shutdown kills.
+    #[tokio::test]
+    async fn pausing_for_an_update_is_the_same_gate_the_shutdown_uses() {
+        let (sup, id, dir) = shim_supervisor("onegate", ECHO_HARNESS);
+        assert!(!sup.turns_paused());
+        sup.pause_turns();
+        assert!(sup.turns_paused());
+        assert!(
+            sup.start(id).await.is_err(),
+            "nothing starts while turns are paused"
+        );
+        sup.resume_turns().await;
+        assert!(!sup.turns_paused());
+        sup.start(id).await.unwrap();
+        sup.shutdown().await;
+        assert!(sup.turns_paused(), "shutdown leaves the gate shut");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

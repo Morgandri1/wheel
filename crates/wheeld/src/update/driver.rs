@@ -128,7 +128,12 @@ impl Git {
     }
 
     pub fn commit(&self, rev: &str) -> Result<String> {
-        let sha = self.run(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])?;
+        let sha = self.run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])?;
         wheel_core::Sha::parse(&sha)
             .map(|s| s.as_str().to_string())
             .with_context(|| format!("git named {rev} as {sha:?}, which is not a commit id"))
@@ -280,8 +285,7 @@ impl UpdateDriver for SourceDriver {
         let short = &target[..target.len().min(12)];
         let src = self.staging.join(format!("src-{short}"));
         if src.exists() {
-            std::fs::remove_dir_all(&src)
-                .with_context(|| format!("clearing {}", src.display()))?;
+            std::fs::remove_dir_all(&src).with_context(|| format!("clearing {}", src.display()))?;
         }
         std::fs::create_dir_all(&src).with_context(|| format!("creating {}", src.display()))?;
         self.git.archive(target, &src)?;
@@ -316,7 +320,10 @@ impl UpdateDriver for SourceDriver {
             .collect();
         for (name, path) in &binaries {
             if !path.is_file() {
-                bail!("the build of {target} produced no {name} at {}", path.display());
+                bail!(
+                    "the build of {target} produced no {name} at {}",
+                    path.display()
+                );
             }
         }
         Ok(Staged { dir: src, binaries })
@@ -468,7 +475,10 @@ pub(crate) mod tests {
             "first",
         );
         git(&dev, &["push", "-q", "origin", "main"]);
-        git(&root, &["clone", "-q", origin.to_str().unwrap(), "checkout"]);
+        git(
+            &root,
+            &["clone", "-q", origin.to_str().unwrap(), "checkout"],
+        );
         let checkout = root.join("checkout");
         for d in [&root, &checkout] {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -511,8 +521,14 @@ pub(crate) mod tests {
         assert_eq!(i.commits, 2);
         assert_eq!(i.paths, vec!["crates/wheel-engine/src/lib.rs", "docs/b.md"]);
 
-        assert_eq!(d.inspect(&third, &third).unwrap().relation, Relation::Current);
-        assert_eq!(d.inspect(&third, &second).unwrap().relation, Relation::Current);
+        assert_eq!(
+            d.inspect(&third, &third).unwrap().relation,
+            Relation::Current
+        );
+        assert_eq!(
+            d.inspect(&third, &second).unwrap().relation,
+            Relation::Current
+        );
         assert!(d.git().origin_url().unwrap().ends_with("origin.git"));
     }
 
@@ -534,10 +550,16 @@ pub(crate) mod tests {
             Relation::Diverged,
             "the checkout holds a commit main does not"
         );
-        assert_eq!(d.inspect(&local, &target).unwrap().relation, Relation::Diverged);
+        assert_eq!(
+            d.inspect(&local, &target).unwrap().relation,
+            Relation::Diverged
+        );
 
         git(&r.checkout, &["reset", "-q", "--hard", &first]);
-        assert_eq!(d.inspect(&first, &target).unwrap().relation, Relation::FastForward);
+        assert_eq!(
+            d.inspect(&first, &target).unwrap().relation,
+            Relation::FastForward
+        );
 
         git(&r.dev, &["reset", "-q", "--hard", &first]);
         commit(&r.dev, &[("crates/wheel-core/src/lib.rs", "z")], "rewrite");
@@ -582,8 +604,15 @@ pub(crate) mod tests {
         d.fetch().unwrap();
         let target = d.target().unwrap();
         d.settle(&target).unwrap();
-        assert_eq!(d.head().unwrap(), target, "settle fast-forwards the checkout");
-        assert!(!proof.exists(), "a hook in the checkout ran during fetch or settle");
+        assert_eq!(
+            d.head().unwrap(),
+            target,
+            "settle fast-forwards the checkout"
+        );
+        assert!(
+            !proof.exists(),
+            "a hook in the checkout ran during fetch or settle"
+        );
     }
 
     #[test]
@@ -626,7 +655,10 @@ pub(crate) mod tests {
 
         let staged = d.build(&first).unwrap();
         assert!(staged.dir.join("docs/a.md").exists());
-        assert!(!staged.dir.join("untracked-secret").exists(), "only the committed tree");
+        assert!(
+            !staged.dir.join("untracked-secret").exists(),
+            "only the committed tree"
+        );
         d.smoke(&staged, &first).unwrap();
 
         let other = "f".repeat(40);
@@ -634,7 +666,10 @@ pub(crate) mod tests {
         assert!(e.contains("not the commit that was verified"), "{e}");
 
         let again = d.build(&first).unwrap();
-        assert_eq!(again.dir, staged.dir, "a rebuild replaces the old source tree");
+        assert_eq!(
+            again.dir, staged.dir,
+            "a rebuild replaces the old source tree"
+        );
     }
 
     #[test]
@@ -667,13 +702,19 @@ pub(crate) mod tests {
         assert!(read("wheeld").contains(&first));
         assert_eq!(read("wheeld.prev"), "old wheeld");
         assert_eq!(read("wheel.prev"), "old wheel");
-        let mode = std::fs::metadata(d.bin_dir.join("wheel")).unwrap().permissions().mode();
+        let mode = std::fs::metadata(d.bin_dir.join("wheel"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o755);
 
         d.rollback().unwrap();
         assert_eq!(read("wheeld"), "old wheeld");
         assert_eq!(read("wheel"), "old wheel");
-        assert!(d.rollback().is_err(), "a second rollback has nothing to restore");
+        assert!(
+            d.rollback().is_err(),
+            "a second rollback has nothing to restore"
+        );
         assert_eq!(d.name(), "source");
     }
 

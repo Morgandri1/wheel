@@ -298,7 +298,12 @@ mod tests {
     #[test]
     fn initialize_announces_a_protocol_version_and_tools() {
         let engine = Engine::for_test();
-        let r = handle(&engine, &req("initialize", json!({})), &mut Session::default()).unwrap();
+        let r = handle(
+            &engine,
+            &req("initialize", json!({})),
+            &mut Session::default(),
+        )
+        .unwrap();
         assert_eq!(r["jsonrpc"], "2.0");
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(r["result"]["capabilities"]["tools"].is_object());
@@ -308,7 +313,12 @@ mod tests {
     #[test]
     fn an_unknown_method_is_a_protocol_error() {
         let engine = Engine::for_test();
-        let r = handle(&engine, &req("resources/list", json!({})), &mut Session::default()).unwrap();
+        let r = handle(
+            &engine,
+            &req("resources/list", json!({})),
+            &mut Session::default(),
+        )
+        .unwrap();
         assert_eq!(r["error"]["code"], -32601);
     }
 
@@ -504,7 +514,11 @@ mod tests {
         let sock = std::env::temp_dir().join(format!("wheel-mcp-nt-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
-        let header = format!("{}: {}", wheel_core::UPDATE_HEADER, notice_header("def5678"));
+        let header = format!(
+            "{}: {}",
+            wheel_core::UPDATE_HEADER,
+            notice_header("def5678")
+        );
         let responses = vec![
             format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n{{\"name\":\"me\"}}"),
             format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n{{\"name\":\"me\"}}"),
@@ -526,7 +540,12 @@ mod tests {
                    "params": {"name": name, "arguments": {}}})
             .to_string()
         };
-        let input = format!("{}\n{}\n{}\n", call(1, "whoami"), call(2, "whoami"), call(3, "update"));
+        let input = format!(
+            "{}\n{}\n{}\n",
+            call(1, "whoami"),
+            call(2, "whoami"),
+            call(3, "update")
+        );
         let mut out = Vec::new();
         serve(&Engine::on_socket(sock.clone()), input.as_bytes(), &mut out).unwrap();
         server.join().unwrap();

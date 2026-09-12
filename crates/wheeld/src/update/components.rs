@@ -22,7 +22,11 @@ pub fn classify(path: &str) -> Component {
         .strip_prefix("qa/")
         .is_some_and(|rest| !rest.contains('/') && rest.ends_with(".json"));
 
-    if under(".github/") || path == "qa/check.sh" || under("qa/tools/") || qa_budget || path == "Makefile"
+    if under(".github/")
+        || path == "qa/check.sh"
+        || under("qa/tools/")
+        || qa_budget
+        || path == "Makefile"
     {
         Component::Ci
     } else if under("crates/wheel-core/")
@@ -63,7 +67,19 @@ pub fn of(paths: &[String]) -> Vec<Component> {
 }
 
 pub fn pertinent(changed: &[Component], runs: &[Component]) -> bool {
-    changed.iter().any(|c| runs.contains(c))
+    // `core` is every Rust component's dependency, so a deployment that runs any
+    // of them runs it too. Without this a `Cargo.lock` bump would read as "not
+    // pertinent" to an engine-only deployment, which is how a board silently
+    // keeps running code it was told to replace.
+    let runs_rust = runs.iter().any(|c| {
+        matches!(
+            c,
+            Component::Core | Component::Engine | Component::Cli | Component::Host | Component::Api
+        )
+    });
+    changed
+        .iter()
+        .any(|c| runs.contains(c) || (*c == Component::Core && runs_rust))
 }
 
 /// Only the components a notice should name: what this deployment runs, plus

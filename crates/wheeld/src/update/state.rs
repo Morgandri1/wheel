@@ -326,7 +326,11 @@ mod tests {
         let kept = std::fs::read_dir(&d)
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"));
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("state.json.corrupt-")
+            });
         assert!(kept, "the evidence must be kept for whoever investigates");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -349,12 +353,21 @@ mod tests {
         s.record(row(now - 9, Outcome::SmokeFailed));
         s.record(row(now - 8, Outcome::Refused(BlockReason::CiFailed)));
         s.record(row(now - 7, Outcome::DrainTimedOut));
-        assert!(!s.suspended(now), "a refusal or a busy board is not a failure");
+        assert!(
+            !s.suspended(now),
+            "a refusal or a busy board is not a failure"
+        );
         s.record(row(now - 6, Outcome::RolledBack));
         assert!(s.suspended(now));
-        assert!(!s.suspended(now + BREAKER_WINDOW_SECS), "a day later it lapses");
+        assert!(
+            !s.suspended(now + BREAKER_WINDOW_SECS),
+            "a day later it lapses"
+        );
         s.breaker_reset = Some(now - 1);
-        assert!(!s.suspended(now), "the operator's `wheeld update` clears it");
+        assert!(
+            !s.suspended(now),
+            "the operator's `wheeld update` clears it"
+        );
         assert!(Outcome::SwapFailed.is_failure());
         assert!(!Outcome::Interrupted.is_failure());
     }
@@ -376,7 +389,10 @@ mod tests {
         assert_eq!(store.take_operator_request(), None);
         std::fs::write(request_path(&d), b"garbage").unwrap();
         assert_eq!(store.take_operator_request(), None);
-        assert!(!request_path(&d).exists(), "a bad request is consumed, not retried");
+        assert!(
+            !request_path(&d).exists(),
+            "a bad request is consumed, not retried"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

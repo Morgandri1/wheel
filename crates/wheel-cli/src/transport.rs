@@ -336,7 +336,13 @@ mod tests {
 
         let sock = tmp_sock("nn");
         let _server = serve_once(&sock, "HTTP/1.1 200 OK\r\n\r\n{}");
-        assert_eq!(engine_on(sock.clone()).get("/v1/cli/whoami").unwrap().update, None);
+        assert_eq!(
+            engine_on(sock.clone())
+                .get("/v1/cli/whoami")
+                .unwrap()
+                .update,
+            None
+        );
         std::fs::remove_file(&sock).ok();
     }
 
@@ -559,7 +565,11 @@ mod http_tests {
             "HTTP/1.1 200 OK\r\nx-wheel-update: n1\r\nContent-Length: 2\r\n\r\n{}".to_string(),
         );
         assert_eq!(
-            engine_on(port).get("/v1/cli/whoami").unwrap().update.as_deref(),
+            engine_on(port)
+                .get("/v1/cli/whoami")
+                .unwrap()
+                .update
+                .as_deref(),
             Some("n1")
         );
         let _ = server.join();
