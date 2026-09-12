@@ -254,11 +254,10 @@ const CLI_STORE_FILE: &str = ".credentials.json";
 const CLI_CONFIG_FILE: &str = ".claude.json";
 const MAX_STORE_BYTES: u64 = 64 * 1024;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
-/// The scope a claude.ai login needs to be worth anything. A renewal that
-/// drops it leaves a token the CLI cannot run inference with, and the CLI
-/// then diverts to its create-an-API-key branch and the login dies quietly.
-/// Nothing else resists a server that echoes back fewer scopes than it was
-/// asked for.
+/// The scope a claude.ai login needs to be worth anything. Named separately
+/// from the general ratchet below only so the error a caller sees for THIS
+/// one names the consequence: drop it and the CLI cannot run inference, and
+/// diverts to its create-an-API-key branch while the login dies quietly.
 const REQUIRED_SCOPE: &str = "user:inference";
 
 /// The longest life Wheel will RECORD for a login, whatever the server says.
@@ -523,7 +522,7 @@ pub fn read_session(dir: &Path) -> Result<OauthSession> {
 
 /// Why a refreshed login was not accepted as the successor of the one it
 /// claims to renew.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RefreshRejected {
     #[error("it carries no access token")]
     NoAccessToken,
@@ -541,8 +540,25 @@ pub enum RefreshRejected {
     ScopeEscalation,
     #[error("it drops the scope the login runs on ({REQUIRED_SCOPE})")]
     ScopeLost,
+    #[error("it drops a scope the original login had ({0})")]
+    ScopeDropped(String),
     #[error("it belongs to a different account")]
     AccountChanged,
+}
+
+impl RefreshRejected {
+    /// No retry could ever turn this into an acceptable renewal: the
+    /// candidate's identity or grant is wrong, not merely unreadable. Every
+    /// other rejection here could in principle be a local read glitch on a
+    /// server that did not rotate the refresh token (§2: a response may omit
+    /// the new one and the CLI keeps the old), so those are worth one more
+    /// try rather than parking the board on the first bad read.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::ScopeEscalation | Self::ScopeLost | Self::ScopeDropped(_) | Self::AccountChanged
+        )
+    }
 }
 
 /// The write-back gate: is `next` a plausible renewal of `prev`, the login a
@@ -576,6 +592,13 @@ pub fn check_refresh(
     let required = REQUIRED_SCOPE.to_string();
     if allowed.contains(&required) && !next.scopes().contains(&required) {
         return Err(R::ScopeLost);
+    }
+    // The ratchet above named `user:inference` specifically because losing it
+    // kills the login outright; every OTHER scope the prior login held is
+    // guarded the same way, so a server that quietly echoes back a narrower
+    // grant on ANY scope is refused rather than silently accepted.
+    if let Some(dropped) = allowed.iter().find(|s| !next.scopes().contains(s)) {
+        return Err(R::ScopeDropped(dropped.clone()));
     }
     let differs =
         |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(x), Some(y)) if x != y);
@@ -1447,6 +1470,16 @@ mod session_tests {
                 R::ScopeEscalation,
             ),
             (
+                "the required scope dropped",
+                with(next(), "scopes", serde_json::json!(["user:profile"])),
+                R::ScopeLost,
+            ),
+            (
+                "a scope other than the required one dropped: the ratchet is not user:inference-only",
+                with(next(), "scopes", serde_json::json!(["user:inference"])),
+                R::ScopeDropped("user:profile".into()),
+            ),
+            (
                 "another account",
                 OauthSession::for_tests(
                     "sk-ant-oat01-evil",
@@ -1480,6 +1513,36 @@ mod session_tests {
             check_refresh(&lapsed, &stale_next, NOW),
             Err(R::Implausible)
         );
+    }
+
+    /// The classification `supervisor::refresh::renew` keys on to decide
+    /// whether a refused candidate is worth another try. Only a wrong
+    /// identity or a narrower grant than before is permanent; everything else
+    /// here could in principle be a local read glitch on a server that did
+    /// not rotate the refresh token, so it must stay retryable.
+    #[test]
+    fn only_identity_and_grant_narrowing_rejections_are_permanent() {
+        use RefreshRejected as R;
+        let permanent = [
+            R::ScopeEscalation,
+            R::ScopeLost,
+            R::ScopeDropped("user:profile".into()),
+            R::AccountChanged,
+        ];
+        for r in &permanent {
+            assert!(r.is_permanent(), "{r:?} must be permanent");
+        }
+        let retryable = [
+            R::NoAccessToken,
+            R::SameAccessToken,
+            R::NoRefreshToken,
+            R::NoExpiry,
+            R::NotNewer,
+            R::Implausible,
+        ];
+        for r in &retryable {
+            assert!(!r.is_permanent(), "{r:?} must be retryable, not permanent");
+        }
     }
 
     #[test]

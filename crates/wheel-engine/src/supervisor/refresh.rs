@@ -35,12 +35,18 @@ use crate::{auth::OauthSession, db::board, oauth::RefreshFailure};
 const DEFAULT_LEAD: Duration = Duration::from_secs(30 * 60);
 /// How soon a renewal that failed for a reason that may pass is tried again.
 const DEFAULT_RETRY: Duration = Duration::from_secs(5 * 60);
-/// No renewal timer ever fires sooner than this, whatever the arithmetic says.
+/// No real exchange happens sooner than this after the previous one, whatever
+/// the arithmetic says and whoever is asking — the sleeping timer AND a
+/// direct call into [`Supervisor::ensure_fresh`] (a spawn, an auth-failure
+/// recovery) both floor on it.
 ///
 /// Every renewal spawns a CLI child that talks to the real token endpoint, so
 /// a schedule that can compute "now" is a self-sustaining loop nobody asked
 /// for. ADVERSARY found exactly that: `expires - lead` is already in the past
 /// for any token shorter-lived than the lead, and the wait floored at zero.
+/// The same arithmetic reaches `ensure_fresh` directly when several callers
+/// arrive close together on one stale generation, which is why the floor
+/// lives there too and not only in the timer's wait.
 const DEFAULT_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// How many consecutive UNREADABLE failures before the engine stops trying.
 ///
@@ -72,6 +78,14 @@ pub(crate) struct Broker {
     /// Consecutive failed renewals per vault, reset by a success or a sign-in.
     attempts: Mutex<HashMap<Uuid, u32>>,
     timers: Mutex<HashMap<Uuid, u64>>,
+    /// When a real exchange was last attempted for this vault (ms), whether it
+    /// succeeded or failed. The timer path already floors its OWN wait at
+    /// `min_interval`, but `ensure_fresh` is also called directly — from a
+    /// spawn, from `recover_from_auth_failure` — and those callers do not wait
+    /// on anything. Without this, a burst of them (several agents failing on
+    /// the same stale generation) serialises through the lineage lock into a
+    /// tight loop of real calls to the token endpoint instead of one.
+    last_attempt: Mutex<HashMap<Uuid, i64>>,
     /// Exchanges attempted, for the engine log and for tests that have to
     /// prove N callers cost one exchange.
     pub(crate) exchanges: AtomicU64,
@@ -90,6 +104,7 @@ impl Default for Broker {
             failures: Mutex::default(),
             attempts: Mutex::default(),
             timers: Mutex::default(),
+            last_attempt: Mutex::default(),
             exchanges: AtomicU64::new(0),
         }
     }
@@ -230,6 +245,24 @@ impl Supervisor {
             );
         }
 
+        // The floor applies here too, not only to the timer's own wait: a
+        // spawn and an auth-failure recovery call this directly, with nothing
+        // between them and the lineage lock. Several such callers arriving
+        // close together would otherwise serialise straight through into back
+        // to back real exchanges.
+        let floor = self.broker.min_interval.as_millis() as i64;
+        if let Some(&at) = self.broker.last_attempt.lock().unwrap().get(&vault) {
+            if now - at < floor {
+                self.arm_refresh_timer(vault, at + floor);
+                return if expires > now {
+                    Ok(expires)
+                } else {
+                    Err("a renewal for this login was just attempted; retrying shortly".into())
+                };
+            }
+        }
+        self.broker.last_attempt.lock().unwrap().insert(vault, now);
+
         match self.renew(vault, vk, &session).await {
             Ok(next) => {
                 self.broker.failures.lock().unwrap().remove(&vault);
@@ -331,11 +364,22 @@ impl Supervisor {
         let mut next = crate::auth::read_session(&scratch.0)
             .map_err(|e| failed(format!("the renewed login could not be read: {e}"), false))?;
         next.carry_forward(prev);
-        // Refused output is not retried: the exchange already happened, so the
-        // refresh token it spent is gone either way, and trying again would
-        // only repeat the refusal.
-        crate::auth::check_refresh(prev, &next, now_ms())
-            .map_err(|why| failed(format!("the renewed login was refused: {why}"), true))?;
+        // A candidate that fails this gate is not automatically a dead grant:
+        // the server is not guaranteed to rotate the refresh token on every
+        // exchange (§2), so a rejection that is not itself security-relevant
+        // (a bad read, a stale expiry) may pass on a genuine retry with the
+        // SAME refresh token. Only `RefreshRejected::is_permanent` — a wrong
+        // identity or a narrower grant than before — stops retrying outright;
+        // everything else is `ambiguous`, bounded by the attempt cap exactly
+        // like a CLI failure nothing could read.
+        if let Err(why) = crate::auth::check_refresh(prev, &next, now_ms()) {
+            let permanent = why.is_permanent();
+            return Err(RefreshFailure {
+                reason: format!("the renewed login was refused: {why}"),
+                permanent,
+                ambiguous: !permanent,
+            });
+        }
         // Not trusted: the refresh path asks the server for a year. Whatever
         // comes back, Wheel records at most the ceiling — and reports what the
         // server actually said, which is how the operator finds out.
@@ -435,11 +479,12 @@ impl Supervisor {
 
     /// Schedule the next renewal of a login that expires at `expires_ms`.
     ///
-    /// A token with less life than [`Broker::min_interval`] cannot be put on a
-    /// sane cadence: renewing it "before it expires" means renewing it now,
-    /// and again immediately, for ever. That is a server issuing something we
+    /// A token with less life than [`Broker::lead`] cannot be put on a sane
+    /// cadence: renewing it "before it expires" means renewing it now, and
+    /// again immediately, for ever. That is a server issuing something we
     /// cannot work with, so it is surfaced as a warning and NOT armed —
-    /// a spawn still renews on demand, which is bounded by messages arriving.
+    /// a spawn still renews on demand, which [`Broker::min_interval`] and
+    /// [`Supervisor::ensure_fresh`]'s own floor keep from looping.
     fn arm_renewal(self: &Arc<Self>, vault: Uuid, expires_ms: i64) {
         let remaining = expires_ms - now_ms();
         // Keyed on the LEAD, not the floor: the loop condition is "less than a
@@ -1433,6 +1478,11 @@ mod tests {
             warning.contains("different account"),
             "the refusal must say what it saw: {warning}"
         );
+        assert!(
+            !rig.sup.refresh_still_possible(rig.vault),
+            "a candidate for another account is security-relevant, not a read glitch: \
+             it must not be retried"
+        );
     }
 
     /// TH1 at the agent. An agent is untrusted code whose HOME is its own
@@ -1808,6 +1858,10 @@ mod tests {
                 lead_ms: 120_000, // always due, so every call tries
                 retry_ms: 60_000,
                 max_attempts: 3,
+                // Below anything a real subprocess round trip could clear:
+                // this test is about the ambiguity cap, not the floor between
+                // attempts, so the floor must not be what limits it here.
+                min_interval_ms: 1,
                 // Not an HTTP failure at all: no status to key on anywhere.
                 fake: serde_json::json!({
                     "refresh_transport_error": "connect ETIMEDOUT 160.79.104.10:443"
@@ -1947,6 +2001,40 @@ mod tests {
             .contains("too soon to renew"));
     }
 
+    /// The floor guards direct calls too, not only the timer's own wait.
+    /// `ensure_fresh` is called straight from a spawn and from
+    /// `recover_from_auth_failure`, with nothing between the caller and the
+    /// lineage lock — a burst of those (several agents failing on one stale,
+    /// still-failing generation) must not turn into one real exchange per
+    /// caller just because the login stays "due" the whole time.
+    ///
+    /// Mutation-checked: drop the floor check in `ensure_fresh` and this
+    /// reports as many exchanges as calls.
+    #[tokio::test]
+    async fn a_burst_of_direct_calls_costs_one_exchange_per_floor_interval() {
+        let rig = Rig::new(
+            "burst",
+            Spec {
+                revoked: true, // every renewal fails, so expiry never moves
+                ttl_ms: 30_000,
+                lead_ms: 60_000, // always due, the lead check never short-circuits
+                min_interval_ms: 10_000, // longer than the whole burst below
+                max_attempts: 20,
+                ..Spec::default()
+            },
+        )
+        .await;
+        for _ in 0..5 {
+            let _ = rig.sup.ensure_fresh(rig.vault, None).await;
+        }
+        assert_eq!(
+            rig.exchanges(),
+            1,
+            "a burst of direct calls inside one floor interval must cost one exchange, \
+             not one per caller"
+        );
+    }
+
     /// The cap exists to bound what nothing could READ. A failure the
     /// classifier understood is already bounded by the token's own remaining
     /// life, and on a box with no API-key fallback, spending that budget on a
@@ -1964,6 +2052,10 @@ mod tests {
                 ttl_ms: 60_000,
                 lead_ms: 120_000, // always due, so every call tries
                 max_attempts: 3,
+                // Below anything a real subprocess round trip could clear:
+                // this test is about the ambiguity cap, not the floor between
+                // attempts, so the floor must not be what limits it here.
+                min_interval_ms: 1,
                 // A server fault: readable, and worth trying again.
                 fake: serde_json::json!({ "refresh_status": "503" }),
                 ..Spec::default()
