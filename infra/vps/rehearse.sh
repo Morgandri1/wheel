@@ -249,20 +249,28 @@ fi
 engine="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"
 docker network create "$project-outside" >/dev/null
 reached=""
+# Both networks, not just edge: wheeld and web sit on egress too (needed for their own loopback
+# publish to work at all — see compose.yml), and Docker isolates DIFFERENT bridge networks from
+# each other by default regardless of `internal: true` — that flag only controls whether a network
+# has its own route out to the internet, not whether another network can route into it. Checking
+# only the internal-network address would miss egress leaking the same way.
 for target in "wheeld 8080 /healthz" "web 3000 /version.json"; do
     read -r svc port path <<<"$target"
-    ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_edge\"}}{{.IPAddress}}{{end}}" "$(compose ps -q "$svc")")"
     if ! compose exec -T caddy wget -q -T 3 -O /dev/null "http://$svc:$port$path"; then
         reached="$reached control failed: caddy cannot reach $svc:$port$path, so the next probe proves nothing;"
     fi
-    if docker run --rm --network "$project-outside" --entrypoint wget caddy:2 -q -T 3 -O /dev/null "http://$ip:$port$path" 2>/dev/null; then
-        reached="$reached $svc at $ip:$port;"
-    fi
-    curl -s -m 3 -o /dev/null "http://$ip:$port$path"
-    echo "  info: this machine (the docker host) → $svc's edge address $ip:$port: curl rc=$? (0 is expected here even when isolation holds — the docker host itself always routes to its own bridge networks; that is not what 'internal: true' promises)"
+    for net in edge egress; do
+        ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_${net}\"}}{{.IPAddress}}{{end}}" "$(compose ps -q "$svc")")"
+        [ -n "$ip" ] || { reached="$reached $svc has no address on $net;"; continue; }
+        if docker run --rm --network "$project-outside" --entrypoint wget caddy:2 -q -T 3 -O /dev/null "http://$ip:$port$path" 2>/dev/null; then
+            reached="$reached $svc at $ip:$port ($net);"
+        fi
+        curl -s -m 3 -o /dev/null "http://$ip:$port$path"
+        echo "  info: this machine (the docker host) → $svc's $net address $ip:$port: curl rc=$? (0 is expected here even when isolation holds — the docker host itself always routes to its own bridge networks; that is not what 'internal: true' promises)"
+    done
 done
 if [ -z "$reached" ]; then
-    say PASS isolated-from-other-networks "a container on another Docker network cannot reach wheeld's or web's edge address (engine: $engine)"
+    say PASS isolated-from-other-networks "a container on another Docker network cannot reach wheeld's or web's address on edge or egress (engine: $engine)"
     record isolated-from-other-networks 0
 else
     say FAIL isolated-from-other-networks "a container on another Docker network reached$reached (engine: $engine). Measured: stock dockerd (docker:dind) enforces 'internal: true' here (iptables blocks the cross-network hop); OrbStack's engine does not (confirmed 2026-09-11). If \$engine here is a Mac dev engine, this is that gap, not a bug in the Caddyfile or compose.yml — the real VPS runs stock dockerd and this check passes there."

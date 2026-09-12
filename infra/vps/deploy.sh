@@ -49,6 +49,22 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$env_file" ] || die "$env_file does not exist — copy .env.example to .env first"
+
+# .env holds no secret by default (wheeld generates its own inside its volume), but it is exactly
+# the kind of file that quietly stops being true, so this checks rather than trusting whoever ran
+# `chmod 600` once remembered to. `ls -ld`'s permission string is portable across GNU and BSD stat,
+# unlike `stat`'s own format flags.
+env_perms="$(ls -ld "$env_file")"
+env_perms="${env_perms%% *}"
+# The 10 permission characters always come first; some platforms append a decoration after them
+# (macOS: `@` for extended attributes, some Linux configurations: `+` for an ACL), so this takes
+# a fixed-width prefix rather than trusting the whole field's length to still be 10.
+env_perms="${env_perms:0:10}"
+if [ "${env_perms#????}" != "------" ]; then
+    echo "deploy: $env_file is not 600 (group/other can read or write it: $env_perms) — fixing it" >&2
+    [ "$dry_run" = 1 ] || chmod 600 "$env_file"
+fi
+
 # shellcheck source=/dev/null
 . "$here/lib/derive-env.sh"
 
@@ -67,8 +83,17 @@ cp "$env_file" "$resolved"
 mode="tunnel mode (nothing published)"
 grep -q '^WHEEL_DOMAIN=.' "$resolved" 2>/dev/null && mode="TLS mode ($(grep '^WHEEL_DOMAIN=' "$resolved" | tail -1 | cut -d= -f2-))"
 echo "==> $mode"
-echo "    resolved settings (from $env_file):"
-sed 's/^/      /' "$resolved"
+if [ "$dry_run" = 1 ]; then
+    # Full values, because seeing exactly what would be applied is the point of a dry run — and a
+    # dry run is not the thing that ends up in a shell's history as "the command that just worked".
+    echo "    resolved settings (from $env_file):"
+    sed 's/^/      /' "$resolved"
+else
+    # Names only on a real run: this reaches SSH scrollback and a root shell's history on every
+    # invocation, not just when asked to inspect it, and .env is not a place secrets belong (see
+    # .env.example) but this should not be where that stops being true.
+    echo "    resolved settings (from $env_file): $(grep -o '^[A-Z_]*' "$resolved" | tr '\n' ' ')"
+fi
 
 if [ "$stop_legacy" = 1 ]; then
     step_header="==> checking for an existing compose project '$legacy_project'"

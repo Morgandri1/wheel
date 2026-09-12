@@ -24,10 +24,15 @@
 # Caddy trusts no proxy in front of it, so {client_ip} is the TCP peer, and for an untrusted peer
 # it already replaces X-Forwarded-Proto and X-Forwarded-Host. The rest are SET here rather than
 # appended: a forwarding value the client sent never reaches wheeld or the web server.
+#
+# X-Forwarded-Port is not one Caddy replaces on its own — measured directly, a client-sent
+# X-Forwarded-Port passes straight through reverse_proxy unmodified, unlike -Proto/-Host. Neither
+# wheeld nor the web app reads it, so it is deleted rather than reconstructed.
 (forwarded) {
 	header_up X-Forwarded-For {client_ip}
 	header_up X-Real-IP {client_ip}
 	header_up -Forwarded
+	header_up -X-Forwarded-Port
 }
 
 {$CADDY_SITE} {
@@ -47,7 +52,12 @@
 	# app's session route, even from a build that ignores the flag. wheeld's flag is the binding one.
 	# A `handle`, and the first one: handle blocks run before a bare `respond` would.
 	@signup {
-		path /v1/auth/signup /api/session/signup
+		# Wildcarded, not exact: measured that /v1/auth/signup/ and /v1/auth/signup;foo pass an
+		# exact-match `path` straight to the backend (a trailing slash or a path parameter is not
+		# the same string). wheeld 404s the former and refuses signup either way today, but this
+		# line's own comment claims the edge blocks it "even from a build that ignores the flag" —
+		# that claim needs the wildcard to be true.
+		path /v1/auth/signup* /api/session/signup*
 		expression `"{$WHEEL_SIGNUP:closed}" != "open"`
 	}
 	handle @signup {

@@ -64,6 +64,27 @@ services:
       - edge
       - egress
 
+  # A config value is not a control until the running binary is proven to enforce it: preflight
+  # only checks that WHEEL_SIGNUP is a well-formed string, which says nothing about whether the
+  # container actually running as "wheeld" is the wheeld binary at all — someone working around a
+  # broken build by pointing this service at a different Dockerfile would sail straight past a
+  # static check. This makes one real HTTP call against wheeld's own documented response shape
+  # (docs/API.md) and fails the whole stack if it doesn't match. web and caddy both wait on it, so
+  # a wheeld that doesn't enforce its own signup gate never gets a public-facing peer in front of it.
+  verify-signup-gate:
+    image: curlimages/curl:8.11.0
+    restart: "no"
+    entrypoint: ["/bin/sh", "/verify-signup-gate.sh"]
+    volumes:
+      - ./verify-signup-gate.sh:/verify-signup-gate.sh:ro
+    environment:
+      - WHEEL_SIGNUP=${WHEEL_SIGNUP:-closed}
+    depends_on:
+      wheeld:
+        condition: service_healthy
+    networks:
+      - edge
+
   web:
     build:
       context: ../..
@@ -74,6 +95,8 @@ services:
         condition: service_completed_successfully
       wheeld:
         condition: service_healthy
+      verify-signup-gate:
+        condition: service_completed_successfully
     environment:
       - WHEEL_API_URL=http://wheeld:8080
       - WHEEL_AUTH_MODE=local
@@ -109,6 +132,8 @@ services:
     restart: unless-stopped
     depends_on:
       preflight:
+        condition: service_completed_successfully
+      verify-signup-gate:
         condition: service_completed_successfully
       wheeld:
         condition: service_started

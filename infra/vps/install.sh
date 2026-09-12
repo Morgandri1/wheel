@@ -8,7 +8,6 @@
 # stdin, and running it again moves to another --ref or changes a setting.
 #
 #   sudo ./install.sh --domain wheel.example.com [--email you@example.com]   HTTPS (Let's Encrypt)
-#   sudo ./install.sh --public-host 203.0.113.5                             plain HTTP on :80
 #   sudo ./install.sh --no-proxy                                            loopback only (SSH tunnel)
 #
 #   --repo <url|path>  what to clone          (default https://github.com/Morgandri1/wheel.git)
@@ -18,6 +17,13 @@
 #   --firewall         allow 22, 80 and 443 in ufw, and enable it
 #   --dry-run          resolve settings and the target commit, print every step it would take,
 #                       change nothing on disk and touch no package manager, service or firewall
+#
+# There is no plain-HTTP-publicly mode, on purpose, matching compose.yml. An earlier version had
+# one (--public-host): Caddy would adapt `:80` with no host matcher, so the HSTS route's
+# `protocol https` match never fired, and WHEEL_PUBLIC_ORIGIN=http://<host> meant the session
+# cookie lost both Secure and the __Host- prefix. A password does not get a second chance once it
+# has crossed the network once in the clear — see README.md and preflight.sh's compose-side
+# reasoning, which applies here unchanged.
 #
 # Layout. src and bin are the auto-update hook points (WHEEL_UPDATE_REPO, WHEEL_UPDATE_BIN_DIR):
 #   /opt/wheel/src   git checkout          /opt/wheel/bin    wheeld, wheel
@@ -30,7 +36,6 @@ set -euo pipefail
 repo=https://github.com/Morgandri1/wheel.git
 ref=main
 domain=""
-public_host=""
 no_proxy=0
 email=""
 tls_internal=0
@@ -73,10 +78,18 @@ write() {
     mv -f "$path.new" "$path"
 }
 
+# A private, 0700 directory for anything downloaded before it's verified or installed — never a
+# fixed /tmp path. A predictable, world-writable path that root then executes or imports (the
+# NodeSource script, the rustup installer, Caddy's signing key) is a race another local user can
+# win between the download and the run.
+install_tmp="$(mktemp -d)"
+chmod 0700 "$install_tmp"
+trap 'rm -rf "$install_tmp"' EXIT
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --domain) domain="${2:?--domain needs a name}"; shift 2 ;;
-        --public-host) public_host="${2:?--public-host needs an address}"; shift 2 ;;
+        --public-host) die "--public-host was removed: it served plain HTTP publicly, which is never a supported mode (see the top of this script). Use --domain for HTTPS, or --no-proxy plus an SSH tunnel." ;;
         --no-proxy) no_proxy=1; shift ;;
         --email) email="${2:?--email needs an address}"; shift 2 ;;
         --repo) repo="${2:?--repo needs a URL or path}"; shift 2 ;;
@@ -85,16 +98,15 @@ while [ $# -gt 0 ]; do
         --updatable) updatable=1; shift ;;
         --firewall) firewall=1; shift ;;
         --dry-run) dry_run=1; shift ;;
-        -h | --help) sed -n '6,25p' "$0"; exit 0 ;;
+        -h | --help) sed -n '6,27p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done
 
 modes=0
 [ -z "$domain" ] || modes=$((modes + 1))
-[ -z "$public_host" ] || modes=$((modes + 1))
 [ "$no_proxy" = 0 ] || modes=$((modes + 1))
-[ "$modes" = 1 ] || die "choose exactly one of --domain, --public-host and --no-proxy"
+[ "$modes" = 1 ] || die "choose exactly one of --domain and --no-proxy"
 [ "$tls_internal" = 0 ] || [ -n "$domain" ] || die "--tls-internal needs --domain"
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
 # shellcheck source=/dev/null
@@ -106,20 +118,17 @@ if [ -n "$domain" ]; then
     api_base="$origin"
     site="$domain"
     allowed_hosts="$domain"
-elif [ -n "$public_host" ]; then
-    origin="http://$public_host"
-    api_base="$origin"
-    site=":80"
-    allowed_hosts="$public_host"
+    mode_label="domain($domain)"
 else
     origin="http://localhost:3000"
     api_base="http://localhost:8080"
     site=""
     allowed_hosts=""
+    mode_label="no-proxy"
 fi
 
 [ "$dry_run" = 0 ] || echo "==> DRY RUN: resolving settings and the target commit; nothing on this machine will change"
-echo "    mode=$([ -n "$domain" ] && echo "domain($domain)" || [ -n "$public_host" ] && echo "public-host($public_host)" || echo "no-proxy") ref=$ref repo=$repo updatable=$updatable firewall=$firewall"
+echo "    mode=$mode_label ref=$ref repo=$repo updatable=$updatable firewall=$firewall"
 
 src=/opt/wheel/src
 vps="$src/infra/vps"
@@ -141,8 +150,8 @@ if ! node_version="$(node --version 2>/dev/null)" || [ "${node_version%%.*}" != 
     if [ "$dry_run" = 1 ]; then
         echo "   (dry-run) would install Node.js 22 from NodeSource"
     else
-        curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
-        bash /tmp/nodesource_setup.sh
+        curl -fsSL https://deb.nodesource.com/setup_22.x -o "$install_tmp/nodesource_setup.sh"
+        bash "$install_tmp/nodesource_setup.sh"
         apt-get install -y -q nodejs
     fi
 fi
@@ -164,8 +173,8 @@ else
     if [ "$dry_run" = 1 ]; then
         echo "   (dry-run) would install rustup + stable toolchain under /opt/wheel/rust"
     else
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-        CARGO_HOME=/opt/wheel/rust/cargo sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$install_tmp/rustup-init.sh"
+        CARGO_HOME=/opt/wheel/rust/cargo sh "$install_tmp/rustup-init.sh" -y --no-modify-path --profile minimal \
             --default-toolchain stable --component clippy --component rustfmt
     fi
 fi
@@ -282,7 +291,53 @@ run install -m 0644 "$vps/systemd/wheeld.service" /etc/systemd/system/wheeld.ser
 run install -m 0644 "$vps/systemd/wheel-web.service" /etc/systemd/system/wheel-web.service
 run systemctl daemon-reload
 run systemctl enable --quiet wheeld wheel-web
-run systemctl restart wheeld wheel-web
+run systemctl restart wheeld
+
+# wheel-web and Caddy start only once wheeld is proven to enforce its own signup gate — a config
+# value is not a control until the binary that reads it is proven to. Without this, a broken
+# build worked around by editing wheeld.service's ExecStart to point at some other binary would
+# still show WHEEL_SIGNUP=closed in the env file and nothing else would notice, and in --no-proxy
+# mode there is no Caddy in front to fall back on.
+if [ "$dry_run" = 1 ]; then
+    echo "   (dry-run) would wait for wheeld's healthz, then verify it enforces WHEEL_SIGNUP before starting wheel-web or Caddy"
+else
+    step "waiting for wheeld"
+    healthy=0
+    for _ in $(seq 1 60); do
+        if curl -fsS -o /dev/null http://127.0.0.1:8080/healthz; then
+            healthy=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$healthy" = 1 ] || die "wheeld did not answer on 127.0.0.1:8080: journalctl -u wheeld -n 50"
+
+    step "verifying wheeld enforces its own signup gate"
+    # install.sh always writes WHEEL_SIGNUP=closed to wheeld.env; the only way it becomes "open" is
+    # the operator's own wheeld.local.env, read second so it wins — mirror that resolution order
+    # here rather than assuming the default this script wrote is still the effective one.
+    effective_signup=closed
+    if [ -f /etc/wheel/wheeld.local.env ] && grep -q '^WHEEL_SIGNUP=' /etc/wheel/wheeld.local.env; then
+        effective_signup="$(grep '^WHEEL_SIGNUP=' /etc/wheel/wheeld.local.env | tail -1 | cut -d= -f2-)"
+    fi
+    signup_body='{"email":"verify-signup-gate@wheel.invalid","password":"verify-signup-gate-probe-not-a-real-account"}'
+    signup_status="$(curl -sS -m 10 -o "$install_tmp/signup-check-body" -w '%{http_code}' -X POST http://127.0.0.1:8080/v1/auth/signup \
+        -H 'content-type: application/json' -d "$signup_body")" || die "could not reach wheeld's own signup route at all — it is not answering as itself"
+    signup_body_text="$(cat "$install_tmp/signup-check-body")"
+    case "$effective_signup" in
+        open)
+            if [ "$signup_status" = 403 ] && printf '%s' "$signup_body_text" | grep -q '"forbidden"'; then
+                die "WHEEL_SIGNUP=open but wheeld still answers 403 forbidden — signup is not actually open"
+            fi
+            ;;
+        *)
+            if [ "$signup_status" != 403 ] || ! printf '%s' "$signup_body_text" | grep -q '"forbidden"'; then
+                die "WHEEL_SIGNUP=closed but POST /v1/auth/signup answered $signup_status, not the documented 403 {\"error\":{\"code\":\"forbidden\"}} — refusing to start wheel-web or Caddy in front of a wheeld that does not enforce its own signup gate"
+            fi
+            ;;
+    esac
+fi
+run systemctl restart wheel-web
 
 if [ "$no_proxy" = 0 ]; then
     if ! command -v caddy >/dev/null; then
@@ -291,8 +346,8 @@ if [ "$no_proxy" = 0 ]; then
             echo "   (dry-run) would add Caddy's apt repository and install caddy"
         else
             apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https
-            curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o /tmp/caddy-stable.gpg.key
-            gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg /tmp/caddy-stable.gpg.key
+            curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o "$install_tmp/caddy-stable.gpg.key"
+            gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg "$install_tmp/caddy-stable.gpg.key"
             curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
             chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
             apt-get update -q
@@ -345,17 +400,6 @@ if [ "$dry_run" = 1 ]; then
     echo "DRY RUN complete. Nothing on this machine was changed."
     exit 0
 fi
-
-step "waiting for wheeld"
-healthy=0
-for _ in $(seq 1 60); do
-    if curl -fsS -o /dev/null http://127.0.0.1:8080/healthz; then
-        healthy=1
-        break
-    fi
-    sleep 1
-done
-[ "$healthy" = 1 ] || die "wheeld did not answer on 127.0.0.1:8080: journalctl -u wheeld -n 50"
 
 cat <<EOF
 

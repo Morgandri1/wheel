@@ -33,7 +33,9 @@ for why that matters even on a box behind a firewall.
 - **`/p/<project>/<path>` is public webhook ingress**, TLS mode only. It is off for every project
   until you switch it on, and anything that reaches it becomes a message to whatever agent the
   endpoint is wired to. See [Webhooks](#webhooks-p).
-- **Signup is closed.** You hold the operator token, and you add accounts with it.
+- **Signup is closed.** You hold the operator token, and you add accounts with it. **It is not a
+  boundary against your own agents**: read why before you rely on it — [A residual worth
+  understanding, not just accepting](#a-residual-worth-understanding-not-just-accepting).
 
 The files:
 
@@ -84,10 +86,15 @@ on anything this kit does right:
 ## 2. Deploy
 
 ```bash
-git clone https://github.com/Morgandri1/wheel.git /opt/wheel
-cd /opt/wheel/infra/vps
+git clone https://github.com/Morgandri1/wheel.git /opt/wheel-compose
+cd /opt/wheel-compose/infra/vps
 cp .env.example .env && chmod 600 .env
 ```
+
+Not `/opt/wheel` — that's the path `install.sh` (the no-Docker path below) manages itself, as
+root, including deleting and recreating `/opt/wheel/bin` and `/opt/wheel/web` on every run. The
+two paths are independent; giving them independent directories keeps it that way even if you ever
+try both on the same box.
 
 Leave `WHEEL_DOMAIN` unset for now if you don't have one yet — that's tunnel mode, the default,
 and section 3 covers it. If **another Wheel deployment is already running on this box** (an older
@@ -236,6 +243,37 @@ Restart the agent (or start it for the first time) and its `GET .../agents/$AGEN
 vault per account, so wiring the same agent to two vaults that both define `ANTHROPIC_API_KEY` is
 refused at wire-creation time — see `docs/ARCHITECTURE.md` M1.6.
 
+### A residual worth understanding, not just accepting
+
+**The operator token is not a boundary against your own agents, and this deployment's shape makes
+that concrete rather than theoretical.** wheeld runs as uid 10001 inside the `wheeld` container in
+the embedded backend this kit uses, and every agent it spawns runs as that same uid, in the same
+container (per-node uids are `docs/ARCHITECTURE.md`'s M2/M3, not built yet). Anything that uid can
+read, an agent can read: `docker compose -p wheel exec -u 10001 wheeld cat /data/operator-token`
+works from inside the container exactly the way it would for you, and so does `/data/master.key` —
+the key that decrypts every vault secret, including the Anthropic key you just put there.
+
+That reachability alone isn't the exposure — an agent you started already has that reach by
+design (§2 of `docs/ARCHITECTURE.md`: "an agent is untrusted remote code execution inside its
+sandbox," and here the sandbox is the whole container). The exposure is the **path that gets an
+agent to act on it without your asking**: `/p/<project>/<path>` (TLS mode) is unauthenticated
+public ingress by design, and whatever reaches it becomes a message to the agent it's wired to
+(see [Webhooks](#webhooks-p) and redteam finding 043). An endpoint wired to an agent with wires
+strong enough to matter turns an internet POST into a prompt a model reads — internet → webhook →
+prompt injection → an agent that reads the operator token and the master key on your instruction,
+having been talked into it by someone else's request body.
+
+This needs your own opt-in (wiring a webhook to an agent) plus a successful injection, so it is
+not a tunnel-mode blocker and not "the operator token is worthless" — revoking it still ends a
+*leaked* token's usefulness (§ AgentGrid above), and the token still keeps a stranger who merely
+reaches the server out. What it does not do is keep an agent *you* wired up out, once that agent
+is compromised by something it reads. Keep endpoints wired to agents with the fewest wires you
+can, prefer a shared secret or HMAC on any endpoint an agent can act on, and treat the vault's
+"never shown back" property as protecting against accidental echo, not as a containment boundary —
+because for this backend, on this host, it isn't one. Separating agent uids from wheeld's own is
+tracked as a real follow-up, not a documentation footnote: `docs/ARCHITECTURE.md`'s per-node-uid
+work (M2/M3) is what actually closes this, the same way it's the fix for redteam finding 037/038.
+
 ## Running on a small box (2 vCPU, ~4 GiB)
 
 Wheel runs on a small VPS; a few things are worth knowing before you find them the hard way.
@@ -283,7 +321,7 @@ decrypts every secret) and the operator token. Stop wheeld while copying it, bec
 live:
 
 ```bash
-cd /opt/wheel/infra/vps
+cd /opt/wheel-compose/infra/vps
 docker compose -p wheel stop wheeld
 docker run --rm -v wheel_wheel-data:/data:ro -v "$PWD:/backup" debian:bookworm-slim \
   tar -C /data -czf "/backup/wheel-data-$(date +%F).tar.gz" .
@@ -298,7 +336,7 @@ certificates and the ACME account. Losing it only means Caddy asks for new ones.
 ## Upgrading
 
 ```bash
-cd /opt/wheel && git pull --ff-only
+cd /opt/wheel-compose && git pull --ff-only
 cd infra/vps && ./deploy.sh --dry-run   # confirm the settings still resolve the way you expect
 ./deploy.sh
 docker compose -p wheel logs --tail 50 wheeld
