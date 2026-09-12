@@ -109,8 +109,7 @@ pub async fn instantiate(
     // literal `Tier::Admin` here would keep claiming it after that stopped being so. `load_member`
     // is the one function that answers what tier somebody holds; asking it costs a query and
     // removes a fact that was only correct by coincidence.
-    let (_, tier) =
-        crate::auth::extractor::load_member(&state, &project.id, user.id()).await?;
+    let (_, tier) = crate::auth::extractor::load_member(&state, &project.id, user.id()).await?;
     let client = HttpBoardClient::new(&state, &project.id, &user, tier);
     let report = execute(&plan, &ExistingBoard::default(), &client).await;
 

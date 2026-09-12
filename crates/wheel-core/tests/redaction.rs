@@ -186,10 +186,16 @@ fn structure_survives_redaction() {
     assert!(redacted.contains("charge"), "{redacted}");
     assert!(redacted.contains("amount"), "{redacted}");
     // The MODE stays, so a reader still learns the field is vault-filled — just not from where.
-    assert!(redacted.contains("vault"), "the fill mode was removed too: {redacted}");
+    assert!(
+        redacted.contains("vault"),
+        "the fill mode was removed too: {redacted}"
+    );
 
     let redacted = json(&agent_with_git().redact_credentials());
-    assert!(redacted.contains("github.com/example/repo.git"), "{redacted}");
+    assert!(
+        redacted.contains("github.com/example/repo.git"),
+        "{redacted}"
+    );
     assert!(redacted.contains("main"), "{redacted}");
 
     let redacted = json(&mcp().redact_credentials());
@@ -255,7 +261,10 @@ fn the_redaction_flag_agrees_with_the_redaction() {
         // And once redacted there is nothing left to redact — redaction is idempotent, so a
         // double-projection cannot report a hidden field that is already gone.
         let once = config.redact_credentials();
-        assert!(!once.has_redactable_credentials(), "{label} is still redactable");
+        assert!(
+            !once.has_redactable_credentials(),
+            "{label} is still redactable"
+        );
         assert_eq!(json(&once.redact_credentials()), json(&once), "{label}");
     }
 }
