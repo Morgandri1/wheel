@@ -29,11 +29,11 @@ use axum::Router;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
+use uuid::Uuid;
 use wheel_api::config::{AuthMode, Config, Env, SignupPolicy};
 use wheel_api::crypto::Secret;
 use wheel_api::db::Db;
 use wheel_api::orchestrator::{NoopOrchestrator, Orchestrator};
-use uuid::Uuid;
 use wheel_api::state::{AppState, Inner};
 
 /// Everything the engine actually received: the request target and the headers that survived the
@@ -1049,13 +1049,23 @@ async fn a_project_that_predates_membership_still_belongs_to_its_owner() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "the owner lost their own project: {body}");
-    assert_eq!(body["tier"], "admin", "the owner is not an admin of their own board");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner lost their own project: {body}"
+    );
+    assert_eq!(
+        body["tier"], "admin",
+        "the owner is not an admin of their own board"
+    );
 
     // It is listed, so it does not merely exist — it is reachable the way a person finds it.
     let (_, list) = call(&h.app, "GET", "/v1/projects", Some(&h.creator), None).await;
     assert!(
-        list.as_array().unwrap().iter().any(|p| p["id"] == json!(legacy.to_string())),
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == json!(legacy.to_string())),
         "a pre-membership project vanished from its owner's project list: {list}"
     );
 
@@ -1068,7 +1078,11 @@ async fn a_project_that_predates_membership_still_belongs_to_its_owner() {
         Some(json!({"name": "renamed after the migration"})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "the owner could not administer their own project");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner could not administer their own project"
+    );
 
     // Everyone else still gets nothing, and gets told nothing.
     for token in [&h.prompter, &h.guest, &h.outsider] {
@@ -1110,7 +1124,11 @@ async fn a_granted_account_sees_the_project_in_its_own_list() {
 
     let (_, after) = call(&h.app, "GET", "/v1/projects", Some(&h.outsider), None).await;
     let listed = after.as_array().unwrap();
-    assert_eq!(listed.len(), 1, "the granted project is not in the grantee's list");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the granted project is not in the grantee's list"
+    );
     assert_eq!(listed[0]["id"], h.project);
     assert_eq!(listed[0]["tier"], "guest");
 
@@ -1123,7 +1141,11 @@ async fn a_granted_account_sees_the_project_in_its_own_list() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "a granted guest could not read the board");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a granted guest could not read the board"
+    );
 
     let (status, _) = call(
         &h.app,
@@ -1178,7 +1200,10 @@ async fn a_role_this_build_cannot_parse_is_refused_rather_than_rounded() {
         h.guest_id.as_str()
     )
     .expect("write the unknown tier");
-    assert_eq!(changed, 1, "the fixture did not actually write an unknown role");
+    assert_eq!(
+        changed, 1,
+        "the fixture did not actually write an unknown role"
+    );
 
     // It buys nothing — not even the read a guest had a moment ago.
     let (status, _) = call(

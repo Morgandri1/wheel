@@ -1001,7 +1001,15 @@ mod tests {
         fn send(&self, agent: Uuid) -> Uuid {
             let msg = {
                 let conn = self.sup.db.lock().unwrap();
-                messages::enqueue(&conn, MessageSender::User, agent, "hello".into(), None).unwrap()
+                messages::enqueue(
+                    &conn,
+                    MessageSender::User,
+                    agent,
+                    "hello".into(),
+                    None,
+                    None,
+                )
+                .unwrap()
             };
             msg.id
         }
@@ -1119,7 +1127,8 @@ mod tests {
         async fn send_body(&self, agent: Uuid, body: &str) -> Uuid {
             let msg = {
                 let conn = self.sup.db.lock().unwrap();
-                messages::enqueue(&conn, MessageSender::User, agent, body.into(), None).unwrap()
+                messages::enqueue(&conn, MessageSender::User, agent, body.into(), None, None)
+                    .unwrap()
             };
             let _ = self.sup.deliver(agent).await;
             msg.id

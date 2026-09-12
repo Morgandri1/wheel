@@ -72,7 +72,7 @@ fn router(db: &Db, url: &str, auth_mode: AuthMode, signup: SignupPolicy) -> Rout
             ingress_limiter: wheel_api::http::ratelimit::RateLimiter::new(60),
             auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
             engine_base_override: None,
-                membership: wheel_api::membership::MembershipEvents::new(),
+            membership: wheel_api::membership::MembershipEvents::new(),
             bridges: wheel_api::http::bridges::BridgeCounter::new(),
         }),
         &[],

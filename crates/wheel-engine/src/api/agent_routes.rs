@@ -1597,10 +1597,15 @@ mod attribution_tests {
     use axum::http::HeaderMap;
     use wheel_core::{AgentConfig, Node, NodeConfig, Position};
 
+    /// A fresh agent each time. The name has to be unique — node names are the address other
+    /// agents send to, so the board refuses a duplicate.
     fn agent(state: &AppState) -> Uuid {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name = format!("agent-{}", N.fetch_add(1, Ordering::Relaxed));
         let node = Node::new(
             Uuid::new_v4(),
-            "agent".parse().unwrap(),
+            name.parse().unwrap(),
             Position::default(),
             NodeConfig::Agent(AgentConfig::default()),
         );

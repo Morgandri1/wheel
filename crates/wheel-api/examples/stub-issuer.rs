@@ -102,6 +102,8 @@ async fn self_check(jwks_url: &str) -> Result<(), String> {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        ws_max_bridges_per_project: 16,
+        ws_max_lifetime_secs: 3600,
     };
     let cache = wheel_api::auth::jwks::JwksCache::new(jwks_url.to_string(), reqwest::Client::new());
     let token = mint("selfcheck");
