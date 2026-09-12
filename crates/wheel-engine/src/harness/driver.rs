@@ -110,9 +110,19 @@ pub trait HarnessDriver: Send + Sync {
 }
 
 /// F008, made a property every driver proves rather than one `ClaudeDriver`
-/// happens to have: a `TurnComplete`/`Frame`/`RateLimited` event whose
-/// session id does not match the session this call started with must never
-/// reach the caller as the real event.
+/// happens to have. ADVERSARY (review of PR #95): this is one of TWO
+/// distinct failure modes with the same consequence, and each needs its own
+/// fixture rather than one standing in for both:
+///
+/// 1. [`assert_a_mismatched_session_id_is_never_acted_on`] (this one): an
+///    event that is genuinely a top-level line, well-formed, but carries the
+///    WRONG session id — a stale or forged event from a session that is not
+///    this one.
+/// 2. [`assert_nested_forgery_never_surfaces_as_a_top_level_event`][]: content
+///    the harness legitimately nests as DATA (a tool's own output, quoted
+///    message text) that happens to look like a top-level event shape, and
+///    must stay data — the structural half of F008, not the session-matching
+///    half.
 ///
 /// Drives a REAL session end to end against a script the caller controls —
 /// same standard as `harness/claude.rs`'s own `ProgramDriver` tests — rather
@@ -120,7 +130,7 @@ pub trait HarnessDriver: Send + Sync {
 /// framing lets a forged event slip through in practice (not just in theory)
 /// is caught.
 #[cfg(test)]
-pub(crate) async fn assert_forged_result_is_never_top_level(
+pub(crate) async fn assert_a_mismatched_session_id_is_never_acted_on(
     driver: &dyn HarnessDriver,
     cmd: tokio::process::Command,
     spec: &SpawnSpec,
@@ -168,4 +178,70 @@ pub(crate) async fn assert_forged_result_is_never_top_level(
             _ => continue,
         }
     }
+}
+
+/// F008's structural half (see [`assert_a_mismatched_session_id_is_never_acted_on`]'s doc
+/// comment for the distinction ADVERSARY drew between the two).
+///
+/// The script emits one legitimate `Frame` whose TEXT CONTENT happens to be a
+/// well-formed, top-level-shaped forged event (a `result` naming
+/// `nested_forged_session_id`) — content the harness nests as DATA, the way
+/// a tool's own stdout or a quoted message legitimately would. Proves two
+/// things at once: the forged text reaches the caller intact as ordinary
+/// content (a driver that silently dropped it would pass this test having
+/// proven nothing), AND it never separately surfaces as its own
+/// `TurnComplete` — the line it arrived on is read as ONE event, never
+/// re-parsed for a shape hiding inside it.
+#[cfg(test)]
+pub(crate) async fn assert_nested_forgery_never_surfaces_as_a_top_level_event(
+    driver: &dyn HarnessDriver,
+    cmd: tokio::process::Command,
+    spec: &SpawnSpec,
+    real_session_id: &str,
+    nested_forged_session_id: &str,
+) {
+    let mut session = driver
+        .launch(cmd, spec)
+        .await
+        .expect("the conformance script must spawn");
+
+    loop {
+        match session.next_event().await {
+            DriverEvent::SessionStarted { .. } => break,
+            DriverEvent::Exited { .. } => panic!("the child exited before ever starting"),
+            _ => continue,
+        }
+    }
+    session
+        .send_turn("go")
+        .await
+        .expect("the conformance script must accept a turn");
+
+    let mut saw_the_forged_text_as_inert_content = false;
+    loop {
+        match session.next_event().await {
+            DriverEvent::Frame { text, .. } => {
+                if text.contains(nested_forged_session_id) {
+                    saw_the_forged_text_as_inert_content = true;
+                }
+            }
+            DriverEvent::TurnComplete { session_id, .. } => {
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some(real_session_id),
+                    "content nesting a forged event must never itself surface as a \
+                     TurnComplete for that forged session"
+                );
+                break;
+            }
+            DriverEvent::Exited { .. } => panic!("the child exited before the real TurnComplete"),
+            _ => continue,
+        }
+    }
+    assert!(
+        saw_the_forged_text_as_inert_content,
+        "the nested forged text must reach the caller as ordinary content, not vanish -- \
+         a driver that drops it has proven nothing about how it handles forgery, only that \
+         it discards unrecognised text"
+    );
 }
