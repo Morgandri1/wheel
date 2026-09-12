@@ -98,3 +98,10 @@ container image" — see the note at the top of this file for exactly what that 
 - **Verify before trusting an image**: check the image build time against the commit under test — this caught
   false findings (stale executor, short-secret prod-boot, missing imported_at) all session. And read code
   rather than acting on a truncated relay.
+- **2026-09-12: never run bare `git config user.name`/`user.email`** in a worktree here. All our worktrees
+  share one bare repo (`git worktree list`) and `extensions.worktreeConfig` is off, so a bare `git config`
+  (no `--global`, no `--worktree`) writes identity into the ONE shared repo config every role reads —
+  I did this by accident and it silently misattributed two of sdk's commits to me for ~8 minutes before I
+  noticed. Use per-command `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`
+  env vars instead — they don't touch the shared file. (Flagged to PM too; no project-wide CLAUDE.md exists
+  yet for this to live in instead, so it's here until one does.)
