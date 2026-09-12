@@ -25,7 +25,22 @@
 set -uo pipefail
 
 data_dir="${WHEEL_DATA_DIR:-/var/lib/wheel}"
-port="${WHEEL_PORT:-8080}"
+
+# THE SAME BIND_ADDR EVERYTHING ELSE READS. wheeld.service interpolates it into --bind,
+# wheel-preflight validates it and wheeld-ready measures against it; this used to invent its own
+# ${WHEEL_PORT:-8080}, a variable set nowhere in the repo. An operator who moved the port in
+# wheeld.local.env -- the single case the whole single-source-of-truth arrangement exists for --
+# got "serving: NO answer" and "the operator token did NOT authenticate" from a perfectly healthy
+# box, and `wheel-doctor health` exited non-zero.
+#
+# Read in wheeld's own resolution order: the managed file, then the operator's, which wins.
+for envfile in /etc/wheel/wheeld.env /etc/wheel/wheeld.local.env; do
+    [ -r "$envfile" ] || continue
+    value="$(grep -E '^BIND_ADDR=' "$envfile" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    [ -n "$value" ] && bind="$value"
+done
+bind="${BIND_ADDR:-${bind:-127.0.0.1:8080}}"
+port="${bind##*:}"
 base="http://127.0.0.1:$port"
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -116,10 +131,16 @@ if [ -r /etc/wheel/toolchain.env ]; then
 fi
 
 hr "exposure"
+# The board's port comes from its own env file for the same reason wheeld's does.
+web_port=3000
+if [ -r /etc/wheel/web.env ]; then
+    value="$(grep -E '^PORT=' /etc/wheel/web.env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    [ -n "$value" ] && web_port="$value"
+fi
 # What the ledger promises, measured rather than restated. Every listener on wheeld's and the
 # board's ports, and what they are bound to.
 if have ss; then
-    ss -ltnH 2>/dev/null | awk -v p1="$port" -v p2=3000 '
+    ss -ltnH 2>/dev/null | awk -v p1="$port" -v p2="$web_port" '
         { a=$4; n=split(a, x, ":"); if (x[n]==p1 || x[n]==p2) {
             host=substr(a, 1, length(a)-length(x[n])-1);
             loop = (host ~ /^(127\.|\[::1\]|\[::ffff:127\.)/) ? "loopback only" : "REACHABLE FROM THE NETWORK";

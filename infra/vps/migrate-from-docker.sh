@@ -14,10 +14,12 @@
 #
 # THE ONE PROPERTY EVERYTHING ELSE RESTS ON: THE DOCKER VOLUME IS ONLY EVER READ.
 #
-# Every container this script runs mounts it `:ro`. There is no `docker volume rm`, no
-# `docker compose down -v`, and no `-v` flag anywhere in this file -- which is grep-assertable, and
-# infra/tests/native-migration.test.sh asserts it, the same way deploy.sh earns its "never -v"
-# claim. So rollback is not a procedure this script has to implement correctly; it is a consequence
+# Every container this script runs mounts it `:ro` -- and that is asserted, not promised: every
+# `-v "$volume:..."` in this file is checked to end in `:ro`, and `docker volume rm` and
+# `compose down -v` are checked to be absent entirely, by infra/tests/native-migration.test.sh on
+# every commit. (An earlier draft of this comment claimed there was "no -v flag anywhere in this
+# file", which was simply false -- the read-only mounts use one -- and would have invited someone
+# to write that stricter grep and break the build.) So rollback is not a procedure this script has to implement correctly; it is a consequence
 # of never having written to the thing you would roll back to.
 #
 # TWO VOLUMES ON THAT MACHINE BELONG TO A RETIRED STACK AND MUST NEVER BE TOUCHED:
@@ -56,7 +58,7 @@ while [ $# -gt 0 ]; do
         --project) project="${2:?--project needs a compose project name}"; shift 2 ;;
         --replace) replace=1; shift ;;
         --dry-run) dry_run=1; shift ;;
-        -h|--help) sed -n '6,33p' "$0"; exit 0 ;;
+        -h|--help) sed -n '6,31p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done
@@ -138,8 +140,14 @@ fi
 # through a pipe that loses a file at the end exits 0.
 step "verifying every file against the source"
 if [ "$dry_run" = 0 ]; then
-    src_hashes="$(in_volume sh -c 'cd /src && find . -type f -print0 | sort -z | xargs -0 sha256sum')"
-    dst_hashes="$(cd "$data_dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"
+    # LC_ALL=C ON BOTH SIDES. The source runs in debian:bookworm-slim with no locale (byte
+    # collation); the destination runs in root's login environment, typically en_US.UTF-8, where
+    # glibc ignores punctuation at the primary collation level. The two `sort`s therefore order the
+    # same filenames differently -- and a data directory is full of dotfiles (.gitignore, .npmrc)
+    # where exactly that divergence shows up. The comparison below is a plain string compare, so a
+    # byte-perfect migration would have died with "the copy does not match the source".
+    src_hashes="$(in_volume sh -c 'cd /src && LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum')"
+    dst_hashes="$(cd "$data_dir" && LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)"
     if [ "$src_hashes" != "$dst_hashes" ]; then
         echo "$src_hashes" > /tmp/wheel-migrate-src.$$
         echo "$dst_hashes" > /tmp/wheel-migrate-dst.$$
@@ -170,7 +178,14 @@ fi
 
 # ---------------------------------------------------------------- prove it on the live box
 step "starting the native stack"
-run systemctl start wheeld
+# A failure here would otherwise exit with systemctl's bare status and no mention of the way back --
+# and this is precisely the moment an operator needs the rollback in front of them, not in a README.
+run systemctl start wheeld || die "wheeld did not start on the migrated data. NOTHING IS LOST: $volume was only ever read and is exactly as it was. Roll back with:
+
+    systemctl stop wheeld wheel-web
+    cd /opt/wheel-compose/infra/vps && ./deploy.sh
+
+Then: journalctl -u wheeld -n 50"
 run systemctl start wheel-web
 
 if [ "$dry_run" = 1 ]; then

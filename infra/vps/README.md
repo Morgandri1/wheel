@@ -311,11 +311,17 @@ sudo infra/vps/install.sh --rollback     # no build, no clone, no network
 That swaps `/opt/wheel/bin/{wheeld,wheel}` with their `.prev`, and the generation you rolled back
 *from* becomes the new `.prev` — so it is reversible.
 
-**An upgrade does not drop the board.** `wheel-web` `Requires=` the signup gate, which `Requires=`
-`wheeld` — and systemd propagates a *stop* along `Requires=` but not a *restart*. So
-`systemctl restart wheeld` leaves the board serving, while `systemctl stop wheeld` deliberately
-takes it down with it (a board in front of a stopped daemon is a board showing errors). Both halves
-are checked in the rehearsal rather than assumed.
+**An upgrade does not drop the board**, and getting that right required a correction. `wheel-web`
+`Requires=` the signup gate so a failing gate still blocks the board — but the gate only `Wants=`
+`wheeld`, not `Requires=` it. With `Requires=` there, every `systemctl restart wheeld` stopped the
+gate on its way down and took `wheel-web` with it, and the board did not come back. The rehearsal
+caught it; a stand-in experiment with toy units had said the opposite.
+
+The trade that buys: if `wheeld` stops, the board **stays up and shows errors** rather than
+stopping too. That is worse than stopping cleanly and much better than an upgrade that drops the
+board permanently, and it recovers by itself when `wheeld` returns. The gate loses nothing by the
+weakening — it makes a real HTTP call and fails on its own if `wheeld` is not answering, which is
+the correct outcome and the entire point of the script it runs.
 
 **`install.sh` refuses to move the box backwards** by default. If the installed binary's commit is
 a descendant of your `--ref`, that is a self-applied update (`WHEEL_AUTO_UPDATE`) about to be

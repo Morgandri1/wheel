@@ -6,7 +6,7 @@
 # Back up a native Wheel install's data directory, and restore one.
 #
 #   sudo ./backup.sh [--to <dir>] [--data-dir <dir>] [--keep <n>] [--no-stop] [--dry-run]
-#   sudo ./backup.sh --restore <archive> [--data-dir <dir>] [--dry-run]
+#   sudo ./backup.sh --restore <archive> [--data-dir <dir>] [--force] [--dry-run]
 #   sudo ./backup.sh --verify <archive>
 #
 # LOSING master.key LOSES EVERY VAULT SECRET ON THE BOARD, PERMANENTLY. It is not derived from
@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
         --verify) verify="${2:?--verify needs an archive}"; shift 2 ;;
         --force) force=1; shift ;;
         --dry-run) dry_run=1; shift ;;
-        -h|--help) sed -n '6,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '6,31p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done
@@ -66,7 +66,7 @@ done
 # restore can check what it is unpacking without needing this script's source of truth to still
 # exist -- an archive has to be self-describing or it stops being verifiable the day the repo moves.
 manifest_of() { # manifest_of <root>
-    ( cd "$1" && find . -type f ! -name MANIFEST -print0 | sort -z | xargs -0 sha256sum )
+    ( cd "$1" && LC_ALL=C find . -type f ! -name MANIFEST ! -name TAKEN-LIVE -print0 | LC_ALL=C sort -z | xargs -0 sha256sum )
 }
 
 # ---------------------------------------------------------------- verify
@@ -82,7 +82,7 @@ if [ -n "$verify" ]; then
     done
     n="$(grep -c . "$tmp/MANIFEST")"
     echo "  ok: $n files, all hashes match, master.key present"
-    grep -q '^# taken-live' "$tmp/MANIFEST" && echo "  WARNING: taken with --no-stop, so the database may be mid-transaction. Good for the secrets, not trustworthy for the store."
+    [ -f "$tmp/TAKEN-LIVE" ] && echo "  WARNING: taken with --no-stop, so the database may be mid-transaction. Good for the secrets, not trustworthy for the store."
     exit 0
 fi
 
@@ -96,10 +96,10 @@ if [ -n "$restore" ]; then
     tar -xzf "$restore" -C "$tmp"
     [ -f "$tmp/MANIFEST" ] || die "$restore has no MANIFEST"
     ( cd "$tmp" && sha256sum --quiet -c MANIFEST ) || die "the archive does not match its own manifest — refusing to restore damaged data over a working install"
-    if grep -q '^# taken-live' "$tmp/MANIFEST" && [ "$force" = 0 ]; then
+    if [ -f "$tmp/TAKEN-LIVE" ] && [ "$force" = 0 ]; then
         die "this archive was taken with --no-stop, so its database may be a half-written transaction. --force if you accept that (the secrets in it are fine; the store may not be)."
     fi
-    rm -f "$tmp/MANIFEST"
+    rm -f "$tmp/MANIFEST" "$tmp/TAKEN-LIVE"
 
     # The old tree is MOVED, never deleted. A restore is exactly when you find out the archive was
     # not what you thought, and the thing you just overwrote is the only other copy.
@@ -167,8 +167,12 @@ if [ "$dry_run" = 1 ]; then
 else
     tmp="$(mktemp -d)"; chmod 0700 "$tmp"
     manifest_of "$data_dir" > "$tmp/MANIFEST"
-    [ "$stop" = 1 ] || echo "# taken-live (--no-stop): the database in this archive may be mid-transaction" >> "$tmp/MANIFEST"
-    ( umask 077 && tar -czf "$archive.part" -C "$data_dir" . -C "$tmp" MANIFEST )
+    # A SIBLING FILE, not a comment line inside MANIFEST. `sha256sum -c` has no comment syntax, so
+    # appending it there made every --verify of such an archive print
+    # "WARNING: 1 line is improperly formatted" -- a message about a damaged manifest, during a
+    # restore, which is the last moment anyone wants to see one.
+    [ "$stop" = 1 ] || echo "taken with --no-stop: the database in this archive may be mid-transaction" > "$tmp/TAKEN-LIVE"
+    ( umask 077 && tar -czf "$archive.part" -C "$data_dir" . -C "$tmp" MANIFEST $([ -f "$tmp/TAKEN-LIVE" ] && echo TAKEN-LIVE) )
     mv -f "$archive.part" "$archive"
     chmod 0600 "$archive"
     rm -rf "$tmp"

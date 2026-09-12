@@ -17,8 +17,20 @@
 [Unit]
 Description=Wheel: prove wheeld enforces its own signup gate before the board starts
 Documentation=https://github.com/Morgandri1/wheel/blob/main/infra/vps/verify-signup-gate.sh
+# Wants=, NOT Requires=, and this cost a rehearsal run to get right.
+#
+# With Requires=wheeld.service, `systemctl restart wheeld` -- i.e. every upgrade -- stopped this
+# oneshot as wheeld went down, and because wheel-web Requires= THIS unit, the board went down with
+# it and did not come back. Measured: rehearse-native.sh's restart-no-cascade check went red with
+# "wheel-web went inactive when wheeld restarted". A stand-in experiment with toy units had said
+# the opposite, which is exactly why the real units get rehearsed.
+#
+# Nothing is lost by weakening it. This gate does not need systemd to promise wheeld is running:
+# it makes a real HTTP call and fails by itself if wheeld is not answering, which is the correct
+# outcome and the entire purpose of the script it runs. Wants= still pulls wheeld in at boot and
+# After= still orders behind it.
+Wants=wheeld.service
 After=wheeld.service
-Requires=wheeld.service
 
 [Service]
 Type=oneshot
@@ -31,7 +43,13 @@ DynamicUser=yes
 # exists to check. Same files, same order, so the resolution is identical by construction.
 EnvironmentFile=/etc/wheel/wheeld.env
 EnvironmentFile=-/etc/wheel/wheeld.local.env
-Environment=WHEEL_GATE_BASE=http://127.0.0.1:8080
+# Built from BIND_ADDR, which the EnvironmentFiles above supply, rather than hardcoded: wheeld's
+# --bind is interpolated from the same variable, so an operator who moves the port in
+# wheeld.local.env would otherwise have this gate probe a closed port, fail, and -- because
+# wheel-web Requires= it -- keep the board from ever starting. install.sh always writes
+# BIND_ADDR=127.0.0.1:8080, so the fallback is belt and braces.
+Environment=BIND_ADDR=127.0.0.1:8080
+Environment=WHEEL_GATE_BASE=http://${BIND_ADDR}
 ExecStart=/opt/wheel/libexec/verify-signup-gate.sh
 SyslogIdentifier=wheel-signup-gate
 

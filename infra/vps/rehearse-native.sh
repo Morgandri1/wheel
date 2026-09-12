@@ -172,7 +172,9 @@ if run_phase serve && { [ "$installed" = 1 ] || [ "$only" = serve ]; }; then
                 case "$h" in 127.*|::1|::ffff:127.*) ;; *) bad="$bad $a" ;; esac
             done
             [ -z "$bad" ] || { echo "reachable from the network:$bad"; exit 1; }
-            [ -n "$(ss -ltnH | awk "{print \$4}" | grep -c ":8080$")" ] || { echo "nothing listens on 8080"; exit 1; }'
+            # -q, not -n "$(grep -c ...)": grep -c ALWAYS prints a number, so the old form could
+            # never fail and this check passed against a box where wheeld was not listening at all.
+            ss -ltnH | awk "{print \$4}" | grep -q ":8080$" || { echo "nothing listens on 8080"; exit 1; }'
 
     # The unit is active AND ExecStartPost proved it serves. Type=simple alone would report
     # "active" for a daemon that never bound.
@@ -181,7 +183,10 @@ if run_phase serve && { [ "$installed" = 1 ] || [ "$only" = serve ]; }; then
             systemctl show -P ExecStartPost wheeld | grep -q wheeld-ready'
 
     check signup-gate-unit "the signup gate ran as a unit, and the board waits on it" \
-        dex bash -c 'systemctl is-active wheel-signup-gate >/dev/null 2>&1 || [ "$(systemctl show -P Result wheel-signup-gate)" = success ]
+        dex bash -c 'set -e
+            # set -e, because without it only the LAST line of this body decided the verdict and
+            # the clause checking the gate actually RAN was dead.
+            systemctl is-active wheel-signup-gate >/dev/null 2>&1 || [ "$(systemctl show -P Result wheel-signup-gate)" = success ]
             systemctl show -P Requires wheel-web | grep -q wheel-signup-gate'
 
     # The gate re-runs on every boot, which is the regression this lane fixed: it used to be a
@@ -225,14 +230,32 @@ if run_phase serve && { [ "$installed" = 1 ] || [ "$only" = serve ]; }; then
             sleep 2
             [ "$(systemctl is-active wheel-web)" = active ] || { echo "wheel-web went $(systemctl is-active wheel-web) when wheeld restarted — every upgrade would drop the board"; exit 1; }'
 
-    # The other half of the same property, and it is the DESIRED one: a board serving in front of a
-    # stopped wheeld is a board showing errors to whoever is logged in.
-    check stop-does-cascade "stopping wheeld takes the board down with it" \
+    # The board surviving a wheeld outage is the deliberate trade for the check above. A board in
+    # front of a stopped wheeld shows errors, which is worse than nothing and much better than a
+    # board that never returns from an upgrade -- and it recovers by itself when wheeld comes back,
+    # with no operator action.
+    check web-survives-wheeld-outage "the board is still up after wheeld stops and starts" \
         dex bash -c 'systemctl stop wheeld
             sleep 2
-            active=$(systemctl is-active wheel-web)
-            systemctl start wheeld >/dev/null 2>&1; systemctl start wheel-web >/dev/null 2>&1
-            [ "$active" != active ] || { echo "wheel-web kept serving with wheeld stopped"; exit 1; }'
+            during=$(systemctl is-active wheel-web)
+            systemctl start wheeld >/dev/null 2>&1
+            sleep 2
+            after=$(systemctl is-active wheel-web)
+            [ "$after" = active ] || { echo "wheel-web is $after after wheeld came back (it was $during while down)"; exit 1; }'
+
+    # The guarantee that weakening must NOT have cost: a failing gate still keeps the board from
+    # starting. Asserted by actually breaking the gate, not by reading the unit file.
+    check gate-still-blocks-the-board "a failing signup gate still stops the board starting" \
+        dex bash -c 'systemctl stop wheel-web >/dev/null 2>&1
+            mkdir -p /etc/systemd/system/wheel-signup-gate.service.d
+            printf "[Service]\nExecStart=\nExecStart=/bin/false\n" > /etc/systemd/system/wheel-signup-gate.service.d/99-break.conf
+            systemctl daemon-reload; systemctl reset-failed wheel-signup-gate >/dev/null 2>&1
+            systemctl start wheel-web >/dev/null 2>&1 && started=1 || started=0
+            rm -f /etc/systemd/system/wheel-signup-gate.service.d/99-break.conf
+            systemctl daemon-reload; systemctl reset-failed wheel-signup-gate >/dev/null 2>&1
+            systemctl start wheel-web >/dev/null 2>&1
+            [ "$started" = 0 ] || { echo "wheel-web started even though the signup gate failed"; exit 1; }'
+
 
     check doctor "wheel-doctor reports all three tiers healthy" \
         dex /usr/local/bin/wheel-doctor health
@@ -244,22 +267,47 @@ fi
 # ---------------------------------------------------------------- upgrade / rollback
 if run_phase upgrade && [ "$installed" = 1 ]; then
     echo
-    echo "=== upgrade: a failed upgrade must roll back and leave a SERVING box ==="
-    check prev-generation "an upgrade leaves a .prev to roll back to" \
-        dex bash -c '[ -e /opt/wheel/bin/wheeld.prev ] || { echo "no .prev after install"; exit 1; }'
+echo "=== upgrade: a failed upgrade must roll back and leave a SERVING box ==="
 
-    # The property that matters is not "rollback works" but "a broken build does not leave the box
-    # down". Simulated by replacing the binary with one that cannot serve.
-    check rollback-on-failure "a build that cannot serve is rolled back automatically" \
-        dex bash -c 'cp /opt/wheel/bin/wheeld /tmp/good
-            printf "#!/bin/sh\nexit 1\n" > /opt/wheel/bin/wheeld.broken && chmod +x /opt/wheel/bin/wheeld.broken
-            ln -f /opt/wheel/bin/wheeld /opt/wheel/bin/wheeld.prev
-            cp /opt/wheel/bin/wheeld.broken /opt/wheel/bin/wheeld
-            systemctl restart wheeld >/dev/null 2>&1 && { echo "a binary that exits 1 was reported as a successful start"; cp /tmp/good /opt/wheel/bin/wheeld; systemctl restart wheeld; exit 1; }
-            cp /tmp/good /opt/wheel/bin/wheeld
-            systemctl restart wheeld >/dev/null 2>&1 || { echo "could not restore"; exit 1; }
-            curl -fsS -o /dev/null -m 10 http://127.0.0.1:8080/healthz'
+    # A SECOND install, because a FIRST one has nothing behind it to keep: install.sh guards .prev
+    # creation on the binary already existing, and its own closing banner says so. The original
+    # check asserted .prev after a single install, failed on every run, and described an upgrade
+    # this phase never performed.
+    check second-install "install.sh is idempotent: a re-run succeeds" \
+        dex "$src/infra/vps/install.sh" --no-proxy --repo "$src" --ref main
+
+    check prev-generation "the re-run left a .prev for both binaries" \
+        dex bash -c 'for b in wheeld wheel; do
+                [ -e "/opt/wheel/bin/$b.prev" ] || { echo "no $b.prev after a second install"; exit 1; }
+            done'
+
+    # install.sh --rollback FOR REAL, rather than a hand-rolled imitation. The previous version of
+    # this check cp-ed over the running binary and died with "Text file busy" -- which is also why
+    # install.sh and sdk/auto-update both swap with hard-link + rename(2) instead of a copy, and is
+    # the argument for a check exercising the shipped code path rather than re-implementing it.
+    check rollback-swaps "install.sh --rollback swaps generations and keeps serving" \
+        dex bash -c "before=\$(/opt/wheel/bin/wheeld --version)
+            prev=\$(/opt/wheel/bin/wheeld.prev --version)
+            $src/infra/vps/install.sh --rollback >/dev/null 2>&1 || { echo '--rollback failed'; exit 1; }
+            after=\$(/opt/wheel/bin/wheeld --version)
+            [ \"\$after\" = \"\$prev\" ] || { echo \"after rollback the running binary is \$after, expected \$prev\"; exit 1; }
+            [ \"\$(/opt/wheel/bin/wheeld.prev --version)\" = \"\$before\" ] || { echo 'the rolled-back-from generation was not kept as .prev'; exit 1; }
+            curl -fsS -o /dev/null -m 10 http://127.0.0.1:8080/healthz || { echo 'not serving after rollback'; exit 1; }
+            $src/infra/vps/install.sh --rollback >/dev/null 2>&1"
+
+    # The headline claim: a build that cannot serve must leave a SERVING box, not a dead one.
+    # Uses the same hard-link + rename swap the real code does, for the Text-file-busy reason above.
+    check rollback-on-failure "a build that cannot serve fails the start rather than being reported healthy" \
+        dex bash -c 'ln -f /opt/wheel/bin/wheeld /tmp/good-wheeld
+            printf "#!/bin/sh\nexit 1\n" > /opt/wheel/bin/.broken && chmod 0755 /opt/wheel/bin/.broken
+            mv -f /opt/wheel/bin/.broken /opt/wheel/bin/wheeld
+            systemctl restart wheeld >/dev/null 2>&1 && started=1 || started=0
+            ln -f /tmp/good-wheeld /opt/wheel/bin/.fix && mv -f /opt/wheel/bin/.fix /opt/wheel/bin/wheeld
+            systemctl restart wheeld >/dev/null 2>&1 || { echo "could not restore a serving binary"; exit 1; }
+            curl -fsS -o /dev/null -m 10 http://127.0.0.1:8080/healthz || { echo "not serving after restore"; exit 1; }
+            [ "$started" = 0 ] || { echo "a binary that exits 1 was reported as a successful start"; exit 1; }'
 fi
+
 
 # ---------------------------------------------------------------- migrate
 if run_phase migrate && [ "$installed" = 1 ]; then

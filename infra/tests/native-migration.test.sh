@@ -51,8 +51,10 @@ if code "$mig" | grep -qE '\bdown\s+(-v\b|--volumes\b)'; then
     bad "no 'compose down -v'" "-v removes the project's volumes, which is exactly the fallback this migration depends on"
 else ok; fi
 
-if code "$mig" | grep -qE 'docker\s+run[^|]*-v\s+[^ ]*:/src(?!:ro)' 2>/dev/null ||
-   code "$mig" | grep -E 'docker\s+run' | grep -E '\-v\s+[^ ]+:/src' | grep -qv ':ro'; then
+# One expression, no lookahead. The first version of this tried `(?!:ro)` -- PCRE syntax handed to
+# grep -E, which exits 2, which `2>/dev/null` hid, which left the `||` fallback silently doing all
+# the work. A dead branch in a safety test is worse than no branch.
+if code "$mig" | grep -E 'docker[[:space:]]+run' | grep -E -- '-v[[:space:]]+[^ ]+:/src' | grep -qv ':ro'; then
     bad "every mount of the source volume is :ro" "a writable mount of the source makes 'the volume is untouched' a hope rather than a fact"
 else ok; fi
 
@@ -96,14 +98,29 @@ else bad "migration compares sha256 on both sides" "a tar through a pipe that tr
 # string survived, the check did not run, and this test said nothing.
 if code "$mig" | grep -qE 'sqlite3[^|]*integrity_check'; then ok
 else bad "migration actually invokes sqlite3 ... integrity_check" "a byte-identical copy of a corrupt database is still corrupt"; fi
-if code "$mig" | grep -q 'master.key'; then ok
-else bad "migration checks master.key by name" "losing it loses every vault secret, permanently and unrecoverably"; fi
-if code "$mig" | grep -q 'operator-token'; then ok
-else bad "migration proves the MIGRATED operator token still authenticates" "a wheeld that serves /healthz proves the listener, not that this board's store decrypted"; fi
+# THE STRING IS NOT THE BEHAVIOUR, which this file has now learned twice (see the integrity_check
+# note above). `master.key` appears in half a dozen die messages and `operator-token` appears in a
+# chmod loop, so grepping for either name stayed green after deleting the checks they are named
+# for. Both now require the surrounding CONSTRUCT.
+#
+# master.key: an inventory check that REFUSES when it is absent, not merely a mention.
+if code "$mig" | grep -qE 'grep -qx "\$must"|master\.key.*die|die.*master\.key'; then ok
+else bad "migration REFUSES to proceed without master.key" "losing it loses every vault secret, permanently and unrecoverably, and a migration that silently omits it looks like a success"; fi
+
+# operator-token: an actual authenticated request, not just a chmod that mentions the filename.
+if code "$mig" | grep -qE 'curl[^|]*v1/projects' && code "$mig" | grep -q 'operator-token'; then ok
+else bad "migration proves the MIGRATED operator token still authenticates" "a wheeld that serves /healthz proves the listener is up, not that this board's store decrypted with the key that just arrived"; fi
 
 echo "== backup.sh =="
-if code "$bak" | grep -qE 'systemctl stop wheeld'; then ok
-else bad "backup stops wheeld first" "SQLite in WAL mode copied live is a half-written transaction, and you find out at restore time"; fi
+# The BACKUP path's stop, not the restore path's. `grep 'systemctl stop wheeld'` matched the
+# restore path at the top of the file, so deleting the stop that guards the archive -- the property
+# this check is named for -- left it green.
+# END-ANCHORED. The backup path stops `wheeld` alone; the restore path stops `wheeld wheel-web`,
+# and an unanchored pattern matched the restore one -- so deleting the backup path's stop, the exact
+# property this check is named for, stayed green. That is the THIRD time in this file a substring
+# match has been satisfied by code other than the code under test.
+if code "$bak" | grep -qE 'was_active=1' && code "$bak" | grep -qE 'run systemctl stop wheeld[[:space:]]*$'; then ok
+else bad "backup stops wheeld before archiving (and restarts it after)" "SQLite in WAL mode copied live is a half-written transaction, and you find out at restore time"; fi
 if code "$bak" | grep -q 'MANIFEST'; then ok
 else bad "backup writes a checksum manifest into the archive" "an archive nobody has read back is a hope, not a backup"; fi
 if code "$bak" | grep -qE '\-\-verify'; then ok

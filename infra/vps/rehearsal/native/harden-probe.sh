@@ -86,7 +86,23 @@ probe() { # probe <name> <script body>  -> runs it under the shipped directives,
     systemctl daemon-reload
     systemctl reset-failed harden-probe >/dev/null 2>&1
     systemctl start harden-probe >/dev/null 2>&1
-    local rc; rc="$(systemctl show -P ExecMainStatus harden-probe)"
+    # ExecMainStatus alone is 0 for a unit whose START JOB failed -- a directive systemd refused to
+    # parse, a unit that would not load at all -- because no main process ever ran to have a status.
+    # Every MUST-SUCCEED check below would then read green against a unit file that does not even
+    # load, which is the opposite of what this probe is for. So a load/start failure is detected
+    # separately and reported as a failure of the check rather than as a passing one.
+    local rc result
+    result="$(systemctl show -P Result harden-probe 2>/dev/null)"
+    rc="$(systemctl show -P ExecMainStatus harden-probe 2>/dev/null)"
+    case "$result" in
+        success | "") ;;
+        exit-code) ;;
+        *)
+            PROBE_OUT="the unit did not run: Result=$result (a directive systemd refused, or a unit that would not load). $(cat "$work/out" 2>/dev/null)"
+            systemctl reset-failed harden-probe >/dev/null 2>&1
+            return 1
+            ;;
+    esac
     systemctl reset-failed harden-probe >/dev/null 2>&1
     PROBE_OUT="$(cat "$work/out" 2>/dev/null)"
     return "${rc:-1}"
@@ -166,7 +182,8 @@ fi
 # So what is checked is the honest thing: that systemd really applied an empty bounding set. What
 # it costs is stated in the README from the directive's semantics, not from a measurement this test
 # bed is able to make.
-applied="$(systemctl show -P CapabilityBoundingSet harden-probe 2>/dev/null || true)"
+# The probe unit has to exist before its resolved properties can be read, so run a no-op through it
+# first and then ask systemd what it computed.
 probe capcheck 'true' || true
 if [ -z "$(systemctl show -P CapabilityBoundingSet harden-probe 2>/dev/null)" ]; then
     good "CapabilityBoundingSet= is applied" "systemd computed an empty bounding set for the unit"

@@ -27,17 +27,26 @@ unit="$vps/systemd/wheeld.service"
 dropin="$vps/systemd/wheeld.service.d/10-resources.conf"
 
 layer="${1:-}"
-[ -n "$layer" ] || { sed -n '6,24p' "$0"; exit 2; }
+[ -n "$layer" ] || { sed -n '6,21p' "$0"; exit 2; }
 
 backup="$(mktemp -d)"
 cp "$unit" "$backup/wheeld.service"
 cp "$dropin" "$backup/10-resources.conf"
+# Restores the pristine files and LEAVES THE BACKUP IN PLACE, so it can be called more than once.
+# It used to `rm -rf "$backup"` on its way out, which made the `all` arm -- restore, re-seed the
+# backup, mutate again -- copy into a directory that no longer existed. From the second mutation on,
+# both the inline restore and this trap silently failed, and the script exited 0 having left
+# ProtectHome=no and ProtectSystem=no written into the COMMITTED unit file. A tool that breaks the
+# thing it is testing, quietly, while reporting success.
 restore() {
     cp "$backup/wheeld.service" "$unit"
     cp "$backup/10-resources.conf" "$dropin"
+}
+cleanup() {
+    restore
     rm -rf "$backup"
 }
-trap restore EXIT
+trap cleanup EXIT
 
 # Every edit must apply exactly once, so a mutation cannot silently miss the line it meant to break
 # and then report a green run as proof of anything.
@@ -124,8 +133,8 @@ case "$layer" in
     sandbox) do_sandbox || overall=1 ;;
     oom)     do_oom     || overall=1 ;;
     all)
-        do_harden  || overall=1; restore; cp "$unit" "$backup/wheeld.service"; cp "$dropin" "$backup/10-resources.conf"; echo
-        do_sandbox || overall=1; restore; cp "$unit" "$backup/wheeld.service"; cp "$dropin" "$backup/10-resources.conf"; echo
+        do_harden  || overall=1; restore; echo
+        do_sandbox || overall=1; restore; echo
         do_oom     || overall=1
         ;;
     *) echo "mutate-native: say which layer to break: harden, sandbox, oom, all" >&2; exit 2 ;;

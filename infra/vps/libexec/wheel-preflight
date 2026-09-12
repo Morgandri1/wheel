@@ -43,8 +43,11 @@ bind="${BIND_ADDR:-127.0.0.1:8080}"
 bind_host="${bind%:*}"
 bind_host="${bind_host#[}"
 bind_host="${bind_host%]}"
+# Same vocabulary wheeld-ready uses, including the v4-mapped form: ::ffff:127.0.0.1 IS loopback,
+# and refusing it here while accepting it there would mean preflight blocks a bind that the
+# readiness check would have been happy with.
 case "$bind_host" in
-    127.* | ::1 | localhost) ;;
+    127.* | ::1 | ::ffff:127.* | localhost) ;;
     *)
         if [ "${WHEEL_ALLOW_EXPOSED_BIND:-0}" = 1 ]; then
             note "WARNING: BIND_ADDR=$bind is not loopback, and WHEEL_ALLOW_EXPOSED_BIND=1 says you meant it. Everyone who can route to $bind_host reaches the sign-in, signup and public ingress routes directly, with no proxy in front and no TLS."
@@ -66,13 +69,21 @@ esac
 
 # ---------------------------------------------------------------- the binary
 [ -x "$bin" ] || fail "$bin is missing or not executable — run infra/vps/install.sh"
+# A binary systemd is about to run as the service user must not be writable by that user's group
+# or by the world. It IS legitimately writable by `wheel` under install.sh --updatable, which is
+# the auto-update lane's documented switch, so owner-write is deliberately not checked.
+#
+# POSITIONALLY, not by a floating pattern. This was `*w??w*`, which only matches two `w`s exactly
+# three positions apart -- i.e. owner-write AND group-write. `chmod o+w` (0757) sailed straight
+# through the one check that exists to stop "anything that can write this chooses what runs as the
+# account that can read master.key". `ls -ld`'s first ten characters are
+# <type><owner rwx><group rwx><other rwx>, so group-write is character 6 and other-write is 9.
 bin_perm="$(ls -ld "$bin" | cut -c1-10)"
-case "$bin_perm" in
-    # A binary systemd is about to run as the service user must not be writable by that user's
-    # group or by the world. It IS legitimately writable by `wheel` under install.sh --updatable,
-    # which is the auto-update lane's documented switch, so owner-write is not checked here.
-    *w??w*) fail "$bin is group- or world-writable ($bin_perm) — anything that can write it chooses what runs as the account that can read master.key" ;;
-esac
+group_w="$(printf '%s' "$bin_perm" | cut -c6)"
+other_w="$(printf '%s' "$bin_perm" | cut -c9)"
+if [ "$group_w" = w ] || [ "$other_w" = w ]; then
+    fail "$bin is group- or world-writable ($bin_perm) — anything that can write it chooses what runs as the account that can read master.key"
+fi
 
 # ---------------------------------------------------------------- the data directory
 #

@@ -197,8 +197,24 @@ check("ExecStartPost" in wheeld, "wheeld has an ExecStartPost",
 # a reboot brought the board up with nothing having checked.
 check(one(gate, "Type") == "oneshot", "wheel-signup-gate is Type=oneshot",
       "it must run to completion and report a verdict, not linger as a service")
-check("wheeld.service" in (gate_unit.get("Requires") or [""])[0], "wheel-signup-gate Requires=wheeld",
-      "the gate would run against nothing and report success")
+# Ordering, and DELIBERATELY NOT Requires=. With Requires=wheeld.service, every `systemctl restart
+# wheeld` -- every upgrade -- stopped this oneshot, which stopped wheel-web (it Requires= the gate),
+# and the board did not come back. Measured in rehearse-native.sh, after a stand-in experiment with
+# toy units had wrongly suggested restart does not propagate.
+#
+# Both directions are asserted, because re-adding Requires= would look like a tightening.
+check(any("wheeld.service" in v for v in gate_unit.get("After", [])),
+      "wheel-signup-gate After=wheeld.service",
+      "the gate would probe wheeld before it is up and fail for a reason that has nothing to do "
+      "with the signup policy")
+check(not any("wheeld.service" in v for v in gate_unit.get("Requires", [])),
+      "wheel-signup-gate does NOT Requires=wheeld.service",
+      "Requires= propagates wheeld's stop to this oneshot and from there to wheel-web, so every "
+      "upgrade restart drops the board and it does not return. The gate does not need the "
+      "dependency: it makes a real HTTP call and fails on its own if wheeld is not answering")
+check(any("wheeld.service" in v for v in gate_unit.get("Wants", [])),
+      "wheel-signup-gate Wants=wheeld.service",
+      "without it nothing pulls wheeld in when the gate is started on its own at boot")
 check(any("wheel-signup-gate.service" in v for v in web_unit.get("Requires", [])),
       "wheel-web Requires=wheel-signup-gate.service",
       "the board would start in front of a wheeld nobody proved enforces its own signup gate — on "

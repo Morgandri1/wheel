@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
         --stop-legacy) stop_legacy=1; shift ;;
         --legacy-project) legacy_project="${2:?--legacy-project needs a name}"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
-        -h | --help) sed -n '6,34p' "$0"; exit 0 ;;
+        -h | --help) sed -n '6,38p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done

@@ -247,7 +247,12 @@ run npm install -g --no-fund --no-audit --loglevel=error \
 # it is an OAuth refresh that stops working a week later on a box nobody is watching. PR #64's
 # headless refresh is the thing that needs the floor.
 if [ "$dry_run" = 0 ]; then
-    claude_installed="$(wheel_version_of claude)"
+    # `|| true` is load-bearing, not defensive noise. wheel_version_of ends in a grep, this script
+    # sets pipefail, and a claude that prints an unparseable banner therefore makes the whole
+    # command substitution exit 1 -- so `set -e` would abort here with NO output, in exactly the
+    # case the comment above says is the one worth catching. The empty-check below is the
+    # diagnostic; it has to be reachable.
+    claude_installed="$(wheel_version_of claude || true)"
     [ -n "$claude_installed" ] || die "claude is installed at $(command -v claude || echo 'nowhere on PATH') but printed no parseable version, so its fitness for headless OAuth refresh cannot be confirmed"
     wheel_version_ge "$claude_installed" "$WHEEL_CLAUDE_MIN" ||
         die "claude reports $claude_installed, below the $WHEEL_CLAUDE_MIN floor that PR #64's headless OAuth refresh requires. npm was asked for $WHEEL_CLAUDE_VERSION, so something else on this box is shadowing it: check 'command -v claude' and 'npm ls -g --depth=0'."
@@ -375,6 +380,12 @@ else
     rm -rf /opt/wheel/web.prev
     [ ! -d /opt/wheel/web ] || mv /opt/wheel/web /opt/wheel/web.prev
     mv /opt/wheel/web.new /opt/wheel/web
+    # NO web.prev IS KEPT, so --rollback and the auto-rollback below revert the BINARIES ONLY.
+    # That is deliberate rather than an oversight: a board build is ~100 MB against a ~30 MB
+    # binary, and the board talks to wheeld over a versioned HTTP API rather than a linked
+    # interface, so a newer board against an older wheeld is the ordinary state of affairs during
+    # any rolling deploy. If that ever stops being true, this is the line to change. Said out loud
+    # because "rolled back" reads like "everything reverted", and here it does not.
     rm -rf /opt/wheel/web.prev
 fi
 
@@ -481,7 +492,10 @@ else
     if [ "$restart_ok" = 0 ]; then
         echo "install: wheeld did not come up at $commit." >&2
         journalctl -u wheeld -n 30 --no-pager >&2 || true
-        if [ -e /opt/wheel/bin/wheeld.prev ]; then
+        # BOTH, because that is what swap_to_prev requires. Testing only wheeld.prev could take
+        # the rollback branch and then die inside swap_to_prev on the missing wheel.prev, leaving
+        # the box DOWN with a message contradicting the test that got us there.
+        if [ -e /opt/wheel/bin/wheeld.prev ] && [ -e /opt/wheel/bin/wheel.prev ]; then
             step "ROLLING BACK to the previous generation"
             swap_to_prev
             if systemctl restart wheeld; then
