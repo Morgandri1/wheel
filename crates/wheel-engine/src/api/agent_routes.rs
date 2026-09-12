@@ -1233,8 +1233,8 @@ mod tests {
 
     /// `resume_readers_if_blocked`'s own doc: "un-sticks EVERY agent that
     /// reads it, not only the one that signed in". Every existing sign-in
-    /// test wires exactly one agent to the vault, so the broadcast itself —
-    /// as opposed to the single-agent `resume_if_blocked` it fans out to —
+    /// test wires exactly one agent to the vault, so the broadcast itself --
+    /// as opposed to the single-agent `resume_if_blocked` it fans out to --
     /// had no coverage.
     #[tokio::test]
     async fn a_vault_credential_resumes_every_blocked_reader_not_just_one() {
@@ -1289,6 +1289,80 @@ mod tests {
             status_of(unrelated),
             wheel_core::AgentStatus::NeedsAuth,
             "an agent blocked on a DIFFERENT vault must not be touched"
+        );
+    }
+
+    fn tier_headers(tier: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-wheel-actor-tier",
+            axum::http::HeaderValue::from_str(tier).unwrap(),
+        );
+        h
+    }
+
+    /// ADVERSARY F2 (PR #70 review verdict): `GET /v1/agents/:id/auth` is a guest route on the
+    /// stated ground that it reports "whether an agent is authenticated, not with what" -- so
+    /// `source` (the vault node name) and `refreshable` (true only for `CLAUDE_OAUTH_SESSION`,
+    /// which is an exact key-name disclosure) must not reach anyone below admin.
+    #[tokio::test]
+    async fn a_guest_learns_only_that_the_agent_is_authenticated() {
+        let state = crate::api::test_state();
+        let (agent, vault) = {
+            let conn = state.db.lock().unwrap();
+            let agent = mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()));
+            let vault = mk(
+                &conn,
+                "anthropic",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            );
+            board::add_wire(&conn, agent, vault, WireType::Read, None).unwrap();
+            let vk = state.supervisor.vault_key().unwrap();
+            crate::vault::put(
+                &conn,
+                vk,
+                vault,
+                wheel_core::CLAUDE_OAUTH_SESSION,
+                r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-a","refreshToken":"sk-ant-ort01-a"}}"#,
+            )
+            .unwrap();
+            (agent, vault)
+        };
+        let _ = vault;
+
+        let admin = auth_status(State(state.clone()), Path(agent), tier_headers("admin"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(admin["authenticated"], true);
+        assert_eq!(
+            admin["source"], "anthropic",
+            "an admin must still see which vault: {admin}"
+        );
+        assert_eq!(
+            admin["refreshable"], true,
+            "an admin must still see this is a refreshable session: {admin}"
+        );
+
+        let guest = auth_status(State(state.clone()), Path(agent), tier_headers("guest"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            guest,
+            serde_json::json!({ "authenticated": true }),
+            "a guest must learn ONLY that the agent is authenticated, nothing about the \
+             credential itself: {guest}"
+        );
+
+        let prompter = auth_status(State(state), Path(agent), tier_headers("prompter"))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            prompter,
+            serde_json::json!({ "authenticated": true }),
+            "below admin is below admin, not guest-only: {prompter}"
         );
     }
 
