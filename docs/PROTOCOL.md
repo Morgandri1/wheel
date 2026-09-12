@@ -185,6 +185,9 @@ a `400`, not an ignored key: check `features` first.
 | `oauth_refresh` | The engine RENEWS a vault-held claude.ai login before it expires, so an 8-hour token does not become an 8-hour board. `GET /v1/agents/:id/auth` reports `refreshable: true`, the `expires_at` of the current token, and a `warning` when the last renewal failed. **Absent on `api-key-only`** |
 | `interrupt` | `POST /v1/agents/:id/interrupt` exists on this build |
 | `script_run` | `POST /v1/scripts/:id/run` exists on this build. **The route existing is not the same as a call succeeding**: it answers `503 config` on any deployment that has not proven per-node uid isolation (F007) — see § "Script nodes". This id promises the route, not that a call will run anything |
+| `quota_parking` | the `rate_limited` status with `resets_at`/`resume_at` on `/v1/board`: a closed usage window requeues the in-flight message and the engine resumes by itself (§5c) |
+| `credential_fallback` | `AgentConfig.fallback_vault`, a read-wired vault whose credential a spawn switches to once when the window closes (§5c) |
+| `await_reply` | `POST /v1/cli/msg` `{await_secs, notify}` and `GET /v1/cli/sent`: the consuming turn's result comes back to the sender (§5c) |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.

@@ -709,7 +709,12 @@ pub async fn msg(
 
 #[derive(Debug, Deserialize)]
 pub struct SentQuery {
-    pub id: uuid::Uuid,
+    /// Optional at EXTRACTION, required in the handler: a query the extractor
+    /// rejects is a 400 answered before the caller is authenticated, which
+    /// breaks this realm's "no token, no answer" contract and tells an
+    /// anonymous caller the route's shape.
+    #[serde(default)]
+    pub id: Option<uuid::Uuid>,
     /// Wait up to this many seconds for it to settle first.
     #[serde(default)]
     pub wait: Option<u64>,
@@ -726,15 +731,17 @@ pub async fn sent(
     axum::extract::Query(q): axum::extract::Query<SentQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let me = caller(&s, &headers)?;
+    let id =
+        q.id.ok_or_else(|| ApiError::invalid("sent needs the id of a message you sent"))?;
     let (receipt, peer, guard) = {
         let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
-        let msg = messages::get(&conn, q.id)
+        let msg = messages::get(&conn, id)
             .map_err(|e| ApiError::internal(e.to_string()))?
             .filter(|m| matches!(&m.from, MessageSender::Node { id, .. } if *id == me.node.id))
-            .ok_or_else(|| ApiError::not_found(q.id.to_string()))?;
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?;
         let peer = board::get(&conn, msg.to)
             .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found(q.id.to_string()))?
+            .ok_or_else(|| ApiError::not_found(id.to_string()))?
             .name
             .to_string();
         me.require(&conn, &peer, WireType::Send)
@@ -1349,7 +1356,10 @@ mod await_tests {
         let Json(later) = sent(
             State(s.clone()),
             ha,
-            axum::extract::Query(SentQuery { id, wait: Some(30) }),
+            axum::extract::Query(SentQuery {
+                id: Some(id),
+                wait: Some(30),
+            }),
         )
         .await
         .unwrap();
@@ -1527,7 +1537,12 @@ mod await_tests {
             .await
             .unwrap();
         let id: uuid::Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
-        let q = || axum::extract::Query(SentQuery { id, wait: None });
+        let q = || {
+            axum::extract::Query(SentQuery {
+                id: Some(id),
+                wait: None,
+            })
+        };
 
         let Json(mine) = sent(State(s.clone()), ha, q()).await.unwrap();
         assert_eq!(mine["outcome"], "pending", "B is stopped: {mine}");
@@ -1535,6 +1550,37 @@ mod await_tests {
             .await
             .expect_err("the recipient did not send it");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// The realm answers "no token" before it answers "bad request": an
+    /// extractor that rejects first would 400 an anonymous caller, which both
+    /// breaks the realm's contract and describes the route to someone who
+    /// presented nothing.
+    #[tokio::test]
+    async fn sent_is_unauthorized_before_it_is_invalid() {
+        let (s, _dir) = fake_state("sent-auth");
+        let empty = axum::extract::Query(SentQuery {
+            id: None,
+            wait: None,
+        });
+        let err = sent(State(s.clone()), HeaderMap::new(), empty)
+            .await
+            .expect_err("no token, no answer");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        // ...and once a token IS presented, the missing id is a plain 400.
+        let (_a, ha) = agent(&s, "a");
+        let err = sent(
+            State(s),
+            ha,
+            axum::extract::Query(SentQuery {
+                id: None,
+                wait: None,
+            }),
+        )
+        .await
+        .expect_err("a message id is required");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
