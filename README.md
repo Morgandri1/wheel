@@ -17,14 +17,22 @@ Workflow: one worktree per team under `/Users/metatron/wheel-wt/<role>`, merge t
 
 Wheel is source-available (PolyForm Noncommercial 1.0.0) — free to use, modify, and share for any noncommercial purpose.
 
-It is **headless-first**: a shell and `curl` are enough to run it, drive it and script it. The board UI is an optional
-add-on that calls the API from its own server. The design and its threat model: `docs/proposals/headless-first.md`.
+It is **headless-first**: a shell (bash or zsh — the `wh()` helper below uses process substitution,
+which POSIX `sh`/`dash` don't have) and `curl` are enough to run it, drive it and script it. The
+board UI is an optional add-on that calls the API from its own server. The design and its threat
+model: `docs/proposals/headless-first.md`.
 
 ### 1. `wheeld` — one executable
-Before this: a **Rust toolchain** (stable; https://rustup.rs — nothing in this workspace pins a
-version) and a **C compiler** (`build-essential` on Debian/Ubuntu, Xcode Command Line Tools on
-macOS: `rusqlite`'s bundled SQLite and `ring`'s assembly both need one to build; nothing here needs
-OpenSSL, every TLS path in the dependency graph is `rustls`). `git`, to get this repo. The examples
+Before this: a **recent Rust stable, at least 1.88** (https://rustup.rs — nothing in this workspace
+pins an exact version, but `crates/wheel-core/Cargo.toml`'s direct dependency on `time` and several
+locked transitive crates declare that floor, and `Cargo.lock`'s own format needs cargo ≥ 1.78
+regardless. **Do not use your distro's packaged `rustc`** — Ubuntu 24.04's apt package is 1.75 and
+will not build this workspace; `rustup` is the one that tracks current stable) and a **C compiler**
+(`build-essential` on Debian/Ubuntu, Xcode Command Line Tools on macOS: `rusqlite`'s bundled SQLite
+and `ring`'s assembly both need one to build; nothing here needs OpenSSL, every TLS path in the
+dependency graph is `rustls`). `git` — to get this repo, and also at **runtime**: the engine shells
+out to `git clone --bare` for any agent workspace backed by a repo
+(`crates/wheel-engine/src/supervisor/workspace.rs`), not only to build `wheeld` once. The examples
 below also use `curl` and `jq`. Building `wheeld` does **not** need Node — but running an agent
 does: install Node.js 22+ and `npm install -g @anthropic-ai/claude-code @openai/codex` yourself, or
 use Docker, which bundles both.
@@ -141,6 +149,9 @@ Projects belong to the account that created them. To script the boards you use i
 either from the UI or with `wheeld token create --email you@example.com`.
 
 ### 4. On your own cloud
+Before this: a Railway account and the `railway` CLI for that path; for any VM/Kubernetes, Docker
+(or a way to run OCI images) plus your own Postgres. Nothing here is built from source by you —
+the images are what's built, per §2's prerequisites, wherever you build or pull them.
 - **Railway**: fork this repo, create services from `docker/Dockerfile.api` and `docker/Dockerfile.host` (+ Postgres), apply
   `infra/railway/settings.json` with `infra/railway/apply-settings.sh`; env vars are listed in `infra/railway/README.md` and `web/DEPLOY.md`.
   The host runs agents as per-project unix users on one machine (no Docker daemon needed) — size it for your agents' builds.
@@ -151,6 +162,8 @@ either from the UI or with `wheeld token create --email you@example.com`.
   authenticates the same way everywhere.
 
 ### Developing Wheel: the multi-service stack
+Before this: the same as §2 (Docker Engine with the Compose v2 plugin, `git`) — Postgres, the API
+and the host all come from the images built below, not from anything installed by hand.
 ```bash
 docker network create wheel
 docker compose -f infra/docker-compose.yml up --build              # postgres + api + host, API on 127.0.0.1:8080

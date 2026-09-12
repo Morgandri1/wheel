@@ -10,8 +10,10 @@
 #   infra/vps/deploy.sh [--env-file <path>] [--dry-run]
 #   infra/vps/deploy.sh --stop-legacy [--legacy-project <name>] [--dry-run]
 #
-#   --env-file <path>       Default: infra/vps/.env. Copied to a private working file; never
-#                            written to.
+#   --env-file <path>       Default: infra/vps/.env. Its content is copied to a private working
+#                            file before anything reads it, but the file ITSELF may be chmod'd to
+#                            600 in place if it is looser than that (see below) — not "never
+#                            written to". Refused if it is a symlink, rather than following it.
 #   --stop-legacy            Stop an older compose deployment (default project name "wheel") if
 #                            one is running, with `docker compose -p <name> down` — NEVER `-v`, so
 #                            its volumes are never touched. Without this flag, an old deployment
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$env_file" ] || die "$env_file does not exist — copy .env.example to .env first"
+[ -L "$env_file" ] && die "$env_file is a symlink — refusing to follow it. This script reads it as root and may chmod it; point --env-file at the real file directly."
 
 # .env holds no secret by default (wheeld generates its own inside its volume), but it is exactly
 # the kind of file that quietly stops being true, so this checks rather than trusting whoever ran
@@ -138,5 +141,21 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 echo "==> docker compose up -d --build"
-compose up -d --build
+if compose up -d --build; then
+    compose ps
+    exit 0
+fi
+up_rc=$?
+
+# depends_on (verify-signup-gate included) gates STARTING a service and never stops one already
+# running, so on a fresh deploy a failed dependency already means wheeld/web never started —
+# nothing more to do there. On an UPGRADE, though, wheeld and an already-running web stay Up,
+# still answering on their loopback ports (tunnel mode's whole access path), so `up` failing is
+# only a loud alarm unless something here actually stops them too. This does, whenever `up` fails
+# for any reason, not only a verify-signup-gate failure specifically — a conservative default is
+# better than trying to attribute the exact cause and getting it wrong. It is still only wheeld
+# and web going down, not proof that nothing was reachable in the time before this ran.
+echo "==> docker compose up failed (rc=$up_rc). Stopping wheeld and web as a precaution — check 'docker compose -p wheel logs' for why, especially verify-signup-gate." >&2
+compose stop wheeld web 2>&1 | sed 's/^/    /' >&2
 compose ps
+exit "$up_rc"

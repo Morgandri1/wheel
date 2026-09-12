@@ -51,9 +51,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # a developer has, or "wheel on wheel" means an agent that can read the repo and
 # not compile it.
 #
-# cc/pkg-config/libssl are not optional extras here -- rusqlite builds bundled
-# sqlite and ring builds its own asm, so without a C toolchain `cargo build`
-# fails deep in a dependency with an error that reads like a Rust problem.
+# The C compiler here is not an optional extra -- rusqlite builds bundled sqlite and ring builds
+# its own asm, so without one `cargo build` fails deep in a dependency with an error that reads
+# like a Rust problem. pkg-config and libssl-dev do NOT share that justification: this workspace's
+# TLS is rustls throughout (reqwest/sqlx/tokio-tungstenite all pin rustls-tls features) and
+# `openssl-sys` does not appear in Cargo.lock at all, so nothing here links against system OpenSSL
+# or needs pkg-config to find it. They install harmlessly today; the reason above just isn't why.
+# Follow-up: confirm nothing in this image's toolchain needs them for anything else, then drop them
+# (docker/Dockerfile.wheeld and infra/vps/install.sh install the same two, for the same non-reason).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev make \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

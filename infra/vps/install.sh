@@ -143,6 +143,11 @@ as_builder() {
 step "system packages"
 export DEBIAN_FRONTEND=noninteractive
 run apt-get update -q
+# build-essential is load-bearing: rusqlite's bundled sqlite and ring's asm both need a C
+# compiler, or the cargo build below fails deep in a dependency with an error that reads like a
+# Rust problem. pkg-config and libssl-dev are NOT — this workspace is rustls-only (no openssl-sys
+# in Cargo.lock at all) — but are installed anyway for parity with docker/Dockerfile.host, which
+# has the same follow-up recorded to drop them once confirmed unneeded there too.
 run apt-get install -y -q --no-install-recommends \
     ca-certificates curl git gnupg build-essential pkg-config libssl-dev make python3 python3-venv procps
 if ! node_version="$(node --version 2>/dev/null)" || [ "${node_version%%.*}" != v22 ]; then

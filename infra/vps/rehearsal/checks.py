@@ -42,6 +42,18 @@ class Skipped(Exception):
     pass
 
 
+class HardClose(Exception):
+    """The connection closed after a request was sent, before any response line arrived.
+
+    Deliberately its own type, not the built-in ConnectionError: ConnectionRefusedError (the
+    target never accepted a connection at all) is itself a ConnectionError subclass, and a plain
+    socket timeout is neither confirmation nor denial of anything. Only this narrower signal — the
+    server accepted the request and then hung up without answering — is actual evidence a proxy
+    aborted mid-stream; the others are absence of evidence, not proof, and must fail loudly rather
+    than being read as a pass.
+    """
+
+
 def expect(condition, why):
     if not condition:
         raise Failed(why)
@@ -160,7 +172,7 @@ class Conn:
         deadline = time.monotonic() + (timeout or self.timeout)
         while b"\r\n\r\n" not in self.buf:
             if not self._fill(deadline):
-                raise ConnectionError("closed before a response")
+                raise HardClose("closed before a response")
         head, self.buf = self.buf.split(b"\r\n\r\n", 1)
         lines = head.decode("latin-1").split("\r\n")
         headers = {}
@@ -530,10 +542,12 @@ def body_limits():
     # over 256 KiB) is caught almost immediately, before reverse_proxy has dialed the backend, and
     # gets a clean 413. A megabyte-scale overage gives reverse_proxy time to start forwarding
     # before the cutoff lands, and aborting an in-flight proxy read surfaces as either a 502 or a
-    # hard close with no response at all — measured directly, both reproduce on repeated identical
-    # 6 MiB POSTs to /v1/projects. Either way nothing over the limit ever succeeds, which is the
-    # property that matters; the exact client-visible failure mode is not, so a raised connection
-    # error counts the same as a 502 here.
+    # HardClose (the server accepted the request, then hung up with no response at all) — measured
+    # directly, both reproduce on repeated identical 6 MiB POSTs to /v1/projects. Either way nothing
+    # over the limit ever succeeds, which is the property that matters. HardClose specifically is
+    # evidence, not merely absence of a clean answer: a plain connection refusal or a bare timeout
+    # would NOT be caught here (see HardClose's own docstring) and would fail this check loudly,
+    # as they should — they prove nothing about the limit, only that something else is wrong.
     answered_by = {}
     for label, path, headers in (
         ("/v1", "/v1/projects", {"x-auth-token": token, "content-type": "application/json"}),
@@ -541,11 +555,16 @@ def body_limits():
     ):
         try:
             reply = request("POST", path, headers, b" " * (6 * MiB))
-        except (ConnectionError, TimeoutError) as e:
-            answered_by[label] = f"a hard connection close ({type(e).__name__}: {e}) — a proxy-level refusal, not a clean 413"
-            continue
-        expect(reply.status in (413, 502) or (reply.status >= 400 and EDGE_413 not in reply.body), f"6 MiB to {label} succeeded: {reply.brief()}")
-        answered_by[label] = "a clean edge 413" if EDGE_413 in reply.body else f"a {reply.status} (proxy-level refusal, not a clean 413 — see the comment above)"
+            refused = reply.status in (413, 502) or (reply.status >= 400 and EDGE_413 not in reply.body)
+            is_clean_413 = EDGE_413 in reply.body
+            detail = "a clean edge 413" if is_clean_413 else f"a {reply.status}"
+            evidence = reply.brief()
+        except HardClose as e:
+            refused, is_clean_413 = True, False
+            detail = f"a hard connection close ({e})"
+            evidence = str(e)
+        expect(refused, f"6 MiB to {label} succeeded, or failed for an unproven reason: {evidence}")
+        answered_by[label] = detail if is_clean_413 else f"{detail} (proxy-level refusal, not a clean 413 — see the comment above)"
     blob = f"{engine(pid)}/chests/{uuid.uuid4()}/blob?key=rehearsal.bin"
     carve_out = request("PUT", blob, {"x-auth-token": token, "content-type": "application/octet-stream"}, b"z" * (6 * MiB))
     expect(carve_out.status and EDGE_413 not in carve_out.body, f"a 6 MiB chest blob, under its 50 MiB limit, was refused at the edge: {carve_out.brief()}")
