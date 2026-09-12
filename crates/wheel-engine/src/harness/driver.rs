@@ -161,9 +161,17 @@ pub(crate) async fn assert_a_mismatched_session_id_is_never_acted_on(
 
     // The script is expected to emit ONE forged-session TurnComplete, then a
     // real one. If the forged one reached the caller as TurnComplete, F008
-    // does not hold for this driver.
+    // does not hold for this driver. It must also not vanish with zero
+    // trace: dropped from the model-facing stream, but surfaced as Unknown
+    // so a caller has SOME forensic signal a mismatched event arrived.
+    let mut saw_the_forgery_as_unknown_noise = false;
     loop {
         match session.next_event().await {
+            DriverEvent::Unknown { raw } => {
+                if raw.contains(forged_session_id) {
+                    saw_the_forgery_as_unknown_noise = true;
+                }
+            }
             DriverEvent::TurnComplete { session_id, .. } => {
                 assert_eq!(
                     session_id.as_deref(),
@@ -178,6 +186,11 @@ pub(crate) async fn assert_a_mismatched_session_id_is_never_acted_on(
             _ => continue,
         }
     }
+    assert!(
+        saw_the_forgery_as_unknown_noise,
+        "the mismatched event must surface as Unknown carrying the raw line, not vanish with \
+         no trace at all"
+    );
 }
 
 /// F008's structural half (see [`assert_a_mismatched_session_id_is_never_acted_on`]'s doc

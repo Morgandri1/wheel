@@ -333,9 +333,8 @@ impl DriverSession for ClaudeSession {
                         match line {
                             Ok(Some(line)) => {
                                 self.stdout_tail.push(&line);
-                                if let Some(event) = self.translate(ClaudeDriver.parse_line(&line)) {
-                                    return event;
-                                }
+                                let event = ClaudeDriver.parse_line(&line);
+                                return self.translate(event, &line);
                             }
                             _ => self.stdout_done = true,
                         }
@@ -357,21 +356,30 @@ impl DriverSession for ClaudeSession {
 
 impl ClaudeSession {
     /// One `HarnessEvent` (the old, stateless parse of a single line) into
-    /// the event this session actually returns, or `None` to keep reading
-    /// (F008: a session-id mismatch is dropped here, not handed to the
-    /// caller as the real event).
-    fn translate(&mut self, event: HarnessEvent) -> Option<DriverEvent> {
+    /// the event this session actually returns.
+    ///
+    /// F008: an event whose session id does not match the one this session
+    /// started with becomes `Unknown` rather than the real event -- dropped
+    /// from the model-facing stream either way, but with the raw line kept
+    /// so a caller has SOME forensic signal that a mismatched (stale or
+    /// forged) event arrived, instead of it vanishing with no trace at all
+    /// (ADVERSARY, review of PR #95: the doc comment on `DriverEvent::Unknown`
+    /// already promised this; this is the fix that makes it true rather than
+    /// the comment being corrected to describe silent dropping).
+    fn translate(&mut self, event: HarnessEvent, raw: &str) -> DriverEvent {
         match event {
             HarnessEvent::Init { session_id } => {
                 self.initialised = true;
                 self.session_id = Some(session_id.clone());
-                Some(DriverEvent::SessionStarted { session_id })
+                DriverEvent::SessionStarted { session_id }
             }
             HarnessEvent::Text { session_id, text } => {
                 if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
-                    return None;
+                    return DriverEvent::Unknown {
+                        raw: raw.to_string(),
+                    };
                 }
-                Some(DriverEvent::Frame { session_id, text })
+                DriverEvent::Frame { session_id, text }
             }
             HarnessEvent::Result {
                 session_id,
@@ -381,15 +389,17 @@ impl ClaudeSession {
                 cost_usd,
             } => {
                 if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
-                    return None;
+                    return DriverEvent::Unknown {
+                        raw: raw.to_string(),
+                    };
                 }
-                Some(DriverEvent::TurnComplete {
+                DriverEvent::TurnComplete {
                     session_id,
                     is_error,
                     text,
                     turns,
                     cost_usd,
-                })
+                }
             }
             HarnessEvent::RateLimit {
                 session_id,
@@ -399,17 +409,19 @@ impl ClaudeSession {
                 resets_at,
             } => {
                 if !session_matches(self.session_id.as_deref(), session_id.as_deref()) {
-                    return None;
+                    return DriverEvent::Unknown {
+                        raw: raw.to_string(),
+                    };
                 }
-                Some(DriverEvent::RateLimited {
+                DriverEvent::RateLimited {
                     session_id,
                     status,
                     window,
                     utilization,
                     resets_at,
-                })
+                }
             }
-            HarnessEvent::Unknown { raw } => Some(DriverEvent::Unknown { raw }),
+            HarnessEvent::Unknown { raw } => DriverEvent::Unknown { raw },
         }
     }
 }
