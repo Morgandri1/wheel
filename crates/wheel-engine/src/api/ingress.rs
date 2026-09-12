@@ -615,8 +615,75 @@ mod tests {
     /// Stated as an equality against the source of truth rather than an
     /// `assert!` clippy can fold away: the point is that this constant tracks
     /// the message limit, not that today's numbers happen to compare.
+    ///
+    /// This does NOT exercise the real call site (QA's audit,
+    /// reports/qa-audit-ingress-body-cap-blind-test-2026-09-12): `MAX_INGRESS_BODY`
+    /// is DEFINED as `wheel_core::MAX_MESSAGE_BODY`, so the two can never
+    /// disagree and this cannot observe a regression at `to_bytes` below.
+    /// `an_oversized_body_is_rejected_before_it_is_buffered` is the test that
+    /// actually proves the cap holds.
     #[test]
     fn the_body_cap_is_the_message_limit() {
         assert_eq!(MAX_INGRESS_BODY, wheel_core::MAX_MESSAGE_BODY);
+    }
+
+    fn endpoint_node(state: &AppState, path: &str) -> uuid::Uuid {
+        let ep = wheel_core::Node::new(
+            Uuid::new_v4(),
+            "hook".parse().unwrap(),
+            wheel_core::Position::default(),
+            NodeConfig::Endpoint(wheel_core::EndpointConfig {
+                method: HttpMethod::Post,
+                path: path.into(),
+                response_mode: wheel_core::ResponseMode::Ack,
+                auth: wheel_core::EndpointAuth::None,
+            }),
+        );
+        let conn = state.db.lock().unwrap();
+        board::create(&conn, &ep).unwrap();
+        ep.id
+    }
+
+    /// ADVERSARY 031, "size before signature": an unsigned body must never be
+    /// buffered past the cap before HMAC verification runs, or a sender pays
+    /// nothing to cost this project memory. Mutation-checked: with the cap at
+    /// `to_bytes` disabled (or widened), this test is the one that goes red —
+    /// `the_body_cap_is_the_message_limit` above stays green either way,
+    /// because it never calls `handle`.
+    #[tokio::test]
+    async fn an_oversized_body_is_rejected_before_it_is_buffered() {
+        let state = crate::api::test_state();
+        endpoint_node(&state, "/hook");
+
+        let oversized = vec![b'a'; MAX_INGRESS_BODY + 1];
+        let resp = handle(
+            State(state),
+            Method::POST,
+            "/hook".parse().unwrap(),
+            HeaderMap::new(),
+            Body::from(oversized),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The boundary: a body AT the cap is not itself oversized. Without this,
+    /// a fix for the case above that shaves the ceiling by one byte (an
+    /// off-by-one on `to_bytes`'s limit) would pass unnoticed.
+    #[tokio::test]
+    async fn a_body_exactly_at_the_cap_is_accepted() {
+        let state = crate::api::test_state();
+        endpoint_node(&state, "/hook");
+
+        let at_limit = vec![b'a'; MAX_INGRESS_BODY];
+        let resp = handle(
+            State(state),
+            Method::POST,
+            "/hook".parse().unwrap(),
+            HeaderMap::new(),
+            Body::from(at_limit),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
