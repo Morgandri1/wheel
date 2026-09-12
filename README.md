@@ -89,8 +89,11 @@ its group (`setsid`) and so is unreachable to `wheeld` itself.
 [Service]
 ExecStart=/usr/local/bin/wheeld --data-dir /var/lib/wheel
 KillMode=mixed
-TimeoutStopSec=30
+TimeoutStopSec=35
 ```
+That is the minimum. For a real server, §2 below installs a unit that also refuses to start on a
+bad configuration, proves it is actually serving before reporting success, and bounds what a
+runaway agent can take.
 
 The browser-facing settings are closed by default. `CORS_ALLOWED_ORIGINS` is empty, and a request is refused unless
 its `Host` is an IP address, `localhost`, the bind address, or a name in `WHEEL_ALLOWED_HOSTS`. That is what stops a
@@ -112,7 +115,49 @@ web page from reaching wheeld through DNS rebinding.
   Trusting `127.0.0.1` trusts every local process, agents included; the Docker layout trusts the proxy's container.
 - `WHEEL_ALLOWED_HOSTS=<domain>`, because the proxy passes the public `Host` through.
 
-### 2. Docker, headless
+### 2. On a server — systemd, no Docker
+**This is the recommended way to run Wheel on a machine that is not your laptop.** `infra/vps/` is
+a kit that builds Wheel from source on Ubuntu 24.04 and runs it under systemd: `wheeld` as a
+`wheel` system user on `127.0.0.1:8080`, the board on `127.0.0.1:3000`, and Caddy in front only if
+you give it a domain. The only thing you install by hand is `git`.
+```bash
+sudo apt-get update && sudo apt-get install -y git
+sudo git clone https://github.com/Morgandri1/wheel.git /opt/wheel-installer
+sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy --dry-run   # resolves everything, changes nothing
+sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy             # tunnel mode: nothing published
+sudo cat /var/lib/wheel/operator-token                                # then add your account, as in §1
+```
+`--domain wheel.example.com --email you@example.com` instead of `--no-proxy` gets HTTPS from
+Let's Encrypt. It is idempotent — run it again with another `--ref` to upgrade, which builds first
+and then restarts, so the downtime is a drain (~28 s for turns in flight) rather than a kill. A
+build that does not come up is rolled back to the previous generation automatically, and
+`--rollback` goes back on demand without rebuilding.
+
+- **The host supplies the toolchain**, which is the one thing this asks of you that Docker did not:
+  Node 22, pnpm, `claude` and `codex` are installed at pinned versions and **verified against what
+  the binaries actually report** — including that `claude` is at or above `2.1.269`, which headless
+  OAuth refresh needs. Checked at install and again on every service start.
+- **Data lives in `/var/lib/wheel`** (`0700`, owned by `wheel`), with `master.key` at `0600`.
+  **Back it up** — `infra/vps/backup.sh` — because losing `master.key` loses every vault secret on
+  the board, permanently.
+- **Wheel is compiled by a separate `wheel-build` user**, so no dependency's `build.rs` or
+  `postinstall` ever runs as the account that can read `master.key`.
+- **The units are hardened deliberately, not maximally.** Agents are processes inside
+  `wheeld.service`, so every sandbox directive constrains the code Wheel exists to run. Directives
+  that break `npm install`, a build, or a browser sandbox are refused and the refusals are recorded
+  and measured. `sudo wheel-doctor` reports what is on; `infra/vps/README.md` §7 says what each
+  costs you.
+- **Limits fail towards the agent, not the daemon.** `OOMPolicy=continue` plus a cgroup
+  `MemoryMax` means a runaway agent is killed and the engine keeps serving — without that one line,
+  systemd's default stops the whole unit and takes every other project's agents with it.
+- **Operating it:** `sudo wheel-doctor` (running vs serving vs actually authenticating),
+  `systemd-cgls -u wheeld.service` (every agent process, live), `journalctl -fu wheeld`.
+
+What you give up relative to §3 is the container boundary between agents and the host: agents run
+as the `wheel` user on the real machine. `infra/vps/README.md` §8 is an honest account of exactly
+what that means, what mitigates it and what only appears to. Read it before choosing.
+
+### 3. Docker, headless — an alternative to §2
 Before this: **Docker Engine with the Compose v2 plugin** (`docker compose version` should print a
 `v2.x`; on Ubuntu, `docker.io` from apt is old enough to lack it — use Docker's own repository) and
 `git`, to get this repo (the image is built from it, not pulled). Everything else — Node, the
@@ -133,10 +178,10 @@ The same thing as a compose file: `docker compose -f infra/compose.wheeld.yml up
   own default is 10 s, too short for the drain above, which is why `--stop-timeout 30` is in the `docker run` example
   and `stop_grace_period: 30s` is in `infra/compose.wheeld.yml`. A running `docker stop` still honours `-t 30` too.
 
-### 3. The board UI (optional)
+### 4. The board UI (optional)
 Before this: **Node.js 22.x** (`node --version`; `npx` ships with it). Nothing else — `wheel-web`
 is a prebuilt package, not a build from source. The `docker compose` variant below needs only what
-§2 already lists.
+§3 already lists.
 ```bash
 WHEEL_API_URL=http://127.0.0.1:8080 npx wheel-web                                # against wheeld on this machine
 docker compose -f infra/compose.wheeld.yml --profile web up -d --build           # or both in compose: UI on http://127.0.0.1:3000
@@ -148,10 +193,10 @@ instead. The UI calls the API from its own server, and the browser never talks t
 Projects belong to the account that created them. To script the boards you use in the UI, mint a token for that account,
 either from the UI or with `wheeld token create --email you@example.com`.
 
-### 4. On your own cloud
+### 5. On your own cloud
 Before this: a Railway account and the `railway` CLI for that path; for any VM/Kubernetes, Docker
 (or a way to run OCI images) plus your own Postgres. Nothing here is built from source by you —
-the images are what's built, per §2's prerequisites, wherever you build or pull them.
+the images are what's built, per §3's prerequisites, wherever you build or pull them.
 - **Railway**: fork this repo, create services from `docker/Dockerfile.api` and `docker/Dockerfile.host` (+ Postgres), apply
   `infra/railway/settings.json` with `infra/railway/apply-settings.sh`; env vars are listed in `infra/railway/README.md` and `web/DEPLOY.md`.
   The host runs agents as per-project unix users on one machine (no Docker daemon needed) — size it for your agents' builds.
@@ -162,7 +207,7 @@ the images are what's built, per §2's prerequisites, wherever you build or pull
   authenticates the same way everywhere.
 
 ### Developing Wheel: the multi-service stack
-Before this: the same as §2 (Docker Engine with the Compose v2 plugin, `git`) — Postgres, the API
+Before this: the same as §3 (Docker Engine with the Compose v2 plugin, `git`) — Postgres, the API
 and the host all come from the images built below, not from anything installed by hand.
 ```bash
 docker network create wheel

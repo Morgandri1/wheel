@@ -6,8 +6,14 @@ Licensed under the PolyForm Noncommercial License 1.0.0.
 See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 -->
 
-Wheel on a single Linode, used from the browser and from AgentGrid. Two modes, chosen by whether
-you have a domain yet:
+Wheel on a single Linode, used from the browser and from AgentGrid.
+
+**The default is native: `wheeld` and the board as systemd services, built from source, no Docker
+daemon on the box.** That is [section 2](#2-install). Docker is still fully supported and is
+[section 9](#9-choosing-docker-instead) — it is a deliberate choice with a stated cost, not the
+path you end up on by following the README.
+
+Two modes, chosen by whether you have a domain yet, and they work the same on both paths:
 
 ```
 TUNNEL MODE (default, no domain yet — nothing published to the network)
@@ -15,70 +21,58 @@ TUNNEL MODE (default, no domain yet — nothing published to the network)
                                           127.0.0.1:3000 ──► web ──► wheeld
                                           127.0.0.1:8080 ──► wheeld
 
-TLS MODE (WHEEL_DOMAIN set, once its A record points here)
-  internet ──► :80 / :443  Caddy ──┬── /v1/*  /p/*  ──►  wheeld :8080 ──► one engine per project (unix sockets)
-                                   └── everything else ──►  web :3000  ──►  wheeld  (server to server)
+TLS MODE (--domain, once its A record points here)
+  internet ──► :80 / :443  Caddy ──┬── /v1/*  /p/*  ──►  wheeld :8080 ──► one engine per project
+                                   └── everything else ──►  web :3000  ──►  wheeld
 ```
 
-There is no third mode that serves plain HTTP to the network. `deploy.sh`'s `preflight` refuses to
-start on a configuration that would do that — see [Without a domain yet](#without-a-domain-yet-tunnel-mode)
-for why that matters even on a box behind a firewall.
+There is no third mode that serves plain HTTP to the network. Both paths refuse to start on a
+configuration that would do that.
 
-- **`deploy.sh` is the only thing that should ever run `docker compose` against this directory.**
-  It computes settings `compose.yml` needs from `infra/vps/.env` and can safely coexist with (and
-  retire) an older deployment on the same box.
 - **`/v1` is Wheel's API.** Every request needs a credential: a session or a `wht_` API token.
-  AgentGrid and scripts use it with a token. Project engines are never exposed; the API is the
-  only way to them, and it checks that you own the project first.
-- **`/p/<project>/<path>` is public webhook ingress**, TLS mode only. It is off for every project
-  until you switch it on, and anything that reaches it becomes a message to whatever agent the
-  endpoint is wired to. See [Webhooks](#webhooks-p).
-- **Signup is closed.** You hold the operator token, and you add accounts with it. **It is not a
-  boundary against your own agents**: read why before you rely on it — [A residual worth
-  understanding, not just accepting](#a-residual-worth-understanding-not-just-accepting).
-
-The files:
+  AgentGrid and scripts use it with a token. Project engines are never exposed.
+- **`/p/<project>/<path>` is public webhook ingress**, TLS mode only, off per project until you
+  switch it on. See [Webhooks](#webhooks-p).
+- **Signup is closed.** You hold the operator token and add accounts with it. **It is not a
+  boundary against your own agents** — [section 8](#8-what-native-loses-versus-docker).
 
 | File | What it is |
 |---|---|
-| `deploy.sh` | The entry point. `--dry-run`, `--stop-legacy` for an older deployment on the same box |
-| `compose.yml` | The stack: `wheeld`, `web`, `caddy` (TLS mode only), a `preflight` that refuses a bad `.env` |
-| `lib/derive-env.sh` | Computes the settings that follow from `WHEEL_DOMAIN`; shared by `deploy.sh` and `rehearse.sh` |
-| `Caddyfile` | The proxy: TLS, routing, body limits, forwarded headers, security headers |
-| `.env.example` | Your settings; copy it to `.env` |
-| `install.sh`, `systemd/` | The same thing without Docker, built from source (not the path below) |
-| `rehearse.sh`, `rehearsal/` | The whole stack on a laptop, and every check below |
+| `install.sh` | **The entry point.** systemd services built from source. `--dry-run` first |
+| `systemd/` | `wheeld.service`, `wheel-web.service`, `wheel-signup-gate.service`, and the resource drop-in |
+| `libexec/` | `wheel-preflight` (refuses a bad config before the daemon binds), `wheeld-ready` (proves it serves), `wheel-doctor` |
+| `toolchain.env` | The pinned Node / pnpm / `claude` / `codex` versions, and the `claude` floor |
+| `backup.sh` | Back up and restore `/var/lib/wheel`. **Read [section 6](#backups-read-this-one)** |
+| `rehearse-native.sh`, `rehearsal/native/` | The whole native install on a laptop, and every check below |
+| `migrate-from-docker.sh` | Docker volume → native layout, read-only against the volume |
+| `deploy.sh`, `compose.yml`, `rehearse.sh` | The Docker path — [section 9](#9-choosing-docker-instead) |
+| `Caddyfile` | The proxy, shared by both paths: TLS, routing, body limits, security headers |
 
 ## 1. The server
 
-- Ubuntu 24.04, with the prerequisites the root `README.md`'s "Running Wheel" §2 lists for the
-  Docker path already installed: Docker Engine with the Compose v2 plugin (`docker --version`,
-  `docker compose version`) and `git`. If not, see [Installing Docker](#installing-docker) below
-  for the exact commands on this OS. Nothing else in this kit needs installing by hand — Node, the
-  `claude`/`codex` CLIs and the Rust toolchain that builds `wheeld` all come from inside the images.
-- **A small box works, with tuning** — see [Running on a small box](#running-on-a-small-box-2-vcpu-4-gib).
-  Wheel compiles Rust to build the images the first time, which is the heaviest moment in the
+- **Ubuntu 24.04.** `install.sh` refuses anything else, by design.
+- **The only thing you install by hand is `git`**, to clone this repo far enough to run the script.
+  Node 22, pnpm, the `claude`/`codex` CLIs, the Rust toolchain and (in TLS mode) Caddy are all
+  installed by `install.sh` at pinned versions. This is the job Docker's image used to do, and
+  moving it to the host is the main thing native asks of you.
+- **A small box works, with tuning** — see [Running on a small box](#running-on-a-small-box-2-vcpu-38-gb).
+  The first build compiles a Rust workspace and a Next.js app and is the heaviest moment in the
   server's life.
-- **A domain is optional, and most of this README works without one.** If you have one already,
-  its A record should point at this server before you flip to [TLS mode](#going-live-flipping-to-tls-mode).
-  If you don't yet, start in tunnel mode — nothing here waits on DNS.
+- **A domain is optional.** Start in tunnel mode; nothing here waits on DNS.
 
-### Firewall reality, read before trusting `ufw`
+### Firewall reality
 
-Three things are true on a typical VPS and worth checking on yours before you rely on any of them:
+Native removes the worst of this, which is one of the reasons it is the default now:
 
-1. **`ufw` does not see Docker's published ports.** Docker writes its own `iptables` rules ahead
-   of `ufw`'s chain, so `docker compose`'s `ports:` mapping can be reachable even when `ufw status`
-   shows the port is not allowed. A rule you did not write is not a rule you can trust.
-2. **A cloud firewall (Linode's Cloud Firewall, in front of the VM) applies before any of that.**
-   It is the one control that is not Docker's or `ufw`'s to bypass.
-3. **`0.0.0.0:PORT` and `127.0.0.1:PORT` are different promises.** The former is reachable from
-   the network (modulo #2); the latter is reachable only from this machine, tunnel or no tunnel.
-
-The consequence for this kit: **wheeld and web publish on `127.0.0.1` only, in every mode**, and
-Caddy — the one thing that publishes on `0.0.0.0` — runs at all only when you have set
-`WHEEL_DOMAIN`. Set the cloud firewall regardless, because it is the layer that is not conditional
-on anything this kit does right:
+1. **There is no Docker, so there are no iptables rules you did not write.** On the Docker path,
+   `ufw status` can show a port closed while `docker compose`'s `ports:` mapping is reachable,
+   because Docker writes its rules ahead of ufw's chain. Natively `ufw` is authoritative over what
+   is reachable.
+2. **A cloud firewall (Linode's, in front of the VM) still applies before anything on the box**,
+   and is the one control that is not yours to misconfigure away from inside.
+3. **`0.0.0.0:PORT` and `127.0.0.1:PORT` are different promises.** wheeld and the board bind
+   `127.0.0.1` in every mode, and `wheeld-ready` measures the real socket on every start rather
+   than trusting the unit file.
 
 | Port | Why |
 |---|---|
@@ -86,62 +80,72 @@ on anything this kit does right:
 | 80/tcp | TLS mode only: Let's Encrypt's HTTP challenge, and the redirect to HTTPS |
 | 443/tcp, 443/udp | TLS mode only: HTTPS (443/udp is HTTP/3, optional) |
 
-## 2. Deploy
+`install.sh --firewall` sets exactly these in ufw and enables it.
+
+## 2. Install
 
 ```bash
-git clone https://github.com/Morgandri1/wheel.git /opt/wheel-compose
-cd /opt/wheel-compose/infra/vps
-cp .env.example .env && chmod 600 .env
+sudo apt-get update && sudo apt-get install -y git
+sudo git clone https://github.com/Morgandri1/wheel.git /opt/wheel-installer
 ```
 
-Not `/opt/wheel` — that's the path `install.sh` (the no-Docker path below) manages itself, as
-root, including deleting and recreating `/opt/wheel/bin` and `/opt/wheel/web` on every run. The
-two paths are independent; giving them independent directories keeps it that way even if you ever
-try both on the same box.
-
-Leave `WHEEL_DOMAIN` unset for now if you don't have one yet — that's tunnel mode, the default,
-and section 3 covers it. If **another Wheel deployment is already running on this box** (an older
-dev stack, a previous install), read [Replacing an existing deployment](#replacing-an-existing-deployment-stop-legacy)
-first; `deploy.sh` will otherwise just fail to bind the ports it needs.
+Not `/opt/wheel` — that is the directory `install.sh` manages itself, as root.
 
 ```bash
-./deploy.sh --dry-run     # prints the resolved settings and every command; changes nothing
-./deploy.sh               # the real thing
+# Tunnel mode: nothing published to the network. Start here if you have no domain yet.
+sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy --dry-run
+sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy
+
+# Or, with a domain whose A record already points here:
+sudo /opt/wheel-installer/infra/vps/install.sh --domain wheel.example.com --email you@example.com
 ```
 
-The first build compiles everything and takes a while — see
-[Running on a small box](#running-on-a-small-box-2-vcpu-4-gib) if it's slow or gets killed.
-`deploy.sh` prints `docker compose ps` when it finishes; `preflight` should show `Exited (0)` and
-`wheeld`/`web` should show `healthy`.
+`--dry-run` resolves every setting and the target commit, prints every command it would run, and
+changes nothing — no package manager, no service, no firewall, no user, no file.
 
-### Replacing an existing deployment (`--stop-legacy`)
+It is idempotent: run it again with another `--ref` to upgrade. Every input is a flag, nothing
+reads stdin, so it works over `ssh` non-interactively — see
+[Deploying over SSH](#deploying-over-ssh-non-interactively).
 
-```bash
-./deploy.sh --stop-legacy --dry-run    # shows exactly what it found and what it would stop
-./deploy.sh --stop-legacy              # docker compose -p <project> down — never -v
+What it does, in the order it matters:
+
+- installs the toolchain at the versions in `toolchain.env`, then **checks what the binaries
+  actually report** — in particular that `claude` is at or above `2.1.269`, which PR #64's headless
+  OAuth refresh requires. A pinned install that silently resolved to something older is the failure
+  this catches, and it is checked again on every service start, not just here;
+- creates two system users: `wheel`, which runs the daemon and owns `/var/lib/wheel` (`0700`), and
+  `wheel-build`, which compiles. **No dependency's `build.rs` or `postinstall` ever runs as the
+  account that can read `master.key`**;
+- builds `wheeld` and the board as `wheel-build`, then installs the binaries with the previous
+  generation kept as `/opt/wheel/bin/*.prev`;
+- installs the units and restarts `wheeld` — a **drain**, not a kill (`KillMode=mixed`, ~28 s for
+  turns in flight, `TimeoutStopSec=35`);
+- **if the new build does not come up, puts the previous one back and restarts it**, then exits
+  non-zero. A failed upgrade leaves a serving box and a red exit code.
+
+```
+/opt/wheel/src   git checkout        /opt/wheel/bin      wheeld, wheel, and *.prev
+/opt/wheel/web   board server        /opt/wheel/libexec  preflight, ready, doctor
+/opt/wheel/rust  shared toolchain    /var/cache/wheel    build caches, `wheel-build`
+/var/lib/wheel   data, 0700 `wheel`  /etc/wheel          settings
 ```
 
-This stops an older compose project (default name `wheel`) if one is running. **It never passes
-`-v`**, so that project's volumes are left exactly as they were — read them later, or remove them
-yourself once you've confirmed you don't need them (`docker volume ls`, then `docker volume rm`).
-Without `--stop-legacy`, an old deployment holding the ports this one needs just makes
-`docker compose up` fail to bind them, loudly, which is the safe default: nothing here stops
-another deployment by surprise. `--legacy-project <name>` targets a different project name.
+Your settings go in `/etc/wheel/wheeld.local.env` and `/etc/wheel/web.local.env`, which
+`install.sh` never touches and which are read second, so they win. Resource limits are a drop-in:
+`/etc/systemd/system/wheeld.service.d/90-local.conf`, likewise never touched.
 
 ## 3. Without a domain yet (tunnel mode)
 
-This is the default — nothing above published a single port to the network. Reach it from your
-own machine:
+Nothing above published a port to the network. Reach it from your own machine:
 
 ```bash
 ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 <user>@<server>
 ```
 
-Leave that running, then from **your own machine** (through the tunnel):
+Leave that running. The operator token is a file, so reading it is one command:
 
 ```bash
-# the operator token, read once
-ssh <user>@<server> "docker compose -p wheel exec wheeld cat /data/operator-token"
+ssh <user>@<server> "sudo cat /var/lib/wheel/operator-token"
 ```
 
 Add your account and sign in — signup is closed, so this token is the only way in:
@@ -154,76 +158,48 @@ printf '{"email":"you@example.com","password":"%s"}' "$PASSWORD" |
     -H 'content-type: application/json' -d @-
 ```
 
-Then open `http://localhost:3000/sign-in` in your browser (through the tunnel) and sign in.
-**AgentGrid** connects to `http://localhost:8080` (through the same tunnel) with a `wht_` token —
-see [AgentGrid and other API clients](#4-agentgrid-and-other-api-clients).
+Then open `http://localhost:3000/sign-in` through the tunnel.
 
-Why tunnel mode has no plain-HTTP fallback: a VPS's published ports are reachable the moment
-anything upstream — a cloud firewall rule you forgot, `ufw` not covering Docker's rules as above —
-lets traffic through, and a password or a `wht_` token does not get a second chance once it has
-crossed the network once in the clear. Loopback-plus-tunnel, or a real certificate: nothing in
-between.
+Why there is no plain-HTTP fallback: a VPS's published ports are reachable the moment anything
+upstream lets traffic through, and a password or a `wht_` token does not get a second chance once
+it has crossed the network in the clear. Loopback plus a tunnel, or a real certificate.
 
-## Going live: flipping to TLS mode
+### Going live: flipping to TLS mode
 
-Once your domain's A record points at this server:
+Once your domain's A record points here (`dig +short wheel.example.com`):
 
 ```bash
-dig +short wheel.example.com     # must print this server's address
+sudo /opt/wheel-installer/infra/vps/install.sh --domain wheel.example.com --email you@example.com
 ```
 
-Edit `.env`: set `WHEEL_DOMAIN=wheel.example.com` (and, optionally, `ACME_EMAIL=you@example.com`).
-Then:
-
-```bash
-./deploy.sh --dry-run    # confirm it now says TLS mode
-./deploy.sh
-docker compose -p wheel logs caddy | grep -i certificate
-```
-
-Caddy starts (it did not exist as a running service in tunnel mode), gets a Let's Encrypt
-certificate, and starts publishing 80 and 443. wheeld and web keep publishing on `127.0.0.1` too —
-that's still your tunnel if you want it, now alongside the public site at
-`https://wheel.example.com`. Nothing you did in tunnel mode (your account, your projects) is lost;
-`wheel-data` is untouched by this flip.
+Caddy is installed and starts publishing 80 and 443. `/var/lib/wheel` is untouched, so nothing you
+did in tunnel mode is lost. One thing genuinely changes for the worse, and it is
+[section 8](#the-one-guarantee-native-cannot-reproduce)'s subject: in TLS mode wheeld is told to
+believe `X-Forwarded-For` from `127.0.0.1`, which on this box means every local process, agents
+included.
 
 ## 4. AgentGrid, and other API clients
 
 AgentGrid needs a URL and a `wht_` token — `http://localhost:8080` through a tunnel, or
-`https://wheel.example.com` once you're in TLS mode. Either way, the events socket is at
-`.../v1/projects/<id>/engine/v1/events` with the token in a header.
-
-Mint a token for **your own account** (not the operator's, which owns no projects of yours):
+`https://wheel.example.com` in TLS mode. Mint a token for **your own account**:
 
 ```bash
-docker compose -p wheel exec wheeld wheeld token create --name agentgrid --email you@example.com
+sudo -u wheel /opt/wheel/bin/wheeld token create --name agentgrid --email you@example.com --data-dir /var/lib/wheel
 ```
 
-It prints the token once. Revoke it with `wheeld token revoke <id>`; that also revokes every token
-minted with it. Any HTTP client works the same way:
+It prints the token once. `wheeld token revoke <id>` revokes it and every token minted with it.
 
 ```bash
-curl -fsS http://localhost:8080/v1/projects -H @<(printf 'x-auth-token: %s\n' "$TOKEN")   # tunnel
-curl -fsS https://wheel.example.com/v1/projects -H @<(printf 'x-auth-token: %s\n' "$TOKEN") # TLS
+curl -fsS http://localhost:8080/v1/projects -H @<(printf 'x-auth-token: %s\n' "$TOKEN")
 ```
-
-The `wheel` CLI has no operator mode yet. Today it is the agent-side CLI that runs inside a
-project's sandbox. `wheel login`/`wheel projects` against a server is follow-up F1 in
-`docs/proposals/headless-first.md`; until then use AgentGrid or the API directly.
 
 ## 5. Agent credentials
 
-An agent's Claude/Codex login lives in a **vault node**, never in `.env`, never in a compose file,
-never in this document with a real value in it. Start with a single Anthropic API key.
+An agent's Claude/Codex login lives in a **vault node**, never in an env file and never in a
+systemd unit. In the board, add a `vault` node, add the key `ANTHROPIC_API_KEY`, enter the value in
+the vault inspector (write-only; never shown back), and wire your agent to it with a `read` wire.
 
-**In the web app** (`http://localhost:3000/app` through a tunnel, or `https://wheel.example.com/app`):
-add a `vault` node, name it (e.g. `anthropic`), add the key `ANTHROPIC_API_KEY`, and enter the
-value in the vault inspector — it is write-only and is never shown back, on the board, in an
-export or in a log. Wire your agent to the vault with a `read` wire. The key is exported into the
-agent's environment the next time it starts.
-
-**From the API**, with your own session or a `wht_` token (`$API` below is `http://localhost:8080`
-through a tunnel, or `https://wheel.example.com`), three calls against the project's engine:
+From the API, with `$API` being your tunnel or domain:
 
 ```bash
 VAULT=$(curl -fsS "$API/v1/projects/$PID/engine/v1/nodes" \
@@ -240,88 +216,296 @@ printf '{"value":"%s"}' "$ANTHROPIC_API_KEY" |
     -H "x-auth-token: $TOKEN" -H 'content-type: application/json' -d @-
 ```
 
-Restart the agent (or start it for the first time) and its `GET .../agents/$AGENT_ID/auth` reports
-`mode: "env"`: authenticated, no browser step. Other recognised keys: `CLAUDE_CODE_OAUTH_TOKEN`
-(from `claude setup-token`, the native OAuth flow rather than an API key) and `CODEX_API_KEY`. One
-vault per account, so wiring the same agent to two vaults that both define `ANTHROPIC_API_KEY` is
-refused at wire-creation time — see `docs/ARCHITECTURE.md` M1.6.
+Other recognised keys: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) and `CODEX_API_KEY`.
+The OAuth path needs `claude >= 2.1.269`, which `install.sh` and every service start verify.
 
-### A residual worth understanding, not just accepting
+## 6. Operating it
 
-**The operator token is not a boundary against your own agents, and this deployment's shape makes
-that concrete rather than theoretical.** wheeld runs as uid 10001 inside the `wheeld` container in
-the embedded backend this kit uses, and every agent it spawns runs as that same uid, in the same
-container (per-node uids are `docs/ARCHITECTURE.md`'s M2/M3, not built yet). Anything that uid can
-read, an agent can read: `docker compose -p wheel exec -u 10001 wheeld cat /data/operator-token`
-works from inside the container exactly the way it would for you, and so does `/data/master.key` —
-the key that decrypts every vault secret, including the Anthropic key you just put there.
+### Is it up? Three different questions
 
-That reachability alone isn't the exposure — an agent you started already has that reach by
-design (§2 of `docs/ARCHITECTURE.md`: "an agent is untrusted remote code execution inside its
-sandbox," and here the sandbox is the whole container). The exposure is the **path that gets an
-agent to act on it without your asking**: `/p/<project>/<path>` (TLS mode) is unauthenticated
-public ingress by design, and whatever reaches it becomes a message to the agent it's wired to
-(see [Webhooks](#webhooks-p) and redteam finding 043). An endpoint wired to an agent with wires
-strong enough to matter turns an internet POST into a prompt a model reads — internet → webhook →
-prompt injection → an agent that reads the operator token and the master key on your instruction,
-having been talked into it by someone else's request body.
+```bash
+sudo wheel-doctor            # everything
+sudo wheel-doctor health     # just the three tiers; exit 0 only if all three pass
+```
 
-This needs your own opt-in (wiring a webhook to an agent) plus a successful injection, so it is
-not a tunnel-mode blocker and not "the operator token is worthless" — revoking it still ends a
-*leaked* token's usefulness (§ AgentGrid above), and the token still keeps a stranger who merely
-reaches the server out. What it does not do is keep an agent *you* wired up out, once that agent
-is compromised by something it reads. Keep endpoints wired to agents with the fewest wires you
-can, prefer a shared secret or HMAC on any endpoint an agent can act on, and treat the vault's
-"never shown back" property as protecting against accidental echo, not as a containment boundary —
-because for this backend, on this host, it isn't one. Separating agent uids from wheeld's own is
-tracked as a real follow-up, not a documentation footnote: `docs/ARCHITECTURE.md`'s per-node-uid
-work (M2/M3) is what actually closes this, the same way it's the fix for redteam finding 037/038.
+| Tier | Proves | Does not prove |
+|---|---|---|
+| **running** | systemd says the unit is active | that anything is listening |
+| **serving** | `/healthz` answers 200 | that the store opened — `/healthz` is a static answer plus the auth mode |
+| **working** | the operator token authenticates a real `GET /v1/projects` | — this is the one that proves the database opened, migrations ran and auth verifies |
 
-## Running on a small box (2 vCPU, ~4 GiB)
+`systemctl status wheeld` tells the truth here, which took work: `Type=simple` reports
+`active (running)` the instant `execve` succeeds. `ExecStartPost=wheeld-ready` polls `/healthz` and
+then measures the listening socket, and systemd does not finish the start job until it returns — so
+`systemctl start wheeld` blocks until wheeld is genuinely serving.
 
-Wheel runs on a small VPS; a few things are worth knowing before you find them the hard way.
+### What are the agents doing?
 
-- **The first build is the heaviest moment.** `deploy.sh`/`docker compose up --build` compiles a
-  Rust workspace and a Next.js app on a 2-vCPU box. It will take a while and will use most of the
-  machine's CPU; that's expected and it finishes. If the build process is OOM-killed (`docker
-  compose build` exits with no clear error, or the daemon log mentions `Killed`), add swap first
-  (below) and retry — Rust's linker step is the usual spike.
-- **Add swap** if you have not already; a 2 GiB file is enough headroom for the build without
-  meaningfully slowing steady-state operation on a box with SSD-backed storage:
+Native is simply better than Docker here. Agents are ordinary processes in `wheeld.service`'s
+cgroup:
+
+```bash
+systemd-cgls -u wheeld.service     # the live tree: every claude, node, cargo, git, with arguments
+systemd-cgtop                      # what they are costing in CPU and memory
+sudo wheel-doctor agents           # the same, plus context
+```
+
+### Logs
+
+```bash
+journalctl -fu wheeld                          # follow
+journalctl -u wheeld -u wheel-web -u wheel-signup-gate -u caddy --since -1h
+journalctl -u wheeld -p warning --since today  # warnings and worse
+```
+
+journald's default rate limit (1000 messages / 30 s / service) is raised in the unit, because an
+incident is the worst possible moment to find out your logs were dropped. `wheeld` currently logs
+text, not JSON — `wheel-api` already emits JSON and giving `wheeld` the same switch is a one-line
+follow-up (F4 in the proposal), so `journalctl -o json` gives you journald's own fields today and
+not wheeld's.
+
+### Backups — read this one
+
+**Losing `master.key` loses every vault secret on the board, permanently.** It is not derived from
+anything and it is not recoverable: it decrypts every project's engine secret and vault key. The
+database is replaceable by comparison; the key is not.
+
+```bash
+sudo infra/vps/backup.sh --to /var/backups/wheel     # stops wheeld (a drain), archives, VERIFIES
+sudo infra/vps/backup.sh --verify <archive>          # check one without restoring it
+sudo infra/vps/backup.sh --restore <archive>         # moves the current tree aside, never deletes
+```
+
+It stops `wheeld` first, because SQLite in WAL mode copied live is a half-written transaction and
+you find that out at restore time. It writes a sha256 manifest into the archive and reads it back,
+because an archive nobody has ever read is a hope. And **it does not encrypt the archive for you** —
+that file contains `master.key` in the clear:
+
+```bash
+gpg --symmetric --cipher-algo AES256 /var/backups/wheel/wheel-data-*.tar.gz
+scp /var/backups/wheel/wheel-data-*.tar.gz.gpg you@elsewhere:
+```
+
+A backup on the disk you are backing up is a copy, not a backup.
+
+### Upgrading, and rolling back
+
+```bash
+cd /opt/wheel-installer && sudo git pull --ff-only
+sudo infra/vps/install.sh --no-proxy --ref main --dry-run
+sudo infra/vps/install.sh --no-proxy --ref main
+```
+
+The build happens as `wheel-build` before anything stops, so downtime is one restart. That restart
+drains: `wheeld` gets SIGTERM alone, finishes turns in flight (~28 s), stops every agent's process
+group, and `TimeoutStopSec=35` is the backstop. Agents come back parked and resume on the next
+message.
+
+If the new build does not serve, `install.sh` puts the previous generation back and restarts it
+automatically. To go back later:
+
+```bash
+sudo infra/vps/install.sh --rollback     # no build, no clone, no network
+```
+
+That swaps `/opt/wheel/bin/{wheeld,wheel}` with their `.prev`, and the generation you rolled back
+*from* becomes the new `.prev` — so it is reversible.
+
+**`install.sh` refuses to move the box backwards** by default. If the installed binary's commit is
+a descendant of your `--ref`, that is a self-applied update (`WHEEL_AUTO_UPDATE`) about to be
+clobbered; it stops and names `--allow-downgrade`.
+
+### Auto-update
+
+`sdk/auto-update` is a separate lane: `wheeld` noticing `main` moved, checking CI is green,
+draining, swapping its own binaries, health-checking and rolling back. This kit owns the
+**operator-initiated** half and never writes `WHEEL_AUTO_UPDATE` — that is yours, in
+`wheeld.local.env`, off unless you set it. The two share only a filesystem contract:
+
+| Hook | Here |
+|---|---|
+| Checkout (`WHEEL_UPDATE_REPO`) | `/opt/wheel/src` |
+| Binaries (`WHEEL_UPDATE_BIN_DIR`) | `/opt/wheel/bin` |
+| Rollback artefact | `/opt/wheel/bin/*.prev` — **written by both, deleted by neither** |
+| Build staging (`WHEEL_UPDATE_STAGING`) | `/var/cache/wheel/update`, off the data directory |
+| Restart | `Restart=on-failure` also restarts after `WHEEL_UPDATE_RESTART=exit` (exit 75) |
+| Policy | `WHEEL_AUTO_UPDATE` in `wheeld.local.env`, off unless you set it |
+
+By default `/opt/wheel/src` and `/opt/wheel/bin` belong to root, so nothing `wheeld` runs — agents
+included — can rewrite them. `install.sh --updatable` hands both to `wheel` and widens the unit's
+`ReadWritePaths=`. That is what lets `wheeld` replace itself. **It also lets any agent do so**,
+because agents run as `wheeld`'s user. Enable it knowingly.
+
+## 7. Hardening and resource limits: what is on, and what it costs
+
+Full reasoning and every measurement: `docs/proposals/wheeld-native-production.md` §4, §4a and §5.
+The short version, because these are the things that will surprise you.
+
+**Every agent runs inside `wheeld.service`'s cgroup and mount namespace.** So every directive is a
+constraint on arbitrary code that clones repos, installs dependencies and compiles. The sandbox is
+deliberately *not* maximal, and the rejections are as considered as the acceptances.
+
+What is on, and what you will notice:
+
+| | What you will notice |
+|---|---|
+| `ProtectHome=yes` | Agents cannot read `/root` or `/home` — your SSH keys, `~/.aws`, shell history. Nothing Wheel runs lives there, so it costs nothing. |
+| `ProtectSystem=strict` | Everything outside `/var/lib/wheel` is read-only to agents. An agent writing `/usr/local` gets `EROFS`. |
+| `PrivateTmp=yes` | The agent's `/tmp` is not yours. To look inside: `sudo nsenter -t $(systemctl show -P MainPID wheeld) -m ls /tmp` |
+| `ProtectProc=invisible` | `ps` inside the unit shows only `wheel`'s processes. **This does nothing for agent-to-agent isolation** — same-uid siblings stay fully visible. |
+| `CapabilityBoundingSet=` | **`ping` stops working** (Ubuntu ships it with `cap_net_raw+ep`). `curl`, `getent` and `nc` are unaffected. |
+| `LimitCORE=0` | No core dump for a `wheeld` crash. Deliberate: a core contains `master.key`, the operator token and every in-flight vault value. To get one temporarily, `systemctl edit wheeld` — and know what you are putting on disk. |
+| `PrivateDevices=yes` | No `/dev/kvm`, `/dev/fuse` or GPU. Ptys still work. |
+
+What is deliberately **not** on, because it breaks agents (all measured):
+
+- **`SystemCallFilter=`** — `@system-service` breaks `unshare -Urm` + `mount`, which is what
+  `bwrap`, Chromium's sandbox and rootless containers do. `wheel-web.service` *does* get it: it
+  runs one known program that spawns nothing.
+- **`RestrictNamespaces=`** — breaks `unshare` outright. Handled at the host level instead: Ubuntu
+  24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1` on by default. Check it
+  (`sysctl kernel.apparmor_restrict_unprivileged_userns`) rather than assume it.
+- **`ProcSubset=pid`** — hides `/proc/meminfo` and `/proc/cpuinfo`, which build tools size their
+  parallelism from. The breakage is silent and gets blamed on the model.
+
+### Resource limits
+
+Sized for 2 vCPU / 3.8 GB, in `/etc/systemd/system/wheeld.service.d/10-resources.conf`. Override in
+`90-local.conf`, never by editing the managed file.
+
+| Setting | When it is hit |
+|---|---|
+| **`OOMPolicy=continue`** | **The line everything else depends on.** systemd's default is `stop`: without this, one agent being OOM-killed makes systemd stop `wheeld` and every other project's agents. With it, the agent dies and the engine keeps serving. |
+| `MemoryHigh=2G` | Throttled and reclaimed. Nothing dies. Turns "memory-hungry agent" into "slow agent". |
+| `MemoryMax=2.8G` | The kernel OOM-kills a process in the cgroup. 2.8 of 3.8 GB leaves room for the kernel, `sshd`, `journald` and Caddy, so **the host's own OOM killer never fires and you never lose `sshd`**. It does not guarantee the *agent* is the victim — the kernel picks by RSS, which usually means the agent, but not always. |
+| `TasksMax=4096` | `fork()` returns `EAGAIN`. A fork bomb stops here. The budget is shared across all agents, so one leaking agent can starve its siblings. |
+| `LimitNOFILE=65536` | `EMFILE` in one process. systemd's 1024 default is below what Node and pnpm want. |
+| `CPUQuota=150%` | Of 200%. Leaves half a core for `sshd` — the difference between "the box is slow" and "I cannot ssh in to stop it". Does not affect `install.sh`, which builds outside this unit. |
+
+### Running on a small box (2 vCPU, 3.8 GB)
+
+- **The first build is the heaviest moment.** It compiles a Rust workspace and a Next.js app.
+- **Add swap** before the first install:
   ```bash
   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
   sudo mkswap /swapfile && sudo swapon /swapfile
   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
   ```
-- **There is no per-host cap on concurrently running agents in the engine today** — `wheel-engine`
-  will run every agent you start. On a small box, that is a discipline you hold, not a knob the
-  software gives you yet: keep few agents with `run_on_startup: true`, and set a short
-  `idle_timeout_secs` (default 300; see `docs/ARCHITECTURE.md` §3c#14) on ones that don't need to
-  stay warm — an idle agent's process stops and resumes transparently on the next message, which
-  is real memory back on a 4 GiB box.
-- **An agent building Rust inside its own workspace** (a `wheel-on-wheel`-style board) can use
-  every core and a lot of RAM on `cargo build`'s own account. There is no wiring today for the
-  engine to cap this per-agent; if you hit it, have the agent's own `~/.cargo/config.toml` (inside
-  its workspace) set `[build]\njobs = 1`, or ask it to.
+  `MemorySwapMax=1G` bounds how much of it one runaway agent can thrash.
+- **There is no per-host cap on concurrently running agents** in the engine today. Keep few agents
+  with `run_on_startup: true`, and set a short `idle_timeout_secs` (default 300) on ones that need
+  not stay warm.
+- **An agent building Rust in its own workspace** can use every core. `CPUQuota` bounds the damage
+  to the box; to bound it per agent, have that agent's own `~/.cargo/config.toml` set
+  `[build]\njobs = 1`.
 
-## Webhooks (`/p`)
+## 8. What native loses versus Docker
 
-TLS mode only — there is no public ingress in tunnel mode, because there is nothing public to hit.
+Docker gave **isolation between agents and the host**. It never gave isolation *between agents* —
+every agent in the `wheeld` image ran as uid 10001 in one container, exactly as every agent
+natively runs as `wheel` on one host. Redteam 037 is open on both. What follows is only about the
+host boundary.
 
-`https://wheel.example.com/p/<project>/<path>` is public by design: a webhook sender can be given
-nothing but a URL. It is off for every project until the owner turns on the project's `http`
-capability. The edge caps a webhook body at 256 KiB, the size of one message.
+**Genuinely lost:**
 
-**Whatever reaches an endpoint becomes a message to the agent wired to it.** An endpoint with no
-auth, wired to an agent that can write to the board, message other agents or read a vault, is an
-open line from the internet to that agent (redteam finding 043). Give endpoints a shared secret or
-HMAC where the sender supports it, and wire them to an agent with the fewest wires you can.
+1. **No pid namespace.** An agent sees every other agent's processes and full command lines, and
+   can signal them. In the container this stopped at the container's boundary.
+2. **No network namespace.** An agent reaches anything bound to `127.0.0.1` on the box.
+3. **`master.key` is same-uid readable.** `0600` protects it from other accounts and from nothing
+   else. An agent that reads `/var/lib/wheel/master.key` holds every vault secret for every project;
+   one that reads `operator-token` holds the account that adds users. This was equally true inside
+   the container (`docker exec -u 10001 wheeld cat /data/master.key` worked) — what the container
+   added was a step.
+4. **Read-only is not invisible.** `ProtectSystem=strict` leaves `/etc`, installed packages and any
+   world-readable file readable. A container's mount namespace would not have had those paths at
+   all. `ProtectHome` closes the part that matters most.
+5. **The declared "laptop mode" rail does not engage.** `docs/PROTOCOL.md` defines shared-uid mode
+   as opt-in, requires a `SHARED_UID_WARNING` on every boot, and says the host must refuse a second
+   project in that mode. `wheeld` never sets `WHEEL_ALLOW_SHARED_UID` and never consults
+   `UidIsolation` — so the warning never prints and the rule is not enforced, while `wheeld` *is*
+   shared-uid by construction. Tracked as follow-up F5; stated here because promoting native to the
+   default is what makes it matter.
 
-## Backups
+**Gained, and worth weighing against the above:**
 
-Everything is in the `wheel-data` volume: the database, every project, `master.key` (which
-decrypts every secret) and the operator token. Stop wheeld while copying it, because SQLite is
-live:
+- Resource limits that actually exist. The Docker deployment sets **no** `mem_limit`, `pids_limit`
+  or `cpus` — section 7's table is a net gain, not a catch-up.
+- `ufw` is authoritative (section 1).
+- `systemd-cgls` shows you what agents are doing without `docker exec`.
+- `wheeld` can update itself (the image runs `USER 10001` against a root-owned binary and cannot).
+- One less daemon, and one less thing that can hold a port or write firewall rules you did not.
+
+**What mitigates the losses, and what only looks like it does.** Real: `ProtectHome`,
+`ProtectProc=invisible`, tunnel mode publishing nothing, the signup gate, the limits in section 7,
+and `wheel-build` keeping dependency build scripts off the account that can read `master.key`. Not
+real: the operator token (not a boundary against your own agents), `0600` modes (same uid), and the
+vault's never-shown-back property (that is anti-echo, not containment).
+
+### The one guarantee native cannot reproduce
+
+In TLS mode, Caddy dials `127.0.0.1:8080` — and so can any agent, because agents run as a normal
+uid on the same host. Nothing at the socket distinguishes them. So
+`WHEEL_TRUSTED_PROXIES=127.0.0.1/32` means wheeld believes `X-Forwarded-For` from an agent exactly
+as it believes it from Caddy. The Docker path trusted one container IP on an internal network that
+no agent could send from.
+
+The consequences are bounded but real: an agent could evade per-IP rate limits and write false
+client addresses into the log of a security event. It is **not** an authentication bypass.
+
+What does not fix it: binding wheeld to another loopback address (any local process can reach any
+loopback address), or an nftables `skuid` rule (wheeld and its agents share a uid). What would fix
+it is Caddy reaching wheeld over a unix socket whose peer credentials wheeld checks — follow-up F2.
+
+**Tunnel mode, the default, is unaffected**: it sets no trusted proxy at all, so wheeld believes no
+forwarded header from anybody.
+
+### The webhook path
+
+Unchanged from the Docker path and still the thing to be careful about. `/p/<project>/<path>` is
+unauthenticated public ingress by design, TLS mode only, and whatever reaches it becomes a message
+to the agent it is wired to (redteam 043). Internet → webhook → prompt injection → an agent that
+reads `master.key` because someone else's request body asked it to. Natively that is one step
+rather than two. Keep endpoints wired to agents with the fewest wires you can, prefer a shared
+secret or HMAC, and treat the operator token as protecting against strangers, not against your own
+agents.
+
+## 9. Choosing Docker instead
+
+Fully supported, and the right choice when **the host-isolation boundary in section 8 matters more
+to you than everything in section 7**. That is the trade in one sentence: you get a mount, pid and
+network namespace between agents and your machine, and you give up the resource limits, `ufw` being
+authoritative, `systemd-cgls`, and `wheeld`'s ability to update itself.
+
+Prerequisites: Docker Engine with the Compose v2 plugin, and `git`. See
+[Installing Docker](#installing-docker).
+
+```bash
+git clone https://github.com/Morgandri1/wheel.git /opt/wheel-compose
+cd /opt/wheel-compose/infra/vps
+cp .env.example .env && chmod 600 .env
+./deploy.sh --dry-run     # prints resolved settings and every command
+./deploy.sh
+```
+
+Not `/opt/wheel` — that path belongs to `install.sh`. The two paths are independent; giving them
+independent directories keeps it that way if you ever try both.
+
+- **`deploy.sh` is the only thing that should run `docker compose` against this directory.** It
+  computes settings `compose.yml` needs from `.env`.
+- Leave `WHEEL_DOMAIN` unset for tunnel mode. Set it (plus `ACME_EMAIL`) and re-run for TLS.
+- The operator token: `docker compose -p wheel exec wheeld cat /data/operator-token`.
+- Tokens: `docker compose -p wheel exec wheeld wheeld token create --name agentgrid --email you@example.com`.
+
+### Replacing an existing deployment (`--stop-legacy`)
+
+```bash
+./deploy.sh --stop-legacy --dry-run    # shows what it found and what it would stop
+./deploy.sh --stop-legacy              # docker compose -p <project> down — never -v
+```
+
+**It never passes `-v`**, so volumes are left exactly as they were.
+
+### Backups, Docker path
 
 ```bash
 cd /opt/wheel-compose/infra/vps
@@ -331,24 +515,17 @@ docker run --rm -v wheel_wheel-data:/data:ro -v "$PWD:/backup" debian:bookworm-s
 docker compose -p wheel start wheeld
 ```
 
-Whoever has that file has every secret on the board. Encrypt it before it leaves the server, for
-example with `gpg --symmetric`. To restore, `docker compose -p wheel down`, extract into a fresh
-`wheel_wheel-data` volume the same way, then `./deploy.sh`. `caddy-data` (TLS mode) holds the
-certificates and the ACME account. Losing it only means Caddy asks for new ones.
+Same warning as section 6: that file holds `master.key` in the clear. Encrypt it before it leaves
+the server.
 
-## Upgrading
+### Upgrading, Docker path
 
 ```bash
 cd /opt/wheel-compose && git pull --ff-only
-cd infra/vps && ./deploy.sh --dry-run   # confirm the settings still resolve the way you expect
-./deploy.sh
-docker compose -p wheel logs --tail 50 wheeld
+cd infra/vps && ./deploy.sh --dry-run && ./deploy.sh
 ```
 
-wheeld gets 35 seconds on SIGTERM to drain in-flight turns (about 28s) and stop every agent's own
-process group. Agents come back parked and pick their sessions up on the next message.
-
-## Installing Docker
+### Installing Docker
 
 Docker's own packages, not Ubuntu's:
 
@@ -362,145 +539,164 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.
 sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
-## The web app somewhere else (Vercel)
+## 10. Migrating a Docker deployment to native
 
-Supported, but not the default. The web app's server has to reach the API, so wheeld's `/v1` must
-be public — this is TLS mode's topology already. Deploy `web/` with
-`WHEEL_API_URL=https://wheel.example.com` and `WHEEL_PUBLIC_ORIGIN=<the web app's own origin>` (see
-`web/DEPLOY.md`). Caddy then only needs to route `/v1` and `/p`. What you give up is the internal
-network: the web server's calls cross the internet, authenticated by the user's session.
-
-## Without Docker: `install.sh`
-
-Not the path above — this is systemd services built from source, for a box without Docker at all.
-The only thing you install yourself is `git`, to clone this repo far enough to run the script (a
-minimal Ubuntu cloud image does not ship it). See its own `--help` for the full flag set
-(`--domain`, `--no-proxy`, `--updatable`, `--firewall`, `--dry-run`); it installs Node 22, a shared
-Rust toolchain, the `claude`/`codex` CLIs and, when `--domain` is used, Caddy from Caddy's own apt
-repository — none of that is a manual prerequisite, it's what the script does. Wheel is compiled by
-an unprivileged `wheel-build` user, so no dependency's build script runs as the account that can
-read `master.key`. wheeld runs as the `wheel` system user on `127.0.0.1:8080`, data in
-`/var/lib/wheel` (`0700`); the web app runs on `127.0.0.1:3000` as a throwaway systemd user. It is
-idempotent: run it again with another `--ref` to upgrade. `--dry-run` resolves settings and the
-target commit and prints every command it would run — verified on a bare `ubuntu:24.04` container
-to leave no user, directory, file or package behind.
+A rehearsed procedure, not an urgent one. The design is one property repeated: **the Docker volume
+is only ever read.** Every container the script runs mounts it `:ro`; there is no `docker volume
+rm`, no `down -v`, and no `-v` flag anywhere in the file — which
+`infra/tests/native-migration.test.sh` asserts on every commit.
 
 ```bash
-sudo git clone https://github.com/Morgandri1/wheel.git /opt/wheel-installer
-sudo /opt/wheel-installer/infra/vps/install.sh --domain wheel.example.com --email you@example.com --dry-run
-sudo /opt/wheel-installer/infra/vps/install.sh --domain wheel.example.com --email you@example.com
+# 1. Install natively, but do not let it take over yet.
+sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy
+
+# 2. Stop the Docker wheeld. This also drains it.
+cd /opt/wheel-compose/infra/vps && docker compose -p wheel stop wheeld
+
+# 3. Look before you leap.
+sudo /opt/wheel-installer/infra/vps/migrate-from-docker.sh --dry-run
+
+# 4. Move it.
+sudo /opt/wheel-installer/infra/vps/migrate-from-docker.sh --replace
 ```
 
-### Deploying over SSH, non-interactively
+It refuses to run while the container is up (a live SQLite copy is a half-written transaction),
+copies the whole volume verbatim, compares **every file's sha256** on both sides, checks
+`master.key` by name, runs `PRAGMA integrity_check` on every database, and then proves the move on
+the live box by authenticating with the **migrated** operator token and listing projects.
 
-Every input to `install.sh` is a flag; nothing reads stdin. Given a host, a user with passwordless
-sudo, and a dedicated SSH key:
+`--replace` moves any existing `/var/lib/wheel` to `/var/lib/wheel.pre-migration-<stamp>` rather
+than deleting it.
+
+**Rollback, in full:**
 
 ```bash
-HOST=203.0.113.5 SSH_USER=root KEY=~/.ssh/wheel_deploy_key DOMAIN=wheel.example.com EMAIL=you@example.com REF=main
+sudo systemctl stop wheeld wheel-web
+cd /opt/wheel-compose/infra/vps && ./deploy.sh
+```
+
+The volume is exactly as it was, so this is not a procedure that has to work — it is a consequence
+of never having written to it.
+
+> **Two volumes on the current production box belong to a retired stack and must never be removed:
+> `wheel_hostdata` and `wheel_pgdata`.** `migrate-from-docker.sh` carries them as an explicit
+> deny-list and refuses to read one even read-only. When you eventually retire the compose project,
+> `docker compose -p wheel down` — never `-v`.
+
+Back up immediately afterwards (section 6). The native install is now the live one; the volume is a
+snapshot that stops ageing from that moment.
+
+## 11. Rehearsing
+
+```bash
+infra/vps/rehearse-native.sh --only harden   # the shipped unit's directives + a real agent workload
+infra/vps/rehearse-native.sh --only oom      # a runaway agent must not take down the daemon
+infra/vps/rehearse-native.sh                 # everything, including a real install.sh run
+```
+
+It boots stock Ubuntu 24.04 with **real systemd** in a container and runs `install.sh` for real. The
+full run compiles the workspace, so it takes what a first install on a server takes.
+
+The phases, and what each proves:
+
+- **harden** — lifts the `[Service]` directives out of the *shipped* `wheeld.service` verbatim and
+  runs a real workload under them: `git clone`, `npm install` of a package with a build step, a
+  real build, pty allocation, `unshare` + `mount`, `ss`/`ip`, DNS. Plus three that must *fail*:
+  writing outside `ReadWritePaths`, reading a world-readable file under `/home`, reading root's
+  `/proc`.
+- **oom** — runs the same workload with and without `OOMPolicy=continue` and requires the default
+  to stop the unit and `continue` not to. If the default ever stops reproducing, the drop-in would
+  be fixing a problem that no longer exists, and this says so rather than passing quietly.
+- **install / serve / upgrade / migrate** — `install.sh` end to end, then the guarantees measured
+  against what it produced: loopback-only binding, the signup gate having run *as a unit* and being
+  enabled for the next boot, `0700`/`0600` modes, preflight refusing a non-loopback bind, the
+  `claude` floor, and a failed upgrade rolling back to a serving box.
+
+**A gate that has never failed proves nothing**, so `rehearsal/native/mutate-native.sh` breaks each
+layer on purpose and exits 0 only if the checks guarding it come back red:
+
+```bash
+infra/vps/rehearsal/native/mutate-native.sh harden    # the four tightenings a review would suggest
+infra/vps/rehearsal/native/mutate-native.sh sandbox   # remove the host protections
+infra/vps/rehearsal/native/mutate-native.sh oom       # drop OOMPolicy=continue
+```
+
+`harden` is the one that matters. A sandbox tightened past what agents need breaks *nothing
+visible* — wheeld starts, the board serves, `systemd-analyze security` scores better — and the
+damage shows up days later as "the model seems worse".
+
+**Where the container differs from a real VM**, stated because a rehearsal that hides its own gaps
+is worse than none: it runs `--privileged` with a delegated cgroup tree; the `cpu` controller is
+often not delegated, so `CPUQuota` is reported rather than asserted; the kernel is the Docker host's;
+and there is no ufw and no cloud firewall, so `--firewall` is not exercised at all.
+`rehearsal/native/Dockerfile`'s header has the full list.
+
+The fast subset runs in `make check` with no Docker at all — `infra:native-units`,
+`infra:native-toolchain`, `infra:native-migration` — covering the invariants whose violation is
+catastrophic *and* statically detectable.
+
+## Deploying over SSH, non-interactively
+
+Every input to `install.sh` is a flag; nothing reads stdin.
+
+```bash
+HOST=203.0.113.5 SSH_USER=root KEY=~/.ssh/wheel_deploy_key REF=main
 
 ssh_run() { ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$HOST" "$@"; }
-
-ssh_run 'sudo -n true' || { echo "no passwordless sudo for $SSH_USER@$HOST" >&2; exit 1; }
+ssh_run 'sudo -n true' || { echo "no passwordless sudo" >&2; exit 1; }
 
 ssh_run bash -s -- "$REF" <<'REMOTE'
 set -euo pipefail
 ref="$1"
-if [ ! -d /opt/wheel-installer/.git ]; then
-    git clone --quiet https://github.com/Morgandri1/wheel.git /opt/wheel-installer
-fi
+[ -d /opt/wheel-installer/.git ] || git clone --quiet https://github.com/Morgandri1/wheel.git /opt/wheel-installer
 git -C /opt/wheel-installer fetch --quiet origin "$ref"
 git -C /opt/wheel-installer -c advice.detachedHead=false checkout --quiet --force "origin/$ref"
 REMOTE
 
-ssh_run sudo /opt/wheel-installer/infra/vps/install.sh --domain "$DOMAIN" --email "$EMAIL" --ref "$REF" --firewall --dry-run
-ssh_run sudo /opt/wheel-installer/infra/vps/install.sh --domain "$DOMAIN" --email "$EMAIL" --ref "$REF" --firewall
+ssh_run sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy --ref "$REF" --firewall --dry-run
+ssh_run sudo /opt/wheel-installer/infra/vps/install.sh --no-proxy --ref "$REF" --firewall
 TOKEN=$(ssh_run sudo cat /var/lib/wheel/operator-token)
 ```
 
-`BatchMode=yes` fails instead of ever prompting; `StrictHostKeyChecking=accept-new` accepts a
-host's key on first connection and still verifies it on every one after.
+`BatchMode=yes` fails instead of prompting; `StrictHostKeyChecking=accept-new` accepts a host key on
+first connection and verifies it on every one after.
 
-### Auto-update hook points
+## Webhooks (`/p`)
 
-`sdk/auto-update` targets exactly this layout, a source checkout that wheeld rebuilds itself from:
+TLS mode only — there is no public ingress in tunnel mode.
 
-| Hook | Here |
-|---|---|
-| Checkout (`WHEEL_UPDATE_REPO`) | `/opt/wheel/src` |
-| Binaries (`WHEEL_UPDATE_BIN_DIR`) | `/opt/wheel/bin` |
-| Build staging (`WHEEL_UPDATE_STAGING`) | `/var/cache/wheel/update`, off the data directory |
-| Restart | `wheeld.service`: `Restart=on-failure` also restarts after `WHEEL_UPDATE_RESTART=exit` (exit 75) |
-| Policy | `WHEEL_AUTO_UPDATE` in `/etc/wheel/wheeld.local.env`, off unless you set it |
+`https://wheel.example.com/p/<project>/<path>` is public by design: a webhook sender can be given
+nothing but a URL. It is off for every project until the owner turns on the project's `http`
+capability. The edge caps a webhook body at 256 KiB.
 
-By default the checkout and the binaries belong to root, so nothing wheeld runs, agents included,
-can rewrite them. `install.sh --updatable` hands both to `wheel` and adds those paths to the unit.
-That is what lets wheeld replace itself. It also lets any agent do so, because agents run as
-wheeld's user (the auto-update proposal's T7). Enable it knowingly.
+**Whatever reaches an endpoint becomes a message to the agent wired to it.** See
+[the webhook path](#the-webhook-path) above for why that matters more natively than it did in a
+container.
 
-## Rehearsing on a laptop
+## The board somewhere else (Vercel)
 
-`infra/vps/rehearse.sh` brings this exact `compose.yml` up on your machine in TLS mode, behind
-Caddy with a certificate from Caddy's own CA instead of Let's Encrypt. It then checks, each check
-as its own process with its own exit code:
-
-- the web app is served, with the security headers;
-- signup is refused, at the edge and by wheeld itself;
-- the operator adds an account, and signing in works;
-- a project, an agent, and a message that reaches `queued`, or `delivered` with the fake harness;
-- `/v1` with and without a `wht_` token;
-- the events WebSocket with header auth, and the web app's event stream through Caddy;
-- webhook ingress, and that forged `X-Forwarded-*` headers never reach wheeld or change who the
-  rate limit counts;
-- the body limits;
-- that wheeld and web publish on `127.0.0.1` only, and that path actually works;
-- that Caddy's admin API is off.
-
-```bash
-infra/vps/rehearse.sh                                        # https://localhost
-REHEARSE_DOMAIN=wheel.rehearsal.test infra/vps/rehearse.sh   # any name; no DNS needed
-REHEARSE_FAKE_HARNESS=1 infra/vps/rehearse.sh                # messages reach `delivered`
-```
-
-It needs ports 80 and 443 free, and it builds from `git archive` of a commit, never your working
-tree. Tunnel mode is exercised by `deploy.sh`'s own logic (it is what actually resolves the
-settings for it) rather than by `rehearse.sh`, which always drives the stack in TLS mode so the
-public-facing behaviour — the part with a bigger blast radius — gets the full check suite every
-time; verify tunnel mode by hand the same way section 3 describes, against a `deploy.sh` run with
-`WHEEL_DOMAIN` left unset.
-
-A gate that has never failed proves nothing, so `rehearsal/mutate.sh edge` breaks the Caddyfile
-the way people break proxies, and publishes wheeld on a non-loopback address. It exits 0 only if
-every check that guards those layers comes back red. The broken layers:
-
-- trusting every proxy
-- dropping HSTS
-- raising the webhook limit
-- un-blocking sign-up
-- forwarding the cookie
-- buffering the event stream
-- turning the admin API on
-- a non-loopback publish
-
-`rehearsal/mutate.sh config` does the same for wheeld's signup flag and the web app's origin.
-
-**One known gap in this rehearsal, not in the kit:** `rehearse.sh` also checks that a container on
-a different Docker network cannot reach wheeld's or web's address on the `edge` network (the
-promise of `internal: true`). Measured directly: OrbStack's engine does not enforce this (a
-container on another network reaches it anyway); stock `dockerd` does (confirmed via `docker:dind`
-— the same probe gets a connection timeout there). If you're rehearsing on a Mac with OrbStack,
-expect this one check red; the real VPS runs stock `dockerd` and it passes there.
+Supported, not the default. The board's server has to reach the API, so wheeld's `/v1` must be
+public — TLS mode's topology. Deploy `web/` with `WHEEL_API_URL=https://wheel.example.com` and
+`WHEEL_PUBLIC_ORIGIN=<the board's own origin>` (see `web/DEPLOY.md`). Note that
+`wheel-web.service`'s `IPAddressDeny=any` exists precisely because the local board needs no
+internet; if you point it at a remote API you must relax that, in a drop-in rather than by editing
+the unit.
 
 ## When something is wrong
 
 | Symptom | Cause |
 |---|---|
-| `deploy.sh` fails to bind a port | Another deployment already holds it — see [Replacing an existing deployment](#replacing-an-existing-deployment-stop-legacy) |
-| No certificate; Caddy logs ACME errors | The A record does not point here yet, or 80/443 are closed in the cloud firewall |
-| `preflight` exited 1 | `.env` is wrong; `docker compose -p wheel logs preflight` names the setting |
-| Sign-in answers `403 cross_origin` | The browser's origin doesn't match `WHEEL_PUBLIC_ORIGIN`: in tunnel mode use `http://localhost:3000`, not the server's IP directly |
+| `systemctl start wheeld` hangs then fails | `ExecStartPost` waited 60 s for `/healthz`. The daemon is running but not serving: `journalctl -u wheeld -n 50` |
+| wheeld refuses to start, naming `BIND_ADDR` | `wheel-preflight` caught a non-loopback bind. Intentional? `WHEEL_ALLOW_EXPOSED_BIND=1` in `wheeld.local.env`, after reading section 1 |
+| wheeld refuses to start, naming `claude` | Below the `2.1.269` floor headless OAuth needs. `npm install -g @anthropic-ai/claude-code@<pinned>` and check `command -v claude` for something shadowing it |
+| The board will not start | `wheel-signup-gate` failed, so `Requires=` blocked it: `journalctl -u wheel-signup-gate -n 20` |
+| An agent's build fails with `EROFS` | It wrote outside `/var/lib/wheel`. `ProtectSystem=strict`, section 7 |
+| An agent cannot find `/tmp` content you put there | `PrivateTmp=yes`. Use `nsenter`, section 6 |
+| `ping` does not work inside an agent | `CapabilityBoundingSet=`, section 7. Use `curl`/`getent` |
+| The box got slow and `sshd` was unresponsive | Raise or clear `CPUQuota` in `90-local.conf`, and see the small-box notes |
+| `wheeld` restarted by itself, journal says `oom-kill` | An agent hit `MemoryMax` and the kernel picked wheeld. Rare; follow-up F3 is the fix. Check `systemd-cgtop` for what was large |
+| Sign-in answers `403 cross_origin` | The browser's origin does not match `WHEEL_PUBLIC_ORIGIN`: in tunnel mode use `http://localhost:3000`, not the server's IP |
 | `/v1` answers `403` naming `WHEEL_ALLOWED_HOSTS` | The request used a host name wheeld was not told about |
-| `413 ... at the proxy` | Over the edge limit: 256 KiB for webhooks, 5 MiB for everything else (wheeld and the web app refuse more anyway) |
-| Webhook `403` | The project's `http` capability is off, or you're in tunnel mode (no ingress) |
-| `docker compose build` seems to hang or the daemon logs `Killed` | Out of memory on the first Rust build — see [Running on a small box](#running-on-a-small-box-2-vcpu-4-gib) |
-| `verify-signup-gate` fails with `WHEEL_SIGNUP=open` set | Known limitation: its probe can be rate-limited by wheeld's own global signup counter (50/hour) if a stranger has already used it up — which they could, since `open` means anyone reaching wheeld can sign up at all. Not a security gap; `open` is already documented as unsafe on a reachable server. |
+| `413 ... at the proxy` | Over the edge limit: 256 KiB for webhooks, 5 MiB otherwise |
+| Webhook `403` | The project's `http` capability is off, or you are in tunnel mode |
+| No certificate; Caddy logs ACME errors | The A record does not point here, or 80/443 are closed in the cloud firewall |

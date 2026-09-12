@@ -4,8 +4,19 @@
 # See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 # Brings up infra/vps/compose.yml (the wheeld single-binary path) from infra/vps/.env. This is the
-# entry point for a Docker-based deploy — never run `docker compose` against compose.yml directly,
+# entry point for a DOCKER-based deploy — never run `docker compose` against compose.yml directly,
 # it needs settings this script derives (see lib/derive-env.sh).
+#
+# THE DEFAULT IS NOT THIS SCRIPT. `infra/vps/install.sh` is: systemd services built from source, no
+# Docker daemon on the box (README.md §2). This path is fully supported and is the right choice
+# when the container boundary between agents and the host matters more to you than what you give up
+# for it — resource limits (compose sets none), `ufw` being authoritative over published ports,
+# `systemd-cgls` as a way to see what agents are doing, and wheeld's ability to update itself.
+# README.md §9 states the trade; §8 states what the native path loses in exchange.
+#
+# The two paths are independent and use independent directories (/opt/wheel-compose here,
+# /opt/wheel there), so trying one does not commit you to it. infra/vps/migrate-from-docker.sh
+# moves this path's state to the other one without writing to the volume it reads.
 #
 #   infra/vps/deploy.sh [--env-file <path>] [--dry-run]
 #   infra/vps/deploy.sh --stop-legacy [--legacy-project <name>] [--dry-run]
@@ -45,7 +56,7 @@ while [ $# -gt 0 ]; do
         --stop-legacy) stop_legacy=1; shift ;;
         --legacy-project) legacy_project="${2:?--legacy-project needs a name}"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
-        -h | --help) sed -n '6,23p' "$0"; exit 0 ;;
+        -h | --help) sed -n '6,34p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done
