@@ -15,3 +15,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+# Only to drive a REAL engine in-process for the end-to-end escaping test
+# (defect #2): the real `wheel` binary (CARGO_BIN_EXE_wheel) talks over a real
+# unix socket to a real running engine, so the escaping/wrapping is proven
+# through the same two processes a harness actually uses, not a mock of the
+# boundary between them.
+wheel-engine = { path = "../wheel-engine" }
+tokio = { workspace = true }
+uuid = { workspace = true }

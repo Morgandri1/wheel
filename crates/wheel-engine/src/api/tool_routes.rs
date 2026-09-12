@@ -399,10 +399,25 @@ pub async fn run_operation(
 
     let outcome = result
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "tool_error", format!("{e:#}")))?;
+    // Wrapped, not mutated in place (defect #2): this is the external
+    // endpoint's own response, nothing on the board wrote it, and it is the
+    // highest-value indirect-prompt-injection target this project has.
+    // `outcome.body` is a parsed `Value` whenever the far end answered with
+    // JSON at all (tools/execute.rs's `finish`), so the wrap runs over every
+    // STRING LEAF rather than the value as a whole -- a caller reading
+    // `.body.some_field` still gets the shape back, just with the leaf text
+    // marked. Headers get the same treatment: they are exactly as
+    // attacker-influenced as the body, and reach the model through the same
+    // rendered text once there is no dedicated field for them either.
+    let body = wheel_core::map_json_strings(&outcome.body, &wheel_core::wrap_tool_output);
+    let headers = wheel_core::map_json_strings(
+        &serde_json::Value::Object(outcome.headers),
+        &wheel_core::wrap_tool_output,
+    );
     Ok(serde_json::json!({
         "status": outcome.status,
-        "headers": outcome.headers,
-        "body": outcome.body,
+        "headers": headers,
+        "body": body,
         "duration_ms": outcome.duration_ms,
         "bytes": outcome.bytes,
     }))
