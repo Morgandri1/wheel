@@ -120,17 +120,38 @@ measured (not re-derived here — citing rather than duplicating):
 
 Formerly "Option B" in this document's first draft. `wheeld` moves from "one process hosting every
 engine as an async task" to "a supervisor that spawns and isolates one sandbox per project" —
-structurally what `wheel-host` already is. **Not a config flag; a real architecture change,** sized
-closer to a milestone than a hardening pass. The mechanism is not new to invent, though: `wheel-
-host`'s `process` sandbox backend (`crates/wheel-host/src/sandbox/process.rs`) already does real
-per-project `setuid`/`setgid` via `pre_exec` (`drop_privileges`: `setgroups([])` → `setgid` →
-`setuid` → `no_new_privs`, in that order — the same order #67's own `NoNewPrivileges=` reasoning
-independently arrives at for a different mechanism), allocates a distinct uid range per project
-(`allocate_uid`), and is covered by its own tested suite. `wheeld` already proxies each project over
-a unix socket the same way `wheel-host` does (`crates/wheeld/src/embedded.rs`'s own doc comment:
-"the host still proxies over a unix socket per project, so the API's engine proxy and events bridge
-run exactly the code they run in production") — the control-plane side is already shared; what's
-missing is the process/container boundary underneath it.
+structurally what `wheel-host` already is. **Not a config flag; a real architecture change** — but
+ADVERSARY's follow-up (building the base for this exact comparison) found the cost is smaller than
+"a real architecture change" alone suggests, because **the isolation primitive itself is not new to
+invent — it is already written, tested, and previously ADVERSARY-reviewed against F003/F007** in
+`wheel-host`'s `process` sandbox backend (`crates/wheel-host/src/sandbox/process.rs`, 963 lines):
+
+- Real per-project `setuid`/`setgid` via `pre_exec` (`drop_privileges`: `setgroups([])` → `setgid` →
+  `setuid` → `no_new_privs`, in that order — the same order #67's own `NoNewPrivileges=` reasoning
+  independently arrives at for a different mechanism — then VERIFIES the uid actually changed rather
+  than trusting the syscalls silently), and a distinct uid range allocated per project
+  (`allocate_uid`).
+- 0700 project data directories, chowned to that allocated uid.
+- **Unix sockets only, no TCP, for the control plane** — the backend's own comment: "on a shared
+  kernel every loopback port is reachable by every other tenant, so a per-project port would undo
+  the whole exercise." **Pathname sockets specifically, not abstract ones** — the abstract namespace
+  ignores filesystem permissions, so it wouldn't actually gate access by the directory's 0700 mode.
+  `wheeld` already does the socket-per-project half of this for its own control plane
+  (`crates/wheeld/src/embedded.rs`'s `socket_path`/`ListenAddr::Unix` — confirmed: every embedded
+  engine already gets its own pathname unix socket, not a shared port), so this part genuinely IS
+  reused today, not just reusable.
+- No secrets on argv, env only — already the pattern `wheeld`'s own agent-spawn path follows
+  elsewhere (`child_command`'s `env_clear` plus an allowlist, §2).
+
+So the real cost of Shape 3 is **porting this primitive into `wheeld`'s own spawn path — which
+currently has none of it (confirmed against `embedded.rs`: no `setuid`, no per-project uid
+allocation, no privilege drop of any kind) — not inventing a new mechanism from a blank page.**
+Sizing it as "build per-project sandboxing from scratch" overstates the unknown; the honest sizing
+question is the porting/adaptation effort plus whatever `wheeld`-specific integration work surfaces
+(the two run different lifecycles — `wheel-host` supervises whole containers/processes from outside;
+`wheeld` embeds engines as in-process tasks today, so SPAWNING a genuinely separate, privilege-
+dropped process per project is the actual new work, even with the drop-privileges primitive itself
+already in hand).
 
 - **Escape-to-host protection:** whatever the per-project sandbox choice earns — Shape 1's Docker
   container hardening, Shape 2's systemd directives applied per-project instead of once, or a
@@ -144,6 +165,19 @@ missing is the process/container boundary underneath it.
   document's original costing (below) described. It is also the only shape where the technology
   choice compounds per project: N parked-agent populations, each independently paying whichever
   runtime's per-sandbox resume cost, not one payment for the whole box.
+
+**A related, narrower finding for Shape 2, from the same reuse angle:** the "unix-socket-only, no
+TCP" pattern above is a partial answer to Shape 2's network-namespace gap — for the CONTROL PLANE
+specifically. It does not fix the gap as a whole: an agent's own outbound work (`git`, `npm`, tool
+calls, and — the specific weakness §"Shape 2" names — reaching whatever else is bound to
+`127.0.0.1`) still goes over the host's shared network stack regardless of how `wheeld` talks to its
+own engines, because that traffic was never a control-plane concern to begin with. `wheeld` already
+gets the control-plane half of this for free (confirmed above); the part #67's own §3 marks WEAKER —
+honest client attribution behind Caddy — needs its own fix (#67's follow-up **F2**, a unix socket
+with peer-credential checking or a shared secret header between Caddy and `wheeld` specifically,
+already scoped there) and is a different problem from general agent network reachability, which no
+shape in this document closes without a real network namespace (Shape 1's container, or Shape 3's
+per-project sandbox if it earns one).
 
 ### The tension Morgan should see stated, not discover after (PM's ask, directly)
 
