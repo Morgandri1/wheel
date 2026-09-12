@@ -38,6 +38,15 @@ discipline `script-execution-scope.md` used.
 
 ## The framing question this has to answer before the numbers mean anything (ADVERSARY, expanded per PM)
 
+**A note on "Docker" in what follows, per Morgan's sharpest correction yet: Docker itself is not
+important — containerization, the PROPERTY, is.** Where "Docker" appears below (Shape 1, the
+`DockerSandbox` backend, `bollard`) it is naming what is LIVE TODAY, not what should stay the
+substrate. Nothing in this document should be read as weighting a recommendation toward keeping
+Docker specifically; where a different mechanism wins on the merits — gVisor, Firecracker, something
+else, integrated through Docker's runtime-flag mechanism OR bypassing Docker entirely (`containerd`
++ Kata directly, a bespoke Firecracker-jailer integration) — that is the recommendation, full stop,
+not a niche alternative to a Docker-shaped default.
+
 Wheel has **three** deployment shapes worth costing separately, not two, and — the finding that
 reshapes this whole document — **they are not equally isolated today, in ways that run in opposite
 directions from what their other tradeoffs suggest.**
@@ -419,7 +428,7 @@ cost.
 | | gVisor (`runsc`) | Firecracker (via Kata Containers, `containerd-shim-kata-v2`, or `firecracker-containerd`) |
 |---|---|---|
 | **Mechanism** | Userspace kernel (the "Sentry") intercepts and reimplements the guest's syscalls; no nested virtualization required in its default `ptrace` platform, or KVM-accelerated in its `kvm` platform where available | A real, minimal guest kernel + init inside a purpose-built microVM; the isolation boundary is genuine hardware virtualization (KVM), not syscall interception |
-| **Docker/wheel-host integration** | Drop-in OCI runtime: `runsc` binary on the host, `--runtime=runsc` (or the per-container `HostConfig.Runtime` field `bollard` already exposes) — no change to `DockerSandbox`'s architecture, one field | Not a drop-in `docker run` flag on its own. Needs either Kata Containers (itself installable as a `--runtime=kata` OCI runtime, comparable integration effort to gVisor if going this route) or a dedicated `firecracker-containerd` stack, which is a different, heavier control plane than the `bollard`-driven `dockerd` this project already runs against |
+| **Integration into `wheel-host`** | Like Firecracker/Kata, not tied to Docker specifically — `runsc` is a general OCI runtime. Drop-in under today's Docker orchestration (`--runtime=runsc`, or the per-container `HostConfig.Runtime` field `bollard` already exposes), or equally usable via `containerd`/CRI-O directly if `wheel-host` moves off `bollard` for another reason | Two equally legitimate paths, not one cost line: (a) `--runtime=kata` under today's Docker orchestration, comparable integration effort to gVisor; or (b) bypass Docker/`bollard` entirely and drive `containerd` + Kata (or `firecracker-containerd`) directly from `wheel-host` — a DIFFERENT control plane, not a worse one. Since containerization is the property that matters, not `dockerd` specifically, (b) is worth evaluating on its own terms during the spike — it removes a layer of indirection (`bollard` → `dockerd` → `containerd-shim-kata-v2` → Firecracker collapses to `wheel-host` → `containerd` → Firecracker directly) rather than adding one |
 | **Host requirement** | Works without KVM at all (ptrace platform); KVM used only if present, as an optimization | **Requires KVM** (hardware virtualization exposed to the host). This is the practical blocker worth flagging loudly: `infra/vps/README.md` targets a generic VPS, and nested virtualization is NOT universally offered by VPS/cloud providers — some budget/shared-CPU tiers explicitly disable it. This has to be confirmed for whatever host Wheel actually deploys to before Firecracker is viable at all, independent of every other tradeoff here |
 | **Published startup overhead** | Modest, additive to an ordinary container start — commonly cited as tens to low-hundreds of milliseconds beyond `runc`, since it is still "start a container," just under a stricter syscall filter | Firecracker's own published figure for booting a minimal guest is ~125ms — but that is kernel+init only; a guest that then needs to bring up Wheel's actual engine+harness environment inside it adds real time on top, likely comparable to or more than gVisor's overhead once the FULL resume path (not just "a VM exists") is counted |
 | **Published memory overhead** | Roughly 10–25MB per sandbox for the Sentry process, on top of the workload's own usage | Firecracker's own design target is ~5MB per microVM for the hypervisor itself — but a full guest kernel + whatever the harness needs resident (not a shared host kernel's page cache) is the real comparison, and that is workload-dependent, not a fixed hypervisor number |
