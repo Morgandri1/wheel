@@ -17,8 +17,8 @@
 //!   half-applied board as a success, which is exactly the invariant this route exists to keep.
 
 use crate::apply::{
-    execute, validate, ApplyPolicy, ApplyReport, BoardClient, EmittedBoard, EmittedNode,
-    ExistingBoard, ExistingNode, Plan, Refusal, WireRef,
+    execute, validate, ApplyPolicy, ApplyReport, BoardClient, EmittedNode, ExistingBoard,
+    ExistingNode, Plan, Refusal, WireRef,
 };
 use crate::auth::extractor::ProjectScope;
 use crate::error::{ApiError, ApiResult};
