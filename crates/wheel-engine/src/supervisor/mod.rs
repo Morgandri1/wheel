@@ -3746,6 +3746,7 @@ done
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: crate::config::HarnessAuthPolicy::default(),
+            script_execution_enabled: false,
         });
         let sup = Arc::new(
             Supervisor::with_harness(

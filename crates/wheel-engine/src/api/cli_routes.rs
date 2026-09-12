@@ -1221,6 +1221,7 @@ pub(crate) mod await_tests {
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: crate::config::HarnessAuthPolicy::default(),
+            script_execution_enabled: false,
         });
         let db = Arc::new(Mutex::new(crate::db::open_memory().unwrap()));
         let events = Arc::new(crate::events::Bus::new());
