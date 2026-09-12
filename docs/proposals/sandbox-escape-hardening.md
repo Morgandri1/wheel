@@ -26,12 +26,23 @@ F007 is what would stop it presenting as a sibling *node*. This document is abou
 assumed beyond what an untrusted, possibly prompt-injected agent already legitimately has under
 `bypassPermissions` — what's reachable from there that shouldn't be?
 
-**Two distinct bad outcomes, not one**, per ADVERSARY: escaping the container to reach the host is
-the headline case, but reaching **another project's** data or process on the same machine, without
-ever leaving any container, is itself bad and explicitly in scope — Morgan deprioritized per-NODE
-isolation *within* a project (F007), not per-PROJECT isolation between them. The rest of this
-document has to answer both, and — the finding that reshapes everything below — **they are not the
-same question on this deployment**, because of which container topology `wheeld` actually runs.
+**Three distinct bad outcomes, not one**, per ADVERSARY: escaping the container to reach the host is
+the headline case, but reaching **another project's** data or process on the same machine without
+ever leaving any container is itself bad and explicitly in scope — Morgan deprioritized per-NODE
+isolation *within* a project (F007), not per-PROJECT isolation between them. **The third is not
+hypothetical — it has already been caught happening, not just theorized about**: redteam finding 048
+is PM's live measurement of `wheel-host` (the Railway multi-tenant deployment, the same
+`docker.rs`/`process.rs` backends §"Shape 3" and item 3 already touch) reaching
+`postgres.railway.internal:5432` and `wheel-api.railway.internal:8080` in plain TCP from inside the
+sandbox — the private-network segmentation §5b promises is not the segmentation that is actually
+deployed, and only credential secrecy stands between that reachability and real use. This document
+does not fix 048 (it is a Railway-topology / `infra/railway/` fix, not a sandbox-mechanism one), but
+whoever picks up items 4–6 or the gVisor/Kata decision should know it is a confirmed instance, not a
+"could theoretically happen" — this proposal's own choice of mechanism does not make 048 worse or
+better, since Shape 1's private network exposure and Shape 3's would share the same fix regardless of
+which sandboxing technology wraps the container. The rest of this document has to answer all three,
+and — the finding that reshapes everything below — **the first two are not the same question on this
+deployment**, because of which container topology `wheeld` actually runs.
 
 Everything below is measured against `main`/`dev` as of this commit, with `file:line`, the same
 discipline `script-execution-scope.md` used.
@@ -257,6 +268,20 @@ real deployment must pass. Before this merges, someone with a docker daemon need
 infra/vps/rehearse.sh                    # tunnel mode: preflight, wheeld, web all healthy
 REHEARSE_DOMAIN=... WHEEL_DOMAIN=... infra/vps/rehearse.sh   # TLS mode: caddy actually binds :80/:443, gets a cert
 ```
+
+**One check missing from that list, added per ADVERSARY: headless Chromium (`playwright`/
+`puppeteer`) inside `wheeld` with `cap_drop: [ALL]` applied.** #67's own systemd unit deliberately
+left `RestrictNamespaces=` OFF specifically because it breaks `bwrap`/Chromium — which means browser
+automation is a real, anticipated agent workload here, not a hypothetical one. Docker's `cap_drop`
+plus its default seccomp profile is a DIFFERENT mechanism from systemd's namespace restriction, and
+I cannot tell from reading alone whether Chromium's own sandbox (which commonly wants
+`unshare(CLONE_NEWUSER)`, and falls back to `--no-sandbox` in constrained containers) survives zero
+capabilities the way it needed that one systemd directive left alone. Exactly the class of claim
+`harden-probe.sh` exists to measure rather than assume on the systemd side — this side needs the
+same discipline: install and launch a headless Chromium (`npx playwright install chromium && node -e
+"require('playwright').chromium.launch()"` or equivalent) as part of the `rehearse.sh` run above,
+alongside the `git clone`/`npm install`/build checks already planned. **Not yet added to
+`rehearse.sh` itself** — naming it here so it is not silently assumed to work.
 
 I have reasoned through why each `cap_drop`/`cap_add` should work; I have not watched it work.
 
@@ -537,7 +562,10 @@ tension Morgan should weigh when deciding whether Shape 2 becomes the default.
   whichever ships first.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83), proceeding regardless
   of the shape decision per PM's instruction not to pause them. **Needs a `rehearse.sh` run with
-  docker access** before merge — not yet done, called out explicitly above rather than assumed.
+  docker access** before merge — not yet done, called out explicitly above rather than assumed —
+  **including a headless-Chromium launch under `cap_drop: [ALL]`** (ADVERSARY: browser automation is
+  a real, anticipated agent workload per #67's own `RestrictNamespaces=` exception for exactly this),
+  not just `git clone`/`npm install`/build.
 - Item 4: needs someone with production shell access to run the two `docker inspect`/`/proc`
   commands above against `wheel-wheeld-1` and record the actual result.
 - Items 5–6: proposed, not implemented, with the specific breakage each would need to survive
