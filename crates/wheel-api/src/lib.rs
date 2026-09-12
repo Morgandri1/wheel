@@ -99,6 +99,12 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             "/v1/projects/{id}/board/apply",
             post(routes::board_apply::apply_board),
         )
+        // The Workflow Builder's conversation, streamed as SSE. Its own route rather than the
+        // engine wildcard: that path shares a 30s client timeout, which would cut a turn short.
+        .route(
+            "/v1/projects/{id}/builder/turns",
+            post(routes::builder::turns),
+        )
         // Registered before the engine wildcard: this one route also accepts a single-use ticket
         // in the query string, because browsers cannot set headers on a WebSocket handshake.
         .route(

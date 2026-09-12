@@ -178,10 +178,38 @@ a `400`, not an ignored key: check `features` first.
 | `idle_parking` | `AgentConfig.idle_timeout_secs` (§5b) |
 | `ephemeral_context` | `AgentConfig.ephemeral_context` |
 | `budgets` | `AgentConfig.budget` `{max_turns?, max_usd?}` |
+| `builder` | `POST /v1/builder/turns` (the Workflow Builder conversation, Server-Sent Events) and `GET`/`PUT`/`DELETE /v1/builder/credential` |
 | `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**: there the OAuth credential this login produces is refused at spawn, so a client must offer API-key auth instead |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.
+
+### Workflow Builder
+
+| Route | Body → Response | M |
+|---|---|---|
+| `POST /v1/builder/turns` | `{mode, turns[], credential?}` → `text/event-stream` | M1 |
+| `GET /v1/builder/credential` | → `{configured, kind}` | M1 |
+| `PUT /v1/builder/credential` | `{api_key}` or `{setup_token}` → `{configured, kind}` | M1 |
+| `DELETE /v1/builder/credential` | → `204` | M1 |
+
+One transient `claude --print` per turn, holding no tools, no MCP and no node token, so its only
+output is text (`docs/proposals/workflow-builder-completion.md`). `mode` is `new` or `improve`; in
+`improve` the engine attaches **its own** board, redacted (mcp `env` values, imported tool specs,
+agent runtime state), never a board supplied by the caller. `turns` is the conversation, last turn
+the user's; at most 40 turns, 16 KiB each, 128 KiB in total.
+
+`credential` chooses which of the project's own credentials the turn runs on — `{"source":"builder"}`
+(the store above), `{"source":"agent","node":<uuid>}`, or `{"source":"vault","node":<uuid>}`. Exactly
+one credential variable ever reaches the child, and a `WHEEL_HARNESS_AUTH=api-key-only` deployment
+refuses an OAuth-shaped one at both the store and the spawn.
+
+Frames: `delta {text}` as the answer streams, then either `done {text, boards}` — `boards` counts
+`---START-WORKFLOW---` markers, so a client can tell when the contract's "exactly one board" was not
+met — or `error {code, message}` with `code` one of `needs_auth`, `builder_error`, `timeout`,
+`too_long`. Refusals *before* the stream opens are ordinary JSON: `409 needs_auth` (carrying
+`sources`, the agents and vaults that could be designated instead), `403 policy`, `429 builder_busy`,
+`400`, `413`. One turn at a time per project.
 
 ### Board
 

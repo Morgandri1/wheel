@@ -36,6 +36,11 @@ rand = "0.8"
 time = { version = "0.3", features = ["std"] }
 serde_yaml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Already in the tree via reqwest/hyper; used for the builder's SSE body stream.
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
+# Digest comparison in the builder route tests: a secret that reached a child under a DIFFERENT
+# name would pass a name check, so values are compared by hash.
+sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }

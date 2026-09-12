@@ -358,6 +358,10 @@ def t_builder_board():
     check("board: the directive itself is not echoed", "<<FAKE" not in out)
     p = run(["-p", "--output-format", "text"], "two please <<FAKE:BOARD=2>>")
     check("board: BOARD=2 emits two blocks", p.stdout.count("---START-WORKFLOW---") == 2)
+    # The engine's builder route escapes user text, so a directive cannot reach us from there.
+    p = run(["-p", "--output-format", "text"], "no directive here", env={"WHEEL_FAKE_BOARD": "1"})
+    check("board: WHEEL_FAKE_BOARD steers it without a directive",
+          p.stdout.count("---START-WORKFLOW---") == 1, p.stdout[:200])
 
 def t_partial_messages():
     args = ["-p", "--input-format", "text", "--output-format", "stream-json", "--verbose"]

@@ -30,6 +30,7 @@ use crate::{config::Config, db};
 
 pub mod agent_routes;
 pub mod board_routes;
+pub mod builder_routes;
 pub mod cli_routes;
 mod engine_routes;
 pub mod events_route;
@@ -57,6 +58,8 @@ pub struct AppState {
     /// Logins waiting for a pasted code. Each holds a live child process, so
     /// this is state with a cost and a TTL, not a cache.
     pub logins: Arc<crate::oauth::LoginSessions>,
+    /// Runs Workflow Builder turns, one at a time per project.
+    pub builder: Arc<crate::builder::Builder>,
 }
 
 /// An error that renders as the uniform `{"error":{"code","message"}}` body.
@@ -197,6 +200,13 @@ pub fn router(state: AppState) -> Router {
         .route("/tools/{id}/import", post(tool_routes::reimport))
         .route("/tools/{id}/ops", get(tool_routes::ops))
         .route("/tools/{id}/call", post(tool_routes::call))
+        .route("/builder/turns", post(builder_routes::turns))
+        .route(
+            "/builder/credential",
+            get(builder_routes::credential_status)
+                .put(builder_routes::credential_put)
+                .delete(builder_routes::credential_delete),
+        )
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -406,6 +416,13 @@ pub struct PatchNode {
 /// without also exercising `WHEEL_VAULT_KEY` parsing.
 #[cfg(test)]
 pub(crate) fn test_state() -> AppState {
+    test_state_under(crate::config::HarnessAuthPolicy::default())
+}
+
+/// As [`test_state`], on a deployment running a chosen credential policy — the builder and the
+/// spawn gate both answer to it, so both need to be testable under it.
+#[cfg(test)]
+pub(crate) fn test_state_under(harness_auth: crate::config::HarnessAuthPolicy) -> AppState {
     use base64::Engine;
 
     let cfg = Arc::new(Config {
@@ -417,7 +434,7 @@ pub(crate) fn test_state() -> AppState {
         json_logs: false,
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
-        harness_auth: crate::config::HarnessAuthPolicy::default(),
+        harness_auth,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());
@@ -432,6 +449,7 @@ pub(crate) fn test_state() -> AppState {
         events,
         logins: Arc::new(crate::oauth::LoginSessions::default()),
         ingress_rate: Arc::new(crate::api::ingress::RateLimiter::default()),
+        builder: Arc::new(crate::builder::Builder::default()),
     }
 }
 

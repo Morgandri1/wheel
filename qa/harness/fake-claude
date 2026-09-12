@@ -567,9 +567,13 @@ def respond(user_text, turn, session_id, model, stream, partial=False):
     else:
         reply = "[fake-claude] turn %d: %s" % (turn, (user_text or "").strip())
     reply = DIRECTIVE.sub("", reply).strip()
-    if "BOARD" in d:
+    # Either the directive or the steering value. The env/config form exists because a caller may
+    # ESCAPE the text it sends -- the engine's builder route frames user turns, so `<<FAKE:BOARD>>`
+    # arrives as inert text -- and a test of that route still has to be able to ask for a board.
+    wanted = d.get("BOARD", fake_opt("WHEEL_FAKE_BOARD", "board"))
+    if wanted is not None:
         try:
-            count = int(d["BOARD"] or 1)
+            count = int(wanted or 1)
         except ValueError:
             count = 1
         reply = reply + "\n" + builder_boards(count)
