@@ -281,8 +281,15 @@ impl Supervisor {
                 } else {
                     0
                 };
-                // Only for a failure nothing could read: a classified one is
-                // already bounded by the token's own remaining life.
+                // `ambiguous` now has two sources (ADVERSARY, #72 round 2):
+                // a CLI failure nothing could read (the original case here),
+                // and, since Round 3, a `check_refresh` content rejection
+                // that isn't identity/grant-narrowing (`RefreshRejected::
+                // is_permanent` false). Both are capped by the SAME budget
+                // below -- unlike a failure `classify_refresh_failure` could
+                // actually read (a 503, say), which is retried for as long as
+                // the token stays usable instead, per the `usable` check
+                // further down.
                 if !failure.permanent && tries >= self.broker.max_attempts {
                     failure.permanent = true;
                     failure.reason = format!(
