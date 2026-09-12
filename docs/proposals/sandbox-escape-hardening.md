@@ -36,74 +36,145 @@ same question on this deployment**, because of which container topology `wheeld`
 Everything below is measured against `main`/`dev` as of this commit, with `file:line`, the same
 discipline `script-execution-scope.md` used.
 
-## The framing question this has to answer before the numbers mean anything (ADVERSARY)
+## The framing question this has to answer before the numbers mean anything (ADVERSARY, expanded per PM)
 
-Wheel has two deployment topologies, and they are not equally isolated today:
+Wheel has **three** deployment shapes worth costing separately, not two, and — the finding that
+reshapes this whole document — **they are not equally isolated today, in ways that run in opposite
+directions from what their other tradeoffs suggest.**
 
-- **`wheel-host` + `DockerSandbox`** (the cloud, multi-tenant deployment, §5b) already runs **one
-  container per project** (`crates/wheel-host/src/sandbox/docker.rs`). Escape-hardening this one is
-  close to a pure "hard config" job: a given project's container is already its own isolation unit,
-  so `cap_drop`/`no-new-privileges`/a stronger runtime (gVisor/Firecracker, see below) each apply
-  per-project automatically, for free, because the boundary they'd reinforce already exists at the
-  right granularity.
-- **`wheeld`** (the VPS/self-hosted deployment — `infra/vps/compose.yml`, the actual container
-  Morgan audited, `wheel-wheeld-1`) is a **single process, single container, running every
-  project's engine and every project's agent children together**, all as the same uid (10001),
-  sharing one filesystem and one kernel namespace. Confirmed independently by both ADVERSARY and
-  me: `crates/wheeld/src/embedded.rs` has no `setuid`, `unshare`, or any privilege-dropping call
-  anywhere — `EmbeddedSandbox` spawns each project's engine as a plain `tokio::spawn` task in the
-  SAME process (§ "Isolation gap" in `script-execution-scope.md`'s §0 table already says as much
-  for per-node; this is the same absence one level up, at per-PROJECT granularity, which nothing
-  else in the codebase currently states this plainly). **There is no isolation unit smaller than
-  "the whole `wheeld` container" today, at all** — not per-project, let alone per-node.
+### Shape 1 — `wheeld` in Docker (live today, `wheel-wheeld-1`)
 
-That absence means the compose-level hardening in §§1–2 below (what ships in this PR) raises the
-cost of escaping `wheeld`'s ONE container to the host. It does **nothing** for project-to-project
-reach *within* that container, because there is no boundary there for `cap_drop`/AppArmor/a
-stronger runtime to reinforce — an attacker with code execution in project A's agent reads project
-B's `/data/projects/B/...` over an ordinary file read, same uid, same mount namespace, no escape of
-any kind required. This is true **regardless of whether §§5–6 (userns-remap, read-only rootfs) or
-gVisor/Firecracker ship** — every one of those hardens the same single boundary, and project B is
-inside it exactly as much as project A is.
+A **single container, single process**, running every project's engine and every project's agent
+children together, all as the same uid (10001), sharing one filesystem and one kernel namespace.
+Confirmed independently by ADVERSARY and me: `crates/wheeld/src/embedded.rs` has no `setuid`,
+`unshare`, or any privilege-dropping call anywhere — `EmbeddedSandbox` spawns each project's engine
+as a plain `tokio::spawn` task in the SAME process. **There is no isolation unit smaller than "the
+whole `wheeld` container" today, at all** — not per-project, let alone per-node.
 
-**So the actual decision is not "which sandboxing technology" — it is which of two architectures
-`wheeld` is:**
+- **Escape-to-host protection:** a real container boundary (pid namespace, network namespace, mount
+  namespace) exists, and §§1–2 below (this PR) harden it further (`cap_drop`, `no-new-privileges`).
+  Still weak in absolute terms — no AppArmor confirmed (§4), no userns-remap (§5) — but a genuine
+  namespace boundary is there to harden.
+- **Project-to-project isolation:** **zero.** An attacker with code execution in project A's agent
+  reads project B's `/data/projects/B/...` over an ordinary file read — same uid, same mount
+  namespace, no escape required. §§1–2/5–6 below harden the container's OUTER boundary; none of
+  them create an inner one, so project B is exactly as reachable after every item in this document
+  ships as before.
+- **gVisor/Firecracker:** applies cleanly — wrap the one container, drop-in via `--runtime=runsc`
+  or a `firecracker-containerd`/Kata shim. Raises the cost of a host escape. Does nothing for
+  project-to-project reach, for the same reason as above: one sandboxed container is still one
+  shared namespace for every project inside it.
 
-- **Option A — harden the one container.** Everything in §§1–2, 4–6 below, plus optionally
-  wrapping the whole `wheeld` container in gVisor/Firecracker. Materially raises the cost of a
-  VPS-host escape. Does not touch project-to-project reach; that stays exactly as open as it is
-  today, at every layer of hardening this option can add.
-- **Option B — `wheeld` becomes a supervisor of per-project sandboxes**, structurally the same
-  shape `wheel-host` already is. This is NOT a small change: `wheeld` would move from "one process
-  hosting every engine as an async task" to "one process that spawns and supervises N sandboxed
-  children," which is a different architecture, not a config flag. The good news: **this
-  mechanism already exists and is already tested** — `wheel-host`'s `process` sandbox backend
-  (`crates/wheel-host/src/sandbox/process.rs`) does real per-project `setuid`/`setgid` via
-  `pre_exec` (`drop_privileges`, line 231/395 — `libc::setuid`, `setgid` before `setuid`,
-  `setgroups([])`, `no_new_privs`), allocates a distinct uid range per project (`allocate_uid`),
-  and is covered by its own test suite. The natural shape of Option B is **converging `wheeld` on
-  that existing backend** rather than inventing a second, parallel isolation mechanism — `wheeld`
-  already proxies each project over a unix socket the same way `wheel-host` does
-  (`crates/wheeld/src/embedded.rs`'s own doc comment: "the host still proxies over a unix socket
-  per project, so the API's engine proxy and events bridge run exactly the code they run in
-  production"), so the control-plane side of this is already shared; what's missing is the process
-  boundary underneath it. Under Option B, gVisor/Firecracker would wrap EACH per-project sandbox,
-  which is where a stronger-than-namespaces runtime actually buys project-to-project isolation, not
-  just VPS-host escape resistance.
+### Shape 2 — `wheeld` native via systemd (PR #67, `api/wheeld-production`, **open, not merged, not deployed**)
 
-**Not deciding between them here.** Option A is what this PR ships (it is strictly good regardless
-of which way B goes, and costs little). Option B is a real project, sized closer to a milestone
-than a hardening pass, and the deciding fact is one this document does not have: whether a given
-`wheeld` deployment is actually single-tenant. It is NOT single-tenant by construction — `WHEEL_
-SIGNUP=open` (`infra/vps/compose.yml`'s own comment: "lets anyone who reaches this server create an
-account and run agents on it") lets any number of distinct people sign up, and even under the
-`closed` default the owner can add more accounts via `POST /v1/auth/users` (`docs/API.md`). So
-"every project belongs to the same person" is a fact about how a *specific* deployment is being
-used, not a guarantee this codebase makes — project-to-project reach on a `WHEEL_SIGNUP=open` (or
-multi-account `closed`) `wheeld` is a genuine cross-TENANT confidentiality breach, not a
-self-inflicted one. Whether that risk is acceptable for THIS deployment, and therefore whether
-Option B is worth its cost, is Morgan's call to make with that fact in hand — not mine to assume
-away.
+Morgan's separate, live directive — *"i'd rather use that than docker… going forward i'd like the
+default to be wheeld [native]"* — proposes making this the **default production deployment**,
+Docker demoted to a supported alternative. That PR's own hardening work is extensive and already
+measured (not re-derived here — citing rather than duplicating):
+
+- **Accepted directives** (`wheeld.service`): `NoNewPrivileges`, `ProtectSystem=strict`,
+  `ProtectHome=yes`, `PrivateTmp`, `ProtectKernelTunables/Modules/ControlGroups`, `RestrictSUIDSGID`,
+  `LockPersonality`, `ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `RestrictRealtime`,
+  empty `CapabilityBoundingSet=`/`AmbientCapabilities=`, `RestrictAddressFamilies=` (keeping
+  `AF_NETLINK` — dropping it silently breaks `ss`, which the kit's own readiness check depends on),
+  `ProtectProc=invisible`, `PrivateDevices`, `PrivateMounts`, `LimitCORE=0`.
+- **Rejected, each with a measurement, not an opinion** (this is the "several standard restrictions
+  break things agents need" PM referenced): `SystemCallFilter=@system-service` (denies `@mount` —
+  breaks `bwrap`/Chromium/rootless-container tooling an agent doing browser QA needs; only
+  `wheel-web.service`, a single known Node program, gets it), `RestrictNamespaces=` (breaks
+  `unshare` outright — Chromium, `bwrap`, rootless Podman all need user/mount/pid namespaces),
+  `ProcSubset=pid` (hides `/proc/meminfo`/`/proc/cpuinfo` — build tools size parallelism from
+  those, breakage is silent and reads as "the model seems dumber"), `LimitNPROC=` (counted per
+  **real uid system-wide**, not per cgroup — every agent shares uid `wheel`, so it counts the wrong
+  population; `TasksMax=` on the cgroup is the correct tool and is used instead).
+- **Resource limits genuinely gained**, real and stated: `OOMPolicy=continue` (default `stop` would
+  take down `wheeld` — and every other project's agents with it — the instant any one agent is
+  OOM-killed), `MemoryMax=2.8G`/`MemoryHigh=2G`/`MemorySwapMax=1G`, `TasksMax=4096`, `CPUQuota=150%`
+  reserving headroom so an agent cannot take `sshd` down with it. **None of this exists on the
+  Docker deployment today** — `infra/vps/compose.yml` sets no `mem_limit`/`pids_limit`/`cpus` at
+  all, so Shape 2 is a strict resource-limit upgrade over Shape 1 as currently deployed.
+- **What #67's own §9 states is genuinely LOST versus Shape 1, in its own words**: *"No pid
+  namespace… an agent sees… every other project's agents, their full command lines, and `wheeld`
+  itself — and it can signal them."* *"No network namespace… an agent shares the host's network
+  stack, so it reaches every service bound to `127.0.0.1`."* *"A weaker filesystem boundary than a
+  container's, in one direction… `ProtectSystem=strict` makes the host read-only, not invisible."*
+  And, load-bearing for THIS document specifically: *"The declared 'laptop mode' safety rail does
+  not engage"* — `PROTOCOL.md` says shared-uid mode must warn loudly and refuse a second project,
+  and `wheeld` does neither, in Docker OR native — a real contract/code discrepancy (#67's follow-up
+  F5), not something Shape 2 introduces, but something Shape 2's promotion to default makes matter
+  more.
+- **Project-to-project isolation: also zero**, and by #67's own honest accounting, WORSE than Shape
+  1's zero — Shape 1 at least confines the blast radius of "sees and can signal every process" to
+  one container's pid namespace; Shape 2 has no pid namespace at all, so that blast radius is the
+  whole host.
+- **gVisor/Firecracker: structurally does not apply, and adopting either would partially undo
+  "native."** Both are container/VM runtimes — something has to hand them a container or a VM
+  boundary to enforce. A bare `systemd` unit running a process tree is neither. Wrapping `wheeld`
+  itself in a gVisor/Firecracker sandbox to get this protection back would mean running it as (or
+  inside) a container again — which is most of what "go native" was for. This is not a cost line in
+  a table; it is a **structural incompatibility** between Shape 2 as designed and "wrap execution in
+  a stronger-than-namespaces sandbox" as a mitigation. Worth stating plainly rather than leaving a
+  blank cell that reads as "not costed yet."
+
+### Shape 3 — `wheeld` converges on `wheel-host`'s per-project sandbox architecture (hypothetical)
+
+Formerly "Option B" in this document's first draft. `wheeld` moves from "one process hosting every
+engine as an async task" to "a supervisor that spawns and isolates one sandbox per project" —
+structurally what `wheel-host` already is. **Not a config flag; a real architecture change,** sized
+closer to a milestone than a hardening pass. The mechanism is not new to invent, though: `wheel-
+host`'s `process` sandbox backend (`crates/wheel-host/src/sandbox/process.rs`) already does real
+per-project `setuid`/`setgid` via `pre_exec` (`drop_privileges`: `setgroups([])` → `setgid` →
+`setuid` → `no_new_privs`, in that order — the same order #67's own `NoNewPrivileges=` reasoning
+independently arrives at for a different mechanism), allocates a distinct uid range per project
+(`allocate_uid`), and is covered by its own tested suite. `wheeld` already proxies each project over
+a unix socket the same way `wheel-host` does (`crates/wheeld/src/embedded.rs`'s own doc comment:
+"the host still proxies over a unix socket per project, so the API's engine proxy and events bridge
+run exactly the code they run in production") — the control-plane side is already shared; what's
+missing is the process/container boundary underneath it.
+
+- **Escape-to-host protection:** whatever the per-project sandbox choice earns — Shape 1's Docker
+  container hardening, Shape 2's systemd directives applied per-project instead of once, or a
+  stronger runtime (below) — but now earned N times, once per project, rather than once for the
+  whole box.
+- **Project-to-project isolation: real, for the first time in any shape.** A distinct uid per
+  project, ideally a distinct sandbox (container or systemd scope) per project, closes the "ordinary
+  file read across projects" path that Shapes 1 and 2 both leave open.
+- **gVisor/Firecracker: this is the ONLY shape where either technology buys project-to-project
+  isolation, not just host-escape resistance** — wrapping each per-project sandbox, exactly as this
+  document's original costing (below) described. It is also the only shape where the technology
+  choice compounds per project: N parked-agent populations, each independently paying whichever
+  runtime's per-sandbox resume cost, not one payment for the whole box.
+
+### The tension Morgan should see stated, not discover after (PM's ask, directly)
+
+**PR #67 and "sandbox escape prevention is paramount" pull in opposite directions on ONE specific
+axis, and agree on another.** They agree that Shape 1 as currently deployed is under-hardened (no
+resource limits at all; #67's own §1 says so) and that both proposals' compose/systemd-level
+hardening are real, cheap wins worth taking regardless of which shape wins. They disagree on the
+namespace question: promoting Shape 2 to the default, as #67 proposes, is **a downgrade on the
+escape-to-host axis specifically** — trading a real pid/network/mount namespace boundary (Shape 1)
+for systemd directives that recover most of the filesystem story and, by #67's OWN admission, none
+of the process-visibility or network-reachability story. It is simultaneously an upgrade on other
+axes that matter (resource limits that prevent one agent from taking the whole box down; a cleaner,
+measured, honestly-scored hardening posture; less operational surprise from Docker's iptables
+interaction with `ufw`). And it forecloses gVisor/Firecracker as an escape-hardening path outright,
+structurally, not as a matter of cost.
+
+**If "sandbox escape prevention is paramount" is the standing priority, Shape 2 becoming the
+default is a decision that trades away part of what that priority is asking for, in exchange for
+real gains on a different axis (resource limits, operational clarity).** That may still be the
+right call — a systemd-confined process with real resource limits and no runaway-agent blast radius
+is a legitimate, defensible posture, and #67's own measurement discipline is exactly what this
+document has been asking for throughout. But it is Morgan's tradeoff to make with the axis named,
+not one that should get decided by which PR merges first while the other is mid-review. **Recommend
+against merging either #67 (promoting Shape 2 to default) or a Shape-3 commitment until this
+specific question — does the default deployment keep a namespace boundary, and is that boundary
+worth more than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
+
+Shape 1's compose hardening (§§1–2 below) is a different decision: it improves Shape 1 without
+foreclosing anything, costs little, and is worth shipping regardless of which shape ends up
+default. That is why it proceeds in this PR while the shape question stays open, per PM's explicit
+instruction not to pause it.
 
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
@@ -290,18 +361,18 @@ by different mechanisms. Neither has been benchmarked against Wheel's actual wor
 document — the figures below are the mechanisms' own published characteristics, presented so Morgan
 can weigh them against what Wheel needs, not a substitute for a real spike if either is chosen.
 
-**Which topology this table is costing, tying back to the framing question above:** the
-integration story below (`--runtime=runsc`, `HostConfig.Runtime`) is written against
-`wheel-host`'s `DockerSandbox` — which already runs one container per project, so gVisor/Firecracker
-slot in per-project for free there, under EITHER option. Applied to `wheeld` as it exists today
-(Option A, the one container), either technology would wrap the SINGLE `wheeld` container and
-raise the cost of a VPS-host escape — it would do nothing for project-to-project reach, for the
-same reason §§1–2/5–6 don't: there is no per-project boundary inside that container for a stronger
-runtime to reinforce. Getting project-to-project isolation from either technology on `wheeld`
-specifically requires Option B first (a sandbox per project) — the runtime choice below then
-applies to EACH of those, which is exactly where the startup-latency number in this table starts
-compounding: N parked agents across N projects each paying gVisor/Firecracker's per-sandbox resume
-cost independently, not once.
+**Which shape this table is costing, tying back to the three shapes above:** the integration story
+below (`--runtime=runsc`, `HostConfig.Runtime`) is written against `wheel-host`'s `DockerSandbox`,
+which already runs one container per project — this table applies to it directly, and to Shape 3
+(each per-project sandbox gets wrapped the same way). Applied to Shape 1 (`wheeld`'s one container
+as it exists today), either technology wraps that SINGLE container: raises the cost of a VPS-host
+escape, does nothing for project-to-project reach, for the same reason §§1–2/5–6 don't — no
+per-project boundary exists inside it for a stronger runtime to reinforce. **Does not apply to
+Shape 2 at all** — native systemd has no container/VM boundary to hand either runtime, and
+retrofitting one would mean partially reversing what "native" was for (§ Shape 2 above). Under
+Shape 3 specifically, the startup-latency number below starts compounding: N parked agents across N
+projects each paying gVisor/Firecracker's per-sandbox resume cost independently, not once for the
+whole box.
 
 **Why startup latency and memory are the two numbers that matter here, specifically:** Wheel's
 whole compute-cost story is idle parking (§3c#14) — an agent's process stops after
@@ -337,20 +408,29 @@ answered first, before any integration work.
 
 ## Summary — what's asked of whoever reads this next
 
-- **The framing question, first**: is `wheeld` staying "one hardened container" (Option A) or
-  becoming "a supervisor of per-project sandboxes" (Option B, converging on `wheel-host`'s existing
-  `process` backend)? Everything else here is Option A — real, worth shipping, but it does not
-  touch project-to-project reach, which is currently unbounded on any `wheeld` deployment with more
-  than one tenant. This is the one decision that changes the shape of the rest of the work, not
-  just its size.
-- Items 1–3: code changes exist (this PR + #83). **Needs a `rehearse.sh` run with docker access**
-  before merge — not yet done, called out explicitly above rather than assumed.
+- **The shape question, first, and it now has three answers instead of two**: Shape 1 (`wheeld` in
+  Docker, live today), Shape 2 (`wheeld` native via systemd, PR #67, proposed as the new default),
+  or Shape 3 (`wheeld` as a per-project sandbox supervisor, converging on `wheel-host`'s existing
+  `process` backend — hypothetical, unbuilt). Shapes 1 and 2 both leave project-to-project reach
+  completely open; Shape 2 is honestly worse on that specific axis (no pid namespace at all) while
+  gaining real resource-limit protection Shape 1 lacks entirely today. Shape 3 is the only one where
+  gVisor/Firecracker or per-project uid isolation actually closes project-to-project reach — and the
+  only one not yet started. **This is the decision everything else's shape depends on, and #67 (push
+  Shape 2 to default) and "sandbox escape prevention is paramount" are in real tension on the
+  namespace question specifically** — see the dedicated section above. Recommend Morgan decide this
+  explicitly before either #67 merges or Shape 3 work starts, rather than have it settled by
+  whichever ships first.
+- Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83), proceeding regardless
+  of the shape decision per PM's instruction not to pause them. **Needs a `rehearse.sh` run with
+  docker access** before merge — not yet done, called out explicitly above rather than assumed.
 - Item 4: needs someone with production shell access to run the two `docker inspect`/`/proc`
   commands above against `wheel-wheeld-1` and record the actual result.
 - Items 5–6: proposed, not implemented, with the specific breakage each would need to survive
-  (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved. Both are Option-A
-  shaped — they harden the single container, not project-to-project reach within it.
-- The real boundary: gVisor vs. Firecracker costed above, explicitly tied to which option they're
-  wrapping — for Morgan to choose between (or defer). Sandbox escape prevention is paramount, but a
-  decision this consequential and this expensive to reverse is his to make with the numbers and the
-  A/B framing in front of him, not mine to preempt.
+  (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved. Both are Shape-1
+  scoped — they harden the single container, not project-to-project reach within it, and (userns-
+  remap specifically) would need re-deriving for Shape 2, where there is no container to remap.
+- The real boundary: gVisor vs. Firecracker costed above, explicitly tied to which shape each one
+  actually wraps — applies to Shapes 1 and 3, structurally does not apply to Shape 2. For Morgan to
+  choose between (or defer). Sandbox escape prevention is paramount, but a decision this
+  consequential and this expensive to reverse is his to make with the numbers and the three-shape
+  framing in front of him, not mine to preempt.
