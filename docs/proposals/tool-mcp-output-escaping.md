@@ -1,7 +1,7 @@
 # Proposal: closing the tool/MCP output escaping gap (defect #2)
 
-Status: **draft, for ADVERSARY + PM review. No implementation until this is agreed.** Author: SDK.
-Date: 2026-09-12.
+Status: **design agreed with ADVERSARY (2026-09-12); ready to leave draft, implementation not yet
+started.** Author: SDK. Date: 2026-09-12.
 
 PM/ADVERSARY flagged: tool and MCP results reach the model **unwrapped**, while in-domain messages
 (the `<AgentPrompt>` channel) are escaped — backwards, given that a tool result can carry content from
@@ -101,82 +101,129 @@ Simplest to implement — one call, already-reviewed function, already tested ag
 attack shapes. **Rejected**: §3 is not a corner case for this project specifically; it is the failure
 mode with the highest probability of firing, on the exact team using this software to build itself.
 
-### (b) A distinct, non-mutating delimiter around tool/MCP output
+### (b) A distinct delimiter around tool/MCP output, self-escaping on its OWN marker
 
-Wrap the *entire* tool-result text in an unambiguous marker that tells the model "the following is
-returned data, not engine framing" — without altering a single byte of the payload itself. E.g. (shape
-only, not proposing exact syntax here):
+**Decided, per ADVERSARY's Q1 answer (2026-09-12): not fully non-mutating.** Wrap the tool-result text
+in an unambiguous marker that tells the model "the following is returned data, not engine framing", and
+apply the *same* narrow-escape trick `escape_envelope_body` uses for `AgentPrompt` — backslash-insert on
+a literal, case-insensitive occurrence of the marker's own tag name, open or close — to the payload
+before wrapping it:
 
 ```
 <wheel:tool-output>
-...verbatim body, byte-for-byte...
+...body, with any literal "<wheel:tool-output" or "</wheel:tool-output" backslash-escaped...
 </wheel:tool-output>
 ```
 
-This preserves byte-for-byte fidelity (no corruption of legitimate content, `wheel inbox`'s
-sha256-original contract is untouched, a script's output that must be re-submitted elsewhere survives
-intact) while giving the model an explicit boundary to reason about. Cost: it is a **prompt-level**
-mitigation, not a structural one — same caveat finding 001 already recorded for literal opening tags
-inside an escaped message body ("a strict machine parser is unaffected... but agents are LLMs reading
-text — an inner literal opening tag could still socially-engineer the model"). A wrapper reduces the
-odds of confusion; it cannot make forgery structurally impossible the way escaping the close tag did
-for the stdin channel, because nothing here is being *parsed* as a boundary by anything other than the
-model itself.
+A fully non-mutating wrapper (the earlier draft of this section) reopens finding 001's original hole one
+level down: attacker-controlled tool output containing a forged **closing** marker lets it "break out" of
+the wrapper from the model's perspective, exactly as an unescaped `</AgentPrompt>` would have for the
+stdin channel. Self-escaping on the marker closes that the same structural way finding 001 closed it for
+messages.
+
+This does **not** reintroduce §3's corruption problem, because it does not key on anything this
+project's own content plausibly contains: nobody's legitimate tool output or script stdout is going to
+contain the literal string `wheel:tool-output` the way this repository's own docs constantly contain
+`AgentPrompt`. Pick a marker namespaced enough that natural collision stays implausible — a `wheel:`
+prefix is enough on its own, and scoping it further (e.g. including the tool/script node's own name) is
+available if a namespace collision is ever observed in practice.
+
+Residual, same as finding 001 recorded for a literal *opening* tag inside an escaped message body: this
+is a **prompt-level** signal, not a structural guarantee against a sufficiently convincing forged
+`<wheel:tool-output>` **opening** marker inside the payload — nothing here parses the payload as a
+boundary except the model itself, so an opening-tag-shaped confusion is reduced, not eliminated, by the
+wrapper's presence. Escaping the close tag removes the "break out and keep going as if this were a new
+message" attack; it does not remove all social-engineering surface, the same residual finding 001 already
+accepted for the message channel.
 
 ### (c) Per-source handling: mutate what has a source of truth, wrap what doesn't
 
 Split by whether the content has a byte-identical fallback elsewhere:
 
-- **`ctx`/`table` reads** (board-authored; another wire-gated agent or the operator wrote it) — these
-  are the same trust tier as a message body, so apply the **same** `escape_envelope_body` treatment
-  message delivery already gets, accepting the identical, already-adversary-reviewed trade-off. This
-  directly closes the asymmetry PM/ADVERSARY named. It reintroduces §3's corruption risk for this one
-  category, which must be called out explicitly in PROTOCOL.md and the CLI's own help text ("a value
-  containing a literal `<AgentPrompt` tag is altered when read back") rather than discovered by an
-  agent debugging a mismatched string.
+- **`ctx` reads** (board-authored; another wire-gated agent or the operator wrote it) — apply the
+  **same** `escape_envelope_body` treatment message delivery already gets. This is not only the
+  consistency argument (same trust tier as a message body); per ADVERSARY's review, `ctx` is a
+  **stronger** case for escaping than the message channel that originally justified
+  `escape_envelope_body`. A forged tag in a message body is live for one delivered turn. A forged tag in
+  `ctx` becomes **system-prompt content**, re-injected on every start and every context-clear, for every
+  agent wired to that `ctx` (§3: "ctx → agent: INJECTION"), until someone rewrites it — categorically
+  higher persistence and leverage than what finding 001 was originally scoped against. `ctx` stands on
+  its own here; it does not need the consistency argument to justify escaping it.
+- **`table` reads** — same treatment as `ctx`, for the consistency argument (same trust tier as a
+  message body — another wire-gated agent or the operator wrote it), though without `ctx`'s injection
+  amplification: a table row is read on demand, not auto-injected into every start.
+- Both reintroduce §3's corruption risk for `ctx`/`table` specifically, which must be called out
+  explicitly in PROTOCOL.md and the CLI's own help text ("a value containing a literal `<AgentPrompt`
+  tag is altered when read back") alongside the persistence rationale above, rather than discovered by
+  an agent debugging a mismatched string.
 - **`tool` node HTTP results and `wheel run <script>` output** (origin outside the board's own wire
   graph — the external endpoint, or whatever the script fetched) — wrap per (b) instead of mutating.
   This is both the highest-value target (real indirect prompt injection, not a hypothetical) and the
   worst place to silently rewrite bytes: a script or a follow-up tool call may need to re-emit or hash
   what a prior call returned, and SSRF/allowlist defenses (§3d, findings 004/045/046/047) already treat
-  this data as adversarial without needing to also mangle it to prove the point.
-- **`wheel inbox <id>`** — left exactly as it is. The contract already fixes its shape (§3c#3: bytes and
-  sha256 are of the *original*), and that invariant is tested (`inbox_returns_original_bytes_lossless`
-  per finding 001's addendum). Wrapping the *rendered* text non-destructively is compatible with that
-  invariant (the wrapper markers are not part of the recorded body or its hash); escaping it is not.
-  Recommendation: wrap it too, for the same reason as (b) above, since a re-read historical message is
-  exactly as capable of carrying a forged tag as a live one.
-- **`wheel run <script>` node config/source** is board-authored (like ctx/table) but its *output* can
+  this data as adversarial without needing to also mangle it to prove the point. **Wrapping is
+  unconditional** — every script's stdout, not only scripts a config flag marks as fetching external
+  content. A boolean "this script fetches external content" flag is a value someone has to remember to
+  update, with no enforcement that it stays true once a `may_place` agent edits the script's `source`
+  (§3e `update`); a flag that silently goes stale fails *open* (unwrapped — exactly the case being
+  closed), and wrapping is cheap enough that there is no real cost worth trading for that failure mode.
+- **`wheel inbox <id>`** — left exactly as it is: the contract already fixes its shape (§3c#3: bytes and
+  sha256 are of the *original*), and that invariant is tested
+  (`inbox_returns_original_bytes_lossless` per finding 001's addendum). Wrapping the *rendered* text per
+  (b) is compatible with that invariant (the wrapper markers are not part of the recorded body or its
+  hash); escaping it is not. Wrapped, for the same reason as `tool`/`script` output: a re-read historical
+  message is exactly as capable of carrying a forged tag as a live one.
+- **`wheel run <script>` node config/source** is board-authored (like `ctx`/`table`) but its *output* can
   carry runtime-fetched content — treat the **output** as external-origin (wrap), not board-authored
   (mutate), regardless of where the script itself came from.
 
-**Recommendation: (c).** It is the only option that (i) closes the gap for the two sources that
-actually matter for injection risk — external tool calls and re-read messages — (ii) does not silently
-corrupt the one category of content this team will read back constantly and cannot route around
-(`ctx`/`table`, unless explicitly warned), and (iii) does not conflict with `wheel inbox`'s existing,
-tested byte-identity contract. The cost is two code paths instead of one, and a PROTOCOL.md sentence
-that has to be precise about which read is which.
+**Recommendation: (c), agreed with ADVERSARY.** It is the only option that (i) closes the gap for the
+sources that actually matter for injection risk — external tool calls, script output, and re-read
+messages — (ii) does not silently corrupt the one category of content this team will read back
+constantly and cannot route around (`ctx`/`table`, unless explicitly warned, and `ctx` carries the
+strongest independent case of anything in this table), and (iii) does not conflict with `wheel inbox`'s
+existing, tested byte-identity contract. The cost is two code paths instead of one, and a PROTOCOL.md
+passage that has to be precise about which read is which and why.
 
 ## 5. What is explicitly out of scope here
 
 - An agent's own attached third-party `mcp` node (§3 "MCP server is attached to the agent's harness
   config at next start") is a **direct** connection between the harness and that server — Wheel does
   not proxy those results at all, so nothing here can wrap or escape them without turning every `mcp`
-  node into a proxied one, which is a materially bigger change than defect #2 asks for. Worth its own
-  finding if ADVERSARY wants to open one; not folded into this proposal.
+  node into a proxied one, which is a materially bigger change than defect #2 asks for. ADVERSARY agreed
+  this scoping is correct for this proposal and opened `redteam/findings/053` to track it formally
+  (Medium, not blocking #2): an `mcp` node calling the same external endpoint a `tool` node would call
+  gets *less* protection than the `tool` node — no SSRF gate beyond finding 005's ask, and no wrapping
+  even after this proposal ships. Not folded into this proposal; tracked separately.
 - Where exactly the (b)/(c) transform lives (a shared helper in `wheel-engine`'s `/v1/cli/*` response
   construction vs. a `wheel-core` function both `mcp.rs` and `main.rs` call) is an implementation
   question for the follow-up PR, not this proposal — but per §1, it must be **one** implementation the
   two renderers share, not two.
 
-## 6. Open questions for ADVERSARY/PM before this leaves draft
+## 6. Resolution log (ADVERSARY review, 2026-09-12)
 
-1. Does (c)'s wrapper syntax need to be something more specific than illustrated in §4(b), e.g. reusing
-   a marker ADVERSARY already has an opinion on from a prior finding?
-2. Is escaping `ctx`/`table` reads (accepting the corruption trade-off, documented) the right call, or
-   would ADVERSARY prefer wrapping there too and living with the residual (b)-style risk instead of any
-   corruption at all? This is the crux of the proposal and the one place I'd most like a second opinion
-   before writing the PR.
-3. Should `wheel run <script>` STDOUT be wrapped unconditionally, or only when the script node's config
-   marks it as fetching external content — the latter avoids wrapping overhead on purely
-   board-internal scripts, at the cost of a config field nothing currently needs.
+Verified independently before answering: `escape_envelope_body` still has exactly one production call
+site on `main` (`message.rs:293`, `Message::envelope()`), and `mcp.rs::render()` (line 197) passes a
+string/object `value` through verbatim — both match §1's claims.
+
+1. **Wrapper syntax** — resolved: self-escaping on the marker's own tag name (§4b), not fully
+   non-mutating. A fully non-mutating wrapper reopens finding 001's hole one level down (a forged
+   closing marker lets attacker content "break out" of the wrapper); escaping `<wheel:tool-output`/
+   `</wheel:tool-output` the same way `escape_envelope_body` escapes `AgentPrompt` closes that, and does
+   not reintroduce §3's corruption problem because nothing legitimate plausibly contains that string the
+   way this repo's docs contain `AgentPrompt`.
+2. **Escape `ctx`/`table`, or wrap everything and accept residual risk there too** — resolved: escape
+   `ctx`/`table` (§4c). `ctx` turned out to have an independent, stronger justification than the
+   consistency argument this proposal originally made: a forged tag there becomes system-prompt content
+   re-injected on every start/context-clear for every wired agent, which is categorically higher
+   persistence than the message channel finding 001 was scoped against. `table` still rests on the
+   consistency argument alone (read on demand, no injection amplification).
+3. **`wheel run <script>` stdout: unconditional wrapping or config-gated** — resolved: unconditional. A
+   flag marking a script as "fetches external content" is a value that can silently go stale once a
+   `may_place` agent edits the script's `source` (§3e), and a stale flag fails *open* (unwrapped) —
+   wrapping is cheap enough that trading it for that failure mode isn't worth it.
+
+**Design agreed.** Remaining before implementation: fold §4(b)'s self-escaping detail into the PR itself
+(no further doc revision required per ADVERSARY — "your call whether that needs a doc revision first or
+can be decided in the implementation PR"; folded in above since it changes the shape of what gets built).
+Related, tracked separately, not blocking: `redteam/findings/053` (§5).
