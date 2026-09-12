@@ -426,19 +426,45 @@ cost.
 | **Steady-state overhead** | Syscall-heavy workloads (lots of small I/O) see the most cost — often cited as a meaningful hit on syscall-bound throughput; CPU-bound work (a `cargo build` mostly compiling) is much less affected, since compute itself isn't intercepted | Near-native once running — the guest has its own real kernel, so steady-state syscall cost is not the concern the way it is for gVisor; the cost is entirely at boot and in per-VM fixed memory |
 | **Operational maturity for THIS shape of workload** | Used in production by GKE Sandbox / Cloud Run for exactly this "many short-lived, frequently-recycled sandboxes" shape | Used in production by AWS Lambda / Fargate for the same shape, but typically inside AWS's own bare-metal fleet with guaranteed KVM access — the VPS-generic deployment target is the less-proven case for it specifically |
 
-**Reading this for Wheel:** gVisor is the cheaper integration (a runtime flag, no new control
-plane, no host virtualization requirement) and its overhead profile fits a `cargo build`-shaped,
-CPU-bound agent workload better than a syscall-throughput-bound one. Firecracker is the stronger
-isolation guarantee (a real kernel boundary, not policy over a shared one) but carries a hard
-infrastructure precondition (KVM) that has not been confirmed for Wheel's actual VPS target, and a
-heavier integration lift than a runtime flag. Neither number above is measured against Wheel's own
-resume path — that is the spike I'd recommend before committing to either, not a substitute for
-picking one now.
+**A real recommendation, not a hedge — Morgan's explicit instruction: don't default toward Docker
+or the familiar option for the isolation MECHANISM specifically; say plainly if the numbers favor
+something else.** They do, directionally: **if escape prevention is genuinely paramount, Firecracker
+(via Kata) is the mechanism that actually matches that priority, and gVisor is the fallback, not the
+default.** The reasoning:
 
-**Not deciding this here — Morgan's call**, per the brief. If gVisor is the direction, the next
-step is a `runsc` spike on `infra/vps/rehearse.sh`'s stack measuring actual resume latency. If
-Firecracker/Kata, the KVM-availability question on the actual target VPS provider has to be
-answered first, before any integration work.
+- **The isolation guarantees are not the same category of thing.** gVisor's Sentry re-implements the
+  syscall surface in userspace — a smaller, more scrutable attack surface than the full Linux kernel,
+  but still a piece of software an attacker's syscalls reach directly, and it has had real sandbox-
+  escape CVEs (not hypothetical — this is the mechanism's own track record, the reason "smaller
+  surface" is not "no surface"). Firecracker's boundary is genuine hardware virtualization: escaping
+  it needs a hypervisor or CPU-level vulnerability, a categorically higher bar, and it is the
+  mechanism AWS itself picked for Lambda/Fargate specifically BECAUSE the workload is "run
+  arbitrary tenant-chosen code" — which is exactly Wheel's own threat model, stated at the top of
+  this document. When the stated priority is "paramount," the stronger category of guarantee is the
+  one that priority is actually asking for.
+- **The KVM precondition is a provisioning decision, not a structural blocker.** It rules out
+  Firecracker on a VPS tier that has it disabled; it does not rule out Firecracker for Wheel, because
+  which VPS tier to deploy on is Morgan's choice to make, not a fixed constraint this document
+  inherited. Many providers offer KVM-capable tiers at a modest cost step up from the cheapest
+  shared-CPU instances. Worth confirming for whichever host is actually chosen, not worth treating as
+  disqualifying by default.
+- **The honest risk, and the one thing this recommendation is conditional on**, is resume latency —
+  Wheel's parked-agent model pays sandbox-startup cost on every wake, and Firecracker's published
+  ~125ms figure is kernel+init only, not "Wheel's engine and harness are answering." Neither number
+  in the table above is measured against Wheel's real resume path. **If a real spike shows
+  Firecracker's resume cost is unacceptable for the product's UX, gVisor is the correct fallback** —
+  cheaper integration, no KVM precondition, and a meaningfully better security posture than either
+  Shape 1's current cap-drop-only hardening or Shape 2's namespace-free systemd confinement. That
+  would be a real, evidenced reason to step down from the stronger mechanism, not a default settled
+  in advance.
+
+**Recommendation: target Firecracker/Kata for whichever of Shape 1 or Shape 3 is chosen as the
+default deployment, contingent on a `runsc`-vs-`kata` resume-latency spike on
+`infra/vps/rehearse.sh`'s stack (or its successor) deciding between them with real numbers instead of
+published ones.** Confirm KVM availability on the target host as part of scoping that spike, not as
+a reason to skip evaluating Firecracker first. This recommendation does not apply to Shape 2 at all —
+native systemd structurally cannot use either mechanism (above), which is itself one more point in
+the tension Morgan should weigh when deciding whether Shape 2 becomes the default.
 
 ## Summary — what's asked of whoever reads this next
 
@@ -464,7 +490,12 @@ answered first, before any integration work.
   scoped — they harden the single container, not project-to-project reach within it, and (userns-
   remap specifically) would need re-deriving for Shape 2, where there is no container to remap.
 - The real boundary: gVisor vs. Firecracker costed above, explicitly tied to which shape each one
-  actually wraps — applies to Shapes 1 and 3, structurally does not apply to Shape 2. For Morgan to
-  choose between (or defer). Sandbox escape prevention is paramount, but a decision this
-  consequential and this expensive to reverse is his to make with the numbers and the three-shape
-  framing in front of him, not mine to preempt.
+  actually wraps — applies to Shapes 1 and 3, structurally does not apply to Shape 2. **Actual
+  recommendation, per Morgan's own instruction not to hedge toward the familiar option: target
+  Firecracker/Kata, gVisor as the evidenced fallback if a real resume-latency spike rules it out.**
+  Firecracker's hardware-virtualization boundary is the category of guarantee "paramount" is asking
+  for; gVisor's syscall-interception layer is real but has its own CVE history, a smaller surface
+  than the shared kernel and not a categorically different kind of boundary. The one open input is
+  measured resume latency against Wheel's actual engine+harness startup, not published kernel-boot
+  numbers — that spike, plus confirming KVM on whichever host is chosen, is what should decide
+  between them, not a default settled here.
