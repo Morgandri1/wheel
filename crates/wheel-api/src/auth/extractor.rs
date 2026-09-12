@@ -128,9 +128,29 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        // Proxy-header auth carries no token at all: the proxy authenticated the user and names
-        // them in a header. Checked first, because in that mode a bearer token is not the
-        // credential and must not be treated as one.
+        let presented = token_from_parts(parts, state);
+
+        // API tokens first, and before the proxy-header branch below.
+        //
+        // A `wht_` token is *this API's own* credential, whichever provider signs sessions, so a
+        // desktop client authenticates the same way against a laptop and against the cloud. It has
+        // to keep working under every mode — including proxy-header auth, where there is otherwise
+        // no bearer token at all and an earlier version of this function returned before ever
+        // looking. That made `wheeld token` useless on a proxy-authenticated deployment: the one
+        // credential an operator can use from a script.
+        if let Some(token) = presented.as_deref() {
+            if crate::auth::api_token::is_api_token(token) {
+                let v = crate::auth::api_token::verify(&state.db, token).await?;
+                return Ok(AuthUser {
+                    user_id: v.user_id,
+                    credential: Credential::ApiToken(v.token_id),
+                });
+            }
+        }
+
+        // Proxy-header auth carries no token: the proxy authenticated the user and names them in a
+        // header. Nothing about that assertion is verified, so the trusted-peer check is the whole
+        // control — and its absence, including when the middleware is not installed, fails closed.
         if let Some(ext) = &state.cfg.external {
             if matches!(
                 ext.verifier,
@@ -149,23 +169,13 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         }
 
-        let token = token_from_parts(parts, state)
-            .ok_or(ApiError::Unauthorized("no bearer token presented"))?;
+        let token = presented.ok_or(ApiError::Unauthorized("no bearer token presented"))?;
 
         // The providers end here, at the same user id. Everything downstream — ProjectScope above
         // all — cannot tell which one ran, which is what makes swapping them configuration rather
         // than a rewrite. A token minted by a mode we are not in fails: local sessions are HS256
-        // against our own secret, jwks tokens are RS256 against the provider's keys, external
-        // tokens are pinned to the deployer's issuer. API tokens are this API's own credential,
-        // whichever provider signs sessions, so a desktop client authenticates the same way
-        // against a laptop and against the cloud.
-        if crate::auth::api_token::is_api_token(&token) {
-            let v = crate::auth::api_token::verify(&state.db, &token).await?;
-            return Ok(AuthUser {
-                user_id: v.user_id,
-                credential: Credential::ApiToken(v.token_id),
-            });
-        }
+        // against our own secret, jwks tokens are RS256 against the provider's keys, and external
+        // tokens are pinned to the deployer's issuer.
         let (user_id, credential) = match state.cfg.auth_mode {
             crate::config::AuthMode::Local => {
                 let live = crate::auth::local::verify_session(

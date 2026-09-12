@@ -136,6 +136,18 @@ fn burn_argon2(password: &str) {
 /// be found by email *and* this value without a remote signup ever standing in for it.
 pub const TOKEN_ONLY: &str = "!token-only";
 
+/// The stored "hash" of an account provisioned by an external identity provider.
+///
+/// **Deliberately not [`TOKEN_ONLY`].** `is_token_only` means "this is the owner account `wheeld`
+/// created on first boot", and it gates `POST /v1/auth/users` and the external-identity admin
+/// routes. If an auto-provisioned external account carried the same sentinel, every user the
+/// deployer's IdP vouched for would be the operator — a privilege escalation handed out at login.
+/// A distinct value keeps the two populations distinguishable by the only thing that distinguishes
+/// them, which is what this column is for.
+///
+/// Like `TOKEN_ONLY` it is not a PHC string, so no password verifies against it.
+pub const EXTERNAL_ONLY: &str = "!external";
+
 /// A hash to verify against when the account does not exist.
 ///
 /// Skipping the hash for an unknown email makes login measurably faster for addresses that are not
@@ -169,10 +181,11 @@ pub async fn create_token_only_user(db: &Db, email: &str) -> ApiResult<User> {
 ///     account whose address an attacker can guess. The provider's claim is kept on the
 ///     `external_identities` row instead, where it is display only and is not a lookup key.
 ///
-/// The password hash is [`TOKEN_ONLY`], so no password verifies against it.
+/// The password hash is [`EXTERNAL_ONLY`], so no password verifies against it — and, critically, it
+/// is *not* the owner account's sentinel.
 pub async fn create_external_user(db: &Db) -> ApiResult<User> {
     let email = format!("external-{}@external.invalid", Uuid::new_v4());
-    insert_user(db, &email, TOKEN_ONLY).await
+    insert_user(db, &email, EXTERNAL_ONLY).await
 }
 
 pub async fn find_token_only_user(db: &Db, email: &str) -> ApiResult<Option<User>> {

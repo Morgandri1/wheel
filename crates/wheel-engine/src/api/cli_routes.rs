@@ -1005,6 +1005,69 @@ mod usage_tests {
         (id, headers)
     }
 
+    /// **The agent-token plane ignores the actor header entirely.**
+    ///
+    /// This is the rule that keeps an agent from claiming to act for a person. It matters most
+    /// under the single-uid gap (ADVERSARY 037), where an agent can read a *sibling's* token file
+    /// and send as that node: the message is then misattributed to the wrong node, which is bad —
+    /// but it carries no `on_behalf_of` at all, so it cannot be laundered into "a human asked for
+    /// this". Missing attribution rather than forged attribution, by design.
+    #[tokio::test]
+    async fn a_cli_send_can_never_assert_an_actor() {
+        let state = super::super::test_state();
+        let (from, mut headers) = agent_with_token(&state, AgentConfig::default());
+        let to = {
+            let node = Node::new(
+                uuid::Uuid::new_v4(),
+                "peer".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Agent(AgentConfig::default()),
+            );
+            let id = node.id;
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &node).unwrap();
+            crate::db::wires::add(
+                &conn,
+                &wheel_core::WireSpec {
+                    from,
+                    to: id,
+                    wire_type: wheel_core::WireType::Send,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        // A well-formed actor header, exactly as the API would set it on the control plane.
+        headers.insert(
+            "x-wheel-actor-id",
+            HeaderValue::from_static("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+        );
+
+        let (_status, Json(receipt)) = msg(
+            State(state.clone()),
+            headers,
+            Json(MsgBody {
+                to: "peer".into(),
+                body: "hello".into(),
+                reply_to: None,
+            }),
+        )
+        .await
+        .expect("the send is accepted");
+
+        let conn = state.db.lock().unwrap();
+        let stored = crate::db::messages::get(&conn, receipt.id)
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(
+            stored.on_behalf_of, None,
+            "an agent asserted an actor on the node-token plane"
+        );
+        assert!(!stored.envelope().contains("on_behalf_of"));
+        let _ = to;
+    }
+
     /// No budget configured: raw spend comes back, with nothing fabricated to
     /// divide it by.
     #[tokio::test]

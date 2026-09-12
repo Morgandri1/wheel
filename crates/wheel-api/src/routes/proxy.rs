@@ -323,9 +323,10 @@ async fn bridge_websocket(
         .acquire(scope.project.id, state.cfg.ws_max_bridges_per_project)
         .ok_or_else(|| {
             tracing::warn!(project_id = %scope.project.id, "websocket bridge cap reached");
-            // 503, not 429: the limit is a concurrency ceiling on this replica, not a rate, and
-            // retrying immediately is exactly the right thing for a client to do once one closes.
-            ApiError::BadGateway("too many live connections for this project")
+            // 503, not 429 and not 502: the limit is a concurrency ceiling on this replica rather
+            // than a rate, and nothing upstream is wrong. Retrying when one closes is exactly the
+            // right thing for a client to do.
+            ApiError::ServiceUnavailable("websocket bridge cap reached")
         })?;
 
     let ws_url = proxy_path::websocket_url(upstream).ok_or_else(|| {
@@ -441,9 +442,14 @@ async fn pump(
 
     let deadline = tokio::time::sleep(Duration::from_secs(watch.state.cfg.ws_max_lifetime_secs));
     tokio::pin!(deadline);
-    let mut keepalive = tokio::time::interval(WS_KEEPALIVE);
+    // `interval_at`, not `interval`: a plain interval fires immediately, which would ping before
+    // the client has had a chance to exist and re-check membership that was resolved microseconds
+    // ago. Both ticks want to start one period from now.
+    let start = tokio::time::Instant::now();
+    let mut keepalive = tokio::time::interval_at(start + WS_KEEPALIVE, WS_KEEPALIVE);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut recheck = tokio::time::interval(WS_MEMBERSHIP_RECHECK);
+    let mut recheck =
+        tokio::time::interval_at(start + WS_MEMBERSHIP_RECHECK, WS_MEMBERSHIP_RECHECK);
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut access = watch.state.membership.subscribe();
 
