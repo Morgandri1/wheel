@@ -352,6 +352,45 @@ pub fn map_json_strings(v: &serde_json::Value, f: &impl Fn(&str) -> String) -> s
     }
 }
 
+/// As [`map_json_strings`], but `f` also runs over every object KEY, not only
+/// values.
+///
+/// A separate function, not a flag on the one above, because the two callers
+/// need different contracts and conflating them risks the wrong one silently
+/// applying to both: a `ctx`'s markdown and a `table` row are plain strings or
+/// have keys the NODE'S OWN OWNER chose (a table's columns come from its
+/// schema), so `map_json_strings` leaving keys untouched there is correct, not
+/// an oversight. A `tool` node's HTTP response is different — the external
+/// endpoint is the attacker (or a compromised one), and it controls every
+/// byte of its own reply, including which JSON keys appear, not only which
+/// values do (ADVERSARY review of #88: `{"<\AgentPrompt ...>": "ok"}` reaches
+/// the model exactly as raw as the same payload in a value would have, since
+/// `mcp.rs::render()`'s object fallback serializes the whole structure, keys
+/// included). Keeping this as its own function means a ctx/table call site
+/// can never be pointed at it by accident and start mangling a developer's
+/// legitimate column names for no benefit.
+pub fn map_json_strings_and_keys(
+    v: &serde_json::Value,
+    f: &impl Fn(&str) -> String,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(f(s)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| map_json_strings_and_keys(i, f))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (f(k), map_json_strings_and_keys(v, f)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Lowercase-hex SHA-256, implemented here so `wheel-core` stays dependency
 /// light and the CLI, engine and tests all agree byte-for-byte.
 pub fn sha256_hex(data: &[u8]) -> String {

@@ -161,6 +161,7 @@ async fn a_forged_tag_in_a_ctx_node_reaches_the_real_mcp_tool_result_already_esc
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: wheel_engine::config::DEFAULT_STARTUP_DEADLINE_SECS,
         harness_auth: Default::default(),
+        script_execution_enabled: false,
     };
     let (ctx_name, token) = seed_board(&cfg.db_path(), hostile);
     let token_file = dir.join("token");

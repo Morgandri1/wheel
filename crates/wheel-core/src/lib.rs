@@ -38,9 +38,9 @@ pub use host::{
     SandboxUpsert, UidIsolation, ENV_ALLOW_SHARED_UID, SHARED_UID_WARNING,
 };
 pub use message::{
-    escape_envelope_body, escape_tool_output_marker, map_json_strings, sha256_hex,
-    wrap_tool_output, Message, MessageReceipt, MessageSender, MessageState, DEFAULT_AWAIT_SECS,
-    MAX_AWAIT_SECS, MAX_MESSAGE_BODY, TOOL_OUTPUT_TAG,
+    escape_envelope_body, escape_tool_output_marker, map_json_strings, map_json_strings_and_keys,
+    sha256_hex, wrap_tool_output, Message, MessageReceipt, MessageSender, MessageState,
+    DEFAULT_AWAIT_SECS, MAX_AWAIT_SECS, MAX_MESSAGE_BODY, TOOL_OUTPUT_TAG,
 };
 pub use name::{
     validate_name, validate_table_name, Ident, NameError, NodeName, NAME_MAX_LEN, RESERVED_NAMES,
