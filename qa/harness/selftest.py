@@ -168,6 +168,21 @@ def t_usage_limit():
           last({"WHEEL_FAKE_LIMIT_UNTIL": closed, "WHEEL_FAKE_LIMIT_WHEN_ENV": "FAKE_CRED_A",
                 "FAKE_CRED_A": "x"})["is_error"] is True)
 
+    with tempfile.TemporaryDirectory() as d:
+        marker = os.path.join(d, "window-closed")
+        open(marker, "w").close()
+        before = time.time()
+        rl = [e for e in events(run(SJ, turn("x"), env={"WHEEL_FAKE_LIMIT_WHILE_FILE": marker,
+                                                          "WHEEL_FAKE_LIMIT_RESETS_IN": "5"}).stdout)
+              if e["type"] == "rate_limit_event"]
+        check("limit_while_file limits while the marker exists",
+              rl and rl[0]["rate_limit_info"]["status"] == "rejected", str(rl))
+        check("limit_while_file's reset is the file's mtime plus resets_in, not now plus resets_in",
+              rl and abs(rl[0]["rate_limit_info"]["resetsAt"] - (before + 5)) < 2, str(rl))
+        os.remove(marker)
+        check("limit_while_file is over once the marker is gone",
+              last({"WHEEL_FAKE_LIMIT_WHILE_FILE": marker})["is_error"] is False)
+
 def t_auth():
     p = run(SJ, turn("x"), env={"WHEEL_FAKE_AUTH": "needs_auth"})
     check("needs_auth exits non-zero", p.returncode != 0)

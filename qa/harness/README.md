@@ -179,6 +179,8 @@ say so instead of quietly passing.
 | `WHEEL_FAKE_LIMIT_UNTIL=<unix secs>` / `limit_until` | every turn before that moment ends on a closed usage window (as `LIMIT`, reset = that moment) |
 | `WHEEL_FAKE_LIMIT_WHEN_ENV=A,B` / `limit_when_env` (list) | only while one of those env vars is set in the child — one account closed, its fallback open |
 | `WHEEL_FAKE_LIMIT_STYLE=event\|text` / `limit_style` | which of the two shapes above `limit_until` uses (default `event`) |
+| `WHEEL_FAKE_LIMIT_WHILE_FILE=/path` / `limit_while_file` | closed while that path exists, instead of until a fixed timestamp — a test decides exactly when the window reopens (`os.remove`) rather than racing a wall clock against how loaded the host is |
+| `WHEEL_FAKE_LIMIT_RESETS_IN=<secs>` / `limit_resets_in` | with `limit_while_file`: the reset reported is the file's own mtime plus this, so it stays a fixed point across every turn the window is still closed for (default 3600) |
 
 `WHEEL_FAKE_TRANSCRIPT` is the other half of injection testing: it captures the engine's stdin
 framing verbatim, independent of what the fake chooses to reply.
