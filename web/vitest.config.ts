@@ -45,6 +45,7 @@ export default defineConfig({
         "src/lib/endpoint-reach.ts",
         "src/lib/templates.ts",
         "src/components/templates/template-gallery.tsx",
+        "src/lib/budget-status.ts",
         // The server-side trust boundary: which paths, headers and bodies reach the API, which
         // requests count as same-origin, the session cookie's flags and lifetime, which credential
         // each mode presents, and the SSE relay. A wrong branch in any of these is silent.

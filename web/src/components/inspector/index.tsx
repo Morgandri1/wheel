@@ -15,6 +15,7 @@ import {
   buildIdleTimeout,
   validateWorkspacePath,
 } from "@/lib/agent-config";
+import { budgetLines, readBudgetStatus } from "@/lib/budget-status";
 import { AuthFlow } from "@/components/inspector/auth-flow";
 import { PanelBoundary } from "@/components/inspector/panel-boundary";
 import { CtxPanel } from "@/components/inspector/ctx-panel";
@@ -282,6 +283,8 @@ function AgentRuntimeFields({
         </div>
       </Field>
 
+      <BudgetUsage node={node} />
+
       <Field label="Idle timeout" hint={`Seconds before the process is parked and resumed on the next message. Empty uses the default of ${IDLE_TIMEOUT_DEFAULT}.`}>
         <Input
           value={idle}
@@ -291,6 +294,44 @@ function AgentRuntimeFields({
           data-testid="input-agent-idle-timeout"
         />
       </Field>
+    </div>
+  );
+}
+
+/**
+ * How close the agent actually is to the cap set above — wow-agent-brief.md #6. Only rendered
+ * once a ceiling exists; a budget-less agent has spend but nothing to divide it by, and a bare
+ * turn/dollar count with no ceiling to compare it against would read as a warning that never was.
+ */
+function BudgetUsage({ node }: { node: AgentNode }) {
+  const budgetStatus = readBudgetStatus(node);
+  if (!budgetStatus) return null;
+
+  const lines = budgetLines(budgetStatus, node.state?.spend?.turns ?? 0, node.state?.spend?.usd ?? 0);
+  if (!lines.length) return null;
+
+  return (
+    <div className="flex flex-col gap-1" data-testid="agent-budget-usage">
+      {lines.map((line) => (
+        <div key={line.kind} className="flex items-center gap-2">
+          <div className="h-1 flex-1 bg-[var(--panel-2)]">
+            <div
+              className="h-1"
+              style={{
+                width: `${Math.min(line.pct, 100)}%`,
+                background: line.near ? "var(--danger)" : "var(--wire-read)",
+              }}
+            />
+          </div>
+          <span
+            className="text-micro text-ink-faint"
+            data-testid={`agent-budget-usage-${line.kind}`}
+            style={line.near ? { color: "var(--danger)" } : undefined}
+          >
+            {line.label}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
