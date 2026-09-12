@@ -125,13 +125,19 @@ mod tests {
     }
 
     /// The export must produce exactly the files that are committed — no more,
-    /// no fewer. A type added to `wheel-core` and forgotten here is invisible
-    /// to Web until it breaks at runtime; a stale file left behind describes a
-    /// type that no longer exists.
+    /// no fewer — AND each one byte-for-byte, not just present under the same
+    /// name. A type added to `wheel-core` and forgotten here is invisible to
+    /// Web until it breaks at runtime; a stale file left behind describes a
+    /// type that no longer exists; and a committed file whose CONTENT fell
+    /// behind a change to the type it describes is invisible to a check that
+    /// only compares the two directories' filenames — which is exactly how
+    /// this went stale once already (qa/BUGS.md BUG-035) without this test
+    /// ever turning red.
     #[test]
     fn the_export_matches_what_is_committed_in_docs_schema() {
         let tmp = scratch("committed");
         export(&tmp).unwrap();
+        let committed = committed_dir();
 
         let names = |d: &Path| {
             let mut v: Vec<String> = fs::read_dir(d)
@@ -142,10 +148,26 @@ mod tests {
             v.sort();
             v
         };
+        let (fresh_names, committed_names) = (names(&tmp), names(&committed));
         assert_eq!(
-            names(&tmp),
-            names(&committed_dir()),
+            fresh_names,
+            committed_names,
             "docs/schema is out of date -- run `cargo run -p wheel-core --bin export-schema -- docs/schema`"
+        );
+
+        let mut stale = Vec::new();
+        for name in &fresh_names {
+            let fresh = fs::read_to_string(tmp.join(name)).unwrap();
+            let checked_in = fs::read_to_string(committed.join(name)).unwrap();
+            if fresh != checked_in {
+                stale.push(name.clone());
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "docs/schema/{{{}}} committed but stale (content differs from a fresh export) -- \
+             run `cargo run -p wheel-core --bin export-schema -- docs/schema`",
+            stale.join(", ")
         );
         fs::remove_dir_all(&tmp).ok();
     }

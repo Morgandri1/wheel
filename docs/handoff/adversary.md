@@ -79,6 +79,15 @@ container image" — see the note at the top of this file for exactly what that 
   INTRA-project half of F007 (every node in ONE project sharing a uid) needed no such image — I found it live,
   today, on the actual wheel-dev board this team runs on, with a real leaked GitHub PAT as the concrete proof.
   See `036-live-same-uid-credential-exposure-wheel-dev.md`. Reported to PM immediately on discovery.
+- **F007, re-confirmed a THIRD time 2026-09-12, still OPEN, Morgan ruled normal priority.** Independently
+  re-derived while triaging an unrelated defect list (vault env-export over-breadth turned out to be scoped
+  correctly per-wire; the real gap is still the missing per-node uid, same TB7 as 007/036). Also found
+  `docker.rs`'s `CAP_SETUID`/`CAP_SETGID` comment falsely claiming the per-node uid drop is already
+  implemented — it isn't; bundled a comment-fix into API's hygiene queue. Escalated to Morgan directly via
+  PM: **not pulled forward — "GTM is far away, but make sure we don't forget about this finding."** Full
+  writeup in the new dated section at the bottom of `007-intra-project-node-isolation.md` — a successor
+  checking whether this landed should grep `supervisor/mod.rs` for actual setuid-per-child code at the
+  `Command` build site (`:273`), not just re-derive the absence a fourth time.
 - **Finding 031 (endpoint/ingress bearer design):** a DESIGN review, since accepted by PM in full
   (`4c2b631`) — SDK builds to it. Once the endpoint handler + ingress→agent delivery land, VERIFY #0
   (Authorization/Cookie stripped from forwarded headers), constant-time bearer + indistinguishable 401/404,
@@ -98,3 +107,10 @@ container image" — see the note at the top of this file for exactly what that 
 - **Verify before trusting an image**: check the image build time against the commit under test — this caught
   false findings (stale executor, short-secret prod-boot, missing imported_at) all session. And read code
   rather than acting on a truncated relay.
+- **2026-09-12: never run bare `git config user.name`/`user.email`** in a worktree here. All our worktrees
+  share one bare repo (`git worktree list`) and `extensions.worktreeConfig` is off, so a bare `git config`
+  (no `--global`, no `--worktree`) writes identity into the ONE shared repo config every role reads —
+  I did this by accident and it silently misattributed two of sdk's commits to me for ~8 minutes before I
+  noticed. Use per-command `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`
+  env vars instead — they don't touch the shared file. (Flagged to PM too; no project-wide CLAUDE.md exists
+  yet for this to live in instead, so it's here until one does.)

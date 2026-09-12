@@ -42,3 +42,31 @@ shared workspaces via setgid; **`WHEEL_TOKEN` delivered via a 0600 file, not env
 /proc/<pid>/environ theft vector). Lands M2 (docker) / M3 (process). Until M2, PROTOCOL.md states the
 gap. Status → ACCEPTED, awaiting M2 impl to verify (PoC: cross-node /proc + token-file read must be
 EACCES). Owner: SDK/Engine (setuid per child, token file) + API (host grants the two ambient caps).
+
+## 2026-09-12 — independently re-confirmed (third path), still OPEN, Morgan ruling: normal priority
+Re-derived the same boundary a third time, via a different path than either the original claim or 036's
+live PAT: source-reading `vault::env_for_agent` (`vault.rs:436`) while triaging an unrelated PM defect
+list. `env_for_agent` correctly scopes to only the agent's wired vaults (`wired_vaults`, `vault.rs:267`
+— not a project-wide export as first described to me), but that scoping is capability-theater without
+the uid boundary: I confirmed (grep across `wheel-engine/src` and `wheel-host/src/sandbox`) there is
+still no `unshare`/namespace/per-child-`setuid` code anywhere — the M2 fix ruled above has not landed.
+Same TB7 boundary as this file's original claim and as 036's live PAT; same root cause; independently
+reached without reading 036 first, then cross-checked against it afterward. No new PoC needed beyond
+036's — recording this as a second independent derivation, which is worth more than a third read of the
+same proof.
+
+Also found while re-deriving: `docker.rs:123-127`'s `cap_add: ["SETUID", "SETGID"]` carries a comment
+asserting "the engine drops each child to its own per-node uid" as present-tense fact. It is not — same
+grep, same result: no such code exists. The comment describes this finding's *ruling* (correctly) but
+states it as *already implemented*. Flagged to PM/API as a doc-accuracy bug (bundled into API's #9
+hygiene PR: correct the comment to say NOT YET IMPLEMENTED, tracked here). The capability grant itself
+is fine to keep — it's not a new privilege, it's the one this finding's ruling asks for — but nothing
+in the container yet uses it, and the comment claiming otherwise is exactly the kind of false-closed
+status this file exists to prevent.
+
+Escalated to Morgan directly (PM, same day): **ruling is normal priority, not pulled forward** — "GTM is
+far away, but make sure we don't forget about this finding." Recorded here specifically so it doesn't.
+Status stays **OPEN**, owner unchanged (SDK/Engine + API), fix unchanged (per-node uid, M2/docker →
+M3/process). Next re-derivation should check for the actual `unshare`/setuid code before re-confirming
+by grep-for-absence again — a landed fix will show up as new code at the call site in
+`supervisor/mod.rs` where the child `Command` is built (`supervisor/mod.rs:273`), not as an absence.

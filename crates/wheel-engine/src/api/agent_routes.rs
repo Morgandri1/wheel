@@ -1177,6 +1177,67 @@ mod tests {
         );
     }
 
+    /// `resume_readers_if_blocked`'s own doc: "un-sticks EVERY agent that
+    /// reads it, not only the one that signed in". Every existing sign-in
+    /// test wires exactly one agent to the vault, so the broadcast itself —
+    /// as opposed to the single-agent `resume_if_blocked` it fans out to —
+    /// had no coverage.
+    #[tokio::test]
+    async fn a_vault_credential_resumes_every_blocked_reader_not_just_one() {
+        let state = crate::api::test_state();
+        let (vault, blocked_a, blocked_b, unrelated) = {
+            let conn = state.db.lock().unwrap();
+            let vault = mk(
+                &conn,
+                "creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            );
+            let other_vault = mk(
+                &conn,
+                "other-creds",
+                NodeConfig::Vault(VaultConfig { keys: vec![] }),
+            );
+            let blocked_a = mk(&conn, "worker-a", NodeConfig::Agent(AgentConfig::default()));
+            let blocked_b = mk(&conn, "worker-b", NodeConfig::Agent(AgentConfig::default()));
+            // Blocked on a DIFFERENT vault: this one's resume must not touch it.
+            let unrelated = mk(&conn, "worker-c", NodeConfig::Agent(AgentConfig::default()));
+            board::add_wire(&conn, blocked_a, vault, WireType::Read, None).unwrap();
+            board::add_wire(&conn, blocked_b, vault, WireType::Read, None).unwrap();
+            board::add_wire(&conn, unrelated, other_vault, WireType::Read, None).unwrap();
+            for agent in [blocked_a, blocked_b, unrelated] {
+                board::set_status(
+                    &conn,
+                    agent,
+                    wheel_core::AgentStatus::NeedsAuth,
+                    Some("stale login"),
+                );
+            }
+            (vault, blocked_a, blocked_b, unrelated)
+        };
+
+        resume_readers_if_blocked(&state, vault).await.unwrap();
+
+        let status_of = |id: Uuid| {
+            let conn = state.db.lock().unwrap();
+            board::agent_state(&conn, id).unwrap().status
+        };
+        assert_ne!(
+            status_of(blocked_a),
+            wheel_core::AgentStatus::NeedsAuth,
+            "the reader whose lapsed login this is must resume"
+        );
+        assert_ne!(
+            status_of(blocked_b),
+            wheel_core::AgentStatus::NeedsAuth,
+            "every OTHER reader of the same vault must resume too, not just one"
+        );
+        assert_eq!(
+            status_of(unrelated),
+            wheel_core::AgentStatus::NeedsAuth,
+            "an agent blocked on a DIFFERENT vault must not be touched"
+        );
+    }
+
     // --- the headless sign-in, end to end (docs/proposals/harness-oauth-refresh.md) -----
 
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../qa/harness/fake-claude");

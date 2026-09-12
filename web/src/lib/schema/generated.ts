@@ -29,6 +29,10 @@ export type AgentStatus =
 
 export interface AgentState {
   /**
+   * How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell "no budget" from "nothing computed".
+   */
+  budget_status?: BudgetStatus | null;
+  /**
    * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
    */
   hosted_on?: string | null;
@@ -47,6 +51,17 @@ export interface AgentState {
    */
   spend?: Spend | null;
   status: AgentStatus;
+}
+
+/**
+ * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
+
+export interface BudgetStatus {
+  max_turns?: number | null;
+  max_usd?: number | null;
+  pct_of_max_turns?: number | null;
+  pct_of_max_usd?: number | null;
 }
 
 /**
@@ -114,9 +129,17 @@ export interface AuthStatus {
    */
   mode?: CredentialKind | null;
   /**
+   * `true` when the engine renews this credential itself before `expires_at`, so the deadline is not the operator's to meet. Omitted when it does not.
+   */
+  refreshable?: boolean | null;
+  /**
    * For `mode: "env"`, the name of the vault node supplying it. Never the value.
    */
   source?: string | null;
+  /**
+   * Something the operator must act on before the credential stops working — e.g. the last automatic refresh failed. Shown BEFORE the agent is refused, not after.
+   */
+  warning?: string | null;
 }
 
 /**
@@ -231,6 +254,10 @@ export type Event =
 
 export type NodeState = {
   /**
+   * How close `spend` is to this agent's configured `budget`, if it has one. `None` means no budget is set at all -- distinct from a `Some` with both percentages absent, so a reader does not have to inspect the struct's insides to tell "no budget" from "nothing computed".
+   */
+  budget_status?: BudgetStatus | null;
+  /**
    * Where this agent's process lives: `"cloud"`, a local runner id, or `None` for **unhosted** — a first-class alarming state, not an absence (§3e). An agent nobody can run is a broken agent and the UI says so.
    */
   hosted_on?: string | null;
@@ -308,6 +335,10 @@ export type LogStream = ("stdout" | "stderr") | "engine" | "transcript";
  */
 
 export type WireType = "read" | "write" | "send";
+
+/**
+ * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
 
 /**
  * Accumulated cost for an agent's current lifetime.
@@ -766,6 +797,10 @@ export interface ToolSource {
  */
 
 /**
+ * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
+
+/**
  * Accumulated cost for an agent's current lifetime.
  */
 
@@ -905,6 +940,10 @@ export interface Position {
   x: number;
   y: number;
 }
+
+/**
+ * docs/wow-agent-brief.md #6: the same budget-proximity numbers `GET /v1/cli/usage` gives an agent about itself, surfaced on `GET /v1/board` for the UI -- one computation, two callers, so the CLI and the board can never disagree about what "80% of budget" means.
+ */
 
 /**
  * Accumulated cost for an agent's current lifetime.
