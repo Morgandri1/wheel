@@ -28,7 +28,7 @@ fn data_dir() -> std::path::PathBuf {
 async fn start() -> (String, String) {
     let dir = wheeld::supervise::prepare_data_dir(&data_dir()).unwrap();
     let keys = Keys::load_or_create(&dir).unwrap();
-    let url = wheeld::start_host(&dir, &keys)
+    let url = wheeld::start_host(&dir, &keys, None)
         .await
         .expect("the sandbox host should start")
         .url;

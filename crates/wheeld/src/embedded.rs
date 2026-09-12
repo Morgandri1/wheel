@@ -52,6 +52,10 @@ pub struct EmbeddedSandbox {
     /// One engine per project. Holding it is what makes stop possible: an engine we cannot stop is
     /// an engine that keeps serving after the project is deleted.
     engines: Mutex<HashMap<Uuid, Engine>>,
+    /// The deployment's updater, if it has one. Every engine carries it, so an agent's
+    /// `/v1/cli/*` call sees the notice, and the updater can pause this engine's delivery while
+    /// it waits for a quiet moment (docs/proposals/auto-update.md).
+    update: Option<std::sync::Arc<dyn wheel_engine::update::UpdateHook>>,
 }
 
 /// The longest path a unix socket may be bound to: 104 bytes on macOS, 108 on Linux. The limit is
@@ -75,7 +79,17 @@ impl EmbeddedSandbox {
             run_dir,
             start_timeout,
             engines: Mutex::new(HashMap::new()),
+            update: None,
         }
+    }
+
+    /// Hand every engine this sandbox starts the deployment's update hook.
+    pub fn with_update(
+        mut self,
+        update: Option<std::sync::Arc<dyn wheel_engine::update::UpdateHook>>,
+    ) -> Self {
+        self.update = update;
+        self
     }
 
     pub fn project_dir(&self, id: &Uuid) -> PathBuf {
@@ -153,6 +167,7 @@ impl Sandbox for EmbeddedSandbox {
         };
 
         let project = *id;
+        let update = self.update.clone();
         let (stop, stop_requested) = oneshot::channel::<()>();
         // A dropped sender resolves the receiver too, so an engine whose handle is lost stops
         // rather than running on unowned.
@@ -160,7 +175,7 @@ impl Sandbox for EmbeddedSandbox {
             let stopped = async move {
                 let _ = stop_requested.await;
             };
-            if let Err(e) = wheel_engine::serve_until(cfg, stopped).await {
+            if let Err(e) = wheel_engine::serve_until_with(cfg, stopped, update).await {
                 tracing::error!(project = %project, error = %format_args!("{e:#}"), "engine exited");
             }
         });

@@ -19,6 +19,7 @@ mod mcp;
 mod transport;
 
 use transport::{Engine, Reply};
+use wheel_core::UpdateNotice;
 
 const USAGE: &str = "\
 wheel — talk to your Wheel board
@@ -37,6 +38,7 @@ wheel — talk to your Wheel board
   wheel inbox [<message-id>]        re-read what I was sent
   wheel ctx clear                   discard my context and start a fresh session
   wheel usage                       my own turn/spend total, and proximity to my budget
+  wheel update [--status]           apply the pending runtime update at a safe point
 
 Values: prefer --file or --stdin. A body passed as an argument goes through
 your shell first, where backticks and $(...) are substituted before wheel ever
@@ -279,6 +281,28 @@ fn run(args: &[String], json_out: bool) -> Result<u8> {
             show(engine.get(&path)?, json_out, render_inbox)
         }
         "usage" => show(engine.get("/v1/cli/usage")?, json_out, render_usage),
+        // The body IS the notice here, so the header is dropped rather than
+        // said twice. No positional argument: `wheel update <agent>` is
+        // ARCHITECTURE §3e's grammar for editing an agent, reserved for it.
+        "update" => match rest.first().map(String::as_str) {
+            None => {
+                let mut r = engine.post("/v1/cli/update", serde_json::json!({}))?;
+                r.update = None;
+                show(r, json_out, render_update_request)
+            }
+            Some("--status") => {
+                let mut r = engine.get("/v1/cli/update")?;
+                r.update = None;
+                show(r, json_out, render_update_status)
+            }
+            Some(_) => {
+                eprintln!(
+                    "wheel: `wheel update` takes no arguments: it asks this deployment to apply its \
+                     pending runtime update. Editing an agent (`wheel update <agent>`) is not in this build."
+                );
+                Ok(1)
+            }
+        },
 
         other => {
             eprintln!("wheel: unknown command {other:?}\n");
@@ -357,20 +381,60 @@ fn read_value(rest: &[String]) -> Result<String> {
 /// The engine's error `code` maps to the exit status, so `wheel` and the wire
 /// matrix agree on what "denied" means without the CLI re-deciding it.
 fn show(r: Reply, json_out: bool, render: fn(&serde_json::Value)) -> Result<u8> {
+    let Reply {
+        status,
+        mut body,
+        update,
+    } = r;
+    let notice = update.as_deref().and_then(UpdateNotice::from_header);
+    let notice_line = place_notice(&mut body, notice.as_ref(), json_out);
+    let code = report(status, &body, json_out, render)?;
+    if let Some(line) = notice_line {
+        eprintln!("{line}");
+    }
+    Ok(code)
+}
+
+/// Where the update notice goes: a `wheel_update` field when the output is a
+/// JSON object, otherwise ONE line for stderr. Never stdout text: an agent
+/// piping `wheel read` into something must get exactly what it asked for.
+fn place_notice(
+    body: &mut serde_json::Value,
+    notice: Option<&UpdateNotice>,
+    json_out: bool,
+) -> Option<String> {
+    let notice = notice?;
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&r.body)?);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "wheel_update".into(),
+                serde_json::to_value(notice).unwrap_or_default(),
+            );
+            return None;
+        }
+    }
+    Some(format!("wheel: {}", notice.line()))
+}
+
+fn report(
+    status: u16,
+    body: &serde_json::Value,
+    json_out: bool,
+    render: fn(&serde_json::Value),
+) -> Result<u8> {
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(body)?);
     }
 
-    if r.status < 300 {
+    if status < 300 {
         if !json_out {
-            render(&r.body);
+            render(body);
         }
         return Ok(0);
     }
 
-    let code = r.body.pointer("/error/code").and_then(|c| c.as_str());
-    let message = r
-        .body
+    let code = body.pointer("/error/code").and_then(|c| c.as_str());
+    let message = body
         .pointer("/error/message")
         .and_then(|m| m.as_str())
         .unwrap_or("engine error");
@@ -578,6 +642,39 @@ fn render_usage(v: &serde_json::Value) {
     }
 }
 
+fn notice_in(v: &serde_json::Value) -> Option<UpdateNotice> {
+    serde_json::from_value(v.clone()).ok()
+}
+
+fn render_update_request(v: &serde_json::Value) {
+    if v["requested"] != true {
+        println!(
+            "nothing to update: {}",
+            v["reason"].as_str().unwrap_or("this deployment is current")
+        );
+        return;
+    }
+    let again = if v["already_requested"] == true {
+        " (already requested)"
+    } else {
+        ""
+    };
+    println!(
+        "requested{again} — it applies when no agent is mid-turn, and a system message \
+         tells you when it is done"
+    );
+    if let Some(n) = notice_in(&v["update"]) {
+        println!("  {}", n.line());
+    }
+}
+
+fn render_update_status(v: &serde_json::Value) {
+    match notice_in(&v["update"]) {
+        Some(n) => println!("{}", n.line()),
+        None => println!("nothing pertinent to update"),
+    }
+}
+
 fn render_inbox(v: &serde_json::Value) {
     if let Some(m) = v.get("message") {
         // A single message prints its EXACT body, which is the whole point of
@@ -629,7 +726,11 @@ mod tests {
     }
 
     fn reply(status: u16, body: serde_json::Value) -> Reply {
-        Reply { status, body }
+        Reply {
+            status,
+            body,
+            update: None,
+        }
     }
 
     fn err_reply(status: u16, code: &str) -> Reply {
@@ -756,6 +857,8 @@ mod tests {
             ("secret", render_secret),
             ("keys", render_keys),
             ("usage", render_usage),
+            ("update_request", render_update_request),
+            ("update_status", render_update_status),
         ];
         // Empty, wrong-typed, null-valued, and deeply wrong. None of these is
         // hypothetical: an older engine, a proxy that rewrote the body, or a
@@ -879,6 +982,8 @@ mod tests {
             ),
             (vec!["msg", "peer", "hello"], "POST", "/v1/cli/msg"),
             (vec!["write", "notes", "body"], "POST", "/v1/cli/write"),
+            (vec!["update"], "POST", "/v1/cli/update"),
+            (vec!["update", "--status"], "GET", "/v1/cli/update"),
         ];
 
         let listener = UnixListener::bind(&sock).unwrap();
@@ -940,6 +1045,7 @@ mod tests {
             vec!["tool", "call"],
             vec!["tool", "call", "petstore"],
             vec!["not-a-command"],
+            vec!["update", "some-agent"],
         ] {
             let args: Vec<String> = bad.iter().map(|a| a.to_string()).collect();
             let r = run(&args, true);
@@ -1004,12 +1110,14 @@ mod tests {
     #[test]
     fn error_codes_map_to_the_documented_exit_statuses() {
         let denied = Reply {
+            update: None,
             status: 403,
             body: serde_json::json!({"error":{"code":"wire_denied","message":"no wire"}}),
         };
         assert_eq!(show(denied, true, render_ok).unwrap(), 3);
 
         let missing = Reply {
+            update: None,
             status: 404,
             body: serde_json::json!({"error":{"code":"not_found","message":"nope"}}),
         };
@@ -1023,6 +1131,7 @@ mod tests {
             (413, "too_large"),
         ] {
             let other = Reply {
+                update: None,
                 status,
                 body: serde_json::json!({"error":{"code":code,"message":"x"}}),
             };
@@ -1033,6 +1142,7 @@ mod tests {
     #[test]
     fn success_is_exit_zero() {
         let ok = Reply {
+            update: None,
             status: 200,
             body: serde_json::json!({"node":"notes"}),
         };

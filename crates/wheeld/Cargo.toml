@@ -22,6 +22,8 @@ wheel-core = { path = "../wheel-core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
@@ -31,7 +33,6 @@ sha2 = "0.10"
 libc = "0.2"
 axum = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
