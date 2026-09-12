@@ -172,7 +172,10 @@ fn a_build_that_never_proved_healthy_is_put_back_before_the_daemon_serves() {
 
     let state = state(&b);
     assert!(state["pending"].is_null(), "no marker survives a rollback");
-    assert_eq!(state["bad"][0], head, "and that commit is never offered again");
+    assert_eq!(
+        state["bad"][0], head,
+        "and that commit is never offered again"
+    );
     assert_eq!(state["history"][0]["outcome"]["outcome"], "rolled_back");
 }
 

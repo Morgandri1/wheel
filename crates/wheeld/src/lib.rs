@@ -33,10 +33,7 @@ pub async fn run(settings: Settings) -> Result<()> {
 ///
 /// The lane is built BEFORE the runtime, not here: see `cli_main` for why a rollback that waited
 /// until this function could not undo a binary that crashes on its way to it.
-pub async fn run_with_updates(
-    settings: Settings,
-    lane: Option<Arc<update::Lane>>,
-) -> Result<()> {
+pub async fn run_with_updates(settings: Settings, lane: Option<Arc<update::Lane>>) -> Result<()> {
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
@@ -171,10 +168,7 @@ pub async fn dispatch(action: config::Action) -> Result<()> {
 }
 
 /// [`dispatch`], carrying the update lane `cli_main` already settled.
-pub async fn dispatch_with(
-    action: config::Action,
-    lane: Option<Arc<update::Lane>>,
-) -> Result<()> {
+pub async fn dispatch_with(action: config::Action, lane: Option<Arc<update::Lane>>) -> Result<()> {
     match action {
         config::Action::PrintUsage => {
             print!("{}", config::USAGE);
