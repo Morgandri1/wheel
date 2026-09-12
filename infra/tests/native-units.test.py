@@ -110,14 +110,40 @@ check(one(res, "OOMPolicy") == "continue", "10-resources.conf sets OOMPolicy=con
       "systemd stop wheeld and every other project's agents with it. Measured in "
       "infra/vps/rehearsal/native/oom-containment.sh — the limit escalates the failure instead of "
       "containing it")
-check("MemoryMax" in res, "10-resources.conf sets MemoryMax",
+# VALUES, not presence. `MemoryMax=infinity` and `TasksMax=infinity` are both legal, both look
+# like the limit is configured, and both mean there is no limit at all — which is exactly the shape
+# a careless "let's stop the OOM kills" edit takes.
+def bounded(key: str) -> bool:
+    v = one(res, key)
+    return bool(v) and v.lower() not in {"infinity", "0", ""}
+
+check(bounded("MemoryMax"), "10-resources.conf sets a FINITE MemoryMax",
       "without a cgroup ceiling the HOST OOM killer fires instead, and it can take sshd — leaving "
-      "a box you cannot log in to in order to fix it")
-check("TasksMax" in res, "10-resources.conf sets TasksMax",
+      "a box you cannot log in to in order to fix it. `MemoryMax=infinity` would satisfy a "
+      "presence check while meaning exactly no limit")
+check(bounded("MemoryHigh"), "10-resources.conf sets a finite MemoryHigh",
+      "MemoryHigh is what turns a memory-hungry agent into a slow one instead of a dead one; "
+      "without it every overage goes straight to the OOM killer")
+check(bounded("TasksMax"), "10-resources.conf sets a finite TasksMax",
       "a fork bomb in one agent otherwise reaches the host's pid limit")
-check("LimitNOFILE" in res, "10-resources.conf sets LimitNOFILE",
+check(bounded("LimitNOFILE"), "10-resources.conf sets LimitNOFILE",
       "systemd's 1024 soft default is below what Node, pnpm and watchers need; EMFILE out of a "
       "bundler is a famously unattributable failure")
+# MemoryHigh must be BELOW MemoryMax or the soft limit never bites before the hard one.
+def as_bytes(v: str | None) -> int | None:
+    if not v:
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KMGT]?)", v.strip())
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}[m.group(2)])
+
+high, hard = as_bytes(one(res, "MemoryHigh")), as_bytes(one(res, "MemoryMax"))
+check(high is not None and hard is not None and high < hard,
+      "MemoryHigh < MemoryMax",
+      f"MemoryHigh={one(res, 'MemoryHigh')} MemoryMax={one(res, 'MemoryMax')}: if the soft limit is "
+      "not below the hard one, reclaim never gets a chance to work and every overage becomes an "
+      "OOM kill — the throttle-first behaviour the drop-in claims simply does not happen")
 
 # ---------------------------------------------------------------- hardening that must NOT tighten
 #
@@ -255,7 +281,15 @@ for key in ("ExecStartPre", "ExecStartPost", "ExecStart"):
 
 # ---------------------------------------------------------------- install.sh keeps the rollback artefact
 install_sh = (VPS / "install.sh").read_text()
-check(not re.search(r"rm\s+(-\w+\s+)*[^\n]*\bbin/[^\s]*\.prev", install_sh),
+# rm, find -delete, or an mv that consumes it. A presence check for `rm` alone would miss the two
+# other ways a tidy-up removes the other lane's rollback artefact.
+destroys_prev = [
+    line for line in install_sh.splitlines()
+    if not line.lstrip().startswith("#")
+    and re.search(r"bin/[^\s\"']*\.prev", line)
+    and re.search(r"\brm\b|-delete\b", line)
+]
+check(not destroys_prev,
       "install.sh never deletes /opt/wheel/bin/*.prev",
       "*.prev is sdk/auto-update's rollback artefact as well as this script's; deleting it removes "
       "the daemon's ability to undo its own failed update")
