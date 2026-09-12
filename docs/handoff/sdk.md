@@ -1,5 +1,29 @@
 # SDK / Engine — handoff
 
+## UPDATE (2026-09-12, defect #2 keys gap fixed; one residual left open on purpose)
+
+`docs/proposals/tool-mcp-output-escaping.md` (defect #2, PR #88, `sdk/tool-mcp-output-escaping-impl`,
+still DRAFT pending ADVERSARY's next pass) wraps tool/MCP output so a forged `<AgentPrompt>` in an
+external endpoint's response can't reach the model unmarked. ADVERSARY's review found one real gap:
+`map_json_strings` only transforms JSON VALUES, never object KEYS — fine for ctx/table (keys are the
+node's own fixed schema) but not for a tool node's HTTP response, where the external endpoint controls
+every byte of its own reply, keys included, and `mcp.rs::render()`'s object fallback (`v.to_string()`)
+serializes the whole structure. Fixed in `908ebe6`: `map_json_strings_and_keys` is a SIBLING function
+(not a change to `map_json_strings`'s contract, so no ctx/table call site can be pointed at it by
+accident), wired into `run_operation`'s body/headers call sites only. Mutation-checked against a real
+socket through the real `run_operation` path, not the mapper function in isolation — see the commit for
+the exact failure text with the live unescaped key.
+
+**Left open, tracked, not fixed here:** a bare `wheel inbox` (no `id`) called over MCP still shows raw,
+unescaped message bodies in the list view — the list response has no top-level `value` for
+`mcp.rs::render()` to pick up, so it falls to stringifying the whole `messages[]` array, raw `body`
+fields included, right next to the unused per-item wrapped `value`. `redteam/findings/054-mcp-inbox-list-
+still-stringifies-raw-message-bodies.md` has the full trace and a concrete recommendation (drop `body`
+from the list response, or restructure so the top-level shape is itself a pre-rendered `value` the way
+ctx/table reads already answer). A successor picking this up should also close the assertion gap that
+let it through PR #88 undetected: test that the forged tag is not the literal text ANYWHERE in the
+JSON-RPC result, not just that a `value` field exists somewhere inside it.
+
 ## UPDATE (session C, 2026-09-06, PM kickoff after wheel-dev stand-down)
 
 Picked the highest-priority still-open item PM/ADVERSARY flagged (`docs/handoff/adversary.md`
