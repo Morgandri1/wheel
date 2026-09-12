@@ -1481,11 +1481,14 @@ mod tests {
     /// as live hides the one failure the system cannot leave on its own.
     #[tokio::test]
     async fn live_agents_counts_processes_not_agents_that_once_had_one() {
-        let rig = Rig::new("liveness", Spec {
-            ttl_ms: 60_000,
-            lead_ms: 1_000,
-            ..Spec::default()
-        });
+        let rig = Rig::new(
+            "liveness",
+            Spec {
+                ttl_ms: 60_000,
+                lead_ms: 1_000,
+                ..Spec::default()
+            },
+        );
         let agent = rig.agents[0];
         let first = rig.send_and_deliver(agent).await;
         until("the agent to be running", || rig.answered(first)).await;

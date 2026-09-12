@@ -464,7 +464,7 @@ mod tests {
             assert_eq!(err.1, "policy_denied");
         }
         // An API key under the same name is exactly what this deployment is for.
-        put_value(
+        let stored = put_value(
             State(state),
             Path((v, "ANTHROPIC_API_KEY".to_string())),
             Json(PutValue {
@@ -473,6 +473,7 @@ mod tests {
         )
         .await
         .expect("an api key is not refused");
+        assert_eq!(stored.0["stored"], true);
     }
 
     /// Two keys in ONE vault that reach a child as the same variable are the
