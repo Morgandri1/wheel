@@ -309,3 +309,110 @@ I'll start PR 1 next unless told otherwise.
   this holds once `steer` and `interrupt` are both real methods that can race against `next_event`'s
   read loop for the same session.
 
+## 9. PR2 scoping (written after PR1 merged: measured, not estimated)
+
+PR1 (`#95`) landed `HarnessDriver`/`DriverSession`/`DriverEvent` and `ClaudeDriver`'s port, unwired,
+with its own conformance suite (both F008 halves, ADVERSARY-reviewed). This section is the scoping
+PM asked for before starting PR2 — the actual supervisor wire-in. Two things changed since §7's
+estimate, one making the diff smaller than feared, one identifying the real risk precisely instead of
+gesturing at it.
+
+### 9.1 The blast radius is much smaller than "90+ call sites" suggested
+
+§7's own estimate (from before PR1) was rough. Re-measured against current `origin/dev`:
+
+- **7** production call sites read `self.harness.*` (`start`, `pump_queue`, `pump_stdout`,
+  `reap`, plus one query in `has_driver`'s caller). All seven are the ones §3/§4 already describe
+  moving to `running.session`/the registry.
+- **`supervisor/mod.rs` has exactly 3 test-double structs** implementing the old `Harness` trait —
+  `ShimDriver` (the default, empty argv/env — most tests don't touch real argv shape), `PoisonDriver`
+  (real argv/env, panics `encode_turn` on one marker body), `ResumeRecordingDriver` (real argv/env,
+  records what `--resume` value it was launched with). `refresh.rs`'s `Rig` uses `harness::claude::
+  ProgramDriver` directly — already `HarnessDriver`-compatible since PR1, so `Rig` needs its
+  `Supervisor::with_harness(...)` call site updated and nothing else.
+- **60 of `mod.rs`'s 66 test functions, and all 22 of `refresh.rs`'s, construct their driver through
+  a handful of shared helpers** (`shim_supervisor`, `shim_supervisor_cfg`, `shim_supervisor_driver`,
+  `shim_supervisor_full`, `shim_supervisor_inner`; `Rig::new`) and never reference `Harness`/
+  `HarnessEvent` in the test body itself — they call the helper, get a `Supervisor`, and exercise its
+  public async API (`start`/`stop`/`deliver`/status assertions). Traced a sample of both the default
+  path and the three custom-driver tests to confirm this, not assumed from the naming.
+
+So the actual porting surface is: **3 structs in `mod.rs` + 1 call site in `refresh.rs`'s `Rig` +
+the 7 production call sites + `Running`/`start`/`pump_queue`/`pump_stdout`/`reap` themselves.** The
+82 test functions are the thing this whole exercise has to keep passing UNCHANGED, not a migration
+cost — if any of them need editing beyond a helper signature change, that is itself a signal
+something about the new contract doesn't actually preserve today's observable behaviour.
+
+### 9.2 The real risk: one `DriverSession`, two concurrent callers
+
+This is what §8's second open question was circling, now identified precisely. Today, `Running`
+holds a `ChildStdin` (written by `pump_queue`, called from delivery) and a `Child`/`BufReader` pair
+read by a *separate, long-running* `pump_stdout` task. These never contend, because stdin and stdout
+are independent OS file descriptors — two Rust values, not one.
+
+`DriverSession` collapses both into one object (`send_turn`/`interrupt` and `next_event` all take
+`&mut self`), because that is what a JSON-RPC-framed protocol like Codex's genuinely needs (a
+request id chosen at write time, an approval reply that has to reference the pending request
+`next_event` is about to yield). But it means whichever task calls `next_event()` in a loop — the
+direct replacement for today's `pump_stdout` task — **exclusively owns the session for the duration
+of every poll**, and nothing else (`pump_queue` calling `send_turn`, `interrupt`/`stop` calling
+`interrupt`) can touch it without that task's cooperation. `Running`'s existing `AsyncMutex` (the
+`AgentSlot`) does not solve this by itself: taking that lock to call `send_turn` would have to wait
+for the in-progress `next_event().await` to resolve first, since both are `&mut` calls on the same
+`Running` value behind the same lock — but `next_event()` legitimately blocks for an arbitrarily long
+time (it's *waiting for the child to say something*), so a naive "hold the slot lock, call the
+method" port of today's pattern would make `send_turn` (and `interrupt`) block for however long the
+child is silent. For Claude that is usually fine (the next `send_turn` only happens after a
+`TurnComplete`, which is exactly when `next_event()` would return anyway) — but `interrupt` is
+supposed to work *while a turn is in flight*, i.e. exactly while `next_event()` is parked waiting.
+Today's `interrupt` (`Running::kill`, killing the process group directly) does not have this
+problem because it never goes through the read task at all.
+
+**Recommendation: one task owns the `DriverSession` exclusively; everything else talks to it through
+channels.** Concretely:
+
+- The task that used to be `pump_stdout` becomes the session's sole owner: an `mpsc` channel carries
+  *commands* in (`SendTurn(String)`, `Interrupt`), and the task's loop is `select!` between
+  `next_event()` and the command channel — so a queued `send_turn`/`interrupt` request is served
+  the next time the task is scheduled, not blocked behind an indefinite read the way a shared-mutex
+  version would be, and `interrupt` genuinely can act while a turn is in flight because it doesn't
+  wait for `next_event()` to return first.
+- `pump_queue` and `Supervisor::interrupt`/`stop` send on that channel instead of calling
+  `running.session.send_turn(...)`/`.interrupt()` directly — `Running` holds the `mpsc::Sender`
+  (cheap to hold under the slot lock) instead of the `Box<dyn DriverSession>` itself, which moves
+  into the owning task at spawn time and never leaves it.
+- `DriverEvent`s flow out through the existing mechanism (`next_event`'s result gets turned into log
+  lines / status updates / the events bus, exactly as `pump_stdout` does today) — this part of the
+  shape does not change, only who is allowed to call `send_turn`/`interrupt` and how.
+- This is an *engine-internal* restructuring, not a `HarnessDriver`/`DriverSession` trait change —
+  PR1's trait shape stays exactly as merged. The channel lives inside `supervisor/mod.rs`'s new
+  version of the spawn/delivery machinery, not in `harness/`.
+
+This is very close to the actor pattern PR1's own module comment gestured at ("`next_event()`'s read
+loop... folded into the session itself") one level further up: PR1 folded stdout+stderr reading into
+one object; PR2's real job is folding *that object's ownership* into one task so the rest of the
+supervisor can only reach it by asking, never by racing it.
+
+### 9.3 Landing plan
+
+Given 9.1's corrected scope, I don't think PR2 needs the further split I originally floated to PM —
+the porting-mechanical parts (3 structs, `Rig`'s one call site) are small enough to land alongside
+the real work (9.2's task-owns-the-session restructuring) in one PR, AS LONG AS 9.2's design is
+settled before writing code, not discovered mid-refactor. Sequence:
+1. Land this section's design (channel-owned session) — flagging to PM/ADVERSARY for a read before
+   implementation starts, since it is the one piece of PR2 that is a genuine new concurrency shape
+   rather than a mechanical port, and it is exactly the kind of decision that is cheap to correct on
+   paper and expensive to correct after `reap`/`pump_queue` are rewritten around it.
+2. Implement: `Running` gains the channel sender (replacing `stdin`/`child`/`pgid`'s direct
+   presence — `pgid` still needed for `signal_group`-style kills, so it likely stays, read by the
+   owning task rather than `Running` directly); the owning task replaces `pump_stdout`; `start`
+   spawns via the registry (`agent_cfg.harness` → `Arc<dyn HarnessDriver>`) instead of
+   `self.harness`; `reap`'s classification reads `DriverEvent::Exited`'s `startup_failure` instead
+   of re-deriving it from raw text.
+3. Port the 3 structs + `Rig`'s call site; run the existing 82 tests unchanged and treat any that
+   need edits as a signal to stop and re-check the design, not a normal part of the port.
+4. `has_driver` becomes a registry lookup (mechanical, already described in §4).
+
+No code written yet — sending this for a read before starting, per the same "measure before cutting"
+discipline §7 already committed to.
+
