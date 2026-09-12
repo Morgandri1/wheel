@@ -40,8 +40,22 @@
         }
       ]
     },
+    "refreshable": {
+      "description": "`true` when the engine renews this credential itself before `expires_at`, so the deadline is not the operator's to meet. Omitted when it does not.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "source": {
       "description": "For `mode: \"env\"`, the name of the vault node supplying it. Never the value.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warning": {
+      "description": "Something the operator must act on before the credential stops working — e.g. the last automatic refresh failed. Shown BEFORE the agent is refused, not after.",
       "type": [
         "string",
         "null"

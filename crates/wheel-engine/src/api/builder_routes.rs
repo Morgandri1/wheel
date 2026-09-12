@@ -214,7 +214,7 @@ pub async fn credential_delete(State(s): State<AppState>) -> ApiResult<StatusCod
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{test_state, test_state_under};
+    use crate::api::{test_state, test_state_with};
     use crate::builder::Builder;
     use crate::config::HarnessAuthPolicy;
     use std::path::{Path, PathBuf};
@@ -303,7 +303,7 @@ mod tests {
                 "python3 is required to run the fake harness; a gate that cannot run must fail \
                  rather than look like it passed"
             );
-            let mut state = test_state_under(policy);
+            let mut state = test_state_with(policy, None, |_| {});
             let dir = std::env::temp_dir().join(format!(
                 "wheel-builder-route-{name}-{}-{}",
                 std::process::id(),
@@ -732,7 +732,7 @@ mod tests {
     /// still be changed, instead of at the moment someone wants an answer.
     #[tokio::test]
     async fn an_api_key_only_project_will_not_store_an_oauth_credential_for_the_builder() {
-        let state = test_state_under(HarnessAuthPolicy::ApiKeyOnly);
+        let state = test_state_with(HarnessAuthPolicy::ApiKeyOnly, None, |_| {});
         let refused = credential_put(
             State(state.clone()),
             Json(StoreCredential {
