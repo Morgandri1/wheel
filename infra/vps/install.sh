@@ -43,10 +43,12 @@
 # reasoning, which applies here unchanged.
 #
 # Layout. src and bin are the auto-update hook points (WHEEL_UPDATE_REPO, WHEEL_UPDATE_BIN_DIR):
-#   /opt/wheel/src   git checkout          /opt/wheel/bin    wheeld, wheel
+#   /opt/wheel/src   git checkout          /opt/wheel/bin    wheeld, wheel, and *.prev
 #   /opt/wheel/web   web app server        /opt/wheel/rust   shared Rust toolchain
+#   /opt/wheel/libexec  preflight, ready, doctor, the signup gate (root-owned: /opt/wheel/src is
+#                       wheel-writable under --updatable, and root must not exec from there)
 #   /var/lib/wheel   data, 0700, `wheel`   /var/cache/wheel  build caches, `wheel-build`
-#   /etc/wheel       settings              units: wheeld, wheel-web, caddy
+#   /etc/wheel       settings              units: wheeld, wheel-web, wheel-signup-gate, caddy
 
 set -euo pipefail
 
@@ -119,7 +121,7 @@ while [ $# -gt 0 ]; do
         --dry-run) dry_run=1; shift ;;
         --rollback) rollback=1; shift ;;
         --allow-downgrade) allow_downgrade=1; shift ;;
-        -h | --help) sed -n '6,45p' "$0"; exit 0 ;;
+        -h | --help) sed -n '6,52p' "$0"; exit 0 ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
 done

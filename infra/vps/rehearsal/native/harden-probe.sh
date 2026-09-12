@@ -146,6 +146,34 @@ else
     good "ProtectProc=invisible" "root's /proc is not readable ($(last))"
 fi
 
+# CapabilityBoundingSet= is APPLIED here, and its cost is deliberately NOT measured here.
+#
+# An earlier version of this probe asserted that `ping` stops working. It does not, and finding out
+# why is the reason this comment is long. Two things conspire:
+#
+#   1. ProtectSystem=strict puts the unit in a mount namespace where /usr is nosuid, so the kernel
+#      IGNORES ping's file capability instead of refusing the execve. In a unit with an empty
+#      bounding set and NO mount namespace, `ping` really does die with EPERM -- which is what the
+#      isolated experiment showed, and why the wrong conclusion was easy to reach.
+#   2. Ubuntu 24.04 defaults net.ipv4.ping_group_range to `0 2147483647`, so ping falls back to an
+#      unprivileged ICMP datagram socket and needs no capability at all.
+#
+# And this container cannot measure the real costs either: Docker sets
+# net.ipv4.ip_unprivileged_port_start=0, so binding port 80 succeeds here with no capability, which
+# it would not on a VM. Measuring a capability restriction inside a --privileged container with
+# rewritten sysctls produces confident, wrong answers -- see the Dockerfile header.
+#
+# So what is checked is the honest thing: that systemd really applied an empty bounding set. What
+# it costs is stated in the README from the directive's semantics, not from a measurement this test
+# bed is able to make.
+applied="$(systemctl show -P CapabilityBoundingSet harden-probe 2>/dev/null || true)"
+probe capcheck 'true' || true
+if [ -z "$(systemctl show -P CapabilityBoundingSet harden-probe 2>/dev/null)" ]; then
+    good "CapabilityBoundingSet= is applied" "systemd computed an empty bounding set for the unit"
+else
+    bad "CapabilityBoundingSet= is applied" "systemd computed a NON-empty bounding set ($(systemctl show -P CapabilityBoundingSet harden-probe)) — the directive is missing or overridden"
+fi
+
 echo
 echo "an agent can still work (these MUST succeed):"
 
@@ -174,6 +202,11 @@ if probe procinfo '
     grep -qE "^(processor|CPU)" /proc/cpuinfo || { echo "no /proc/cpuinfo"; exit 1; }
     echo "meminfo $(awk "/MemTotal/{print \$2}" /proc/meminfo)kB, $(nproc) cpus, loadavg $(cut -d" " -f1 /proc/loadavg)"
 '; then good "ProcSubset=all: meminfo/cpuinfo" "$(last)"; else bad "ProcSubset=all: meminfo/cpuinfo" "$(last)"; fi
+
+if probe curlout '
+    curl -fsS -o /dev/null -m 20 https://registry.npmjs.org/ || { echo "curl to the npm registry failed"; exit 1; }
+    echo "https egress works without any capability"
+'; then good "https egress (curl, no capabilities)" "$(last)"; else bad "https egress (curl, no capabilities)" "$(last)"; fi
 
 if probe dns '
     getent hosts github.com | head -1 || { echo "getent failed"; exit 1; }

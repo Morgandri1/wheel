@@ -359,7 +359,7 @@ What is on, and what you will notice:
 | `ProtectSystem=strict` | Everything outside `/var/lib/wheel` is read-only to agents. An agent writing `/usr/local` gets `EROFS`. |
 | `PrivateTmp=yes` | The agent's `/tmp` is not yours. To look inside: `sudo nsenter -t $(systemctl show -P MainPID wheeld) -m ls /tmp` |
 | `ProtectProc=invisible` | `ps` inside the unit shows only `wheel`'s processes. **This does nothing for agent-to-agent isolation** — same-uid siblings stay fully visible. |
-| `CapabilityBoundingSet=` | **`ping` stops working** (Ubuntu ships it with `cap_net_raw+ep`). `curl`, `getent` and `nc` are unaffected. |
+| `CapabilityBoundingSet=` | Nothing in the unit can hold a capability. In practice that means **no raw sockets** (`tcpdump`, `traceroute -I`, `nmap -sS`) and **no binding a port below 1024** — an agent testing a server must use a high port. `ping` is *not* affected, despite carrying `cap_net_raw`: Ubuntu's default `net.ipv4.ping_group_range` lets it use an unprivileged ICMP socket. (An earlier draft of this table claimed otherwise; the rehearsal's own measurement is what corrected it.) |
 | `LimitCORE=0` | No core dump for a `wheeld` crash. Deliberate: a core contains `master.key`, the operator token and every in-flight vault value. To get one temporarily, `systemctl edit wheeld` — and know what you are putting on disk. |
 | `PrivateDevices=yes` | No `/dev/kvm`, `/dev/fuse` or GPU. Ptys still work. |
 
