@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod http;
+pub mod membership;
 pub mod models;
 pub mod orchestrator;
 pub mod routes;
@@ -77,6 +78,9 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/tokens", post(routes::tokens::create))
         .route("/v1/auth/tokens", get(routes::tokens::list))
         .route("/v1/auth/tokens/{id}", delete(routes::tokens::revoke))
+        // Redeeming an invite takes AuthUser, not ProjectScope: the caller is not a member yet.
+        // Outside `/v1/projects/{id}` for the same reason — the invite names the project.
+        .route("/v1/invites/accept", post(routes::members::accept))
         .route("/v1/projects", post(routes::projects::create))
         .route("/v1/projects", get(routes::projects::list))
         // Create + capability-patch + apply + rollback-on-failure, one atomic server sequence —
@@ -93,6 +97,25 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/projects/{id}/stop", post(routes::projects::stop))
         .route("/v1/projects/{id}/restart", post(routes::projects::restart))
         .route("/v1/projects/{id}/ws-ticket", post(routes::ws_ticket::mint))
+        // Membership. Reading is a guest capability; changing anything is admin.
+        .route(
+            "/v1/projects/{id}/members",
+            get(routes::members::list).post(routes::members::grant),
+        )
+        .route(
+            "/v1/projects/{id}/members/{user_id}",
+            delete(routes::members::revoke),
+        )
+        // Invites are admin throughout, listing included: an invite is a credential, so even its
+        // existence and tier are facts about who is about to gain access.
+        .route(
+            "/v1/projects/{id}/invites",
+            get(routes::members::list_invites).post(routes::members::create_invite),
+        )
+        .route(
+            "/v1/projects/{id}/invites/{invite_id}",
+            delete(routes::members::revoke_invite),
+        )
         // Realise a builder-emitted board. Validated against the wire matrix before anything is
         // created; 207 rather than 200 when only part of it landed.
         .route(

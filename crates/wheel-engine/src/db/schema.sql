@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS messages (
     sha256       TEXT NOT NULL,
     bytes        INTEGER NOT NULL,
     reply_to     TEXT,
+    -- The Wheel principal a person asked for this on behalf of, when one did. Only ever written
+    -- from the control plane: an agent on the node-token plane cannot assert an actor, and public
+    -- ingress has none. See crates/wheel-engine/src/api/actor.rs.
+    on_behalf_of TEXT,
     state        TEXT NOT NULL,          -- queued | delivered | consumed
     is_error     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,

@@ -1089,9 +1089,11 @@ mod tests {
         assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 0);
 
         for body in ["one", "two"] {
-            crate::db::messages::enqueue(&c, MessageSender::User, a.id, body.into(), None).unwrap();
+            crate::db::messages::enqueue(&c, MessageSender::User, a.id, body.into(), None, None)
+                .unwrap();
         }
-        crate::db::messages::enqueue(&c, MessageSender::User, b.id, "theirs".into(), None).unwrap();
+        crate::db::messages::enqueue(&c, MessageSender::User, b.id, "theirs".into(), None, None)
+            .unwrap();
 
         assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 2);
         // ...and it is per agent, not a board-wide total.

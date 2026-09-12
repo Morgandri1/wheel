@@ -60,6 +60,13 @@
         "null"
       ]
     },
+    "on_behalf_of": {
+      "description": "The Wheel principal who asked for this message, when a person did.\n\nSet only on the engine control plane, from the `x-wheel-actor-id` header the API adds after stripping anything the client sent under that namespace. It is `None` on the node-token plane and on public ingress, deliberately: an agent cannot assert an actor, and an anonymous webhook has none.\n\n**Known limit (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the engine's environ can call the control plane as the host and set this to anything. That is forged attribution and it closes with per-node uids, not here. An agent that merely steals a *sibling's node token* reaches the CLI plane, where the header is ignored — so that failure is missing attribution rather than forged, which is the better of the two.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "reply_to": {
       "description": "Threading (§3c#9): the message this one replies to.",
       "type": [

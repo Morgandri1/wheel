@@ -548,6 +548,135 @@ impl Node {
     }
 }
 
+/// Board fields that name or carry a credential, removed for a caller below `admin`.
+///
+/// # Why this exists
+///
+/// `GET /v1/board` is a **guest** route (`docs/API.md`, access tiers), and the board JSON is a map
+/// of where a project's secrets live. Before this, a guest received every vault node's key names,
+/// every `vault_ref` naming `<vault>/<KEY>`, and — worst — every `mode: "static"` fill's `value`,
+/// which is an operator-typed secret in plaintext that [`crate::tool::FillMode::Static`]'s own
+/// doc-comment claims is never shown.
+///
+/// That contradicted the tier table in two directions at once: `GET /v1/vault/{id}` is admin
+/// *precisely* because "a map of where the secrets are is still the vault", while the same map
+/// shipped on a guest route. The contradiction is resolved toward the security property.
+///
+/// # What it does and does not remove
+///
+/// It removes the credential *references and values*, never the structure. A guest still sees that
+/// a vault node exists, that a tool field is vault-filled, that an endpoint requires a bearer, and
+/// which repository a workspace clones — because the point of sharing a board is that somebody can
+/// read it. What they cannot learn is *which secret*, which is the thing that turns a shared board
+/// into a target list.
+///
+/// # Why the match is exhaustive
+///
+/// No wildcard arm, deliberately. A new [`NodeConfig`] variant will not compile until somebody
+/// decides what it exposes — the "fix the class, not the instance" rule applied ahead of time,
+/// because the failure mode here is silent and lands on whoever shared their board.
+pub trait RedactCredentials {
+    /// A copy with every credential-bearing field emptied.
+    fn redact_credentials(&self) -> Self;
+
+    /// Whether redaction would change anything, so a response can say so rather than showing an
+    /// empty list that reads as "there are none".
+    fn has_redactable_credentials(&self) -> bool;
+}
+
+impl RedactCredentials for NodeConfig {
+    fn redact_credentials(&self) -> Self {
+        match self {
+            // Key NAMES are the map. Emptied rather than removed: `keys` is a required field, and
+            // a board entry that fails to deserialize is worse than one that says nothing.
+            NodeConfig::Vault(c) => {
+                let _ = c;
+                NodeConfig::Vault(VaultConfig { keys: Vec::new() })
+            }
+
+            // `value` is an operator-typed secret; `vault_ref` names one. `mode` stays, so a
+            // reader still sees that the field is filled and how — just not with what.
+            NodeConfig::Tool(c) => {
+                let mut c = c.clone();
+                for op in c.operations.iter_mut() {
+                    for p in op.params.iter_mut() {
+                        p.fill.value = None;
+                        p.fill.vault_ref = None;
+                    }
+                }
+                NodeConfig::Tool(c)
+            }
+
+            // The variant stays `Bearer`: redacting it to `None` would describe a protected
+            // endpoint as public, which is worse than saying nothing.
+            NodeConfig::Endpoint(c) => {
+                let mut c = c.clone();
+                if let EndpointAuth::Bearer { vault_ref } = &mut c.auth {
+                    vault_ref.clear();
+                }
+                NodeConfig::Endpoint(c)
+            }
+
+            // `env` is a plain map an operator types values into, so it is a credential carrier in
+            // exactly the way a static fill is. The keys go with the values: an env var *name* like
+            // `STRIPE_SECRET_KEY` is the same disclosure as a vault key name.
+            NodeConfig::Mcp(c) => NodeConfig::Mcp(match c.clone() {
+                McpConfig::Stdio { command, args, .. } => McpConfig::Stdio {
+                    command,
+                    args,
+                    env: None,
+                },
+                McpConfig::Http { url, .. } => McpConfig::Http { url, env: None },
+            }),
+
+            // A workspace's `vault_ref` names the git credential. The url and ref stay.
+            NodeConfig::Agent(c) => {
+                let mut c = c.clone();
+                for w in c.workspaces.iter_mut() {
+                    if let Some(git) = w.git.as_mut() {
+                        git.vault_ref = None;
+                    }
+                }
+                NodeConfig::Agent(c)
+            }
+
+            // Nothing credential-bearing. Listed rather than folded into a wildcard so that adding
+            // a field to any of them is a compile-time decision rather than a silent leak.
+            NodeConfig::Ctx(c) => NodeConfig::Ctx(c.clone()),
+            NodeConfig::Table(c) => NodeConfig::Table(c.clone()),
+            NodeConfig::Script(c) => NodeConfig::Script(c.clone()),
+            NodeConfig::Chest(c) => NodeConfig::Chest(c.clone()),
+        }
+    }
+
+    fn has_redactable_credentials(&self) -> bool {
+        match self {
+            NodeConfig::Vault(c) => !c.keys.is_empty(),
+            NodeConfig::Tool(c) => c
+                .operations
+                .iter()
+                .flat_map(|op| op.params.iter())
+                .any(|p| p.fill.value.is_some() || p.fill.vault_ref.is_some()),
+            NodeConfig::Endpoint(c) => {
+                matches!(&c.auth, EndpointAuth::Bearer { vault_ref } if !vault_ref.is_empty())
+            }
+            NodeConfig::Mcp(c) => match c {
+                McpConfig::Stdio { env, .. } | McpConfig::Http { env, .. } => {
+                    env.as_ref().is_some_and(|e| !e.is_empty())
+                }
+            },
+            NodeConfig::Agent(c) => c
+                .workspaces
+                .iter()
+                .any(|w| w.git.as_ref().is_some_and(|g| g.vault_ref.is_some())),
+            NodeConfig::Ctx(_)
+            | NodeConfig::Table(_)
+            | NodeConfig::Script(_)
+            | NodeConfig::Chest(_) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

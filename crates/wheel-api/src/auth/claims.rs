@@ -78,9 +78,10 @@ pub async fn verify(
         }
     }
 
-    if claims.sub.is_empty() {
-        return Err(ApiError::Unauthorized("token has empty sub"));
-    }
+    // The subject becomes `projects.owner_id`, an `x-wheel-actor-id` header and an envelope
+    // attribute. What it may contain is decided once, here, rather than sanitised at each use.
+    super::principal::validate(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("token subject is not a usable principal"))?;
 
     Ok(VerifiedUser {
         user_id: claims.sub,

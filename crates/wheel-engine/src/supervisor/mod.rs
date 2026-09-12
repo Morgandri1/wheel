@@ -2952,6 +2952,7 @@ mod tests {
             to,
             body.to_string(),
             None,
+            None,
         )
         .unwrap();
     }
@@ -4056,6 +4057,7 @@ done
             to,
             body.to_string(),
             None,
+            None,
         )
         .unwrap();
     }
@@ -4071,6 +4073,7 @@ done
             },
             to,
             body.to_string(),
+            None,
             None,
         )
         .unwrap();
@@ -4395,6 +4398,7 @@ done
                 wheel_core::MessageSender::User,
                 id,
                 format!("a body containing {POISON}"),
+                None,
                 None,
             )
             .unwrap()
@@ -4912,6 +4916,7 @@ done
             wheel_core::MessageSender::User,
             to,
             body.to_string(),
+            None,
             None,
         )
         .unwrap()

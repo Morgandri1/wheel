@@ -110,6 +110,14 @@ pub struct Config {
     pub proxy_timeout_secs: u64,
     /// How long to wait for a TCP connection to the host before calling it unreachable.
     pub host_connect_timeout_secs: u64,
+    /// Live WebSocket bridges one project may hold **on this replica** (ADVERSARY 011). Per
+    /// replica, not global: with N replicas the effective ceiling is N times this. It is a
+    /// blast-radius bound rather than a quota, and `docs/API.md` says so.
+    pub ws_max_bridges_per_project: usize,
+    /// Absolute lifetime of a bridge, after which it closes and the client takes a new ws-ticket.
+    /// Defence in depth: it bounds how long a missed revocation can persist even if both the
+    /// notification and the periodic re-check fail.
+    pub ws_max_lifetime_secs: u64,
 }
 
 /// Derive the session signing key from the master key, with domain separation.
@@ -260,6 +268,8 @@ impl Config {
             ingress_body_limit_bytes: parse_or("INGRESS_BODY_LIMIT_BYTES", 5 * 1024 * 1024usize)?,
             proxy_timeout_secs: parse_or("PROXY_TIMEOUT_SECS", 30u64)?,
             host_connect_timeout_secs: parse_or("HOST_CONNECT_TIMEOUT_SECS", 3u64)?,
+            ws_max_bridges_per_project: parse_or("WS_MAX_BRIDGES_PER_PROJECT", 16usize)?,
+            ws_max_lifetime_secs: parse_or("WS_MAX_LIFETIME_SECS", 3600u64)?,
         };
 
         if cfg.host_secret.expose().is_empty() {

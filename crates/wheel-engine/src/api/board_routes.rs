@@ -6,9 +6,11 @@
 
 use axum::{extract::State, http::StatusCode, Json};
 use uuid::Uuid;
+use wheel_core::node::RedactCredentials;
 use wheel_core::{Event, Node, NodeState, NodeType, NodeWithState, Timestamp, WireSpec};
 
 use axum::extract::Path;
+use serde::Deserialize;
 
 use super::{ApiError, ApiResult, AppState, CreateNode, PatchNode};
 use crate::db::board;
@@ -17,13 +19,23 @@ use crate::db::board;
 ///
 /// The only board read. Vault values are never included: a vault node returns
 /// its `config.keys` and nothing else.
-pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+pub async fn get_board(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    // `GET /v1/board` is a GUEST route, and the board is where a project's whole credential map
+    // would otherwise be handed out in one response: vault key names, every `vault_ref` naming
+    // `<vault>/<KEY>`, and every static fill's operator-typed value in plaintext. Below admin the
+    // config is projected — see `wheel_core::node::RedactCredentials` for what goes and what stays.
+    let tier = super::actor::tier_from_headers(&headers);
+    let redact = tier < super::actor::ActorTier::Admin;
+
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let nodes = board::list(&conn).map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let with_state: Vec<NodeWithState> = nodes
+    let with_state: Vec<serde_json::Value> = nodes
         .into_iter()
-        .map(|n| {
+        .map(|mut n| {
             // `state` is present for every node and null for non-agents, so a
             // client can tell "has no state" from "not loaded".
             let state = match n.node_type() {
@@ -32,7 +44,21 @@ pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::
                 )),
                 _ => None,
             };
-            NodeWithState { node: n, state }
+            // `redacted` is emitted so a client can say "hidden — admin only" rather than render an
+            // empty key list, which reads as "this vault has none". Showing nothing and showing
+            // nothing-because-you-may-not-see-it are different facts.
+            let hidden = redact && n.config.has_redactable_credentials();
+            if redact {
+                n.config = n.config.redact_credentials();
+            }
+            let mut v = serde_json::to_value(NodeWithState { node: n, state })
+                .unwrap_or(serde_json::Value::Null);
+            if hidden {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("redacted".into(), serde_json::Value::Bool(true));
+                }
+            }
+            v
         })
         .collect();
 
@@ -40,6 +66,25 @@ pub async fn get_board(State(s): State<AppState>) -> ApiResult<Json<serde_json::
         "nodes": with_state,
         "project": { "id": s.cfg.project_id },
     })))
+}
+
+/// Shared by every test module in this file that calls `get_board` directly: a
+/// `HeaderMap` asserting the named tier, matching what the API's proxy sets
+/// after stripping and re-verifying a caller's real membership
+/// (`wheel-api/src/http/actor.rs::sanitized_with_actor`).
+#[cfg(test)]
+fn headers_for_tier(tier: &str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(
+        "x-wheel-actor-tier",
+        axum::http::HeaderValue::from_str(tier).unwrap(),
+    );
+    h
+}
+
+#[cfg(test)]
+fn admin_headers() -> axum::http::HeaderMap {
+    headers_for_tier("admin")
 }
 
 /// `POST /v1/nodes` → the created `Node`.
@@ -81,6 +126,74 @@ pub async fn create_node(
         at: Timestamp::now(),
     });
     Ok((StatusCode::CREATED, Json(node)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeContent {
+    pub markdown: String,
+}
+
+/// `PUT /v1/nodes/:id/content` — replace a ctx node's markdown, and nothing else.
+///
+/// # Why this route exists rather than a rule about `PATCH /v1/nodes/:id`
+///
+/// A prompter's job is to "manage context, and prompt agents" (operator ruling, 2026-09-11), while
+/// the board's *shape* — creating, deleting, rewiring, and agent config such as model, budget and
+/// harness — is admin. `PATCH /v1/nodes/:id` carries `name`, `position` and `config` in one body,
+/// so ctx content and agent config arrive through the same door.
+///
+/// Letting a prompter through that door conditionally would mean the API authorising on a request
+/// *body* — parsing node config to decide permissions, duplicating engine knowledge, and deciding
+/// about one thing while the engine acts on another. That is the confusion `extractor.rs` refuses
+/// for `x-project-id`, and it is how a tier acquires the conditional powers the ruling forbids.
+///
+/// So the narrow door is a separate path, and `auth::policy` stays a pure `(method, path)` table.
+/// Same idiom as `PUT /v1/vault/:id/:key`, and the same principle `table_routes` states: the
+/// operator gets exactly the same box an agent does — this is `wheel write` against a ctx node,
+/// minus the wire check, because the caller is not a node and has no wires.
+pub async fn put_content(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<NodeContent>,
+) -> ApiResult<Json<Node>> {
+    if body.markdown.len() > wheel_core::MAX_VALUE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            format!(
+                "content is {} bytes; the limit is {}",
+                body.markdown.len(),
+                wheel_core::MAX_VALUE_BYTES
+            ),
+        ));
+    }
+
+    let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
+    let node = board::get(&conn, id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(id.to_string()))?;
+
+    // Only a ctx node has operator-editable content. Refusing by node *type* rather than by
+    // ignoring the field keeps the route's meaning narrow: it can never become a second way to
+    // patch something a prompter is not allowed to patch.
+    if !matches!(node.config, wheel_core::NodeConfig::Ctx(_)) {
+        return Err(ApiError::invalid(format!(
+            "{} is {} {}, and only a ctx node has editable content",
+            node.name,
+            node.node_type().article(),
+            node.node_type()
+        )));
+    }
+
+    let mut updated = node;
+    updated.config = wheel_core::NodeConfig::Ctx(wheel_core::CtxConfig {
+        markdown: body.markdown,
+    });
+    board::update(&conn, &updated)?;
+    s.events.publish(Event::BoardChanged {
+        at: Timestamp::now(),
+    });
+    Ok(Json(updated))
 }
 
 /// `PATCH /v1/nodes/:id` — partial update of name, position and/or config.
@@ -661,7 +774,7 @@ mod budget_status_tests {
             id
         };
 
-        let resp = get_board(State(state)).await.unwrap().0;
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
         let node = resp["nodes"]
             .as_array()
             .unwrap()
@@ -684,7 +797,7 @@ mod budget_status_tests {
             mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()))
         };
 
-        let resp = get_board(State(state)).await.unwrap().0;
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
         let node = resp["nodes"]
             .as_array()
             .unwrap()
@@ -792,5 +905,338 @@ mod ctx_patch_size_limit_tests {
             StatusCode::OK,
             "the limit is inclusive, matching wheel-core's own boundary test"
         );
+    }
+}
+
+/// ADVERSARY finding 054: `GET /v1/board` is a guest-reachable route (the proposal's own words --
+/// "a guest cannot ... read or write any vault value -- including the list of key names" -- and the
+/// policy table's `v1/board => Guest`), so the ONLY thing standing between a guest and every vault's
+/// key names is this handler's own redaction. `wheel-core/tests/redaction.rs` proves
+/// `RedactCredentials` empties a `VaultConfig`'s `keys` in isolation; nothing before this proved the
+/// route actually calls it for a non-admin caller -- the two calls to `get_board` elsewhere in this
+/// file did not even compile against the current signature until this change, so nothing here had
+/// run at all.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use wheel_core::{NodeConfig, Position, VaultConfig};
+
+    fn vault_node(conn: &rusqlite::Connection, name: &str, keys: &[&str]) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: keys.iter().map(|s| s.to_string()).collect(),
+            }),
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    fn vault_of(resp: &serde_json::Value, id: Uuid) -> &serde_json::Value {
+        resp["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id.to_string())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guest_never_sees_a_vaults_key_names() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(
+            node["config"]["keys"],
+            serde_json::json!([]),
+            "a guest must not learn any key name: {node}"
+        );
+        assert_eq!(
+            node["redacted"], true,
+            "a guest must be told the vault is hidden, not shown an empty list that reads as \
+             'this vault has none': {node}"
+        );
+    }
+
+    /// The same as above, once more for `prompter`: redaction is "below admin", not "guest only" --
+    /// a two-branch `match` on tier would have been an easy place to leave prompter unredacted by
+    /// accident.
+    #[tokio::test]
+    async fn a_prompter_never_sees_a_vaults_key_names_either() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY"])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("prompter"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(node["config"]["keys"], serde_json::json!([]));
+        assert_eq!(node["redacted"], true);
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_the_real_key_names() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        };
+
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(
+            node["config"]["keys"],
+            serde_json::json!(["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        );
+        assert!(
+            node.get("redacted").is_none(),
+            "an admin's own board must not claim anything was hidden from them: {node}"
+        );
+    }
+
+    /// A request with no tier header at all is the fail-closed case
+    /// `tier_from_headers` documents: treated as guest, not as admin. This is
+    /// what a caller that reached the engine WITHOUT going through the API's
+    /// proxy (and therefore without a verified tier) gets.
+    #[tokio::test]
+    async fn a_request_asserting_no_tier_at_all_is_treated_as_a_guest() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY"])
+        };
+
+        let resp = get_board(State(state), axum::http::HeaderMap::new())
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(node["config"]["keys"], serde_json::json!([]));
+    }
+
+    /// A vault with no keys at all is not "redacted" -- there is nothing to hide, and claiming
+    /// otherwise would tell a guest a credential exists when it does not.
+    #[tokio::test]
+    async fn an_empty_vault_is_not_reported_as_redacted() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "empty", &[])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert!(
+            node.get("redacted").is_none(),
+            "an empty vault has nothing to redact: {node}"
+        );
+    }
+
+    /// The reviewer's finding named this specifically: a Tool node's `fill.value` is an
+    /// operator-typed plaintext secret ("Bearer sk_live_..."), and `fill.vault_ref` names where a
+    /// vault-mode fill's credential lives. `RedactCredentials` already empties both for
+    /// `NodeConfig::Tool` (`wheel-core/src/node.rs`); this proves `get_board` actually reaches that
+    /// arm for a non-admin caller, not only that the trait impl is correct in isolation
+    /// (`wheel-core/tests/redaction.rs` already covers that half).
+    fn tool_node(conn: &rusqlite::Connection, name: &str) -> Uuid {
+        use wheel_core::{
+            Fill, FillMode, ParamLocation, ToolConfig, ToolFormat, ToolKind, ToolMethod,
+            ToolOperation, ToolParam, ToolSource,
+        };
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Tool(ToolConfig {
+                kind: ToolKind::Http,
+                source: ToolSource {
+                    format: ToolFormat::Manual,
+                    raw: String::new(),
+                    imported_at: Timestamp::now(),
+                },
+                base_url: "https://api.stripe.com".into(),
+                operations: vec![ToolOperation {
+                    id: "charge".into(),
+                    method: ToolMethod::Post,
+                    path: "/v1/charges".into(),
+                    summary: None,
+                    enabled: true,
+                    params: vec![
+                        ToolParam {
+                            name: "Authorization".into(),
+                            location: ParamLocation::Header,
+                            required: true,
+                            description: None,
+                            schema: None,
+                            fill: Fill {
+                                mode: FillMode::Static,
+                                value: Some("Bearer sk_live_topsecret".into()),
+                                vault_ref: None,
+                            },
+                        },
+                        ToolParam {
+                            name: "X-Api-Key".into(),
+                            location: ParamLocation::Header,
+                            required: true,
+                            description: None,
+                            schema: None,
+                            fill: Fill {
+                                mode: FillMode::Vault,
+                                value: None,
+                                vault_ref: Some("creds/STRIPE_SECRET".into()),
+                            },
+                        },
+                    ],
+                }],
+            }),
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    fn fills_of(node: &serde_json::Value) -> &Vec<serde_json::Value> {
+        node["config"]["operations"][0]["params"]
+            .as_array()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guest_never_sees_a_tools_static_secret_or_vault_ref() {
+        let state = crate::api::test_state();
+        let tool = {
+            let conn = state.db.lock().unwrap();
+            tool_node(&conn, "stripe")
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, tool);
+        let params = fills_of(node);
+        assert_eq!(
+            params[0]["fill"].get("value"),
+            None,
+            "the static Bearer value must never reach a guest: {node}"
+        );
+        assert_eq!(
+            params[1]["fill"].get("vault_ref"),
+            None,
+            "the vault ref must never reach a guest either -- it names where the credential \
+             lives: {node}"
+        );
+        // The mode stays: a reader must still see the field is filled and how, per
+        // RedactCredentials's own doc comment -- just not with what.
+        assert_eq!(params[0]["fill"]["mode"], "static");
+        assert_eq!(params[1]["fill"]["mode"], "vault");
+        assert_eq!(node["redacted"], true);
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_a_tools_real_fills() {
+        let state = crate::api::test_state();
+        let tool = {
+            let conn = state.db.lock().unwrap();
+            tool_node(&conn, "stripe")
+        };
+
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
+        let node = vault_of(&resp, tool);
+        let params = fills_of(node);
+        assert_eq!(params[0]["fill"]["value"], "Bearer sk_live_topsecret");
+        assert_eq!(params[1]["fill"]["vault_ref"], "creds/STRIPE_SECRET");
+    }
+
+    /// An endpoint's bearer `vault_ref` is the same disclosure shape: it names the vault key that
+    /// would authenticate a webhook call.
+    #[tokio::test]
+    async fn a_guest_never_sees_an_endpoints_bearer_vault_ref() {
+        use wheel_core::{EndpointAuth, EndpointConfig, HttpMethod, ResponseMode};
+        let state = crate::api::test_state();
+        let ep = {
+            let n = Node::new(
+                Uuid::new_v4(),
+                "hook".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Endpoint(EndpointConfig {
+                    method: HttpMethod::Post,
+                    path: "/hook".into(),
+                    response_mode: wheel_core::ResponseMode::Ack,
+                    auth: EndpointAuth::Bearer {
+                        vault_ref: "creds/WEBHOOK_SECRET".into(),
+                    },
+                }),
+            );
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &n).unwrap();
+            let _ = ResponseMode::Ack;
+            n.id
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, ep);
+        assert_eq!(
+            node["config"]["auth"]["vault_ref"], "",
+            "a guest must not learn which vault key authenticates this webhook: {node}"
+        );
+        // Still reported as `Bearer`, not silently downgraded to `none` -- describing a protected
+        // endpoint as public would be worse than saying nothing.
+        assert!(node["config"]["auth"].get("vault_ref").is_some());
+    }
+
+    /// An MCP node's `env` is operator-typed values keyed by names an agent could otherwise infer a
+    /// credential's shape from (`STRIPE_SECRET_KEY`), so the whole map goes, not just the values.
+    #[tokio::test]
+    async fn a_guest_never_sees_an_mcp_nodes_env() {
+        use wheel_core::{McpConfig, NodeConfig as NC};
+        let state = crate::api::test_state();
+        let mcp = {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("STRIPE_SECRET_KEY".to_string(), "sk_live_x".to_string());
+            let n = Node::new(
+                Uuid::new_v4(),
+                "stripe_mcp".parse().unwrap(),
+                Position::default(),
+                NC::Mcp(McpConfig::Stdio {
+                    command: "stripe-mcp".into(),
+                    args: None,
+                    env: Some(env),
+                }),
+            );
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &n).unwrap();
+            n.id
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, mcp);
+        assert!(
+            node["config"].get("env").is_none(),
+            "a guest must not see the mcp env map, key names included: {node}"
+        );
+        assert_eq!(node["redacted"], true);
     }
 }

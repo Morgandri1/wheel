@@ -90,6 +90,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     // statements are CREATE ... IF NOT EXISTS and never touch a table that
     // already exists.
     add_column(conn, "vault_values", "expires_at TEXT")?;
+    add_column(conn, "messages", "on_behalf_of TEXT")?;
     snap_positions_to_cells(conn)?;
     Ok(())
 }

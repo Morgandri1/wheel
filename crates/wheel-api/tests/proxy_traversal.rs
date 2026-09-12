@@ -114,6 +114,8 @@ fn cfg(db_url: &str, host_url: &str) -> Config {
         ingress_body_limit_bytes: 5 * 1024 * 1024,
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
+        ws_max_bridges_per_project: 16,
+        ws_max_lifetime_secs: 3600,
     }
 }
 
@@ -226,6 +228,8 @@ async fn harness() -> Harness {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         // The real host URL layout, not a direct engine: that layout is what the bug escaped.
         engine_base_override: None,
+        membership: wheel_api::membership::MembershipEvents::new(),
+        bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     let app = wheel_api::build_router(state, &[]);
 
@@ -360,28 +364,37 @@ async fn ambiguous_segments_are_refused_without_echoing_the_path() {
 async fn ordinary_engine_paths_and_queries_reach_the_callers_own_project() {
     let h = harness().await;
     let mine = &h.mine;
-    for (suffix, target) in [
+    // Method matters now: `auth::policy` is default-DENY and keys on (method, path), so a case here
+    // has to name a method the engine actually serves on that path. `v1/nodes` was a GET, which no
+    // engine route serves and no policy row grants — it only ever worked because the recording host
+    // answers anything. Changed to POST, which is the real route, and which leaves what this test is
+    // about — that a query string and an encoded slash survive the hop intact — exactly as it was.
+    for (method, suffix, target) in [
         (
+            "GET",
             "v1/board",
             format!("/host/v1/projects/{mine}/engine/v1/board"),
         ),
         (
+            "POST",
             "v1/nodes?dry_run=1&tag=a%2Fb",
             format!("/host/v1/projects/{mine}/engine/v1/nodes?dry_run=1&tag=a%2Fb"),
         ),
         (
+            "GET",
             "v1/vault/some%20key",
             format!("/host/v1/projects/{mine}/engine/v1/vault/some%20key"),
         ),
         (
+            "GET",
             "v1/board/",
             format!("/host/v1/projects/{mine}/engine/v1/board/"),
         ),
     ] {
         let uri = format!("/v1/projects/{mine}/engine/{suffix}");
-        let (status, body) = call(&h.app, "GET", &uri, Some(&h.alice)).await;
-        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
-        assert_eq!(h.log.take(), vec![target], "{uri}");
+        let (status, body) = call(&h.app, method, &uri, Some(&h.alice)).await;
+        assert_eq!(status, StatusCode::OK, "{method} {uri}: {body}");
+        assert_eq!(h.log.take(), vec![target], "{method} {uri}");
     }
 }
 

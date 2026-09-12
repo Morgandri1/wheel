@@ -167,7 +167,7 @@ a `400`, not an ignored key: check `features` first.
 
 | Feature id | What it guarantees |
 |---|---|
-| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id` |
+| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id`, `PUT /v1/nodes/:id/content` |
 | `wires` | `POST`/`DELETE /v1/wires` |
 | `messages` | `POST /v1/agents/:id/send` |
 | `inbox` | `GET /v1/agents/:id/inbox`, `GET /v1/agents/:id/inbox/:message_id` |
@@ -193,6 +193,7 @@ Each id is held to its row by a test that calls the routes or creates an agent c
 | `GET /v1/board` | → `{ nodes: NodeWithState[], project: {id, name, capabilities} }` | M1 |
 | `POST /v1/nodes` | `{name, type, config, position}` → `Node` | M1 |
 | `PATCH /v1/nodes/:id` | `{name?, position?, config?}` (partial) → `Node` | M1 |
+| `PUT /v1/nodes/:id/content` | `{markdown}` → `Node` | M1 |
 | `DELETE /v1/nodes/:id` | → `204` | M1 |
 | `POST /v1/wires` | `WireSpec {from,to,type}` → `204` | M1 |
 | `DELETE /v1/wires` | `WireSpec` → `204` | M1 |
@@ -686,6 +687,30 @@ Exactly these bytes, as the `text` of a stream-json user turn:
 ```
 
 `reply_to="<uuid>"` is added to the open tag when the message is a reply (M2).
+
+`on_behalf_of="<principal>"` is added when a *person* asked for the message, after `reply_to`. Both
+optional attributes append after the three that are always present, so anything anchored on the
+opening `<AgentPrompt id="…" from="…" type="…"` prefix keeps reading the same thing.
+
+Which plane a message arrived on decides whether it carries one, and the rules are not symmetrical:
+
+| Plane | `on_behalf_of` |
+|---|---|
+| `/v1/*` control plane (engine secret; the API's hop) | the `x-wheel-actor-id` the API set, re-validated by the engine |
+| `/v1/cli/*` (node tokens) | **absent** — the header is not read at all, so an agent cannot assert an actor |
+| `/ingress/*` (public) | absent — the hit is anonymous and already `type=endpoint` |
+
+The value is generated from the message row, never interpolated from a body, and a principal's
+charset excludes quotes, whitespace and control characters — so it cannot close the attribute. The
+engine re-applies that check rather than trusting the API, because a layer that assumes the other
+one ran is not a layer (ADVERSARY 009).
+
+**Known limit, not fixed here (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the
+engine's environ — confirmed by run on the single-uid backend — can call the control plane *as the
+host* and set this attribute to anything. That is forged attribution and it closes with per-node
+uids, not here. An agent that merely steals a *sibling's node token* reaches the CLI plane, where the
+header is ignored, so that failure is **missing** attribution rather than forged — which is the
+better of the two, and is why the plane rules are asymmetrical on purpose.
 
 Attribution is **engine-generated and unforgeable**: the `from`/`type` attributes come from the resolved sender
 node, never from anything the sender controls. A body containing `</AgentPrompt>` (any case) has the `/` escaped
