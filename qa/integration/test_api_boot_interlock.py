@@ -86,6 +86,21 @@ def main():
 
     # An EMPTY dev secret must be treated as absent, never as an empty HMAC key —
     # an empty key would make every forged token verify.
+    #
+    # This check is a weaker, black-box proxy for that guarantee: it only confirms the
+    # image still boots and says nothing alarming, not that no forged token would actually
+    # verify (that would need a live, network-attached container and a forged HS256 token —
+    # this image runs with --network none). What actually closes the guarantee is that
+    # AUTH_DEV_SECRET has exactly one read in the whole workspace, crates/wheel-api/src/
+    # config.rs:165 (`.filter(|s| !s.is_empty())`, empty -> None), and exactly one consumer,
+    # crates/wheel-api/src/auth/claims.rs:58 (`cfg.dev_secret.as_deref().ok_or(...)`, no
+    # fallback to an empty key) — verified by API and independently re-verified here
+    # (2026-09-12, PR #85 discussion) by grepping every AUTH_DEV_SECRET/dev_secret
+    # reference in crates/. An empty string cannot reach the verifier as a live key because
+    # there is no second path for it to travel. IF THAT EVER STOPS BEING TRUE — a second
+    # read of AUTH_DEV_SECRET or dev_secret appears anywhere outside those two lines — this
+    # check's coverage claim needs revisiting, because it would no longer be backed by a
+    # single-normalization-point argument.
     rc, out = boot({"WHEEL_ENV": "prod", "AUTH_DEV_SECRET": ""})
     R.check("API-dev-interlock-boot/empty-secret",
             rc is None or "AUTH_DEV_SECRET" not in out,
