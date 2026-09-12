@@ -354,24 +354,34 @@ impl Supervisor {
         )
         .await?;
 
-        // THE RULE for everything below: any outcome other than "exit 0 AND a
-        // readable store that passes the gate" means the refresh token we sent
-        // is irreversibly gone -- the server spent it whether or not the CLI
-        // managed to write the result. So the vault keeps the old pair (which
-        // is now dead) and the next attempt gets a 400, which is permanent and
-        // parks with a reason. There is nothing to "retry into" here; the only
-        // recovery is a person signing in.
+        // THE RULE for everything below, corrected from an earlier version of
+        // this comment that no longer matched the code (ADVERSARY, #72 round
+        // 1): a failed exchange does not automatically mean R is gone for
+        // good, because the server is not guaranteed to rotate it on every
+        // attempt (§2's `refresh_token: F = e`) — so most failure shapes here
+        // ARE worth a retry with the same refresh token, not only the CLI
+        // failures classified transient by `classify_refresh_failure` above
+        // this call.
+        //
+        // A failure reading what a successful CLI exit actually wrote (this
+        // next line) is ours to classify, and it stays `permanent: false,
+        // ambiguous: false` — retried on the `retry` timer for as long as the
+        // CURRENT token is still usable, never bounded by the attempt cap,
+        // because there is no server signal here at all: whether R survived a
+        // truncated or unwritable local write (§2's own
+        // writer-clears-before-it-writes hazard) is not something this
+        // failure shape can tell us either way.
         let mut next = crate::auth::read_session(&scratch.0)
             .map_err(|e| failed(format!("the renewed login could not be read: {e}"), false))?;
         next.carry_forward(prev);
-        // A candidate that fails this gate is not automatically a dead grant:
-        // the server is not guaranteed to rotate the refresh token on every
-        // exchange (§2), so a rejection that is not itself security-relevant
-        // (a bad read, a stale expiry) may pass on a genuine retry with the
-        // SAME refresh token. Only `RefreshRejected::is_permanent` — a wrong
-        // identity or a narrower grant than before — stops retrying outright;
-        // everything else is `ambiguous`, bounded by the attempt cap exactly
-        // like a CLI failure nothing could read.
+        // A store that DOES read is a different question, decided by
+        // `RefreshRejected::is_permanent` below: only a wrong identity or a
+        // narrower grant than before stops retrying outright. Everything else
+        // is `ambiguous`, bounded by the attempt cap exactly like a CLI
+        // failure nothing could read — there is no cheap way from here to
+        // know whether the exchange that produced THIS candidate actually
+        // spent R, so retrying it is a bet bounded by the cap, never an
+        // assumption that it is free.
         if let Err(why) = crate::auth::check_refresh(prev, &next, now_ms()) {
             let permanent = why.is_permanent();
             return Err(RefreshFailure {
