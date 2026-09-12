@@ -345,6 +345,35 @@ rather than treated as a later phase:**
    piece of work once the mechanism spikes land, not squeezed into this PR's remaining scope. The
    convergence is the target; this PR is the first, already-shipped step toward it, not a competing
    "harden the shared container instead" path that needs to be walked back.
+4. **Confirmed not mutually exclusive (ADVERSARY): this isn't a Shape-2-style hard conflict, because
+   Shape 1 and Shape 3 sit on different axes and stack.** Shape 1 hardens what the whole container can
+   do to the host; Shape 3 adds a boundary INSIDE that container between projects. Not theoretical —
+   `wheel-host`'s own container already runs both today (hardened at the Railway/host level, and
+   internally spawning per-project sandboxes via `DockerSandbox`). Converging `wheeld` onto Shape 3 is
+   converging it onto an architecture this codebase already runs successfully, not inventing a new
+   combination and hoping it holds.
+5. **The one concrete adjustment Shape 1 needs to make room for, not a blocker but worth landing
+   correctly (ADVERSARY):** Shape 3's per-project `setuid`/`setgid` (§3's `process.rs` pattern) needs
+   `wheeld` to hold `CAP_SETUID`/`CAP_SETGID` — dropping privilege to a project's uid is impossible
+   without it. Item 2's `cap_drop: [ALL]`, nothing added back for `wheeld` is correct **today** (§ item
+   2's table — `wheeld` never calls setuid/setgid yet) and should ship exactly as scoped; the one line
+   this adds back is `wheeld`'s own row gaining `cap_add: [SETUID, SETGID]` **when, and only when, Shape
+   3's actual spawn code lands**, with the same inline justification `docker.rs` now carries post-#83
+   ("wheeld drops each per-project sandbox to its own uid, which needs exactly these two and nothing
+   else"). That is the mirror image of the bug #83 fixed — a grant landing WITH real code behind it,
+   not a grant sitting unused waiting for code that never showed up. No reason to sequence-block item 2
+   on this; it is a one-line follow-up gated on Shape 3's spawn code existing, not a redesign.
+6. **One interaction to verify, not assume, if userns-remap (item 5, still proposal-only) is EVER
+   adopted alongside Shape 3 (ADVERSARY):** they are two different uid-remapping layers — userns-remap
+   at the Docker/host level (the whole container's uid range remapped), Shape 3's internal
+   `setuid`/`setgid` at `wheeld`'s own process level (project A → uid X, project B → uid Y, inside that
+   remapped container). Stacking two remapping layers is exactly the shape of bug that produces an
+   off-by-mapping error nobody notices until it accidentally grants MORE host privilege than intended,
+   not less. Not asserting it breaks — there is no way to test the actual mapping arithmetic from this
+   sandbox — but per this document's own "measured, not assumed" standard (§ items 2 and 4's live-run
+   requirements), userns-remap and Shape 3 must not ship together without an explicit test proving what
+   HOST uid a Shape-3-dropped-to-uid-Y process actually runs as once userns-remap is also active. This
+   is a gate on combining item 5 with the convergence, not a reason to hold either back individually.
 
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
@@ -360,7 +389,7 @@ Per service, what was actually checked before writing `cap_drop`/`cap_add` (not 
 | Service | Runs as | What it does | Capability needed | `cap_add` |
 |---|---|---|---|---|
 | `preflight` | `caddy:2` image, `network_mode: none` | Shell script validating env vars (`preflight.sh`) | none | — |
-| `wheeld` | fixed uid 10001 (`docker/Dockerfile.wheeld` `USER 10001`) | Never calls setuid/setgid; the embedded sandbox backend runs every agent as **wheeld's own uid** too (`crates/wheeld/src/embedded.rs`'s doc comment: "the tenants are all the same person" — single-tenant by design, a stated boundary, not F007 scope) | none | — |
+| `wheeld` | fixed uid 10001 (`docker/Dockerfile.wheeld` `USER 10001`) | Never calls setuid/setgid; the embedded sandbox backend runs every agent as **wheeld's own uid** too (`crates/wheeld/src/embedded.rs`'s doc comment: "the tenants are all the same person" — single-tenant by design, a stated boundary, not F007 scope) | none today — **will need `CAP_SETUID`/`CAP_SETGID` the moment Shape 3's per-project setuid lands (§ "Combining Shape 1 and Shape 3", point 5, ADVERSARY)**, added then with the same inline justification `docker.rs` carries post-#83, not before | — |
 | `verify-signup-gate` | `curlimages/curl` image | Shell script, one `curl` call (`verify-signup-gate.sh`) | none | — |
 | `web` | fixed uid 10001 (`docker/Dockerfile.web` `USER 10001`) | `node server.js` on an unprivileged port (3000) | none | — |
 | `caddy` | root (official `caddy:2` image default) | Binds `:80`/`:443` (privileged ports), ACME (HTTP-01/TLS-ALPN, same two ports), writes certs to its own volumes | `CAP_NET_BIND_SERVICE` (root loses low-port binding once `cap_drop: ALL` removes it too — dropping ALL from root is not equivalent to leaving root alone) | `["NET_BIND_SERVICE"]` |
@@ -492,6 +521,14 @@ condition: it needs a `rehearse.sh` run with `userns-remap` actually enabled on 
 machine before it ships, specifically to catch the volume-ownership interaction above rather than
 finding it in production. **Proposing it; not implementing it in this document** — Morgan's call
 given it is a daemon-wide setting on the one host everything already runs on.
+
+**Second condition, added once Shape 3's convergence is in play (ADVERSARY):** userns-remap and
+Shape 3's internal per-project `setuid`/`setgid` are two different uid-remapping layers stacked on
+top of each other (host-level container remap, then `wheeld`'s own process-level per-project remap
+inside it) — see "Combining Shape 1 and Shape 3", point 6. Do not enable both together without an
+explicit test proving what HOST uid a Shape-3-dropped-to-uid-Y process actually runs as under
+userns-remap; the two conditions are independent and both must hold before combining all three
+(userns-remap + Shape 1's cap posture + Shape 3).
 
 ## 6. Read-only rootfs with explicit writable mounts — proposal, not a decision
 
