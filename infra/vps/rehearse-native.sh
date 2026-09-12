@@ -255,14 +255,25 @@ if run_phase serve && { [ "$installed" = 1 ] || [ "$only" = serve ]; }; then
 
     # The guarantee that weakening must NOT have cost: a failing gate still keeps the board from
     # starting. Asserted by actually breaking the gate, not by reading the unit file.
+    # The gate must be STOPPED as well as broken, or this proves nothing. It is a oneshot with
+    # RemainAfterExit=yes, so after a successful install it sits in `active (exited)` and
+    # Requires= is satisfied without systemd ever running it again -- wheel-web started happily in
+    # front of a gate rigged to fail, and the check reported a guarantee that had not been tested.
+    #
+    # That is also a REAL property worth naming rather than only a flaw in the check: the gate
+    # verifies on every BOOT, not on every wheel-web restart. Exactly the same is true of compose's
+    # `depends_on`, which gates starting a service and never re-checks one already up -- see the
+    # header of verify-signup-gate.sh.
     check gate-still-blocks-the-board "a failing signup gate still stops the board starting" \
-        dex bash -c 'systemctl stop wheel-web >/dev/null 2>&1
+        dex bash -c 'systemctl stop wheel-web wheel-signup-gate >/dev/null 2>&1
             mkdir -p /etc/systemd/system/wheel-signup-gate.service.d
             printf "[Service]\nExecStart=\nExecStart=/bin/false\n" > /etc/systemd/system/wheel-signup-gate.service.d/99-break.conf
             systemctl daemon-reload; systemctl reset-failed wheel-signup-gate >/dev/null 2>&1
             systemctl start wheel-web >/dev/null 2>&1 && started=1 || started=0
             rm -f /etc/systemd/system/wheel-signup-gate.service.d/99-break.conf
-            systemctl daemon-reload; systemctl reset-failed wheel-signup-gate >/dev/null 2>&1
+            rmdir /etc/systemd/system/wheel-signup-gate.service.d 2>/dev/null
+            systemctl daemon-reload; systemctl reset-failed wheel-signup-gate wheel-web >/dev/null 2>&1
+            systemctl start wheel-signup-gate >/dev/null 2>&1
             systemctl start wheel-web >/dev/null 2>&1
             [ "$started" = 0 ] || { echo "wheel-web started even though the signup gate failed"; exit 1; }'
 

@@ -322,15 +322,32 @@ elif probe build '
 
 # Optional tier: the heaviest thing an agent does on this box is compile Rust (a wheel-on-wheel
 # board does exactly that). Skipped loudly rather than silently when no toolchain is present.
-if ! command -v cargo >/dev/null 2>&1; then
-    meh "cargo build" "no Rust toolchain in this test bed (rehearse-native.sh installs one)"
-elif probe cargo '
-    cd "$HOME/harden-probe" || exit 1
-    export CARGO_HOME="$HOME/harden-probe/.cargo"
-    cargo new --quiet --bin crate 2>&1 | tail -2
-    cd crate && cargo build --quiet --offline 2>&1 | tail -3
+# install.sh puts the shared toolchain under /opt/wheel/rust rather than on the default PATH, so
+# `command -v cargo` finds nothing even on a fully installed box -- which made this tier skip after
+# a real install and, because a skip is a failure here, failed the whole phase. Look where the
+# installer actually puts it, and hand the probe unit the same environment the ENGINE gives an
+# agent: PATH plus RUSTUP_HOME, with a writable CARGO_HOME under the data dir.
+#
+# RUSTUP_HOME is load-bearing and is the same trap `make image-verify-prod` guards for the Docker
+# image: the toolchain is a+rX so the service user can RUN it but not WRITE it, and without
+# RUSTUP_HOME the rustup shim cannot find a toolchain at all.
+cargo_bin=""
+if command -v cargo >/dev/null 2>&1; then
+    cargo_bin="$(command -v cargo)"
+elif [ -x /opt/wheel/rust/cargo/bin/cargo ]; then
+    cargo_bin=/opt/wheel/rust/cargo/bin/cargo
+fi
+if [ -z "$cargo_bin" ]; then
+    meh "cargo build" "no Rust toolchain on this box (rehearse-native.sh's install phase provides one)"
+elif probe cargo "
+    cd \"\$HOME/harden-probe\" || exit 1
+    export PATH=$(dirname "$cargo_bin"):\$PATH
+    export RUSTUP_HOME=\${RUSTUP_HOME:-/opt/wheel/rust/rustup}
+    export CARGO_HOME=\"\$HOME/harden-probe/.cargo\"
+    $cargo_bin new --quiet --bin crate 2>&1 | tail -2
+    cd crate && $cargo_bin build --quiet --offline 2>&1 | tail -3
     ./target/debug/crate
-'; then good "cargo build" "$(last)"; else bad "cargo build" "$(last)"; fi
+"; then good "cargo build (the heaviest agent workload)" "$(last)"; else bad "cargo build (the heaviest agent workload)" "$(last)"; fi
 
 echo
 echo "resource limits are applied (not just written):"
