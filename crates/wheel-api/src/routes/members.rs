@@ -12,7 +12,7 @@
 //! viewing. Invites are admin even to *list*, because an invite is a credential and its existence,
 //! tier and expiry are facts about who is about to gain access.
 
-use crate::auth::{ProjectScope, Tier};
+use crate::auth::{AdminScope, ProjectScope, Tier};
 use crate::error::{ApiError, ApiResult};
 use crate::membership;
 use crate::state::AppState;
@@ -51,10 +51,9 @@ pub struct GrantMember {
 /// `POST /v1/projects/{id}/members`
 pub async fn grant(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    AdminScope(scope): AdminScope,
     Json(body): Json<GrantMember>,
 ) -> ApiResult<(StatusCode, Json<membership::Member>)> {
-    scope.require(Tier::Admin)?;
     let tier = parse_tier(&body.role)?;
     let member = membership::grant(
         &state.db,
@@ -111,10 +110,9 @@ pub struct CreatedInvite {
 /// `POST /v1/projects/{id}/invites`
 pub async fn create_invite(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    AdminScope(scope): AdminScope,
     Json(body): Json<NewInvite>,
 ) -> ApiResult<(StatusCode, Json<CreatedInvite>)> {
-    scope.require(Tier::Admin)?;
     let tier = parse_tier(&body.role)?;
     let issued = membership::create_invite(
         &state.db,

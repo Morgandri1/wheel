@@ -20,7 +20,6 @@ use crate::apply::{
     execute, validate, ApplyPolicy, ApplyReport, BoardClient, EmittedBoard, EmittedNode,
     ExistingBoard, ExistingNode, Plan, Refusal, WireRef,
 };
-use crate::auth::extractor::ProjectScope;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::extract::State;
@@ -310,11 +309,10 @@ async fn read_board(client: &HttpBoardClient) -> ApiResult<ExistingBoard> {
 
 pub async fn apply_board(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    crate::auth::AdminScope(scope): crate::auth::AdminScope,
     Json(req): Json<ApplyRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     // Applying a board creates, patches and wires nodes: it is board structure, which is admin.
-    scope.require(crate::auth::Tier::Admin)?;
     let client = HttpBoardClient::new(&state, &scope.project.id, &scope.user, scope.tier);
     let existing = read_board(&client).await?;
 

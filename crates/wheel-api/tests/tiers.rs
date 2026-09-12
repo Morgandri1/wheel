@@ -1243,3 +1243,65 @@ async fn a_role_this_build_cannot_parse_is_refused_rather_than_rounded() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["tier"], "admin");
 }
+
+/// The tier is checked **before** the request body is parsed.
+///
+/// Found by probing a running server rather than by reading: a guest POSTing a malformed body to an
+/// admin route got a 422 about their JSON instead of a 403 about their tier. Not a bypass — a valid
+/// body always reached the tier check and was refused — but the wrong order twice over. It told a
+/// caller about a route they may not use, and it deserialised attacker-controlled input before
+/// deciding whether they were allowed to send any.
+///
+/// The fix is `AdminScope`, which moves the check into extraction, ahead of the body. This pins it:
+/// the answer must be 403 whatever the body looks like, including no body at all.
+#[tokio::test]
+async fn the_tier_is_checked_before_the_body_is_parsed() {
+    let h = harness().await;
+    let bodies = [
+        None,                              // no body at all
+        Some(json!({})),                   // valid JSON, wrong shape
+        Some(json!({"role": 7})),          // right key, wrong type
+        Some(json!("not even an object")), // valid JSON, not an object
+    ];
+
+    for (label, body) in ["absent", "empty", "wrong type", "not an object"]
+        .into_iter()
+        .zip(bodies)
+    {
+        for (tier, token) in [("guest", &h.guest), ("prompter", &h.prompter)] {
+            for uri in [
+                format!("/v1/projects/{}/members", h.project),
+                format!("/v1/projects/{}/invites", h.project),
+                format!("/v1/projects/{}/board/apply", h.project),
+            ] {
+                let (status, _) = call(&h.app, "POST", &uri, Some(token), body.clone()).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "a {tier} sending a {label} body to {uri} learned about the body instead of \
+                     being refused for their tier"
+                );
+            }
+        }
+    }
+
+    // And an admin sending the same malformed bodies still gets a body error, not a tier error:
+    // the check moved, it did not swallow the 400/422 that a real admin needs to see.
+    let (status, _) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/members", h.project),
+        Some(&h.creator),
+        Some(json!({})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an admin was refused by tier"
+    );
+    assert!(
+        status.is_client_error(),
+        "a malformed body should still be a client error for an admin, got {status}"
+    );
+}

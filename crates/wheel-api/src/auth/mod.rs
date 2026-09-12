@@ -6,4 +6,4 @@ pub mod local;
 pub mod policy;
 pub mod principal;
 
-pub use extractor::{AuthUser, Credential, ProjectScope, Tier};
+pub use extractor::{AdminScope, AuthUser, Credential, ProjectScope, Tier};

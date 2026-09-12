@@ -218,10 +218,9 @@ pub async fn get_one(
 /// tier system and the public ingress touch.
 pub async fn update(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    crate::auth::AdminScope(scope): crate::auth::AdminScope,
     Json(body): Json<UpdateProject>,
 ) -> ApiResult<Json<Project>> {
-    scope.require(crate::auth::Tier::Admin)?;
     let project = update_project(&state, scope.project.id, body).await?;
     Ok(Json(project.with_tier(scope.tier)))
 }

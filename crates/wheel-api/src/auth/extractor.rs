@@ -246,6 +246,43 @@ impl FromRequestParts<AppState> for ProjectScope {
     }
 }
 
+/// A [`ProjectScope`] proven to be at [`Tier::Admin`], declared in the handler's signature.
+///
+/// # Why this exists as a type rather than a call
+///
+/// `scope.require(Tier::Admin)?` in a handler body is correct, and every handler does it — but it
+/// runs *after* axum has extracted the body, because a body extractor must come last. So a guest
+/// POSTing a malformed body to an admin route got a 422 about their JSON rather than a 403 about
+/// their tier, and attacker-controlled input was deserialised before the tier was checked. Neither
+/// is a bypass; both are the wrong order, and the order is the thing this file is about.
+///
+/// As a `FromRequestParts` extractor the check moves ahead of the body, and — more importantly —
+/// the handler's *signature* declares the tier it needs, in the same way taking a `ProjectScope` at
+/// all declares that it needs membership. A handler that takes `AdminScope` cannot forget to check,
+/// which is a stronger guarantee than one that remembers.
+///
+/// There is deliberately no `PrompterScope` beside it: every prompter-tier route is an engine path
+/// behind the proxy, decided by `auth::policy`, so such a type would have no caller. It is one impl
+/// away if an API route ever needs it.
+pub struct AdminScope(pub ProjectScope);
+
+impl FromRequestParts<AppState> for AdminScope {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let scope = ProjectScope::from_request_parts(parts, state).await?;
+        scope.require(Tier::Admin)?;
+        Ok(AdminScope(scope))
+    }
+}
+
+impl std::ops::Deref for AdminScope {
+    type Target = ProjectScope;
+    fn deref(&self) -> &ProjectScope {
+        &self.0
+    }
+}
+
 /// Resolve the target project id from the path segment, cross-checked against `x-project-id`.
 ///
 /// The contract has clients send `x-project-id` while the routes also carry the id in the path.
