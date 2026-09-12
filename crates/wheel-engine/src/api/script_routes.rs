@@ -66,6 +66,13 @@ pub async fn run(
     // can read every sibling node's token file and reach whatever the host's
     // network can, with no SSRF policy of its own. Off by default; a
     // deployment opts in with `WHEEL_SCRIPT_EXEC=1` once that gate closes.
+    //
+    // This flag alone is discipline, not enforcement (ADVERSARY review of this
+    // PR): nothing stops a future deploy, a copied `.env`, or someone who has
+    // forgotten why it is off from flipping it on a still-single-uid box, and
+    // nothing here would catch that. `execute` below checks the fact that
+    // actually matters -- whether the spawned child is PROVABLY isolated --
+    // against reality, not against this flag's say-so.
     if !s.cfg.script_execution_enabled {
         return Err(ApiError::config(
             "script execution is disabled on this deployment pending per-node isolation \
@@ -75,14 +82,71 @@ pub async fn run(
     let (node, cfg) = require_script(&s, id)?;
     debug_assert_eq!(node.node_type(), NodeType::Script);
     let args = body.map(|Json(b)| b.args).unwrap_or_default();
-    execute(&s, id, &cfg, &args).await
+    execute(&s, id, &cfg, &args, true).await
 }
 
+/// The engine's own real uid does not survive `child_command`'s `env_clear`,
+/// so this is read once per call from the OS rather than assumed to be
+/// whatever the process started as.
+fn own_real_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// A spawned child's real uid, read from procfs. `None` when it cannot be
+/// determined -- a race with the child exiting, a non-Linux host, anything --
+/// which [`uids_prove_isolation`] treats as UNPROVEN, not as isolated.
+#[cfg(target_os = "linux")]
+fn real_uid_of(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    // "Uid:\t<real>\t<effective>\t<saved>\t<filesystem>"
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Procfs does not exist here, so a child's real uid can never be read --
+/// which is the correct, honest answer: this route cannot prove isolation on
+/// a platform it has no way to inspect, so it must refuse. Production always
+/// runs this engine under Linux/Docker (§5b); this arm exists so a macOS
+/// `cargo build`/`cargo test` still compiles rather than needing `cfg(test)`
+/// everywhere this is used.
+#[cfg(not(target_os = "linux"))]
+fn real_uid_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// The one fact that actually has to be true before this engine runs
+/// untrusted, agent-or-operator-authored code: the child's real uid differs
+/// from the engine's own. A pure comparison over plain `u32`s (rather than a
+/// function that spawns something) so the DECISION is unit-testable without
+/// a privileged process to observe -- see the tests below.
+///
+/// `child` is `None` when it could not be determined, which counts as
+/// UNPROVEN and therefore refused: a fact this engine cannot verify is not
+/// one it may act as though it verified.
+///
+/// Under today's reality -- nothing in this engine calls setuid/setgid or
+/// `pre_exec` anywhere (F007 is unbuilt) -- `child` is always `Some(own)`,
+/// so this always returns `false` and [`execute`] always refuses, regardless
+/// of `WHEEL_SCRIPT_EXEC`. That is deliberate: the check does not need F007's
+/// code to exist to do its job, and it will start passing correctly, with no
+/// further change here, the day a real per-node uid drop lands and actually
+/// changes what a spawned child's uid is.
+fn uids_prove_isolation(own: u32, child: Option<u32>) -> bool {
+    child.is_some_and(|uid| uid != own)
+}
+
+/// `enforce_isolation` exists ONLY so the tests below can exercise the spawn/capture/timeout
+/// mechanics on their own -- every real caller is [`run`], which always passes `true`, hardcoded
+/// at its one call site above. There is no HTTP-reachable, wire-reachable, or CLI-reachable path
+/// that can pass `false`; the parameter is private to this module and this file is the only place
+/// that ever calls this function.
 async fn execute(
     s: &AppState,
     id: Uuid,
     cfg: &ScriptConfig,
     args: &[String],
+    enforce_isolation: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
     let dir = s
         .cfg
@@ -91,6 +155,19 @@ async fn execute(
         .join(Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir)
         .map_err(|e| ApiError::internal(format!("creating the script's run directory: {e}")))?;
+    // 0700: the script's own source and its captured output sit here briefly, and this
+    // directory is one setuid drop away from being readable by an equally-isolated sibling
+    // that happens to share a supplementary group -- the same reasoning as the OAuth renewal
+    // scratch dir (`supervisor/refresh.rs`) right next to this code. Inert today (nothing else
+    // can reach `/data/scripts` under the single uid this runs as either), cheap now, and the
+    // exact thing F007's completion checklist would otherwise have to rediscover.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&dir);
+            ApiError::internal(format!("locking down the script's run directory: {e}"))
+        })?;
+    }
     let file = dir.join(cfg.language.main_file());
     let write_result = std::fs::write(&file, &cfg.source);
     if let Err(e) = write_result {
@@ -137,7 +214,32 @@ async fn execute(
             ));
         }
     };
-    let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
+    let pid = child.id();
+    let pgid = pid.and_then(|pid| libc::pid_t::try_from(pid).ok());
+
+    // ADVERSARY review of this PR: `WHEEL_SCRIPT_EXEC` is discipline, not enforcement. This is
+    // the enforcement -- checked against the just-spawned child's ACTUAL uid, as early as
+    // possible and before a byte of its output is read, so a deployment that flipped the flag
+    // without per-node isolation actually in effect gets a clear refusal instead of an agent's
+    // (or the board owner's) code quietly running with no isolation from its siblings.
+    if enforce_isolation {
+        let own = own_real_uid();
+        let child_uid = pid.and_then(real_uid_of);
+        if !uids_prove_isolation(own, child_uid) {
+            if let Some(pgid) = pgid {
+                // SAFETY: killpg only delivers a signal, to our own child's process group.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+            let _ = child.wait().await;
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(ApiError::config(
+                "script execution refused: this engine cannot prove the spawned child would run \
+                 under a different uid than its own (per-node isolation, F007, is not yet in \
+                 effect) -- see docs/proposals/script-execution-scope.md",
+            ));
+        }
+    }
+
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let out_task = tokio::spawn(read_capped(stdout, MAX_SCRIPT_OUTPUT));
@@ -224,6 +326,53 @@ mod tests {
         node.id
     }
 
+    fn script_cfg(language: ScriptLanguage, source: &str, timeout: u32) -> ScriptConfig {
+        ScriptConfig {
+            language,
+            source: source.to_string(),
+            timeout_secs: Some(timeout),
+        }
+    }
+
+    // --- the uid isolation gate (ADVERSARY review of this PR) ------------------------------
+
+    #[test]
+    fn uids_prove_isolation_is_true_only_for_a_known_different_uid() {
+        assert!(
+            !uids_prove_isolation(1000, Some(1000)),
+            "the same uid, however it was spawned, proves nothing"
+        );
+        assert!(
+            uids_prove_isolation(1000, Some(1001)),
+            "a genuinely different uid is what the check exists to find"
+        );
+        assert!(
+            !uids_prove_isolation(1000, None),
+            "an unreadable/undetermined child uid must be UNPROVEN, not assumed safe"
+        );
+    }
+
+    /// The end-to-end proof this review asked for: under today's reality (nothing in this
+    /// engine calls setuid/setgid -- F007 is unbuilt) every real, spawned child shares the
+    /// engine's own uid, so `run` must refuse EVEN WITH THE FLAG ON. This is what makes the
+    /// gate structural rather than a second flag someone could also forget to check: it is
+    /// provably true in any environment this test runs in, including production, until a real
+    /// uid drop lands and changes what `real_uid_of` actually reads.
+    #[tokio::test]
+    async fn run_refuses_a_real_script_even_with_the_flag_enabled_because_isolation_is_unproven() {
+        let s = test_state();
+        assert!(
+            s.cfg.script_execution_enabled,
+            "test_state() enables the flag; the isolation check must be what refuses this"
+        );
+        let id = script_node(&s, ScriptLanguage::Python, "print('should not run')", 10);
+        let err = run(State(s), Path(id), None).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, "config", _)
+        ));
+    }
+
     /// docs/proposals/script-execution-scope.md's gate, as code: a deployment
     /// that has not opted in must refuse to run ANY script, not merely warn.
     #[tokio::test]
@@ -241,16 +390,28 @@ mod tests {
         ));
     }
 
+    // --- execution mechanics -----------------------------------------------------------------
+    //
+    // These call `execute(..., false)` directly rather than going through `run`, because the
+    // isolation gate above refuses every real child in any environment these tests run in
+    // (there is no way to spawn a genuinely different-uid process without real privileges to
+    // drop to). `false` is reachable ONLY from this test module -- `run`'s one call site
+    // hardcodes `true` -- so this bypass cannot exist in a build that serves real traffic.
+    // What these tests are FOR is the mechanics: does stdout/stderr/exit-code/timeout capture
+    // actually work, independent of whether it is safe to reach in production.
+
     #[tokio::test]
     async fn a_python_script_returns_its_stdout_stderr_and_exit_code() {
         let s = test_state();
-        let id = script_node(
-            &s,
+        let cfg = script_cfg(
             ScriptLanguage::Python,
             "import sys\nprint('out')\nprint('err', file=sys.stderr)\nsys.exit(3)\n",
             10,
         );
-        let out = run(State(s), Path(id), None).await.unwrap().0;
+        let out = execute(&s, Uuid::new_v4(), &cfg, &[], false)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(out["stdout"], "out\n");
         assert_eq!(out["stderr"], "err\n");
         assert_eq!(out["exit_code"], 3);
@@ -260,18 +421,17 @@ mod tests {
     #[tokio::test]
     async fn args_reach_the_script() {
         let s = test_state();
-        let id = script_node(
-            &s,
+        let cfg = script_cfg(
             ScriptLanguage::Python,
             "import sys\nprint(sys.argv[1:])\n",
             10,
         );
-        let out = run(
-            State(s),
-            Path(id),
-            Some(Json(RunBody {
-                args: vec!["a".into(), "b".into()],
-            })),
+        let out = execute(
+            &s,
+            Uuid::new_v4(),
+            &cfg,
+            &["a".to_string(), "b".to_string()],
+            false,
         )
         .await
         .unwrap()
@@ -282,15 +442,49 @@ mod tests {
     #[tokio::test]
     async fn a_script_past_its_timeout_is_killed_and_reported() {
         let s = test_state();
-        let id = script_node(
-            &s,
-            ScriptLanguage::Python,
-            "import time\ntime.sleep(30)\n",
-            1,
-        );
-        let out = run(State(s), Path(id), None).await.unwrap().0;
+        let cfg = script_cfg(ScriptLanguage::Python, "import time\ntime.sleep(30)\n", 1);
+        let out = execute(&s, Uuid::new_v4(), &cfg, &[], false)
+            .await
+            .unwrap()
+            .0;
         assert_eq!(out["timed_out"], true);
         assert!(out["exit_code"].is_null());
+    }
+
+    /// ADVERSARY review of this PR: the run directory holds the script's source and its
+    /// captured output, and must be locked down the same way the OAuth renewal scratch dir
+    /// is (`supervisor/refresh.rs`) rather than left at whatever `create_dir_all`'s default
+    /// mode is. Caught by actually stat-ing it WHILE a script is still running, not by
+    /// reading the code that sets it.
+    #[tokio::test]
+    async fn the_run_directory_is_locked_down_while_the_script_is_still_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = test_state();
+        let id = Uuid::new_v4();
+        let cfg = script_cfg(ScriptLanguage::Python, "import time\ntime.sleep(2)\n", 10);
+        let handle = tokio::spawn({
+            let s = s.clone();
+            async move { execute(&s, id, &cfg, &[], false).await }
+        });
+
+        let base = s.cfg.scripts_dir().join(id.to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let dir = loop {
+            if let Some(Ok(entry)) = std::fs::read_dir(&base).ok().and_then(|mut d| d.next()) {
+                break entry.path();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run directory never appeared"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "run directory must be 0700, was {mode:o}");
+
+        let _ = handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]

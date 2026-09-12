@@ -86,6 +86,22 @@ pub async fn serve_until(
         );
     }
 
+    // ADVERSARY review of #75/F007: said loudly, every boot, at warn level -- so an operator who
+    // DID mean to set this sees it confirmed, and anyone auditing logs later can tell it was
+    // deliberate rather than a copy-pasted .env nobody re-read. The route itself still refuses
+    // every call (`api/script_routes.rs`'s uid self-check) until a spawned script's child is
+    // PROVEN to run under a different uid than this engine's own, which nothing does yet -- this
+    // flag alone cannot turn script execution on; it can only widen who is refused politely with a
+    // clear reason instead of not reaching the route's config check at all.
+    if cfg.script_execution_enabled {
+        tracing::warn!(
+            "{} is set: this deployment has opted into running script nodes. The route itself \
+             stays refused until per-node uid isolation (F007) is provably in effect for the \
+             spawned child -- see docs/proposals/script-execution-scope.md.",
+            crate::config::ENV_SCRIPT_EXEC
+        );
+    }
+
     let conn = db::open(&cfg.db_path())?;
     tracing::info!(db = %cfg.db_path().display(), "database ready");
     db::board::ensure_tables(&conn)?;
