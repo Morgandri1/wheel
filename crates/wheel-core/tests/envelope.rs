@@ -75,11 +75,16 @@ fn on_behalf_of_appears_only_when_set_and_always_after_type() {
     let reply_at = env.find("reply_to=").expect("reply_to present");
     let actor_at = env.find("on_behalf_of=").expect("on_behalf_of present");
     assert!(
-        env.starts_with("<AgentPrompt id=\"abababab-abab-abab-abab-ababababab\
-         ab\" from=\"user\" type=\"user\""),
+        env.starts_with(
+            "<AgentPrompt id=\"abababab-abab-abab-abab-ababababab\
+         ab\" from=\"user\" type=\"user\""
+        ),
         "the three original attributes keep their place and order: {env}"
     );
-    assert!(reply_at < actor_at, "optional attributes append in a fixed order: {env}");
+    assert!(
+        reply_at < actor_at,
+        "optional attributes append in a fixed order: {env}"
+    );
 }
 
 /// The value can never close the attribute, because a principal cannot contain a quote — enforced
@@ -88,7 +93,10 @@ fn on_behalf_of_appears_only_when_set_and_always_after_type() {
 /// consequence would be visible here rather than in production.
 #[test]
 fn an_attributed_envelope_still_has_exactly_one_opening_tag() {
-    let mut m = msg("a body mentioning <AgentPrompt and </AgentPrompt>", MessageSender::User);
+    let mut m = msg(
+        "a body mentioning <AgentPrompt and </AgentPrompt>",
+        MessageSender::User,
+    );
     m.on_behalf_of = Some("alice".into());
     let env = m.envelope();
     assert_eq!(env.matches("<AgentPrompt ").count(), 1, "{env}");

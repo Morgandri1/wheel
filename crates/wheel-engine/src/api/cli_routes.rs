@@ -564,8 +564,15 @@ pub async fn msg(
         // `None`, always: this is the node-token plane. An agent holding a token — its own, or a
         // sibling's under the single-uid gap (ADVERSARY 037) — cannot claim to be acting for a
         // person. The header is not read here, so there is nothing to ignore.
-        messages::enqueue(&conn, from, target.id, body.body.clone(), body.reply_to, None)
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        messages::enqueue(
+            &conn,
+            from,
+            target.id,
+            body.body.clone(),
+            body.reply_to,
+            None,
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?
     };
 
     s.events.publish(Event::Message {

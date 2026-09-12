@@ -78,7 +78,10 @@ mod tests {
         // If one of these ever stopped starting with the prefix, the strip would no longer remove
         // a client's forgery of it and the replacement above would sit beside theirs.
         for n in [ACTOR_ID, ACTOR_TIER, ACTOR_CREDENTIAL] {
-            assert!(n.starts_with(WHEEL_PREFIX), "{n} must be inside the namespace");
+            assert!(
+                n.starts_with(WHEEL_PREFIX),
+                "{n} must be inside the namespace"
+            );
         }
     }
 }

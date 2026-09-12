@@ -184,20 +184,31 @@ async fn signup(base: &str, email: &str) -> (String, String) {
 }
 
 async fn project(base: &str, token: &str) -> String {
-    let (status, body) = post(base, "/v1/projects", Some(token), Some(json!({"name": "ws"}))).await;
+    let (status, body) = post(
+        base,
+        "/v1/projects",
+        Some(token),
+        Some(json!({"name": "ws"})),
+    )
+    .await;
     assert_eq!(status, 201, "{body}");
     body["id"].as_str().unwrap().to_string()
 }
 
 async fn ticket(base: &str, token: &str, pid: &str) -> String {
-    let (status, body) = post(base, &format!("/v1/projects/{pid}/ws-ticket"), Some(token), None).await;
+    let (status, body) = post(
+        base,
+        &format!("/v1/projects/{pid}/ws-ticket"),
+        Some(token),
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     body["ticket"].as_str().unwrap().to_string()
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn open(base: &str, token: &str, pid: &str) -> Result<Socket, String> {
     let t = ticket(base, token, pid).await;
@@ -253,8 +264,13 @@ async fn one_projects_bridges_do_not_consume_anothers_budget() {
     let b = project(&api.base, &token).await;
 
     let _first = open(&api.base, &token, &a).await.expect("project a");
-    assert!(open(&api.base, &token, &a).await.is_err(), "a is at its cap");
-    let _other = open(&api.base, &token, &b).await.expect("project b has its own budget");
+    assert!(
+        open(&api.base, &token, &a).await.is_err(),
+        "a is at its cap"
+    );
+    let _other = open(&api.base, &token, &b)
+        .await
+        .expect("project b has its own budget");
 }
 
 /// The WS path builds a fresh request and forwards no client header, so the actor markers exist
@@ -302,7 +318,9 @@ async fn revoking_a_member_closes_their_live_bridge() {
     .await;
     assert_eq!(status, 201, "{body}");
 
-    let mut socket = open(&api.base, &guest, &pid).await.expect("the guest's bridge");
+    let mut socket = open(&api.base, &guest, &pid)
+        .await
+        .expect("the guest's bridge");
 
     let c = reqwest::Client::new();
     let res = c

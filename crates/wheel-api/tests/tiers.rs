@@ -57,18 +57,17 @@ impl EngineLog {
 async fn recording_engine() -> (String, EngineLog) {
     let log = EngineLog::default();
     let app = Router::new()
-        .fallback(|State(log): State<EngineLog>, req: Request<Body>| async move {
-            let target = req
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_default();
-            log.0
-                .lock()
-                .unwrap()
-                .push((target, req.headers().clone()));
-            axum::Json(json!({"ok": true}))
-        })
+        .fallback(
+            |State(log): State<EngineLog>, req: Request<Body>| async move {
+                let target = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                log.0.lock().unwrap().push((target, req.headers().clone()));
+                axum::Json(json!({"ok": true}))
+            },
+        )
         .with_state(log.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -154,7 +153,9 @@ async fn call_with(
     };
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
 }
@@ -224,7 +225,11 @@ async fn harness() -> Harness {
             Some(json!({"user_id": id, "role": role})),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "granting {role} failed: {body}");
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "granting {role} failed: {body}"
+        );
     }
 
     engine.take();
@@ -338,7 +343,12 @@ async fn a_lower_tier_is_refused_every_engine_path_above_it() {
 async fn the_cli_realm_is_refused_to_every_tier_including_admin() {
     let h = harness().await;
     for token in [&h.guest, &h.prompter, &h.creator] {
-        for path in ["v1/cli/whoami", "v1/cli/msg", "v1/cli/secret", "v1/cli/query"] {
+        for path in [
+            "v1/cli/whoami",
+            "v1/cli/msg",
+            "v1/cli/secret",
+            "v1/cli/query",
+        ] {
             let uri = format!("/v1/projects/{}/engine/{path}", h.project);
             let (status, _) = call(&h.app, "POST", &uri, Some(token), Some(json!({}))).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{path} was reachable");
@@ -361,7 +371,11 @@ async fn an_engine_path_with_no_rule_is_refused_even_for_an_admin() {
     // A method nobody granted on a path somebody did.
     let uri = format!("/v1/projects/{}/engine/v1/board", h.project);
     let (status, _) = call(&h.app, "DELETE", &uri, Some(&h.creator), None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "DELETE /v1/board was reachable");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "DELETE /v1/board was reachable"
+    );
 }
 
 /// API routes, as opposed to proxied engine paths. Each handler carries its own `require`, and this
@@ -371,15 +385,31 @@ async fn a_lower_tier_is_refused_every_admin_api_route() {
     let h = harness().await;
     let p = &h.project;
     let admin_only: Vec<(&str, String, Option<serde_json::Value>)> = vec![
-        ("PATCH", format!("/v1/projects/{p}"), Some(json!({"name": "renamed"}))),
+        (
+            "PATCH",
+            format!("/v1/projects/{p}"),
+            Some(json!({"name": "renamed"})),
+        ),
         ("POST", format!("/v1/projects/{p}/start"), None),
         ("POST", format!("/v1/projects/{p}/stop"), None),
         ("POST", format!("/v1/projects/{p}/restart"), None),
-        ("POST", format!("/v1/projects/{p}/board/apply"), Some(json!({"board": {"nodes": [], "wires": []}}))),
-        ("POST", format!("/v1/projects/{p}/members"), Some(json!({"user_id": "x", "role": "guest"}))),
+        (
+            "POST",
+            format!("/v1/projects/{p}/board/apply"),
+            Some(json!({"board": {"nodes": [], "wires": []}})),
+        ),
+        (
+            "POST",
+            format!("/v1/projects/{p}/members"),
+            Some(json!({"user_id": "x", "role": "guest"})),
+        ),
         ("DELETE", format!("/v1/projects/{p}/members/x"), None),
         ("GET", format!("/v1/projects/{p}/invites"), None),
-        ("POST", format!("/v1/projects/{p}/invites"), Some(json!({"role": "guest"}))),
+        (
+            "POST",
+            format!("/v1/projects/{p}/invites"),
+            Some(json!({"role": "guest"})),
+        ),
         ("DELETE", format!("/v1/projects/{p}"), None),
     ];
 
@@ -409,7 +439,10 @@ async fn a_guest_may_read_the_project_and_take_a_ticket() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["tier"], "guest", "the response says what the caller may do");
+    assert_eq!(
+        body["tier"], "guest",
+        "the response says what the caller may do"
+    );
 
     let (status, _) = call(
         &h.app,
@@ -427,7 +460,12 @@ async fn a_guest_may_read_the_project_and_take_a_ticket() {
 #[tokio::test]
 async fn a_non_member_is_told_nothing_at_all() {
     let h = harness().await;
-    for (method, suffix) in [("GET", ""), ("PATCH", ""), ("DELETE", ""), ("POST", "/stop")] {
+    for (method, suffix) in [
+        ("GET", ""),
+        ("PATCH", ""),
+        ("DELETE", ""),
+        ("POST", "/stop"),
+    ] {
         let (status, _) = call(
             &h.app,
             method,
@@ -474,7 +512,11 @@ async fn a_revoked_member_stops_being_a_member() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, _) = call(&h.app, "GET", &uri, Some(&h.prompter), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "a revoked member still had access");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a revoked member still had access"
+    );
 }
 
 // --------------------------------------------------------------------------- the creator
@@ -592,26 +634,30 @@ async fn a_forged_actor_header_never_reaches_the_engine() {
 #[tokio::test]
 async fn a_forged_tier_does_not_open_a_route() {
     let h = harness().await;
-    let forged = [("x-wheel-actor-tier", "admin"), ("x-wheel-actor-id", "creator@example.com")];
+    let forged = [
+        ("x-wheel-actor-tier", "admin"),
+        ("x-wheel-actor-id", "creator@example.com"),
+    ];
 
     for (tier, token) in [("guest", &h.guest), ("prompter", &h.prompter)] {
         let uri = format!("/v1/projects/{}/engine/v1/vault/{AGENT}/KEY", h.project);
-        let (status, _) = call_with(&h.app, "PUT", &uri, Some(token), Some(json!({})), &forged).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a {tier} forged their way into the vault");
+        let (status, _) =
+            call_with(&h.app, "PUT", &uri, Some(token), Some(json!({})), &forged).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a {tier} forged their way into the vault"
+        );
         assert!(h.engine.take().is_empty());
 
         // And on the API's own routes, where the tier comes from the same place.
         let uri = format!("/v1/projects/{}", h.project);
-        let (status, _) = call_with(
-            &h.app,
-            "DELETE",
-            &uri,
-            Some(token),
-            None,
-            &forged,
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a {tier} forged a project delete");
+        let (status, _) = call_with(&h.app, "DELETE", &uri, Some(token), None, &forged).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a {tier} forged a project delete"
+        );
     }
 }
 
@@ -670,7 +716,10 @@ async fn an_invite_grants_the_tier_it_names() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{invite}");
-    let token = invite["token"].as_str().expect("an invite token").to_string();
+    let token = invite["token"]
+        .as_str()
+        .expect("an invite token")
+        .to_string();
     assert!(token.starts_with("wi_"), "{token}");
 
     let (status, accepted) = call(
@@ -722,7 +771,10 @@ async fn accepting_a_lower_invite_never_downgrades() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(accepted["role"], "prompter", "a guest link demoted a prompter");
+    assert_eq!(
+        accepted["role"], "prompter",
+        "a guest link demoted a prompter"
+    );
 }
 
 /// Single-use by default: the count is consumed inside the redeeming statement, so a second
@@ -878,12 +930,19 @@ async fn the_project_list_is_what_you_created_plus_what_you_joined() {
     assert_eq!(mine[0]["tier"], "admin");
 
     let (_, joined) = call(&h.app, "GET", "/v1/projects", Some(&h.guest), None).await;
-    assert_eq!(joined.as_array().unwrap().len(), 1, "a joined project is not listed");
+    assert_eq!(
+        joined.as_array().unwrap().len(),
+        1,
+        "a joined project is not listed"
+    );
     assert_eq!(joined[0]["id"], h.project);
     assert_eq!(joined[0]["tier"], "guest");
 
     let (_, none) = call(&h.app, "GET", "/v1/projects", Some(&h.outsider), None).await;
-    assert!(none.as_array().unwrap().is_empty(), "a non-member saw a project");
+    assert!(
+        none.as_array().unwrap().is_empty(),
+        "a non-member saw a project"
+    );
 }
 
 /// A guest's project does not count against their own quota: charging them for a project somebody
@@ -900,10 +959,18 @@ async fn a_joined_project_does_not_consume_your_quota() {
             Some(json!({"name": format!("guest-own-{i}")})),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "guest could not create their own project");
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "guest could not create their own project"
+        );
     }
     let (_, list) = call(&h.app, "GET", "/v1/projects", Some(&h.guest), None).await;
-    assert_eq!(list.as_array().unwrap().len(), 4, "three created plus one joined");
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        4,
+        "three created plus one joined"
+    );
 }
 
 /// Membership reading is a guest capability, and the creator is reported even though they are not a

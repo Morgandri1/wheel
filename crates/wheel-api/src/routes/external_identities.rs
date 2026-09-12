@@ -40,10 +40,7 @@ fn external_cfg(state: &AppState) -> ApiResult<&crate::config::ExternalAuth> {
 }
 
 /// `GET /v1/auth/external-identities`
-pub async fn list(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> ApiResult<Json<Vec<Identity>>> {
+pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<Identity>>> {
     external_cfg(&state)?;
     require_operator(&state, &user).await?;
     Ok(Json(

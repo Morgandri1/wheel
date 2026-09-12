@@ -51,7 +51,8 @@ pub fn is_valid_principal(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= MAX_LEN
         && raw.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '~')
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '~')
         })
 }
 
@@ -85,7 +86,10 @@ mod tests {
             from_headers(&headers("3f2504e0-4f89-11d3-9a0c-0305e82c3301")).as_deref(),
             Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301")
         );
-        assert_eq!(from_headers(&headers("alice@example.com")).as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            from_headers(&headers("alice@example.com")).as_deref(),
+            Some("alice@example.com")
+        );
     }
 
     #[test]

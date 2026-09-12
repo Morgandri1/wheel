@@ -217,7 +217,10 @@ impl BoardClient for HttpBoardClient {
 
     async fn patch_config(&self, id: Uuid, config: &serde_json::Value) -> Result<(), String> {
         let resp = self
-            .request(reqwest::Method::PATCH, format!("{}/v1/nodes/{id}", self.base))
+            .request(
+                reqwest::Method::PATCH,
+                format!("{}/v1/nodes/{id}", self.base),
+            )
             .json(config)
             .send()
             .await

@@ -138,11 +138,7 @@ async fn an_algorithm_outside_the_allowlist_is_refused() {
 async fn the_hs256_confusion_attack_is_refused() {
     let (key, server, cache) = plane().await;
     let cfg = ext(&server.url);
-    let forged = sign_hs256(
-        KID,
-        key.public_der_b64.as_bytes(),
-        &claims("alice"),
-    );
+    let forged = sign_hs256(KID, key.public_der_b64.as_bytes(), &claims("alice"));
     assert!(verify(&forged, &cfg, &cache).await.is_err());
 }
 
@@ -221,7 +217,10 @@ async fn the_audience_is_compared_by_equality_not_by_prefix() {
 
     c["aud"] = json!("wheel:");
     let token = sign_rs256_value(&key, KID, &c);
-    assert!(verify(&token, &cfg, &cache).await.is_ok(), "exact match must still work");
+    assert!(
+        verify(&token, &cfg, &cache).await.is_ok(),
+        "exact match must still work"
+    );
 }
 
 /// A multi-audience token is accepted when ours is among them — RFC 7519's rule, and what real
@@ -280,7 +279,10 @@ async fn a_token_with_no_exp_or_an_expired_one_is_refused() {
     let mut c = claims_for("alice");
     c.as_object_mut().unwrap().remove("exp");
     let token = sign_rs256_value(&key, KID, &c);
-    assert!(verify(&token, &cfg, &cache).await.is_err(), "a token with no exp never expires");
+    assert!(
+        verify(&token, &cfg, &cache).await.is_err(),
+        "a token with no exp never expires"
+    );
 
     let mut c = claims_for("alice");
     c["exp"] = json!(now() - 3600);
@@ -304,18 +306,27 @@ async fn the_lifetime_cap_is_enforced_and_needs_iat() {
     let mut c = claims_for("alice");
     c.as_object_mut().unwrap().remove("iat");
     let token = sign_rs256_value(&key, KID, &c);
-    assert!(verify(&token, &cfg, &cache).await.is_err(), "no iat, so no cap");
+    assert!(
+        verify(&token, &cfg, &cache).await.is_err(),
+        "no iat, so no cap"
+    );
 
     let mut c = claims_for("alice");
     let issued = now();
     c["iat"] = json!(issued);
     c["exp"] = json!(issued + 301);
     let token = sign_rs256_value(&key, KID, &c);
-    assert!(verify(&token, &cfg, &cache).await.is_err(), "a token over the cap was accepted");
+    assert!(
+        verify(&token, &cfg, &cache).await.is_err(),
+        "a token over the cap was accepted"
+    );
 
     c["exp"] = json!(issued + 300);
     let token = sign_rs256_value(&key, KID, &c);
-    assert!(verify(&token, &cfg, &cache).await.is_ok(), "a token at the cap must pass");
+    assert!(
+        verify(&token, &cfg, &cache).await.is_ok(),
+        "a token at the cap must pass"
+    );
 }
 
 // --------------------------------------------------------------------------- #10 the subject
@@ -355,7 +366,10 @@ async fn a_configured_subject_claim_is_used_instead_of_sub() {
     let mut c = claims_for("mutable-handle");
     c["oid"] = json!("stable-1");
     let token = sign_rs256_value(&key, KID, &c);
-    assert_eq!(verify(&token, &cfg, &cache).await.unwrap().subject, "stable-1");
+    assert_eq!(
+        verify(&token, &cfg, &cache).await.unwrap().subject,
+        "stable-1"
+    );
 
     // And a token missing that claim is refused rather than silently falling back to `sub`.
     let token = sign_rs256_value(&key, KID, &claims_for("mutable-handle"));

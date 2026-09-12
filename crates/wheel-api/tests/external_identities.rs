@@ -24,7 +24,9 @@ use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
-use wheel_api::config::{AuthMode, Config, Env, ExternalAuth, ExternalVerifier, Provision, SignupPolicy};
+use wheel_api::config::{
+    AuthMode, Config, Env, ExternalAuth, ExternalVerifier, Provision, SignupPolicy,
+};
 use wheel_api::crypto::Secret;
 use wheel_api::db::Db;
 use wheel_api::http::client_ip::TrustedPeer;
@@ -136,8 +138,13 @@ async fn call(
     }
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// The owner account plus a `wht_` token for it — the credential `wheeld` hands an operator on first
@@ -181,7 +188,10 @@ async fn a_trusted_proxy_assertion_authenticates_and_provisions() {
         "/v1/projects",
         None,
         None,
-        &[("x-forwarded-user", "alice"), ("x-forwarded-email", "alice@corp.test")],
+        &[
+            ("x-forwarded-user", "alice"),
+            ("x-forwarded-email", "alice@corp.test"),
+        ],
         true,
     )
     .await;
@@ -236,7 +246,16 @@ async fn only_the_operator_account_may_manage_identities() {
     let token = operator(&db).await;
 
     // The operator can list.
-    let (status, body) = call(&app, "GET", "/v1/auth/external-identities", Some(&token), None, &[], false).await;
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/v1/auth/external-identities",
+        Some(&token),
+        None,
+        &[],
+        false,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.as_array().unwrap().is_empty());
 
@@ -274,7 +293,11 @@ async fn an_operator_can_link_and_then_disable_an_identity() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "linked mode provisioned a stranger");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "linked mode provisioned a stranger"
+    );
 
     // The operator links the subject to an account that exists.
     let account = wheel_api::auth::local::create_user(&db, "alice@corp.test", "Correct-Horse-9!")
@@ -291,7 +314,10 @@ async fn an_operator_can_link_and_then_disable_an_identity() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{linked}");
-    assert_eq!(linked["issuer"], ISSUER, "the issuer comes from configuration, not the request");
+    assert_eq!(
+        linked["issuer"], ISSUER,
+        "the issuer comes from configuration, not the request"
+    );
     assert_eq!(linked["user_id"], json!(account.id));
 
     // Now the same assertion authenticates, as that account.
@@ -332,10 +358,23 @@ async fn an_operator_can_link_and_then_disable_an_identity() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "a disabled identity still authenticated");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a disabled identity still authenticated"
+    );
 
     // The row survives, so an operator can still see what they disabled.
-    let (_, listed) = call(&app, "GET", "/v1/auth/external-identities", Some(&token), None, &[], false).await;
+    let (_, listed) = call(
+        &app,
+        "GET",
+        "/v1/auth/external-identities",
+        Some(&token),
+        None,
+        &[],
+        false,
+    )
+    .await;
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert!(listed[0]["disabled_at"].is_string());
 }
@@ -363,7 +402,10 @@ async fn an_externally_provisioned_account_is_not_the_owner_account() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{me}");
-    assert_eq!(me["owner"], false, "an external account was reported as the owner");
+    assert_eq!(
+        me["owner"], false,
+        "an external account was reported as the owner"
+    );
 
     // And it cannot use the owner-only routes, which is what `owner` actually controls.
     for (method, uri, body) in [
@@ -384,7 +426,11 @@ async fn an_externally_provisioned_account_is_not_the_owner_account() {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "an external account reached {uri}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an external account reached {uri}"
+        );
     }
 }
 
@@ -440,7 +486,16 @@ async fn linking_a_hostile_subject_is_refused() {
 async fn the_identity_routes_are_absent_without_external_auth() {
     let (app, db) = app(None).await;
     let token = operator(&db).await;
-    let (status, _) = call(&app, "GET", "/v1/auth/external-identities", Some(&token), None, &[], false).await;
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/v1/auth/external-identities",
+        Some(&token),
+        None,
+        &[],
+        false,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, _) = call(

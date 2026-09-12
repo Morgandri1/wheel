@@ -71,7 +71,10 @@ async fn the_same_subject_always_maps_to_the_same_wheel_principal() {
         .expect("resolved");
     assert_eq!(first, second);
     // And it is a Wheel uuid, not the foreign subject.
-    assert!(uuid::Uuid::parse_str(&first).is_ok(), "{first} is not a Wheel principal");
+    assert!(
+        uuid::Uuid::parse_str(&first).is_ok(),
+        "{first} is not a Wheel principal"
+    );
     assert_ne!(first, "alice");
 
     let other = external::principal_for(&db, &cfg, &verified("bob", None))
@@ -163,9 +166,15 @@ async fn linked_provisioning_refuses_an_unknown_subject_until_it_is_linked() {
     let account = wheel_api::auth::local::create_user(&db, "alice@example.com", "Correct-Horse-9!")
         .await
         .unwrap();
-    external::link(&db, &cfg, &verified("alice", None), account.id, Some("operator"))
-        .await
-        .expect("linked");
+    external::link(
+        &db,
+        &cfg,
+        &verified("alice", None),
+        account.id,
+        Some("operator"),
+    )
+    .await
+    .expect("linked");
 
     // ...and now the same subject resolves to exactly that account.
     let principal = external::principal_for(&db, &cfg, &verified("alice", None))
@@ -241,7 +250,10 @@ async fn resolving_an_identity_records_that_it_was_seen() {
         .await
         .unwrap()
         .unwrap();
-    assert!(fresh.last_seen_at.is_none(), "first provision is not a sighting");
+    assert!(
+        fresh.last_seen_at.is_none(),
+        "first provision is not a sighting"
+    );
 
     external::principal_for(&db, &cfg, &verified("alice", None))
         .await
@@ -250,5 +262,8 @@ async fn resolving_an_identity_records_that_it_was_seen() {
         .await
         .unwrap()
         .unwrap();
-    assert!(seen.last_seen_at.is_some(), "a resolved identity was not stamped");
+    assert!(
+        seen.last_seen_at.is_some(),
+        "a resolved identity was not stamped"
+    );
 }

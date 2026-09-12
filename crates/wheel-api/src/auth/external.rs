@@ -152,8 +152,7 @@ pub(crate) fn checked_claims(
         .get(&ext.subject_claim)
         .and_then(|v| v.as_str())
         .ok_or("token has no usable subject claim")?;
-    super::principal::validate(subject)
-        .map_err(|_| "token subject is not a usable principal")?;
+    super::principal::validate(subject).map_err(|_| "token subject is not a usable principal")?;
 
     Ok(Verified {
         subject: subject.to_string(),
@@ -438,18 +437,24 @@ mod tests {
         let mut e = ext();
         e.max_ttl_secs = Some(300);
         // No iat: a cap that cannot be computed must refuse, not pass.
-        let no_iat =
-            checked_claims(&claims(serde_json::json!({ "sub": "a", "aud": "wheel-test", "exp": 1_000 })), &e)
-                .unwrap_err();
+        let no_iat = checked_claims(
+            &claims(serde_json::json!({ "sub": "a", "aud": "wheel-test", "exp": 1_000 })),
+            &e,
+        )
+        .unwrap_err();
         assert!(no_iat.contains("iat"), "{no_iat}");
 
         assert!(checked_claims(
-            &claims(serde_json::json!({ "sub": "a", "aud": "wheel-test", "iat": 1_000, "exp": 1_301 })),
+            &claims(
+                serde_json::json!({ "sub": "a", "aud": "wheel-test", "iat": 1_000, "exp": 1_301 })
+            ),
             &e
         )
         .is_err());
         assert!(checked_claims(
-            &claims(serde_json::json!({ "sub": "a", "aud": "wheel-test", "iat": 1_000, "exp": 1_300 })),
+            &claims(
+                serde_json::json!({ "sub": "a", "aud": "wheel-test", "iat": 1_000, "exp": 1_300 })
+            ),
             &e
         )
         .is_ok());
@@ -458,8 +463,13 @@ mod tests {
     #[test]
     fn azp_is_checked_only_when_configured() {
         let mut e = ext();
-        let c = claims(serde_json::json!({ "sub": "a", "aud": "wheel-test", "exp": 1, "azp": "app-1" }));
-        assert!(checked_claims(&c, &e).is_ok(), "empty allowlist checks nothing");
+        let c = claims(
+            serde_json::json!({ "sub": "a", "aud": "wheel-test", "exp": 1, "azp": "app-1" }),
+        );
+        assert!(
+            checked_claims(&c, &e).is_ok(),
+            "empty allowlist checks nothing"
+        );
         e.azp = vec!["app-2".into()];
         assert!(checked_claims(&c, &e).is_err());
         e.azp = vec!["app-1".into(), "app-2".into()];

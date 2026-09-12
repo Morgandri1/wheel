@@ -87,13 +87,19 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
     // --- the baseline works, so a failure below is about the thing that changed ----------------
     external_jwks_env();
     let cfg = boots("a complete jwks configuration");
-    let ext = cfg.external.as_ref().expect("the block is present under external mode");
+    let ext = cfg
+        .external
+        .as_ref()
+        .expect("the block is present under external mode");
     assert_eq!(ext.issuer, "https://idp.example.test");
     assert_eq!(ext.audiences, vec!["wheel-prod".to_string()]);
     assert_eq!(ext.provision, Provision::Auto);
     assert_eq!(ext.subject_claim, "sub", "the default subject claim");
     assert!(!ext.sole_audience, "multi-audience is accepted by default");
-    assert!(ext.max_ttl_secs.is_none(), "no lifetime cap unless asked for");
+    assert!(
+        ext.max_ttl_secs.is_none(),
+        "no lifetime cap unless asked for"
+    );
     match &ext.verifier {
         ExternalVerifier::Jwks { url, algs } => {
             assert_eq!(url, "https://idp.example.test/jwks");
@@ -105,7 +111,9 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
     // --- the block exists exactly when the mode does -------------------------------------------
     base_env();
     assert!(
-        boots("local mode with no external variables").external.is_none(),
+        boots("local mode with no external variables")
+            .external
+            .is_none(),
         "an external block appeared without external mode"
     );
 
@@ -115,7 +123,10 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
     std::env::set_var("WHEEL_EXTERNAL_AUDIENCE", "wheel-prod");
     let e = refuses("a WHEEL_EXTERNAL_* variable under AUTH_MODE=local");
     assert!(e.contains("WHEEL_EXTERNAL_AUDIENCE"), "{e}");
-    assert!(e.contains("external"), "the message should name the mode: {e}");
+    assert!(
+        e.contains("external"),
+        "the message should name the mode: {e}"
+    );
 
     // --- each required field is required -------------------------------------------------------
     for missing in [
@@ -129,7 +140,10 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
         external_jwks_env();
         std::env::remove_var(missing);
         let e = refuses(missing);
-        assert!(e.contains(missing), "the error should name {missing}, got: {e}");
+        assert!(
+            e.contains(missing),
+            "the error should name {missing}, got: {e}"
+        );
     }
 
     // An empty value is a missing value, not an empty audience list.
@@ -192,7 +206,9 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
         external_jwks_env();
         std::env::set_var("WHEEL_EXTERNAL_JWKS_URL", url);
         std::env::set_var("WHEEL_EXTERNAL_ISSUER", issuer);
-        refuses(&format!("a local or plaintext provider at {url} / {issuer}"));
+        refuses(&format!(
+            "a local or plaintext provider at {url} / {issuer}"
+        ));
     }
 
     // In dev, pointing at a local issuer is exactly what dev is for.

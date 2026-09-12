@@ -267,9 +267,9 @@ impl ExternalAuth {
                 }
             }
             "" => bail!("WHEEL_EXTERNAL_VERIFIER must be set (\"jwks\" or \"proxy_header\")"),
-            other => bail!(
-                "WHEEL_EXTERNAL_VERIFIER must be \"jwks\" or \"proxy_header\", got {other:?}"
-            ),
+            other => {
+                bail!("WHEEL_EXTERNAL_VERIFIER must be \"jwks\" or \"proxy_header\", got {other:?}")
+            }
         };
 
         let provision = match var_or("WHEEL_EXTERNAL_PROVISION", "").trim() {
@@ -281,7 +281,9 @@ impl ExternalAuth {
                  If your issuer lets anyone sign up, \"auto\" lets anyone into Wheel — so this is \
                  a decision to make out loud, never one to default."
             ),
-            other => bail!("WHEEL_EXTERNAL_PROVISION must be \"auto\" or \"linked\", got {other:?}"),
+            other => {
+                bail!("WHEEL_EXTERNAL_PROVISION must be \"auto\" or \"linked\", got {other:?}")
+            }
         };
 
         let max_ttl_secs = match std::env::var("WHEEL_EXTERNAL_MAX_TTL_SECS") {
@@ -307,7 +309,9 @@ impl ExternalAuth {
                 "1" | "true" | "yes"
             ),
             subject_claim: {
-                let c = var_or("WHEEL_EXTERNAL_SUBJECT_CLAIM", "sub").trim().to_string();
+                let c = var_or("WHEEL_EXTERNAL_SUBJECT_CLAIM", "sub")
+                    .trim()
+                    .to_string();
                 if c.is_empty() {
                     bail!("WHEEL_EXTERNAL_SUBJECT_CLAIM must not be empty");
                 }
@@ -373,7 +377,10 @@ impl ExternalAuth {
             provision: Provision::Auto,
             verifier: ExternalVerifier::Jwks {
                 url: "https://issuer.example/jwks".into(),
-                algs: vec![jsonwebtoken::Algorithm::RS256, jsonwebtoken::Algorithm::EdDSA],
+                algs: vec![
+                    jsonwebtoken::Algorithm::RS256,
+                    jsonwebtoken::Algorithm::EdDSA,
+                ],
             },
         }
     }

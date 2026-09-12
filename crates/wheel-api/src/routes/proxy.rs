@@ -90,7 +90,11 @@ pub async fn engine_proxy(
 ///
 /// A path with no rule is refused, not allowed: `auth::policy` is default-DENY, so adding an engine
 /// route without a rule makes it unreachable through the API rather than reachable by everyone.
-fn require_engine_tier(scope: &ProjectScope, method: &axum::http::Method, segments: &[&str]) -> ApiResult<()> {
+fn require_engine_tier(
+    scope: &ProjectScope,
+    method: &axum::http::Method,
+    segments: &[&str],
+) -> ApiResult<()> {
     let needed = policy::engine_tier(method, segments).ok_or(ApiError::Forbidden(
         "this engine path is not reachable through the API",
     ))?;
@@ -415,7 +419,8 @@ impl BridgeWatch {
     /// admin-tier socket until it happens to close on its own. Re-opening at the new tier is one
     /// round trip and is the client's to do.
     async fn still_entitled(&self) -> bool {
-        match crate::auth::extractor::load_member(&self.state, &self.project_id, &self.user_id).await
+        match crate::auth::extractor::load_member(&self.state, &self.project_id, &self.user_id)
+            .await
         {
             Ok((_, tier)) => tier >= self.tier,
             // A database error is not evidence of revocation, and closing every socket in the

@@ -46,60 +46,164 @@ const WRITE: &[&str] = &["POST", "PATCH", "PUT", "DELETE"];
 /// §5.2; the short version is beside each group.
 const RULES: &[Rule] = &[
     // ---- guest: view only -------------------------------------------------------------------
-    Rule { methods: GET, path: "v1/engine", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/board", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/events", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/agents/{}/log", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/agents/{}/inbox", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/agents/{}/inbox/{}", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/tables/{}/rows", tier: Tier::Guest },
-    Rule { methods: GET, path: "v1/tools/{}/ops", tier: Tier::Guest },
+    Rule {
+        methods: GET,
+        path: "v1/engine",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/board",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/events",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/agents/{}/log",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/agents/{}/inbox",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/agents/{}/inbox/{}",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/tables/{}/rows",
+        tier: Tier::Guest,
+    },
+    Rule {
+        methods: GET,
+        path: "v1/tools/{}/ops",
+        tier: Tier::Guest,
+    },
     // Whether an agent is authenticated, not with what. Clearing or attaching a credential is
     // admin, immediately below, and is a different method on the same path.
-    Rule { methods: GET, path: "v1/agents/{}/auth", tier: Tier::Guest },
-
+    Rule {
+        methods: GET,
+        path: "v1/agents/{}/auth",
+        tier: Tier::Guest,
+    },
     // ---- admin: credentials --------------------------------------------------------------------
     // Listed before the prompter block so the narrower `auth` rules win over nothing, and so the
     // credential surfaces read as one group. A prompter must never attach, clear or use the
     // creator's LLM accounts: per ADVERSARY 037 a vault value is readable by every agent in the
     // project, so sharing a project must not share the creator's bill.
-    Rule { methods: DELETE, path: "v1/agents/{}/auth", tier: Tier::Admin },
-    Rule { methods: POST, path: "v1/agents/{}/auth/begin", tier: Tier::Admin },
-    Rule { methods: POST, path: "v1/agents/{}/auth/complete", tier: Tier::Admin },
+    Rule {
+        methods: DELETE,
+        path: "v1/agents/{}/auth",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/auth/begin",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/auth/complete",
+        tier: Tier::Admin,
+    },
     // The vault is not a prompter surface at all. `GET /v1/vault/{id}` returns key *names* only,
     // but a map of where the secrets are is still the vault.
-    Rule { methods: GET, path: "v1/vault/{}", tier: Tier::Admin },
-    Rule { methods: WRITE, path: "v1/vault/{}/{}", tier: Tier::Admin },
+    Rule {
+        methods: GET,
+        path: "v1/vault/{}",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: WRITE,
+        path: "v1/vault/{}/{}",
+        tier: Tier::Admin,
+    },
     // Invoking a tool spends vault-filled credentials. That is credential *use*, which is the
     // vault boundary wearing a different hat.
-    Rule { methods: POST, path: "v1/tools/{}/call", tier: Tier::Admin },
-
+    Rule {
+        methods: POST,
+        path: "v1/tools/{}/call",
+        tier: Tier::Admin,
+    },
     // ---- admin: board structure -----------------------------------------------------------------
-    Rule { methods: WRITE, path: "v1/nodes", tier: Tier::Admin },
-    Rule { methods: WRITE, path: "v1/wires", tier: Tier::Admin },
-    Rule { methods: POST, path: "v1/tools/import", tier: Tier::Admin },
-    Rule { methods: POST, path: "v1/tools/{}/import", tier: Tier::Admin },
-
+    Rule {
+        methods: WRITE,
+        path: "v1/nodes",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: WRITE,
+        path: "v1/wires",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/tools/import",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/tools/{}/import",
+        tier: Tier::Admin,
+    },
     // ---- prompter: context and prompting ---------------------------------------------------------
     // The narrow content door. `PATCH /v1/nodes/{id}` stays admin below, because it also carries
     // agent config and a tier may not have conditional powers.
-    Rule { methods: PUT, path: "v1/nodes/{}/content", tier: Tier::Prompter },
-    Rule { methods: POST, path: "v1/agents/{}/send", tier: Tier::Prompter },
-    Rule { methods: POST, path: "v1/agents/{}/start", tier: Tier::Prompter },
-    Rule { methods: POST, path: "v1/agents/{}/stop", tier: Tier::Prompter },
+    Rule {
+        methods: PUT,
+        path: "v1/nodes/{}/content",
+        tier: Tier::Prompter,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/send",
+        tier: Tier::Prompter,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/start",
+        tier: Tier::Prompter,
+    },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/stop",
+        tier: Tier::Prompter,
+    },
     // The composition of start and stop. Allowing both halves and refusing the whole would be a
     // rule with no content.
-    Rule { methods: POST, path: "v1/agents/{}/restart", tier: Tier::Prompter },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/restart",
+        tier: Tier::Prompter,
+    },
     // Resetting an agent's session is context management, and a prompter can already stop it.
-    Rule { methods: POST, path: "v1/agents/{}/clear", tier: Tier::Prompter },
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/clear",
+        tier: Tier::Prompter,
+    },
     // Read-only SQL, but expressed as SQL, behind an authorizer whose function arm was
     // allow-by-default as recently as ADVERSARY 044. `GET .../rows` gives a guest the same data
     // through a door with no SQL in it, so the lowest-trust tier need not stand on that.
-    Rule { methods: POST, path: "v1/tables/{}/query", tier: Tier::Prompter },
-
+    Rule {
+        methods: POST,
+        path: "v1/tables/{}/query",
+        tier: Tier::Prompter,
+    },
     // ---- admin: the general node patch ------------------------------------------------------
     // Last of the `v1/nodes` rules so `v1/nodes/{}/content` above wins for a prompter.
-    Rule { methods: WRITE, path: "v1/nodes/{}", tier: Tier::Admin },
+    Rule {
+        methods: WRITE,
+        path: "v1/nodes/{}",
+        tier: Tier::Admin,
+    },
 ];
 
 /// The minimum tier for an engine path, or `None` when no tier may reach it.
@@ -168,31 +272,76 @@ mod tests {
         assert_eq!(tier("GET", "v1/board"), Some(Tier::Guest));
         assert_eq!(tier("GET", "v1/engine"), Some(Tier::Guest));
         assert_eq!(tier("GET", "v1/events"), Some(Tier::Guest));
-        assert_eq!(tier("GET", &format!("v1/agents/{AGENT}/log")), Some(Tier::Guest));
-        assert_eq!(tier("GET", &format!("v1/agents/{AGENT}/inbox")), Some(Tier::Guest));
-        assert_eq!(tier("GET", &format!("v1/agents/{AGENT}/inbox/{AGENT}")), Some(Tier::Guest));
-        assert_eq!(tier("GET", &format!("v1/tables/{AGENT}/rows")), Some(Tier::Guest));
-        assert_eq!(tier("GET", &format!("v1/tools/{AGENT}/ops")), Some(Tier::Guest));
+        assert_eq!(
+            tier("GET", &format!("v1/agents/{AGENT}/log")),
+            Some(Tier::Guest)
+        );
+        assert_eq!(
+            tier("GET", &format!("v1/agents/{AGENT}/inbox")),
+            Some(Tier::Guest)
+        );
+        assert_eq!(
+            tier("GET", &format!("v1/agents/{AGENT}/inbox/{AGENT}")),
+            Some(Tier::Guest)
+        );
+        assert_eq!(
+            tier("GET", &format!("v1/tables/{AGENT}/rows")),
+            Some(Tier::Guest)
+        );
+        assert_eq!(
+            tier("GET", &format!("v1/tools/{AGENT}/ops")),
+            Some(Tier::Guest)
+        );
     }
 
     #[test]
     fn prompting_and_context_are_prompter() {
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/send")), Some(Tier::Prompter));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/start")), Some(Tier::Prompter));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/stop")), Some(Tier::Prompter));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/restart")), Some(Tier::Prompter));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/clear")), Some(Tier::Prompter));
-        assert_eq!(tier("PUT", &format!("v1/nodes/{AGENT}/content")), Some(Tier::Prompter));
-        assert_eq!(tier("POST", &format!("v1/tables/{AGENT}/query")), Some(Tier::Prompter));
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/send")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/start")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/stop")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/restart")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/clear")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("PUT", &format!("v1/nodes/{AGENT}/content")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/tables/{AGENT}/query")),
+            Some(Tier::Prompter)
+        );
     }
 
     /// The narrow content door must win over the general node patch, or a prompter cannot write
     /// context at all — and the general patch must stay admin, or a prompter can rewire the board.
     #[test]
     fn the_content_door_is_prompter_and_the_general_node_patch_is_admin() {
-        assert_eq!(tier("PUT", &format!("v1/nodes/{AGENT}/content")), Some(Tier::Prompter));
-        assert_eq!(tier("PATCH", &format!("v1/nodes/{AGENT}")), Some(Tier::Admin));
-        assert_eq!(tier("DELETE", &format!("v1/nodes/{AGENT}")), Some(Tier::Admin));
+        assert_eq!(
+            tier("PUT", &format!("v1/nodes/{AGENT}/content")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("PATCH", &format!("v1/nodes/{AGENT}")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("DELETE", &format!("v1/nodes/{AGENT}")),
+            Some(Tier::Admin)
+        );
         assert_eq!(tier("POST", "v1/nodes"), Some(Tier::Admin));
     }
 
@@ -201,22 +350,49 @@ mod tests {
         assert_eq!(tier("POST", "v1/wires"), Some(Tier::Admin));
         assert_eq!(tier("DELETE", "v1/wires"), Some(Tier::Admin));
         assert_eq!(tier("GET", &format!("v1/vault/{AGENT}")), Some(Tier::Admin));
-        assert_eq!(tier("PUT", &format!("v1/vault/{AGENT}/KEY")), Some(Tier::Admin));
-        assert_eq!(tier("DELETE", &format!("v1/vault/{AGENT}/KEY")), Some(Tier::Admin));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/auth/begin")), Some(Tier::Admin));
-        assert_eq!(tier("POST", &format!("v1/agents/{AGENT}/auth/complete")), Some(Tier::Admin));
-        assert_eq!(tier("DELETE", &format!("v1/agents/{AGENT}/auth")), Some(Tier::Admin));
-        assert_eq!(tier("POST", &format!("v1/tools/{AGENT}/call")), Some(Tier::Admin));
+        assert_eq!(
+            tier("PUT", &format!("v1/vault/{AGENT}/KEY")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("DELETE", &format!("v1/vault/{AGENT}/KEY")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/auth/begin")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/auth/complete")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("DELETE", &format!("v1/agents/{AGENT}/auth")),
+            Some(Tier::Admin)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/tools/{AGENT}/call")),
+            Some(Tier::Admin)
+        );
         assert_eq!(tier("POST", "v1/tools/import"), Some(Tier::Admin));
-        assert_eq!(tier("POST", &format!("v1/tools/{AGENT}/import")), Some(Tier::Admin));
+        assert_eq!(
+            tier("POST", &format!("v1/tools/{AGENT}/import")),
+            Some(Tier::Admin)
+        );
     }
 
     /// Reading whether an agent is authenticated is a guest read; clearing that credential is not.
     /// Same path, different method, different tier — so the table must discriminate on both.
     #[test]
     fn method_decides_where_a_path_is_shared() {
-        assert_eq!(tier("GET", &format!("v1/agents/{AGENT}/auth")), Some(Tier::Guest));
-        assert_eq!(tier("DELETE", &format!("v1/agents/{AGENT}/auth")), Some(Tier::Admin));
+        assert_eq!(
+            tier("GET", &format!("v1/agents/{AGENT}/auth")),
+            Some(Tier::Guest)
+        );
+        assert_eq!(
+            tier("DELETE", &format!("v1/agents/{AGENT}/auth")),
+            Some(Tier::Admin)
+        );
     }
 
     #[test]
@@ -257,7 +433,13 @@ mod tests {
     /// first, which is why the table may assume its segments are literal.
     #[test]
     fn an_unforwardable_path_is_refused_before_the_table_sees_it() {
-        for p in ["/", "v1//board", "v1/../board", "v1/%2e%2e/board", "v1/bo\\ard"] {
+        for p in [
+            "/",
+            "v1//board",
+            "v1/../board",
+            "v1/%2e%2e/board",
+            "v1/bo\\ard",
+        ] {
             assert!(
                 wheel_core::proxy_path::proxy_segments(p).is_err(),
                 "{p} must be refused by the decoder"
@@ -269,22 +451,41 @@ mod tests {
     #[test]
     fn a_prefix_is_not_a_match() {
         assert_eq!(tier("GET", "v1/boardroom"), None);
-        assert_eq!(tier("GET", "v1/board/"), Some(Tier::Guest), "a trailing slash is the same path");
+        assert_eq!(
+            tier("GET", "v1/board/"),
+            Some(Tier::Guest),
+            "a trailing slash is the same path"
+        );
         assert_eq!(tier("PUT", &format!("v1/nodes/{AGENT}/contents")), None);
     }
 
     #[test]
     fn head_is_treated_as_a_read_wherever_get_is() {
         assert_eq!(tier("HEAD", "v1/board"), Some(Tier::Guest));
-        assert_eq!(tier("HEAD", &format!("v1/vault/{AGENT}")), Some(Tier::Admin));
+        assert_eq!(
+            tier("HEAD", &format!("v1/vault/{AGENT}")),
+            Some(Tier::Admin)
+        );
     }
 
     #[test]
     fn segment_matching_does_not_let_a_wildcard_swallow_a_path() {
-        assert!(matches_pattern("v1/agents/{}/send", &["v1", "agents", "x", "send"]));
-        assert!(!matches_pattern("v1/agents/{}/send", &["v1", "agents", "x", "y", "send"]));
-        assert!(!matches_pattern("v1/agents/{}/send", &["v1", "agents", "send"]));
+        assert!(matches_pattern(
+            "v1/agents/{}/send",
+            &["v1", "agents", "x", "send"]
+        ));
+        assert!(!matches_pattern(
+            "v1/agents/{}/send",
+            &["v1", "agents", "x", "y", "send"]
+        ));
+        assert!(!matches_pattern(
+            "v1/agents/{}/send",
+            &["v1", "agents", "send"]
+        ));
         assert!(matches_pattern("v1/**", &["v1", "anything", "deep"]));
-        assert!(!matches_pattern("v1/**", &["v1"]), "** needs at least one segment");
+        assert!(
+            !matches_pattern("v1/**", &["v1"]),
+            "** needs at least one segment"
+        );
     }
 }

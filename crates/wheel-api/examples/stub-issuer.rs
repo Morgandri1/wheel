@@ -41,7 +41,9 @@ use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::json;
 use std::sync::Arc;
-use wheel_api::config::{AuthMode, Config, Env, ExternalAuth, ExternalVerifier, Provision, SignupPolicy};
+use wheel_api::config::{
+    AuthMode, Config, Env, ExternalAuth, ExternalVerifier, Provision, SignupPolicy,
+};
 
 /// Shared with `tests/support.rs` by including the same files, so a token this mints and a token
 /// the suite mints are signed by one key.
@@ -177,7 +179,11 @@ async fn self_check(jwks_url: &str, external_jwks_url: &str) -> Result<(), Strin
     match wheel_api::auth::claims::verify(&token, &cfg, &cache).await {
         Ok(u) if u.user_id == "selfcheck" => {}
         Ok(u) => return Err(format!("verified as the wrong subject: {}", u.user_id)),
-        Err(e) => return Err(format!("the API's own jwks verifier rejected our token: {e:?}")),
+        Err(e) => {
+            return Err(format!(
+                "the API's own jwks verifier rejected our token: {e:?}"
+            ))
+        }
     }
 
     let ext = external_config(external_jwks_url);
@@ -189,7 +195,12 @@ async fn self_check(jwks_url: &str, external_jwks_url: &str) -> Result<(), Strin
         let token = mint("selfcheck", alg, Some(EXTERNAL_AUDIENCE));
         match wheel_api::auth::external::verify_token(&token, &ext, &ext_cache).await {
             Ok(v) if v.subject == "selfcheck" => {}
-            Ok(v) => return Err(format!("{alg:?}: verified as the wrong subject: {}", v.subject)),
+            Ok(v) => {
+                return Err(format!(
+                    "{alg:?}: verified as the wrong subject: {}",
+                    v.subject
+                ))
+            }
             Err(e) => {
                 return Err(format!(
                     "{alg:?}: the API's own external verifier rejected our token: {e:?}"
@@ -285,7 +296,9 @@ async fn main() {
         mint(&sub, Algorithm::EdDSA, Some(EXTERNAL_AUDIENCE))
     );
     println!();
-    println!("  more tokens: curl 'http://{addr}/token?sub=<user id>&alg=EdDSA&aud={EXTERNAL_AUDIENCE}'");
+    println!(
+        "  more tokens: curl 'http://{addr}/token?sub=<user id>&alg=EdDSA&aud={EXTERNAL_AUDIENCE}'"
+    );
     println!("  every one of them verified against the API's own verifiers before serving.");
 
     tokio::signal::ctrl_c().await.ok();

@@ -477,11 +477,8 @@ pub async fn accept(
            AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AND uses < max_uses \
          RETURNING project_id, role, email";
 
-    let row: Option<(Uuid, String, Option<String>)> = crate::db_fetch_optional!(
-        db,
-        db.pick(PG, SQLITE),
-        invite_digest(token)
-    )?;
+    let row: Option<(Uuid, String, Option<String>)> =
+        crate::db_fetch_optional!(db, db.pick(PG, SQLITE), invite_digest(token))?;
 
     // Unknown, expired, revoked and exhausted are deliberately one answer: an invite link is a
     // credential, and distinguishing them would say which links exist.
@@ -497,7 +494,9 @@ pub async fn accept(
     if let Some(want) = &locked_email {
         let matches = user_email.is_some_and(|have| have.eq_ignore_ascii_case(want));
         if !matches {
-            return Err(ApiError::Unauthorized("invite is locked to another address"));
+            return Err(ApiError::Unauthorized(
+                "invite is locked to another address",
+            ));
         }
     }
 

@@ -147,7 +147,9 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(why) => tracing::debug!(reason = why, "auth rejected"),
             ApiError::Forbidden(why) => tracing::debug!(reason = why, "forbidden"),
             ApiError::BadGateway(why) => tracing::warn!(reason = why, "upstream unavailable"),
-            ApiError::ServiceUnavailable(why) => tracing::warn!(reason = why, "refused: at capacity"),
+            ApiError::ServiceUnavailable(why) => {
+                tracing::warn!(reason = why, "refused: at capacity")
+            }
             _ => tracing::debug!(code, "request rejected"),
         }
 
