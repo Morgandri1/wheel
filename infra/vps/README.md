@@ -311,6 +311,12 @@ sudo infra/vps/install.sh --rollback     # no build, no clone, no network
 That swaps `/opt/wheel/bin/{wheeld,wheel}` with their `.prev`, and the generation you rolled back
 *from* becomes the new `.prev` — so it is reversible.
 
+**An upgrade does not drop the board.** `wheel-web` `Requires=` the signup gate, which `Requires=`
+`wheeld` — and systemd propagates a *stop* along `Requires=` but not a *restart*. So
+`systemctl restart wheeld` leaves the board serving, while `systemctl stop wheeld` deliberately
+takes it down with it (a board in front of a stopped daemon is a board showing errors). Both halves
+are checked in the rehearsal rather than assumed.
+
 **`install.sh` refuses to move the box backwards** by default. If the installed binary's commit is
 a descendant of your `--ref`, that is a self-applied update (`WHEEL_AUTO_UPDATE`) about to be
 clobbered; it stops and names `--allow-downgrade`.

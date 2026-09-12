@@ -172,6 +172,16 @@ check("SuccessExitStatus" not in wheeld, "wheeld has NO SuccessExitStatus",
       "SuccessExitStatus=75 would make the auto-update exit look clean, so systemd would not "
       "restart and the update would never take effect")
 
+# ---------------------------------------------------------------- one source of truth for the bind
+#
+# config.rs resolves the bind as flag, THEN BIND_ADDR, then its default. A literal address in
+# ExecStart would therefore beat an operator's BIND_ADDR while wheel-preflight and wheeld-ready
+# both read BIND_ADDR -- preflight would validate an address the daemon ignored, and wheeld-ready
+# would probe the wrong port and fail a healthy start.
+exec_start = one(wheeld, "ExecStart") or ""
+check("${BIND_ADDR}" in exec_start, "wheeld ExecStart interpolates ${BIND_ADDR}",
+      "a literal --bind silently overrides the operator's BIND_ADDR, and then preflight and "
+      "wheeld-ready are checking a value the daemon never used")
 # ---------------------------------------------------------------- running vs serving
 check("ExecStartPre" in wheeld, "wheeld has an ExecStartPre",
       "nothing would refuse a non-loopback bind, a wrong data-dir mode, or a claude below the "
@@ -236,6 +246,10 @@ check(not re.search(r"rm\s+(-\w+\s+)*[^\n]*\bbin/[^\s]*\.prev", install_sh),
 check(".prev" in install_sh and "--rollback" in install_sh,
       "install.sh writes a .prev generation and offers --rollback",
       "an upgrade with no way back leaves a failed build as the only build")
+check(re.search(r"^\s*echo \"BIND_ADDR=", install_sh, re.M) is not None,
+      "install.sh writes BIND_ADDR into wheeld.env",
+      "wheeld.service interpolates ${BIND_ADDR} into --bind, so an unset one makes --bind take an "
+      "empty argument and the daemon fails to start")
 check("libexec/wheel-preflight" in install_sh and "libexec/wheeld-ready" in install_sh,
       "install.sh installs the libexec scripts the units call",
       "the units would reference files that are not on the server and wheeld would fail to start")

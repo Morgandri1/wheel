@@ -378,6 +378,11 @@ fi
 
 step "settings in /etc/wheel (yours go in *.local.env, which this never touches)"
 {
+    # The single source of truth for where wheeld listens. wheeld.service interpolates it into
+    # --bind, and wheel-preflight and wheeld-ready both read it, so an operator who overrides it in
+    # wheeld.local.env gets a daemon, a preflight and a readiness probe that all agree. Loopback:
+    # nothing in this kit publishes wheeld to the network (README.md section 1).
+    echo "BIND_ADDR=127.0.0.1:8080"
     echo "PUBLIC_BASE_URL=$api_base"
     [ -z "$allowed_hosts" ] || echo "WHEEL_ALLOWED_HOSTS=$allowed_hosts"
     # TLS mode only, and the one guarantee native cannot reproduce (proposal §3). Caddy dials

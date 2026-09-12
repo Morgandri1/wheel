@@ -52,7 +52,14 @@ EnvironmentFile=-/etc/wheel/wheeld.local.env
 # via `+` — it has to stat files the service user cannot).
 ExecStartPre=+/opt/wheel/libexec/wheel-preflight
 
-ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind 127.0.0.1:8080
+# ${BIND_ADDR}, not a literal. crates/wheeld/src/config.rs resolves the bind as flag, THEN
+# BIND_ADDR, then its own default -- so a literal --bind here would silently win over an operator's
+# BIND_ADDR in wheeld.local.env, while wheel-preflight and wheeld-ready both read BIND_ADDR and
+# would be validating and measuring a value the daemon had ignored. Preflight refusing a bind that
+# was never going to be used is merely confusing; wheeld-ready probing the wrong port would report
+# a healthy daemon as failed. Interpolating the variable makes all three agree by construction.
+# wheeld.env always sets it, so this is never empty.
+ExecStart=/opt/wheel/bin/wheeld --data-dir /var/lib/wheel --bind ${BIND_ADDR}
 
 # Type=simple reports "active (running)" the instant execve succeeds — before the store is opened,
 # before migrations, before anything binds. systemd does not finish the start job until

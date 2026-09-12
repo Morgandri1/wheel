@@ -216,6 +216,24 @@ if run_phase serve && { [ "$installed" = 1 ] || [ "$only" = serve ]; }; then
             wheel_version_ge "$v" "$WHEEL_CLAUDE_MIN" || { echo "claude $v < floor $WHEEL_CLAUDE_MIN"; exit 1; }
             echo "claude $v >= $WHEEL_CLAUDE_MIN"'
 
+    # Requires= propagates STOP but not RESTART, and the difference is load-bearing: an upgrade
+    # restarts wheeld, and if that cascaded through wheel-signup-gate to wheel-web the board would
+    # drop on every upgrade. Measured rather than assumed, because it is a systemd subtlety that
+    # would be discovered during a deploy otherwise.
+    check restart-no-cascade "an upgrade restart of wheeld leaves the board up" \
+        dex bash -c 'systemctl restart wheeld
+            sleep 2
+            [ "$(systemctl is-active wheel-web)" = active ] || { echo "wheel-web went $(systemctl is-active wheel-web) when wheeld restarted — every upgrade would drop the board"; exit 1; }'
+
+    # The other half of the same property, and it is the DESIRED one: a board serving in front of a
+    # stopped wheeld is a board showing errors to whoever is logged in.
+    check stop-does-cascade "stopping wheeld takes the board down with it" \
+        dex bash -c 'systemctl stop wheeld
+            sleep 2
+            active=$(systemctl is-active wheel-web)
+            systemctl start wheeld >/dev/null 2>&1; systemctl start wheel-web >/dev/null 2>&1
+            [ "$active" != active ] || { echo "wheel-web kept serving with wheeld stopped"; exit 1; }'
+
     check doctor "wheel-doctor reports all three tiers healthy" \
         dex /usr/local/bin/wheel-doctor health
 
