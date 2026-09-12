@@ -1048,4 +1048,195 @@ mod redaction_tests {
             "an empty vault has nothing to redact: {node}"
         );
     }
+
+    /// The reviewer's finding named this specifically: a Tool node's `fill.value` is an
+    /// operator-typed plaintext secret ("Bearer sk_live_..."), and `fill.vault_ref` names where a
+    /// vault-mode fill's credential lives. `RedactCredentials` already empties both for
+    /// `NodeConfig::Tool` (`wheel-core/src/node.rs`); this proves `get_board` actually reaches that
+    /// arm for a non-admin caller, not only that the trait impl is correct in isolation
+    /// (`wheel-core/tests/redaction.rs` already covers that half).
+    fn tool_node(conn: &rusqlite::Connection, name: &str) -> Uuid {
+        use wheel_core::{
+            Fill, FillMode, ParamLocation, ToolConfig, ToolFormat, ToolKind, ToolMethod,
+            ToolOperation, ToolParam, ToolSource,
+        };
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Tool(ToolConfig {
+                kind: ToolKind::Http,
+                source: ToolSource {
+                    format: ToolFormat::Manual,
+                    raw: String::new(),
+                    imported_at: Timestamp::now(),
+                },
+                base_url: "https://api.stripe.com".into(),
+                operations: vec![ToolOperation {
+                    id: "charge".into(),
+                    method: ToolMethod::Post,
+                    path: "/v1/charges".into(),
+                    summary: None,
+                    enabled: true,
+                    params: vec![
+                        ToolParam {
+                            name: "Authorization".into(),
+                            location: ParamLocation::Header,
+                            required: true,
+                            description: None,
+                            schema: None,
+                            fill: Fill {
+                                mode: FillMode::Static,
+                                value: Some("Bearer sk_live_topsecret".into()),
+                                vault_ref: None,
+                            },
+                        },
+                        ToolParam {
+                            name: "X-Api-Key".into(),
+                            location: ParamLocation::Header,
+                            required: true,
+                            description: None,
+                            schema: None,
+                            fill: Fill {
+                                mode: FillMode::Vault,
+                                value: None,
+                                vault_ref: Some("creds/STRIPE_SECRET".into()),
+                            },
+                        },
+                    ],
+                }],
+            }),
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    fn fills_of(node: &serde_json::Value) -> &Vec<serde_json::Value> {
+        node["config"]["operations"][0]["params"]
+            .as_array()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guest_never_sees_a_tools_static_secret_or_vault_ref() {
+        let state = crate::api::test_state();
+        let tool = {
+            let conn = state.db.lock().unwrap();
+            tool_node(&conn, "stripe")
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, tool);
+        let params = fills_of(node);
+        assert_eq!(
+            params[0]["fill"].get("value"),
+            None,
+            "the static Bearer value must never reach a guest: {node}"
+        );
+        assert_eq!(
+            params[1]["fill"].get("vault_ref"),
+            None,
+            "the vault ref must never reach a guest either -- it names where the credential \
+             lives: {node}"
+        );
+        // The mode stays: a reader must still see the field is filled and how, per
+        // RedactCredentials's own doc comment -- just not with what.
+        assert_eq!(params[0]["fill"]["mode"], "static");
+        assert_eq!(params[1]["fill"]["mode"], "vault");
+        assert_eq!(node["redacted"], true);
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_a_tools_real_fills() {
+        let state = crate::api::test_state();
+        let tool = {
+            let conn = state.db.lock().unwrap();
+            tool_node(&conn, "stripe")
+        };
+
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
+        let node = vault_of(&resp, tool);
+        let params = fills_of(node);
+        assert_eq!(params[0]["fill"]["value"], "Bearer sk_live_topsecret");
+        assert_eq!(params[1]["fill"]["vault_ref"], "creds/STRIPE_SECRET");
+    }
+
+    /// An endpoint's bearer `vault_ref` is the same disclosure shape: it names the vault key that
+    /// would authenticate a webhook call.
+    #[tokio::test]
+    async fn a_guest_never_sees_an_endpoints_bearer_vault_ref() {
+        use wheel_core::{EndpointAuth, EndpointConfig, HttpMethod, ResponseMode};
+        let state = crate::api::test_state();
+        let ep = {
+            let n = Node::new(
+                Uuid::new_v4(),
+                "hook".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Endpoint(EndpointConfig {
+                    method: HttpMethod::Post,
+                    path: "/hook".into(),
+                    response_mode: wheel_core::ResponseMode::Ack,
+                    auth: EndpointAuth::Bearer {
+                        vault_ref: "creds/WEBHOOK_SECRET".into(),
+                    },
+                }),
+            );
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &n).unwrap();
+            let _ = ResponseMode::Ack;
+            n.id
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, ep);
+        assert_eq!(
+            node["config"]["auth"]["vault_ref"], "",
+            "a guest must not learn which vault key authenticates this webhook: {node}"
+        );
+        // Still reported as `Bearer`, not silently downgraded to `none` -- describing a protected
+        // endpoint as public would be worse than saying nothing.
+        assert!(node["config"]["auth"].get("vault_ref").is_some());
+    }
+
+    /// An MCP node's `env` is operator-typed values keyed by names an agent could otherwise infer a
+    /// credential's shape from (`STRIPE_SECRET_KEY`), so the whole map goes, not just the values.
+    #[tokio::test]
+    async fn a_guest_never_sees_an_mcp_nodes_env() {
+        use wheel_core::{McpConfig, NodeConfig as NC};
+        let state = crate::api::test_state();
+        let mcp = {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert("STRIPE_SECRET_KEY".to_string(), "sk_live_x".to_string());
+            let n = Node::new(
+                Uuid::new_v4(),
+                "stripe_mcp".parse().unwrap(),
+                Position::default(),
+                NC::Mcp(McpConfig::Stdio {
+                    command: "stripe-mcp".into(),
+                    args: None,
+                    env: Some(env),
+                }),
+            );
+            let conn = state.db.lock().unwrap();
+            board::create(&conn, &n).unwrap();
+            n.id
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, mcp);
+        assert!(
+            node["config"].get("env").is_none(),
+            "a guest must not see the mcp env map, key names included: {node}"
+        );
+        assert_eq!(node["redacted"], true);
+    }
 }
