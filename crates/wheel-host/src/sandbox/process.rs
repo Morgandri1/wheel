@@ -49,6 +49,10 @@ pub struct ProcessSandbox {
     /// Live children, so stop/status act on the process we actually started rather than on a pid
     /// we read back from somewhere and hoped was still ours.
     children: Mutex<HashMap<Uuid, tokio::process::Child>>,
+    /// How long `stop()` gives the engine's own SIGTERM handler before SIGKILL. Always
+    /// `ENGINE_STOP_GRACE_SECS` in production; a test shrinks it so proving the SIGKILL fallback
+    /// actually fires doesn't mean waiting out a 30s production budget.
+    stop_grace_secs: u64,
 }
 
 impl ProcessSandbox {
@@ -58,6 +62,7 @@ impl ProcessSandbox {
             store,
             proc_root: PathBuf::from("/proc"),
             children: Mutex::new(HashMap::new()),
+            stop_grace_secs: ENGINE_STOP_GRACE_SECS,
         }
     }
 
@@ -65,6 +70,13 @@ impl ProcessSandbox {
     #[cfg(test)]
     fn with_proc_root(mut self, root: PathBuf) -> Self {
         self.proc_root = root;
+        self
+    }
+
+    /// Shrink the SIGKILL grace `stop()` gives an unresponsive engine. Tests only.
+    #[cfg(test)]
+    fn with_stop_grace_secs(mut self, secs: u64) -> Self {
+        self.stop_grace_secs = secs;
         self
     }
 
@@ -434,7 +446,7 @@ impl Sandbox for ProcessSandbox {
         let Some(mut child) = self.children.lock().await.remove(id) else {
             return Ok(()); // already stopped; stop must converge
         };
-        // SIGTERM first: the engine's contract is a clean shutdown within ENGINE_STOP_GRACE_SECS
+        // SIGTERM first: the engine's contract is a clean shutdown within `stop_grace_secs`
         // (agents drained and stopped, sqlite flushed). Killing outright would risk a torn
         // database, or a replayed turn (review round 2, finding 2 — SIGKILLing an engine that is
         // still inside its own drain is exactly the mid-turn kill the shutdown redesign exists to
@@ -448,7 +460,7 @@ impl Sandbox for ProcessSandbox {
         }
 
         let graceful =
-            tokio::time::timeout(Duration::from_secs(ENGINE_STOP_GRACE_SECS), child.wait()).await;
+            tokio::time::timeout(Duration::from_secs(self.stop_grace_secs), child.wait()).await;
         if graceful.is_err() {
             tracing::warn!(project = %id, "engine ignored SIGTERM; killing");
             let _ = child.kill().await;
@@ -567,13 +579,62 @@ mod tests {
     /// to 25s (a 2s HTTP drain, up to 20s for turns in flight, a 3s SIGTERM grace for its agents),
     /// so a SIGKILL budget shorter than that would cut off exactly the drain the redesign asks the
     /// engine to do.
+    ///
+    /// A prior version of this test asserted only on the `ENGINE_STOP_GRACE_SECS` constant, which
+    /// stayed green even after a reviewer reverted the call site in `stop()` to a shorter hardcoded
+    /// timeout — the constant was still correct, it just was not the number `stop()` used. This
+    /// pins the production default that `stop()` actually reads.
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn the_engine_stop_grace_covers_its_own_shutdown_budget() {
+    fn production_defaults_to_the_full_engine_shutdown_grace() {
+        let dir = tempdir();
+        let sb = sandbox_in(&dir);
         assert!(
-            ENGINE_STOP_GRACE_SECS >= 30,
-            "ENGINE_STOP_GRACE_SECS is {ENGINE_STOP_GRACE_SECS}s, which is not enough room for a \
-             ~25s engine shutdown to finish before being SIGKILLed"
+            sb.stop_grace_secs >= 30,
+            "ProcessSandbox::new must default stop_grace_secs to ENGINE_STOP_GRACE_SECS (>= 30s), \
+             got {}",
+            sb.stop_grace_secs
+        );
+    }
+
+    /// The behavioural half of the same fix: drives the real `stop()` against a real child that
+    /// ignores SIGTERM, so a future edit that makes `stop()` stop reading `stop_grace_secs` (the
+    /// same class of regression review round 2 found) turns this red, not just a constant check.
+    #[tokio::test]
+    async fn stop_gives_an_unresponsive_engine_its_configured_grace_before_killing_it() {
+        let dir = tempdir();
+        let sb = sandbox_in(&dir).with_stop_grace_secs(1);
+        let id = Uuid::new_v4();
+
+        // A disposition already set to ignore (as opposed to a handler function) survives execve,
+        // so `exec`ing into `sleep` keeps the same pid truly ignoring SIGTERM — the way a wedged
+        // engine might.
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .expect("spawn a stubborn child");
+        let pid = child.id().expect("child pid") as libc::pid_t;
+        sb.children.lock().await.insert(id, child);
+        // Give the shell time to install the trap before stop() sends SIGTERM: sending it too
+        // early would hit the shell's default (terminating) disposition and race the assertion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = Instant::now();
+        sb.stop(&id).await.expect("stop");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "stop killed the engine before its configured grace period elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "stop should kill promptly once the grace period elapses, took {elapsed:?}"
+        );
+        // SAFETY: signal 0 sends nothing and only probes whether the pid still exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the unresponsive engine should have been killed once its grace period elapsed"
         );
     }
 
