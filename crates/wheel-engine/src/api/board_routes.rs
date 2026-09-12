@@ -68,6 +68,25 @@ pub async fn get_board(
     })))
 }
 
+/// Shared by every test module in this file that calls `get_board` directly: a
+/// `HeaderMap` asserting the named tier, matching what the API's proxy sets
+/// after stripping and re-verifying a caller's real membership
+/// (`wheel-api/src/http/actor.rs::sanitized_with_actor`).
+#[cfg(test)]
+fn headers_for_tier(tier: &str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert(
+        "x-wheel-actor-tier",
+        axum::http::HeaderValue::from_str(tier).unwrap(),
+    );
+    h
+}
+
+#[cfg(test)]
+fn admin_headers() -> axum::http::HeaderMap {
+    headers_for_tier("admin")
+}
+
 /// `POST /v1/nodes` → the created `Node`.
 /// Refuse a harness this build cannot actually run.
 ///
@@ -755,7 +774,7 @@ mod budget_status_tests {
             id
         };
 
-        let resp = get_board(State(state)).await.unwrap().0;
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
         let node = resp["nodes"]
             .as_array()
             .unwrap()
@@ -778,7 +797,7 @@ mod budget_status_tests {
             mk(&conn, "agent", NodeConfig::Agent(AgentConfig::default()))
         };
 
-        let resp = get_board(State(state)).await.unwrap().0;
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
         let node = resp["nodes"]
             .as_array()
             .unwrap()
@@ -885,6 +904,148 @@ mod ctx_patch_size_limit_tests {
             resp.status(),
             StatusCode::OK,
             "the limit is inclusive, matching wheel-core's own boundary test"
+        );
+    }
+}
+
+/// ADVERSARY finding 054: `GET /v1/board` is a guest-reachable route (the proposal's own words --
+/// "a guest cannot ... read or write any vault value -- including the list of key names" -- and the
+/// policy table's `v1/board => Guest`), so the ONLY thing standing between a guest and every vault's
+/// key names is this handler's own redaction. `wheel-core/tests/redaction.rs` proves
+/// `RedactCredentials` empties a `VaultConfig`'s `keys` in isolation; nothing before this proved the
+/// route actually calls it for a non-admin caller -- the two calls to `get_board` elsewhere in this
+/// file did not even compile against the current signature until this change, so nothing here had
+/// run at all.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use wheel_core::{NodeConfig, Position, VaultConfig};
+
+    fn vault_node(conn: &rusqlite::Connection, name: &str, keys: &[&str]) -> Uuid {
+        let n = Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: keys.iter().map(|s| s.to_string()).collect(),
+            }),
+        );
+        board::create(conn, &n).unwrap();
+        n.id
+    }
+
+    fn vault_of(resp: &serde_json::Value, id: Uuid) -> &serde_json::Value {
+        resp["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id.to_string())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guest_never_sees_a_vaults_key_names() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(
+            node["config"]["keys"],
+            serde_json::json!([]),
+            "a guest must not learn any key name: {node}"
+        );
+        assert_eq!(
+            node["redacted"], true,
+            "a guest must be told the vault is hidden, not shown an empty list that reads as \
+             'this vault has none': {node}"
+        );
+    }
+
+    /// The same as above, once more for `prompter`: redaction is "below admin", not "guest only" --
+    /// a two-branch `match` on tier would have been an easy place to leave prompter unredacted by
+    /// accident.
+    #[tokio::test]
+    async fn a_prompter_never_sees_a_vaults_key_names_either() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY"])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("prompter"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(node["config"]["keys"], serde_json::json!([]));
+        assert_eq!(node["redacted"], true);
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_the_real_key_names() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        };
+
+        let resp = get_board(State(state), admin_headers()).await.unwrap().0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(
+            node["config"]["keys"],
+            serde_json::json!(["ANTHROPIC_API_KEY", "OTHER_KEY"])
+        );
+        assert!(
+            node.get("redacted").is_none(),
+            "an admin's own board must not claim anything was hidden from them: {node}"
+        );
+    }
+
+    /// A request with no tier header at all is the fail-closed case
+    /// `tier_from_headers` documents: treated as guest, not as admin. This is
+    /// what a caller that reached the engine WITHOUT going through the API's
+    /// proxy (and therefore without a verified tier) gets.
+    #[tokio::test]
+    async fn a_request_asserting_no_tier_at_all_is_treated_as_a_guest() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "anthropic", &["ANTHROPIC_API_KEY"])
+        };
+
+        let resp = get_board(State(state), axum::http::HeaderMap::new())
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert_eq!(node["config"]["keys"], serde_json::json!([]));
+    }
+
+    /// A vault with no keys at all is not "redacted" -- there is nothing to hide, and claiming
+    /// otherwise would tell a guest a credential exists when it does not.
+    #[tokio::test]
+    async fn an_empty_vault_is_not_reported_as_redacted() {
+        let state = crate::api::test_state();
+        let vault = {
+            let conn = state.db.lock().unwrap();
+            vault_node(&conn, "empty", &[])
+        };
+
+        let resp = get_board(State(state), headers_for_tier("guest"))
+            .await
+            .unwrap()
+            .0;
+        let node = vault_of(&resp, vault);
+        assert!(
+            node.get("redacted").is_none(),
+            "an empty vault has nothing to redact: {node}"
         );
     }
 }
