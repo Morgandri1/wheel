@@ -393,6 +393,19 @@ loop... folded into the session itself") one level further up: PR1 folded stdout
 one object; PR2's real job is folding *that object's ownership* into one task so the rest of the
 supervisor can only reach it by asking, never by racing it.
 
+**Update (ADVERSARY design review): a real gap closed, one line above corrected.** The
+`select! { next_event() => ..., cmd = rx.recv() => ... }` loop above races `next_event()` on every
+iteration, and `select!` *drops* the losing branch's future rather than pausing it. Whether that
+loses data depends on `next_event()` being cancellation-safe, which the trait never said as a
+requirement — so "PR1's trait shape stays exactly as merged" above turned out not to hold: fixed in
+`#96` (draft, `sdk/driver-cancellation-safety`), which makes cancellation safety an explicit,
+documented part of `next_event()`'s contract and proves `ClaudeSession` already satisfies it
+(`next_event_is_cancellation_safe_across_a_partial_line`, a real mid-write race via a script that
+writes a genuinely partial line, not a timing assumption). ADVERSARY's own framing: cheaper than
+pin-and-reuse, and something a Codex JSON-RPC client wants regardless of this specific channel
+design, since it is exactly the kind of stateful client that could get this wrong on its own. PR2
+should treat this as settled going in, not rediscover it mid-implementation.
+
 ### 9.3 Landing plan
 
 Given 9.1's corrected scope, I don't think PR2 needs the further split I originally floated to PM —
