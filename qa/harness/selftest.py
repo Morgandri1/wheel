@@ -171,14 +171,21 @@ def t_usage_limit():
     with tempfile.TemporaryDirectory() as d:
         marker = os.path.join(d, "window-closed")
         open(marker, "w").close()
-        before = time.time()
+        # Backdated well clear of "now": a marker created and read back-to-back
+        # would land mtime and time.time() in the same instant, so a check
+        # comparing against mtime+resets_in couldn't tell that apart from one
+        # comparing against now+resets_in — both pass either way (QA,
+        # mutation-checked this and caught the blind spot). Ten seconds back
+        # puts the two candidate answers comfortably outside the tolerance.
+        old = time.time() - 10
+        os.utime(marker, (old, old))
         rl = [e for e in events(run(SJ, turn("x"), env={"WHEEL_FAKE_LIMIT_WHILE_FILE": marker,
                                                           "WHEEL_FAKE_LIMIT_RESETS_IN": "5"}).stdout)
               if e["type"] == "rate_limit_event"]
         check("limit_while_file limits while the marker exists",
               rl and rl[0]["rate_limit_info"]["status"] == "rejected", str(rl))
         check("limit_while_file's reset is the file's mtime plus resets_in, not now plus resets_in",
-              rl and abs(rl[0]["rate_limit_info"]["resetsAt"] - (before + 5)) < 2, str(rl))
+              rl and abs(rl[0]["rate_limit_info"]["resetsAt"] - (old + 5)) < 2, str(rl))
         os.remove(marker)
         check("limit_while_file is over once the marker is gone",
               last({"WHEEL_FAKE_LIMIT_WHILE_FILE": marker})["is_error"] is False)
