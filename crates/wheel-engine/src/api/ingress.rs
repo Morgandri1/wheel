@@ -305,11 +305,18 @@ fn authenticate(
         })
         .or_else(|| {
             // A sender that can be given only a URL gets a longer URL.
+            // Percent-decoded: this is a query VALUE, not a comparison of raw
+            // wire bytes, and a secret containing `%`, `&`, `+` or any other
+            // URL-reserved byte arrives here still encoded (ADVERSARY,
+            // review of #103). `+` is left as a literal plus -- this is a URI
+            // query component per RFC 3986, not
+            // `application/x-www-form-urlencoded`, which is the one place
+            // `+` means space.
             uri.query().and_then(|q| {
                 q.split('&')
                     .filter_map(|kv| kv.split_once('='))
                     .find(|(k, _)| *k == "token")
-                    .map(|(_, v)| v.to_string())
+                    .map(|(_, v)| percent_decode(v))
             })
         });
 
@@ -317,6 +324,30 @@ fn authenticate(
         Some(p) => super::constant_time_eq(p.as_bytes(), expected.as_bytes()),
         None => false,
     }
+}
+
+/// Percent-decode a single query-string VALUE (not a whole URL). `%XX`
+/// becomes that byte; anything else, including a `%` not followed by two hex
+/// digits, passes through literally rather than being dropped -- a malformed
+/// escape must not silently shorten the value into something that then
+/// coincidentally fails to match for a second, unrelated reason.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Every distinguishable reason `resolve_secret` can fail to produce a
@@ -902,6 +933,90 @@ mod tests {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(bytes)
         }
+    }
+
+    /// ADVERSARY, review of #103: a secret containing a URL-reserved byte,
+    /// correctly percent-encoded per RFC 3986 by whoever built the `?token=`
+    /// URL, must still match -- it did not, since the extraction never
+    /// decoded it.
+    #[test]
+    fn percent_decode_reverses_a_correctly_encoded_query_value() {
+        assert_eq!(percent_decode("abc"), "abc");
+        assert_eq!(percent_decode("a%2Bb%26c%25d"), "a+b&c%d");
+        // `+` is a literal plus in a URI query component (RFC 3986), not a
+        // form-encoded space -- unlike `application/x-www-form-urlencoded`.
+        assert_eq!(percent_decode("a+b"), "a+b");
+        // A malformed escape passes through literally rather than being
+        // dropped or panicking on a non-hex/short tail.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("100%2"), "100%2");
+        assert_eq!(percent_decode("100%zz"), "100%zz");
+    }
+
+    /// The end-to-end version of the test above: a secret with a `&` in it,
+    /// sent the way a real client would (percent-encoded in the URL), must
+    /// authenticate through the real function, not just the helper.
+    #[test]
+    fn a_percent_encoded_query_token_authenticates_through_the_real_function() {
+        use wheel_core::{
+            AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position, ResponseMode,
+            VaultConfig,
+        };
+
+        let state = crate::api::test_state();
+        let conn = state.db.lock().unwrap();
+        let vault = Node::new(
+            Uuid::new_v4(),
+            "v".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["S".into()],
+            }),
+        );
+        let agent = Node::new(
+            Uuid::new_v4(),
+            "a".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let endpoint = Node::new(
+            Uuid::new_v4(),
+            "e".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::Bearer {
+                    vault_ref: "v/S".into(),
+                },
+            }),
+        );
+        board::create(&conn, &vault).unwrap();
+        board::create(&conn, &agent).unwrap();
+        board::create(&conn, &endpoint).unwrap();
+        board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+        board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+        let vk = state.supervisor.require_vault_key().unwrap();
+        // The secret itself contains `&` and `%`, both URL-reserved.
+        crate::vault::put(&conn, vk, vault.id, "S", "a&b%c").unwrap();
+        drop(conn);
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+        let headers = HeaderMap::new();
+        let uri: Uri = "/hook?token=a%26b%25c".parse().unwrap();
+
+        assert!(
+            authenticate(&state, &matched, &headers, &uri, b""),
+            "a correctly percent-encoded query token must decode and match"
+        );
     }
 
     /// The hit is attributed to the endpoint NODE, so the envelope's `type` is
