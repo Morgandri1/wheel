@@ -259,8 +259,24 @@ fn authenticate(
     // The secret is read through the endpoint's OWN wires, so an endpoint
     // without a `read` wire to the vault cannot authenticate at all — the
     // capability is the wire, here as everywhere else.
-    let Some(expected) = resolve_secret(state, matched.id, vault_ref) else {
-        return false;
+    let expected = match resolve_secret(state, matched, vault_ref) {
+        Ok(secret) => secret,
+        Err(reason) => {
+            // An operator-error case (misconfiguration, or the vault/wire/key
+            // state this build expects is missing), never a wrong-credential
+            // case — the caller's presented value is not even looked at yet.
+            // Logged, unlike a bad credential: hiding a WRONG presented
+            // secret protects against enumeration; hiding a BROKEN endpoint
+            // just leaves the operator staring at silent 401s (this bug).
+            tracing::warn!(
+                endpoint = %matched.name,
+                endpoint_id = %matched.id,
+                reason = reason.as_str(),
+                "auth:bearer endpoint cannot resolve its secret — every request will 401 \
+                 until this is fixed"
+            );
+            return false;
+        }
     };
 
     // `authorization: Bearer <secret>`, or the same value in the header a
@@ -289,11 +305,28 @@ fn authenticate(
         })
         .or_else(|| {
             // A sender that can be given only a URL gets a longer URL.
+            // Percent-decoded: this is a query VALUE, not a comparison of raw
+            // wire bytes, and a secret containing `%`, `&`, `+` or any other
+            // URL-reserved byte arrives here still encoded (ADVERSARY,
+            // review of #103). `+` is left as a literal plus -- this is a URI
+            // query component per RFC 3986, not
+            // `application/x-www-form-urlencoded`, which is the one place
+            // `+` means space.
             uri.query().and_then(|q| {
                 q.split('&')
                     .filter_map(|kv| kv.split_once('='))
                     .find(|(k, _)| *k == "token")
-                    .map(|(_, v)| v.to_string())
+                    // STRICT utf8, not `from_utf8_lossy`: a decoded value
+                    // that is not valid utf8 must never reach the comparison
+                    // as a lossy string (ADVERSARY, review of #103) -- U+FFFD
+                    // substitution is a many-to-one mapping, and a security
+                    // comparison must not have one, even where nothing today
+                    // exploits it (every real secret is a `String`, so
+                    // `expected` cannot itself contain the substitution
+                    // character for a collision to land on). Failing to
+                    // produce a candidate here is just "no credential
+                    // presented" -- the existing, already-safe 401 path.
+                    .and_then(|(_, v)| String::from_utf8(percent_decode_bytes(v)).ok())
             })
         });
 
@@ -303,24 +336,120 @@ fn authenticate(
     }
 }
 
+/// Percent-decode a single query-string VALUE (not a whole URL) to its raw
+/// bytes. `%XX` becomes that byte; anything else, including a `%` not
+/// followed by two hex digits, passes through literally rather than being
+/// dropped -- a malformed escape must not silently shorten the value into
+/// something that then coincidentally fails to match for a second, unrelated
+/// reason.
+///
+/// Returns bytes, not a `String`: the one caller compares against a secret on
+/// a security-sensitive path, and `String::from_utf8_lossy` would substitute
+/// U+FFFD for any invalid sequence -- a many-to-one mapping with no place on
+/// a comparison, however impractical to exploit today (ADVERSARY, review of
+/// #103).
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Every distinguishable reason `resolve_secret` can fail to produce a
+/// secret. Previously collapsed into one bare `None`, which meant an
+/// operator's own broken wiring (missing wire, wrong vault_ref, no vault key
+/// on this deployment, a value that will not decrypt) looked EXACTLY like the
+/// "working as designed" case of an endpoint nobody has wired a vault to yet
+/// — and both looked, from the outside, like a caller's wrong credential. The
+/// three names below are `authenticate`'s own log line, not exposed to the
+/// caller: a wrong credential still gets a bare 401, unchanged.
+#[derive(Debug, PartialEq, Eq)]
+enum SecretError {
+    /// `vault_ref` is not `<name>/<key>` — a config-time bug, since
+    /// `EndpointAuth::Bearer`'s `vault_ref` is operator-entered free text.
+    MalformedRef,
+    /// No node named `<name>`, of type vault, that this endpoint holds a
+    /// `read` wire to. Covers "wrong name", "right name wrong type", and
+    /// "right vault but the wire was never drawn" as one case: from the
+    /// endpoint's point of view they are the same fact — it cannot reach it.
+    NoReadableVault,
+    /// The vault exists and is wired, but has nothing stored at `<key>`.
+    NoSuchKey,
+    /// This engine has no usable vault key at all (`WHEEL_VAULT_KEY` missing
+    /// or unparseable) — a deployment-level fact, true for every vault on the
+    /// board, not particular to this endpoint.
+    NoVaultKey(&'static str),
+    /// A value is stored at `<key>`, but would not decrypt under this
+    /// engine's vault key. The one case that is otherwise SILENT by
+    /// construction (`vault::get` returns `Err`, previously swallowed by
+    /// `.ok()`): a vault key rotated without re-encrypting stored values
+    /// leaves every secret behind it permanently unreadable, with nothing
+    /// short of this log line to say so.
+    DecryptFailed,
+    /// The board's own storage could not be read at all (a poisoned lock
+    /// aside, effectively unreachable) — named separately so it is never
+    /// confused with a legitimate "not found".
+    StorageUnavailable,
+}
+
+impl SecretError {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SecretError::MalformedRef => "malformed_vault_ref",
+            SecretError::NoReadableVault => "no_readable_vault",
+            SecretError::NoSuchKey => "no_such_key",
+            SecretError::NoVaultKey(_) => "no_vault_key",
+            SecretError::DecryptFailed => "decrypt_failed",
+            SecretError::StorageUnavailable => "storage_unavailable",
+        }
+    }
+}
+
 /// Read `<vault>/<key>`, but only across a real `endpoint → vault (read)` wire.
-fn resolve_secret(state: &AppState, endpoint: Uuid, vault_ref: &str) -> Option<String> {
-    let (vault_name, key) = vault_ref.split_once('/')?;
+fn resolve_secret(
+    state: &AppState,
+    matched: &MatchedEndpoint,
+    vault_ref: &str,
+) -> Result<String, SecretError> {
+    let (vault_name, key) = vault_ref.split_once('/').ok_or(SecretError::MalformedRef)?;
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(p) => p.into_inner(),
     };
-    let wires = board::wires_from(&conn, endpoint).ok()?;
-    let nodes = board::list(&conn).ok()?;
-    let vault = nodes.iter().find(|n| {
-        n.name.as_str() == vault_name
-            && n.node_type() == NodeType::Vault
-            && wires
-                .iter()
-                .any(|w| w.to == n.id && w.wire_type == WireType::Read)
-    })?;
-    let vk = state.supervisor.require_vault_key().ok()?;
-    crate::vault::get(&conn, vk, vault.id, key).ok().flatten()
+    let wires =
+        board::wires_from(&conn, matched.id).map_err(|_| SecretError::StorageUnavailable)?;
+    let nodes = board::list(&conn).map_err(|_| SecretError::StorageUnavailable)?;
+    let vault = nodes
+        .iter()
+        .find(|n| {
+            n.name.as_str() == vault_name
+                && n.node_type() == NodeType::Vault
+                && wires
+                    .iter()
+                    .any(|w| w.to == n.id && w.wire_type == WireType::Read)
+        })
+        .ok_or(SecretError::NoReadableVault)?;
+    let vk = state
+        .supervisor
+        .require_vault_key()
+        .map_err(SecretError::NoVaultKey)?;
+    match crate::vault::get(&conn, vk, vault.id, key) {
+        Ok(Some(secret)) => Ok(secret),
+        Ok(None) => Err(SecretError::NoSuchKey),
+        Err(_) => Err(SecretError::DecryptFailed),
+    }
 }
 
 /// Fan the hit out over the endpoint's own wires.
@@ -535,6 +664,469 @@ mod tests {
             v.as_object().unwrap().len(),
             1,
             "unexpected top-level shape: {v}"
+        );
+    }
+
+    /// PM/Morgan's repro (project `ingress-auth-repro`): a correctly wired,
+    /// correctly configured, correctly presented Bearer secret must
+    /// authenticate. It does not -- `authenticate()` returns false for every
+    /// valid presentation form, which fails closed (safe direction) but means
+    /// every `auth:bearer` endpoint on the board is permanently unusable.
+    #[test]
+    fn a_bearer_secret_actually_authenticates_a_real_wired_endpoint() {
+        use wheel_core::{
+            AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position, ResponseMode,
+            VaultConfig,
+        };
+
+        let state = crate::api::test_state();
+        let conn = state.db.lock().unwrap();
+
+        let vault = Node::new(
+            Uuid::new_v4(),
+            "v".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["S".into()],
+            }),
+        );
+        let agent = Node::new(
+            Uuid::new_v4(),
+            "a".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let endpoint = Node::new(
+            Uuid::new_v4(),
+            "e".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::Bearer {
+                    vault_ref: "v/S".into(),
+                },
+            }),
+        );
+        board::create(&conn, &vault).unwrap();
+        board::create(&conn, &agent).unwrap();
+        board::create(&conn, &endpoint).unwrap();
+        board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+        board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+
+        let vk = state.supervisor.require_vault_key().unwrap();
+        crate::vault::put(&conn, vk, vault.id, "S", "the-secret").unwrap();
+        drop(conn);
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer the-secret".parse().unwrap());
+        let uri: Uri = "/hook".parse().unwrap();
+
+        assert!(
+            authenticate(&state, &matched, &headers, &uri, b""),
+            "a correctly wired endpoint with the correct Bearer secret must authenticate"
+        );
+    }
+
+    /// Every `resolve_secret` failure used to collapse into one bare `None`;
+    /// this proves each of the six is now its own, distinguishable variant
+    /// rather than the same catch-all reached by six different paths.
+    mod resolve_secret_reasons {
+        use super::*;
+        use wheel_core::{EndpointConfig, HttpMethod, Node, Position, ResponseMode, VaultConfig};
+
+        /// A fresh vault + endpoint pair, wired, with no value stored yet —
+        /// the shared starting point every variant test edits from.
+        fn wired(state: &AppState) -> (rusqlite::Connection, Node, MatchedEndpoint) {
+            let conn = crate::db::open_memory().unwrap();
+            let vault = Node::new(
+                Uuid::new_v4(),
+                "v".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["S".into()],
+                }),
+            );
+            let endpoint = Node::new(
+                Uuid::new_v4(),
+                "e".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Endpoint(EndpointConfig {
+                    method: HttpMethod::Post,
+                    path: "/hook".into(),
+                    response_mode: ResponseMode::Ack,
+                    auth: wheel_core::EndpointAuth::Bearer {
+                        vault_ref: "v/S".into(),
+                    },
+                }),
+            );
+            board::create(&conn, &vault).unwrap();
+            board::create(&conn, &endpoint).unwrap();
+            board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+            let matched = MatchedEndpoint {
+                id: endpoint.id,
+                name: endpoint.name.clone(),
+                config: match &endpoint.config {
+                    NodeConfig::Endpoint(c) => c.clone(),
+                    _ => unreachable!(),
+                },
+            };
+            let _ = state;
+            (conn, vault, matched)
+        }
+
+        #[test]
+        fn malformed_vault_ref_is_named_not_conflated_with_a_missing_vault() {
+            let state = crate::api::test_state();
+            let (conn, _vault, mut matched) = wired(&state);
+            *state.db.lock().unwrap() = conn;
+            matched.config.auth = wheel_core::EndpointAuth::Bearer {
+                vault_ref: "no-slash-here".into(),
+            };
+            assert_eq!(
+                resolve_secret(&state, &matched, "no-slash-here"),
+                Err(SecretError::MalformedRef)
+            );
+        }
+
+        #[test]
+        fn no_wire_is_no_readable_vault_not_a_bare_none() {
+            let state = crate::api::test_state();
+            let conn = crate::db::open_memory().unwrap();
+            let vault = Node::new(
+                Uuid::new_v4(),
+                "v".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["S".into()],
+                }),
+            );
+            let endpoint = Node::new(
+                Uuid::new_v4(),
+                "e".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Endpoint(EndpointConfig {
+                    method: HttpMethod::Post,
+                    path: "/hook".into(),
+                    response_mode: ResponseMode::Ack,
+                    auth: wheel_core::EndpointAuth::Bearer {
+                        vault_ref: "v/S".into(),
+                    },
+                }),
+            );
+            board::create(&conn, &vault).unwrap();
+            board::create(&conn, &endpoint).unwrap();
+            // No wire drawn at all -- the vault exists, but the endpoint has
+            // no capability to read it.
+            let vk = state.supervisor.require_vault_key().unwrap();
+            crate::vault::put(&conn, vk, vault.id, "S", "x").unwrap();
+            *state.db.lock().unwrap() = conn;
+            let matched = MatchedEndpoint {
+                id: endpoint.id,
+                name: endpoint.name.clone(),
+                config: match &endpoint.config {
+                    NodeConfig::Endpoint(c) => c.clone(),
+                    _ => unreachable!(),
+                },
+            };
+            assert_eq!(
+                resolve_secret(&state, &matched, "v/S"),
+                Err(SecretError::NoReadableVault)
+            );
+        }
+
+        #[test]
+        fn a_wired_vault_with_nothing_stored_is_no_such_key_not_decrypt_failed() {
+            let state = crate::api::test_state();
+            let (conn, _vault, matched) = wired(&state);
+            // Wired, but nothing was ever `put` at "S".
+            *state.db.lock().unwrap() = conn;
+            assert_eq!(
+                resolve_secret(&state, &matched, "v/S"),
+                Err(SecretError::NoSuchKey)
+            );
+        }
+
+        #[test]
+        fn no_vault_key_on_this_deployment_is_named_and_not_confused_with_the_others() {
+            // Built by hand, not `test_state()`: this is the one axis
+            // `test_state` hardcodes (a real vault key), so the "no key at
+            // all" deployment shape needs its own AppState.
+            let cfg = std::sync::Arc::new(crate::config::Config {
+                project_id: Uuid::new_v4(),
+                engine_secret: "0123456789abcdef".into(),
+                vault_key: None,
+                data_dir: std::env::temp_dir()
+                    .join(format!("wheel-ingress-test-{}", Uuid::new_v4())),
+                listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+                json_logs: false,
+                tool_allow_hosts: Vec::new(),
+                startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+                harness_auth: crate::config::HarnessAuthPolicy::default(),
+                script_execution_enabled: false,
+            });
+            let conn = crate::db::open_memory().unwrap();
+            let vault = Node::new(
+                Uuid::new_v4(),
+                "v".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Vault(VaultConfig {
+                    keys: vec!["S".into()],
+                }),
+            );
+            let endpoint = Node::new(
+                Uuid::new_v4(),
+                "e".parse().unwrap(),
+                Position::default(),
+                NodeConfig::Endpoint(EndpointConfig {
+                    method: HttpMethod::Post,
+                    path: "/hook".into(),
+                    response_mode: ResponseMode::Ack,
+                    auth: wheel_core::EndpointAuth::Bearer {
+                        vault_ref: "v/S".into(),
+                    },
+                }),
+            );
+            board::create(&conn, &vault).unwrap();
+            board::create(&conn, &endpoint).unwrap();
+            board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+            let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+            let events = std::sync::Arc::new(crate::events::Bus::new());
+            let supervisor =
+                crate::supervisor::Supervisor::new(cfg.clone(), db.clone(), events.clone());
+            let state = AppState {
+                supervisor: std::sync::Arc::new(supervisor),
+                cfg,
+                db,
+                events,
+                logins: std::sync::Arc::new(crate::oauth::LoginSessions::default()),
+                ingress_rate: std::sync::Arc::new(RateLimiter::default()),
+            };
+            let matched = MatchedEndpoint {
+                id: endpoint.id,
+                name: endpoint.name.clone(),
+                config: match &endpoint.config {
+                    NodeConfig::Endpoint(c) => c.clone(),
+                    _ => unreachable!(),
+                },
+            };
+            assert!(matches!(
+                resolve_secret(&state, &matched, "v/S"),
+                Err(SecretError::NoVaultKey(_))
+            ));
+        }
+
+        /// The smoking-gun case: a value stored under one vault key that no
+        /// longer decrypts under the key this engine is now running with (a
+        /// `WHEEL_VAULT_KEY` rotated without re-encrypting stored values).
+        /// Previously silent by construction (`vault::get`'s `Err` swallowed
+        /// by `.ok()`) -- the exact gap PM asked this logging to close.
+        #[test]
+        fn a_value_that_wont_decrypt_under_the_current_key_is_named_not_swallowed() {
+            let state = crate::api::test_state();
+            let (conn, vault, matched) = wired(&state);
+            let old_key = crate::vault::VaultKey::from_base64(&base64_encode([9u8; 32])).unwrap();
+            crate::vault::put(&conn, &old_key, vault.id, "S", "x").unwrap();
+            *state.db.lock().unwrap() = conn;
+            // `state`'s own supervisor holds the [7u8; 32] key `test_state`
+            // hardcodes -- different from `old_key` above, so the stored
+            // ciphertext will not decrypt under it.
+            assert_eq!(
+                resolve_secret(&state, &matched, "v/S"),
+                Err(SecretError::DecryptFailed)
+            );
+        }
+
+        fn base64_encode(bytes: [u8; 32]) -> String {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+    }
+
+    /// ADVERSARY, review of #103: a secret containing a URL-reserved byte,
+    /// correctly percent-encoded per RFC 3986 by whoever built the `?token=`
+    /// URL, must still match -- it did not, since the extraction never
+    /// decoded it.
+    #[test]
+    fn percent_decode_reverses_a_correctly_encoded_query_value() {
+        fn decode(s: &str) -> String {
+            String::from_utf8(percent_decode_bytes(s)).unwrap()
+        }
+        assert_eq!(decode("abc"), "abc");
+        assert_eq!(decode("a%2Bb%26c%25d"), "a+b&c%d");
+        // `+` is a literal plus in a URI query component (RFC 3986), not a
+        // form-encoded space -- unlike `application/x-www-form-urlencoded`.
+        assert_eq!(decode("a+b"), "a+b");
+        // A malformed escape passes through literally rather than being
+        // dropped or panicking on a non-hex/short tail.
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(decode("100%2"), "100%2");
+        assert_eq!(decode("100%zz"), "100%zz");
+    }
+
+    /// The comparison-path fix itself (ADVERSARY, review of #103): a query
+    /// value that percent-decodes to bytes which are NOT valid utf8 must
+    /// never reach `constant_time_eq` as a lossy-substituted string. It must
+    /// instead behave as "no credential presented" -- still a 401, never a
+    /// panic, and never a many-to-one comparison.
+    #[test]
+    fn a_query_value_that_decodes_to_invalid_utf8_is_never_lossily_compared() {
+        // %FF%FE is not valid utf8 in any interpretation.
+        let bytes = percent_decode_bytes("%FF%FE");
+        assert!(String::from_utf8(bytes).is_err());
+    }
+
+    /// The end-to-end version of the test above: a secret with a `&` in it,
+    /// sent the way a real client would (percent-encoded in the URL), must
+    /// authenticate through the real function, not just the helper.
+    #[test]
+    fn a_percent_encoded_query_token_authenticates_through_the_real_function() {
+        use wheel_core::{
+            AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position, ResponseMode,
+            VaultConfig,
+        };
+
+        let state = crate::api::test_state();
+        let conn = state.db.lock().unwrap();
+        let vault = Node::new(
+            Uuid::new_v4(),
+            "v".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["S".into()],
+            }),
+        );
+        let agent = Node::new(
+            Uuid::new_v4(),
+            "a".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let endpoint = Node::new(
+            Uuid::new_v4(),
+            "e".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::Bearer {
+                    vault_ref: "v/S".into(),
+                },
+            }),
+        );
+        board::create(&conn, &vault).unwrap();
+        board::create(&conn, &agent).unwrap();
+        board::create(&conn, &endpoint).unwrap();
+        board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+        board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+        let vk = state.supervisor.require_vault_key().unwrap();
+        // The secret itself contains `&` and `%`, both URL-reserved.
+        crate::vault::put(&conn, vk, vault.id, "S", "a&b%c").unwrap();
+        drop(conn);
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+        let headers = HeaderMap::new();
+        let uri: Uri = "/hook?token=a%26b%25c".parse().unwrap();
+
+        assert!(
+            authenticate(&state, &matched, &headers, &uri, b""),
+            "a correctly percent-encoded query token must decode and match"
+        );
+    }
+
+    /// ADVERSARY's coverage gap on the test above: proves the WIRING, not
+    /// just `percent_decode_bytes` in isolation. A query token that decodes
+    /// to invalid utf8 must be refused through the real `authenticate()`
+    /// call. The stored secret is deliberately set to the EXACT string
+    /// `String::from_utf8_lossy` would have produced from the presented
+    /// bytes -- under the lossy bug this PR fixed, that made the two sides
+    /// equal and authenticated the request. A secret that merely differs
+    /// from the presented garbage would pass even with the bug still in
+    /// place (any two different strings fail to match either way), so it
+    /// would prove nothing; this is the one setup where the two behaviours
+    /// actually diverge.
+    #[test]
+    fn a_query_token_decoding_to_invalid_utf8_is_refused_not_panicked_or_lossily_matched() {
+        use wheel_core::{
+            AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position, ResponseMode,
+            VaultConfig,
+        };
+
+        let state = crate::api::test_state();
+        let conn = state.db.lock().unwrap();
+        let vault = Node::new(
+            Uuid::new_v4(),
+            "v".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["S".into()],
+            }),
+        );
+        let agent = Node::new(
+            Uuid::new_v4(),
+            "a".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let endpoint = Node::new(
+            Uuid::new_v4(),
+            "e".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::Bearer {
+                    vault_ref: "v/S".into(),
+                },
+            }),
+        );
+        board::create(&conn, &vault).unwrap();
+        board::create(&conn, &agent).unwrap();
+        board::create(&conn, &endpoint).unwrap();
+        board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+        board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+        let vk = state.supervisor.require_vault_key().unwrap();
+        // The would-be collision: exactly what the OLD, lossy code would
+        // have decoded "%FF%FE" into. If the fix regressed to lossy
+        // conversion, this secret would equal the presented value and
+        // authenticate would wrongly return true.
+        let lossy_collision = String::from_utf8_lossy(&[0xFF, 0xFE]).into_owned();
+        crate::vault::put(&conn, vk, vault.id, "S", &lossy_collision).unwrap();
+        drop(conn);
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+        let headers = HeaderMap::new();
+        let uri: Uri = "/hook?token=%FF%FE".parse().unwrap();
+
+        assert!(
+            !authenticate(&state, &matched, &headers, &uri, b""),
+            "a query token that decodes to invalid utf8 must be refused even when the stored \
+             secret happens to equal its lossy decoding -- never panic, never lossily match"
         );
     }
 
