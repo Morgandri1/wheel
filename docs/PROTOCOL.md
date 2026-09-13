@@ -1044,11 +1044,30 @@ naming what is gone rather than saying "reduced isolation":
 > socket, and read any other child's environment. Vault values are protected
 > only by the encryption key, which lives in that same environment.
 
-**The host must refuse to start a second project in this mode.** One project as
-one user is a convenience; two projects as one user is a tenancy boundary that
-does not exist while claiming to. `wheel_core::UidIsolation::from_env()` is the
-single reader of that variable, so the host and the engine cannot disagree about
-which mode they are in.
+`wheel_core::UidIsolation::from_env()` is the single reader of that variable
+(`crates/wheel-engine/src/lib.rs`'s `serve_until` is the only caller), so nothing
+downstream can read a second, disagreeing answer from the same environment.
+
+**What is NOT yet true, stated plainly rather than implied by the paragraph
+above (ADVERSARY, 2026-09-12):**
+
+- **Nothing refuses a second project in this mode.** The intent — "one project as
+  one user is a convenience; two projects as one user is a tenancy boundary that
+  does not exist while claiming to" — is not enforced anywhere in this codebase.
+  Neither `wheel-host` nor `wheeld` counts how many projects are running shared
+  and refuses a second. The paragraph this replaces claimed the check exists; it
+  does not.
+- **`wheeld` — the one deployment that genuinely runs every project shared-uid
+  by construction (`crates/wheeld/src/embedded.rs`'s own header) — never sets
+  `WHEEL_ALLOW_SHARED_UID` and never calls `UidIsolation::from_env()` at all.**
+  So the warning above **never fires** on the one binary whose normal operation
+  is exactly the condition it exists to announce. This is not a hypothetical
+  misconfiguration; it is `wheeld`'s documented, accepted default mode running
+  with the safety rail silently disengaged. Tracked as follow-up **F5** in
+  `docs/proposals/wheeld-native-production.md` (PR #67), owned SDK/Engine + API.
+  Fix it there, either by having `wheeld` engage this mechanism honestly or by
+  this section stopping its claim that shared-uid mode is announced and
+  single-project-enforced when, for `wheeld`, it is neither.
 
 ## Tool nodes (§3d)
 
