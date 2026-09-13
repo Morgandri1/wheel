@@ -30,6 +30,11 @@ enum Engine {
     Accepts,
     /// Nodes succeed; wires are refused, so the apply lands partially.
     RefusesWires,
+    /// Nodes and wires succeed, but every wire comes back flagged — the
+    /// shape `wheel-engine`'s `db::board::add_wire` uses for finding 043 (+
+    /// its addendum) and the pre-existing vault-overlap warning: the wire is
+    /// real, not an error, and the operator still needs to see why.
+    WarnsWires,
 }
 
 /// A mock engine that REMEMBERS what it created, so a second apply is a genuine "improve" against
@@ -81,6 +86,13 @@ async fn mock_engine(behaviour: Engine) -> String {
                         Engine::RefusesWires => {
                             (StatusCode::BAD_REQUEST, "wire refused by the engine").into_response()
                         }
+                        Engine::WarnsWires => (
+                            StatusCode::OK,
+                            axum::Json(json!({"warning": "finding 043: this exposes agent \
+                                researcher to unauthenticated input from anyone who can reach \
+                                the endpoint's public URL"})),
+                        )
+                            .into_response(),
                     }
                 }),
             )
@@ -224,6 +236,41 @@ async fn a_legal_board_applies_and_reports_200() {
     assert_eq!(body["applied"], true);
     assert_eq!(body["report"]["created_nodes"].as_array().unwrap().len(), 2);
     assert_eq!(body["report"]["created_wires"].as_array().unwrap().len(), 1);
+}
+
+/// End-to-end sanity check for the wire-warning plumbing (finding 043 + its addendum,
+/// `wheel-engine`'s `db::board::add_wire`, PR #99): a wire the engine flags is still a SUCCESSFUL
+/// apply — `applied: true`, `200`, the wire is in `created_wires` — but the warning is not
+/// dropped anywhere between the engine's `{"warning": ...}` response and this route's own JSON
+/// body. Proves the full path (`HttpBoardClient::add_wire` parses it, `execute` threads it into
+/// `ApplyReport.warnings`, the handler serialises it), not just the unit-level pieces.
+#[tokio::test]
+async fn a_flagged_wire_still_applies_and_the_warning_reaches_the_caller() {
+    let app = app(Engine::WarnsWires).await;
+    let (token, id) = project(&app).await;
+
+    let (status, body) = apply(&app, &token, &id, legal_board()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a flagged wire is not a failure: {body}"
+    );
+    assert_eq!(body["applied"], true);
+    assert_eq!(body["report"]["created_wires"].as_array().unwrap().len(), 1);
+
+    let warnings = body["report"]["warnings"]
+        .as_array()
+        .expect("a warnings array");
+    assert_eq!(warnings.len(), 1, "{body}");
+    assert_eq!(warnings[0]["wire"]["from"], "notes");
+    assert_eq!(warnings[0]["wire"]["to"], "researcher");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("researcher"),
+        "{body}"
+    );
 }
 
 /// The invariant. A caller branching on 2xx must not be able to read a partial apply as success.
