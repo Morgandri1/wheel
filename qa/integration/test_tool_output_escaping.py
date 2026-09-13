@@ -168,7 +168,7 @@ def main():
         )
         if not R.check("ESC/setup", notes and reader, "node creation -> %s" % st):
             return R.report("tool-output-escaping")
-        http("POST", "/v1/wires", {"from": "reader", "to": "hostile-notes", "type": "read"})
+        http("POST", "/v1/wires", {"from": reader, "to": notes, "type": "read"})
 
         http("POST", "/v1/agents/%s/start" % reader)
         if not R.check("ESC/token-file", wait_token(reader),
