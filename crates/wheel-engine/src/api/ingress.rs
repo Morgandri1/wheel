@@ -1051,6 +1051,85 @@ mod tests {
         );
     }
 
+    /// ADVERSARY's coverage gap on the test above: proves the WIRING, not
+    /// just `percent_decode_bytes` in isolation. A query token that decodes
+    /// to invalid utf8 must be refused through the real `authenticate()`
+    /// call. The stored secret is deliberately set to the EXACT string
+    /// `String::from_utf8_lossy` would have produced from the presented
+    /// bytes -- under the lossy bug this PR fixed, that made the two sides
+    /// equal and authenticated the request. A secret that merely differs
+    /// from the presented garbage would pass even with the bug still in
+    /// place (any two different strings fail to match either way), so it
+    /// would prove nothing; this is the one setup where the two behaviours
+    /// actually diverge.
+    #[test]
+    fn a_query_token_decoding_to_invalid_utf8_is_refused_not_panicked_or_lossily_matched() {
+        use wheel_core::{
+            AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position, ResponseMode,
+            VaultConfig,
+        };
+
+        let state = crate::api::test_state();
+        let conn = state.db.lock().unwrap();
+        let vault = Node::new(
+            Uuid::new_v4(),
+            "v".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["S".into()],
+            }),
+        );
+        let agent = Node::new(
+            Uuid::new_v4(),
+            "a".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Agent(AgentConfig::default()),
+        );
+        let endpoint = Node::new(
+            Uuid::new_v4(),
+            "e".parse().unwrap(),
+            Position::default(),
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::Bearer {
+                    vault_ref: "v/S".into(),
+                },
+            }),
+        );
+        board::create(&conn, &vault).unwrap();
+        board::create(&conn, &agent).unwrap();
+        board::create(&conn, &endpoint).unwrap();
+        board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+        board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+        let vk = state.supervisor.require_vault_key().unwrap();
+        // The would-be collision: exactly what the OLD, lossy code would
+        // have decoded "%FF%FE" into. If the fix regressed to lossy
+        // conversion, this secret would equal the presented value and
+        // authenticate would wrongly return true.
+        let lossy_collision = String::from_utf8_lossy(&[0xFF, 0xFE]).into_owned();
+        crate::vault::put(&conn, vk, vault.id, "S", &lossy_collision).unwrap();
+        drop(conn);
+
+        let matched = MatchedEndpoint {
+            id: endpoint.id,
+            name: endpoint.name.clone(),
+            config: match &endpoint.config {
+                NodeConfig::Endpoint(c) => c.clone(),
+                _ => unreachable!(),
+            },
+        };
+        let headers = HeaderMap::new();
+        let uri: Uri = "/hook?token=%FF%FE".parse().unwrap();
+
+        assert!(
+            !authenticate(&state, &matched, &headers, &uri, b""),
+            "a query token that decodes to invalid utf8 must be refused even when the stored \
+             secret happens to equal its lossy decoding -- never panic, never lossily match"
+        );
+    }
+
     /// The hit is attributed to the endpoint NODE, so the envelope's `type` is
     /// `endpoint` because of what the sender IS — not because this module
     /// wrote the word. `type=user` is the operator's own turns and an external
