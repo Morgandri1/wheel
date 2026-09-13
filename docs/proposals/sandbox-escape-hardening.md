@@ -266,10 +266,18 @@ gets both.** That may still be the right call — a systemd-confined process wit
 and no runaway-agent blast radius is a legitimate, defensible posture, and #67's own measurement
 discipline is exactly what this document has been asking for throughout. But it is Morgan's tradeoff
 to make with the axis named and the reconciliation path now confirmed unavailable, not one that
-should get decided by which PR merges first while the other is mid-review. **Recommend against
-merging either #67 (promoting Shape 2 to default) or a Shape-3 commitment until this specific
-question — does the default deployment keep a namespace boundary, and is that boundary worth more
-than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
+should get decided by which PR merges first while the other is mid-review.
+
+**RESOLVED 2026-09-13 — Morgan's ruling, via PM, applying his own stated ladder (lightest sandbox
+mechanism first, then escape security, then operator UX): #67 stays open as a reviewed, opt-in
+deployment path, but does NOT become the default until Shape 1/3's gVisor sandboxing lands.** #67
+alone provides zero project isolation — it fails the FIRST rung of that ladder outright, and its real
+strengths (`OOMPolicy=continue`, resource limits, self-update, `ufw` authority) are third-rung
+operator-UX concerns — a tiebreaker once the isolation question is already settled, not something
+that can outweigh it. #67 itself may merge whenever it is ready (a real, reviewed improvement as an
+opt-in path); what does not happen is flipping it to the default deployment shape in docs/config
+before Shape 3's per-project gVisor convergence (above) lands. This closes the tension carried since
+the framing-question section above — no further Morgan decision needed on this axis.
 
 Shape 1's compose hardening (§§1–2 below) is a different decision from the shape question above: it
 improves the CURRENT deployment without foreclosing anything, costs little, and shipped in this PR
@@ -780,12 +788,13 @@ only whether that stronger boundary was ever reachable on this deployment, and i
   reach completely open; Shape 2 is honestly worse on that specific axis (no pid namespace at all)
   while gaining real resource-limit protection Shape 1 lacks entirely today. Shape 3 is the only one
   where gVisor or per-project uid isolation actually closes project-to-project reach — and the only
-  one not yet started. **This is the decision everything else's shape depends on, and #67 (push
-  Shape 2 to default) and "sandbox escape prevention is paramount" are in real tension on the
-  namespace question specifically, with no microVM-shaped reconciliation available now that KVM is
-  confirmed absent** — see the dedicated section above. Recommend Morgan decide this explicitly
-  before either #67 merges or Shape 3 work starts, rather than have it settled by whichever ships
-  first.
+  one not yet started. **RESOLVED 2026-09-13, Morgan via PM: #67 stays open as a reviewed, opt-in
+  deployment path and may merge whenever ready, but does NOT become the default shape until Shape
+  1/3's gVisor convergence lands** — applying Morgan's own ladder (lightest mechanism, then escape
+  security, then operator UX), #67 alone fails the isolation rung outright and its real strengths
+  (`OOMPolicy=continue`, resource limits, self-update) are third-rung UX wins, a tiebreaker once
+  isolation is settled, not a reason to accept losing it now. See the dedicated section above for the
+  full ruling.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
   instruction not to pause them — reframed by the ruling above as the validated per-project template
   for the converged effort, not a separate track that could later turn out to have been wasted work.
