@@ -48,7 +48,28 @@
 # stranger can also make deploys fail while it's set that way.
 set -eu
 
-base="http://wheeld:8080"
+# Where wheeld is. The Docker path leaves this unset and gets the compose service name; the native
+# path (wheel-signup-gate.service) sets it to wheeld's loopback address. ONE implementation of "is
+# this really wheeld, and does it really enforce its own signup gate", exercised by both
+# deployments — so neither can drift into being the only tested one, which is exactly what happened
+# while the native check was a block of shell inside install.sh that ran once at install time.
+# Resolution order, most explicit first. The native unit deliberately does NOT pass a URL: an
+# earlier version had `Environment=WHEEL_GATE_BASE=http://${BIND_ADDR}` in the unit file, and
+# systemd does NOT expand variables inside Environment= (only ExecStart= and friends get that), so
+# the gate probed the literal host `${BIND_ADDR}` and curl answered "URL rejected: Bad hostname".
+# The gate then correctly refused to let the board start -- a real failure, honestly reported, for
+# a reason that had nothing to do with signup. Deriving it here keeps one source of truth and takes
+# systemd's expansion rules out of the picture entirely.
+if [ -n "${WHEEL_GATE_BASE:-}" ]; then
+    base="$WHEEL_GATE_BASE"
+elif [ -n "${BIND_ADDR:-}" ]; then
+    # Always dial loopback, whatever wheeld was told to bind: an operator who set 0.0.0.0 still has
+    # a daemon reachable on 127.0.0.1, and this probe has no business leaving the machine.
+    base="http://127.0.0.1:${BIND_ADDR##*:}"
+else
+    # The Docker path: compose's service name, on its own network.
+    base="http://wheeld:8080"
+fi
 
 # Control: proves this really is wheeld, answering normally, before trusting anything it says
 # about signup specifically. /healthz needs no auth and no signup opinion; if THIS is not a plain
@@ -62,15 +83,22 @@ if [ "$control_status" != 200 ]; then
     exit 1
 fi
 
+# A private temporary file, never a fixed /tmp path. In compose this ran as the only process in a
+# throwaway container and /tmp/body was harmless; natively it runs on a host where /tmp is shared,
+# and a predictable path another local user can pre-create as a symlink is a file this script then
+# writes through as whatever it is running as.
+body_file="$(mktemp)"
+trap 'rm -f "$body_file"' EXIT
+
 # A password under wheel-api's 10-character minimum. See the file header: this is what makes the
 # probe side-effect-free on both branches, not merely a coincidence of who lost this particular
 # race.
 body='{"email":"verify-signup-gate-probe@wheel.invalid","password":"x"}'
-response="$(curl -sS -m 10 -o /tmp/body -w '%{http_code}' -X POST "$base/v1/auth/signup" -H 'content-type: application/json' -d "$body")" || {
+response="$(curl -sS -m 10 -o "$body_file" -w '%{http_code}' -X POST "$base/v1/auth/signup" -H 'content-type: application/json' -d "$body")" || {
     echo "verify-signup-gate: could not reach $base/v1/auth/signup at all (rc=$?) — wheeld is not answering as itself" >&2
     exit 1
 }
-body_text="$(cat /tmp/body)"
+body_text="$(cat "$body_file")"
 # wheel-api's ApiError::Forbidden always renders this exact text (error.rs), regardless of which
 # internal reason triggered it — signup-closed is the only Forbidden this route can raise, but the
 # Host-guard's differently-worded 403 is ruled out explicitly rather than assumed away.

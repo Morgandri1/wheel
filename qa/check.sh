@@ -256,6 +256,38 @@ else
   skip_absent "infra:prune-probe-projects" "infra/tests/prune-probe-projects.test.sh not present"
 fi
 
+# The native systemd path's invariants. Same argument for living here as the pruner above: the
+# subject is a set of scripts that run as ROOT on the one machine holding every secret on the
+# board, and these checks are plain stdlib/bash — no docker, no network, milliseconds — so exit
+# 0/1 is honest and there is no "could not run" state for them to hide in.
+#
+# The real proof of the native path is infra/vps/rehearsal/native/, which boots systemd in a
+# container and runs an agent workload under the shipped unit. That takes minutes and needs Docker,
+# so it is the equivalent of rehearse.sh: run before a deploy, not on every commit. What lives here
+# is the subset whose violation is catastrophic AND statically detectable — OOMPolicy=continue
+# going missing (one agent's OOM kill then stops the daemon), a well-meant SystemCallFilter
+# appearing on wheeld.service (breaks every agent that drives a browser), the signup gate losing
+# its ordering before the board, install.sh deleting the other lane's rollback artefact.
+if [ -x infra/tests/native-units.test.py ]; then
+  step "infra:native-units" "$PY" infra/tests/native-units.test.py
+else
+  skip_absent "infra:native-units" "infra/tests/native-units.test.py not present"
+fi
+if [ -x infra/tests/native-toolchain.test.sh ]; then
+  step "infra:native-toolchain" bash infra/tests/native-toolchain.test.sh
+else
+  skip_absent "infra:native-toolchain" "infra/tests/native-toolchain.test.sh not present"
+fi
+# migrate-from-docker.sh and backup.sh are destruction-adjacent and run as root. Their central
+# claims ("the Docker volume is only ever read", "wheel_hostdata and wheel_pgdata are never
+# touched", "the old tree is moved aside, not deleted") are properties of the text, and a property
+# of the text is checkable on every commit rather than in a rehearsal nobody runs before merging.
+if [ -x infra/tests/native-migration.test.sh ]; then
+  step "infra:native-migration" bash infra/tests/native-migration.test.sh
+else
+  skip_absent "infra:native-migration" "infra/tests/native-migration.test.sh not present"
+fi
+
 # The image must contain the binaries the contract depends on. BUG-010: the `wheel`
 # CLI was silently absent because the Dockerfile built a bin name that does not exist
 # under `|| true` and copied it with an optional glob. Nothing failed; it just was not there.
