@@ -37,7 +37,7 @@ is PM's live measurement of `wheel-host` (the Railway multi-tenant deployment, t
 sandbox — the private-network segmentation §5b promises is not the segmentation that is actually
 deployed, and only credential secrecy stands between that reachability and real use. This document
 does not fix 048 (it is a Railway-topology / `infra/railway/` fix, not a sandbox-mechanism one), but
-whoever picks up items 4–6 or the gVisor/Kata decision should know it is a confirmed instance, not a
+whoever picks up items 4–6 or the gVisor rollout should know it is a confirmed instance, not a
 "could theoretically happen" — this proposal's own choice of mechanism does not make 048 worse or
 better, since Shape 1's private network exposure and Shape 3's would share the same fix regardless of
 which sandboxing technology wraps the container. The rest of this document has to answer all three,
@@ -133,23 +133,19 @@ measured (not re-derived here — citing rather than duplicating):
   once `wheeld` is just `exec`'d directly by systemd. Wrapping `wheeld` in a gVisor sandbox to get
   this protection back means running it AS a container again, undoing most of what "go native" was
   for.
-- **Firecracker is a genuinely different case — ADVERSARY's correction, not fully "does not apply."**
-  "Native" and "no VM boundary" got merged into one claim above, and only one of them is actually
-  forced. #67's real value isn't "no container" in the abstract — it is systemd's OWN mechanisms
-  (`OOMPolicy=continue`, real cgroup resource limits, `wheeld` updating its own root-owned binary,
-  `ufw` being authoritative), and none of that requires bare metal specifically — it requires systemd
-  running AS PID 1 with real cgroups v2 underneath it. **A Firecracker microVM gives exactly that**:
-  it boots a real guest kernel, so `#67`'s entire measured systemd directive set
-  (`ProtectKernelModules`, `ProtectClock`, the empty `CapabilityBoundingSet=`, all of it) works
-  unmodified inside the guest — from `wheeld`'s own perspective it IS native, because a real kernel
-  is what "native" was ever asking for. **"Native-in-Firecracker"** keeps `#67`'s systemd wins AND
-  gets Firecracker's escape-resistance argument applied to the whole thing, rather than the two being
-  mutually exclusive. Contingent on the SAME KVM-availability question that already gates plain
-  Firecracker (§"Recommendation" below) — this does not remove that blocker, it changes what's on the
-  other side of it if KVM is present. **Not yet verified by anyone actually booting it** — this
-  document can name the reconciliation, it cannot confirm systemd-as-PID-1 inside a Kata/Firecracker
-  guest behaves identically to bare metal for every directive #67 measured; that needs a real boot,
-  not a reading of either codebase.
+- **Firecracker was a genuinely different case — CLOSED, not just contingent, as of Morgan's KVM
+  check (§"Recommendation" below): no `/dev/kvm`, 0 `vmx`/`svm` in `cpuinfo` on the actual target
+  host.** "Native" and "no VM boundary" got merged into one claim above, and only one of them was
+  actually forced — #67's real value isn't "no container" in the abstract, it is systemd's OWN
+  mechanisms (`OOMPolicy=continue`, real cgroup resource limits, `wheeld` updating its own root-owned
+  binary, `ufw` being authoritative), and none of that required bare metal specifically, only systemd
+  running AS PID 1 with real cgroups v2 underneath it. **"Native-in-Firecracker"** would have kept
+  #67's systemd wins AND gotten a VM boundary applied to the whole thing — a real reconciliation path
+  in principle, and worth recording as such for whoever revisits this if the deployment target ever
+  changes — but it needed KVM to exist at all, and on this host it does not. **This reconciliation is
+  now closed, not open-and-unverified**: not "not yet booted," but structurally unavailable, since
+  there is no hypervisor to boot it in. #67 and "sandbox escape prevention is paramount" stay in the
+  unresolved tension described below with no microVM-shaped way out of it on this host.
 - **The same reconciliation does NOT confidently extend to gVisor — named, not leaned on.** gVisor's
   Sentry is a partial userspace reimplementation of the syscall surface, and a full init system
   running its own service manager with real cgroups v2 device/resource controllers is much shakier
@@ -255,28 +251,25 @@ real, cheap wins worth taking regardless of which shape wins. Read strictly — 
 downgrade on the escape-to-host axis specifically**: trading a real pid/network/mount namespace
 boundary (Shape 1) for systemd directives that recover most of the filesystem story and, by #67's
 OWN admission, none of the process-visibility or network-reachability story, while gaining real
-resource limits Shape 1 lacks entirely. **"Native-in-Firecracker" — running #67's entire measured
-systemd hardening pass as PID 1 inside a Firecracker guest kernel, rather than on the bare host — is
-a real reconciliation path, not a forced choice, IF Firecracker clears the same KVM-availability
-check and boot-validation this document already gates it on elsewhere.** If it works, `wheeld` keeps
-every one of #67's systemd wins (`OOMPolicy=continue`, cgroup limits, `ufw` authority) AND gains a
-genuine kernel-separation escape boundary, rather than trading one for the other. Not yet verified —
-someone has to actually boot it — so this does not resolve the tension today, it names the shape a
-resolution could take.
+resource limits Shape 1 lacks entirely. **"Native-in-Firecracker" would have been a real
+reconciliation path — running #67's entire measured systemd hardening pass as PID 1 inside a
+Firecracker guest kernel, rather than on the bare host, keeping every one of #67's systemd wins
+(`OOMPolicy=continue`, cgroup limits, `ufw` authority) AND gaining a genuine kernel-separation escape
+boundary — but it is now CLOSED, not open: Morgan confirmed no KVM on the target host (§"Recommendation"
+below), and there is no hypervisor for a microVM-shaped reconciliation to run in.**
 
-**If "sandbox escape prevention is paramount" is the standing priority, and native-in-Firecracker
-turns out not to be viable (KVM absent, or systemd-as-PID-1 inside a guest does not actually behave
-like bare metal for #67's directive set), Shape 2 becoming the default on bare metal is a decision
-that trades away part of what that priority is asking for, in exchange for real gains on a different
-axis (resource limits, operational clarity).** That may still be the right call — a systemd-confined
-process with real resource limits and no runaway-agent blast radius is a legitimate, defensible
-posture, and #67's own measurement discipline is exactly what this document has been asking for
-throughout. But it is Morgan's tradeoff to make with the axis named, not one that should get decided
-by which PR merges first while the other is mid-review, and not one that should be treated as forced
-before native-in-Firecracker has actually been tried. **Recommend against merging either #67
-(promoting Shape 2 to default) or a Shape-3 commitment until this specific question — does the
-default deployment keep a namespace boundary, and is that boundary
-worth more than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
+**With native-in-Firecracker closed, the tension is real and does not resolve to a shape either
+proposal can claim on its own: Shape 2 becoming the default on bare metal trades away the
+namespace boundary "sandbox escape prevention is paramount" is asking for, in exchange for real gains
+on a different axis (resource limits, operational clarity), and there is no third option left that
+gets both.** That may still be the right call — a systemd-confined process with real resource limits
+and no runaway-agent blast radius is a legitimate, defensible posture, and #67's own measurement
+discipline is exactly what this document has been asking for throughout. But it is Morgan's tradeoff
+to make with the axis named and the reconciliation path now confirmed unavailable, not one that
+should get decided by which PR merges first while the other is mid-review. **Recommend against
+merging either #67 (promoting Shape 2 to default) or a Shape-3 commitment until this specific
+question — does the default deployment keep a namespace boundary, and is that boundary worth more
+than #67's resource-limit and operational gains — has an explicit answer from Morgan.**
 
 Shape 1's compose hardening (§§1–2 below) is a different decision from the shape question above: it
 improves the CURRENT deployment without foreclosing anything, costs little, and shipped in this PR
@@ -294,10 +287,11 @@ to the easier answer.
 **Assessed: this converges, and it converges more cleanly than "Shape 1 now, Shape 3 later" would
 have suggested — because the two pieces of work were never actually independent.**
 
-- **The container/VM-hardening decision (which mechanism, gVisor/Kata/Firecracker/plain
-  `cap_drop`+AppArmor) and the per-project architecture change are the SAME decision, not two.**
-  Whatever mechanism the KVM check and the three spikes above land on has to be applied to SOME
-  sandbox boundary. Today that boundary is "the one shared `wheeld` container" (Shape 1 as scoped).
+- **The container/VM-hardening decision (which mechanism — resolved as gVisor, § "Recommendation"
+  below, now that Morgan's KVM check ruled Firecracker/Kata out — plus plain `cap_drop`+AppArmor) and
+  the per-project architecture change are the SAME decision, not two.**
+  Whatever mechanism wins has to be applied to SOME sandbox boundary. Today that boundary is "the one
+  shared `wheeld` container" (Shape 1 as scoped).
   Converging with Shape 3 means the boundary is instead "each project's own sandbox" — the exact same
   directives (`cap_drop: [ALL]`, `no-new-privileges`, AppArmor confirmation, or a stronger runtime)
   apply verbatim, just N times instead of once. **Nothing already shipped in this PR (items 1–2) is
@@ -308,8 +302,8 @@ have suggested — because the two pieces of work were never actually independen
   sequential either — and one of them may turn out to be REDUNDANT with the other, worth stating
   plainly.** `process.rs`'s uid-drop exists specifically because Railway's `process` backend has NO
   container boundary at all — uid is the ONLY isolation it has. If Shape 3's per-project sandboxes
-  each get a REAL container/VM boundary (Docker, gVisor, Kata, or Firecracker), that boundary is
-  already doing the separating between projects on its own, the way `wheel-host`'s existing
+  each get a REAL container/VM boundary (Docker, or Docker-plus-gVisor per the resolved mechanism
+  above), that boundary is already doing the separating between projects on its own, the way `wheel-host`'s existing
   `DockerSandbox` already does today for the cloud deployment — a per-project uid becomes
   defense-in-depth on top of an already-isolated boundary, not the load-bearing mechanism. Cheap to
   add given the primitive already exists and is tested; not the critical path either way.
@@ -330,21 +324,21 @@ have suggested — because the two pieces of work were never actually independen
   its own unix socket, the exact pattern `wheel-host` uses (`crates/wheeld/src/embedded.rs`'s own doc
   comment, cited above) — the control-plane side already converged before this ruling. What's
   different today is only `EmbeddedSandbox` (`tokio::spawn` per project, no isolation boundary at
-  all) versus `wheel-host`'s real `Sandbox` implementations (`DockerSandbox`, `process.rs`, and
-  whichever `FirecrackerSandbox` the spikes above justify). Converging Shape 1 into Shape 3 means
-  retiring `EmbeddedSandbox` in favor of `wheeld` driving ONE OF THOSE SAME `Sandbox` implementations
-  — reusing `wheel-host`'s own crate rather than building a parallel one. This is a real, larger
-  architecture change (retiring a sandbox backend, not tuning a compose file), but it is not new
-  invention: every piece (the trait, the uid-drop primitive, the Docker backend, and — per the spikes
-  above — potentially a Firecracker backend) already exists or is already scoped.
+  all) versus `wheel-host`'s real `Sandbox` implementations (`DockerSandbox`, `process.rs`).
+  Converging Shape 1 into Shape 3 means retiring `EmbeddedSandbox` in favor of `wheeld` driving
+  `DockerSandbox` with `runsc` as its runtime — reusing `wheel-host`'s own crate rather than building
+  a parallel one, and no `FirecrackerSandbox` to build at all now that KVM is confirmed absent. This
+  is a real, larger architecture change (retiring a sandbox backend, not tuning a compose file), but
+  it is not new invention: every piece (the trait, the uid-drop primitive, the Docker backend, the
+  `runsc` runtime flag) already exists or is a drop-in config change.
 
 **Where this leaves the shape/mechanism decisions above, restated with the convergence folded in
 rather than treated as a later phase:**
 
-1. The KVM check and the three spikes (resume latency at the correct parking granularity, storage
-   mechanism, per-project networking cost at scale) are now gating the CONVERGED effort directly, not
-   a separate "Shape 3, eventually" track — their results decide what `wheeld`'s per-project sandbox
-   actually looks like, which is the same question as "what does Shape 1's hardening apply to."
+1. **The mechanism question is resolved, not a gating spike anymore: gVisor, confirmed by Morgan's
+   KVM check (§"Recommendation" below).** Nothing here waits on a spike result — the CONVERGED
+   effort's per-project sandbox is "`DockerSandbox` with `--runtime=runsc`," the same answer as
+   Shape 1's own hardening mechanism, which is exactly the point of converging them.
 2. Items 1–2 (this PR, already shipped) remain correct and worth keeping merged as-is: they harden
    the CURRENT single-container deployment while the convergence work above is scoped and built, and
    the same directives carry forward into the per-project template once `EmbeddedSandbox` is retired
@@ -354,7 +348,7 @@ rather than treated as a later phase:**
    prohibitive — every primitive it needs already exists in this codebase (the `Sandbox` trait, the
    uid-drop code, at least one working backend) — but it is a real architecture change to `wheeld`
    (retiring `EmbeddedSandbox`), not a config change, and it should be scoped and sequenced as its own
-   piece of work once the mechanism spikes land, not squeezed into this PR's remaining scope. The
+   piece of work, not squeezed into this PR's remaining scope. The
    convergence is the target; this PR is the first, already-shipped step toward it, not a competing
    "harden the shared container instead" path that needs to be walked back.
 4. **Confirmed not mutually exclusive (ADVERSARY): this isn't a Shape-2-style hard conflict, because
@@ -727,75 +721,71 @@ None of this reverses the escape-resistance argument. It means "structurally str
 different questions, the second is not yet answered, and a defensible recommendation needs it
 answered — not asserted past what either agent's analysis currently supports.
 
-**What this means for the order of work (ADVERSARY's process point still stands, strengthened by the
-walk-back rather than undercut by it):**
+**RESOLVED 2026-09-13 — Morgan checked the actual target host directly: no `/dev/kvm`, 0 `vmx`/`svm`
+flags in `/proc/cpuinfo`. No KVM, full stop.** Every branch above that was gated on "if KVM is
+available" is now moot, not hypothetically but confirmed — Firecracker and Kata both require
+hardware virtualization exposed to the host (§ table, "Host requirement" row) and neither can run on
+this host at all, independent of every other tradeoff this document costed. This closes the
+conditional cleanly rather than leaving it open: the three spikes (resume latency, storage mechanism,
+networking cost at scale) never needed to run, because there was never a Firecracker path for them to
+gate. Nothing about the qualified security argument above (gVisor still shares the host kernel; a
+VM boundary would have been structurally stronger against that specific attack surface) changes —
+only whether that stronger boundary was ever reachable on this deployment, and it is not.
 
-1. **Immediately, ahead of anything else in this document, including items 1–3's already-shipped
-   Docker polish: confirm KVM availability on whichever host is the actual deployment target** —
-   `ls /dev/kvm` / `kvm-ok`, one cheap check. If disabled, gVisor is the only real option, full stop,
-   and nothing below this line needs doing at all. This is now an even higher-value first step than
-   the earlier draft gave it credit for: if KVM is absent, the entire networking/storage/latency-
-   at-scale analysis below is moot before it starts, for free.
-2. **If KVM is available, the recommendation is NOT yet "target Firecracker" — it is "run the
-   requirement-grounded spikes below, because the escape-resistance case alone is not sufficient
-   given the fuller requirement set."** Three spikes, not the earlier draft's two, and none
-   optional given what ADVERSARY's follow-up surfaced:
-   - **Resume latency**, measured at the granularity project-level parking would actually use (not
-     assumed to be "once per project" — that assumption itself needs to be confirmed or refuted
-     first, since it changes how often the latency cost below is even paid).
-   - **Storage mechanism** — not "virtio-fs vs. virtio-blk" as a single either/or, but confirming the
-     split-by-content-type call above (virtio-blk for `wheel.db`, virtio-fs for the workspace tree)
-     against Wheel's real sqlite-plus-workspace access pattern, including what it costs to
-     provision/grow/back up at N-project scale for whichever mix that turns out to be.
-   - **Networking cost at scale** — TAP/bridge resource cost per concurrent project, not just "does
-     it work," since ADVERSARY's point is specifically that this is a marginal, multiplying cost, not
-     a fixed integration one.
-3. **The integration path (Kata vs. a direct `FirecrackerSandbox` against `wheel-host`'s own
-   backend-agnostic trait) is a fourth, separate decision, and it INTERACTS with the networking/
-   storage spikes above rather than sitting beside them** — going direct is likely cheaper for the
-   escape mechanism itself (reuses `process.rs`'s existing child-process-lifecycle shape) but loses
-   Kata's automatic CNI-compatible networking and its built-in virtio-fs/virtio-blk device wiring
-   (mounting each backend to the right path, per the split-by-content-type call above), meaning
-   `wheel-host` would have to build that lifecycle itself. Which integration path is cheaper OVERALL
-   depends on the networking/storage spikes' results, not on the escape-mechanism cost alone.
-4. **gVisor is not "the fallback if Firecracker is ruled out" — it is the CURRENT honest baseline
-   recommendation until the three spikes above actually run**, given it already satisfies all four
-   requirements today at effectively no marginal cost, and Firecracker's advantage is proven only on
-   one of the four. Escape-resistance alone does not outweigh three unanswered operational questions
-   at genuine scale — that would be exactly the "structurally stronger boundary" vs. "practical to
-   operate" conflation ADVERSARY named. If the spikes come back favorable, Firecracker is very likely
-   the right target given §"Settled" above; until they do, recommending it outright would be the
-   overconfidence Morgan's instruction asked this document to avoid in the OTHER direction.
+**Final recommendation, no longer conditional: gVisor (`runsc`), full stop.**
 
-This recommendation does not apply to Shape 2 at all — native systemd structurally cannot use either
-mechanism (above), which is itself one more point in the tension Morgan should weigh when deciding
-whether Shape 2 becomes the default.
+1. It already satisfies all four requirements (per-board isolation, networking, persistent storage,
+   multiplayer) today at effectively no marginal cost — the case made in the "Settled"/"NOT settled"
+   analysis above for why it was the honest baseline holds unchanged; it is now also the ONLY
+   available option, not just the safer default while Firecracker's case was still open.
+2. Integration is a drop-in under `wheel-host`'s existing Docker orchestration — `--runtime=runsc` or
+   the per-container `HostConfig.Runtime` field `bollard` already exposes (§ table, "Integration into
+   `wheel-host`" row) — applied to Shape 1's single container now, and to each per-project sandbox
+   once Shape 3's convergence (above) retires `EmbeddedSandbox`. No new orchestration layer, no
+   `containerd`/Kata bypass work, no `FirecrackerSandbox` to build against `wheel-host`'s `Sandbox`
+   trait — that whole integration-path question (§"The integration path" discussion above) is now
+   moot along with the mechanism it was costing.
+3. **What this does NOT resolve, restated so it is not lost now that the mechanism question is
+   closed:** gVisor still runs the untrusted workload on the host's own kernel via syscall
+   interception (§ qualification 1 above) — real gVisor escape CVEs exist precisely because
+   reimplementing that much syscall surface is itself a large attack surface. Confirming "no KVM"
+   answers "which mechanism," not "is this now solved" — items 1–6 (cap_drop, AppArmor, userns-remap,
+   read-only rootfs) remain the layers that raise the cost of an escape through THAT surface, and the
+   side-channel caveat (qualification 3 above, Spectre-class attacks crossing any software boundary on
+   a shared physical CPU) applies to gVisor exactly as it would have to Firecracker — core-pinning/SMT
+   isolation between tenants is still unbudgeted work, not something "no KVM" makes moot.
+4. This recommendation does not apply to Shape 2 at all — native systemd structurally cannot use
+   gVisor (§ Shape 2 above: no OCI runtime slot once `wheeld` is `exec`'d directly), which is itself
+   one more point in the tension Morgan should weigh when deciding whether Shape 2 becomes the
+   default, and the "native-in-Firecracker" reconciliation named above for that tension is now closed
+   for the same KVM-absence reason — #67 and escape-prevention stay in unresolved tension on the
+   namespace question, with no microVM-shaped reconciliation available on this host.
 
 ## Summary — what's asked of whoever reads this next
 
 - **Morgan's ruling, first, since it reframes everything below: converge Shape 1 into Shape 3 rather
   than sequence them.** Assessed and NOT genuinely prohibitive — every primitive the converged effort
   needs already exists in this codebase (`wheel-host`'s `Sandbox` trait, its uid-drop primitive, its
-  Docker backend). The container/VM-hardening mechanism decided by the KVM check + three spikes below
-  and the per-project architecture change are the same decision, not two phases: whatever mechanism
-  wins gets applied per-project instead of to the one shared container, and items 1–2 (already
-  shipped) are the validated template for that, not wasted work. The real, honestly-stated cost: this
-  is a genuine architecture change to `wheeld` (retiring `EmbeddedSandbox` for one of `wheel-host`'s
-  real `Sandbox` implementations), not a config change — sized as its own piece of work once the
-  mechanism spikes land, not squeezed into this PR. See § "Combining Shape 1 and Shape 3" above for
-  the full assessment.
+  Docker backend). The container/VM-hardening mechanism (resolved below: gVisor) and the per-project
+  architecture change are the same decision, not two phases: gVisor gets applied per-project instead
+  of to the one shared container, and items 1–2 (already shipped) are the validated template for
+  that, not wasted work. The real, honestly-stated cost: this is a genuine architecture change to
+  `wheeld` (retiring `EmbeddedSandbox` for `wheel-host`'s `DockerSandbox`), not a config change —
+  sized as its own piece of work, not squeezed into this PR. See § "Combining Shape 1 and Shape 3"
+  above for the full assessment.
 - **The shape question, and it now has three answers instead of two**: Shape 1 (`wheeld` in
   Docker, live today), Shape 2 (`wheeld` native via systemd, PR #67, proposed as the new default),
   or Shape 3 (`wheeld` as a per-project sandbox supervisor, converging on `wheel-host`'s existing
-  `process` backend — hypothetical, unbuilt). Shapes 1 and 2 both leave project-to-project reach
-  completely open; Shape 2 is honestly worse on that specific axis (no pid namespace at all) while
-  gaining real resource-limit protection Shape 1 lacks entirely today. Shape 3 is the only one where
-  gVisor/Firecracker or per-project uid isolation actually closes project-to-project reach — and the
-  only one not yet started. **This is the decision everything else's shape depends on, and #67 (push
+  `DockerSandbox` backend — hypothetical, unbuilt). Shapes 1 and 2 both leave project-to-project
+  reach completely open; Shape 2 is honestly worse on that specific axis (no pid namespace at all)
+  while gaining real resource-limit protection Shape 1 lacks entirely today. Shape 3 is the only one
+  where gVisor or per-project uid isolation actually closes project-to-project reach — and the only
+  one not yet started. **This is the decision everything else's shape depends on, and #67 (push
   Shape 2 to default) and "sandbox escape prevention is paramount" are in real tension on the
-  namespace question specifically** — see the dedicated section above. Recommend Morgan decide this
-  explicitly before either #67 merges or Shape 3 work starts, rather than have it settled by
-  whichever ships first.
+  namespace question specifically, with no microVM-shaped reconciliation available now that KVM is
+  confirmed absent** — see the dedicated section above. Recommend Morgan decide this explicitly
+  before either #67 merges or Shape 3 work starts, rather than have it settled by whichever ships
+  first.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
   instruction not to pause them — reframed by the ruling above as the validated per-project template
   for the converged effort, not a separate track that could later turn out to have been wasted work.
@@ -810,31 +800,22 @@ whether Shape 2 becomes the default.
   (volume ownership; `$CARGO_HOME` write behavior) named rather than hand-waved. Both are Shape-1
   scoped — they harden the single container, not project-to-project reach within it, and (userns-
   remap specifically) would need re-deriving for Shape 2, where there is no container to remap.
-- The real boundary: gVisor vs. Firecracker, costed against the actual target — per-BOARD
-  micro-isolation plus networking, persistent storage and multiplayer (#70) together, not
-  escape-resistance alone — applies to Shapes 1 and 3, structurally does not apply to Shape 2.
-  **Honest state after two more rounds of adversarial review, including ADVERSARY walking their own
-  earlier lean back on the fuller picture AND then pressure-testing their own "categorically
-  stronger" phrasing: escape-resistance settles in Firecracker's favor on its own terms (removes
-  gVisor's specific syscall-emulation attack surface, which has real escape CVEs of its own) —
-  qualified three ways, not unqualified (§ above): Kata vs. raw Firecracker are different TCBs; KVM
-  itself is a smaller, more scrutinized, not-risk-free attack surface, not "solved"; and neither
-  option addresses CPU-level side-channel attacks without separately budgeted core-pinning/SMT
-  isolation. The full requirement set does NOT resolve cleanly either, and this document should not
-  claim more certainty than either finding supports.** Networking and persistent storage scale LINEARLY with concurrent projects for
-  Firecracker (real per-VM infrastructure) and are free for gVisor (inherited from the container);
-  whether project-level idle-parking is needed at real scale — which would make Firecracker's boot
-  cost a per-resume tax rather than a one-time cost — is not decided; and the published ~5MB
-  hypervisor figure undersold Firecracker's real footprint (a full guest kernel resident per project
-  is the honest number). **Current baseline recommendation: gVisor, because it already satisfies all
-  four requirements today at effectively no marginal cost, and Firecracker's advantage is proven on
-  only one of the four so far.** Confirm KVM availability on the real target host FIRST regardless
-  (moots everything else immediately if absent); if present, three spikes — resume latency at the
-  correct parking granularity, confirming the split-by-content-type storage call (virtio-blk for
-  `wheel.db`, virtio-fs for the workspace tree — grounded in a real production incident, § table
-  above) at N-project scale, and per-project networking cost at scale — decide whether Firecracker's
-  escape-resistance case is worth its
-  operational cost. The integration path (Kata vs. a direct `FirecrackerSandbox` against
-  `wheel-host`'s own backend-agnostic `Sandbox` trait, which `process.rs` already proves works for a
-  non-OCI backend in production) is a further, coupled decision once Firecracker clears those spikes,
-  not a default settled here.
+- **The real boundary: RESOLVED as gVisor, no longer conditional — Morgan checked the actual target
+  host directly (2026-09-13): no `/dev/kvm`, 0 `vmx`/`svm` flags in `/proc/cpuinfo`.** Firecracker
+  and Kata both require hardware virtualization exposed to the host and neither can run here at all;
+  the whole gVisor-vs-Firecracker comparison this document built — per-BOARD micro-isolation plus
+  networking, persistent storage and multiplayer (#70) together, not escape-resistance alone, applies
+  to Shapes 1 and 3, structurally does not apply to Shape 2 — is preserved above as the record of why
+  gVisor is the answer, not as an open question anymore. **Final recommendation: gVisor (`runsc`),
+  drop-in via `--runtime=runsc` under `wheel-host`'s existing Docker orchestration, applied to Shape
+  1's single container now and to each per-project sandbox once Shape 3's convergence lands.** None
+  of the three spikes named in earlier revisions (resume latency, storage mechanism, networking cost
+  at scale) ever needed to run — they existed to weigh Firecracker's tradeoffs, and there was never a
+  Firecracker path available on this host for them to gate. What does NOT change: gVisor still runs
+  the untrusted workload on the host's own kernel via syscall interception, with real gVisor
+  escape CVEs in its history precisely because of how much syscall surface it reimplements (§
+  qualification 1 above) — confirming "no KVM" answered which mechanism to use, not "is escape risk
+  now zero." Items 1–6 above remain the layers that raise the cost of an escape through gVisor's own
+  surface, and the CPU-level side-channel caveat (qualification 3 above) applies to gVisor exactly as
+  it would have applied to Firecracker — core-pinning/SMT isolation between tenants is still
+  unbudgeted work, unaffected by which mechanism was chosen.
