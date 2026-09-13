@@ -272,7 +272,8 @@ wh /v1/projects/$P -X PATCH -d '{"capabilities": {"http": true}}'
 ```
 The endpoint can look completely correctly configured and still be refused — this gate is checked
 before the request ever reaches the endpoint node, and nothing on the endpoint's own config hints
-that it exists.
+that it exists. Tracked as `redteam/findings/057` (the gate itself fails safe and is correct by
+design; the finding is about the missing signal, not the gate).
 
 **A saved `GET .../board` response is not what `board/apply` wants**, and feeding one straight to
 the other fails confusingly rather than obviously: `GET .../board` returns wires PER NODE, keyed by
