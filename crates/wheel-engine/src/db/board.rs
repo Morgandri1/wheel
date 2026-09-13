@@ -13,8 +13,8 @@ use super::tables;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use wheel_core::{
-    check_wire, AgentState, Node, NodeConfig, NodeName, NodeType, Position, Timestamp, Wire,
-    WireType,
+    check_wire, AgentState, EndpointAuth, Node, NodeConfig, NodeName, NodeType, Position,
+    Timestamp, Wire, WireType,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -408,11 +408,114 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// The name of a `ctx` node `agent` already holds a `write` wire to, if any.
+/// Finding 043's addendum only checks ONE additional hop past the direct
+/// endpoint->agent leg (explicitly not general graph reachability), so this
+/// stops at the first ctx write wire found rather than collecting all of them.
+fn agent_ctx_write_target(conn: &Connection, agent: Uuid) -> Result<Option<String>> {
+    for wire in wires_from(conn, agent)? {
+        if wire.wire_type == WireType::Write {
+            if let Some(node) = get(conn, wire.to)? {
+                if node.node_type() == NodeType::Ctx {
+                    return Ok(Some(node.name.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `agent` already receives a `send` wire from an `auth:none`
+/// endpoint, and that endpoint's id if so.
+fn unauthenticated_endpoint_sending_to(conn: &Connection, agent: Uuid) -> Result<Option<Uuid>> {
+    for (from, ty) in wires_to(conn, agent)? {
+        if ty == WireType::Send {
+            if let Some(node) = get(conn, from)? {
+                if matches!(&node.config, NodeConfig::Endpoint(cfg) if cfg.auth == EndpointAuth::None)
+                {
+                    return Ok(Some(from));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Finding 043 (+ its 2026-09-13 addendum): warn when a wire creates, or
+/// completes, the dangerous combination `endpoint(auth:none) --send--> agent
+/// --write--> ctx`. The two legs can be drawn in either order, so this is
+/// checked from whichever side the NEW wire is on:
+///
+/// - the new wire IS the endpoint->agent leg: warn the plain form always (an
+///   unauthenticated endpoint reaching a capable agent is dangerous even with
+///   no ctx write), and the worse, distinct form if the agent already writes
+///   a ctx (043's addendum: that reinjects into every OTHER agent reading it,
+///   on every start/context-clear -- board-wide and durable, not one turn).
+/// - the new wire IS the agent->ctx write leg, and the agent already has an
+///   `auth:none` endpoint sending to it: the combination is only COMPLETED
+///   now, by this wire, so it gets the same distinct warning.
+///
+/// Deliberately one hop, not graph reachability (the addendum is explicit
+/// about that scope), and deliberately non-fatal on any lookup error (a
+/// warning that fails to compute must never block a wire the §3 matrix
+/// otherwise allows) -- callers use `.ok().flatten()`, matching the existing
+/// vault-overlap warning below.
+fn endpoint_agent_ctx_warning(
+    conn: &Connection,
+    from_node: &Node,
+    to: Uuid,
+    to_node: &Node,
+    ty: WireType,
+) -> Result<Option<String>> {
+    if from_node.node_type() == NodeType::Endpoint
+        && to_node.node_type() == NodeType::Agent
+        && ty == WireType::Send
+    {
+        let unauthenticated = matches!(&from_node.config, NodeConfig::Endpoint(cfg) if cfg.auth == EndpointAuth::None);
+        if !unauthenticated {
+            return Ok(None);
+        }
+        return Ok(Some(match agent_ctx_write_target(conn, to)? {
+            Some(ctx_name) => format!(
+                "finding 043 addendum: this exposes ctx {ctx_name} to unauthenticated internet \
+                 content via agent {} — reinjected into the system prompt of every OTHER agent \
+                 that reads {ctx_name}, on every start or context-clear, not scoped to one turn",
+                to_node.name
+            ),
+            None => format!(
+                "finding 043: this exposes agent {} to unauthenticated input from anyone who \
+                 can reach the endpoint's public URL",
+                to_node.name
+            ),
+        }));
+    }
+
+    if from_node.node_type() == NodeType::Agent
+        && to_node.node_type() == NodeType::Ctx
+        && ty == WireType::Write
+    {
+        if unauthenticated_endpoint_sending_to(conn, from_node.id)?.is_some() {
+            return Ok(Some(format!(
+                "finding 043 addendum: agent {} already receives unauthenticated internet \
+                 content from an endpoint with no auth — with this wire, that content is \
+                 reinjected into the system prompt of every OTHER agent that reads {}, on every \
+                 start or context-clear, not scoped to one turn",
+                from_node.name, to_node.name
+            )));
+        }
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
 /// Create a wire after checking it against the §3 matrix.
 ///
 /// `Ok(Some(warning))` is a wire that was created but deserves the operator's
-/// attention (028 face 5: two vaults declaring the same credential); it is
-/// not an error and must not be treated as one.
+/// attention (028 face 5: two vaults declaring the same credential; finding
+/// 043 and its addendum: an unauthenticated endpoint reaching, directly or
+/// via one more ctx-write hop, a capable agent); it is not an error and must
+/// not be treated as one.
 pub fn add_wire(
     conn: &Connection,
     from: Uuid,
@@ -453,7 +556,12 @@ pub fn add_wire(
             .map(|a| a.to_string())
     } else {
         None
-    };
+    }
+    .or_else(|| {
+        endpoint_agent_ctx_warning(conn, &from_node, to, &to_node, ty)
+            .ok()
+            .flatten()
+    });
 
     // Idempotent: re-creating an existing wire is a no-op, not an error.
     conn.execute(
@@ -1208,6 +1316,126 @@ mod tests {
         add_wire(&c, a.id, b.id, WireType::Send, None).unwrap();
         add_wire(&c, a.id, b.id, WireType::Send, None).unwrap();
         assert_eq!(wires_from(&c, a.id).unwrap().len(), 1);
+    }
+
+    fn endpoint(name: &str, auth: EndpointAuth) -> Node {
+        node(
+            name,
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth,
+            }),
+        )
+    }
+
+    /// Finding 043: the plain case. No ctx write wire on the agent yet, so
+    /// the warning is the direct-exposure one, not the addendum's.
+    #[test]
+    fn an_unauthenticated_endpoint_to_agent_warns_plainly_with_no_ctx_write() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        let msg = warning.expect("an unauthenticated endpoint -> agent wire must warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(msg.contains("reader"), "{msg}");
+        assert!(
+            !msg.contains("reinjected"),
+            "no ctx write exists yet, so this must not claim the addendum's worse blast \
+             radius: {msg}"
+        );
+    }
+
+    /// Finding 043's addendum, drawn endpoint-leg-last: the agent already
+    /// writes a ctx when the unauthenticated endpoint wire is added, so the
+    /// combination is dangerous from the moment this wire is created.
+    #[test]
+    fn an_unauthenticated_endpoint_to_agent_that_already_writes_ctx_warns_the_addendum() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        let msg = warning.expect("the amplified chain must warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(
+            msg.contains("notes"),
+            "must name the ctx that gets reinjected: {msg}"
+        );
+        assert!(msg.contains("reinjected"), "{msg}");
+    }
+
+    /// Same chain, ctx-leg-last: the unauthenticated endpoint->agent wire
+    /// already exists, and THIS wire (agent->ctx write) is what completes the
+    /// dangerous combination -- so it must be the one that warns, since it is
+    /// the wire the operator is drawing right now.
+    #[test]
+    fn writing_a_ctx_that_completes_an_existing_unauthenticated_endpoint_chain_warns() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+
+        let warning = add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+        let msg = warning.expect("completing the chain from the ctx side must also warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(msg.contains("notes"), "{msg}");
+        assert!(msg.contains("reinjected"), "{msg}");
+    }
+
+    /// A `Bearer`-authenticated endpoint is exactly what finding 043's fix
+    /// tells operators to switch to, so it must never trip the warning it is
+    /// the recommended escape from -- otherwise the warning cannot be
+    /// resolved and stops meaning anything.
+    #[test]
+    fn a_bearer_authenticated_endpoint_to_agent_does_not_warn() {
+        let c = mem();
+        let hook = endpoint(
+            "hook",
+            EndpointAuth::Bearer {
+                vault_ref: "secrets/k".into(),
+            },
+        );
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        assert!(
+            warning.is_none(),
+            "an authenticated endpoint must not trip finding 043's warning: {warning:?}"
+        );
+    }
+
+    /// An agent writing a ctx with no unauthenticated endpoint anywhere near
+    /// it is the ordinary, undangerous case and must stay silent.
+    #[test]
+    fn writing_a_ctx_with_no_unauthenticated_endpoint_in_the_picture_does_not_warn() {
+        let c = mem();
+        let a = agent("writer");
+        let notes = ctx("notes");
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+
+        let warning = add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+        assert!(warning.is_none(), "{warning:?}");
     }
 
     #[test]
