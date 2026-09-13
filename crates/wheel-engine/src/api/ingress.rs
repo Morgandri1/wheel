@@ -316,7 +316,17 @@ fn authenticate(
                 q.split('&')
                     .filter_map(|kv| kv.split_once('='))
                     .find(|(k, _)| *k == "token")
-                    .map(|(_, v)| percent_decode(v))
+                    // STRICT utf8, not `from_utf8_lossy`: a decoded value
+                    // that is not valid utf8 must never reach the comparison
+                    // as a lossy string (ADVERSARY, review of #103) -- U+FFFD
+                    // substitution is a many-to-one mapping, and a security
+                    // comparison must not have one, even where nothing today
+                    // exploits it (every real secret is a `String`, so
+                    // `expected` cannot itself contain the substitution
+                    // character for a collision to land on). Failing to
+                    // produce a candidate here is just "no credential
+                    // presented" -- the existing, already-safe 401 path.
+                    .and_then(|(_, v)| String::from_utf8(percent_decode_bytes(v)).ok())
             })
         });
 
@@ -326,12 +336,19 @@ fn authenticate(
     }
 }
 
-/// Percent-decode a single query-string VALUE (not a whole URL). `%XX`
-/// becomes that byte; anything else, including a `%` not followed by two hex
-/// digits, passes through literally rather than being dropped -- a malformed
-/// escape must not silently shorten the value into something that then
-/// coincidentally fails to match for a second, unrelated reason.
-fn percent_decode(s: &str) -> String {
+/// Percent-decode a single query-string VALUE (not a whole URL) to its raw
+/// bytes. `%XX` becomes that byte; anything else, including a `%` not
+/// followed by two hex digits, passes through literally rather than being
+/// dropped -- a malformed escape must not silently shorten the value into
+/// something that then coincidentally fails to match for a second, unrelated
+/// reason.
+///
+/// Returns bytes, not a `String`: the one caller compares against a secret on
+/// a security-sensitive path, and `String::from_utf8_lossy` would substitute
+/// U+FFFD for any invalid sequence -- a many-to-one mapping with no place on
+/// a comparison, however impractical to exploit today (ADVERSARY, review of
+/// #103).
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -347,7 +364,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Every distinguishable reason `resolve_secret` can fail to produce a
@@ -941,16 +958,31 @@ mod tests {
     /// decoded it.
     #[test]
     fn percent_decode_reverses_a_correctly_encoded_query_value() {
-        assert_eq!(percent_decode("abc"), "abc");
-        assert_eq!(percent_decode("a%2Bb%26c%25d"), "a+b&c%d");
+        fn decode(s: &str) -> String {
+            String::from_utf8(percent_decode_bytes(s)).unwrap()
+        }
+        assert_eq!(decode("abc"), "abc");
+        assert_eq!(decode("a%2Bb%26c%25d"), "a+b&c%d");
         // `+` is a literal plus in a URI query component (RFC 3986), not a
         // form-encoded space -- unlike `application/x-www-form-urlencoded`.
-        assert_eq!(percent_decode("a+b"), "a+b");
+        assert_eq!(decode("a+b"), "a+b");
         // A malformed escape passes through literally rather than being
         // dropped or panicking on a non-hex/short tail.
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("100%2"), "100%2");
-        assert_eq!(percent_decode("100%zz"), "100%zz");
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(decode("100%2"), "100%2");
+        assert_eq!(decode("100%zz"), "100%zz");
+    }
+
+    /// The comparison-path fix itself (ADVERSARY, review of #103): a query
+    /// value that percent-decodes to bytes which are NOT valid utf8 must
+    /// never reach `constant_time_eq` as a lossy-substituted string. It must
+    /// instead behave as "no credential presented" -- still a 401, never a
+    /// panic, and never a many-to-one comparison.
+    #[test]
+    fn a_query_value_that_decodes_to_invalid_utf8_is_never_lossily_compared() {
+        // %FF%FE is not valid utf8 in any interpretation.
+        let bytes = percent_decode_bytes("%FF%FE");
+        assert!(String::from_utf8(bytes).is_err());
     }
 
     /// The end-to-end version of the test above: a secret with a `&` in it,
