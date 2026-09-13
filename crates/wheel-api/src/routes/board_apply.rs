@@ -265,7 +265,12 @@ impl BoardClient for HttpBoardClient {
         Ok(())
     }
 
-    async fn add_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String> {
+    async fn add_wire(
+        &self,
+        from: Uuid,
+        to: Uuid,
+        wire_type: WireType,
+    ) -> Result<Option<String>, String> {
         let resp = self
             .request(reqwest::Method::POST, &["v1", "wires"])?
             .json(&serde_json::json!({"from": from, "to": to, "type": wire_type}))
@@ -275,7 +280,16 @@ impl BoardClient for HttpBoardClient {
         if !resp.status().is_success() {
             return Err(Self::failure(resp).await);
         }
-        Ok(())
+        // The engine's own board-state-flag mechanism (`db::board::add_wire`) returns
+        // `{"warning": "..."}` on the same 200 for a wire that was created but deserves the
+        // operator's attention. A board applied through this route deserves that warning exactly
+        // as much as one wired by hand in the UI — dropping the body here would silently swallow
+        // it for every builder-emitted or `wheel.toml`-driven board.
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        Ok(body
+            .get("warning")
+            .and_then(|w| w.as_str())
+            .map(str::to_string))
     }
 }
 
@@ -394,4 +408,87 @@ pub async fn apply_board(
         status,
         Json(serde_json::json!({"applied": complete, "report": report})),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthUser, Tier};
+    use axum::routing::post;
+    use axum::Router;
+
+    /// A one-route fake engine that answers every `POST /v1/wires` with the given body, so
+    /// `HttpBoardClient::add_wire` is exercised against real HTTP bytes rather than asserted by
+    /// reading the source.
+    async fn fake_engine(body: serde_json::Value) -> String {
+        let router = Router::new().route(
+            "/v1/wires",
+            post(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve");
+        });
+        format!("http://{addr}")
+    }
+
+    /// `pub(crate)` struct literal, private fields: valid because this test module is a
+    /// descendant of the module that defines them. `Tier::Admin` matches what `v1/wires` actually
+    /// needs (`auth::policy::engine_tier`), so `request()`'s policy check does not refuse before
+    /// the fake engine ever sees the call.
+    fn client_against(base: String) -> HttpBoardClient {
+        let user = AuthUser::from_redeemed_ticket("test-user".into());
+        let mut actor = axum::http::HeaderMap::new();
+        crate::http::actor::set_actor(&mut actor, &user, Tier::Admin);
+        HttpBoardClient {
+            http: reqwest::Client::new(),
+            base,
+            bearer: "Bearer test".into(),
+            tier: Tier::Admin,
+            actor,
+        }
+    }
+
+    /// The engine's own board-state-flag mechanism (`db::board::add_wire`, `board_routes.rs`)
+    /// returns `{"warning": "..."}` on a 200 for a wire it created but flagged. This is the one
+    /// piece of new logic in the plumbing fix — everything else is `execute`'s job, unit-tested in
+    /// `apply.rs` against a fake `BoardClient`.
+    #[tokio::test]
+    async fn a_warning_in_the_engines_response_reaches_the_caller() {
+        let base = fake_engine(serde_json::json!({
+            "warning": "exposes notes to unauthenticated input"
+        }))
+        .await;
+        let client = client_against(base);
+
+        let warning = client
+            .add_wire(Uuid::new_v4(), Uuid::new_v4(), WireType::Send)
+            .await
+            .expect("wire created");
+
+        assert_eq!(
+            warning.as_deref(),
+            Some("exposes notes to unauthenticated input")
+        );
+    }
+
+    /// The ordinary case — no `warning` field at all — must not be misread as one.
+    #[tokio::test]
+    async fn no_warning_field_means_none_not_an_error() {
+        let base = fake_engine(serde_json::json!({"id": Uuid::new_v4()})).await;
+        let client = client_against(base);
+
+        let warning = client
+            .add_wire(Uuid::new_v4(), Uuid::new_v4(), WireType::Send)
+            .await
+            .expect("wire created");
+
+        assert!(warning.is_none(), "{warning:?}");
+    }
 }
