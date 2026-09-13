@@ -37,6 +37,14 @@ pub enum BoardError {
     /// An agent's `fallback_vault` does not name a vault it reads.
     #[error("{0}")]
     Fallback(String),
+    /// Two endpoint nodes answering the same `(method, path)`.
+    /// `validate_endpoint_path`'s own doc comment claims paths "must be
+    /// unambiguous", but nothing enforced it -- ingress's `match_endpoint`
+    /// silently returns whichever one it finds first, so a second endpoint
+    /// at the same path does not fail loudly, it shadows the first one
+    /// (ADVERSARY, investigating the live Bearer-auth incident).
+    #[error("{0}")]
+    DuplicatePath(String),
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -92,6 +100,7 @@ pub fn create_with(
     allow_hosts: &[String],
 ) -> Result<(), BoardError> {
     wheel_core::validate_config_with(&node.config, allow_hosts)?;
+    check_endpoint_path_unique(conn, node)?;
     // A node being created has no wires yet, so a fallback set here is always
     // refused: wire the vault first, then set it.
     check_fallback_vault(conn, node)?;
@@ -593,6 +602,7 @@ pub fn update_with(
     allow_hosts: &[String],
 ) -> Result<(), BoardError> {
     wheel_core::validate_config_with(&node.config, allow_hosts)?;
+    check_endpoint_path_unique(conn, node)?;
 
     // `t_<name>` is a table of its own, so it has to follow the node through
     // every shape the node can change into. A rename that did not carry the
@@ -773,6 +783,42 @@ pub fn rate_limited_agents(conn: &Connection) -> Result<Vec<(Uuid, Option<Timest
             ))
         })
         .collect())
+}
+
+/// No two endpoint nodes may answer the same `(method, path)`.
+///
+/// `validate_endpoint_path` (wheel-core) claims paths "must be unambiguous"
+/// in its own doc comment, but it is a pure function with no board access,
+/// so it cannot be the thing that enforces it -- and nothing else was. The
+/// practical failure mode: `ingress::match_endpoint` returns the FIRST
+/// endpoint it finds at a path, so a second one at the same path does not
+/// error, it silently shadows the first -- every hit is answered by
+/// whichever node happens to sort first, and the operator's actually-wired
+/// endpoint may never be reached at all.
+///
+/// A node's own id is always excluded: on create it is not in `existing` yet
+/// (nothing to exclude), and on update editing an endpoint's OTHER fields
+/// must not trip this against itself.
+fn check_endpoint_path_unique(conn: &Connection, node: &Node) -> Result<(), BoardError> {
+    let NodeConfig::Endpoint(cfg) = &node.config else {
+        return Ok(());
+    };
+    let existing = list(conn).map_err(|e| BoardError::Storage(e.to_string()))?;
+    if let Some(conflict) = existing.iter().find(|n| {
+        n.id != node.id
+            && matches!(&n.config, NodeConfig::Endpoint(other)
+                if other.method == cfg.method && other.path == cfg.path)
+    }) {
+        return Err(BoardError::DuplicatePath(format!(
+            "endpoint {:?} already answers {} {} -- two endpoints at the same \
+             path is not a second listener, it is one of them silently \
+             shadowing the other",
+            conflict.name,
+            cfg.method.as_str(),
+            cfg.path
+        )));
+    }
+    Ok(())
 }
 
 /// An agent's `fallback_vault` must name a vault it already reads, so the
@@ -1276,6 +1322,87 @@ mod tests {
         );
         assert!(create(&c, &bad).is_err());
         assert!(list(&c).unwrap().is_empty());
+    }
+
+    fn endpoint_at(name: &str, method: HttpMethod, path: &str) -> Node {
+        node(
+            name,
+            NodeConfig::Endpoint(EndpointConfig {
+                method,
+                path: path.into(),
+                response_mode: ResponseMode::Ack,
+                auth: EndpointAuth::None,
+            }),
+        )
+    }
+
+    /// `validate_endpoint_path`'s own doc comment (wheel-core) claims paths
+    /// "must be unambiguous" -- adversary found that nothing enforced it:
+    /// `ingress::match_endpoint` silently returns the FIRST endpoint it
+    /// finds at a `(method, path)`, so a second one at the same address does
+    /// not error, it shadows the first.
+    #[test]
+    fn a_second_endpoint_at_the_same_method_and_path_is_refused() {
+        let c = mem();
+        let first = endpoint_at("hook-a", HttpMethod::Post, "/hook");
+        create(&c, &first).unwrap();
+
+        let second = endpoint_at("hook-b", HttpMethod::Post, "/hook");
+        let err = create(&c, &second).unwrap_err();
+        assert!(matches!(err, BoardError::DuplicatePath(_)), "got {err:?}");
+        // The first endpoint's own node is untouched and still alone.
+        assert_eq!(list(&c).unwrap().len(), 1);
+    }
+
+    /// Same path, different METHOD, is not a conflict -- `match_endpoint`
+    /// keys on the pair, and two endpoints answering GET and POST at the
+    /// same path is an ordinary REST-ish shape, not ambiguity.
+    #[test]
+    fn the_same_path_with_a_different_method_is_not_a_conflict() {
+        let c = mem();
+        create(&c, &endpoint_at("hook-get", HttpMethod::Get, "/hook")).unwrap();
+        create(&c, &endpoint_at("hook-post", HttpMethod::Post, "/hook")).unwrap();
+        assert_eq!(list(&c).unwrap().len(), 2);
+    }
+
+    /// The same check fires on UPDATE -- editing an endpoint's path to
+    /// collide with an existing one must be refused, not just refused at
+    /// creation time.
+    #[test]
+    fn editing_an_endpoints_path_into_a_collision_is_also_refused() {
+        let c = mem();
+        create(&c, &endpoint_at("hook-a", HttpMethod::Post, "/hook-a")).unwrap();
+        let mut b = endpoint_at("hook-b", HttpMethod::Post, "/hook-b");
+        create(&c, &b).unwrap();
+
+        b.config = NodeConfig::Endpoint(EndpointConfig {
+            method: HttpMethod::Post,
+            path: "/hook-a".into(),
+            response_mode: ResponseMode::Ack,
+            auth: EndpointAuth::None,
+        });
+        let err = update(&c, &b).unwrap_err();
+        assert!(matches!(err, BoardError::DuplicatePath(_)), "got {err:?}");
+    }
+
+    /// The exclusion is BY ID, not "any endpoint with this name": saving an
+    /// endpoint's OTHER fields (e.g. flipping auth mode) without touching its
+    /// path or method must never trip this against itself.
+    #[test]
+    fn updating_an_endpoints_other_fields_does_not_trip_the_check_against_itself() {
+        let c = mem();
+        let mut e = endpoint_at("hook", HttpMethod::Post, "/hook");
+        create(&c, &e).unwrap();
+
+        e.config = NodeConfig::Endpoint(EndpointConfig {
+            method: HttpMethod::Post,
+            path: "/hook".into(),
+            response_mode: ResponseMode::Ack,
+            auth: EndpointAuth::Bearer {
+                vault_ref: "v/k".into(),
+            },
+        });
+        update(&c, &e).unwrap();
     }
 
     #[test]

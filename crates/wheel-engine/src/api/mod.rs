@@ -132,6 +132,10 @@ impl From<db::board::BoardError> for ApiError {
             // so it is the caller's to fix, not an internal fault.
             B::Storage(m) => ApiError::invalid(m),
             B::Fallback(m) => ApiError::invalid(m),
+            // 409, same class as NameTaken: well-formed request, the board
+            // already has a node claiming this identity (here, the (method,
+            // path) an endpoint answers rather than a name).
+            B::DuplicatePath(m) => ApiError::new(StatusCode::CONFLICT, "duplicate_path", m),
         }
     }
 }
