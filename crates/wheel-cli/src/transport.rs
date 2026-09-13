@@ -220,14 +220,15 @@ mod tests {
     }
 
     fn tmp_sock(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "wheel-transport-{name}-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // `/tmp` directly, not `std::env::temp_dir()`: a unix socket path is
+        // capped at `SUN_LEN` (~100 bytes on Linux), and a `TMPDIR` that is
+        // itself a long, project-scoped path (as it is under this sandbox)
+        // pushes the full name over that limit before the socket is ever
+        // bound, turning a network test into a path-length test.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            PathBuf::from("/tmp").join(format!("wt-{name}-{}-{n}", std::process::id() % 100_000));
         let _ = std::fs::remove_file(&p);
         p
     }

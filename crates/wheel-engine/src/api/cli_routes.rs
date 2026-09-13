@@ -198,6 +198,12 @@ pub async fn ls(
             let cfg = table_config(&node)?;
             let keys = tables::list_keys(&conn, &node.name, cfg, q.prefix.as_deref(), MAX_KEYS, 0)
                 .map_err(storage_err)?;
+            // A row's key is board-authored too (defect #2): whoever wrote the
+            // row chose it.
+            let keys: Vec<String> = keys
+                .iter()
+                .map(|k| wheel_core::escape_envelope_body(k))
+                .collect();
             Ok(Json(serde_json::json!({ "node": node.name, "keys": keys })))
         }
         // Not `{"keys": []}`. Chest storage is M2, and an empty list is
@@ -240,8 +246,15 @@ pub async fn read(
         .map_err(|d| deny(&s, Some(&me), d))?;
 
     match &node.config {
+        // Escaped the same way a message body is (defect #2,
+        // docs/proposals/tool-mcp-output-escaping.md §4c): board-native
+        // content, wire-gated write, same trust tier as a message from
+        // another agent -- and for `ctx` specifically, a stronger case than
+        // messages ever were, since a forged tag here is re-injected into
+        // every reader's system prompt on every start/context-clear, not
+        // live for one delivered turn.
         wheel_core::NodeConfig::Ctx(c) => Ok(Json(serde_json::json!({
-            "node": node.name, "type": "ctx", "value": c.markdown
+            "node": node.name, "type": "ctx", "value": wheel_core::escape_envelope_body(&c.markdown)
         }))),
         wheel_core::NodeConfig::Table(cfg) => {
             let (_, row) = split_address(&q.addr);
@@ -250,6 +263,8 @@ pub async fn read(
                     let value = tables::get_row(&conn, &node.name, cfg, key)
                         .map_err(storage_err)?
                         .ok_or_else(|| ApiError::not_found(format!("{}/{key}", node.name)))?;
+                    let value =
+                        wheel_core::map_json_strings(&value, &wheel_core::escape_envelope_body);
                     Ok(Json(serde_json::json!({
                         "node": node.name, "type": "table", "row": key, "value": value
                     })))
@@ -258,6 +273,10 @@ pub async fn read(
                 None => {
                     let rows = tables::list_rows(&conn, &node.name, cfg, q.limit(), q.offset())
                         .map_err(storage_err)?;
+                    let rows: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|r| wheel_core::map_json_strings(r, &wheel_core::escape_envelope_body))
+                        .collect();
                     Ok(Json(serde_json::json!({
                         "node": node.name, "type": "table", "rows": rows,
                         "limit": q.limit(), "offset": q.offset()
@@ -529,6 +548,10 @@ pub async fn query(
         me.require(&conn, &body.table, WireType::Read)
             .map_err(|d| deny(&s, Some(&me), d))?;
     }
+    // Same table content `read`/`ls` return, reached over the SQL escape hatch
+    // instead: the same escaping applies (defect #2), or this would be the
+    // one path left to read a table's content unescaped.
+    let rows = wheel_core::map_json_strings(&rows, &wheel_core::escape_envelope_body);
     Ok(Json(serde_json::json!({ "rows": rows })))
 }
 
@@ -792,13 +815,34 @@ pub async fn inbox(
             .map_err(|e| ApiError::internal(e.to_string()))?
             .filter(|m| m.to == me.node.id)
             .ok_or_else(|| ApiError::not_found(id.to_string()))?;
-        return Ok(Json(serde_json::json!({ "message": m })));
+        // `message.body`/`sha256`/`bytes` stay byte-identical to what was sent
+        // (§3c#3) -- that IS the point of `wheel inbox`, and it is a tested
+        // invariant. So the wrap for the model (defect #2: a re-read historical
+        // message is exactly as capable of carrying a forged tag as a live
+        // one) goes in a SEPARATE `value` field instead of mutating `body`.
+        // MCP's generic `render()` picks up a top-level `value` on its own;
+        // the CLI's `render_inbox` is updated to print it instead of `body`.
+        let value = wheel_core::wrap_tool_output(&m.body);
+        return Ok(Json(serde_json::json!({ "message": m, "value": value })));
     }
 
     let limit = q.limit.unwrap_or(50).min(10_000);
     let list: Vec<Message> = messages::inbox(&conn, me.node.id, None, limit)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "messages": list })))
+    // Same reasoning as above, per item: a bare `wheel inbox` is a preview
+    // list, but the MCP path's generic renderer has no per-item convention
+    // and would otherwise stringify every listed message's FULL, un-truncated
+    // `body` verbatim as part of one JSON blob -- worse than the single-id
+    // case, since nothing bounds it to one message.
+    let messages: Vec<serde_json::Value> = list
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or_default();
+            v["value"] = serde_json::json!(wheel_core::wrap_tool_output(&m.body));
+            v
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "messages": messages })))
 }
 
 #[derive(Debug, Deserialize)]

@@ -978,6 +978,24 @@ matched nothing.
 | `MCP-token-not-in-argv` | The node token reaches the server as a FILE path; no token appears in any command line (§5b: argv is world-readable across uids). | **S1** |
 | `VAL-table-name-no-silent-rename` | A table node named with `-` is REFUSED, and the engine does not then create `bad_table` instead. A silent rename would satisfy the atomicity check while handing the user a node at an address they never chose — and every peer's wires, preamble and `wheel read` would use it. | S2 |
 
+## 11b-iii. ESC — tool/MCP output escaping (defect #2)
+
+A forged `<AgentPrompt>` tag planted in board data (a ctx node, a table row, anything an agent
+can read back through a tool) must reach the model already inert once it comes back as a tool
+result — the same envelope-forgery threat `MSG-envelope-forge`/`ING-envelope-forge-from-
+stranger` cover for a delivered MESSAGE, but for a tool/MCP RESULT instead. Driven through the
+real engine and the real `wheel mcp-serve` binary (`qa/integration/test_tool_output_escaping.py`),
+not a unit test of the escaping function in isolation — a function that escapes correctly on its
+own proves nothing about whether the two real processes on this path actually call it (ADVERSARY,
+review of #74).
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `ESC-close-tag-escaped` | A forged `</AgentPrompt>` inside data an MCP tool reads back arrives at the model escaped (`<\/AgentPrompt>`), not live. | **S1** |
+| `ESC-open-tag-escaped` | A forged `<AgentPrompt id="...">` opening tag is escaped the same way — a defender that only neutralises closes and not opens still lets a forged envelope render open-ended. | **S1** |
+| `ESC-no-live-close-tag` | **Gates the line above.** No unescaped `</AgentPrompt>` reaches the model at all — the escaped and unescaped forms are checked as distinct substrings, not inferred from the escaped form's presence alone. | **S1** |
+| `ESC-no-live-open-tag` | Same, for the opening tag. | **S1** |
+
 ## 11c. ING — endpoint ingress fan-out (§3, SDK session 2 item 1)
 
 Written before the feature, so it lands against a red suite rather than being described by
