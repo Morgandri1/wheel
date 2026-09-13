@@ -344,6 +344,44 @@ answer: the link is a credential, so the response must not say which links exist
 Listing invites is admin, not guest: an invite's existence and tier are facts about who is about to
 gain access.
 
+### Redaction contract for membership data (decision, 2026-09-13)
+
+**When a field in `Member` or `InviteInfo` is hidden from a caller's tier, it is PRESENT and emptied
+(`null` / `""` / `[]` as the field's type requires), never absent, and the containing object carries a
+sibling `"redacted": true`.** This is the same shape `RedactCredentials` already uses for a board
+node's config (`wheel-core`'s `NodeConfig::redact_credentials`) — one redaction convention across the
+whole API, not two, so a client needs exactly one parsing strategy wherever it sees `"redacted"`.
+
+Reasons, independent of the precedent alone:
+
+- **A required field cannot become absent without breaking strict deserialization.** `RedactCredentials`
+  empties `VaultConfig.keys` rather than removing it for exactly this reason ("a board entry that fails
+  to deserialize is worse than one that says nothing") — the same is true for a generated client's
+  non-optional field.
+- **Some of these fields are already legitimately `null` for a reason that has nothing to do with
+  redaction** — `Member.invited_by` is `null` for a member with no recorded inviter, and always
+  serializes as `"invited_by": null` today (it is `Option<String>` with no
+  `skip_serializing_if`, so absence was never how "no value" was expressed here). If redaction
+  ALSO used `null`, or used absence, a client could not tell "nothing to show" apart from "hidden from
+  you" — an explicit signal is required either way, which is the actual argument for matching the
+  existing shape rather than inventing a second one.
+- **Disclosure, checked per field rather than assumed:** presence-with-`redacted:true` for
+  `invited_by` tells a guest nothing they could not already infer (every member but the creator was
+  invited by *someone*); the same holds for an invite's `expires_at` (every invite has one). Where it
+  would not be a wash — e.g. whether an invite is email-locked, if that field is ever surfaced below
+  admin — omission is actually the *worse* choice: an invite either has a locked `email` or does not,
+  so omitting the field only on locked rows (to avoid saying "there's an email here, hidden") makes the
+  row shape itself the leak, distinguishing locked from unlocked invites by structure instead of by the
+  value the redaction was supposed to hide. Present-and-emptied has no such tell: every row keeps the
+  same keys regardless of what is inside them.
+
+Not a live gap today: `GET /v1/projects/{id}/members` is guest-visible and currently returns every
+`Member` field unredacted by design (`routes/members.rs`: "a guest may see who else is here"), and
+`GET .../invites` is admin-only at the *route* level, so there is no partial view of `InviteInfo` to
+redact yet. This is the contract for whichever of the two changes first — a new field on `Member` that
+should not be guest-visible, or a lower-tier view of invites — so it is decided once, in the open,
+rather than by whichever PR happens to touch it first.
+
 ## Routes
 
 ### `GET /healthz`
