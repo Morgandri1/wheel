@@ -485,28 +485,65 @@ ones:**
 
 ### 3. Does gVisor scale down to this granularity sensibly, or does per-agent need something lighter
 
-**Gut check: is per-agent gVisor answering a different question than F007 already answers, or the
-SAME question at a much higher price?** F007's own scope (per-node uid isolation, `setuid`/`setgid`
-within a shared kernel, the primitive Shape 3 already ports from `process.rs`) exists specifically to
-stop the blast radius §1 above describes — one compromised agent reading a sibling's vault-exported
-env, node token file, or `wheel.db` rows (redteam 037's carriers). That is near-FREE relative to
-gVisor: no new kernel boundary, no Sentry process, no syscall interception — just a distinct uid per
-child, the same mechanism Shape 3 already costs at effectively zero marginal overhead. **A full
-per-agent gVisor sandbox closes a NARROWER residual gap beyond what F007 already closes: a kernel
-EXPLOIT escaping the uid boundary to reach a sibling agent's process/memory directly, not just its
-files** — the same "uid isolation doesn't survive a kernel bug" argument this document already made
-for why project-level gVisor beats plain `cap_drop`, one layer deeper. That gap is real, but it is
-the SAME shape of residual risk this document has named at every layer so far (item "The real
-boundary" below: hardening measures raise the cost of an escape, none of them removes the shared
-kernel underneath) — not a NEW threat class per-agent sandboxing uniquely answers.
+**First, precisely, not vaguely: which of redteam 037's own carriers does a per-agent KERNEL boundary
+actually close, on its own, with nothing else changed?** 037 enumerates six, ranked by impact
+(`redteam/findings/037-single-uid-blast-radius.md`) — the answer differs carrier by carrier, and
+conflating them is exactly the imprecision ADVERSARY flagged:
+
+- **Items 1 (engine's `/proc/<pid>/environ`, the crown jewels) and 2 (a sibling agent's
+  `/proc/<pid>/environ`, vault-exported secrets without a wire): CLOSED by a kernel boundary alone,
+  but not for the reason "kernel boundary" first suggests.** 037's own PoC already proved WHY: TEST 2
+  (a genuinely different uid reading another process's `/proc/<pid>/environ`) got `Permission
+  denied` with **no kernel sandbox involved at all** — standard Linux `/proc` permission semantics
+  already gate this on uid, not on PID-namespace membership. So a per-agent kernel sandbox closes
+  these two carriers, but **F007's own per-node uid split (`process.rs`'s primitive, already costed
+  above as near-free) closes them just as completely, by itself, with zero kernel-boundary
+  spend.** A kernel sandbox does not add anything here beyond what F007 alone already achieves —
+  worth stating plainly rather than crediting gVisor for a closure uid isolation already provides.
+- **Items 3 (node capability token impersonation), 5 (sibling creds dirs), and 6 (`prompt.txt`,
+  scripts, chest blobs): NOT closed by a kernel boundary UNLESS it is combined with per-agent
+  permission separation.** These are all `0600`/`0700` FILESYSTEM permissions, and a PID/mount
+  namespace around a process changes nothing about which uid owns a file or which uid the reading
+  process runs as. **If per-agent sandboxes still share the project's single uid inside each
+  sandbox (kernel boundary added, F007 not), these three carriers stay exactly as open as they are
+  today** — an agent in its own gVisor sandbox, mounting the same project volume, running as the
+  same uid, can still `open()` a sibling's `0600` token file the instant that path is reachable
+  inside its own mount namespace. Closing these needs F007's uid split (making the reading uid
+  genuinely different, so the existing `0600`/`0700` bits start meaning something between siblings)
+  — the kernel boundary is neither necessary nor sufficient for this half of 037 on its own.
+- **Item 4 (`wheel.db` read directly — messages, table rows, chest index, vault ciphertext) is the
+  odd one out: NOT reliably closed by EITHER mechanism, on the facts this document has.** The
+  database is one file per PROJECT by design, not scoped to any single node's uid — F007's own
+  description (`ARCHITECTURE.md` §2: "each project owns a uid range... per-node creds/config dirs...
+  are 0700 to that uid") is about *creds/config dirs*, not `wheel.db` itself, and 037's own text notes
+  the file is created with no per-file `0600` narrowing (`db/mod.rs`, "no per-file 0600"). Neither a
+  kernel sandbox nor a per-node uid split closes this carrier unless the engine ALSO narrows
+  `wheel.db`'s own permissions to its own uid (excluding every node uid, including legitimate
+  per-node ones) and mediates every read through the wire-gated CLI instead of leaving the raw file
+  reachable — a DATA-LAYER change, not a sandboxing one, and not currently scoped by F007, Shape 3,
+  or this document's per-agent costing. Whatever number comes back for "how much does per-agent
+  sandboxing cost" should not be read as answering item 4 at all.
+
+**So the corrected gut check: per-agent gVisor is not "F007 plus a narrow kernel-exploit-only extra"
+— it is a DIFFERENT mechanism that overlaps F007 on two carriers (1, 2, which F007 already closes
+alone, for free) and does nothing on its own for three more (3, 5, 6, which need F007's uid split
+regardless of kernel boundary) and cannot answer the sixth (4) without a data-layer change neither
+approach currently scopes.** The one thing a kernel boundary adds that F007's uid split does not is
+resistance to a KERNEL EXPLOIT that bypasses uid checks entirely (the same "uid isolation doesn't
+survive a kernel bug" argument this document already made for why project-level gVisor beats plain
+`cap_drop`, one layer deeper) — real, but it is marginal PROTECTION ON TOP OF an F007 that has
+already landed, not a replacement for it, and it closes nothing 037 enumerates that F007 does not
+already close on its own.
 
 **So the honest framing is not "gVisor doesn't scale down" — it scales down fine, mechanically, the
 same `--runtime=runsc` flag applies to a per-agent container exactly as it does to a per-project one
-— it is "the marginal security gain over F007 (near-free) is bought at gVisor's FULL per-sandbox
-price, multiplied by the running-agent count rather than the running-project count."** Whether that
-trade is worth it depends on how much weight "kernel-exploit lateral movement between two agents the
-SAME human already trusts with the whole project" carries next to the cost above — a judgment call
-this document flags rather than makes, per the discipline held throughout.
+— it is "per-agent gVisor's marginal, KERNEL-EXPLOIT-ONLY security gain over an F007 that must ALSO
+be built regardless is bought at gVisor's FULL per-sandbox price, multiplied by the running-agent
+count rather than the running-project count."** Whether that trade is worth it depends on how much
+weight "kernel-exploit lateral movement between two agents the SAME human already trusts with the
+whole project" carries next to the cost above, GIVEN that F007 alone — not gVisor — is what actually
+closes four of 037's six carriers, and a data-layer change neither approach scopes is what the fifth
+needs. A judgment call this document flags rather than makes, per the discipline held throughout.
 
 **A middle path worth naming, closer to what "shared-trust" might have meant in the original
 question:** rather than uniform per-agent sandboxing, sandbox only the agents whose OWN exposure
@@ -938,15 +975,22 @@ only whether that stronger boundary was ever reachable on this deployment, and i
   isolation is settled, not a reason to accept losing it now. See the dedicated section above for the
   full ruling.
 - **Per-agent sandboxing (Morgan's follow-up, one granularity finer than Shape 3): mechanically
-  fine, NOT free.** gVisor scales down to per-agent the same way it scales to per-project — same
-  `--runtime=runsc` flag — but the count it multiplies is (concurrently RUNNING agents), not
+  fine, NOT free, and answers a NARROWER slice of 037's blast radius than "per-agent isolation"
+  sounds like it should.** gVisor scales down to per-agent the same way it scales to per-project —
+  same `--runtime=runsc` flag — but the count it multiplies is (concurrently RUNNING agents), not
   (concurrently active projects), and this team's own board demonstrates that multiplier is real:
-  up to 6× on ONE project alone. The marginal security gain over F007's already-planned, near-free
-  uid isolation is narrow (kernel-exploit lateral movement between same-owner siblings, not the
-  file/token blast radius F007 already stops) — worth the cost only if that narrow residual risk
-  weighs enough on its own, which is ADVERSARY's call, not decided here. A selective middle path
-  (sandbox only agents finding 043 already flags as exposed) bounds the multiplier without new
-  machinery. See § "Per-agent sandboxing" above for the full costing.
+  up to 6× on ONE project alone, and because agent-level parking already happens today, gVisor's
+  resume tax would land on every existing wake, not a new rarer event. **Scoped precisely against
+  037's six carriers, not vaguely:** a kernel boundary closes carriers 1–2 (`/proc/<pid>/environ`
+  reads) — but 037's own PoC shows F007's uid split closes those SAME two carriers alone, for free,
+  with no kernel boundary needed. Carriers 3/5/6 (token files, creds dirs, prompt.txt) are
+  filesystem-permission carriers a kernel boundary does nothing for without F007's uid split ALSO
+  landing. Carrier 4 (`wheel.db`) is closed by NEITHER mechanism without a data-layer change neither
+  currently scopes. Net: gVisor's only marginal gain over an F007 that must be built regardless is
+  kernel-exploit resistance between same-owner siblings — real, but it closes nothing 037 enumerates
+  that F007 doesn't already close on its own. A selective middle path (sandbox only agents finding
+  043 already flags as exposed) bounds the multiplier without new machinery if the kernel-exploit
+  margin is judged worth it. See § "Per-agent sandboxing" above for the full costing.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
   instruction not to pause them — reframed by the ruling above as the validated per-project template
   for the converged effort, not a separate track that could later turn out to have been wasted work.
