@@ -389,6 +389,148 @@ rather than treated as a later phase:**
    HOST uid a Shape-3-dropped-to-uid-Y process actually runs as once userns-remap is also active. This
    is a gate on combining item 5 with the convergence, not a reason to hold either back individually.
 
+## Per-agent sandboxing, costed against Shape 3's per-project scope (Morgan's follow-up)
+
+Morgan's question, exactly: how much more expensive is it to independently sandbox each AGENT, not
+just each project — extending this document's own costing framework (§ "gVisor vs. Firecracker"
+below) one granularity level finer than Shape 3 ever scoped. Answered here with the same discipline
+the rest of this document holds itself to: reuse the numbers already established, don't re-derive
+them, and say plainly where the multiplier is real versus where it is bounded.
+
+**What "one sandbox per agent" actually means, mechanically, first — because Shape 3 already changed
+what the baseline is.** Today, every agent is already `§3c#13`'s "one process per agent" — a real OS
+process, one per running agent, confirmed in `supervisor/mod.rs`'s own doc comment. What Shape 3 adds
+is a project-level sandbox boundary AROUND those sibling processes; what per-agent sandboxing would
+add is a SEPARATE sandbox boundary for EACH of those already-separate processes, individually. The
+work is not "invent per-agent isolation" — it is "give the process boundary that already exists its
+own kernel boundary too," the same escalation this document already made once, from
+`cap_drop`/AppArmor (item 2) to a real VM/syscall-emulation boundary (gVisor), applied one level
+deeper than Shape 3 stopped.
+
+### 1. Which agents actually need their own sandbox — not a shared-trust question, a blast-radius one
+
+Project-to-project separation (Shape 3) has a real "shared trust" boundary to draw on: different
+projects can belong to different humans (`WHEEL_SIGNUP=open`, or a closed deployment's owner adding
+more accounts — both already cited above), so grouping by project is grouping by actual trust
+domain. **Within one project, that argument does not exist — every agent on a board shares the SAME
+human owner**, so "which agents trust each other" is not the question that decides how many sandboxes
+a board needs. The question this document's own threat model already answers is the right one
+instead: **the attacker already reaches "agent runs attacker-chosen code"** (stated once, at the top
+of this document, and unchanged since) — any ONE agent can be the one that gets there, via prompt
+injection through a `ctx` write, an unauthenticated endpoint (finding 043, PR #97/#99, now merged),
+or a compromised tool call. Once that happens, the question per-agent sandboxing answers is not
+"was this agent trusted" but "how much does compromising it hand the attacker beyond that one
+agent's own resources" — the same blast-radius framing F007 (`script-execution-scope.md`, per-node
+isolation, already accepted as the eventual target in `ARCHITECTURE.md` §2's own text: "Isolation
+boundary = the NODE, not the project") already exists to answer.
+
+**So the honest count is not "agents without a shared-trust reason to be together" — every agent on
+a board is in that category by this document's own threat model — it is "every CONCURRENTLY RUNNING
+agent," full stop, with one narrower exception worth naming: agents that share a `workspaces` path
+by design (§3e: "Shared workspaces between agents are allowed (same path)").** That is a real,
+intentional co-location pattern — but it does not argue for a SHARED sandbox any more than two
+projects needing to exchange data would; a shared workspace is a shared VOLUME MOUNT, which N
+separate sandboxes can each mount identically, the same way N separate uids already share a
+directory today with nothing about the sharing depending on a shared kernel. There is no case in
+this codebase where two agents need to be in the SAME sandbox for a feature to work — only ones
+where they need to see the same FILES, which per-agent sandboxing does not break.
+
+### 2. How many concurrent sandboxes, and the multiplier that actually matters
+
+Idle parking (§3c#14) already operates at PER-AGENT granularity today — an individual agent parks
+after its own `idle_timeout_secs` and resumes on its own next message, independent of its
+project-mates. This means the concurrency count per-agent sandboxing needs is **not** "total agents
+defined across every board," it is "agents currently un-parked" — the same running/starting states
+Shape 3's own count already restricts to at the project level, one layer finer.
+
+**The multiplier from project-granularity to agent-granularity is exactly (running agents per active
+project), and this document does not have to guess at that number — it is running one right now.**
+This very team's own board (`pm`, `api`, `sdk`, `web`, `qa`, `adversary`) is one project with up to
+six agents live at once. Per-project sandboxing (Shape 3 as scoped): **one** sandbox for that whole
+board, however many of the six are active. Per-agent sandboxing: up to **six**, the moment more than
+one of us is mid-turn simultaneously — which, per this document's own commit history, is the ordinary
+case, not an edge one. That is a real, lived 6× multiplier on THIS project alone, not a hypothetical
+ceiling; a board built for genuine multi-agent collaboration (the whole point of the wire matrix, §3)
+should be expected to run several agents concurrently more often than not, not as a rare peak.
+
+**Applying gVisor's own already-established numbers (§ table below) at that multiplier, not new
+ones:**
+- **Memory:** ~10–25MB Sentry overhead per sandbox (established). Per-project: that cost once per
+  active project. Per-agent: that cost once per RUNNING AGENT — on this team's own board alone,
+  60–150MB of sandbox-mechanism overhead at six concurrent agents, versus 10–25MB for the same board
+  under Shape 3. Scaled to a deployment running many boards, the per-agent total is (concurrent
+  running agents across every active project), which is structurally larger than (concurrent active
+  projects) by exactly the average board's own concurrency — bounded only by how collaborative
+  Wheel's own boards actually get.
+- **Startup/resume latency:** "tens to low-hundreds of milliseconds beyond `runc`" per sandbox
+  (established). Per-project, this is paid once per project wake. Per-agent, it is paid on **every
+  individual agent resume** — which, because agent-level parking is ALREADY how the system works
+  today (not a hypothetical future extension the way "project-level parking" was flagged as, two
+  rows up in the table below), is not a new frequency this document has to estimate: it is the
+  existing per-agent wake rate, made slower by tens-to-low-hundreds of milliseconds on top of
+  whatever the process-resume cost already is ("well under a second," per the engine's own tests,
+  cited above). A user messaging a parked agent already waits for a process resume; per-agent
+  sandboxing adds gVisor's own boot tax to THAT wait, on every wake, for every agent — not a one-time
+  or per-project cost the way Shape 3's version of this same tradeoff was scoped.
+- **One correction this document owes itself, from its own prior table:** gVisor's KVM-accelerated
+  platform is NOT the one either shape gets here. This document already established, in the
+  KVM-absence finding that resolved the Firecracker question, that the target host has no `/dev/kvm`.
+  gVisor's numbers above are achievable on either its `ptrace` or `kvm` platform, and this
+  deployment gets `ptrace` — the platform with the HIGHER steady-state syscall-interception cost of
+  the two (§ table, "Steady-state overhead" row already names syscall-heavy workloads as gVisor's
+  worst case). Per-agent sandboxing multiplies exactly that worse-case platform's overhead by the
+  running-agent count, not the better-case KVM-accelerated numbers some published gVisor benchmarks
+  cite — worth stating plainly so the multiplier above is not read as more favorable than the actual
+  target host supports.
+
+### 3. Does gVisor scale down to this granularity sensibly, or does per-agent need something lighter
+
+**Gut check: is per-agent gVisor answering a different question than F007 already answers, or the
+SAME question at a much higher price?** F007's own scope (per-node uid isolation, `setuid`/`setgid`
+within a shared kernel, the primitive Shape 3 already ports from `process.rs`) exists specifically to
+stop the blast radius §1 above describes — one compromised agent reading a sibling's vault-exported
+env, node token file, or `wheel.db` rows (redteam 037's carriers). That is near-FREE relative to
+gVisor: no new kernel boundary, no Sentry process, no syscall interception — just a distinct uid per
+child, the same mechanism Shape 3 already costs at effectively zero marginal overhead. **A full
+per-agent gVisor sandbox closes a NARROWER residual gap beyond what F007 already closes: a kernel
+EXPLOIT escaping the uid boundary to reach a sibling agent's process/memory directly, not just its
+files** — the same "uid isolation doesn't survive a kernel bug" argument this document already made
+for why project-level gVisor beats plain `cap_drop`, one layer deeper. That gap is real, but it is
+the SAME shape of residual risk this document has named at every layer so far (item "The real
+boundary" below: hardening measures raise the cost of an escape, none of them removes the shared
+kernel underneath) — not a NEW threat class per-agent sandboxing uniquely answers.
+
+**So the honest framing is not "gVisor doesn't scale down" — it scales down fine, mechanically, the
+same `--runtime=runsc` flag applies to a per-agent container exactly as it does to a per-project one
+— it is "the marginal security gain over F007 (near-free) is bought at gVisor's FULL per-sandbox
+price, multiplied by the running-agent count rather than the running-project count."** Whether that
+trade is worth it depends on how much weight "kernel-exploit lateral movement between two agents the
+SAME human already trusts with the whole project" carries next to the cost above — a judgment call
+this document flags rather than makes, per the discipline held throughout.
+
+**A middle path worth naming, closer to what "shared-trust" might have meant in the original
+question:** rather than uniform per-agent sandboxing, sandbox only the agents whose OWN exposure
+already elevates their individual risk — the exact set finding 043 (+ its addendum, PR #97/#99)
+already identifies: an agent reachable from an `auth:none` endpoint, especially one that also holds
+a `ctx` write wire (043's amplification case). That bounds the multiplier to a small, IDENTIFIABLE
+subset of a board's agents — the ones actually exposed to untrusted input — rather than every agent
+uniformly, without requiring a new capability: the same board-state signal finding 043's fix already
+computes (`db::board::add_wire`'s warning check, merged in #99) names exactly this set today.
+
+**What this section does NOT resolve, flagged for ADVERSARY specifically, per Morgan's ask to loop
+them in on the security-boundary side:**
+1. Whether the residual kernel-exploit-between-siblings threat this section names is one Wheel's
+   actual threat model should weight as seriously as project-to-project reach was weighted (§
+   "Combining Shape 1 and Shape 3" above) — that section had two independent, confirmed reasons
+   (cross-tenant confidentiality, cross-tenant availability) that do not carry over here, since
+   sibling agents share one owner by construction. Whether a narrower reason exists is ADVERSARY's
+   call, not asserted here.
+2. Whether the selective, finding-043-scoped middle path above is a legitimate reduction of the
+   uniform case, or whether it quietly reintroduces the SAME risk it claims to bound if a board's
+   trust profile changes after the sandbox assignment is made (an agent gains a new endpoint wire
+   later, without its sandbox status being reconsidered) — a staleness question this section
+   surfaces but does not resolve.
+
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
 `infra/vps/compose.yml`. Added to `preflight`, `wheeld`, `verify-signup-gate`, `web`, `caddy`.
@@ -795,6 +937,16 @@ only whether that stronger boundary was ever reachable on this deployment, and i
   (`OOMPolicy=continue`, resource limits, self-update) are third-rung UX wins, a tiebreaker once
   isolation is settled, not a reason to accept losing it now. See the dedicated section above for the
   full ruling.
+- **Per-agent sandboxing (Morgan's follow-up, one granularity finer than Shape 3): mechanically
+  fine, NOT free.** gVisor scales down to per-agent the same way it scales to per-project — same
+  `--runtime=runsc` flag — but the count it multiplies is (concurrently RUNNING agents), not
+  (concurrently active projects), and this team's own board demonstrates that multiplier is real:
+  up to 6× on ONE project alone. The marginal security gain over F007's already-planned, near-free
+  uid isolation is narrow (kernel-exploit lateral movement between same-owner siblings, not the
+  file/token blast radius F007 already stops) — worth the cost only if that narrow residual risk
+  weighs enough on its own, which is ADVERSARY's call, not decided here. A selective middle path
+  (sandbox only agents finding 043 already flags as exposed) bounds the multiplier without new
+  machinery. See § "Per-agent sandboxing" above for the full costing.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
   instruction not to pause them — reframed by the ruling above as the validated per-project template
   for the converged effort, not a separate track that could later turn out to have been wasted work.
