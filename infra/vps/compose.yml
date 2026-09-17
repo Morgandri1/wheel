@@ -54,6 +54,11 @@ services:
       - WHEEL_ALLOWED_HOSTS=${WHEEL_ALLOWED_HOSTS:-wheeld}
       - WHEEL_SIGNUP=${WHEEL_SIGNUP:-closed}
       - RUST_LOG=${RUST_LOG:-info}
+      # Bare, same reason as PUBLIC_BASE_URL/WHEEL_TRUSTED_PROXIES above: unset in .env means
+      # absent from wheeld's environment, not an empty string, so its own default mode applies.
+      # #109 added the flag but never added it here, so it could not be turned on via .env at all
+      # on this deployment path — only by hand-editing the running container directly.
+      - WHEEL_LOG_MODE
     ports:
       # Loopback only, in every mode. Reachable from this machine (an SSH tunnel, or the operator
       # themselves) and never from the network, whether or not Caddy is also running.
