@@ -391,6 +391,13 @@ rather than treated as a later phase:**
 
 ## Per-agent sandboxing, costed against Shape 3's per-project scope (Morgan's follow-up)
 
+**RULING, stated first so this section is never mistaken for a scope change: Morgan wants these
+numbers banked FOR REFERENCE — this is explicitly NOT a priority change.** Project isolation (Shape
+3, per-project) stays P1, unchanged; per-agent stays lower priority, unchanged. Nothing below alters
+this document's actual recommendation (§ "Summary" — Shape 3, gVisor, converged with Shape 1) or
+sequences ahead of it. This section exists so the numbers exist when they are next needed, not to
+argue for building per-agent sandboxing now.
+
 Morgan's question, exactly: how much more expensive is it to independently sandbox each AGENT, not
 just each project — extending this document's own costing framework (§ "gVisor vs. Firecracker"
 below) one granularity level finer than Shape 3 ever scoped. Answered here with the same discipline
@@ -974,9 +981,11 @@ only whether that stronger boundary was ever reachable on this deployment, and i
   (`OOMPolicy=continue`, resource limits, self-update) are third-rung UX wins, a tiebreaker once
   isolation is settled, not a reason to accept losing it now. See the dedicated section above for the
   full ruling.
-- **Per-agent sandboxing (Morgan's follow-up, one granularity finer than Shape 3): mechanically
-  fine, NOT free, and answers a NARROWER slice of 037's blast radius than "per-agent isolation"
-  sounds like it should.** gVisor scales down to per-agent the same way it scales to per-project —
+- **Per-agent sandboxing (Morgan's follow-up, one granularity finer than Shape 3): REFERENCE MATERIAL,
+  ruled explicitly NOT a priority change — project isolation stays P1, per-agent stays lower priority,
+  banked for whenever it's next needed.** Mechanically fine, NOT free, and answers a NARROWER slice
+  of 037's blast radius than "per-agent isolation" sounds like it should. gVisor scales down to
+  per-agent the same way it scales to per-project —
   same `--runtime=runsc` flag — but the count it multiplies is (concurrently RUNNING agents), not
   (concurrently active projects), and this team's own board demonstrates that multiplier is real:
   up to 6× on ONE project alone, and because agent-level parking already happens today, gVisor's
