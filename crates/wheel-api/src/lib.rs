@@ -67,6 +67,9 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         // Unauthenticated, like /healthz: a deploy gate runs before anyone has a token, and the
         // answer is a single bit that reveals nothing.
         .route("/v1/host/healthz", get(routes::health::host_healthz))
+        // Unauthenticated capability discovery, mirroring GET /v1/engine one layer up: what this
+        // API-layer build can do, checked before a client depends on it.
+        .route("/v1/info", get(routes::info::info))
         // Local auth. These 404 when AUTH_MODE is not `local`, so a provider swap cannot leave a
         // second way in.
         .route("/v1/auth/signup", post(routes::auth::signup))

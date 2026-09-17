@@ -260,7 +260,10 @@ Notable boundaries, each with a reason:
 * **The vault is admin only, including listing key names.** Per ADVERSARY 037 a vault value is
   readable by every agent in the project, so sharing a project must not share the creator's
   third-party credentials. Attaching or clearing an agent's LLM credential, and invoking a tool that
-  spends one, are admin for the same reason.
+  spends one, are admin for the same reason. Enforced server-side: `GET .../board` redacts every
+  vault (and any other node with `has_redactable_credentials()`) via `NodeConfig::redact_credentials`
+  before the response leaves the engine for any caller below admin (`board_routes.rs::get_board`) —
+  a client never receives key names to hide client-side.
 * **`/v1/cli/*` is refused to every tier, admins included**, when reached through the proxy. It is the
   node-token realm; the API cannot attribute an actor there, so it declines to carry one.
 * **Writing ctx content uses `PUT /v1/nodes/{id}/content`**, not `PATCH /v1/nodes/{id}`. The patch
@@ -377,6 +380,35 @@ directly.
 Liveness only — no backend name, no project counts, no upstream error text. The answer is cached for
 one second: the route is unauthenticated, and without that a flood here becomes a flood against the
 one machine every tenant's sandbox runs on.
+
+### `GET /v1/info`
+
+Unauthenticated capability discovery for this API-layer build, mirroring `GET /v1/engine` one layer
+down (`PROTOCOL.md`'s "Engine discovery"): what THIS layer can do, checked before a client depends on
+it, rather than inferred from an incidental response field.
+
+```jsonc
+{
+  "version": "0.1.0",     // CARGO_PKG_VERSION, compile-time
+  "api_version": "v1",
+  "features": ["membership"]
+}
+```
+
+**Why this exists rather than an engine `FEATURES` id:** membership (`POST /v1/projects/{id}/members`
+and friends, below) is enforced entirely in this crate's own auth/policy layer before a request ever
+reaches a project's engine — `wheel-engine` has no route, config field or behaviour for it at all, so
+there is nothing there a test could hold a `"membership"` id to. It would be a permanently-true string
+with no engine-side truth behind it. This route is the discovery surface for capabilities that belong
+to the API layer instead — `tests/info.rs` proves `membership` by calling a real membership route
+against a real project, not by asserting the string is present in a const.
+
+- **Additive only**, same rule as `GET /v1/engine`: a client ignores fields and feature ids it does
+  not know. An absent id means the capability is not there.
+
+| Feature id | What it guarantees |
+|---|---|
+| `membership` | `/v1/projects/{id}/members`, `/v1/projects/{id}/invites` and `/v1/invites/accept` exist and behave as documented under "Membership and invites" above. |
 
 ### `POST /v1/projects`
 ```bash
