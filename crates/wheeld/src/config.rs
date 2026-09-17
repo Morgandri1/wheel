@@ -12,6 +12,7 @@ USAGE:
     wheeld token create [--name <label>] [--email <account>] [--data-dir <path>]
     wheeld token list [--data-dir <path>]
     wheeld token revoke <id> [--data-dir <path>]
+    wheeld update [--status] [--data-dir <path>]
 
 OPTIONS:
     --data-dir <path>   Where boards, secrets and project data live.
@@ -25,12 +26,17 @@ The first start writes an operator token to <data-dir>/operator-token. Send it a
 `x-auth-token: <token>` or `Authorization: Bearer <token>`. `wheeld token` makes more,
 lists them and revokes them, straight from the data directory.
 
+`wheeld update` asks a RUNNING wheeld to move this deployment to the latest CI-green
+commit on origin/main, at the next moment no agent is mid-turn; `--status` only reports
+what is pending. Both need WHEEL_AUTO_UPDATE set to prompt or auto.
+
 ENVIRONMENT:
     WHEEL_ALLOWED_HOSTS   More host names a request may be addressed to, besides localhost
                           and IP addresses. Refusing the rest keeps DNS-rebinding pages out.
     WHEEL_SIGNUP          closed (the default) or open. Closed, the owner adds
                           accounts with POST /v1/auth/users and the operator token.
     CORS_ALLOWED_ORIGINS  Browser origins allowed to call the API directly. Default: none.
+    WHEEL_AUTO_UPDATE     off (the default), prompt or auto. See docs/proposals/auto-update.md.
 ";
 
 /// Loopback: only this machine can reach it until the operator says otherwise.
@@ -50,6 +56,11 @@ pub enum Action {
         data_dir: PathBuf,
         command: TokenCommand,
     },
+    /// Ask the running daemon to update itself, or report what is pending.
+    Update {
+        data_dir: PathBuf,
+        status_only: bool,
+    },
     PrintUsage,
     PrintVersion,
 }
@@ -65,6 +76,9 @@ impl Settings {
         S: AsRef<str>,
     {
         let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+        if args.first().map(String::as_str) == Some("update") {
+            return parse_update(&args[1..]);
+        }
         if args.first().map(String::as_str) == Some("token") {
             return parse_token(&args[1..]);
         }
@@ -103,6 +117,32 @@ impl Settings {
 
         Ok(Action::Run(Settings { data_dir, bind }))
     }
+}
+
+/// `wheeld update [--status]`, with the same `--data-dir` rules as the daemon.
+fn parse_update(args: &[String]) -> Result<Action> {
+    let mut data_dir: Option<PathBuf> = None;
+    let mut status_only = false;
+    let mut it = args.iter().map(String::as_str);
+    while let Some(arg) = it.next() {
+        match arg {
+            "-h" | "--help" => return Ok(Action::PrintUsage),
+            "--status" => status_only = true,
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(it.next().context("--data-dir needs a path")?))
+            }
+            other => match other.strip_prefix("--data-dir=") {
+                Some(v) => data_dir = Some(PathBuf::from(v)),
+                // No positional argument: `wheel update <agent>` is ARCHITECTURE §3e's grammar for
+                // editing an agent, and this is the daemon updating itself.
+                None => bail!("unknown argument {other:?} for `wheeld update`\n\n{USAGE}"),
+            },
+        }
+    }
+    Ok(Action::Update {
+        data_dir: resolve_data_dir(data_dir)?,
+        status_only,
+    })
 }
 
 /// `wheeld token create|list|revoke`, with the same `--data-dir` rules as the daemon.
