@@ -529,9 +529,34 @@ conflating them is exactly the imprecision ADVERSARY flagged:
   per-node ones) and mediates every read through the wire-gated CLI instead of leaving the raw file
   reachable — a DATA-LAYER change, not a sandboxing one, and not currently scoped by F007, Shape 3,
   or this document's per-agent costing. Whatever number comes back for "how much does per-agent
-  sandboxing cost" should not be read as answering item 4 at all.
+  sandboxing cost" should not be read as answering item 4 at all. **This carrier-walk itself caught
+  an overstatement in 037 as originally filed** ("items 1–6 all close with the same control: per-node
+  uids" — not true for item 4, since `wheel.db` is never in F007's own §2 scope) — ADVERSARY filed
+  the correction as `037-carrier4-refinement`, PR #111, crediting this analysis.
 
-**So the corrected gut check: per-agent gVisor is not "F007 plus a narrow kernel-exploit-only extra"
+**Which SHAPE of "per-agent sandboxing" the carrier walk above and the multiplier numbers in §2
+actually describe — ADVERSARY's follow-up, and it matters, because there are two, at two different
+costs:**
+- **The CHEAP shape — a kernel boundary bolted onto today's architecture, same shared uid, same
+  shared project volume mounted into every agent's sandbox unchanged — is what "the same
+  `--runtime=runsc` flag applies to a per-agent container exactly as it does to a per-project one"
+  (§2's costing) actually prices, and it is what the carrier walk above is true of: closes 1–2
+  (redundantly with F007), leaves 3/5/6 open, cannot touch 4.
+- **A FULLER shape exists and would close more: a per-agent sandbox built with its OWN mount
+  namespace per agent — bind-mounting only that agent's own creds dir, workspace and token file, the
+  way sandboxes/containers conventionally scope filesystem access in the first place, not an add-on
+  — would close 3/5/6 too, independent of F007's uid split, and could close 4 as well simply by never
+  bind-mounting `wheel.db` into an agent's view at all (a second, independent closure path for
+  carrier 4, distinct from the data-layer permission change named above).** That is a materially
+  BIGGER, different piece of work than the cheap shape — real per-agent filesystem scoping design,
+  not a runtime flag — and it is NOT what this document's multiplier numbers cost. **"Per-agent
+  sandboxing closes only carriers 1–2, redundantly with F007" is true for the cheap shape and false
+  for the fuller one — whoever reads this next should not assume the 6× multiplier and memory/latency
+  figures in §2 describe the fuller architecture, since they do not.** Whether the fuller shape's
+  extra closure (3/5/6/4, on top of what F007 gets for free) is worth its own, larger and uncosted
+  price is a separate question this document does not answer — flagged, not priced.
+
+**So the corrected gut check, for the shape actually costed here: per-agent gVisor is not "F007 plus a narrow kernel-exploit-only extra"
 — it is a DIFFERENT mechanism that overlaps F007 on two carriers (1, 2, which F007 already closes
 alone, for free) and does nothing on its own for three more (3, 5, 6, which need F007's uid split
 regardless of kernel boundary) and cannot answer the sixth (4) without a data-layer change neither
