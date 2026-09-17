@@ -473,6 +473,7 @@ pub(crate) fn test_state_with(
         // The runtime is buildable and testable ahead of F007 (docs/proposals/
         // script-execution-scope.md); only PRODUCTION defaults this off.
         script_execution_enabled: true,
+        ingress_diagnostic_logging: false,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());

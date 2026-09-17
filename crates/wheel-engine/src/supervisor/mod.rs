@@ -2987,6 +2987,7 @@ mod tests {
             startup_deadline_secs: deadline_secs,
             harness_auth,
             script_execution_enabled: false,
+            ingress_diagnostic_logging: false,
         });
         let sup = Arc::new(
             Supervisor::with_harness(
@@ -3748,6 +3749,7 @@ done
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: crate::config::HarnessAuthPolicy::default(),
             script_execution_enabled: false,
+            ingress_diagnostic_logging: false,
         });
         let sup = Arc::new(
             Supervisor::with_harness(

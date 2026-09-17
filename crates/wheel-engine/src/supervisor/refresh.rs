@@ -972,6 +972,7 @@ mod tests {
                 startup_deadline_secs: DEFAULT_STARTUP_DEADLINE_SECS,
                 harness_auth: spec.policy,
                 script_execution_enabled: false,
+                ingress_diagnostic_logging: false,
             });
             let mut sup = Supervisor::with_harness(
                 cfg,
