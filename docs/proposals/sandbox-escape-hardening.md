@@ -561,19 +561,46 @@ subset of a board's agents — the ones actually exposed to untrusted input — 
 uniformly, without requiring a new capability: the same board-state signal finding 043's fix already
 computes (`db::board::add_wire`'s warning check, merged in #99) names exactly this set today.
 
-**What this section does NOT resolve, flagged for ADVERSARY specifically, per Morgan's ask to loop
-them in on the security-boundary side:**
-1. Whether the residual kernel-exploit-between-siblings threat this section names is one Wheel's
-   actual threat model should weight as seriously as project-to-project reach was weighted (§
-   "Combining Shape 1 and Shape 3" above) — that section had two independent, confirmed reasons
-   (cross-tenant confidentiality, cross-tenant availability) that do not carry over here, since
-   sibling agents share one owner by construction. Whether a narrower reason exists is ADVERSARY's
-   call, not asserted here.
-2. Whether the selective, finding-043-scoped middle path above is a legitimate reduction of the
-   uniform case, or whether it quietly reintroduces the SAME risk it claims to bound if a board's
-   trust profile changes after the sandbox assignment is made (an agent gains a new endpoint wire
-   later, without its sandbox status being reconsidered) — a staleness question this section
-   surfaces but does not resolve.
+**RESOLVED — ADVERSARY's ruling on both open questions, folded in rather than left open:**
+
+1. **Not worth the multiplier — and this is the SAME tradeoff Morgan already ruled on, one layer
+   narrower, not a fresh decision.** Shape 3 already puts the WHOLE PROJECT behind a gVisor boundary,
+   so "a kernel exploit crossing between two sibling agents" means a bug in gVisor's OWN Sentry
+   exploited by one already-project-sandboxed agent to reach another agent's memory INSIDE that same
+   sandbox — not a host escape, not a cross-project reach. That stays entirely within the blast
+   radius Shape 3 already contains. This is a narrower slice of exactly the category Morgan already
+   ruled F007 low-priority against (real, but bounded — stays inside one project's own boundary
+   either way, unlike sandbox/container escape, the actually catastrophic outcome). Second,
+   independent reason: both agents already share ONE owner who has already accepted
+   `bypassPermissions` on every agent on the board — nothing relies on agent restraint, the wire
+   matrix is the real, engine-enforced authorization boundary regardless of uid. What a
+   sibling-memory-read attacker gains beyond what F007 already prevents is access to capabilities the
+   SIBLING agent already legitimately holds via its own wires, not capabilities the wire matrix would
+   have refused the attacker anyway — a different, and by design weaker, boundary than the
+   owner-to-owner trust project isolation protects. **Recommendation: do not pursue uniform per-agent
+   sandboxing** — the real 6× multiplier (worse: on the `ptrace` platform specifically, gVisor's
+   worse-case steady-state overhead, paid on every existing agent wake, the common case not the rare
+   one per § above) is a continuously-paid tax on exactly this kind of daily multi-agent workflow, for
+   a threat that stays inside a boundary already ruled lower priority.
+2. **The staleness gap is real — same class of bug as finding 046 (tool-call TOCTOU, no recheck
+   before disclosure): a security decision computed once from a snapshot, applied to state that keeps
+   changing.** An agent gaining a new `auth:none` endpoint wire (or a `ctx` write wire completing
+   043's amplification shape) AFTER its sandbox tier was assigned, with nothing re-evaluating it,
+   isn't an edge case on a board where wiring is live and editable at any time — it is routine.
+   **The fix, if this path is ever built, is close to free: don't assign sandbox tier once at
+   provisioning — recompute the SAME signal finding 043's own fix already computes
+   (`db::board::add_wire`'s warning check, #99) at every agent START instead**, piggybacking on an
+   event (parking/resume) that already fires constantly rather than a new background reconciliation
+   loop. One residual gap even then, worth naming rather than silently assuming continuous
+   enforcement: an agent CURRENTLY RUNNING when its exposure profile changes stays on its old tier
+   until its next restart — the same shape as other live-reconfig-takes-effect-on-restart patterns
+   already accepted elsewhere in this codebase (an agent rename while running → `409`, takes effect
+   after stop), not a new kind of gap.
+
+**Bottom line for Morgan: don't build per-agent sandboxing now — this matches, and does not reopen,
+the existing P1 ruling (§ "Ruling" above). If it is ever revisited, the selective, finding-043-scoped
+middle path is the right SHAPE (bounds the multiplier to genuinely exposed agents), as long as tier
+assignment is recomputed at agent-start rather than snapshotted once.**
 
 ## 1. `security_opt: [no-new-privileges:true]` on every service — done
 
@@ -997,9 +1024,14 @@ only whether that stronger boundary was ever reachable on this deployment, and i
   landing. Carrier 4 (`wheel.db`) is closed by NEITHER mechanism without a data-layer change neither
   currently scopes. Net: gVisor's only marginal gain over an F007 that must be built regardless is
   kernel-exploit resistance between same-owner siblings — real, but it closes nothing 037 enumerates
-  that F007 doesn't already close on its own. A selective middle path (sandbox only agents finding
-  043 already flags as exposed) bounds the multiplier without new machinery if the kernel-exploit
-  margin is judged worth it. See § "Per-agent sandboxing" above for the full costing.
+  that F007 doesn't already close on its own. **ADVERSARY's ruling on both open questions: don't
+  build it.** The kernel-exploit margin stays inside the SAME bounded blast radius Morgan already
+  ruled F007 low-priority against (sibling-to-sibling, one project's own boundary either way, never a
+  host or cross-project escape) — a narrower slice of a category already ruled below P1, not a fresh
+  decision. The selective, finding-043-scoped middle path is the right SHAPE if this is ever
+  revisited, but only with tier assignment recomputed at agent-start (piggybacking on parking/resume)
+  rather than snapshotted once — a staleness gap ADVERSARY tied to the same TOCTOU class as finding
+  046. See § "Per-agent sandboxing" above for the full costing and ruling.
 - Items 1–3 (Shape 1's compose hardening): code changes exist (this PR + #83). Proceeding now, per PM's
   instruction not to pause them — reframed by the ruling above as the validated per-project template
   for the converged effort, not a separate track that could later turn out to have been wasted work.
