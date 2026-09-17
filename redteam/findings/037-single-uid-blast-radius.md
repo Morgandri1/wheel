@@ -156,3 +156,35 @@ top of the tree independently of that: the engine should `std::env::remove_var("
 `WHEEL_ENGINE_SECRET` immediately after reading them at startup (removes item 1's `/proc` carrier — a one-liner,
 does not need per-node uids), and workspace git creds must be delivered out-of-band, never in the remote URL
 (the SDK fix already in flight). These reduce blast radius; only per-node uids remove it.
+
+## Correction, 2026-09-17: "items 1-6 all close with the SAME control" overstates item 4
+
+Found while reviewing API's per-agent-sandboxing costing (`docs/proposals/sandbox-escape-hardening.md`,
+`48353e9`), which walked all six carriers against both F007 and a hypothetical per-agent kernel boundary and
+caught this precisely — worth recording here since it corrects THIS finding's own closing line, not just
+informs a downstream document.
+
+**Items 1, 2, 3, 5, 6 close "for free" from generic per-node uid work** — nothing beyond "give each node a
+distinct uid" is needed, because each carrier's exposure is ALREADY gated on uid today (`/proc/<pid>/environ`
+permissions for 1-2, `0600`/`0700` file modes for 3/5/6) and simply broken by the uids no longer matching.
+037's own PoC (TEST 2) already demonstrates this for 1-2 directly.
+
+**Item 4 (`wheel.db`) does NOT close this way, and saying "the same control" closes it overstates what F007's
+own scope (`ARCHITECTURE.md` §2) actually commits to.** §2 names *creds/config dirs* (0700 to the node uid)
+and *workspaces* (setgid, deliberately shared) explicitly — it says nothing about `wheel.db`'s own file
+permissions, and this finding's own item 4 text already noted the file is created with "no per-file 0600."
+`wheel.db` is not a per-node resource to begin with — it is the ENGINE's own database, one file for the whole
+project, holding every node's data. Per-node uids alone do not narrow who can open it; a distinctly-uid'd
+agent (`base+1+n`) can still read it unless the file is ADDITIONALLY tightened to `0600`, owned by the
+engine's own uid (`base`) specifically — excluding every node uid, including legitimate per-node ones, not
+just the project uid agents shared before F007. That is a deliberate, separate step, not a side effect of the
+uid-split work, and needs to be a NAMED line item when F007 is actually implemented, or it will ship believing
+item 4 is closed when it is not.
+
+A second, independent path worth naming for whoever builds per-agent sandboxing (not F007): a properly
+mount-namespace-scoped per-agent sandbox — one that gives each agent's sandbox bind-mounts for only its own
+creds dir/workspace/token file, never the raw project data directory — would close item 4 too, simply by
+never exposing `wheel.db`'s path inside the agent's filesystem view at all, independent of file permissions.
+That is NOT automatic from "wrap a kernel boundary around the existing shared-uid, shared-volume container" —
+it requires the sandbox to be built with per-agent mount scoping specifically, which is an implementation
+choice, not a property "per-agent sandboxing" gets for free either.
