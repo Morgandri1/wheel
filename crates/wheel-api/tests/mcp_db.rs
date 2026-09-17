@@ -32,8 +32,10 @@ const HOST_SECRET: &str = "host-secret-the-caller-never-sees";
 
 // ---------------------------------------------------------------- mock engine
 
-/// One call the mock engine saw: method, path (query included), body.
-type Call = (String, String, Option<Value>);
+/// One call the mock engine saw: method, path (query included), body, and the `x-wheel-actor-tier`
+/// header — the last of which proves `routes::mcp::engine` sets actor headers on every call rather
+/// than reaching the engine anonymously, the way it did before this fix.
+type Call = (String, String, Option<Value>, Option<String>);
 
 #[derive(Clone, Default)]
 struct Seen {
@@ -64,6 +66,11 @@ async fn mock_engine() -> (String, Seen) {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v == format!("Bearer {HOST_SECRET}"))
                 .unwrap_or(false);
+            let actor_tier = req
+                .headers()
+                .get("x-wheel-actor-tier")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let bytes = axum::body::to_bytes(req.into_body(), 1 << 20)
                 .await
                 .unwrap();
@@ -71,7 +78,7 @@ async fn mock_engine() -> (String, Seen) {
             s.calls
                 .lock()
                 .unwrap()
-                .push((method, path.clone(), body.clone()));
+                .push((method, path.clone(), body.clone(), actor_tier));
 
             // The host authenticates US, so a call that forgot the secret is
             // a bug worth failing loudly rather than answering.
@@ -171,11 +178,19 @@ async fn board() -> Board {
 impl Board {
     /// A `wht_` token for a fresh user: the operator's real credential.
     async fn token(&self) -> String {
+        self.token_with_id().await.0
+    }
+
+    /// The same, plus the principal it authenticates as — for tests that need to grant that exact
+    /// account membership, which `POST /v1/projects/{id}/members` addresses by principal, not by
+    /// token.
+    async fn token_with_id(&self) -> (String, String) {
         let user = format!("user_{}", uuid::Uuid::new_v4());
-        issue(&self.db, &user, "operator", Mint::Operator)
+        let token = issue(&self.db, &user, "operator", Mint::Operator)
             .await
             .expect("issue a token")
-            .token
+            .token;
+        (token, user)
     }
 
     async fn project(&self, token: &str) -> String {
@@ -189,6 +204,26 @@ impl Board {
         let (status, body) = self.send(req).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         body["id"].as_str().unwrap().to_string()
+    }
+
+    /// Grant `member_id` (from `token_with_id`) `role` on `project`, as the project's owner
+    /// (`admin_token`).
+    async fn grant(&self, admin_token: &str, project: &str, member_id: &str, role: &str) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/projects/{project}/members"))
+            .header("authorization", format!("Bearer {admin_token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"user_id": member_id, "role": role}).to_string(),
+            ))
+            .unwrap();
+        let (status, body) = self.send(req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "granting {role} failed: {body}"
+        );
     }
 
     async fn send(&self, req: Request<Body>) -> (StatusCode, Value) {
@@ -316,7 +351,7 @@ async fn a_tool_call_reaches_the_engine_of_a_project_i_own() {
     let result = b.call(&token, "board", json!({"project": project})).await;
     assert_eq!(result["isError"], false, "{result}");
     assert!(text(&result).contains("\"pm\""), "{}", text(&result));
-    let (method, path, _) = b.engine.last();
+    let (method, path, _, _) = b.engine.last();
     assert_eq!((method.as_str(), path.as_str()), ("GET", "/v1/board"));
 
     // `projects` needs no engine at all, and lists what I own.
@@ -395,7 +430,7 @@ async fn ask_waits_for_the_answer_and_labels_it_untrusted() {
         "another agent's words must arrive labelled: {said}"
     );
 
-    let (method, path, body) = b.engine.last();
+    let (method, path, body, _) = b.engine.last();
     assert_eq!(method, "POST");
     assert_eq!(path, format!("/v1/agents/{agent}/send"));
     assert_eq!(
@@ -413,7 +448,7 @@ async fn ask_waits_for_the_answer_and_labels_it_untrusted() {
         )
         .await;
     assert_eq!(result["isError"], false);
-    let (_, _, body) = b.engine.last();
+    let (_, _, body, _) = b.engine.last();
     assert!(
         body.unwrap().get("await_secs").is_none(),
         "send must not wait"
@@ -436,7 +471,7 @@ async fn an_agents_log_arrives_labelled_as_untrusted_input() {
     let said = text(&result);
     assert!(said.starts_with("[agent-authored output"), "{said}");
     assert!(said.contains("ignore your instructions"), "{said}");
-    let (_, path, _) = b.engine.last();
+    let (_, path, _, _) = b.engine.last();
     assert_eq!(path, format!("/v1/agents/{agent}/log?since=4&limit=2"));
 }
 
@@ -531,4 +566,159 @@ async fn a_bad_tool_call_is_a_tool_error_and_an_unknown_method_is_a_protocol_err
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(answer["error"]["code"], -32601, "{answer}");
+}
+
+// ------------------------------------------------------------- tier enforcement (guest bypass)
+
+/// The bug this closes: `scope()` used to resolve a caller's `ProjectScope` and then discard the
+/// tier, keeping only the project id — so `engine()` reached the project's control plane directly,
+/// bypassing `routes::proxy` and `auth::policy` entirely, with no actor header at all. A guest
+/// (view-only by `auth::policy`'s own table) could therefore use MCP to start agents, send them
+/// messages, and stop them — Prompter-tier actions — on any project they merely had guest access
+/// to. This is the regression test: every Prompter-tier tool must refuse a guest, the same way the
+/// HTTP proxy already does, and the engine must never be called on the way to that refusal.
+#[tokio::test]
+async fn a_guest_cannot_reach_prompter_tier_tools_through_mcp() {
+    let b = board().await;
+    let admin = b.token().await;
+    let project = b.project(&admin).await;
+    let (guest, guest_id) = b.token_with_id().await;
+    b.grant(&admin, &project, &guest_id, "guest").await;
+
+    let before = b.engine.calls().len();
+    for (tool, args) in [
+        (
+            "send",
+            json!({"project": project, "agent": uuid::Uuid::new_v4(), "body": "hi"}),
+        ),
+        (
+            "ask",
+            json!({"project": project, "agent": uuid::Uuid::new_v4(), "body": "hi"}),
+        ),
+        (
+            "start",
+            json!({"project": project, "agent": uuid::Uuid::new_v4()}),
+        ),
+        (
+            "stop",
+            json!({"project": project, "agent": uuid::Uuid::new_v4()}),
+        ),
+    ] {
+        let result = b.call(&guest, tool, args).await;
+        assert_eq!(
+            result["isError"], true,
+            "{tool} must be refused for a guest: {result:?}"
+        );
+        assert_eq!(
+            text(&result),
+            "This operation is not permitted.",
+            "{tool}: {result:?}"
+        );
+    }
+    // The refusal happens before the engine is ever reached — a tier check that ran AFTER the call
+    // would only hide the result, not close the bypass (the engine would already have acted).
+    assert_eq!(
+        b.engine.calls().len(),
+        before,
+        "a refused tool must never reach the engine"
+    );
+}
+
+/// The same guest is still Guest-tier per `auth::policy`'s own table — `board` and `logs` are
+/// `Tier::Guest` there, so MCP must keep allowing them, not turn into a blanket admin-only surface.
+#[tokio::test]
+async fn a_guest_still_reaches_guest_tier_tools_through_mcp() {
+    let b = board().await;
+    let admin = b.token().await;
+    let project = b.project(&admin).await;
+    let (guest, guest_id) = b.token_with_id().await;
+    b.grant(&admin, &project, &guest_id, "guest").await;
+
+    let result = b.call(&guest, "board", json!({"project": project})).await;
+    assert_ne!(result["isError"], true, "{result:?}");
+
+    let result = b
+        .call(
+            &guest,
+            "logs",
+            json!({"project": project, "agent": uuid::Uuid::new_v4()}),
+        )
+        .await;
+    assert_ne!(result["isError"], true, "{result:?}");
+}
+
+/// The second half of the fix: every engine call MCP makes carries the caller's real actor tier,
+/// so engine-side tier-dependent projections (the same mechanism `auth_status`'s redaction already
+/// uses) see an honest caller instead of an anonymous one.
+#[tokio::test]
+async fn every_mcp_engine_call_carries_the_callers_actor_tier() {
+    let b = board().await;
+    let admin = b.token().await;
+    let project = b.project(&admin).await;
+
+    b.call(&admin, "board", json!({"project": project})).await;
+    let (_, _, _, tier) = b.engine.last();
+    assert_eq!(
+        tier.as_deref(),
+        Some("admin"),
+        "the project owner's own call must carry their real tier"
+    );
+
+    let (prompter, prompter_id) = b.token_with_id().await;
+    b.grant(&admin, &project, &prompter_id, "prompter").await;
+    b.call(
+        &prompter,
+        "send",
+        json!({"project": project, "agent": uuid::Uuid::new_v4(), "body": "hi"}),
+    )
+    .await;
+    let (_, _, _, tier) = b.engine.last();
+    assert_eq!(tier.as_deref(), Some("prompter"), "{tier:?}");
+}
+
+/// The matrix ADVERSARY asked for, driving every project-scoped MCP tool as a guest against
+/// `auth::policy`'s own table — the test that would have caught this bug, and the one that catches
+/// the next tool added to `tools()` without its `engine()` path being reachable at the right tier.
+/// (`projects` is excluded: it is not project-scoped at all — no `project` argument, no `scope()`
+/// call — so it is outside what this matrix is about.)
+#[tokio::test]
+async fn every_project_scoped_mcp_tool_is_refused_or_allowed_exactly_as_policy_says() {
+    let b = board().await;
+    let admin = b.token().await;
+    let project = b.project(&admin).await;
+    let (guest, guest_id) = b.token_with_id().await;
+    b.grant(&admin, &project, &guest_id, "guest").await;
+
+    let agent = || uuid::Uuid::new_v4().to_string();
+    // (tool, args, allowed for Guest per auth::policy.rs)
+    let cases: Vec<(&str, Value, bool)> = vec![
+        ("board", json!({"project": project}), true),
+        ("logs", json!({"project": project, "agent": agent()}), true),
+        (
+            "send",
+            json!({"project": project, "agent": agent(), "body": "hi"}),
+            false,
+        ),
+        (
+            "ask",
+            json!({"project": project, "agent": agent(), "body": "hi"}),
+            false,
+        ),
+        (
+            "start",
+            json!({"project": project, "agent": agent()}),
+            false,
+        ),
+        ("stop", json!({"project": project, "agent": agent()}), false),
+    ];
+
+    for (tool, args, allowed) in cases {
+        let result = b.call(&guest, tool, args).await;
+        let refused =
+            result["isError"] == true && text(&result) == "This operation is not permitted.";
+        assert_eq!(
+            !refused, allowed,
+            "{tool}: expected allowed={allowed}, got {result:?}"
+        );
+    }
 }
