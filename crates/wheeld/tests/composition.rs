@@ -11,6 +11,24 @@
 use uuid::Uuid;
 use wheeld::supervise::Keys;
 
+/// Serializes every test in this file against the process-global environment `apply_defaults`
+/// composes (`WHEEL_HOST_SECRET` above all).
+///
+/// "Each uses its own directory and only the first `apply_defaults` wins" (below) is correct
+/// ACROSS PROCESSES — an operator's own env var must never be silently overridden — but `cargo
+/// test` runs this file's tests CONCURRENTLY, in one process, by default, and that turns the same
+/// correct behaviour into a real, order-dependent flake: whichever test's `start()` happens to call
+/// `apply_defaults` first sets the value every other test in this file reads back or checks against
+/// for the rest of the process's life, not just its own. A test whose own host was built from a
+/// DIFFERENT `Keys::host_secret` than what ends up composed then authenticates with the wrong
+/// value — a genuine 401, nothing to do with the product. Holding this lock for a whole test body
+/// (an async lock, so it is safe to hold across the `.await`s `start()` and every HTTP call make)
+/// removes the interleaving rather than working around its symptom.
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(tokio::sync::Mutex::default)
+}
+
 /// One data directory per test. `start_host` writes environment defaults, and those are
 /// process-global, so these tests share a process carefully: each uses its own directory and only
 /// the first `apply_defaults` wins (it never overrides what is already set), which is the behaviour
@@ -28,7 +46,7 @@ fn data_dir() -> std::path::PathBuf {
 async fn start() -> (String, String) {
     let dir = wheeld::supervise::prepare_data_dir(&data_dir()).unwrap();
     let keys = Keys::load_or_create(&dir).unwrap();
-    let url = wheeld::start_host(&dir, &keys)
+    let url = wheeld::start_host(&dir, &keys, None)
         .await
         .expect("the sandbox host should start")
         .url;
@@ -43,6 +61,7 @@ async fn start() -> (String, String) {
 
 #[tokio::test]
 async fn the_embedded_host_serves_and_runs_a_projects_engine() {
+    let _guard = env_lock().lock().await;
     let (host_url, secret) = start().await;
     let http = reqwest::Client::new();
 
@@ -123,6 +142,7 @@ async fn the_embedded_host_serves_and_runs_a_projects_engine() {
 /// every project on the machine. An unauthenticated caller must get nothing.
 #[tokio::test]
 async fn the_embedded_host_still_requires_its_bearer() {
+    let _guard = env_lock().lock().await;
     let (host_url, _) = start().await;
     let http = reqwest::Client::new();
 
@@ -142,6 +162,11 @@ async fn the_embedded_host_still_requires_its_bearer() {
 async fn help_and_version_do_their_job_without_starting_anything() {
     use wheeld::config::{Action, Settings};
 
+    // Also guarded: without this, a concurrent `start()` in another test could compose
+    // `WHEEL_HOST_SECRET` for the first time in the window between the two reads below, and this
+    // test would wrongly blame `--help`/`--version` for "composing an environment" it never
+    // touched.
+    let _guard = env_lock().lock().await;
     let before = std::env::var("WHEEL_HOST_SECRET").ok();
 
     wheeld::dispatch(Settings::parse(["--help"]).unwrap())

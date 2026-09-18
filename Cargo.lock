@@ -3212,6 +3212,7 @@ dependencies = [
  "libc",
  "rand 0.9.5",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
