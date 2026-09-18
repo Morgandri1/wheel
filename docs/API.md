@@ -323,7 +323,7 @@ request, and any live events WebSocket that member holds is closed rather than l
 ## Membership and invites
 
 ```
-GET    /v1/projects/{id}/members                    → { creator, members: [Member] }   (guest)
+GET    /v1/projects/{id}/members                    → { creator, creator_email?, members: [Member] }  (guest)
 POST   /v1/projects/{id}/members  {user_id, role}   → Member                           (admin)
 DELETE /v1/projects/{id}/members/{user_id}          → 204                              (admin)
 
@@ -339,6 +339,44 @@ An invite token is `wi_` plus 32 random bytes; only its SHA-256 is stored, so a 
 is not a copy of anyone's invitations. It expires (7 days by default), has a use count (1 by
 default), and may be locked to an email — checked against the account's *verified* address, never
 against a claim in the request.
+
+### Member and creator email — resolved for display, masked for a guest
+
+`Member.email` and `MemberList.creator_email` are `Option<String>`, omitted from the response
+entirely when there is nothing to show (`skip_serializing_if`, the same convention `Project.tier`
+uses) — clients must handle absence, not assume the field is always there.
+
+**Resolution.** `user_id`/`creator` are opaque principals — a `users.id` UUID under `local` auth, an
+external provider's `sub` under `jwks` — and are never masked at any tier, since they identify
+nothing about the person beyond "a member of this project," the same as a database row id would.
+`email` is a best-effort DISPLAY value resolved separately:
+- Under `local` auth, every member's principal IS a `users.id`, so the API looks up any row's email
+  directly — not just the caller's own.
+- Under `jwks`, there is deliberately no local account row for another provider's principal at all
+  (members can be `jwks` accounts with nothing in this API's own `users` table). The only email this
+  API can ever know for a `jwks` member is the CALLER'S OWN, read from the `email` claim on the JWT
+  that authenticated the current request, when the provider includes one. Every other `jwks`
+  member's `email` is always absent — not a gap to close, the honest limit of what a stateless
+  verifier can know about someone else's account.
+
+**Masking, guest tier only.** A guest sees every OTHER member's `email` (and `creator_email`, unless
+they are the creator) masked: first two characters, a fixed three-character mask (`•••`, not
+sized to the hidden length — a size-matched mask leaks the length), last two characters, domain
+shown in full (`so•••ne@example.com`). A local part of four characters or fewer shows only its
+first character plus the mask (`ab@x.com` and `abcd@x.com` are indistinguishable once masked, which
+is the point — showing both characters of a two-character local part is not meaningfully masked at
+all). Counted in Unicode code points, not bytes, so a multi-byte character is never split. A
+non-email-shaped identifier, if one is ever surfaced through this same helper elsewhere, gets the
+identical rule applied to the whole string.
+
+**The guest's own row is never masked** — they already know their own email, and masking it would
+cost them a lookup without hiding anything. Every other tier (`prompter`, `admin`) sees every email
+unmasked; masking is guest-specific, not a general privacy filter.
+
+**Enforced server-side**, in the handler, before the response is built — the same reasoning
+`GET .../board`'s `redact_credentials` already uses for vault key names: a client that masked the
+value itself would not protect a caller hitting this route directly (`curl`, a script, anything
+that is not the reference UI).
 
 Accepting is idempotent and **never lowers an existing tier**, so a stale guest link cannot be used
 to demote a prompter. Unknown, expired, revoked and exhausted invites are one indistinguishable

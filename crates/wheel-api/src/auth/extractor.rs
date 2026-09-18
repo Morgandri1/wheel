@@ -99,6 +99,14 @@ impl Tier {
 pub struct AuthUser {
     user_id: String,
     credential: Credential,
+    /// The email this SPECIFIC request's own credential carried, when it carried one. Never
+    /// resolved for anyone but the caller themselves: under `local` auth, `routes::members::list`
+    /// looks up every member's email from `users` directly (their id is a real row there); under
+    /// `jwks`, there is no local row for another provider-authenticated principal at all, so this
+    /// field is the ONLY email the server can ever know about the caller's own row, and `None` for
+    /// every other jwks member is not a gap to close — it is the honest limit of what the server
+    /// can know.
+    email: Option<String>,
 }
 
 impl AuthUser {
@@ -110,6 +118,10 @@ impl AuthUser {
         self.credential
     }
 
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
     /// Build one from an identity this module itself resolved. `pub(crate)` and deliberately
     /// awkward to reach: the events route redeems a ws-ticket, which proves an identity by a
     /// different route than a header, and it still has to end at the same type.
@@ -117,6 +129,7 @@ impl AuthUser {
         AuthUser {
             user_id,
             credential: Credential::WsTicket,
+            email: None,
         }
     }
 }
@@ -141,6 +154,10 @@ impl FromRequestParts<AppState> for AuthUser {
                 return Ok(AuthUser {
                     user_id: v.user_id,
                     credential: Credential::ApiToken(v.token_id),
+                    // An API token carries no email claim of its own; `routes::members::list`'s
+                    // per-member `users` table lookup still finds a `local`-mode caller's email by
+                    // id regardless — this only matters for the `jwks` case this field exists for.
+                    email: None,
                 });
             }
         }
@@ -152,7 +169,7 @@ impl FromRequestParts<AppState> for AuthUser {
         // rather than a rewrite. A token minted by the mode we are *not* in fails without a special
         // case: local sessions are HS256 against our own secret, jwks tokens are RS256 against the
         // provider's keys.
-        let (user_id, credential) = match state.cfg.auth_mode {
+        let (user_id, credential, email) = match state.cfg.auth_mode {
             crate::config::AuthMode::Local => {
                 let live = crate::auth::local::verify_session(
                     &state.db,
@@ -161,19 +178,26 @@ impl FromRequestParts<AppState> for AuthUser {
                     &state.cfg.public_base_url,
                 )
                 .await?;
-                (live.user_id, Credential::Session(Some(live.session_id)))
+                // Not resolved here: `routes::members::list` looks this account's email up by id
+                // from `users` directly when it needs it, the same way it does for every OTHER
+                // local member's row — carrying it on `AuthUser` too would just be a second,
+                // independently-stale copy of the same row.
+                (
+                    live.user_id,
+                    Credential::Session(Some(live.session_id)),
+                    None,
+                )
             }
-            crate::config::AuthMode::Jwks => (
-                crate::auth::claims::verify(&token, &state.cfg, &state.jwks)
-                    .await?
-                    .user_id,
-                Credential::Session(None),
-            ),
+            crate::config::AuthMode::Jwks => {
+                let verified = crate::auth::claims::verify(&token, &state.cfg, &state.jwks).await?;
+                (verified.user_id, Credential::Session(None), verified.email)
+            }
         };
 
         Ok(AuthUser {
             user_id,
             credential,
+            email,
         })
     }
 }

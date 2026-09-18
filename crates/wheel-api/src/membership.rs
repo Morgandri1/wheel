@@ -199,6 +199,12 @@ pub struct Member {
     pub invited_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Display email, resolved and (for a guest caller) masked by `routes::members::list` after
+    /// this list is fetched — not populated here, since that needs the caller's own auth context
+    /// (mode, tier) this function does not have. `None` until then, and `None` permanently for any
+    /// member this deployment has no way to know an email for (see `AuthUser::email`'s doc comment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -230,6 +236,7 @@ pub async fn list(db: &Db, project_id: &Uuid) -> ApiResult<Vec<Member>> {
                 invited_by: r.invited_by,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                email: None,
             })
         })
         .collect())
@@ -300,6 +307,7 @@ pub async fn find(db: &Db, project_id: &Uuid, user_id: &str) -> ApiResult<Option
             invited_by: r.invited_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            email: None,
         })
     }))
 }
