@@ -56,8 +56,30 @@ impl EngineLog {
 }
 
 async fn recording_engine() -> (String, EngineLog) {
+    recording_engine_with_board(json!({"nodes": []})).await
+}
+
+/// As [`recording_engine`], but `GET /v1/board` answers with the given body instead of the
+/// generic `{"ok": true}` — for a test whose apply has to see a real existing node (a deletion,
+/// for instance, which `apply::validate` refuses unless the target is genuinely on the board).
+/// Every other path, DELETE included, still falls through to the same recorder.
+async fn recording_engine_with_board(board: serde_json::Value) -> (String, EngineLog) {
     let log = EngineLog::default();
     let app = Router::new()
+        .route(
+            "/v1/board",
+            axum::routing::get({
+                let log = log.clone();
+                move |req: Request<Body>| {
+                    let log = log.clone();
+                    let board = board.clone();
+                    async move {
+                        log.0.lock().unwrap().push(("/v1/board".into(), req.headers().clone()));
+                        axum::Json(board)
+                    }
+                }
+            }),
+        )
         .fallback(
             |State(log): State<EngineLog>, req: Request<Body>| async move {
                 let target = req
@@ -179,10 +201,17 @@ async fn signup(app: &Router, email: &str) -> (String, String) {
 }
 
 async fn harness() -> Harness {
+    let (engine_base, engine) = recording_engine().await;
+    harness_with_engine(engine_base, engine).await
+}
+
+/// As [`harness`], against a caller-supplied engine — for a test that needs the mock to answer a
+/// specific request (e.g. `GET /v1/board` describing a node that already exists) rather than the
+/// generic `{"ok": true}` every other test here relies on.
+async fn harness_with_engine(engine_base: String, engine: EngineLog) -> Harness {
     let path = std::env::temp_dir().join(format!("wheel-tiers-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
     let db = Db::connect(&url).await.expect("connect and migrate");
-    let (engine_base, engine) = recording_engine().await;
 
     let state = AppState::new(Inner {
         jwks: wheel_api::auth::jwks::JwksCache::new(
@@ -706,6 +735,67 @@ async fn the_board_apply_path_carries_the_actor_and_refuses_lower_tiers() {
             headers.get("x-wheel-actor-tier").unwrap(),
             "admin",
             "{target} carried the forged tier"
+        );
+    }
+}
+
+/// The sibling to the test above, but exercising a REMOVAL. Found by adversarial mutation
+/// testing: every test in this file still passed with `HttpBoardClient::delete_node`/
+/// `delete_wire` reverted to a raw, unattributed request, because the empty board above never
+/// deletes anything and this file's other checks never look at the DELETE calls' headers. Nothing
+/// previously would have caught either method silently losing its actor headers and tier check —
+/// exactly the risk `HttpBoardClient::request`'s own doc comment warns about.
+#[tokio::test]
+async fn a_deletion_through_board_apply_also_carries_the_actor() {
+    let node_id = Uuid::new_v4();
+    let (engine_base, engine) = recording_engine_with_board(json!({
+        "nodes": [{
+            "id": node_id,
+            "name": "old-notes",
+            "type": "ctx",
+            "config": {"markdown": "stale"},
+            "wires": [],
+        }],
+    }))
+    .await;
+    let h = harness_with_engine(engine_base, engine).await;
+    let uri = format!("/v1/projects/{}/board/apply", h.project);
+    let removal = json!({"nodes": [], "wires": [], "remove": {"nodes": ["old-notes"]}});
+
+    // Deletions require the digest of a plan actually shown (ruling 3 / T11): preview first.
+    let dry_run = json!({"board": removal, "allow_delete": true, "dry_run": true});
+    let (status, plan) = call(&h.app, "POST", &uri, Some(&h.creator), Some(dry_run)).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let digest = plan["plan_digest"]
+        .as_str()
+        .expect("a plan digest")
+        .to_string();
+    h.engine.take(); // the preview's own board read, not what this test is checking
+
+    let apply = json!({"board": removal, "allow_delete": true, "expect_plan": digest});
+    let (status, report) = call(&h.app, "POST", &uri, Some(&h.creator), Some(apply)).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    let seen = h.engine.take();
+    let deletes: Vec<_> = seen
+        .iter()
+        .filter(|(target, _)| target.contains("/v1/nodes/"))
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        1,
+        "expected exactly one node delete reaching the engine: {seen:?}"
+    );
+    for (target, headers) in &seen {
+        assert_eq!(
+            headers.get("x-wheel-actor-id").map(|v| v.to_str().unwrap()),
+            Some(h.creator_id.as_str()),
+            "{target} arrived without the actor"
+        );
+        assert_eq!(
+            headers.get("x-wheel-actor-tier").unwrap(),
+            "admin",
+            "{target} missing the actor's tier"
         );
     }
 }
