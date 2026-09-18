@@ -62,6 +62,7 @@ export default defineConfig({
         "src/lib/upstream.ts",
         "src/lib/api-proxy.ts",
         "src/lib/session-routes.ts",
+        "src/lib/invite-routes.ts",
         "src/lib/ingress-probe.ts",
         "src/lib/event-relay.ts",
         "src/lib/session-user.ts",

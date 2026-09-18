@@ -6,9 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { AuthMode } from "@/lib/auth";
 
+const searchParams = vi.hoisted(() => ({ current: new URLSearchParams() }));
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => searchParams.current,
 }));
 
 /**
@@ -19,9 +20,10 @@ vi.mock("next/navigation", () => ({
  * <RuntimeConfig> sets it; otherwise the screen renders the "not in local mode" notice and there is
  * no form to assert on.
  */
-async function renderScreen(mode: "sign-in" | "sign-up", authMode: AuthMode = "local") {
+async function renderScreen(mode: "sign-in" | "sign-up", authMode: AuthMode = "local", search = "") {
   vi.resetModules();
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ user: null })));
+  searchParams.current = new URLSearchParams(search);
   (await import("@/lib/auth")).setAuthMode(authMode);
   const { AuthScreen } = await import("@/components/auth/auth-screen");
   return render(<AuthScreen mode={mode} />);
@@ -30,6 +32,31 @@ async function renderScreen(mode: "sign-in" | "sign-up", authMode: AuthMode = "l
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  searchParams.current = new URLSearchParams();
+});
+
+/**
+ * A new visitor an invite link sent to sign up (or an existing member sent to sign in) must not
+ * lose that destination on the toggle: `next-path.ts`'s own function re-validates it either side,
+ * so passing the raw value here is not a second trust decision, just not dropping it in transit.
+ */
+describe("the sign-in/sign-up toggle carries `next` along", () => {
+  it("adds next to the sign-up link when signing in was not the destination", async () => {
+    await renderScreen("sign-in", "local", "?next=%2Fapp%2Finvite%2Fwi_abc");
+    const href = screen.getByTestId("link-auth-switch").getAttribute("href");
+    expect(href).toBe("/sign-up?next=%2Fapp%2Finvite%2Fwi_abc");
+  });
+
+  it("adds next to the sign-in link the other way", async () => {
+    await renderScreen("sign-up", "local", "?next=%2Fapp%2Finvite%2Fwi_abc");
+    const href = screen.getByTestId("link-auth-switch").getAttribute("href");
+    expect(href).toBe("/sign-in?next=%2Fapp%2Finvite%2Fwi_abc");
+  });
+
+  it("carries no query string at all when there was nothing to carry", async () => {
+    await renderScreen("sign-in");
+    expect(screen.getByTestId("link-auth-switch").getAttribute("href")).toBe("/sign-up");
+  });
 });
 
 /**

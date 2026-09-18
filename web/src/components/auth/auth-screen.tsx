@@ -59,6 +59,12 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
 
   // `next` is where the user was headed before we intercepted them; only a path on this origin.
   const next = typeof window === "undefined" ? "/app" : safeNextPath(params.get("next"), window.location.origin);
+  // The sign-in/sign-up toggle carries the raw value along rather than `next` above: whichever
+  // screen the visitor lands on next re-validates it with the same function, so passing the
+  // unvalidated string here is not a second trust decision, just not losing it in transit — a new
+  // visitor an invite link sent to sign up must still land on the invite after creating the account.
+  const rawNext = params.get("next");
+  const switchHref = `${isSignUp ? "/sign-in" : "/sign-up"}${rawNext ? `?next=${encodeURIComponent(rawNext)}` : ""}`;
 
   useEffect(() => {
     void hydrateSession();
@@ -196,7 +202,7 @@ export function AuthScreen({ mode }: { mode: "sign-in" | "sign-up" }) {
         <div className="border-t border-rule px-5 py-3 text-meta text-ink-dim">
           {isSignUp ? "Already have an account? " : "No account yet? "}
           <Link
-            href={isSignUp ? "/sign-in" : "/sign-up"}
+            href={switchHref}
             className="text-ink underline underline-offset-4"
             data-testid="link-auth-switch"
           >

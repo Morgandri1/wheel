@@ -172,6 +172,33 @@ export const invites = {
     }),
 };
 
+/**
+ * `POST /api/invites/accept` — not project-scoped, so unlike everything else in this file it does
+ * not go through `/api/wheel/...`; see `src/lib/invite-routes.ts` for why that route exists.
+ *
+ * Deliberately does NOT call `notifyUnauthorized()` on a 401 the way `request()` does elsewhere:
+ * the API answers an unusable invite (unknown, expired, revoked, locked to another address) with
+ * the same generic 401 it uses for a dead session — distinguishing them would tell a caller which
+ * invite links exist. Treating every 401 here as "you're signed out" would misfire on the far more
+ * common case (a bad or already-used link) for a page whose entire job is redeeming one. A session
+ * that is genuinely dead surfaces normally on this visitor's next request anywhere else in the app.
+ */
+export async function acceptInvite(token: string): Promise<{ project_id: string; role: string }> {
+  let res: Response;
+  try {
+    res = await fetch("/api/invites/accept", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ token }),
+    });
+  } catch {
+    throw new ApiError(0, "offline", "Can't reach this app's server. Check your connection.");
+  }
+  if (!res.ok) throw await toApiError(res);
+  return res.json();
+}
+
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
 
 /**
