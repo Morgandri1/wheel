@@ -74,7 +74,10 @@ async fn recording_engine_with_board(board: serde_json::Value) -> (String, Engin
                     let log = log.clone();
                     let board = board.clone();
                     async move {
-                        log.0.lock().unwrap().push(("/v1/board".into(), req.headers().clone()));
+                        log.0
+                            .lock()
+                            .unwrap()
+                            .push(("/v1/board".into(), req.headers().clone()));
                         axum::Json(board)
                     }
                 }
