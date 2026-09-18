@@ -17,24 +17,15 @@ Workflow: one worktree per team under `/Users/metatron/wheel-wt/<role>`, merge t
 
 Wheel is source-available (PolyForm Noncommercial 1.0.0) — free to use, modify, and share for any noncommercial purpose.
 
-It's **headless-first**: a shell and `curl` are enough to run, drive and script it. The board UI is an optional
-add-on that calls the API from its own server. (Design + threat model: `docs/proposals/headless-first.md`.)
-
-### 1. `wheeld` — one executable
-Needs: Rust stable 1.88+ ([rustup.rs](https://rustup.rs) — not your distro's packaged `rustc`, it's usually too
-old), a C compiler (`build-essential` / Xcode CLT), and `git` (also used at runtime, for agent workspaces). Running
-an agent (not just building) needs Node.js 22+ with `npm install -g @anthropic-ai/claude-code @openai/codex`, or
-use Docker (§2), which bundles both.
-
+Fastest way to get going — Docker Engine + `git`, nothing else:
 ```bash
-cargo build --release -p wheeld
-./target/release/wheeld          # API + sandbox host + agents in one process, sqlite store, on http://127.0.0.1:8080
+docker build -f docker/Dockerfile.wheeld -t wheeld .
+docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
+(umask 077; docker exec wheeld cat /data/operator-token > ~/.wheel-token)
+export WHEEL_TOKEN_FILE=~/.wheel-token
 ```
-- Listens on `127.0.0.1:8080` by default (`--bind` / `BIND_ADDR` to change).
-- Everything lives in `~/.wheel` (`--data-dir` / `WHEEL_DATA_DIR`) — treat it like an SSH key.
-- First start writes an operator token to `~/.wheel/operator-token`.
 
-Drive it with that token:
+Then drive it with that token:
 ```bash
 wh() { local path=$1; shift
        curl -fsS -H @<(printf 'x-auth-token: %s\n' "$(cat "${WHEEL_TOKEN_FILE:-$HOME/.wheel/operator-token}")") \
@@ -54,67 +45,10 @@ wh /v1/projects/$P/engine/v1/agents/$(id worker)/send -d '{"body": "Say hello."}
 wh "/v1/projects/$P/engine/v1/agents/$(id worker)/log?limit=50"
 ```
 
-More tokens:
-```bash
-wheeld token create --name laptop         # prints the new token, on stdout, this once
-wheeld token list                         # id, account, name, created, last used, revoked
-wheeld token revoke <id>                  # revokes it and every token it minted
-```
+Want the board UI too? `WHEEL_API_URL=http://127.0.0.1:8080 npx wheel-web` (needs Node 22+).
 
-As a systemd service, use `KillMode=mixed` (not the default `control-group`) so `wheeld` gets to drain in-flight
-turns before its agents are killed:
-```ini
-[Service]
-ExecStart=/usr/local/bin/wheeld --data-dir /var/lib/wheel
-KillMode=mixed
-TimeoutStopSec=30
-```
-
-**Signup** is closed by default (`WHEEL_SIGNUP=open` to allow self-signup — only on a box nobody else can reach,
-since a stranger's signup runs a stranger's agent code as your user). While closed, the owner adds people:
-```bash
-printf '{"email":"%s","password":"%s"}' you@example.com "$PASSWORD" | wh /v1/auth/users -d @-
-```
-
-**Behind a reverse proxy** (the VPS kit in `infra/vps/` sets all of these): `PUBLIC_BASE_URL=https://<domain>`,
-`WHEEL_TRUSTED_PROXIES=<proxy address>`, `WHEEL_ALLOWED_HOSTS=<domain>`.
-
-### 2. Docker, headless
-Needs: Docker Engine with the Compose v2 plugin, and `git`. Everything else (Node, `claude`/`codex`, Rust) is
-inside the image.
-```bash
-docker build -f docker/Dockerfile.wheeld -t wheeld .              # or: make wheeld-image
-docker run -d --name wheeld --stop-timeout 30 -v wheel-data:/data -p 127.0.0.1:8080:8080 wheeld
-(umask 077; docker exec wheeld cat /data/operator-token > ~/.wheel-token)
-export WHEEL_TOKEN_FILE=~/.wheel-token                             # then `wh` as above
-docker exec wheeld wheeld token create --name ci                   # more tokens, the same way
-```
-Or as compose: `docker compose -f infra/compose.wheeld.yml up -d --build`.
-
-### 3. The board UI (optional)
-Needs: Node.js 22.x. `wheel-web` is a prebuilt package, not a build from source.
-```bash
-WHEEL_API_URL=http://127.0.0.1:8080 npx wheel-web                                # against wheeld on this machine
-docker compose -f infra/compose.wheeld.yml --profile web up -d --build           # or both in compose: UI on http://127.0.0.1:3000
-```
-The UI signs in with email + password (same signup rules as above), and calls the API from its own server — the
-browser never talks to the API directly. To script boards you use in the UI, mint a token for that account
-(`wheeld token create --email you@example.com`).
-
-### 4. On your own cloud
-- **Railway**: fork this repo, create services from `docker/Dockerfile.api` and `docker/Dockerfile.host` (+
-  Postgres), apply `infra/railway/settings.json` with `infra/railway/apply-settings.sh`. Env vars:
-  `infra/railway/README.md` and `web/DEPLOY.md`.
-- **Any VM / Kubernetes**: run the two images with Postgres; the host needs a persistent volume at `/data` and must
-  NOT be publicly reachable (API talks to it privately via `WHEEL_HOST_SECRET`). The web app is a standard Next.js
-  server reaching the API at `WHEEL_API_URL`.
-
-### Developing Wheel: the multi-service stack
-```bash
-docker network create wheel
-docker compose -f infra/docker-compose.yml up --build              # postgres + api + host, API on 127.0.0.1:8080
-docker compose -f infra/docker-compose.yml --profile web up --build   # plus the board UI on 127.0.0.1:3000
-```
+Building `wheeld` from source, the board UI in depth, production deployment (systemd, reverse proxy, signup,
+Railway/VM/Kubernetes), and every environment variable: **[docs/SETUP.md](docs/SETUP.md)**.
 
 ### Agents and credentials
 Agents are Claude Code / Codex processes. Give them credentials through a **vault** node (one per account; wire
