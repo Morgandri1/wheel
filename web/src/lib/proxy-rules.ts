@@ -52,6 +52,9 @@ function isBoardRoute(segments: string[]): boolean {
   if (PROJECT_ACTIONS.has(action)) return rest.length === 0;
   if (action === "board") return rest.length === 1 && rest[0] === "apply";
   if (action === "engine") return rest[0] === "v1" && rest.length >= 2;
+  // GET/POST .../members|invites and DELETE .../members|invites/{id} — the id segment is
+  // whatever a principal or invite id looks like, already bounded by safeSegment above.
+  if (action === "members" || action === "invites") return rest.length <= 1;
   return false;
 }
 

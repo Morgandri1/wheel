@@ -49,6 +49,10 @@ describe("which paths reach the API", () => {
     ["/api/wheel/v1/projects/9b1d/engine/v1/board", "/v1/projects/9b1d/engine/v1/board"],
     ["/api/wheel/v1/projects/p1/engine/v1/vault/n1/ANTHROPIC_API_KEY", "/v1/projects/p1/engine/v1/vault/n1/ANTHROPIC_API_KEY"],
     ["/api/wheel/v1/projects/p1/engine/v1/chests/c1/blob", "/v1/projects/p1/engine/v1/chests/c1/blob"],
+    ["/api/wheel/v1/projects/p1/members", "/v1/projects/p1/members"],
+    ["/api/wheel/v1/projects/p1/members/u1", "/v1/projects/p1/members/u1"],
+    ["/api/wheel/v1/projects/p1/invites", "/v1/projects/p1/invites"],
+    ["/api/wheel/v1/projects/p1/invites/inv1", "/v1/projects/p1/invites/inv1"],
   ])("forwards %s as %s", (pathname, expected) => {
     expect(upstreamPath(pathname)).toBe(expected);
   });
@@ -84,6 +88,8 @@ describe("which paths reach the API", () => {
     "/api/wheel/v1/projects/p1/engine/v1",
     "/api/wheel/v1/projects/p1/engine/v2/board",
     "/api/wheel/v1/projects/p1/anything",
+    "/api/wheel/v1/projects/p1/members/u1/extra",
+    "/api/wheel/v1/projects/p1/invites/inv1/extra",
     "/api/wheel/%76%31/projects",
     "/api/wheel/v1/%70rojects",
   ])("refuses the route %s", (pathname) => {
