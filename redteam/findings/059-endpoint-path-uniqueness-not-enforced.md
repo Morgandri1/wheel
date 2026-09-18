@@ -9,10 +9,18 @@
 - **Owner:** SDK (`crates/wheel-core/src/validate.rs::validate_endpoint`,
   `crates/wheel-engine/src/db/board.rs::create_with`/`update_with`,
   `crates/wheel-engine/src/api/ingress.rs::match_endpoint`).
-- **Status:** OPEN. Investigated and run-verified as a candidate root cause for the live
+- **Status:** FIXED. Investigated and run-verified as a candidate root cause for the live
   `EndpointAuth::Bearer` failure PM/Morgan reported; **ruled out** for that specific incident —
-  Morgan confirmed only one `/telegram` endpoint exists on the live board. Opening as its own
-  finding per PM's instruction, since the gap is real independent of that incident.
+  Morgan confirmed only one `/telegram` endpoint exists on the live board. Opened as its own
+  finding per PM's instruction, since the gap is real independent of that incident. sdk built the
+  fix — `check_endpoint_path_unique`, `BoardError::DuplicatePath` (409, same class as `NameTaken`)
+  at both `create_with` and `update_with` — PR #107, merged to `dev` as `831cb43`
+  (2026-09-17T02:13:54Z). Verified by ADVERSARY at review time: mutation-tested all three call
+  sites/behaviours independently (both `create_with`/`update_with` guard calls, and the by-id
+  self-exclusion on update) by disabling each in turn and confirming exactly the tests meant to
+  catch it fail while the negative-case tests stay green; `db::board` suite green afterward. Not
+  re-run for this status update — recorded as fixed on the strength of that contemporaneous
+  verification and the merge itself.
 
 ## The gap
 `validate_endpoint_path`'s own doc comment states the invariant plainly:
