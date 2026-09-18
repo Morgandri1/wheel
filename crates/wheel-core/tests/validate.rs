@@ -19,6 +19,7 @@ use wheel_core::{
     },
     AgentConfig, ChestConfig, Column, ColumnType, CtxConfig, EndpointConfig, HttpMethod, McpConfig,
     NodeConfig, ResponseMode, ScriptConfig, ScriptLanguage, TableConfig, VaultConfig,
+    MAX_VALUE_BYTES,
 };
 
 fn col(name: &str) -> Column {
@@ -328,13 +329,42 @@ fn a_system_prompt_has_a_ceiling_and_the_boundary_is_allowed() {
 
 #[test]
 fn configs_with_nothing_to_validate_are_accepted_rather_than_forgotten() {
-    // ctx and chest have no constraints today. Asserting that explicitly means
-    // adding one later breaks a test rather than passing silently.
+    // chest has no constraints today. Asserting that explicitly means adding
+    // one later breaks a test rather than passing silently.
+    assert!(validate_config(&NodeConfig::Chest(ChestConfig::default())).is_ok());
+}
+
+// --- ctx ---------------------------------------------------------------
+//
+// ADVERSARY #1: `POST /v1/cli/write` (what an agent uses) already caps a ctx
+// value at MAX_VALUE_BYTES, but `PATCH /v1/nodes/:id` -- owner-authenticated,
+// but also the route an unrelated authz bug could reach without ever
+// crossing an agent's own boundary -- had NOTHING enforcing it here, where
+// both callers actually converge (`db::board::create`/`update`). An oversized
+// ctx is re-injected into every wired agent's system prompt on every start,
+// so an unbounded one is a self-inflicted cost/DoS lever, not a
+// confidentiality gap.
+
+#[test]
+fn a_ctx_markdown_has_a_ceiling_and_the_boundary_is_allowed() {
     assert!(validate_config(&NodeConfig::Ctx(CtxConfig {
         markdown: String::new()
     }))
     .is_ok());
-    assert!(validate_config(&NodeConfig::Chest(ChestConfig::default())).is_ok());
+
+    assert!(validate_config(&NodeConfig::Ctx(CtxConfig {
+        markdown: "x".repeat(MAX_VALUE_BYTES)
+    }))
+    .is_ok());
+
+    assert_eq!(
+        validate_config(&NodeConfig::Ctx(CtxConfig {
+            markdown: "x".repeat(MAX_VALUE_BYTES + 1)
+        })),
+        Err(ConfigError::CtxTooLong {
+            max: MAX_VALUE_BYTES
+        })
+    );
 }
 
 // --- url_host --------------------------------------------------------------

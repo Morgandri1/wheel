@@ -41,7 +41,11 @@ pub async fn create(
     let project = create_project(&state, &user, body.name).await?;
     Ok((
         axum::http::StatusCode::CREATED,
-        Json(project.with_ingress_base(&state.cfg.public_base_url)),
+        Json(
+            project
+                .with_ingress_base(&state.cfg.public_base_url)
+                .with_tier(crate::auth::Tier::Admin),
+        ),
     ))
 }
 
@@ -152,18 +156,40 @@ pub(crate) async fn create_project(
     Ok(project)
 }
 
+/// Every project this principal can reach: the ones they created, and the ones they were invited
+/// to. One statement with the access rule in its `WHERE`, so the list and `load_member` cannot
+/// disagree about who can see what — a project missing from the list but reachable by id, or the
+/// reverse, is the kind of drift two queries produce.
 pub async fn list(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<Project>>> {
-    let rows: Vec<ProjectRow> = crate::db_fetch_all!(
-        &state.db,
-        "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
-         FROM projects WHERE owner_id = $1 ORDER BY created_at DESC",
-        user.id()
-    )?;
+    const SQL: &str = "SELECT p.id, p.owner_id, p.name, p.capabilities, p.status, \
+                p.created_at, p.updated_at, \
+                CASE WHEN p.owner_id = $1 THEN 'admin' ELSE m.role END AS role \
+           FROM projects p \
+           LEFT JOIN project_members m \
+             ON m.project_id = p.id AND m.user_id = $1 AND m.revoked_at IS NULL \
+          WHERE p.owner_id = $1 OR m.role IS NOT NULL \
+          ORDER BY p.created_at DESC";
+    let rows: Vec<ListedProjectRow> = crate::db_fetch_all!(&state.db, SQL, user.id())?;
     Ok(Json(
         rows.into_iter()
-            .map(|r| Project::from(r).with_ingress_base(&state.cfg.public_base_url))
+            .filter_map(|r| {
+                // A role this build cannot read is not access. Same fail-closed choice as
+                // `load_member`, applied here so the two agree about an unknown tier too.
+                crate::auth::Tier::parse(&r.role).map(|tier| {
+                    Project::from(r.project)
+                        .with_ingress_base(&state.cfg.public_base_url)
+                        .with_tier(tier)
+                })
+            })
             .collect(),
     ))
+}
+
+#[derive(sqlx::FromRow)]
+struct ListedProjectRow {
+    #[sqlx(flatten)]
+    project: ProjectRow,
+    role: String,
 }
 
 pub async fn get_one(
@@ -172,6 +198,7 @@ pub async fn get_one(
 ) -> ApiResult<Json<Project>> {
     // Reconcile the stored status against what the runtime actually reports, so a container that
     // died out from under us is not reported as running.
+    // No `require` here: reaching this handler already proved membership, and a guest may read.
     let mut project = scope.project;
     if let Ok(observed) = state.orch.status(&project.id).await {
         if observed != project.status {
@@ -179,26 +206,36 @@ pub async fn get_one(
             project.status = observed;
         }
     }
-    Ok(Json(project.with_ingress_base(&state.cfg.public_base_url)))
+    Ok(Json(
+        project
+            .with_ingress_base(&state.cfg.public_base_url)
+            .with_tier(scope.tier),
+    ))
 }
 
+/// Renaming a project is settings; toggling `capabilities.http` decides whether an unauthenticated
+/// door into the project exists at all. Both are admin — and the second is the only point where the
+/// tier system and the public ingress touch.
 pub async fn update(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    crate::auth::AdminScope(scope): crate::auth::AdminScope,
     Json(body): Json<UpdateProject>,
 ) -> ApiResult<Json<Project>> {
-    let project = update_project(&state, scope.project.id, scope.user.id(), body).await?;
-    Ok(Json(project))
+    let project = update_project(&state, scope.project.id, body).await?;
+    Ok(Json(project.with_tier(scope.tier)))
 }
 
 /// The body of [`update`], reusable by anything that needs to patch a project without going
 /// through HTTP — today that's `routes::instantiate`'s capability-patch step (§4.3 of
 /// `docs/proposals/wow-templates-instantiate-route.md`), which sends `UpdateProject { name: None,
 /// capabilities: Some(...) }` through this exact path rather than a narrower one-field query.
+/// Authorisation happened before this was called — `load_member` proved membership as a predicate
+/// and `require` proved the tier. This statement is the action, not the check, so it is keyed on
+/// the project alone: an admin who is not the creator must be able to run it, and an `owner_id`
+/// predicate here would silently no-op for them rather than refusing anyone.
 pub(crate) async fn update_project(
     state: &AppState,
     project_id: Uuid,
-    owner_id: &str,
     body: UpdateProject,
 ) -> ApiResult<Project> {
     if let Some(name) = &body.name {
@@ -210,22 +247,21 @@ pub(crate) async fn update_project(
 
     // COALESCE keeps this a single statement while leaving omitted fields untouched.
     const PG: &str = "UPDATE projects SET \
-           name = COALESCE($3, name), \
-           capabilities = COALESCE($4, capabilities), \
+           name = COALESCE($2, name), \
+           capabilities = COALESCE($3, capabilities), \
            updated_at = now() \
-         WHERE id = $1 AND owner_id = $2 \
+         WHERE id = $1 \
          RETURNING id, owner_id, name, capabilities, status, created_at, updated_at";
     const SQLITE: &str = "UPDATE projects SET \
-           name = COALESCE($3, name), \
-           capabilities = COALESCE($4, capabilities), \
+           name = COALESCE($2, name), \
+           capabilities = COALESCE($3, capabilities), \
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-         WHERE id = $1 AND owner_id = $2 \
+         WHERE id = $1 \
          RETURNING id, owner_id, name, capabilities, status, created_at, updated_at";
     let row: ProjectRow = crate::db_fetch_one!(
         &state.db,
         state.db.pick(PG, SQLITE),
         project_id,
-        owner_id,
         body.name.as_ref().map(|n| n.trim()),
         caps
     )?;
@@ -236,7 +272,8 @@ pub async fn destroy(
     State(state): State<AppState>,
     scope: ProjectScope,
 ) -> ApiResult<axum::http::StatusCode> {
-    destroy_project(&state, scope.project.id, scope.user.id()).await?;
+    scope.require(crate::auth::Tier::Admin)?;
+    destroy_project(&state, scope.project.id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -244,11 +281,7 @@ pub async fn destroy(
 /// through HTTP — today that's `routes::instantiate`'s rollback path. Same order, same
 /// never-orphan-beyond-our-knowledge guarantee: the row is deleted only if the sandbox teardown
 /// itself succeeded.
-pub(crate) async fn destroy_project(
-    state: &AppState,
-    project_id: Uuid,
-    owner_id: &str,
-) -> ApiResult<()> {
+pub(crate) async fn destroy_project(state: &AppState, project_id: Uuid) -> ApiResult<()> {
     // Tear down the runtime first. If this fails we keep the row, so the container cannot be
     // orphaned beyond our knowledge — an orphan we have no record of is an orphan nobody cleans up.
     state
@@ -257,12 +290,7 @@ pub(crate) async fn destroy_project(
         .await
         .map_err(ApiError::Internal)?;
 
-    crate::db_execute!(
-        &state.db,
-        "DELETE FROM projects WHERE id = $1 AND owner_id = $2",
-        project_id,
-        owner_id
-    )?;
+    crate::db_execute!(&state.db, "DELETE FROM projects WHERE id = $1", project_id)?;
     Ok(())
 }
 
@@ -296,7 +324,11 @@ async fn reprovision(state: &AppState, id: &Uuid) -> ApiResult<()> {
         .map_err(ApiError::Internal)
 }
 
+/// Project lifecycle is admin (operator ruling, 2026-09-11) — distinct from *agent* start/stop,
+/// which is prompter. The consequence is real and recorded in `docs/proposals/shared-projects.md`
+/// §2.2c: a prompter arriving at a stopped sandbox cannot start it, and must ask an admin.
 pub async fn start(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
+    scope.require(crate::auth::Tier::Admin)?;
     reprovision(&state, &scope.project.id).await?;
     start_and_observe(&state, &scope.project.id).await?;
     reload(&state, &scope).await
@@ -339,6 +371,7 @@ async fn start_and_observe(state: &AppState, id: &Uuid) -> ApiResult<ProjectStat
 }
 
 pub async fn stop(State(state): State<AppState>, scope: ProjectScope) -> ApiResult<Json<Project>> {
+    scope.require(crate::auth::Tier::Admin)?;
     state
         .orch
         .stop(&scope.project.id)
@@ -352,6 +385,7 @@ pub async fn restart(
     State(state): State<AppState>,
     scope: ProjectScope,
 ) -> ApiResult<Json<Project>> {
+    scope.require(crate::auth::Tier::Admin)?;
     reprovision(&state, &scope.project.id).await?;
     state
         .orch
@@ -392,11 +426,12 @@ async fn reload(state: &AppState, scope: &ProjectScope) -> ApiResult<Json<Projec
     let row: ProjectRow = crate::db_fetch_one!(
         &state.db,
         "SELECT id, owner_id, name, capabilities, status, created_at, updated_at \
-         FROM projects WHERE id = $1 AND owner_id = $2",
-        scope.project.id,
-        scope.user.id()
+         FROM projects WHERE id = $1",
+        scope.project.id
     )?;
     Ok(Json(
-        Project::from(row).with_ingress_base(&state.cfg.public_base_url),
+        Project::from(row)
+            .with_ingress_base(&state.cfg.public_base_url)
+            .with_tier(scope.tier),
     ))
 }

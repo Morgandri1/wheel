@@ -215,13 +215,16 @@ def main():
                     "the previous spawn's oauth token is still exported — replacing a "
                     "credential must not leave the old variable set")
 
-        # §5b: argv is world-readable across uids, so a credential must never be on it.
-        R.check("SEC-no-secret-in-argv",
-                not any(OAT in a or KEY in a for a in r.get("argv", [])),
-                "a credential appears in the child's argv: %r" % (r.get("argv"),))
-        R.check("AUTH-cred-config-dir",
-                bool(r.get("config", {}).get("CLAUDE_CONFIG_DIR")),
-                "CLAUDE_CONFIG_DIR is unset — per-node credential isolation depends on it")
+            # §5b: argv is world-readable across uids, so a credential must never be on it.
+            # Checked against THIS spawn's own record — reusing the OAT spawn's `r` here
+            # (a bug this once was) would re-verify argv already covered above and miss a
+            # KEY leak entirely.
+            R.check("SEC-no-secret-in-argv",
+                    not any(OAT in a or KEY in a for a in r.get("argv", [])),
+                    "a credential appears in the child's argv: %r" % (r.get("argv"),))
+            R.check("AUTH-cred-config-dir",
+                    bool(r.get("config", {}).get("CLAUDE_CONFIG_DIR")),
+                    "CLAUDE_CONFIG_DIR is unset — per-node credential isolation depends on it")
 
         # THE ENGINE NOW REFUSES A CODEX NODE (08b3492), and that is correct: Codex is M2,
         # and a node accepted-then-silently-run-as-claude is precisely the success shape an

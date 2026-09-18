@@ -64,6 +64,8 @@ pub enum ConfigError {
     StaticFillMissingValue(String),
     #[error("field {0:?} has fill mode 'vault' but vault_ref is missing or not '<vault>/<key>'")]
     BadVaultRef(String),
+    #[error("ctx markdown is too long (max {max} bytes)")]
+    CtxTooLong { max: usize },
 }
 
 pub const MAX_ENDPOINT_PATH: usize = 512;
@@ -175,7 +177,24 @@ pub fn validate_config_with(cfg: &NodeConfig, allow_hosts: &[String]) -> Result<
             }
             Ok(())
         }
-        NodeConfig::Ctx(_) => Ok(()),
+        NodeConfig::Ctx(c) => {
+            // `wheel write <ctx>` (POST /v1/cli/write) already caps this at
+            // MAX_VALUE_BYTES (`cli_routes.rs`), so the public-ingress path an
+            // agent uses is already bounded. `PATCH /v1/nodes/:id` -- owner-
+            // authenticated only, but ALSO the route an unrelated authz bug
+            // could reach without ever touching an agent's own boundary -- had
+            // no check at all. An oversized ctx is re-injected into every
+            // wired agent's system prompt on every start (§3 CLI grammar), so
+            // the failure mode here is a self-inflicted cost/DoS blowup, not a
+            // confidentiality one -- but it is enforced at the ONE place both
+            // callers already go through, so the two paths cannot drift again.
+            if c.markdown.len() > crate::MAX_VALUE_BYTES {
+                return Err(ConfigError::CtxTooLong {
+                    max: crate::MAX_VALUE_BYTES,
+                });
+            }
+            Ok(())
+        }
         NodeConfig::Table(t) => validate_table(t),
         NodeConfig::Endpoint(e) => validate_endpoint(e),
         NodeConfig::Script(s) => validate_script(s),

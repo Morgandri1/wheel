@@ -150,6 +150,13 @@ impl Sandbox for EmbeddedSandbox {
             // default. Only `wheel-host`'s cloud deployment opts into the
             // stricter policy.
             harness_auth: wheel_engine::config::HarnessAuthPolicy::default(),
+            // docs/proposals/script-execution-scope.md's gate (F007: per-node uid
+            // isolation) is unmet everywhere this binary runs too — a self-hosted
+            // board still shares one uid across every node on it. Off until that
+            // closes, same as the cloud engine's own default.
+            script_execution_enabled: std::env::var(wheel_engine::config::ENV_SCRIPT_EXEC)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         };
 
         let project = *id;

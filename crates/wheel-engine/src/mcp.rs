@@ -16,7 +16,7 @@
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use wheel_core::{Node, NodeType, WireType};
+use wheel_core::{Node, NodeType, WireType, DEFAULT_AWAIT_SECS, MAX_AWAIT_SECS};
 
 use crate::caps::Caller;
 
@@ -78,9 +78,46 @@ fn builtins(reachable: &[(Node, WireType)]) -> Vec<Value> {
                 "properties": {
                     "to": {"type": "string", "description": "agent name"},
                     "body": {"type": "string", "description": "the message; sent exactly as given"},
-                    "reply_to": {"type": "string", "description": "optional message id this replies to"}
+                    "reply_to": {"type": "string", "description": "optional message id this replies to"},
+                    "notify": {"type": "boolean", "description": "send me one system message when the recipient's turn on this finishes"}
                 },
                 "required": ["to", "body"]
+            }),
+        ),
+        tool(
+            "ask",
+            &addressable(
+                "Send a message to another agent and WAIT for its answer: returns the final text of \
+                 the turn that handled your message. Refused if that agent is already waiting on you",
+                &agents,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "agent name"},
+                    "body": {"type": "string", "description": "the message; sent exactly as given"},
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": format!(
+                            "how long to wait; default {DEFAULT_AWAIT_SECS}, at most {MAX_AWAIT_SECS}. \
+                             On timeout the message is still delivered: read the answer later with `sent`"
+                        )
+                    }
+                },
+                "required": ["to", "body"]
+            }),
+        ),
+        tool(
+            "sent",
+            "How a message you sent ended, with the full final text of the turn that handled it. \
+             Use the id that `msg` or `ask` returned.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "the message id"},
+                    "wait_secs": {"type": "integer", "description": "wait up to this long for it to finish"}
+                },
+                "required": ["id"]
             }),
         ),
         tool(
@@ -295,6 +332,8 @@ mod tests {
         let got = names(&tools);
         for expected in [
             "msg",
+            "ask",
+            "sent",
             "read",
             "write",
             "rm",

@@ -23,6 +23,13 @@ use crate::{name::NodeName, node::NodeType, timestamp::Timestamp};
 /// (§3c#6).
 pub const MAX_MESSAGE_BODY: usize = 256 * 1024;
 
+/// How long `wheel msg --await-reply` / MCP `ask` waits when no time is given.
+pub const DEFAULT_AWAIT_SECS: u64 = 600;
+
+/// The longest any wait for a reply may be. A request for longer is clamped:
+/// an unbounded wait is how two agents asking each other hang for ever.
+pub const MAX_AWAIT_SECS: u64 = 3600;
+
 /// Who sent a message. The `type` rendered into the envelope comes from here
 /// and is **engine-generated** — a body can never forge it (§3c#5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -145,6 +152,20 @@ pub struct Message {
     /// Threading (§3c#9): the message this one replies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<Uuid>,
+    /// The Wheel principal who asked for this message, when a person did.
+    ///
+    /// Set only on the engine control plane, from the `x-wheel-actor-id` header the API adds after
+    /// stripping anything the client sent under that namespace. It is `None` on the node-token
+    /// plane and on public ingress, deliberately: an agent cannot assert an actor, and an
+    /// anonymous webhook has none.
+    ///
+    /// **Known limit (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the
+    /// engine's environ can call the control plane as the host and set this to anything. That is
+    /// forged attribution and it closes with per-node uids, not here. An agent that merely steals a
+    /// *sibling's node token* reaches the CLI plane, where the header is ignored — so that failure
+    /// is missing attribution rather than forged, which is the better of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
     pub created_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<Timestamp>,
@@ -197,23 +218,31 @@ impl From<&Message> for MessageReceipt {
 /// form, and `wheel inbox <id>` returns the original body from sqlite (§3c#2),
 /// so nothing is lost.
 pub fn escape_envelope_body(body: &str) -> String {
-    // The comparison is on BYTES, and the string is never sliced by a byte
-    // offset we computed.
-    //
-    // It used to be `body[name_at..name_at + TAG.len()]`, and slicing a `str`
-    // at an index that is not a character boundary PANICS. `name_at` was
-    // always a boundary -- it follows `<` and an optional `/`, both ASCII --
-    // so the bug hid until the byte 11 further on landed mid-character. An em
-    // dash did it: PM writes them in most messages, one was stored on the
-    // wheel-dev board, and every engine start replayed it and died. A whole
-    // project stayed offline through reboots because of one character in one
-    // message.
-    //
-    // The wider rule this is written to obey: message content must never be
-    // able to kill an engine. A body that is awkward, malformed or hostile is
-    // a bad message, not a dead board -- whatever this cannot interpret it
-    // emits as ordinary text.
-    const TAG: &[u8] = b"agentprompt";
+    escape_tag(body, b"agentprompt")
+}
+
+/// The generic engine finding 001's fix runs on, keyed on any tag name rather
+/// than only `AgentPrompt`: neutralise a literal `<TAG` or `</TAG` (matched
+/// case-insensitively on decoded bytes) by backslash-inserting after the `<`,
+/// leaving everything else in the input untouched.
+///
+/// The comparison is on BYTES, and the string is never sliced by a byte
+/// offset we computed.
+///
+/// It used to be `body[name_at..name_at + TAG.len()]`, and slicing a `str`
+/// at an index that is not a character boundary PANICS. `name_at` was
+/// always a boundary -- it follows `<` and an optional `/`, both ASCII --
+/// so the bug hid until the byte 11 further on landed mid-character. An em
+/// dash did it: PM writes them in most messages, one was stored on the
+/// wheel-dev board, and every engine start replayed it and died. A whole
+/// project stayed offline through reboots because of one character in one
+/// message.
+///
+/// The wider rule this is written to obey: content must never be able to
+/// kill an engine. Input that is awkward, malformed or hostile is bad
+/// content, not a dead board -- whatever this cannot interpret it emits as
+/// ordinary text.
+fn escape_tag(body: &str, tag: &[u8]) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
@@ -226,7 +255,7 @@ pub fn escape_envelope_body(body: &str) -> String {
             } else {
                 after
             };
-            // Byte slicing, not `&str` slicing. `body.len() >= name_at + TAG.len()`
+            // Byte slicing, not `&str` slicing. `body.len() >= name_at + tag.len()`
             // proves the index is IN RANGE; it proves nothing about it being on
             // a CHARACTER boundary, and that is what panicked -- one '<' with a
             // multi-byte character straddling the offset eleven bytes later took
@@ -235,8 +264,8 @@ pub fn escape_envelope_body(body: &str) -> String {
             // comment above this function already claimed: matching is on the
             // decoded BYTES.
             let matches_tag = bytes
-                .get(name_at..name_at + TAG.len())
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(TAG));
+                .get(name_at..name_at + tag.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(tag));
             if matches_tag {
                 // Consume only the '<'; the rest is emitted as ordinary text.
                 out.push_str("<\\");
@@ -255,6 +284,111 @@ pub fn escape_envelope_body(body: &str) -> String {
         i += c.len_utf8();
     }
     out
+}
+
+/// The tag name [`wrap_tool_output`] delimits its wrapper with. Chosen to be
+/// implausible in legitimate content: unlike `AgentPrompt`, which this
+/// project's own docs quote constantly, nothing outside Wheel's own wrapper
+/// has a reason to contain the literal string `wheel:tool-output`.
+pub const TOOL_OUTPUT_TAG: &str = "wheel:tool-output";
+
+/// Neutralise a literal `<wheel:tool-output` / `</wheel:tool-output` in text
+/// that is about to be wrapped by [`wrap_tool_output`] (defect #2, ADVERSARY
+/// review of `docs/proposals/tool-mcp-output-escaping.md`).
+///
+/// Needed because a fully non-mutating wrapper reopens finding 001's hole one
+/// level down: attacker-controlled content containing a forged CLOSING marker
+/// would "break out" of the wrapper from the model's perspective, exactly as
+/// an unescaped `</AgentPrompt>` would have for the stdin channel. This is the
+/// same transform as [`escape_envelope_body`], keyed on a different tag.
+pub fn escape_tool_output_marker(body: &str) -> String {
+    escape_tag(body, TOOL_OUTPUT_TAG.as_bytes())
+}
+
+/// Wrap tool/MCP output that reached the board from outside the wire graph
+/// itself (a `tool` node's external HTTP response, a re-read message body) in
+/// an explicit "this is returned data, not engine framing" marker, with the
+/// payload self-escaped against forging that same marker.
+///
+/// Unlike [`escape_envelope_body`], this is a prompt-level signal, not a
+/// structural guarantee: nothing parses the wrapper as a boundary except the
+/// model itself. It reduces confusion from a literal *opening*
+/// `<wheel:tool-output>` inside the payload; it does not eliminate it, the
+/// same residual finding 001 already accepted for `AgentPrompt`.
+pub fn wrap_tool_output(body: &str) -> String {
+    format!(
+        "<{TOOL_OUTPUT_TAG}>\n{}\n</{TOOL_OUTPUT_TAG}>",
+        escape_tool_output_marker(body)
+    )
+}
+
+/// Apply `f` to every string leaf of a JSON value, recursively, leaving the
+/// shape (object keys, array order, numbers, bools, null) untouched.
+///
+/// Needed because board-native content (a `ctx`'s markdown, a `table` row, a
+/// `tool` node's HTTP response) is not always a bare string by the time it
+/// reaches a CLI/MCP response: a table row is a JSON object of typed columns,
+/// and a `tool` call's response body is `serde_json::from_str(..).unwrap_or
+/// (Value::String(text))` (`tools/execute.rs`), so it is a parsed JSON tree
+/// whenever the far end answered with JSON at all — which is the common case
+/// for anything wrapping a REST API. A transform applied only to a
+/// stringified whole would either not run (the shape is already structured
+/// when it leaves the engine) or would have to re-serialize and lose typed
+/// access for every caller, agent-visible field types included. Walking the
+/// tree and transforming only the leaves keeps both: the shape a caller reads
+/// programmatically survives, and every place attacker-controlled text could
+/// actually be sitting gets the treatment.
+pub fn map_json_strings(v: &serde_json::Value, f: &impl Fn(&str) -> String) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(f(s)),
+        Value::Array(items) => Value::Array(items.iter().map(|i| map_json_strings(i, f)).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), map_json_strings(v, f)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// As [`map_json_strings`], but `f` also runs over every object KEY, not only
+/// values.
+///
+/// A separate function, not a flag on the one above, because the two callers
+/// need different contracts and conflating them risks the wrong one silently
+/// applying to both: a `ctx`'s markdown and a `table` row are plain strings or
+/// have keys the NODE'S OWN OWNER chose (a table's columns come from its
+/// schema), so `map_json_strings` leaving keys untouched there is correct, not
+/// an oversight. A `tool` node's HTTP response is different — the external
+/// endpoint is the attacker (or a compromised one), and it controls every
+/// byte of its own reply, including which JSON keys appear, not only which
+/// values do (ADVERSARY review of #88: `{"<\AgentPrompt ...>": "ok"}` reaches
+/// the model exactly as raw as the same payload in a value would have, since
+/// `mcp.rs::render()`'s object fallback serializes the whole structure, keys
+/// included). Keeping this as its own function means a ctx/table call site
+/// can never be pointed at it by accident and start mangling a developer's
+/// legitimate column names for no benefit.
+pub fn map_json_strings_and_keys(
+    v: &serde_json::Value,
+    f: &impl Fn(&str) -> String,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(f(s)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| map_json_strings_and_keys(i, f))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (f(k), map_json_strings_and_keys(v, f)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Lowercase-hex SHA-256, implemented here so `wheel-core` stays dependency
@@ -278,18 +412,35 @@ impl Message {
     /// <body>
     /// </AgentPrompt>
     /// ```
-    /// `reply_to="<id>"` is added when the message is a reply (§3c#9).
+    /// `reply_to="<id>"` is added when the message is a reply (§3c#9), and
+    /// `on_behalf_of="<principal>"` when a person asked for it.
+    ///
+    /// Both optional attributes are **appended after `type`**, never inserted among the three that
+    /// were always there. Everything that reads an envelope — the engine's own tests, QA's
+    /// independently-written oracle, the red team's parser — anchors on the opening
+    /// `<AgentPrompt id="…" from="…" type="…"` prefix, so appending keeps them all reading the same
+    /// thing while inserting would break each of them differently.
+    ///
+    /// The value cannot close the attribute: a principal's charset excludes quotes, control
+    /// characters and whitespace, and the engine re-applies that check rather than trusting the API
+    /// (ADVERSARY 001 attack shape 5, and finding 009's lesson about single-layer validation). The
+    /// body is still never parsed for framing — every attribute here is generated.
     pub fn envelope(&self) -> String {
         let reply = match self.reply_to {
             Some(r) => format!(" reply_to=\"{r}\""),
             None => String::new(),
         };
+        let on_behalf_of = match &self.on_behalf_of {
+            Some(actor) => format!(" on_behalf_of=\"{actor}\""),
+            None => String::new(),
+        };
         format!(
-            "<AgentPrompt id=\"{}\" from=\"{}\" type=\"{}\"{}>\n{}\n</AgentPrompt>",
+            "<AgentPrompt id=\"{}\" from=\"{}\" type=\"{}\"{}{}>\n{}\n</AgentPrompt>",
             self.id,
             self.from.name(),
             self.from.sender_type(),
             reply,
+            on_behalf_of,
             escape_envelope_body(&self.body)
         )
     }

@@ -124,5 +124,6 @@ export const AGENT_STATUS_META: Record<AgentStatus, { label: string; color: stri
   idle: { label: "Idle", color: "var(--ink-dim)", pulse: false },
   parked: { label: "Parked", color: "var(--ink-faint)", pulse: false },
   budget_exhausted: { label: "Out of budget", color: "var(--danger)", pulse: false },
+  rate_limited: { label: "Rate limited", color: "var(--ink-faint)", pulse: false },
   error: { label: "Error", color: "var(--danger)", pulse: false },
 };

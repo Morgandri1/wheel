@@ -48,6 +48,14 @@ pub enum ApiError {
     #[error("the host is out of disk")]
     InsufficientStorage,
 
+    /// We are refusing to take on more of something, and the caller should try again shortly.
+    ///
+    /// Distinct from `RateLimited`: that is a rate, this is a concurrency ceiling. A client at a
+    /// live-connection cap should retry when one closes, not back off a fixed window — and distinct
+    /// from `BadGateway`, because nothing upstream is wrong.
+    #[error("temporarily unavailable")]
+    ServiceUnavailable(&'static str),
+
     /// The engine answered an ingress request with a bodiless 404: it has no `/ingress/*` route at
     /// all. A blank 404 is indistinguishable from a mistyped path, which is exactly the confusion
     /// this replaces.
@@ -60,6 +68,14 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// What a client is told. The MCP server reports a refusal inside a
+    /// successful JSON-RPC response (a tool error the model can act on), so it
+    /// needs the same words the HTTP body would have carried — including
+    /// `NotFound`'s deliberately uninformative one.
+    pub fn message(&self) -> String {
+        self.parts().2
+    }
+
     fn parts(&self) -> (StatusCode, &'static str, String) {
         match self {
             // Note the message: it does not distinguish "no token" from "bad token" from
@@ -108,6 +124,11 @@ impl ApiError {
                  again."
                     .into(),
             ),
+            ApiError::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "This project has too many live connections. Try again shortly.".into(),
+            ),
             ApiError::IngressUnavailable => (
                 StatusCode::NOT_IMPLEMENTED,
                 "ingress_unavailable",
@@ -134,6 +155,9 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(why) => tracing::debug!(reason = why, "auth rejected"),
             ApiError::Forbidden(why) => tracing::debug!(reason = why, "forbidden"),
             ApiError::BadGateway(why) => tracing::warn!(reason = why, "upstream unavailable"),
+            ApiError::ServiceUnavailable(why) => {
+                tracing::warn!(reason = why, "refused: at capacity")
+            }
             _ => tracing::debug!(code, "request rejected"),
         }
 

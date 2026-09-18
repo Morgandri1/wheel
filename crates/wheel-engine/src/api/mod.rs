@@ -11,6 +11,10 @@
 //!
 //! Keeping them disjoint is the point: a child process that somehow reached the
 //! control-plane port still cannot use its own token there.
+//!
+//! The realms also decide attribution: `x-wheel-actor-id` is read on `/v1/*` and
+//! ignored everywhere else, so an agent cannot claim to be acting for a person.
+//! See [`actor`].
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +32,7 @@ use wheel_core::{ErrorBody, NodeConfig, NodeName, Position};
 
 use crate::{config::Config, db};
 
+pub mod actor;
 pub mod agent_routes;
 pub mod board_routes;
 pub mod builder_routes;
@@ -35,6 +40,7 @@ pub mod cli_routes;
 mod engine_routes;
 pub mod events_route;
 pub mod ingress;
+pub mod script_routes;
 mod table_routes;
 pub mod tool_routes;
 pub mod vault_routes;
@@ -128,6 +134,7 @@ impl From<db::board::BoardError> for ApiError {
             // and the message says which character and what to use instead --
             // so it is the caller's to fix, not an internal fault.
             B::Storage(m) => ApiError::invalid(m),
+            B::Fallback(m) => ApiError::invalid(m),
         }
     }
 }
@@ -180,11 +187,19 @@ pub fn router(state: AppState) -> Router {
             "/nodes/{id}",
             axum::routing::patch(board_routes::patch_node).delete(board_routes::delete_node),
         )
+        // The narrow content door: a prompter writes ctx content here, while the general node
+        // patch above stays admin. See `board_routes::put_content` for why it is a separate path
+        // rather than a condition on the patch.
+        .route(
+            "/nodes/{id}/content",
+            axum::routing::put(board_routes::put_content),
+        )
         .route("/wires", post(board_routes::add_wire))
         .route("/wires", delete(board_routes::remove_wire))
         .route("/agents/{id}/start", post(agent_routes::start))
         .route("/agents/{id}/stop", post(agent_routes::stop))
         .route("/agents/{id}/restart", post(agent_routes::restart))
+        .route("/agents/{id}/interrupt", post(agent_routes::interrupt))
         .route("/agents/{id}/clear", post(agent_routes::clear))
         .route("/agents/{id}/send", post(agent_routes::send))
         .route("/agents/{id}/log", get(agent_routes::log))
@@ -220,6 +235,7 @@ pub fn router(state: AppState) -> Router {
                 .put(builder_routes::credential_put)
                 .delete(builder_routes::credential_delete),
         )
+        .route("/scripts/{id}/run", post(script_routes::run))
         .route("/events", get(events_route::events_ws))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -240,6 +256,7 @@ pub fn router(state: AppState) -> Router {
         .route("/secret/keys", get(cli_routes::secret_keys))
         .route("/write", post(cli_routes::write))
         .route("/msg", post(cli_routes::msg))
+        .route("/sent", get(cli_routes::sent))
         .route("/inbox", get(cli_routes::inbox))
         .route("/rm", post(cli_routes::rm))
         .route("/query", post(cli_routes::query))
@@ -342,30 +359,40 @@ fn stalled_agents(
         .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(String::from))
         .collect();
 
+    let now = time::OffsetDateTime::now_utc();
     out.extend(
         crate::db::messages::agents_with_work_older_than(conn, deadline_secs)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(agent, _)| {
-            // Transitional agents are 041's business, and an agent that is
-            // parked, stopped, unauthenticated or out of budget is not FAILING
-            // to deliver — it is not delivering, which is a different thing and
-            // not a fault to report.
-            !matches!(
-                crate::db::board::agent_state(conn, *agent)
-                    .unwrap_or_default()
-                    .status,
-                wheel_core::AgentStatus::Starting
-                    | wheel_core::AgentStatus::Parked
-                    | wheel_core::AgentStatus::Stopped
-                    | wheel_core::AgentStatus::NeedsAuth
-                    | wheel_core::AgentStatus::BudgetExhausted
-            )
-        })
-        .filter(|(agent, _)| !wedged.contains(&agent.to_string()))
-        .map(|(agent, n)| {
-            serde_json::json!({ "agent": agent, "queued": n, "reason": "queued longer than the deadline" })
-        }),
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(agent, _)| !wedged.contains(&agent.to_string()))
+            .filter_map(|(agent, n)| {
+                use wheel_core::AgentStatus as S;
+                let state = crate::db::board::agent_state(conn, agent).unwrap_or_default();
+                let reason = match state.status {
+                    // Transitional agents are 041's business, and an agent that is
+                    // parked, stopped, unauthenticated or out of budget is not FAILING
+                    // to deliver — it is not delivering, which is a different thing and
+                    // not a fault to report.
+                    S::Starting | S::Parked | S::Stopped | S::NeedsAuth | S::BudgetExhausted => {
+                        return None
+                    }
+                    // Waiting for its usage window, not failing to deliver --
+                    // until the time it said it would be back has passed by
+                    // more than the deadline, which means its timer was lost.
+                    // The same predicate the resume path is tested against.
+                    S::RateLimited => {
+                        let overdue = state.resume_at.is_some_and(|t| {
+                            (now - t.into_inner()).whole_seconds() > deadline_secs
+                        });
+                        if !overdue {
+                            return None;
+                        }
+                        "rate-limited past its resume time"
+                    }
+                    _ => "queued longer than the deadline",
+                };
+                Some(serde_json::json!({ "agent": agent, "queued": n, "reason": reason }))
+            }),
     );
     out
 }
@@ -453,6 +480,9 @@ pub(crate) fn test_state_with(
         tool_allow_hosts: Vec::new(),
         startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
         harness_auth,
+        // The runtime is buildable and testable ahead of F007 (docs/proposals/
+        // script-execution-scope.md); only PRODUCTION defaults this off.
+        script_execution_enabled: true,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());
@@ -565,6 +595,7 @@ mod tests {
                 id,
                 "work".into(),
                 None,
+                None,
             )
             .unwrap()
         };
@@ -642,6 +673,61 @@ mod tests {
             !alive.contains(&wedged.to_string()),
             "a delivered message on a LIVE agent is a turn in progress, not a wedge"
         );
+    }
+
+    /// A rate-limited agent is WAITING, and naming it would cry wolf -- until
+    /// the time it said it would be back has passed by more than the deadline.
+    /// Then its timer was lost, and that is exactly what the report is for.
+    #[test]
+    fn a_rate_limited_agent_is_waiting_until_it_is_overdue() {
+        let conn = crate::db::open_memory().unwrap();
+        let agent = |name: &str| {
+            let n = wheel_core::Node::new(
+                uuid::Uuid::new_v4(),
+                name.parse().unwrap(),
+                wheel_core::Position::default(),
+                wheel_core::NodeConfig::Agent(wheel_core::AgentConfig::default()),
+            );
+            crate::db::board::create(&conn, &n).unwrap();
+            crate::db::messages::enqueue(
+                &conn,
+                wheel_core::MessageSender::User,
+                n.id,
+                "work".into(),
+                None,
+                None,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at = datetime('now', '-600 seconds') WHERE to_id = ?1",
+                [n.id.to_string()],
+            )
+            .unwrap();
+            n.id
+        };
+        let at = |secs: i64| {
+            wheel_core::Timestamp::from(
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(secs),
+            )
+        };
+        let waiting = agent("waiting");
+        crate::db::board::set_rate_limited(&conn, waiting, None, at(3600), "closed");
+        let just_due = agent("just-due");
+        crate::db::board::set_rate_limited(&conn, just_due, None, at(-30), "closed");
+        let overdue = agent("overdue");
+        crate::db::board::set_rate_limited(&conn, overdue, None, at(-600), "closed");
+
+        let report = stalled_agents(&conn, 60, &Default::default());
+        let named: Vec<String> = report
+            .iter()
+            .filter_map(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string))
+            .collect();
+        assert_eq!(
+            named,
+            vec![overdue.to_string()],
+            "only the agent whose resume time is well past may be named"
+        );
+        assert_eq!(report[0]["reason"], "rate-limited past its resume time");
     }
 
     /// The engine must be able to say what code it IS.
@@ -731,6 +817,7 @@ mod tests {
             "/secret",
             "/write",
             "/msg",
+            "/sent",
             "/inbox",
             "/rm",
             "/query",

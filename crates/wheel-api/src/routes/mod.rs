@@ -4,6 +4,8 @@ pub mod builder;
 pub mod health;
 pub mod ingress;
 pub mod instantiate;
+pub mod mcp;
+pub mod members;
 pub mod projects;
 pub mod proxy;
 pub mod tokens;

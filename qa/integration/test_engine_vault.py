@@ -42,16 +42,25 @@ CANARY = "VAULT-CANARY-d41d8cd98f00b204e9800998ecf8427e"
 # Written to a ctx node in the clear, as the positive control for the at-rest scan.
 PLAIN_CANARY = "PLAINTEXT-CONTROL-59e6f1c0a7b34d28"
 KEY = "STRIPE_KEY"
+# ADVERSARY F1 / PR #70: GET /v1/board now redacts a vault's key names below
+# admin (multiplayer tiers). This suite calls the engine directly, the way an
+# operator/project-owner request actually looks once the API attaches a
+# verified tier -- so the two assertions that check key NAMES are still
+# listed need to say so explicitly, or they get the new fail-closed-to-guest
+# default and see a redacted board instead of a broken one.
+ADMIN = {"x-wheel-actor-tier": "admin"}
 
 
 def sh(*a, **kw):
     return subprocess.run(a, capture_output=True, text=True, **kw)
 
 
-def http(method, path, body=None, token=SECRET):
+def http(method, path, body=None, token=SECRET, headers=None):
     import urllib.error, urllib.request
     r = urllib.request.Request(BASE + path, method=method)
     r.add_header("Authorization", "Bearer " + token)
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -244,7 +253,7 @@ def main():
                         "SEC-vault-env-scope/wired", "SEC-vault-env-scope/unwired",
                         "SEC-vault-not-in-transcript", "SEC-vault-never-read/log"):
                 R.skip(tid, why)
-            st, board = http("GET", "/v1/board")
+            st, board = http("GET", "/v1/board", headers=ADMIN)
             R.check("SEC-vault-keys-are-names", KEY in json.dumps(board),
                     "the key NAME should be listed even before values can be written")
             return R.report("engine-vault")
@@ -261,7 +270,7 @@ def main():
         R.check("SEC-vault-write-only", st in (404, 405),
                 "GET on a vault key answered %s — the only way in must be PUT" % st)
 
-        st, board = http("GET", "/v1/board")
+        st, board = http("GET", "/v1/board", headers=ADMIN)
         board_txt = json.dumps(board)
         R.check("SEC-vault-never-read/board", CANARY not in board_txt,
                 "the value is in GET /v1/board")

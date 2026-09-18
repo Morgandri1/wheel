@@ -118,16 +118,20 @@ impl DockerSandbox {
         let host_config = bollard::models::HostConfig {
             // Least privilege. A tenant's agents run arbitrary code by design, so the container is
             // treated as hostile: hard resource caps so one project cannot starve the machine every
-            // other tenant shares, and every capability dropped except the two below.
+            // other tenant shares, and every capability dropped, NONE added back.
+            //
+            // F007 (per-node uid isolation, docs/proposals/script-execution-scope.md) is NOT YET
+            // IMPLEMENTED: `child_command` (wheel-engine/src/supervisor/mod.rs) clears a child's
+            // environment but never calls setuid/setgid or `pre_exec` anywhere in the engine, so
+            // every child on a project still runs as the container's own uid. An earlier version of
+            // this comment claimed the engine "drops each child to its own per-node uid" and granted
+            // CAP_SETUID/CAP_SETGID on that basis — false, and the grant was accordingly unused
+            // capability surface on a container that treats its own tenant as hostile. Tracked M2:
+            // add the grant back IN THE SAME COMMIT that lands the setuid/setgid calls, not before.
             cap_drop: Some(vec!["ALL".into()]),
-            // ADVERSARY ruling F007: the engine drops each child to its own per-node uid, which
-            // needs exactly these two and nothing else. Granting CAP_SETUID/CAP_SETGID rather than
-            // running the engine as unconstrained root is the whole point of the finding — the
-            // engine can change a child's uid and can do nothing else privileged.
-            cap_add: Some(vec!["SETUID".into(), "SETGID".into()]),
-            // Compatible with the above: no_new_privs blocks privilege *gain* through execve
-            // (setuid bits, file capabilities); it does not revoke a capability the process
-            // already holds, so per-child setuid still works.
+            // Compatible with the (currently empty) capability set above: no_new_privs blocks
+            // privilege *gain* through execve (setuid bits, file capabilities) regardless of what,
+            // if anything, is granted.
             security_opt: Some(vec!["no-new-privileges".into()]),
             memory: Some(self.cfg.memory_bytes),
             nano_cpus: Some(self.cfg.nano_cpus),

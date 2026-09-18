@@ -50,6 +50,11 @@ pub struct Project {
     /// `PUBLIC_BASE_URL` rather than stored, so it stays correct if the deployment moves.
     /// Populated at the response boundary by `with_ingress_base`.
     pub ingress_base_url: String,
+    /// The *calling* principal's tier in this project. A property of the request, not of the row,
+    /// so it is filled in at the response boundary like `ingress_base_url` and is absent wherever
+    /// there is no caller to speak of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<crate::auth::Tier>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -59,6 +64,13 @@ impl Project {
     /// public base URL is deployment configuration, not a property of the row.
     pub fn with_ingress_base(mut self, public_base_url: &str) -> Self {
         self.ingress_base_url = format!("{}/p/{}", public_base_url.trim_end_matches('/'), self.id);
+        self
+    }
+
+    /// Record what the caller may do here, so a client can render the right controls rather than
+    /// discovering its tier by being refused.
+    pub fn with_tier(mut self, tier: crate::auth::Tier) -> Self {
+        self.tier = Some(tier);
         self
     }
 }
@@ -85,6 +97,7 @@ impl From<ProjectRow> for Project {
             // not default to open.
             capabilities: serde_json::from_value(r.capabilities).unwrap_or_default(),
             ingress_base_url: String::new(),
+            tier: None,
             status: match r.status.as_str() {
                 "starting" => ProjectStatus::Starting,
                 "running" => ProjectStatus::Running,

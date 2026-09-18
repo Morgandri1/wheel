@@ -146,7 +146,12 @@ pub fn credential_detail(
         ],
         wheel_core::Harness::Codex => &["CODEX_API_KEY"],
     };
+    // The account an agent normally runs as, so not its standby.
+    let standby = fallback_vault(conn, agent)?.map(|(id, _)| id);
     for (id, name) in wired_vaults(conn, agent)? {
+        if Some(id) == standby {
+            continue;
+        }
         // STORED values only, not declared keys. A vault that lists
         // ANTHROPIC_API_KEY in its config but holds no value for it supplies
         // nothing: reporting it as a credential tells the operator the agent
@@ -447,21 +452,32 @@ pub fn env_for_agent(
             let Some(v) = get(conn, vk, id, &key)? else {
                 continue;
             };
-            if key == wheel_core::CLAUDE_OAUTH_SESSION {
-                // The access token only. The refresh token stays with the
-                // engine: a child that held it would be a second refresher
-                // racing the first for a single-use token.
-                let session = crate::auth::OauthSession::from_vault_value(&v)?;
-                let token = session
-                    .access_token()
-                    .ok_or_else(|| anyhow::anyhow!("the stored login has no access token"))?;
-                env.push((slot(&key).to_string(), token.to_string()));
-            } else {
-                env.push((key, v));
-            }
+            env.push(env_pair(&key, v)?);
         }
     }
     Ok(env)
+}
+
+/// Turn one stored `(key, value)` into what actually reaches a child's
+/// environment. Shared by every spawn-env builder so the OAuth-session
+/// unpacking cannot re-diverge between them — `env_for_spawn` shipped without
+/// it once already, exporting a raw `CLAUDE_OAUTH_SESSION` (the whole stored
+/// session JSON, refresh token included) instead of the access token under
+/// `CLAUDE_CODE_OAUTH_TOKEN`, which every vault-authenticated spawn on that
+/// path silently failed to log in with (QA, tracing the refresh.rs hangs).
+fn env_pair(key: &str, value: String) -> Result<(String, String)> {
+    if key == wheel_core::CLAUDE_OAUTH_SESSION {
+        // The access token only. The refresh token stays with the engine: a
+        // child that held it would be a second refresher racing the first
+        // for a single-use token.
+        let session = crate::auth::OauthSession::from_vault_value(&value)?;
+        let token = session
+            .access_token()
+            .ok_or_else(|| anyhow::anyhow!("the stored login has no access token"))?;
+        Ok((slot(key).to_string(), token.to_string()))
+    } else {
+        Ok((key.to_string(), value))
+    }
 }
 
 /// Milliseconds since the epoch, as the credential stores speak, to the
@@ -535,6 +551,88 @@ pub fn replace_session_if(
         next.expires_at().and_then(millis_to_timestamp),
     )?;
     Ok(true)
+}
+
+/// Why `vault` cannot be `agent`'s `fallback_vault`, if it cannot.
+///
+/// It must be a vault the agent ALREADY reads. That is what keeps a fallback
+/// from widening anything: with the read wire the agent can already
+/// `wheel secret get` every value in it.
+pub fn check_fallback(conn: &Connection, agent: Uuid, vault: Uuid) -> Result<(), String> {
+    let Some(node) = board::get(conn, vault).map_err(|e| e.to_string())? else {
+        return Err(format!(
+            "fallback_vault {vault} is not a node on this board"
+        ));
+    };
+    if node.node_type() != NodeType::Vault {
+        return Err(format!(
+            "fallback_vault {} is {} {} node, not a vault",
+            node.name,
+            node.node_type().article(),
+            node.node_type()
+        ));
+    }
+    let wired = board::wires_from(conn, agent)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|w| w.to == vault && w.wire_type == WireType::Read);
+    if !wired {
+        return Err(format!(
+            "fallback_vault {} must be a vault this agent already has a read wire to; \
+             wire it first, then set fallback_vault",
+            node.name
+        ));
+    }
+    Ok(())
+}
+
+/// The agent's fallback vault as (id, name), if it has one AND still reads it.
+///
+/// The spawn-time half of [`check_fallback`]: config time is one door, and a
+/// wire removed afterwards walks straight past it.
+pub fn fallback_vault(conn: &Connection, agent: Uuid) -> Result<Option<(Uuid, String)>> {
+    let Some(vault) =
+        board::get(conn, agent)?.and_then(|n| n.config.as_agent().and_then(|a| a.fallback_vault))
+    else {
+        return Ok(None);
+    };
+    if check_fallback(conn, agent, vault).is_err() {
+        return Ok(None);
+    }
+    Ok(board::get(conn, vault)?.map(|n| (n.id, n.name.to_string())))
+}
+
+/// The environment one spawn gets from its wired vaults, with the credential
+/// half chosen by which account this spawn runs as.
+///
+/// Only CREDENTIAL keys are switched; every other key is exported as
+/// [`env_for_agent`] would. A normal spawn withholds the fallback vault's
+/// credentials, or the harness would pick between two accounts by its own
+/// precedence. A fallback spawn exports ONLY the fallback vault's credentials.
+/// The ambiguity rule runs first and is unchanged.
+pub fn env_for_spawn(
+    conn: &Connection,
+    vk: &VaultKey,
+    agent: Uuid,
+    fallback: Option<Uuid>,
+    use_fallback: bool,
+) -> Result<Vec<(String, String)>> {
+    if let Some(a) = find_ambiguity(conn, agent, None)? {
+        bail!(a);
+    }
+    let mut env = Vec::new();
+    for (id, _) in wired_vaults(conn, agent)? {
+        let is_fallback = Some(id) == fallback;
+        for key in list_keys(conn, id)? {
+            if wheel_core::is_credential_key(&key) && is_fallback != use_fallback {
+                continue;
+            }
+            if let Some(v) = get(conn, vk, id, &key)? {
+                env.push(env_pair(&key, v)?);
+            }
+        }
+    }
+    Ok(env)
 }
 
 /// Blank out any secret that appears in a line bound for a log or transcript.
@@ -1187,6 +1285,49 @@ mod tests {
         );
         assert_eq!(session_vault_for(&c, a.id).unwrap(), Some(v.id));
         assert_eq!(session_vaults(&c).unwrap(), vec![v.id]);
+    }
+
+    /// QA, tracing the refresh.rs test hangs to their root cause: `env_for_spawn` is the function
+    /// every REAL spawn actually calls (`supervisor/mod.rs`'s `self.vault_key` branch), and it
+    /// shipped without `env_for_agent`'s OAuth-session unpacking -- a vault-stored login reached the
+    /// child as a raw `CLAUDE_OAUTH_SESSION` env var (the whole session JSON, refresh token
+    /// included) instead of the access token under `CLAUDE_CODE_OAUTH_TOKEN`. The harness found no
+    /// usable token, reported "please run /login", and the engine correctly (but permanently, since
+    /// nothing was ever actually wrong with the login) parked the agent on `NeedsAuth`.
+    ///
+    /// Same property as `a_vaulted_login_reaches_a_child_as_its_access_token_only`, on the function
+    /// that actually ships to a real child. Mutation-checked: reverting `env_for_spawn` to push
+    /// `(key, v)` directly (its shape before this fix) makes this fail with the raw session JSON
+    /// under the literal key `CLAUDE_OAUTH_SESSION` instead of the token under
+    /// `CLAUDE_CODE_OAUTH_TOKEN`.
+    #[test]
+    fn a_real_spawns_env_unpacks_the_oauth_session_too() {
+        let c = crate::db::open_memory().unwrap();
+        let v = vault("creds", &[]);
+        let a = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        board::create(&c, &v).unwrap();
+        board::create(&c, &a).unwrap();
+        board::add_wire(&c, a.id, v.id, WireType::Read, None).unwrap();
+        put_session(
+            &c,
+            v.id,
+            &session("sk-ant-oat01-access", "sk-ant-ort01-refresh"),
+        );
+
+        let env = env_for_spawn(&c, &key(), a.id, None, false).unwrap();
+        assert_eq!(
+            env,
+            vec![(
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "sk-ant-oat01-access".to_string()
+            )],
+            "a real spawn must see the unpacked access token, not the raw session: {env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, v)| v.contains("sk-ant-ort") || k == wheel_core::CLAUDE_OAUTH_SESSION),
+            "the refresh token must never be exported: {env:?}"
+        );
     }
 
     /// The login and a bare token are the same variable in the child, so two

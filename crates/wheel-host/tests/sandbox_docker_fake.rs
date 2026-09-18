@@ -216,7 +216,11 @@ async fn the_container_we_ask_for_is_the_locked_down_one() {
     let host = &body["HostConfig"];
 
     assert_eq!(host["CapDrop"], serde_json::json!(["ALL"]));
-    assert_eq!(host["CapAdd"], serde_json::json!(["SETUID", "SETGID"]));
+    // No capability is added back. F007 (per-node uid isolation) is not yet implemented -- nothing
+    // in the engine calls setuid/setgid -- so granting SETUID/SETGID here would be capability
+    // surface on a hostile container with no code that uses it. Add it back in the same commit that
+    // lands the setuid/setgid calls.
+    assert_eq!(host["CapAdd"], serde_json::Value::Null);
     assert_eq!(
         host["SecurityOpt"],
         serde_json::json!(["no-new-privileges"])

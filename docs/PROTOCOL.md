@@ -23,7 +23,7 @@ too — this is the index, not the only warning.
 
 | Capability | State today | Milestone |
 |---|---|---|
-| `script` nodes — execution | Types, validation, wire matrix and the capability gate are all done. There is no runtime, no `POST /v1/cli/run`, and **no `wheel run` subcommand** (it exits 1, "unknown command"). The agent preamble already advertises it, so agents will try it and fail. | M2 |
+| `script` nodes — execution | The runtime and an operator-only route (`POST /v1/scripts/:id/run`) exist but are **gated off by default** (`WHEEL_SCRIPT_EXEC`) pending F007 — see § Script nodes. The AGENT-facing half is still entirely missing: no `POST /v1/cli/run`, and **no `wheel run` subcommand** (it exits 1, "unknown command"). The agent preamble already advertises it, so agents will try it and fail. | M2 |
 | `chest` nodes — blob storage | Types, key normalisation and the sqlite index table exist; no blob I/O, no `/v1/chests/*` routes. All four CLI verbs answer an honest 400. | M2 |
 | `mcp` nodes — per-node servers | `McpConfig` is validated and stored, but wiring `agent → mcp` attaches nothing to the harness. It is accepted and silently does nothing. The `--mcp-config` the engine passes is the built-in `wheel mcp-serve` server, unrelated to these nodes. | M2 |
 | Size ceilings for the two above | `MAX_BLOB_BYTES` and `MAX_SCRIPT_OUTPUT_BYTES` are constants with no call sites. | with the above |
@@ -89,6 +89,9 @@ stalled and each is a healthy one that a naive check would flag:
   - **starting / parked / stopped / needs_auth / budget_exhausted** — not failing
     to deliver, just not delivering. `starting` is judged by the startup deadline
     instead, so the two do not disagree.
+  - **rate_limited** — waiting for its usage window (§5c), until its own `resume_at`
+    has passed by more than the deadline. Then its resume timer was lost, and it is
+    named with reason `rate-limited past its resume time`.
 A stall report that names healthy agents is one an operator learns to ignore,
 which is the failure it exists to prevent.
 
@@ -167,7 +170,7 @@ a `400`, not an ignored key: check `features` first.
 
 | Feature id | What it guarantees |
 |---|---|
-| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id` |
+| `board` | `GET /v1/board`, `POST /v1/nodes`, `PATCH`/`DELETE /v1/nodes/:id`, `PUT /v1/nodes/:id/content` |
 | `wires` | `POST`/`DELETE /v1/wires` |
 | `messages` | `POST /v1/agents/:id/send` |
 | `inbox` | `GET /v1/agents/:id/inbox`, `GET /v1/agents/:id/inbox/:message_id` |
@@ -181,6 +184,11 @@ a `400`, not an ignored key: check `features` first.
 | `oauth_paste_code` | `POST /v1/agents/:id/auth/begin` answering `paste_code`, then `POST /v1/agents/:id/auth/complete`. Headless by construction: the engine never opens a browser, the client shows the URL and posts the code back. **Absent on a `WHEEL_HARNESS_AUTH=api-key-only` deployment**, where both routes answer `403 policy_denied` |
 | `builder` | `POST /v1/builder/turns` (the Workflow Builder conversation, Server-Sent Events) and `GET`/`PUT`/`DELETE /v1/builder/credential` |
 | `oauth_refresh` | The engine RENEWS a vault-held claude.ai login before it expires, so an 8-hour token does not become an 8-hour board. `GET /v1/agents/:id/auth` reports `refreshable: true`, the `expires_at` of the current token, and a `warning` when the last renewal failed. **Absent on `api-key-only`** |
+| `interrupt` | `POST /v1/agents/:id/interrupt` exists on this build |
+| `script_run` | `POST /v1/scripts/:id/run` exists on this build. **The route existing is not the same as a call succeeding**: it answers `503 config` on any deployment that has not proven per-node uid isolation (F007) — see § "Script nodes". This id promises the route, not that a call will run anything |
+| `quota_parking` | the `rate_limited` status with `resets_at`/`resume_at` on `/v1/board`: a closed usage window requeues the in-flight message and the engine resumes by itself (§5c) |
+| `credential_fallback` | `AgentConfig.fallback_vault`, a read-wired vault whose credential a spawn switches to once when the window closes (§5c) |
+| `await_reply` | `POST /v1/cli/msg` `{await_secs, notify}` and `GET /v1/cli/sent`: the consuming turn's result comes back to the sender (§5c) |
 
 Each id is held to its row by a test that calls the routes or creates an agent carrying the field
 (`crates/wheel-engine/src/api/engine_routes.rs`). Advertising an id with nothing behind it fails the suite.
@@ -219,6 +227,7 @@ met — or `error {code, message}` with `code` one of `needs_auth`, `builder_err
 | `GET /v1/board` | → `{ nodes: NodeWithState[], project: {id, name, capabilities} }` | M1 |
 | `POST /v1/nodes` | `{name, type, config, position}` → `Node` | M1 |
 | `PATCH /v1/nodes/:id` | `{name?, position?, config?}` (partial) → `Node` | M1 |
+| `PUT /v1/nodes/:id/content` | `{markdown}` → `Node` | M1 |
 | `DELETE /v1/nodes/:id` | → `204` | M1 |
 | `POST /v1/wires` | `WireSpec {from,to,type}` → `204` | M1 |
 | `DELETE /v1/wires` | `WireSpec` → `204` | M1 |
@@ -287,10 +296,13 @@ GET    /v1/cli/read?addr=<node>[/<row>]    → ctx markdown / table row  (chest 
 POST   /v1/cli/write   {addr, value}       → upsert; ctx replace, table row  (chest blob: M2, returns 400)
 POST   /v1/cli/rm      {addr}              → {node, row, removed}
 POST   /v1/cli/query   {table, sql}        → {rows}   read-only, one table
-POST   /v1/cli/msg     {to, body, reply_to?} → {id, sha256, bytes, state}
+POST   /v1/cli/msg     {to, body, reply_to?, await_secs?, notify?} → {id, sha256, bytes, state} (202)
+                       with await_secs: + {outcome, result?, error?} (200)   §5c
+GET    /v1/cli/sent?id=<id>[&wait=<secs>]  → the same outcome, for a message I sent   §5c
 GET    /v1/cli/inbox[?id=<message id>]     → {messages} or one message, verbatim
 POST   /v1/cli/ctx/clear                   → {node, cleared, status}   own context only
-GET    /v1/cli/usage                       → {turns, usd, max_turns?, pct_of_max_turns?, max_usd?, pct_of_max_usd?}   own agent only
+GET    /v1/cli/usage                       → {turns, usd, status, quota?, resets_at?, resume_at?, fallback_until?,
+                                              max_turns?, pct_of_max_turns?, max_usd?, pct_of_max_usd?}   own agent only
 GET    /v1/cli/tool?node=<tool>            → {tool, operations}  agent-fill fields only
 POST   /v1/cli/tool   {node, op, args, curl?} → the call result, or the masked curl
 GET    /v1/cli/mcp/tools                   → {tools} the MCP tool list for this node
@@ -591,6 +603,7 @@ an exit code.
 | `GET /v1/chests/:id/ls?prefix` | → `{entries:[{key,bytes,modified_at}]}` | M2 |
 | `GET /v1/chests/:id/blob?key` | → raw bytes | M2 |
 | `PUT /v1/chests/:id/blob?key` | raw body → `204` | M2 |
+| `POST /v1/scripts/:id/run` | `{args?: string[]}` → `{stdout, stderr, exit_code, timed_out, stdout_truncated, stderr_truncated}` | M2, **gated off** |
 
 #### Table nodes
 
@@ -634,6 +647,26 @@ Each of these alone would be an argument; together they are the boundary:
 
 `ATTACH`, `DETACH`, `PRAGMA`, every write verb, and `load_extension` are all rejected. Refusals name the object
 sqlite blocked and add why.
+
+#### Script nodes
+
+`POST /v1/scripts/:id/run` runs the node's **current** `config.source` as the project owner, from the board —
+not by way of a wire, the same way `POST /v1/tables/:id/query` needs none for the owner. It writes `source` to
+a fresh directory under `scripts_dir()/<node_id>/`, picks the interpreter from `language` (`python3`; `node`;
+`node --experimental-strip-types` for `ts` — Node 22 strips TypeScript types natively rather than needing a
+second interpreter), and runs it through `child_command` (§ Isolation gap below) in its own process group so a
+`timeout_secs` kill reaches whatever the script itself started. `stdout`/`stderr` are each capped at 1 MiB
+(`stdout_truncated`/`stderr_truncated` say so); a run that outlives `timeout_secs` is killed and reported with
+`timed_out: true`, `exit_code: null`.
+
+**Gated off by default** (`WHEEL_SCRIPT_EXEC`, unset/`0`): `docs/proposals/script-execution-scope.md` records
+PM's ruling that per-node uid isolation (F007, the §0 isolation gap above) is a precondition of *running* a
+script, not later hardening — every child on a project shares one uid today, so a script can read every sibling
+node's 0600 token file and reach whatever the host's network can, with no SSRF policy of its own (`validate.rs`'s
+`host_is_denied` governs `tool`/`mcp` URLs only). A deployment that has not closed that gap and had ADVERSARY
+review the resulting egress gets `503 config` naming both. This route is the operator-only half of the gap in
+§0's status table; the agent-facing half (`wheel run`, `/v1/cli/run`, the MCP `run` tool) remains **not built** —
+see the CLI grammar below and `wheel-engine/src/mcp.rs`'s test pinning `run` absent from the MCP surface.
 
 ### Events — `GET /v1/events` (WebSocket)
 
@@ -691,6 +724,30 @@ Exactly these bytes, as the `text` of a stream-json user turn:
 ```
 
 `reply_to="<uuid>"` is added to the open tag when the message is a reply (M2).
+
+`on_behalf_of="<principal>"` is added when a *person* asked for the message, after `reply_to`. Both
+optional attributes append after the three that are always present, so anything anchored on the
+opening `<AgentPrompt id="…" from="…" type="…"` prefix keeps reading the same thing.
+
+Which plane a message arrived on decides whether it carries one, and the rules are not symmetrical:
+
+| Plane | `on_behalf_of` |
+|---|---|
+| `/v1/*` control plane (engine secret; the API's hop) | the `x-wheel-actor-id` the API set, re-validated by the engine |
+| `/v1/cli/*` (node tokens) | **absent** — the header is not read at all, so an agent cannot assert an actor |
+| `/ingress/*` (public) | absent — the hit is anonymous and already `type=endpoint` |
+
+The value is generated from the message row, never interpolated from a body, and a principal's
+charset excludes quotes, whitespace and control characters — so it cannot close the attribute. The
+engine re-applies that check rather than trusting the API, because a layer that assumes the other
+one ran is not a layer (ADVERSARY 009).
+
+**Known limit, not fixed here (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the
+engine's environ — confirmed by run on the single-uid backend — can call the control plane *as the
+host* and set this attribute to anything. That is forged attribution and it closes with per-node
+uids, not here. An agent that merely steals a *sibling's node token* reaches the CLI plane, where the
+header is ignored, so that failure is **missing** attribution rather than forged — which is the
+better of the two, and is why the plane rules are asymmetrical on purpose.
 
 Attribution is **engine-generated and unforgeable**: the `from`/`type` attributes come from the resolved sender
 node, never from anything the sender controls. A body containing `</AgentPrompt>` (any case) has the `/` escaped
@@ -750,7 +807,8 @@ exhaustively would fall over in production.
 | `system` / `init` | Record `session_id`, `model`; status → `idle`. |
 | `assistant` | Append text to the log. |
 | `user` | Tool results — append to the log. |
-| `result` | **Turn complete.** Usage fields feed `state.spend` and the agent `budget`. `is_error` → status `error` + `last_error`; else in-flight message → `consumed`, status → `idle`, then ephemeral clear if configured, then deliver next queued. |
+| `result` | **Turn complete.** Usage fields feed `state.spend` and the agent `budget`. Its text is kept on the consumed message (`wheel sent`, §5c). `is_error` → status `error` + `last_error`, unless it is a usage limit (§5c) or needs_auth, which requeue; else in-flight message → `consumed`, status → `idle`, then ephemeral clear if configured, then deliver next queued. |
+| `rate_limit_event` | Session-matched like `result`. Recorded as the agent's `quota` window; `status: "rejected"` marks the current turn as ended by a closed usage window (§5c). |
 | anything else | Logged verbatim, ignored. |
 
 A **non-JSON line on stdout is never fatal**: it is logged verbatim as a `stdout` line and the stream continues.
@@ -795,6 +853,8 @@ wheel connections                     my wires, in plain language
 wheel ls                              every keyspace I'm wired to, with wire type   (§3c#7)
 wheel ls    <node> [prefix]           table row keys  (chest paths: M2, returns 400)
 wheel msg   <agent> "<text>"|--stdin|--file <p>   → {id, sha256, bytes, state}      (§3c#3)
+            [--await-reply[=SECS]] [--notify]     wait for the answer / be told when it finishes (§5c)
+wheel sent  <message-id> [--wait[=SECS]]          how a message I sent ended, and its answer (§5c)
 wheel read  <node>                    ctx markdown / table rows / chest listing
 wheel read  <node>/<row>              table row JSON / chest blob (--out <file>)
 wheel write <node> "<v>"|--stdin|--file           ctx: replace markdown
@@ -819,6 +879,8 @@ Every command prints one human line, or JSON with `--json`.
 | 2 | Engine error. |
 | **3** | **Wire denied** — `no wire from <me> to <node> (need: write)`. |
 | 4 | No such node. |
+| 5 | `--await-reply` / `sent`: the turn that consumed it ended in `error`, or it was `undeliverable`. |
+| 6 | `--await-reply` / `sent`: not finished yet — the wait ran out, or it is still pending. The message is still live. |
 
 **Argv hazard warning** (§3c#1). A body passed as argv goes through the agent's shell, where backticks and `$(…)`
 are substituted and the message is silently corrupted — this is a real defect observed on YOKE, and it is why
@@ -843,9 +905,59 @@ made YOKE unusable. So:
 - `budget: {max_turns?, max_usd?}` → on reach, status `budget_exhausted`; the engine will not self-restart.
 - The engine idles at ~0 CPU: no polling loops anywhere — channels, WS and inotify only.
 
-Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_exhausted | error`, plus
+Statuses: `stopped | starting | needs_auth | running | idle | parked | budget_exhausted | rate_limited | error`, plus
 `hosted_on` (`"cloud"` | runner id | `null`). **`null` means unhosted, which is a loud, alarming state** —
 an agent nobody can run is broken, and the UI says so rather than showing it as merely stopped.
+
+## 5c. Usage windows and delegation (`docs/proposals/agentgrid-parity.md`)
+
+**`rate_limited`.** A turn ends on a closed usage window when its `result` is `is_error` and either a
+session-matched `rate_limit_event` with `status: "rejected"` arrived in that turn, or the error text names a
+usage limit. The engine then, in order:
+
+1. returns the in-flight message to `queued`, with `last_error` saying so. It does this at most
+   **12** times per message (`limit_requeues`); after that the message is consumed with an error;
+2. stops the child, keeping its session;
+3. sets status `rate_limited` with `resets_at` (the harness's reset, or `null`) and `resume_at` (when it
+   will try again). `resume_at` is the reset plus 5–64 s of jitter, or, with no reset, a backoff of 15 min
+   doubling to 5 h. It is clamped to 8 days ahead;
+4. arms one timer for `resume_at`. When it fires the agent is set `parked`, and `deliver` resumes it if work
+   is queued. The timer does nothing if the status has changed since (an operator `start`/`stop` wins), and
+   it is re-armed from `agent_state` at engine boot.
+
+Messages sent to a `rate_limited` agent queue as they do for `parked`. `state.quota` always carries the last
+window the harness reported (`{status, window?, utilization?, resets_at?, observed_at}`).
+
+**`fallback_vault`** (agent config, optional). It names a vault the agent **already has a `read` wire to**.
+A missing node, a non-vault or an unwired vault is refused (`400 invalid`) when the field is set or changed,
+and a wire removed later makes spawn ignore it. The existing ambiguity rules are unchanged, so the fallback
+supplies a different credential key from the primary (e.g. `CLAUDE_CODE_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`).
+
+- A **normal** spawn withholds the fallback vault's credential keys.
+- The first closed window restarts the agent once, immediately, on the fallback. `state.fallback_until` is
+  set to the primary's resume time.
+- A **fallback** spawn exports that vault's credential keys and no other credential: other vaults' and the
+  node's stored token are withheld. Non-credential keys are exported as always.
+- A closed window on the fallback parks the agent, never bounces it back.
+
+**Delegation.** `POST /v1/cli/msg` with `await_secs` (default 600, clamped to 1..3600) waits, holding no lock,
+until the turn that consumed the message ends, then returns `outcome`:
+
+| outcome | meaning |
+|---|---|
+| `consumed` | `result` is that turn's final text: the harness's own `result`, from the recipient's session |
+| `error` | the turn failed; `error` is why |
+| `undeliverable` | quarantined |
+| `timeout` | the wait ended first; the message is still delivered, and `GET /v1/cli/sent` collects the answer later |
+
+The result is disclosed only if the caller still holds the `send` wire (`403` otherwise). A wait that would
+close a cycle — the target is already waiting, directly or through others, on the caller — is refused at
+once with `409 await_cycle`, and nothing is sent. More than 8 open waits per caller is `429 too_many_awaits`.
+
+`notify: true` (agents only) enqueues exactly one `system` message to the sender when the message settles,
+threaded with `reply_to` to it. It carries the outcome and at most 4 KiB of the result, labelled
+agent-authored, and says where the full text is. It goes through the normal queue and the envelope escaping
+like any other message, and the excerpt is withheld if the send wire is gone.
 
 ## 6. Limits (§3c#6)
 
@@ -960,11 +1072,30 @@ naming what is gone rather than saying "reduced isolation":
 > socket, and read any other child's environment. Vault values are protected
 > only by the encryption key, which lives in that same environment.
 
-**The host must refuse to start a second project in this mode.** One project as
-one user is a convenience; two projects as one user is a tenancy boundary that
-does not exist while claiming to. `wheel_core::UidIsolation::from_env()` is the
-single reader of that variable, so the host and the engine cannot disagree about
-which mode they are in.
+`wheel_core::UidIsolation::from_env()` is the single reader of that variable
+(`crates/wheel-engine/src/lib.rs`'s `serve_until` is the only caller), so nothing
+downstream can read a second, disagreeing answer from the same environment.
+
+**What is NOT yet true, stated plainly rather than implied by the paragraph
+above (ADVERSARY, 2026-09-12):**
+
+- **Nothing refuses a second project in this mode.** The intent — "one project as
+  one user is a convenience; two projects as one user is a tenancy boundary that
+  does not exist while claiming to" — is not enforced anywhere in this codebase.
+  Neither `wheel-host` nor `wheeld` counts how many projects are running shared
+  and refuses a second. The paragraph this replaces claimed the check exists; it
+  does not.
+- **`wheeld` — the one deployment that genuinely runs every project shared-uid
+  by construction (`crates/wheeld/src/embedded.rs`'s own header) — never sets
+  `WHEEL_ALLOW_SHARED_UID` and never calls `UidIsolation::from_env()` at all.**
+  So the warning above **never fires** on the one binary whose normal operation
+  is exactly the condition it exists to announce. This is not a hypothetical
+  misconfiguration; it is `wheeld`'s documented, accepted default mode running
+  with the safety rail silently disengaged. Tracked as follow-up **F5** in
+  `docs/proposals/wheeld-native-production.md` (PR #67), owned SDK/Engine + API.
+  Fix it there, either by having `wheeld` engage this mechanism honestly or by
+  this section stopping its claim that shared-uid mode is announced and
+  single-project-enforced when, for `wheeld`, it is neither.
 
 ## Tool nodes (§3d)
 
@@ -1212,9 +1343,10 @@ notification (no `id`) is never answered. The tool LIST comes from `GET /v1/cli/
 compiled in, so it reflects the caller's **current** wires — a tool node wired after the agent started
 appears without a restart.
 
-**Built-in tools**: `msg` · `read` · `write` · `rm` · `ls` · `query` · `secret_get` · `inbox` · `whoami` ·
-`connections` · `ctx_clear`. Each maps to the `/v1/cli/*` route that already implements it, so there is one
-implementation of what a tool does and nothing to drift.
+**Built-in tools**: `msg` · `ask` · `sent` · `read` · `write` · `rm` · `ls` · `query` · `secret_get` · `inbox` ·
+`whoami` · `connections` · `ctx_clear` · `usage`. Each maps to the `/v1/cli/*` route that already implements it,
+so there is one implementation of what a tool does and nothing to drift. `ask` is `msg` with `await_secs`
+(§5c): its content is the recipient's answer, and anything but `consumed` is a tool error that says why.
 
 `run` is deliberately **absent** until script nodes exist (M2). A tool whose route returns 404 teaches a
 model that the board is unreliable, and it stops trying things that would have worked.

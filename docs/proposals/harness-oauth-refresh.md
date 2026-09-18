@@ -486,13 +486,61 @@ test.
     tool wired to the vault could send the refresh token upstream as a parameter. It now refuses the
     key exactly as `wheel secret get` does.
 
+### Round 3 (defect #8, PM-assigned; residuals closed)
+
+14. **Every `check_refresh` rejection was classified permanent.** The server is not guaranteed to
+    rotate the refresh token on every exchange (§2), so a rejection that is not itself
+    security-relevant (a bad read, a stale expiry, the same access token echoed back) could in
+    principle pass on a genuine retry with the SAME refresh token — treating it as unrecoverable
+    was giving up sooner than the credential actually was. `RefreshRejected::is_permanent` now
+    keys the two apart: `ScopeEscalation`, `ScopeLost`/`ScopeDropped` and `AccountChanged` are
+    identity/grant-narrowing and stay permanent (a retry cannot fix a wrong account or a server
+    that is handing back less than it was); everything else (`NoAccessToken`, `SameAccessToken`,
+    `NoRefreshToken`, `NoExpiry`, `NotNewer`, `Implausible`) is `ambiguous` — bounded by the same
+    attempt cap as a CLI failure nothing could read, rather than parked on the first bad read.
+15. **The scope ratchet only defended `user:inference`.** `REQUIRED_SCOPE` refused a renewal that
+    dropped the inference scope, but a server that quietly echoed back a narrower grant on any
+    OTHER previously-held scope passed. `check_refresh` now refuses dropping any scope the prior
+    login had (`RefreshRejected::ScopeDropped`), not only the one the CLI cannot run without.
+16. **`ensure_fresh` enforced no minimum interval on its own.** The timer's own wait floors at
+    `min_interval`, but a spawn and `recover_from_auth_failure` call `ensure_fresh` directly, with
+    nothing between them and the lineage lock — several such callers arriving close together on
+    one stale, still-failing generation serialised straight through into one real exchange per
+    caller instead of one per floor interval. `ensure_fresh` now tracks the last attempt per vault
+    and floors on it the same way the timer does.
+17. **`arm_renewal`'s doc comment named `Broker::min_interval`** as the guard it applies, when the
+    code beneath it (correctly) keys on `Broker::lead` — the exact distinction the comment two
+    lines below it draws. Fixed to name the right field.
+
+### Round 3, ADVERSARY's review (comment-only fix)
+
+18. **`renew()`'s "THE RULE for everything below" comment was left stale by item 14 above.** It still
+    said every non-exit-0 outcome permanently kills the refresh token with "nothing to retry into" —
+    directly above code that now retries six of the nine `check_refresh` rejections. ADVERSARY: "a
+    future reader who trusts the comment over the code will 'fix' this by reverting Round 3." Rewritten
+    to say what the code actually does: a `read_session` failure stays `permanent: false, ambiguous:
+    false` (retried on the timer, bounded by the current token's usable life, never by the attempt
+    cap — there is no server signal in a local read failure either way); a store that reads but fails
+    the content gate is split by `is_permanent()`, and even its retryable half is bounded by the
+    attempt cap rather than assumed free, because nothing here can tell whether the exchange that
+    produced it already spent R.
+
+ADVERSARY also verified item 14's mutation-check independently (dropped `ScopeDropped` from the
+permanent arm, watched the test fail, confirmed the fix) and answered a question raised while reviewing
+it: could `NotNewer`/`SameAccessToken` be attacker-influenced under the single-uid gap (037/F007)? Yes
+in principle, but not newly — `check_refresh`'s identity/scope gates run identically on every attempt
+regardless of how many happen, so retrying does not loosen what can be promoted to the vault, only
+whether the engine gives up after one bad read. If anything the OLD single-shot-permanent behavior was
+the easier target for a same-uid attacker wanting to brick a shared login (win one race); the new
+behavior needs up to `max_attempts` wins for the same outcome. Filed as a non-issue, not a residual.
+
+Also noted, pre-existing and explicitly not part of this PR: `carry_forward` backfills `next`'s missing
+account/org identity from `prev` *before* `check_refresh` runs, so `AccountChanged` only fires on a
+candidate that reports a *different* identity — one that omits identity entirely passes. Worth a line
+in the eventual per-node-uid (F007) hardening pass; not a defect #8 fix.
+
 ### Deferred to a follow-up, deliberately (they are real, and none blocks the board)
 
-- Every `check_refresh` rejection is classified permanent. A false positive is then unrecoverable
-  without a person, and the gate keys on server-controlled values never observed live.
-- Scopes ratchet downward: the gate blocks escalation, and a server returning a SUBSET passes.
-  `REQUIRED_SCOPE` now refuses a renewal that drops `user:inference`, but a general downgrade is
-  still unresisted.
 - `resume_readers_if_blocked` — the documented VPS recovery path — has no test of its own.
 - A table in PROTOCOL.md swallowed the sentence after it, which now renders as a third cell.
 

@@ -13,8 +13,8 @@ use super::tables;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 use wheel_core::{
-    check_wire, AgentState, Node, NodeConfig, NodeName, NodeType, Position, Timestamp, Wire,
-    WireType,
+    check_wire, AgentState, EndpointAuth, Node, NodeConfig, NodeName, NodeType, Position,
+    Timestamp, Wire, WireType,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,9 @@ pub enum BoardError {
     /// A table node's storage could not follow it. Its own message says why.
     #[error("{0}")]
     Storage(String),
+    /// An agent's `fallback_vault` does not name a vault it reads.
+    #[error("{0}")]
+    Fallback(String),
 }
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
@@ -89,6 +92,9 @@ pub fn create_with(
     allow_hosts: &[String],
 ) -> Result<(), BoardError> {
     wheel_core::validate_config_with(&node.config, allow_hosts)?;
+    // A node being created has no wires yet, so a fallback set here is always
+    // refused: wire the vault first, then set it.
+    check_fallback_vault(conn, node)?;
     let (ty, cfg) = split_config(&node.config);
     let now = Timestamp::now().to_rfc3339();
 
@@ -402,11 +408,114 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// The name of a `ctx` node `agent` already holds a `write` wire to, if any.
+/// Finding 043's addendum only checks ONE additional hop past the direct
+/// endpoint->agent leg (explicitly not general graph reachability), so this
+/// stops at the first ctx write wire found rather than collecting all of them.
+fn agent_ctx_write_target(conn: &Connection, agent: Uuid) -> Result<Option<String>> {
+    for wire in wires_from(conn, agent)? {
+        if wire.wire_type == WireType::Write {
+            if let Some(node) = get(conn, wire.to)? {
+                if node.node_type() == NodeType::Ctx {
+                    return Ok(Some(node.name.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `agent` already receives a `send` wire from an `auth:none`
+/// endpoint, and that endpoint's id if so.
+fn unauthenticated_endpoint_sending_to(conn: &Connection, agent: Uuid) -> Result<Option<Uuid>> {
+    for (from, ty) in wires_to(conn, agent)? {
+        if ty == WireType::Send {
+            if let Some(node) = get(conn, from)? {
+                if matches!(&node.config, NodeConfig::Endpoint(cfg) if cfg.auth == EndpointAuth::None)
+                {
+                    return Ok(Some(from));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Finding 043 (+ its 2026-09-13 addendum): warn when a wire creates, or
+/// completes, the dangerous combination `endpoint(auth:none) --send--> agent
+/// --write--> ctx`. The two legs can be drawn in either order, so this is
+/// checked from whichever side the NEW wire is on:
+///
+/// - the new wire IS the endpoint->agent leg: warn the plain form always (an
+///   unauthenticated endpoint reaching a capable agent is dangerous even with
+///   no ctx write), and the worse, distinct form if the agent already writes
+///   a ctx (043's addendum: that reinjects into every OTHER agent reading it,
+///   on every start/context-clear -- board-wide and durable, not one turn).
+/// - the new wire IS the agent->ctx write leg, and the agent already has an
+///   `auth:none` endpoint sending to it: the combination is only COMPLETED
+///   now, by this wire, so it gets the same distinct warning.
+///
+/// Deliberately one hop, not graph reachability (the addendum is explicit
+/// about that scope), and deliberately non-fatal on any lookup error (a
+/// warning that fails to compute must never block a wire the §3 matrix
+/// otherwise allows) -- callers use `.ok().flatten()`, matching the existing
+/// vault-overlap warning below.
+fn endpoint_agent_ctx_warning(
+    conn: &Connection,
+    from_node: &Node,
+    to: Uuid,
+    to_node: &Node,
+    ty: WireType,
+) -> Result<Option<String>> {
+    if from_node.node_type() == NodeType::Endpoint
+        && to_node.node_type() == NodeType::Agent
+        && ty == WireType::Send
+    {
+        let unauthenticated = matches!(&from_node.config, NodeConfig::Endpoint(cfg) if cfg.auth == EndpointAuth::None);
+        if !unauthenticated {
+            return Ok(None);
+        }
+        return Ok(Some(match agent_ctx_write_target(conn, to)? {
+            Some(ctx_name) => format!(
+                "finding 043 addendum: this exposes ctx {ctx_name} to unauthenticated internet \
+                 content via agent {} — reinjected into the system prompt of every OTHER agent \
+                 that reads {ctx_name}, on every start or context-clear, not scoped to one turn",
+                to_node.name
+            ),
+            None => format!(
+                "finding 043: this exposes agent {} to unauthenticated input from anyone who \
+                 can reach the endpoint's public URL",
+                to_node.name
+            ),
+        }));
+    }
+
+    if from_node.node_type() == NodeType::Agent
+        && to_node.node_type() == NodeType::Ctx
+        && ty == WireType::Write
+    {
+        if unauthenticated_endpoint_sending_to(conn, from_node.id)?.is_some() {
+            return Ok(Some(format!(
+                "finding 043 addendum: agent {} already receives unauthenticated internet \
+                 content from an endpoint with no auth — with this wire, that content is \
+                 reinjected into the system prompt of every OTHER agent that reads {}, on every \
+                 start or context-clear, not scoped to one turn",
+                from_node.name, to_node.name
+            )));
+        }
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
 /// Create a wire after checking it against the §3 matrix.
 ///
 /// `Ok(Some(warning))` is a wire that was created but deserves the operator's
-/// attention (028 face 5: two vaults declaring the same credential); it is
-/// not an error and must not be treated as one.
+/// attention (028 face 5: two vaults declaring the same credential; finding
+/// 043 and its addendum: an unauthenticated endpoint reaching, directly or
+/// via one more ctx-write hop, a capable agent); it is not an error and must
+/// not be treated as one.
 pub fn add_wire(
     conn: &Connection,
     from: Uuid,
@@ -447,7 +556,12 @@ pub fn add_wire(
             .map(|a| a.to_string())
     } else {
         None
-    };
+    }
+    .or_else(|| {
+        endpoint_agent_ctx_warning(conn, &from_node, to, &to_node, ty)
+            .ok()
+            .flatten()
+    });
 
     // Idempotent: re-creating an existing wire is a no-op, not an error.
     conn.execute(
@@ -487,6 +601,13 @@ pub fn update_with(
     // nothing on the board addressing them -- and then the next table node to
     // claim that name inherits a stranger's data.
     let was = get(conn, node.id).ok().flatten();
+    // Only when it CHANGES. A wire removed later leaves a dangling fallback
+    // that spawn ignores; refusing every unrelated edit (a drag, a rename)
+    // until it is repaired would punish the operator for the spawn check.
+    let fallback_of = |n: &Node| n.config.as_agent().and_then(|a| a.fallback_vault);
+    if was.as_ref().and_then(fallback_of) != fallback_of(node) {
+        check_fallback_vault(conn, node)?;
+    }
     let was_table = was
         .as_ref()
         .filter(|n| matches!(n.config, NodeConfig::Table(_)))
@@ -557,12 +678,16 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
 
     let s = conn
         .prepare(
-            "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd
+            "SELECT status, session_id, last_activity, last_error, hosted_on, turns, usd,
+                    resets_at, resume_at, quota, fallback_until
              FROM agent_state WHERE node_id = ?1",
         )?
         .query_row(params![node_id.to_string()], |r| {
             let status: String = r.get(0)?;
-            let last_activity: Option<String> = r.get(2)?;
+            let at = |i: usize| -> rusqlite::Result<Option<Timestamp>> {
+                Ok(r.get::<_, Option<String>>(i)?
+                    .and_then(|t| Timestamp::parse_rfc3339(&t).ok()))
+            };
             let spend = wheel_core::Spend {
                 turns: r.get::<_, i64>(5)? as u64,
                 usd: r.get(6)?,
@@ -571,17 +696,92 @@ pub fn agent_state(conn: &Connection, node_id: Uuid) -> Result<AgentState> {
                 status: serde_json::from_value(serde_json::Value::String(status))
                     .unwrap_or_default(),
                 session_id: r.get(1)?,
-                last_activity: last_activity
-                    .and_then(|t| wheel_core::Timestamp::parse_rfc3339(&t).ok()),
+                last_activity: at(2)?,
                 last_error: r.get(3)?,
                 hosted_on: r.get(4)?,
                 queued_messages: queued as u32,
                 budget_status: wheel_core::BudgetStatus::compute(spend, budget),
                 spend: Some(spend),
+                resets_at: at(7)?,
+                resume_at: at(8)?,
+                quota: r
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|q| serde_json::from_str(&q).ok()),
+                fallback_until: at(10)?,
             })
         })
         .optional()?;
     Ok(s.unwrap_or_default())
+}
+
+/// Park an agent on a closed usage window: status, the harness's reset time
+/// and the engine's own resume time, written together.
+pub fn set_rate_limited(
+    conn: &Connection,
+    node: Uuid,
+    resets_at: Option<Timestamp>,
+    resume_at: Timestamp,
+    reason: &str,
+) {
+    set_status(
+        conn,
+        node,
+        wheel_core::AgentStatus::RateLimited,
+        Some(reason),
+    );
+    let _ = conn.execute(
+        "UPDATE agent_state SET resets_at = ?2, resume_at = ?3 WHERE node_id = ?1",
+        params![
+            node.to_string(),
+            resets_at.map(|t| t.to_rfc3339()),
+            resume_at.to_rfc3339()
+        ],
+    );
+}
+
+/// Record the last usage window the harness reported.
+pub fn set_quota(conn: &Connection, node: Uuid, quota: &wheel_core::QuotaWindow) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET quota = ?2 WHERE node_id = ?1",
+        params![
+            node.to_string(),
+            serde_json::to_string(quota).unwrap_or_default()
+        ],
+    );
+}
+
+pub fn set_fallback_until(conn: &Connection, node: Uuid, until: Option<Timestamp>) {
+    let _ = conn.execute(
+        "UPDATE agent_state SET fallback_until = ?2 WHERE node_id = ?1",
+        params![node.to_string(), until.map(|t| t.to_rfc3339())],
+    );
+}
+
+/// Every agent parked on a closed usage window, with when it is due back.
+pub fn rate_limited_agents(conn: &Connection) -> Result<Vec<(Uuid, Option<Timestamp>)>> {
+    let mut stmt =
+        conn.prepare("SELECT node_id, resume_at FROM agent_state WHERE status = 'rate_limited'")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    Ok(rows
+        .flatten()
+        .filter_map(|(id, at)| {
+            Some((
+                id.parse().ok()?,
+                at.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),
+            ))
+        })
+        .collect())
+}
+
+/// An agent's `fallback_vault` must name a vault it already reads, so the
+/// fallback can never reach a credential the agent could not already reach.
+fn check_fallback_vault(conn: &Connection, node: &Node) -> Result<(), BoardError> {
+    let Some(vault) = node.config.as_agent().and_then(|a| a.fallback_vault) else {
+        return Ok(());
+    };
+    crate::vault::check_fallback(conn, node.id, vault).map_err(BoardError::Fallback)
 }
 
 /// Set an agent's status directly. Used by auth to move a node out of
@@ -596,7 +796,8 @@ pub fn set_status(
     let _ = conn.execute(
         "INSERT INTO agent_state (node_id,status,last_activity,last_error)
          VALUES (?1,?2,?3,?4)
-         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4",
+         ON CONFLICT(node_id) DO UPDATE SET status=?2, last_activity=?3, last_error=?4,
+             resets_at=NULL, resume_at=NULL",
         params![
             node.to_string(),
             status.as_str(),
@@ -622,6 +823,94 @@ pub fn remove_wire(conn: &Connection, from: Uuid, to: Uuid, ty: WireType) -> Res
         params![from.to_string(), to.to_string(), ty.as_str()],
     )?;
     Ok(n > 0)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use wheel_core::{AgentConfig, CtxConfig, VaultConfig};
+
+    fn node(name: &str, config: NodeConfig) -> Node {
+        Node::new(
+            Uuid::new_v4(),
+            name.parse().unwrap(),
+            Position::default(),
+            config,
+        )
+    }
+
+    fn with_fallback(agent: &Node, fallback: Option<Uuid>) -> Node {
+        let mut n = agent.clone();
+        if let NodeConfig::Agent(a) = &mut n.config {
+            a.fallback_vault = fallback;
+        }
+        n
+    }
+
+    fn refusal(r: Result<(), BoardError>) -> String {
+        match r {
+            Err(BoardError::Fallback(m)) => m,
+            other => panic!("expected a fallback refusal, got {other:?}"),
+        }
+    }
+
+    /// The property the whole fallback rests on: it can never reach a
+    /// credential the agent could not already `wheel secret get`.
+    #[test]
+    fn a_fallback_vault_must_be_a_vault_the_agent_already_reads() {
+        let c = crate::db::open_memory().unwrap();
+        let standby = node(
+            "standby",
+            NodeConfig::Vault(VaultConfig {
+                keys: vec!["ANTHROPIC_API_KEY".into()],
+            }),
+        );
+        let notes = node(
+            "notes",
+            NodeConfig::Ctx(CtxConfig {
+                markdown: String::new(),
+            }),
+        );
+        create(&c, &standby).unwrap();
+        create(&c, &notes).unwrap();
+
+        let agent = node("worker", NodeConfig::Agent(AgentConfig::default()));
+        let born = with_fallback(&agent, Some(standby.id));
+        assert!(
+            refusal(create(&c, &born)).contains("read wire"),
+            "a node being created has no wires, so a fallback there is always refused"
+        );
+        create(&c, &agent).unwrap();
+
+        assert!(
+            refusal(update(&c, &with_fallback(&agent, Some(Uuid::new_v4()))))
+                .contains("not a node")
+        );
+        assert!(refusal(update(&c, &with_fallback(&agent, Some(notes.id)))).contains("not a vault"));
+        assert!(
+            refusal(update(&c, &with_fallback(&agent, Some(standby.id)))).contains("read wire"),
+            "a vault the agent cannot read is exactly the widening this refuses"
+        );
+
+        add_wire(&c, agent.id, standby.id, WireType::Read, None).unwrap();
+        let chosen = with_fallback(&agent, Some(standby.id));
+        update(&c, &chosen).expect("a vault the agent reads is a valid fallback");
+
+        // Removed afterwards: spawn ignores it, and an unrelated edit is not
+        // held hostage to the dangling reference.
+        remove_wire(&c, agent.id, standby.id, WireType::Read).unwrap();
+        let mut edited = chosen.clone();
+        if let NodeConfig::Agent(a) = &mut edited.config {
+            a.system_prompt = "still editable".into();
+        }
+        update(&c, &edited).expect("an edit that leaves the fallback alone is not re-judged");
+
+        // ...but choosing it again is judged again.
+        update(&c, &with_fallback(&edited, None)).unwrap();
+        assert!(
+            refusal(update(&c, &with_fallback(&edited, Some(standby.id)))).contains("read wire")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1029,6 +1318,126 @@ mod tests {
         assert_eq!(wires_from(&c, a.id).unwrap().len(), 1);
     }
 
+    fn endpoint(name: &str, auth: EndpointAuth) -> Node {
+        node(
+            name,
+            NodeConfig::Endpoint(EndpointConfig {
+                method: HttpMethod::Post,
+                path: "/hook".into(),
+                response_mode: ResponseMode::Ack,
+                auth,
+            }),
+        )
+    }
+
+    /// Finding 043: the plain case. No ctx write wire on the agent yet, so
+    /// the warning is the direct-exposure one, not the addendum's.
+    #[test]
+    fn an_unauthenticated_endpoint_to_agent_warns_plainly_with_no_ctx_write() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        let msg = warning.expect("an unauthenticated endpoint -> agent wire must warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(msg.contains("reader"), "{msg}");
+        assert!(
+            !msg.contains("reinjected"),
+            "no ctx write exists yet, so this must not claim the addendum's worse blast \
+             radius: {msg}"
+        );
+    }
+
+    /// Finding 043's addendum, drawn endpoint-leg-last: the agent already
+    /// writes a ctx when the unauthenticated endpoint wire is added, so the
+    /// combination is dangerous from the moment this wire is created.
+    #[test]
+    fn an_unauthenticated_endpoint_to_agent_that_already_writes_ctx_warns_the_addendum() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        let msg = warning.expect("the amplified chain must warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(
+            msg.contains("notes"),
+            "must name the ctx that gets reinjected: {msg}"
+        );
+        assert!(msg.contains("reinjected"), "{msg}");
+    }
+
+    /// Same chain, ctx-leg-last: the unauthenticated endpoint->agent wire
+    /// already exists, and THIS wire (agent->ctx write) is what completes the
+    /// dangerous combination -- so it must be the one that warns, since it is
+    /// the wire the operator is drawing right now.
+    #[test]
+    fn writing_a_ctx_that_completes_an_existing_unauthenticated_endpoint_chain_warns() {
+        let c = mem();
+        let hook = endpoint("hook", EndpointAuth::None);
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+
+        let warning = add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+        let msg = warning.expect("completing the chain from the ctx side must also warn");
+        assert!(msg.contains("043"), "{msg}");
+        assert!(msg.contains("notes"), "{msg}");
+        assert!(msg.contains("reinjected"), "{msg}");
+    }
+
+    /// A `Bearer`-authenticated endpoint is exactly what finding 043's fix
+    /// tells operators to switch to, so it must never trip the warning it is
+    /// the recommended escape from -- otherwise the warning cannot be
+    /// resolved and stops meaning anything.
+    #[test]
+    fn a_bearer_authenticated_endpoint_to_agent_does_not_warn() {
+        let c = mem();
+        let hook = endpoint(
+            "hook",
+            EndpointAuth::Bearer {
+                vault_ref: "secrets/k".into(),
+            },
+        );
+        let a = agent("reader");
+        let notes = ctx("notes");
+        create(&c, &hook).unwrap();
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+        add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+
+        let warning = add_wire(&c, hook.id, a.id, WireType::Send, None).unwrap();
+        assert!(
+            warning.is_none(),
+            "an authenticated endpoint must not trip finding 043's warning: {warning:?}"
+        );
+    }
+
+    /// An agent writing a ctx with no unauthenticated endpoint anywhere near
+    /// it is the ordinary, undangerous case and must stay silent.
+    #[test]
+    fn writing_a_ctx_with_no_unauthenticated_endpoint_in_the_picture_does_not_warn() {
+        let c = mem();
+        let a = agent("writer");
+        let notes = ctx("notes");
+        create(&c, &a).unwrap();
+        create(&c, &notes).unwrap();
+
+        let warning = add_wire(&c, a.id, notes.id, WireType::Write, None).unwrap();
+        assert!(warning.is_none(), "{warning:?}");
+    }
+
     #[test]
     fn deleting_a_node_removes_wires_in_both_directions() {
         let c = mem();
@@ -1089,9 +1498,11 @@ mod tests {
         assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 0);
 
         for body in ["one", "two"] {
-            crate::db::messages::enqueue(&c, MessageSender::User, a.id, body.into(), None).unwrap();
+            crate::db::messages::enqueue(&c, MessageSender::User, a.id, body.into(), None, None)
+                .unwrap();
         }
-        crate::db::messages::enqueue(&c, MessageSender::User, b.id, "theirs".into(), None).unwrap();
+        crate::db::messages::enqueue(&c, MessageSender::User, b.id, "theirs".into(), None, None)
+            .unwrap();
 
         assert_eq!(agent_state(&c, a.id).unwrap().queued_messages, 2);
         // ...and it is per agent, not a board-wide total.
