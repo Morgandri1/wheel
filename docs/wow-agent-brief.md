@@ -52,12 +52,11 @@ personal OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, injected `mode:"env"`), which i
 operator wants a switch to an approved path (a real Anthropic API key / Console credential) without ripping out the
 existing mode.
 
-**Policy, clarified 2026-09-18 (operator):** the OAuth-token mode itself is not the thing to remove — a
-self-hosted `wheeld` instance is free to use it (the user is running their own token against their own box, no
-service being offered). It should stay a **first-class feature for self-hosted instances**. What needs to be
-**easily turned off** is running it on a **managed instance operated by AgentGrid on someone else's behalf** —
-that's the actual ToS-break shape. So the env var's job is less "replace the default" and more "let a managed
-deployment refuse/disable oauth-token mode cleanly," while self-hosted keeps it as a normal, supported option.
+**Policy, restated 2026-09-18 (operator) — matches task 4, not a new decision:** oauth-token mode is not the thing
+to remove; it's a first-class option on self-hosted `wheeld`, since that's a user running their own token against
+their own box, no service being offered. The actual ToS-break shape is a **managed instance AgentGrid operates on
+someone else's behalf** running it — task 4 already names this (cloud = API-key-only, operator's own board the
+sole exception). So this env var is the mechanism task 4's policy needs, not a separate default to design.
 
 **Shape:** an env var (name the agents' to propose, e.g. `WHEEL_HARNESS_AUTH`) whose value chooses the auth method
 per project/agent — at minimum `oauth-token` (today's behaviour, kept for the operator's own board) and an API-key
