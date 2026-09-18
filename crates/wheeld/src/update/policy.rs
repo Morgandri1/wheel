@@ -446,4 +446,15 @@ mod tests {
         let e = Policy::from_vars(&|k| env.get(k).cloned(), &d.data, &d.bin).unwrap_err();
         assert!(format!("{e:#}").contains(ENV_STAGING));
     }
+
+    #[test]
+    fn each_mode_names_the_env_value_that_selects_it() {
+        for (mode, word) in [
+            (Mode::Off, "off"),
+            (Mode::Prompt, "prompt"),
+            (Mode::Auto, "auto"),
+        ] {
+            assert_eq!(mode.as_str(), word);
+        }
+    }
 }

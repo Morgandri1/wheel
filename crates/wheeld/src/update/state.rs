@@ -403,4 +403,16 @@ mod tests {
         assert_eq!(v["outcome"]["reason"], "dirty_checkout");
         assert_eq!(v["by"]["kind"], "auto");
     }
+
+    /// A read failure that is not "not found" (here, `state.json` is itself a
+    /// directory) is a real error `open` must surface, not something to set
+    /// aside like a corrupt file and quietly start empty over.
+    #[test]
+    fn an_unreadable_state_file_is_an_error_not_a_fresh_start() {
+        let d = dir();
+        std::fs::create_dir_all(d.join("state.json")).unwrap();
+        let e = StateStore::open(&d).err().unwrap();
+        assert!(format!("{e:#}").contains("state.json"));
+        std::fs::remove_dir_all(&d).ok();
+    }
 }

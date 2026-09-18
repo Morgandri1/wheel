@@ -280,6 +280,16 @@ POST   /v1/cli/tool   {node, op, args, curl?} → the call result, or the masked
 GET    /v1/cli/mcp/tools                   → {tools} the MCP tool list for this node
 GET    /v1/cli/secret?addr=<vault>/<key>   → {node, key, value}   wire-gated, agents
 GET    /v1/cli/secret/keys?node=<vault>    → {node, keys}         wire-gated, agents
+GET    /v1/cli/update                      → {update: UpdateNotice?}   what this deployment's updater would say
+                                              right now (docs/proposals/auto-update.md); 403 update_disabled if
+                                              WHEEL_AUTO_UPDATE is off
+POST   /v1/cli/update                      → 202 {requested, already_requested, update} accepted/already queued;
+                                              200 {requested: false, reason} nothing pertinent to update;
+                                              409 update_refused if suspended (circuit breaker) or otherwise
+                                              blocked; 403 update_denied for a non-agent caller (an endpoint can
+                                              start a script, so a request from one would hand the internet a
+                                              restart lever) — always targets the CI-green tip of main, never a
+                                              caller-chosen ref
 ```
 
 Values are encrypted at rest with AES-256-GCM under the project's `WHEEL_VAULT_KEY`, and each

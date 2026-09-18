@@ -736,3 +736,318 @@ fn a_running_build_that_was_never_stamped_falls_back_to_the_checkout() {
     assert_eq!(running_sha("unknown", driver.as_ref()).unwrap(), RUNNING);
     assert_eq!(running_sha("", driver.as_ref()).unwrap(), RUNNING);
 }
+
+#[test]
+fn every_outcome_has_its_own_message_and_empty_components_read_as_nothing() {
+    fn row(outcome: Outcome, components: Vec<Component>, busy: Vec<String>) -> Row {
+        Row {
+            at: 0,
+            from: RUNNING.into(),
+            to: TARGET.into(),
+            by: agent(),
+            outcome,
+            components,
+            busy,
+            notified: false,
+        }
+    }
+
+    let updated = message(&row(Outcome::Updated, vec![Component::Engine], vec![]));
+    assert!(
+        updated.contains("updated") && updated.contains("(engine)"),
+        "{updated}"
+    );
+
+    let no_components = message(&row(Outcome::Updated, vec![], vec![]));
+    assert!(!no_components.contains("()"), "{no_components}");
+
+    let rolled_back = message(&row(Outcome::RolledBack, vec![], vec![]));
+    assert!(rolled_back.contains("rolled back"), "{rolled_back}");
+
+    let timed_out_named = message(&row(
+        Outcome::DrainTimedOut,
+        vec![],
+        vec!["pm".into(), "sdk".into()],
+    ));
+    assert!(timed_out_named.contains("pm, sdk"), "{timed_out_named}");
+
+    let timed_out_unnamed = message(&row(Outcome::DrainTimedOut, vec![], vec![]));
+    assert!(
+        timed_out_unnamed.contains("agents were"),
+        "{timed_out_unnamed}"
+    );
+
+    let refused = message(&row(
+        Outcome::Refused(BlockReason::CiPending),
+        vec![],
+        vec![],
+    ));
+    assert!(refused.contains("waiting for CI"), "{refused}");
+
+    let build_failed = message(&row(Outcome::BuildFailed, vec![], vec![]));
+    assert!(build_failed.contains("did not build"), "{build_failed}");
+
+    let smoke_failed = message(&row(Outcome::SmokeFailed, vec![], vec![]));
+    assert!(smoke_failed.contains("smoke test"), "{smoke_failed}");
+
+    let swap_failed = message(&row(Outcome::SwapFailed, vec![], vec![]));
+    assert!(
+        swap_failed.contains("could not be installed"),
+        "{swap_failed}"
+    );
+
+    let interrupted = message(&row(Outcome::Interrupted, vec![], vec![]));
+    assert!(interrupted.contains("interrupted"), "{interrupted}");
+}
+
+/// A fake of the OTHER side of the seam from `FakeRuntime`: one engine, as
+/// `Registry` (not `Updater`) sees it. `Registry` is the piece that fans a
+/// single drain out across every engine this daemon runs, and nothing above
+/// exercises it directly — the `Updater` tests all go through `FakeRuntime`.
+#[derive(Default)]
+struct FakeEngine {
+    log: Mutex<Vec<String>>,
+    posts: Mutex<Vec<(Uuid, String)>>,
+    busy_answer: Mutex<Vec<String>>,
+}
+
+impl FakeEngine {
+    fn new() -> Arc<Self> {
+        Arc::new(FakeEngine::default())
+    }
+
+    fn did(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+impl EngineControl for FakeEngine {
+    fn pause(&self) {
+        self.log.lock().unwrap().push("pause".into());
+    }
+
+    fn busy(&self) -> wheel_engine::update::BoxFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            self.log.lock().unwrap().push("busy".into());
+            self.busy_answer.lock().unwrap().clone()
+        })
+    }
+
+    fn resume(&self) -> wheel_engine::update::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.log.lock().unwrap().push("resume".into());
+        })
+    }
+
+    fn post_system(&self, agent: Uuid, body: String) -> wheel_engine::update::BoxFuture<'_, bool> {
+        Box::pin(async move {
+            self.posts.lock().unwrap().push((agent, body));
+            true
+        })
+    }
+}
+
+/// `Arc::downgrade`'s type parameter is inferred from the `Arc<FakeEngine>` it
+/// is given, so the unsizing to `Weak<dyn EngineControl>` `attach` wants has to
+/// happen at a coercion site — a bare `Arc::downgrade(&a)` at the call site
+/// infers `Weak<FakeEngine>` and stops there.
+fn weak(e: &Arc<FakeEngine>) -> Weak<dyn EngineControl> {
+    let w: Weak<FakeEngine> = Arc::downgrade(e);
+    w
+}
+
+#[tokio::test]
+async fn an_engine_that_joins_mid_drain_is_paused_at_once() {
+    let reg = Registry::default();
+    let a = FakeEngine::new();
+    reg.attach(Uuid::nil(), weak(&a));
+    assert!(a.did().is_empty(), "not paused before any drain starts");
+
+    reg.pause().await;
+    let b = FakeEngine::new();
+    reg.attach(Uuid::new_v4(), weak(&b));
+    assert_eq!(
+        b.did(),
+        vec!["pause".to_string()],
+        "joins a drain already in progress"
+    );
+
+    reg.resume().await;
+    assert!(a.did().contains(&"resume".to_string()));
+    assert!(b.did().contains(&"resume".to_string()));
+}
+
+#[tokio::test]
+async fn a_dropped_engine_falls_silently_out_of_busy() {
+    let reg = Registry::default();
+    let a = FakeEngine::new();
+    let b = FakeEngine::new();
+    *a.busy_answer.lock().unwrap() = vec!["agent-a".into()];
+    *b.busy_answer.lock().unwrap() = vec!["agent-b".into()];
+    reg.attach(Uuid::new_v4(), weak(&a));
+    reg.attach(Uuid::new_v4(), weak(&b));
+
+    let mut busy = reg.busy().await;
+    busy.sort();
+    assert_eq!(busy, vec!["agent-a".to_string(), "agent-b".to_string()]);
+
+    drop(a);
+    assert_eq!(
+        reg.busy().await,
+        vec!["agent-b".to_string()],
+        "the dropped engine is gone, not merely quiet"
+    );
+}
+
+#[tokio::test]
+async fn notify_reaches_only_the_named_projects_engine() {
+    let reg = Registry::default();
+    let engine = FakeEngine::new();
+    let project = Uuid::new_v4();
+    let node = Uuid::new_v4();
+    reg.attach(project, weak(&engine));
+
+    let reached = reg
+        .notify(
+            &Requester::Agent {
+                project,
+                node,
+                name: "pm".into(),
+            },
+            "hello".into(),
+        )
+        .await;
+    assert!(reached);
+    assert_eq!(
+        engine.posts.lock().unwrap().clone(),
+        vec![(node, "hello".to_string())]
+    );
+
+    let unreached = reg
+        .notify(
+            &Requester::Agent {
+                project: Uuid::new_v4(),
+                node,
+                name: "pm".into(),
+            },
+            "hello".into(),
+        )
+        .await;
+    assert!(!unreached, "no engine is attached for that project");
+
+    assert!(
+        reg.notify(&Requester::Operator, "logged, not delivered".into())
+            .await
+    );
+    assert!(
+        reg.notify(&Requester::Auto, "logged, not delivered".into())
+            .await
+    );
+}
+
+#[tokio::test]
+async fn the_hook_delegates_to_the_updater_and_the_registry_it_was_built_from() {
+    let f = fixture(Mode::Prompt);
+    f.updater.check().await;
+    let registry = Arc::new(Registry::default());
+    let hook = Hook {
+        updater: f.updater.clone(),
+        registry: registry.clone(),
+    };
+
+    let notice = hook.notice().expect("a notice");
+    assert_eq!(notice.target.as_str(), TARGET);
+
+    let outcome = hook.request(wheel_engine::update::Requester {
+        project: Uuid::nil(),
+        node: Uuid::nil(),
+        name: "pm".into(),
+    });
+    assert!(
+        matches!(outcome, RequestOutcome::Accepted(_)),
+        "{outcome:?}"
+    );
+
+    let engine = FakeEngine::new();
+    hook.attach(Uuid::new_v4(), weak(&engine));
+    let _ = registry.busy().await;
+    assert!(
+        engine.did().contains(&"busy".to_string()),
+        "attach() reached the registry the hook was built with"
+    );
+}
+
+/// `WHEEL_AUTO_UPDATE` is process-global and cargo runs tests in parallel
+/// threads, so every case that reads or writes it is sequenced inside this
+/// one test rather than split across separate `#[test]`s — same reasoning as
+/// `wheeld::config`'s `configuration_comes_from_flags_then_environment_then_defaults`.
+#[test]
+fn from_operator_reports_status_and_records_a_request_exactly_when_asked() {
+    let data_dir = std::env::temp_dir().join(format!("wheeld-op-{}", Uuid::new_v4()));
+    let update_dir = data_dir.join("update");
+
+    std::env::remove_var(policy::ENV_MODE);
+    let mut out = Vec::new();
+    let err = from_operator(&data_dir, false, &mut out).unwrap_err();
+    assert!(err.to_string().contains("off"), "{err}");
+
+    std::env::set_var(policy::ENV_MODE, "prompt");
+
+    out.clear();
+    from_operator(&data_dir, true, &mut out).unwrap();
+    let text = String::from_utf8(out.clone()).unwrap();
+    assert!(text.contains("has not checked yet"), "{text}");
+
+    let store = StateStore::open(&update_dir).unwrap();
+    store.update(|s| s.checked_at = Some(1)).unwrap();
+    out.clear();
+    from_operator(&data_dir, true, &mut out).unwrap();
+    let text = String::from_utf8(out.clone()).unwrap();
+    assert!(text.contains("nothing pertinent to update"), "{text}");
+
+    let notice = UpdateNotice {
+        state: UpdateState::Available,
+        running: Sha::parse(RUNNING).unwrap(),
+        target: Sha::parse(TARGET).unwrap(),
+        components: vec![Component::Engine],
+        commits: 3,
+        reason: None,
+    };
+    store
+        .update(|s| {
+            s.last_notice = Some(notice.clone());
+            s.record(Row {
+                at: 1,
+                from: RUNNING.into(),
+                to: TARGET.into(),
+                by: agent(),
+                outcome: Outcome::SwapFailed,
+                components: vec![Component::Engine],
+                busy: vec![],
+                notified: true,
+            });
+        })
+        .unwrap();
+
+    out.clear();
+    from_operator(&data_dir, true, &mut out).unwrap();
+    let text = String::from_utf8(out.clone()).unwrap();
+    assert!(text.contains(&notice.line()), "{text}");
+    assert!(text.contains("last attempt"), "{text}");
+    assert!(
+        !state::request_path(&update_dir).exists(),
+        "--status must never record a request"
+    );
+
+    out.clear();
+    from_operator(&data_dir, false, &mut out).unwrap();
+    let text = String::from_utf8(out.clone()).unwrap();
+    assert!(text.contains("requested"), "{text}");
+    assert!(
+        state::request_path(&update_dir).exists(),
+        "the operator's own request is recorded"
+    );
+
+    std::env::remove_var(policy::ENV_MODE);
+    std::fs::remove_dir_all(&data_dir).ok();
+}
