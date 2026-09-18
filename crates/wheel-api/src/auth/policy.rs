@@ -189,12 +189,30 @@ const RULES: &[Rule] = &[
         path: "v1/agents/{}/clear",
         tier: Tier::Prompter,
     },
+    // Interrupting a turn is the same lifecycle class as stop/restart above -- a prompter who may
+    // already stop the agent outright may also ask its current turn to yield. Added in #75;
+    // missing from this table until now meant the route was unreachable at ANY tier, admin
+    // included (default-deny caught it, but that made it a dead route, not a working one).
+    Rule {
+        methods: POST,
+        path: "v1/agents/{}/interrupt",
+        tier: Tier::Prompter,
+    },
     // Read-only SQL, but expressed as SQL, behind an authorizer whose function arm was
     // allow-by-default as recently as ADVERSARY 044. `GET .../rows` gives a guest the same data
     // through a door with no SQL in it, so the lowest-trust tier need not stand on that.
     Rule {
         methods: POST,
         path: "v1/tables/{}/query",
+        tier: Tier::Prompter,
+    },
+    // `script_routes::run`'s own doc comment: "no wire to check, the same as
+    // POST /v1/tables/:id/query needing none for the project's own owner" -- the same tier as
+    // that route, for the same reason. Also missing a row entirely until now (unreachable at any
+    // tier, same class of gap as interrupt above).
+    Rule {
+        methods: POST,
+        path: "v1/scripts/{}/run",
         tier: Tier::Prompter,
     },
     // ---- admin: the general node patch ------------------------------------------------------
@@ -317,11 +335,19 @@ mod tests {
             Some(Tier::Prompter)
         );
         assert_eq!(
+            tier("POST", &format!("v1/agents/{AGENT}/interrupt")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
             tier("PUT", &format!("v1/nodes/{AGENT}/content")),
             Some(Tier::Prompter)
         );
         assert_eq!(
             tier("POST", &format!("v1/tables/{AGENT}/query")),
+            Some(Tier::Prompter)
+        );
+        assert_eq!(
+            tier("POST", &format!("v1/scripts/{AGENT}/run")),
             Some(Tier::Prompter)
         );
     }

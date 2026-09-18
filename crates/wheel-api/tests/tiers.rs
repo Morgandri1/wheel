@@ -1139,6 +1139,66 @@ async fn the_member_list_names_the_creator_who_is_not_a_row() {
     );
 }
 
+/// A prompter (not a guest) sees every member's real, unmasked email — masking is a guest-only
+/// concern, the same as it is for the members list's other tier-gated behaviour.
+#[tokio::test]
+async fn a_prompter_sees_real_emails_for_every_member_and_the_creator() {
+    let h = harness().await;
+    let (status, body) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}/members", h.project),
+        Some(&h.prompter),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["creator_email"], "creator@example.com", "{body}");
+    let members = body["members"].as_array().unwrap();
+    let by_role = |role: &str| {
+        members
+            .iter()
+            .find(|m| m["role"] == role)
+            .unwrap_or_else(|| panic!("no {role} row in {body:?}"))
+    };
+    assert_eq!(by_role("prompter")["email"], "prompter@example.com");
+    assert_eq!(by_role("guest")["email"], "guest@example.com");
+}
+
+/// The masking spec itself, server-side: a guest sees every OTHER member's email masked
+/// (first two + fixed three-dot mask + last two, full domain), but their own email plainly — they
+/// already know it. `user_id`/`creator` (opaque principals, nothing to hide) are never masked at
+/// any tier, confirmed by the existing `the_member_list_names_the_creator_who_is_not_a_row` above.
+#[tokio::test]
+async fn a_guest_sees_every_other_members_email_masked_but_their_own_plainly() {
+    let h = harness().await;
+    let (status, body) = call(
+        &h.app,
+        "GET",
+        &format!("/v1/projects/{}/members", h.project),
+        Some(&h.guest),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // "creator" -> first two "cr", last two "or".
+    assert_eq!(body["creator_email"], "cr•••or@example.com", "{body}");
+    let members = body["members"].as_array().unwrap();
+    let by_role = |role: &str| {
+        members
+            .iter()
+            .find(|m| m["role"] == role)
+            .unwrap_or_else(|| panic!("no {role} row in {body:?}"))
+    };
+    // "prompter" -> "pr"..."er"; someone else's row, masked.
+    assert_eq!(by_role("prompter")["email"], "pr•••er@example.com");
+    // The guest's OWN row: plain, not masked.
+    assert_eq!(by_role("guest")["email"], "guest@example.com");
+    // And user_id/creator never mask, at this tier or any other.
+    assert_eq!(body["creator"], h.creator_id);
+    assert_eq!(by_role("prompter")["user_id"], h.prompter_id);
+}
+
 // --------------------------------------------------------------------------- migration safety
 
 /// **The test that stands between this change and locking the live deployment's owner out.**

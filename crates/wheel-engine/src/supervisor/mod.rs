@@ -2420,6 +2420,16 @@ impl Supervisor {
         });
     }
 
+    /// The message body a resume timer queues for an agent whose own queue
+    /// was empty when its usage window reset (Morgan's report: an agent that
+    /// hit its limit mid-task, with nothing queued behind it, stayed parked
+    /// silently through a multi-day gap otherwise). Names WHY the turn is
+    /// starting rather than a bare "continue", so the model reads it as its
+    /// own usage window resetting, not an ambiguous new instruction from
+    /// someone else.
+    const RESUME_AFTER_LIMIT_BODY: &'static str =
+        "Your usage window has reset -- continue where you left off.";
+
     /// The resume timer firing. Inert unless the agent is still parked on a
     /// window that is now due: an operator's start or stop, or a newer limit
     /// with a later resume, win without any cancellation bookkeeping.
@@ -2434,8 +2444,40 @@ impl Supervisor {
         if !due {
             return;
         }
-        // Parked, so `deliver` resumes it only if work is waiting: a timer
-        // firing on an empty queue costs no process.
+        // `deliver` only resumes a parked agent if work is waiting
+        // (§2: "a timer firing on an empty queue costs no process") -- which
+        // is right for a queue that already has real work in it, but an
+        // agent that hit its limit mid-task with NOTHING queued behind it
+        // would otherwise stay parked forever: nothing else was ever going
+        // to send it a message. So an empty queue gets a synthetic
+        // MessageSender::System "continue" first, the same sender kind (and
+        // the same envelope-level distinction from a real user/agent
+        // message) already used for a delivery-failure notice.
+        let queued_continue = {
+            let conn = self.db.lock().unwrap();
+            // `unwrap_or(true)`, not `false`: the opposite direction from
+            // `deliver`'s own lookup, and deliberately so -- a failed read
+            // here must not enqueue a SECOND synthetic message on top of one
+            // that might already be there unseen. Assuming "has queue" skips
+            // the injection, at worst leaving the agent parked exactly as it
+            // was before this fix existed, never a duplicate continue.
+            if messages::has_queued(&conn, agent).unwrap_or(true) {
+                None
+            } else {
+                messages::enqueue(
+                    &conn,
+                    wheel_core::MessageSender::System,
+                    agent,
+                    Self::RESUME_AFTER_LIMIT_BODY.to_string(),
+                    None,
+                    None,
+                )
+                .ok()
+            }
+        };
+        if let Some(msg) = queued_continue {
+            publish_message(&self.events, &self.db.lock().unwrap(), msg.id);
+        }
         self.set_status(agent, AgentStatus::Parked, None);
         let _ = self.deliver(agent).await;
     }
@@ -2987,6 +3029,7 @@ mod tests {
             startup_deadline_secs: deadline_secs,
             harness_auth,
             script_execution_enabled: false,
+            ingress_diagnostic_logging: false,
         });
         let sup = Arc::new(
             Supervisor::with_harness(
@@ -3748,6 +3791,7 @@ done
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: crate::config::HarnessAuthPolicy::default(),
             script_execution_enabled: false,
+            ingress_diagnostic_logging: false,
         });
         let sup = Arc::new(
             Supervisor::with_harness(
@@ -4287,6 +4331,93 @@ done
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         assert_eq!(status_of(&sup, id), AgentStatus::Stopped);
         assert!(!has_process(&sup, id).await, "nothing was spawned");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Morgan's report: an agent that hit its usage limit mid-task, with
+    /// nothing else queued behind it, stayed parked silently through a
+    /// multi-day gap -- `resume_after_limit`'s own `deliver` call is a
+    /// deliberate no-op on an empty queue. This proves the fix: a synthetic
+    /// `MessageSender::System` continue is queued first, so the agent
+    /// actually starts and finishes a real turn once its window resets,
+    /// with nothing enqueued by the test itself.
+    #[tokio::test]
+    async fn an_agent_with_an_empty_queue_gets_a_synthetic_continue_when_its_window_resets() {
+        let (sup, id, dir) = fake_supervisor("quota-empty-resume", serde_json::json!({}), |_| {});
+        let soon = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        {
+            let conn = sup.db.lock().unwrap();
+            board::set_rate_limited(&conn, id, None, soon.into(), "closed");
+        }
+        // Deliberately NOT enqueuing anything -- the empty-queue case this
+        // fix closes. Before this fix, nothing would ever wake this agent.
+        sup.arm_resume_timer(id, soon);
+
+        until("the synthetic continue message to appear", || {
+            let conn = sup.db.lock().unwrap();
+            !messages::inbox(&conn, id, None, 10)
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .await;
+        let mid = message_to(&sup, id);
+        let queued = {
+            let conn = sup.db.lock().unwrap();
+            messages::inbox(&conn, id, None, 10).unwrap()
+        };
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly one synthetic message, not a pile-up: {queued:?}"
+        );
+        assert_eq!(
+            queued[0].from,
+            wheel_core::MessageSender::System,
+            "a system-injected continue must never be attributable to a real user or agent"
+        );
+        assert_eq!(queued[0].body, Supervisor::RESUME_AFTER_LIMIT_BODY);
+
+        until("the synthetic continue to complete a real turn", || {
+            settled(&sup, mid).state == MessageState::Consumed
+        })
+        .await;
+        assert_eq!(status_of(&sup, id), AgentStatus::Idle);
+        sup.stop(id).await.ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The requeued message itself already covers the non-empty-queue case
+    /// (`a_closed_usage_window_requeues_parks_and_resumes_at_the_reset`), so
+    /// this only has to prove the OTHER branch stays inert: a real message
+    /// already waiting must never also get a synthetic one stacked next to
+    /// it.
+    #[tokio::test]
+    async fn a_non_empty_queue_never_gets_a_synthetic_continue_added_to_it() {
+        let (sup, id, dir) =
+            fake_supervisor("quota-nonempty-resume", serde_json::json!({}), |_| {});
+        let soon = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        {
+            let conn = sup.db.lock().unwrap();
+            board::set_rate_limited(&conn, id, None, soon.into(), "closed");
+        }
+        enqueue(&sup, id, "real work, already queued");
+        sup.arm_resume_timer(id, soon);
+
+        let mid = message_to(&sup, id);
+        until("the real message to complete", || {
+            settled(&sup, mid).state == MessageState::Consumed
+        })
+        .await;
+        let queued = {
+            let conn = sup.db.lock().unwrap();
+            messages::inbox(&conn, id, None, 10).unwrap()
+        };
+        assert_eq!(
+            queued.len(),
+            1,
+            "no synthetic continue must appear beside real, already-queued work: {queued:?}"
+        );
+        sup.stop(id).await.ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 

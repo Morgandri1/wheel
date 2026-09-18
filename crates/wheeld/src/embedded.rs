@@ -157,6 +157,15 @@ impl Sandbox for EmbeddedSandbox {
             script_execution_enabled: std::env::var(wheel_engine::config::ENV_SCRIPT_EXEC)
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // Same read `Config::from_env` does (crates/wheel-engine/src/config.rs):
+            // off unless the operator explicitly opts in per PR #103's follow-up.
+            // This is the site that actually matters for the standalone `wheeld`
+            // deployment -- it builds `Config` by hand rather than through
+            // `from_env`, so a hardcoded `false` here would make WHEEL_LOG_MODE
+            // unsettable on the one binary Morgan actually runs.
+            ingress_diagnostic_logging: std::env::var(wheel_engine::config::ENV_LOG_MODE)
+                .map(|v| v == "diagnostic")
+                .unwrap_or(false),
         };
 
         let project = *id;

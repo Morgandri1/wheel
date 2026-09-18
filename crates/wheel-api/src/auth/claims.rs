@@ -21,12 +21,19 @@ pub struct Claims {
     pub nbf: Option<i64>,
     #[serde(default)]
     pub azp: Option<String>,
+    /// Best-effort display email, when the provider includes one. Never used as an identity —
+    /// `sub` is — and never validated the way `sub` is by `auth::principal`: it is display data
+    /// only, for the masked-email surface (`routes::members::list`), not something the API keys
+    /// anything security-relevant on.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// A user id that has been proven by signature verification.
 #[derive(Debug, Clone)]
 pub struct VerifiedUser {
     pub user_id: String,
+    pub email: Option<String>,
 }
 
 /// Verify a bearer token against the JWKS, or — only in dev — against the HS256 shared secret.
@@ -85,6 +92,7 @@ pub async fn verify(
 
     Ok(VerifiedUser {
         user_id: claims.sub,
+        email: claims.email,
     })
 }
 

@@ -260,7 +260,10 @@ Notable boundaries, each with a reason:
 * **The vault is admin only, including listing key names.** Per ADVERSARY 037 a vault value is
   readable by every agent in the project, so sharing a project must not share the creator's
   third-party credentials. Attaching or clearing an agent's LLM credential, and invoking a tool that
-  spends one, are admin for the same reason.
+  spends one, are admin for the same reason. Enforced server-side: `GET .../board` redacts every
+  vault (and any other node with `has_redactable_credentials()`) via `NodeConfig::redact_credentials`
+  before the response leaves the engine for any caller below admin (`board_routes.rs::get_board`) —
+  a client never receives key names to hide client-side.
 * **`/v1/cli/*` is refused to every tier, admins included**, when reached through the proxy. It is the
   node-token realm; the API cannot attribute an actor there, so it declines to carry one.
 * **Writing ctx content uses `PUT /v1/nodes/{id}/content`**, not `PATCH /v1/nodes/{id}`. The patch
@@ -320,7 +323,7 @@ request, and any live events WebSocket that member holds is closed rather than l
 ## Membership and invites
 
 ```
-GET    /v1/projects/{id}/members                    → { creator, members: [Member] }   (guest)
+GET    /v1/projects/{id}/members                    → { creator, creator_email?, members: [Member] }  (guest)
 POST   /v1/projects/{id}/members  {user_id, role}   → Member                           (admin)
 DELETE /v1/projects/{id}/members/{user_id}          → 204                              (admin)
 
@@ -337,12 +340,88 @@ is not a copy of anyone's invitations. It expires (7 days by default), has a use
 default), and may be locked to an email — checked against the account's *verified* address, never
 against a claim in the request.
 
+### Member and creator email — resolved for display, masked for a guest
+
+`Member.email` and `MemberList.creator_email` are `Option<String>`, omitted from the response
+entirely when there is nothing to show (`skip_serializing_if`, the same convention `Project.tier`
+uses) — clients must handle absence, not assume the field is always there.
+
+**Resolution.** `user_id`/`creator` are opaque principals — a `users.id` UUID under `local` auth, an
+external provider's `sub` under `jwks` — and are never masked at any tier, since they identify
+nothing about the person beyond "a member of this project," the same as a database row id would.
+`email` is a best-effort DISPLAY value resolved separately:
+- Under `local` auth, every member's principal IS a `users.id`, so the API looks up any row's email
+  directly — not just the caller's own.
+- Under `jwks`, there is deliberately no local account row for another provider's principal at all
+  (members can be `jwks` accounts with nothing in this API's own `users` table). The only email this
+  API can ever know for a `jwks` member is the CALLER'S OWN, read from the `email` claim on the JWT
+  that authenticated the current request, when the provider includes one. Every other `jwks`
+  member's `email` is always absent — not a gap to close, the honest limit of what a stateless
+  verifier can know about someone else's account.
+
+**Masking, guest tier only.** A guest sees every OTHER member's `email` (and `creator_email`, unless
+they are the creator) masked: first two characters, a fixed three-character mask (`•••`, not
+sized to the hidden length — a size-matched mask leaks the length), last two characters, domain
+shown in full (`so•••ne@example.com`). A local part of four characters or fewer shows only its
+first character plus the mask (`ab@x.com` and `abcd@x.com` are indistinguishable once masked, which
+is the point — showing both characters of a two-character local part is not meaningfully masked at
+all). Counted in Unicode code points, not bytes, so a multi-byte character is never split. A
+non-email-shaped identifier, if one is ever surfaced through this same helper elsewhere, gets the
+identical rule applied to the whole string.
+
+**The guest's own row is never masked** — they already know their own email, and masking it would
+cost them a lookup without hiding anything. Every other tier (`prompter`, `admin`) sees every email
+unmasked; masking is guest-specific, not a general privacy filter.
+
+**Enforced server-side**, in the handler, before the response is built — the same reasoning
+`GET .../board`'s `redact_credentials` already uses for vault key names: a client that masked the
+value itself would not protect a caller hitting this route directly (`curl`, a script, anything
+that is not the reference UI).
+
 Accepting is idempotent and **never lowers an existing tier**, so a stale guest link cannot be used
 to demote a prompter. Unknown, expired, revoked and exhausted invites are one indistinguishable
 answer: the link is a credential, so the response must not say which links exist.
 
 Listing invites is admin, not guest: an invite's existence and tier are facts about who is about to
 gain access.
+
+### Redaction contract for membership data (decision, 2026-09-13)
+
+**When a field in `Member` or `InviteInfo` is hidden from a caller's tier, it is PRESENT and emptied
+(`null` / `""` / `[]` as the field's type requires), never absent, and the containing object carries a
+sibling `"redacted": true`.** This is the same shape `RedactCredentials` already uses for a board
+node's config (`wheel-core`'s `NodeConfig::redact_credentials`) — one redaction convention across the
+whole API, not two, so a client needs exactly one parsing strategy wherever it sees `"redacted"`.
+
+Reasons, independent of the precedent alone:
+
+- **A required field cannot become absent without breaking strict deserialization.** `RedactCredentials`
+  empties `VaultConfig.keys` rather than removing it for exactly this reason ("a board entry that fails
+  to deserialize is worse than one that says nothing") — the same is true for a generated client's
+  non-optional field.
+- **Some of these fields are already legitimately `null` for a reason that has nothing to do with
+  redaction** — `Member.invited_by` is `null` for a member with no recorded inviter, and always
+  serializes as `"invited_by": null` today (it is `Option<String>` with no
+  `skip_serializing_if`, so absence was never how "no value" was expressed here). If redaction
+  ALSO used `null`, or used absence, a client could not tell "nothing to show" apart from "hidden from
+  you" — an explicit signal is required either way, which is the actual argument for matching the
+  existing shape rather than inventing a second one.
+- **Disclosure, checked per field rather than assumed:** presence-with-`redacted:true` for
+  `invited_by` tells a guest nothing they could not already infer (every member but the creator was
+  invited by *someone*); the same holds for an invite's `expires_at` (every invite has one). Where it
+  would not be a wash — e.g. whether an invite is email-locked, if that field is ever surfaced below
+  admin — omission is actually the *worse* choice: an invite either has a locked `email` or does not,
+  so omitting the field only on locked rows (to avoid saying "there's an email here, hidden") makes the
+  row shape itself the leak, distinguishing locked from unlocked invites by structure instead of by the
+  value the redaction was supposed to hide. Present-and-emptied has no such tell: every row keeps the
+  same keys regardless of what is inside them.
+
+Not a live gap today: `GET /v1/projects/{id}/members` is guest-visible and currently returns every
+`Member` field unredacted by design (`routes/members.rs`: "a guest may see who else is here"), and
+`GET .../invites` is admin-only at the *route* level, so there is no partial view of `InviteInfo` to
+redact yet. This is the contract for whichever of the two changes first — a new field on `Member` that
+should not be guest-visible, or a lower-tier view of invites — so it is decided once, in the open,
+rather than by whichever PR happens to touch it first.
 
 ## Routes
 
@@ -377,6 +456,35 @@ directly.
 Liveness only — no backend name, no project counts, no upstream error text. The answer is cached for
 one second: the route is unauthenticated, and without that a flood here becomes a flood against the
 one machine every tenant's sandbox runs on.
+
+### `GET /v1/info`
+
+Unauthenticated capability discovery for this API-layer build, mirroring `GET /v1/engine` one layer
+down (`PROTOCOL.md`'s "Engine discovery"): what THIS layer can do, checked before a client depends on
+it, rather than inferred from an incidental response field.
+
+```jsonc
+{
+  "version": "0.1.0",     // CARGO_PKG_VERSION, compile-time
+  "api_version": "v1",
+  "features": ["membership"]
+}
+```
+
+**Why this exists rather than an engine `FEATURES` id:** membership (`POST /v1/projects/{id}/members`
+and friends, below) is enforced entirely in this crate's own auth/policy layer before a request ever
+reaches a project's engine — `wheel-engine` has no route, config field or behaviour for it at all, so
+there is nothing there a test could hold a `"membership"` id to. It would be a permanently-true string
+with no engine-side truth behind it. This route is the discovery surface for capabilities that belong
+to the API layer instead — `tests/info.rs` proves `membership` by calling a real membership route
+against a real project, not by asserting the string is present in a const.
+
+- **Additive only**, same rule as `GET /v1/engine`: a client ignores fields and feature ids it does
+  not know. An absent id means the capability is not there.
+
+| Feature id | What it guarantees |
+|---|---|
+| `membership` | `/v1/projects/{id}/members`, `/v1/projects/{id}/invites` and `/v1/invites/accept` exist and behave as documented under "Membership and invites" above. |
 
 ### `POST /v1/projects`
 ```bash

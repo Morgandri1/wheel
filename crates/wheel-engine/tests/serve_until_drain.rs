@@ -31,6 +31,7 @@ async fn a_half_sent_request_cannot_hold_the_engine_open() {
         startup_deadline_secs: wheel_engine::config::DEFAULT_STARTUP_DEADLINE_SECS,
         harness_auth: Default::default(),
         script_execution_enabled: false,
+        ingress_diagnostic_logging: false,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let engine = tokio::spawn(wheel_engine::serve_until(cfg, async move {

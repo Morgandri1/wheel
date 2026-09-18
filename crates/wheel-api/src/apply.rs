@@ -863,7 +863,17 @@ fn minimal_patch(
 pub trait BoardClient: Send + Sync {
     async fn create_node(&self, node: &EmittedNode) -> Result<Uuid, String>;
     async fn patch_config(&self, id: Uuid, config: &serde_json::Value) -> Result<(), String>;
-    async fn add_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String>;
+    /// `Ok(Some(warning))` is a wire the engine created but flagged as deserving the operator's
+    /// attention (the same non-error, board-state-flag mechanism `wheel-engine`'s own `add_wire`
+    /// uses — e.g. an ambiguous vault credential, or an `endpoint(auth:none)->agent(send)` wire
+    /// whose target agent also holds a `ctx` write wire, finding 043's addendum). The wire is
+    /// created either way; this is purely advisory.
+    async fn add_wire(
+        &self,
+        from: Uuid,
+        to: Uuid,
+        wire_type: WireType,
+    ) -> Result<Option<String>, String>;
     async fn delete_node(&self, id: Uuid) -> Result<(), String>;
     async fn delete_wire(&self, from: Uuid, to: Uuid, wire_type: WireType) -> Result<(), String>;
 }
@@ -942,6 +952,17 @@ impl Failure {
     }
 }
 
+/// A wire that was created but that the engine flagged as deserving the operator's attention —
+/// not a refusal (the wire exists), not silently dropped either. Board-apply's own leg of the
+/// same mechanism `wheel-engine`'s `board_routes.rs` already surfaces to the interactive UI: a
+/// caller building a board through this route deserves the identical warning, not a discarded
+/// response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireWarning {
+    pub wire: WireRef,
+    pub message: String,
+}
+
 /// Exactly what happened. Never "ok" for a partial apply — see `is_complete`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ApplyReport {
@@ -950,6 +971,8 @@ pub struct ApplyReport {
     pub created_wires: Vec<WireRef>,
     pub deleted_nodes: Vec<String>,
     pub deleted_wires: Vec<WireRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<WireWarning>,
     pub failures: Vec<Failure>,
 }
 
@@ -1056,7 +1079,15 @@ pub async fn execute(
             continue;
         };
         match client.add_wire(from, to, wire.wire_type).await {
-            Ok(()) => report.created_wires.push(reference),
+            Ok(warning) => {
+                report.created_wires.push(reference.clone());
+                if let Some(message) = warning {
+                    report.warnings.push(WireWarning {
+                        wire: reference,
+                        message,
+                    });
+                }
+            }
             Err(error) => report.failures.push(Failure::wire(&reference, error)),
         }
     }
@@ -1108,6 +1139,7 @@ mod tests {
     struct FakeClient {
         fail_node: Option<String>,
         fail_wire: bool,
+        wire_warning: Option<String>,
         created: std::sync::Mutex<Vec<String>>,
         patched: std::sync::Mutex<Vec<Uuid>>,
         patch_bodies: std::sync::Mutex<Vec<serde_json::Value>>,
@@ -1119,6 +1151,7 @@ mod tests {
             Self {
                 fail_node: None,
                 fail_wire: false,
+                wire_warning: None,
                 created: std::sync::Mutex::new(Vec::new()),
                 patched: std::sync::Mutex::new(Vec::new()),
                 patch_bodies: std::sync::Mutex::new(Vec::new()),
@@ -1149,11 +1182,16 @@ mod tests {
             self.deleted_wires.lock().unwrap().push((f, t, w));
             Ok(())
         }
-        async fn add_wire(&self, _f: Uuid, _t: Uuid, _w: WireType) -> Result<(), String> {
+        async fn add_wire(
+            &self,
+            _f: Uuid,
+            _t: Uuid,
+            _w: WireType,
+        ) -> Result<Option<String>, String> {
             if self.fail_wire {
                 return Err("engine refused the wire".into());
             }
-            Ok(())
+            Ok(self.wire_warning.clone())
         }
     }
 
@@ -1180,6 +1218,45 @@ mod tests {
         assert_eq!(report.created_nodes.len(), 2);
         assert_eq!(report.created_wires.len(), 1);
         assert!(report.failures.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    /// A wire the engine creates but flags (the same non-error mechanism `board_routes.rs`
+    /// surfaces to the interactive UI) must not be silently dropped just because this board came
+    /// through the apply route rather than a hand-drawn wire — it is still `is_complete()` (the
+    /// wire was NOT refused), but the caller can see exactly which wire and why.
+    #[tokio::test]
+    async fn a_flagged_wire_is_still_created_and_the_warning_is_reported_against_it() {
+        let b = board(serde_json::json!({
+            "nodes": [agent("researcher"), ctx("notes")],
+            "wires": [{"from": "notes", "to": "researcher", "type": "send"}],
+        }));
+        let existing = ExistingBoard::default();
+        let plan = validate(
+            &b,
+            &existing,
+            ApplyPolicy {
+                allow_patch: true,
+                allow_wire: true,
+                ..Default::default()
+            },
+        )
+        .expect("legal");
+        let mut client = FakeClient::new();
+        client.wire_warning = Some("exposes notes to unauthenticated input".into());
+        let report = execute(&plan, &existing, &client).await;
+
+        assert!(
+            report.is_complete(),
+            "a flagged wire is not a failure: {report:?}"
+        );
+        assert_eq!(report.created_wires.len(), 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].wire, report.created_wires[0]);
+        assert_eq!(
+            report.warnings[0].message,
+            "exposes notes to unauthenticated input"
+        );
     }
 
     /// The success-shape invariant: a partial apply must never look complete.

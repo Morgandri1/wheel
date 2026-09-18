@@ -40,7 +40,10 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, ProjectScope};
 use crate::error::{ApiError, ApiResult};
+use crate::http::actor;
+use crate::routes::proxy::{self, require_engine_tier};
 use crate::state::AppState;
+use wheel_core::proxy_path;
 
 /// The MCP revision this speaks. Clients send their own; we answer with ours.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -270,13 +273,15 @@ async fn projects(state: &AppState, user: &AuthUser) -> Result<String, ApiError>
     Ok(pretty(&json!(list)))
 }
 
-/// Authorise THIS call for the project it names.
-async fn scope(state: &AppState, user: &AuthUser, args: &Value) -> Result<Uuid, ApiError> {
+/// Prove membership in the project this call names — but NOT the whole authorisation. The tier
+/// this returns still has to be checked per tool, per call, against the exact engine path that
+/// call is about to hit: `engine()` does that, reusing `auth::policy`'s own table rather than this
+/// function silently becoming a second, driftable copy of it.
+async fn scope(state: &AppState, user: &AuthUser, args: &Value) -> Result<ProjectScope, ApiError> {
     let raw = string(args, "project")?;
     let id = Uuid::parse_str(raw.trim())
         .map_err(|_| ApiError::BadRequest("project must be a uuid".into()))?;
-    let scope = ProjectScope::for_target(state, user, id).await?;
-    Ok(scope.project.id)
+    ProjectScope::for_target(state, user, id).await
 }
 
 fn agent_id(args: &Value) -> Result<Uuid, ApiError> {
@@ -295,9 +300,16 @@ fn string(args: &Value, key: &str) -> Result<String, ApiError> {
 ///
 /// The suffix goes through the same `upstream_url` the proxy uses, so a path a
 /// parser could read two ways is refused here exactly as it is there.
+///
+/// **This is the authorisation boundary for every MCP tool, not a detail of how the request is
+/// sent.** Every tool call reaches the engine through here, so gating it once, here, protects every
+/// tool — the same shape `routes::proxy::engine_proxy` uses for the HTTP proxy, reusing its exact
+/// `require_engine_tier` rather than a second copy of the tier table that could silently disagree
+/// with it. Previously this function trusted the caller entirely and sent no actor headers at all,
+/// which is what let a guest reach `send`/`start`/`stop` — Prompter-tier actions — through MCP.
 async fn engine(
     state: &AppState,
-    project: &Uuid,
+    scope: &ProjectScope,
     method: Method,
     rest: &str,
     body: Option<Value>,
@@ -306,11 +318,18 @@ async fn engine(
         Some((p, q)) => (p, Some(q)),
         None => (rest, None),
     };
-    let url = crate::routes::proxy::upstream_url(&state.engine_base_url(project), path, query)?;
+    let segments = proxy_path::proxy_segments(path)
+        .map_err(|_| ApiError::BadRequest("path traversal is not permitted".into()))?;
+    require_engine_tier(scope, &method, &segments)?;
+
+    let url = proxy::upstream_url(&state.engine_base_url(&scope.project.id), path, query)?;
+    let mut actor_headers = axum::http::HeaderMap::new();
+    actor::set_actor(&mut actor_headers, &scope.user, scope.tier);
     let mut req = state
         .http
         .request(method, url)
-        .bearer_auth(state.cfg.host_secret.expose());
+        .bearer_auth(state.cfg.host_secret.expose())
+        .headers(actor_headers);
     if let Some(body) = body {
         req = req.json(&body);
     }

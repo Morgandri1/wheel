@@ -85,3 +85,44 @@ already exposed. So after the carrier is closed, rotate — but rotate the VALUE
 ## Note
 Credit to PM: insisting on CONFIRMING the endpoint's auth mode rather than assuming Bearer is what turned a
 false "latent" rating into the true "live" one. The conditional was right; the fact was the other way.
+
+## 2026-09-13 addendum — the two-hop chain (endpoint→agent→ctx) is a WORSE blast radius, same root cause
+
+API found this reviewing PR #69 and asked that it be formalized rather than left as an aside. This file
+already names the shape in passing (line 27: the PM agent is dangerous partly because it can "write to
+ctx/plans"), but the systemic-fix section above only checks the DIRECT `endpoint(none)→agent(send)` wire —
+it does not consider what that agent does with the message once it has it, which is where this variant
+diverges.
+
+**The chain:** `endpoint(auth:none) --send--> agent --write--> ctx`. If the SAME agent that receives an
+unauthenticated webhook hit ALSO holds a `write` wire to a `ctx` node, a prompt-injected reply doesn't stay
+scoped to that agent's one turn (the blast radius this file's existing chain assumes) — it can write
+attacker-controlled content into ctx, which §3's own injection rule then reinjects into the SYSTEM PROMPT
+of every OTHER agent wired to read that ctx, on every start and every context-clear, until someone notices
+and rewrites it. That is board-wide and durable, not one-agent-one-turn. Same root cause as the rest of
+this file (no layer says anything at the moment the DANGEROUS COMBINATION of wires is drawn); one hop
+further; materially worse blast radius, because the amplification point (ctx re-injection) is itself
+already a known high-leverage vector — see the adversary review that shaped `docs/proposals/
+tool-mcp-output-escaping.md`'s design: "a forged tag in ctx becomes system-prompt content, re-injected on
+every start/context-clear... categorically higher persistence and leverage than [a message]." This finding
+is that same persistence property, reached via a webhook instead of a forged tag.
+
+**Severity:** rate this specific chain variant at least as seriously as this file's own systemic-gap rating
+(High) — arguably higher given the amplification, though not independently re-litigating the file's
+existing Critical rating for the LIVE Telegram/PM-agent instance, which is a separate, already-tracked
+fact pattern (that instance's ADDITIONAL exposure via this exact ctx angle should be checked as part of
+its own remediation, not assumed absent).
+
+**Fix — extend the SAME systemic-fix mechanism this file already asks for, not a new one:**
+- Web endpoint panel / API board-state flag: when an endpoint has `auth:none` AND a `send` wire to an
+  agent, the warning this file already asks for must ALSO check whether that same agent holds any `write`
+  wire to a `ctx` (or, by the same logic, a `table` other agents' prompts or logic depend on) node, and
+  say so distinctly — "this exposes `<ctx>` to unauthenticated internet content, reinjected into every
+  agent that reads it" is a different, worse warning than "this exposes `<agent>` for one turn," and an
+  operator deciding whether to accept the risk needs to know which one they're looking at.
+- The check is transitive over exactly one additional hop (endpoint→agent→ctx), not a general reachability
+  analysis — do not scope-creep this into graph-walking the whole board; the two-hop case is the one with a
+  demonstrated, high-leverage amplification mechanism (ctx's own injection semantics) behind it.
+
+Owner: same as the file's existing systemic fix (Web + API/Engine), since it is the identical mechanism
+gaining one more condition to check, not a new one to build.

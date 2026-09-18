@@ -24,9 +24,39 @@ use uuid::Uuid;
 
 #[derive(Serialize)]
 pub struct MemberList {
-    /// The creator, who is always an admin and is never a `project_members` row.
+    /// The creator, who is always an admin and is never a `project_members` row. A principal —
+    /// opaque under either auth mode — never masked: it identifies nothing about the person beyond
+    /// "member of this project", the same as a database row id would.
     creator: String,
+    /// Display email for the creator, resolved and (for a guest caller, except their own) masked
+    /// the same way each member's `email` below is. See `display_email`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creator_email: Option<String>,
     members: Vec<membership::Member>,
+}
+
+/// The best display email this deployment can honestly attach to `user_id`, or `None`.
+///
+/// Under `local` auth every member's principal IS a `users.id`, so any row's email is one lookup
+/// away — not just the caller's own. Under `jwks` there is deliberately no local row for another
+/// provider's principal at all (migration 0006), so the ONLY email the server can ever know for a
+/// jwks member is the caller's own, carried on `AuthUser` from the token THIS request presented —
+/// `None` for every other jwks row is not a gap to close, it is the honest limit of what the server
+/// can know without inventing a second identity store.
+async fn display_email(state: &AppState, scope: &ProjectScope, user_id: &str) -> Option<String> {
+    match state.cfg.auth_mode {
+        crate::config::AuthMode::Local => {
+            let id = Uuid::parse_str(user_id).ok()?;
+            crate::auth::local::find_user(&state.db, &id)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| u.email)
+        }
+        crate::config::AuthMode::Jwks => (user_id == scope.user.id())
+            .then(|| scope.user.email().map(str::to_string))
+            .flatten(),
+    }
 }
 
 /// `GET /v1/projects/{id}/members`
@@ -34,10 +64,34 @@ pub async fn list(
     State(state): State<AppState>,
     scope: ProjectScope,
 ) -> ApiResult<Json<MemberList>> {
-    // No `require`: reaching here proved membership, and a guest may see who else is here.
-    let members = membership::list(&state.db, &scope.project.id).await?;
+    // No `require`: reaching here proved membership, and a guest may see who else is here — WHO,
+    // not necessarily their exact email if a lower tier shouldn't see it. `user_id`/`creator` stay
+    // raw at every tier (opaque principals, nothing to hide); `email` is masked for a guest caller
+    // on every row but their own, server-side, the same reasoning `get_board`'s
+    // `redact_credentials` already uses: client-side masking alone would not protect a caller
+    // hitting this route directly.
+    let mut members = membership::list(&state.db, &scope.project.id).await?;
+    let creator_id = scope.project.owner_id.clone();
+    let mut creator_email = display_email(&state, &scope, &creator_id).await;
+    for member in &mut members {
+        member.email = display_email(&state, &scope, &member.user_id).await;
+    }
+
+    if scope.tier == Tier::Guest {
+        let caller = scope.user.id();
+        if creator_id != caller {
+            creator_email = creator_email.map(|e| wheel_core::mask_identifier(&e));
+        }
+        for member in &mut members {
+            if member.user_id != caller {
+                member.email = member.email.as_deref().map(wheel_core::mask_identifier);
+            }
+        }
+    }
+
     Ok(Json(MemberList {
-        creator: scope.project.owner_id.clone(),
+        creator: creator_id,
+        creator_email,
         members,
     }))
 }

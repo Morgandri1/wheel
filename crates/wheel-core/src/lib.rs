@@ -19,6 +19,7 @@
 pub mod engine;
 pub mod event;
 pub mod host;
+pub mod identity_mask;
 pub mod message;
 pub mod name;
 pub mod node;
@@ -37,6 +38,7 @@ pub use host::{
     Capabilities, ErrorBody, ErrorDetail, HostHealth, SandboxBackend, SandboxInfo, SandboxStatus,
     SandboxUpsert, UidIsolation, ENV_ALLOW_SHARED_UID, SHARED_UID_WARNING,
 };
+pub use identity_mask::mask_identifier;
 pub use message::{
     escape_envelope_body, escape_tool_output_marker, map_json_strings, map_json_strings_and_keys,
     sha256_hex, wrap_tool_output, Message, MessageReceipt, MessageSender, MessageState,

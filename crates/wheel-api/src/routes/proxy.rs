@@ -90,7 +90,12 @@ pub async fn engine_proxy(
 ///
 /// A path with no rule is refused, not allowed: `auth::policy` is default-DENY, so adding an engine
 /// route without a rule makes it unreachable through the API rather than reachable by everyone.
-fn require_engine_tier(
+///
+/// `pub(crate)`: `routes::mcp`'s `engine()` reuses this directly rather than re-deriving the same
+/// check against a second copy of the tier table — two authorisation tables that can drift is its
+/// own bug class, and it is exactly how the MCP bypass this closes was introduced in the first
+/// place (MCP called the engine directly, past this function, with no tier check of its own at all).
+pub(crate) fn require_engine_tier(
     scope: &ProjectScope,
     method: &axum::http::Method,
     segments: &[&str],

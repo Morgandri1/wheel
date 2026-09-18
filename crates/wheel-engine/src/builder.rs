@@ -1189,6 +1189,7 @@ mod tests {
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: policy,
             script_execution_enabled: false,
+            ingress_diagnostic_logging: false,
         }
     }
 

@@ -135,6 +135,10 @@ impl From<db::board::BoardError> for ApiError {
             // so it is the caller's to fix, not an internal fault.
             B::Storage(m) => ApiError::invalid(m),
             B::Fallback(m) => ApiError::invalid(m),
+            // 409, same class as NameTaken: well-formed request, the board
+            // already has a node claiming this identity (here, the (method,
+            // path) an endpoint answers rather than a name).
+            B::DuplicatePath(m) => ApiError::new(StatusCode::CONFLICT, "duplicate_path", m),
         }
     }
 }
@@ -483,6 +487,7 @@ pub(crate) fn test_state_with(
         // The runtime is buildable and testable ahead of F007 (docs/proposals/
         // script-execution-scope.md); only PRODUCTION defaults this off.
         script_execution_enabled: true,
+        ingress_diagnostic_logging: false,
     });
     let db = Arc::new(Mutex::new(db::open_memory().unwrap()));
     let events = Arc::new(crate::events::Bus::new());

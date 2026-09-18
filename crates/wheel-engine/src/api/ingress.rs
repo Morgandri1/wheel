@@ -268,13 +268,22 @@ fn authenticate(
             // Logged, unlike a bad credential: hiding a WRONG presented
             // secret protects against enumeration; hiding a BROKEN endpoint
             // just leaves the operator staring at silent 401s (this bug).
-            tracing::warn!(
-                endpoint = %matched.name,
-                endpoint_id = %matched.id,
-                reason = reason.as_str(),
-                "auth:bearer endpoint cannot resolve its secret — every request will 401 \
-                 until this is fixed"
-            );
+            //
+            // Gated on WHEEL_LOG_MODE=diagnostic (Morgan's explicit ask,
+            // after #103 shipped): diagnostic detail an operator opts into
+            // while debugging one endpoint, off by default rather than a
+            // standing log line on every deployment. The gate is on THIS
+            // branch only -- a wrong presented credential was never logged
+            // either way, and still isn't, regardless of the flag.
+            if state.cfg.ingress_diagnostic_logging {
+                tracing::warn!(
+                    endpoint = %matched.name,
+                    endpoint_id = %matched.id,
+                    reason = reason.as_str(),
+                    "auth:bearer endpoint cannot resolve its secret — every request will 401 \
+                     until this is fixed"
+                );
+            }
             return false;
         }
     };
@@ -873,6 +882,7 @@ mod tests {
                 startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
                 harness_auth: crate::config::HarnessAuthPolicy::default(),
                 script_execution_enabled: false,
+                ingress_diagnostic_logging: false,
             });
             let conn = crate::db::open_memory().unwrap();
             let vault = Node::new(
@@ -924,6 +934,104 @@ mod tests {
                 resolve_secret(&state, &matched, "v/S"),
                 Err(SecretError::NoVaultKey(_))
             ));
+        }
+
+        /// Morgan's explicit ask, after #103 shipped: gate the logging, not
+        /// the authentication outcome. `authenticate()` must refuse a
+        /// request that hits an operator-error `SecretError` identically
+        /// whether `ingress_diagnostic_logging` is on or off -- the flag
+        /// controls a `tracing::warn!` call, nothing about what gets
+        /// returned to the caller.
+        #[test]
+        fn the_diagnostic_logging_flag_never_changes_whether_a_request_is_refused() {
+            use wheel_core::{
+                AgentConfig, EndpointAuth, EndpointConfig, HttpMethod, Node, Position,
+                ResponseMode, VaultConfig,
+            };
+
+            for diagnostic in [false, true] {
+                let vault_key = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+                };
+                let cfg = std::sync::Arc::new(crate::config::Config {
+                    project_id: Uuid::new_v4(),
+                    engine_secret: "0123456789abcdef".into(),
+                    vault_key: Some(vault_key),
+                    data_dir: std::env::temp_dir()
+                        .join(format!("wheel-ingress-test-{}", Uuid::new_v4())),
+                    listen: wheel_core::ListenAddr::parse("tcp://127.0.0.1:7999").unwrap(),
+                    json_logs: false,
+                    tool_allow_hosts: Vec::new(),
+                    startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+                    harness_auth: crate::config::HarnessAuthPolicy::default(),
+                    script_execution_enabled: false,
+                    ingress_diagnostic_logging: diagnostic,
+                });
+                let conn = crate::db::open_memory().unwrap();
+                let vault = Node::new(
+                    Uuid::new_v4(),
+                    "v".parse().unwrap(),
+                    Position::default(),
+                    NodeConfig::Vault(VaultConfig {
+                        keys: vec!["S".into()],
+                    }),
+                );
+                let agent = Node::new(
+                    Uuid::new_v4(),
+                    "a".parse().unwrap(),
+                    Position::default(),
+                    NodeConfig::Agent(AgentConfig::default()),
+                );
+                let endpoint = Node::new(
+                    Uuid::new_v4(),
+                    "e".parse().unwrap(),
+                    Position::default(),
+                    NodeConfig::Endpoint(EndpointConfig {
+                        method: HttpMethod::Post,
+                        path: "/hook".into(),
+                        response_mode: ResponseMode::Ack,
+                        auth: EndpointAuth::Bearer {
+                            vault_ref: "v/S".into(),
+                        },
+                    }),
+                );
+                board::create(&conn, &vault).unwrap();
+                board::create(&conn, &agent).unwrap();
+                board::create(&conn, &endpoint).unwrap();
+                board::add_wire(&conn, endpoint.id, vault.id, WireType::Read, None).unwrap();
+                board::add_wire(&conn, endpoint.id, agent.id, WireType::Send, None).unwrap();
+                // No value ever `put` at "S" -- a real, operator-error SecretError
+                // (NoSuchKey), the same class of failure the flag gates logging for.
+                let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                let events = std::sync::Arc::new(crate::events::Bus::new());
+                let supervisor =
+                    crate::supervisor::Supervisor::new(cfg.clone(), db.clone(), events.clone());
+                let state = AppState {
+                    supervisor: std::sync::Arc::new(supervisor),
+                    cfg,
+                    db,
+                    events,
+                    logins: std::sync::Arc::new(crate::oauth::LoginSessions::default()),
+                    ingress_rate: std::sync::Arc::new(RateLimiter::default()),
+                    builder: std::sync::Arc::new(crate::builder::Builder::default()),
+                };
+                let matched = MatchedEndpoint {
+                    id: endpoint.id,
+                    name: endpoint.name.clone(),
+                    config: match &endpoint.config {
+                        NodeConfig::Endpoint(c) => c.clone(),
+                        _ => unreachable!(),
+                    },
+                };
+                let headers = HeaderMap::new();
+                let uri: Uri = "/hook".parse().unwrap();
+                assert!(
+                    !authenticate(&state, &matched, &headers, &uri, b""),
+                    "diagnostic={diagnostic}: an operator-error case must still refuse the \
+                     request regardless of the logging flag"
+                );
+            }
         }
 
         /// The smoking-gun case: a value stored under one vault key that no

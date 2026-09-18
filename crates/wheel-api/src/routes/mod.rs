@@ -2,6 +2,7 @@ pub mod auth;
 pub mod board_apply;
 pub mod builder;
 pub mod health;
+pub mod info;
 pub mod ingress;
 pub mod instantiate;
 pub mod mcp;

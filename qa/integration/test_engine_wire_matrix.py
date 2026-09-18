@@ -112,6 +112,11 @@ def main():
                 # Hyphens stay in every OTHER type's name on purpose: §3 permits them and
                 # the address path should keep being exercised with one.
                 nm = "%s_%d" % (t, n) if t == "table" else "%s-%d" % (t, n)
+                # Two endpoints sharing one path used to silently shadow each other; the
+                # engine now refuses the second (endpoint path-uniqueness invariant), so
+                # this fixture's own two endpoint nodes need distinct paths to coexist.
+                if t == "endpoint":
+                    cfg = {**cfg, "path": "%s-%d" % (cfg["path"], n)}
                 st, body, _ = api("POST", "/v1/nodes",
                                   {"name": nm, "type": t, "position": {"x": 0.0, "y": 0.0},
                                    "config": cfg})
