@@ -149,6 +149,46 @@ export interface Project {
   tier?: import("../tiers").Tier;
 }
 
+/**
+ * `GET /v1/projects/{id}/members` (§"Membership and invites"). `user_id`/`creator` are opaque
+ * principals, never masked; `email` is a best-effort display value, absent when this deployment has
+ * no way to know it, and masked (for a guest caller, on every row but their own) server-side —
+ * never something a client redoes, since a caller hitting the route directly would bypass it.
+ */
+export interface Member {
+  user_id: string;
+  role: import("../tiers").Tier;
+  invited_by: string | null;
+  created_at: string;
+  updated_at: string;
+  email?: string;
+}
+
+export interface MemberList {
+  creator: string;
+  creator_email?: string;
+  members: Member[];
+}
+
+/** `GET /v1/projects/{id}/invites` — admin only, even to list: an invite's existence is a fact. */
+export interface InviteInfo {
+  id: string;
+  project_id: string;
+  role: import("../tiers").Tier;
+  email: string | null;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  max_uses: number;
+  uses: number;
+  revoked_at: string | null;
+}
+
+/** `POST /v1/projects/{id}/invites` — `token` is the only time the value is ever returned. */
+export interface CreatedInvite extends InviteInfo {
+  token: string;
+}
+
 export interface Board {
   nodes: WheelNode[];
   /**

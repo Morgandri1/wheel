@@ -14,6 +14,7 @@ import { Canvas } from "@/components/board/canvas";
 import { Inspector } from "@/components/inspector";
 import { AgentDrawer } from "@/components/drawer/agent-drawer";
 import { BuilderSession } from "@/components/builder/builder-session";
+import { MembersPanel } from "@/components/members/members-panel";
 import { StatusBar } from "@/components/board/status-bar";
 import { Header } from "@/components/header";
 import { Button, Empty, Skeleton } from "@/components/ui";
@@ -109,6 +110,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
    */
   const [skipBuilder, setSkipBuilder] = useState(false);
   const [improving, setImproving] = useState(false);
+  const [membersOpen, setMembersOpen] = useState(false);
   const builderForEmptyBoard = nodes.length === 0 && !skipBuilder;
   // What the builder is shown and what an improve proposal is read against.
   const known = useMemo(
@@ -170,9 +172,15 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
             </span>
           ) : null}
 
+          <span className="flex-1" />
+          {/* Membership is worth seeing even on a stopped project — it is about who can reach it,
+              not what it is doing right now. */}
+          <Button size="sm" data-testid="btn-open-members" onClick={() => setMembersOpen(true)}>
+            Members
+          </Button>
+
           {running ? (
             <>
-              <span className="flex-1" />
               {/* The mockup's top-bar actions. Export is a real thing you can do with what the
                   board already returns; parking every agent at once is the one bulk action worth
                   having, because the reason you want it is a bill. */}
@@ -292,6 +300,12 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
           <AgentDrawer nodes={nodes} api={api} projectId={projectId} />
         </>
       )}
+      <MembersPanel
+        open={membersOpen}
+        onClose={() => setMembersOpen(false)}
+        projectId={projectId}
+        tier={project.data?.tier}
+      />
     </div>
   );
 }

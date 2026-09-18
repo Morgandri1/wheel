@@ -23,7 +23,11 @@ import type {
   AuthBegin,
   AuthStatus,
   Board,
+  CreatedInvite,
+  InviteInfo,
   LogLine,
+  Member,
+  MemberList,
   Message,
   NodeType,
   Position,
@@ -121,6 +125,51 @@ export const projects = {
   start: (id: string) => request<Project>(projectPath(id, "start"), { method: "POST", projectId: id }),
   stop: (id: string) => request<Project>(projectPath(id, "stop"), { method: "POST", projectId: id }),
   restart: (id: string) => request<Project>(projectPath(id, "restart"), { method: "POST", projectId: id }),
+};
+
+// ---------------------------------------------------------------- membership and invites (§"Membership and invites")
+
+export const members = {
+  list: (projectId: string) =>
+    request<MemberList>(projectPath(projectId, "members"), { projectId }),
+  /** Also how an existing member's tier is changed: the route upserts on `(project, user_id)`. */
+  grant: (projectId: string, userId: string, role: import("@/lib/tiers").Tier) =>
+    request<Member>(projectPath(projectId, "members"), {
+      method: "POST",
+      body: { user_id: userId, role },
+      projectId,
+    }),
+  revoke: (projectId: string, userId: string) =>
+    request<void>(projectPath(projectId, "members", userId), {
+      method: "DELETE",
+      projectId,
+      expect: "void",
+    }),
+};
+
+export const invites = {
+  list: (projectId: string) =>
+    request<InviteInfo[]>(projectPath(projectId, "invites"), { projectId }),
+  create: (
+    projectId: string,
+    body: {
+      role: import("@/lib/tiers").Tier;
+      email?: string;
+      expires_in_days?: number;
+      max_uses?: number;
+    },
+  ) =>
+    request<CreatedInvite>(projectPath(projectId, "invites"), {
+      method: "POST",
+      body,
+      projectId,
+    }),
+  revoke: (projectId: string, inviteId: string) =>
+    request<void>(projectPath(projectId, "invites", inviteId), {
+      method: "DELETE",
+      projectId,
+      expect: "void",
+    }),
 };
 
 // ---------------------------------------------------------------- engine, via the API proxy (§4)
