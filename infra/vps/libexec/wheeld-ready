@@ -1,0 +1,89 @@
+#!/bin/sh
+# Copyright Morgan Metz
+# Licensed under the PolyForm Noncommercial License 1.0.0.
+# See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
+
+# wheeld.service's ExecStartPost. Two jobs, and both are about a promise being MEASURED rather than
+# declared.
+#
+#   1. Make `systemctl status` tell the truth. Type=simple reports "active (running)" the instant
+#      execve succeeds — before the store is opened, before migrations, before anything binds. For
+#      Type=simple systemd does not finish the start job until ExecStartPost exits, so blocking here
+#      until /healthz answers is what makes `systemctl start wheeld` mean "wheeld is serving" and
+#      `systemctl status` stop lying. (The real fix is Type=notify and one sd_notify(READY=1) after
+#      the bind: follow-up F1 in docs/proposals/wheeld-native-production.md.)
+#
+#   2. Prove the loopback promise against the kernel. The Docker path earns "nothing is published"
+#      from compose's `ports: "127.0.0.1:8080:8080"`. Natively the equivalent has to come from
+#      somewhere real, and a line in a unit file is not real — it is the same class of claim as the
+#      compose file. So this reads the actual listening socket and fails the unit if wheeld's port
+#      is bound anywhere but loopback.
+#
+# Failing here fails the unit, which with Restart=on-failure and StartLimitBurst means a wheeld that
+# starts but never serves is caught and stopped rather than sitting there reported as healthy.
+set -eu
+
+fail() {
+    echo "wheeld-ready: $*" >&2
+    exit 1
+}
+
+bind="${BIND_ADDR:-127.0.0.1:8080}"
+port="${bind##*:}"
+probe="http://127.0.0.1:$port/healthz"
+
+# Generous on purpose: the deadline that matters is a daemon that never serves, not a daemon that
+# is slow. A first boot opens a store, runs migrations and reconciles every project's engine, and
+# killing that at 10 seconds would turn a slow start into a crashloop. TimeoutStartSec (systemd's
+# default, 90s) is the real backstop above this.
+deadline=60
+i=0
+while [ "$i" -lt "$deadline" ]; do
+    if curl -fsS -o /dev/null -m 5 "$probe" 2>/dev/null; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+[ "$i" -lt "$deadline" ] || fail "wheeld did not answer $probe within ${deadline}s. It is running but not serving, which is the state Type=simple would otherwise report as healthy. journalctl -u wheeld -n 50"
+
+# Every listening socket on this port, whatever address family, with no reliance on process
+# attribution (ProtectProc=invisible means this process cannot see who owns what, and it does not
+# need to — a non-loopback listener on wheeld's port is a failure whoever opened it).
+# `ss` output captured and its exit status CHECKED before anything is concluded from it. Iterating
+# over `$(ss ... 2>/dev/null)` directly meant that if ss ever failed at runtime -- iproute2 removed
+# after install, AF_NETLINK denied by some future drop-in -- the loop body simply never ran, and
+# this script cheerfully printed "loopback only". That is the exact failure this file's header
+# argues against: a measurement that degrades into an assumption while still reporting success.
+# wheel-preflight checks `command -v ss` at start, which does not cover ss failing when run.
+if ! listeners="$(ss -ltnH 2>/dev/null)"; then
+    fail "ss failed, so the listening socket could not be measured. Refusing to report a daemon as ready on an unverified bind — this check exists precisely because a unit-file line is not evidence."
+fi
+
+exposed=""
+found_port=0
+for addr in $(printf '%s\n' "$listeners" | awk '{print $4}'); do
+    [ "${addr##*:}" = "$port" ] || continue
+    found_port=1
+    host="${addr%:*}"
+    host="${host#[}"
+    host="${host%]}"
+    case "$host" in
+        127.* | ::1 | ::ffff:127.* | localhost) ;;
+        *) exposed="$exposed $addr" ;;
+    esac
+done
+if [ -n "$exposed" ]; then
+    if [ "${WHEEL_ALLOW_EXPOSED_BIND:-0}" = 1 ]; then
+        echo "wheeld-ready: WARNING: port $port is listening on$exposed, and WHEEL_ALLOW_EXPOSED_BIND=1 says you meant it"
+    else
+        fail "port $port is listening on$exposed, not just loopback. wheel-preflight admitted the configured bind, so something else opened this — a BIND_ADDR the unit did not see, a second wheeld, or a forwarder. Refusing to report a daemon as ready while it is reachable from the network."
+    fi
+fi
+
+# /healthz answered above, so SOMETHING is serving this port; if ss cannot see a listener for it,
+# ss is not telling us what we think it is and the loopback conclusion is unfounded.
+[ "$found_port" = 1 ] ||
+    fail "/healthz answered on port $port but ss reports no listener on it — the socket measurement is not describing this daemon, so 'loopback only' cannot be concluded from it"
+
+echo "wheeld-ready: serving on 127.0.0.1:$port, loopback only"
