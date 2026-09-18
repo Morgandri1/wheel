@@ -1188,6 +1188,7 @@ mod tests {
             tool_allow_hosts: Vec::new(),
             startup_deadline_secs: crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
             harness_auth: policy,
+            script_execution_enabled: false,
         }
     }
 

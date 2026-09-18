@@ -1283,6 +1283,7 @@ pub(crate) mod await_tests {
                 events,
                 ingress_rate: Arc::default(),
                 logins: Arc::default(),
+                builder: Arc::new(crate::builder::Builder::default()),
             },
             dir,
         )

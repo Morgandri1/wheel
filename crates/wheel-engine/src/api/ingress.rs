@@ -910,6 +910,7 @@ mod tests {
                 events,
                 logins: std::sync::Arc::new(crate::oauth::LoginSessions::default()),
                 ingress_rate: std::sync::Arc::new(RateLimiter::default()),
+                builder: std::sync::Arc::new(crate::builder::Builder::default()),
             };
             let matched = MatchedEndpoint {
                 id: endpoint.id,
