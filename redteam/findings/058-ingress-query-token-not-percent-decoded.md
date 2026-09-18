@@ -6,8 +6,13 @@
   (`sdk/ingress-bearer-auth-diagnostics`) for the live `EndpointAuth::Bearer` failure —
   distinct from that bug and not what is causing it.
 - **Owner:** SDK (`crates/wheel-engine/src/api/ingress.rs::authenticate`).
-- **Status:** OPEN, reported to sdk; sdk to decide whether to fix inline in #103 or as its
-  own follow-up.
+- **Status:** FIXED. sdk folded the fix into #103 (`percent_decode_bytes` + strict-utf8 comparison,
+  commits `b376fa4`/`f83ea3d`/`339f9e1`), merged to `dev` as `260f3b5` (2026-09-13T21:12:22Z).
+  Verified by ADVERSARY at review time (2026-09-13): mutation-tested by reverting each half of the
+  fix independently (lossy-vs-strict comparison, and the percent-decode call site itself) and
+  confirming the regression tests genuinely fail without it; full `ingress::` suite green
+  afterward. Not re-run for this status update — recorded as fixed on the strength of that
+  contemporaneous verification and the merge itself.
 
 ## The gap
 `authenticate()`'s query-param fallback for a presented Bearer credential:
