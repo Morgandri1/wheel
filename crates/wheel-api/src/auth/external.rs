@@ -398,6 +398,87 @@ pub async fn disable(db: &Db, id: &Uuid) -> ApiResult<bool> {
     Ok(crate::db_execute!(db, &sql, id)? > 0)
 }
 
+/// An identity by its own id.
+pub async fn find_by_id(db: &Db, id: &Uuid) -> ApiResult<Option<ExternalIdentity>> {
+    Ok(crate::db_fetch_optional!(
+        db,
+        &format!("SELECT {COLUMNS} FROM external_identities WHERE id = $1"),
+        id
+    )?)
+}
+
+/// Has this principal got external identities, all of which an operator has disabled?
+///
+/// This is what ends an open events socket. The rule is "every identity is disabled", not "any":
+/// a Wheel account can be linked to more than one subject, and a socket does not record which of
+/// them opened it, so closing on the first disabled one would cut off a person the operator has
+/// not cut off. An account with NO external identity (a local user, the owner) is never ended by
+/// this — there is nothing here to have disabled.
+pub async fn user_has_no_live_identity(db: &Db, user_id: &str) -> ApiResult<bool> {
+    let Ok(id) = Uuid::parse_str(user_id) else {
+        return Ok(false);
+    };
+    let total: i64 = crate::db_scalar!(
+        db,
+        "SELECT COUNT(*) FROM external_identities WHERE user_id = $1",
+        id
+    )?;
+    if total == 0 {
+        return Ok(false);
+    }
+    let live: i64 = crate::db_scalar!(
+        db,
+        "SELECT COUNT(*) FROM external_identities WHERE user_id = $1 AND disabled_at IS NULL",
+        id
+    )?;
+    Ok(live == 0)
+}
+
+#[derive(sqlx::FromRow)]
+struct ProjectRef {
+    id: Uuid,
+}
+
+/// Disable an identity AND tell every socket its user holds to re-check.
+///
+/// Disabling alone only refuses the next verification; an open events stream makes no further
+/// request, so nothing would ever look again until it hit its lifetime cap. `BridgeWatch`
+/// re-checks on `AccessChanged` for its own (project, user), so announcing one per project the
+/// principal owns or belongs to closes them within milliseconds — and the bridge's periodic
+/// re-check closes them anyway if this announcement is lost.
+pub async fn disable_and_announce(
+    db: &Db,
+    events: &crate::membership::MembershipEvents,
+    id: &Uuid,
+) -> ApiResult<bool> {
+    let Some(identity) = find_by_id(db, id).await? else {
+        return Ok(false);
+    };
+    if !disable(db, id).await? {
+        return Ok(false);
+    }
+    let user = identity.user_id.to_string();
+    let projects: Vec<ProjectRef> = crate::db_fetch_all!(
+        db,
+        "SELECT id FROM projects WHERE owner_id = $1 \
+         UNION SELECT project_id AS id FROM project_members \
+         WHERE user_id = $1 AND revoked_at IS NULL",
+        &user
+    )?;
+    for p in projects {
+        crate::membership::announce(
+            db,
+            events,
+            crate::membership::AccessChanged {
+                project_id: p.id,
+                user_id: user.clone(),
+            },
+        )
+        .await;
+    }
+    Ok(true)
+}
+
 async fn touch(db: &Db, id: &Uuid) -> ApiResult<()> {
     let now = db.pick("now()", "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
     let sql = format!("UPDATE external_identities SET last_seen_at = {now} WHERE id = $1");

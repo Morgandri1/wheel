@@ -344,6 +344,14 @@ under a new Wheel account, which would silently orphan the old account's project
 still succeeds — the IdP still vouches for them — and access does not, which is the only revocation
 lever Wheel has over a provider with no back-channel logout.
 
+**Open events streams end too.** A socket makes no further request, so it would otherwise outlive the
+disable until its lifetime cap (`WS_MAX_LIFETIME_SECS`, default 3600). The disable therefore tells every
+project the principal owns or belongs to to re-check, and the bridge closes within milliseconds; the
+bridge's periodic membership re-check (30 s) reads the identity as well, so it still closes if that
+announcement is lost. The rule is **all** of the principal's external identities disabled, not any: an
+account linked to two subjects is not cut off by disabling one, because a socket does not record which
+identity opened it. An account with no external identity is never ended by this.
+
 ## API tokens (every `AUTH_MODE`)
 
 API tokens are how a client without a browser signs in: a script, CI, or a desktop app such as AgentGrid. They work the

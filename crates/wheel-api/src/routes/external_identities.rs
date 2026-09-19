@@ -105,7 +105,7 @@ pub async fn disable(
 ) -> ApiResult<StatusCode> {
     external_cfg(&state)?;
     require_operator(&state, &user).await?;
-    match external::disable(&state.db, &id).await? {
+    match external::disable_and_announce(&state.db, &state.membership, &id).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound),
     }

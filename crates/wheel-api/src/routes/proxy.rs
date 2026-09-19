@@ -426,11 +426,27 @@ impl BridgeWatch {
     /// A *downgrade* ends it too, not only a revocation: a demoted admin otherwise keeps an
     /// admin-tier socket until it happens to close on its own. Re-opening at the new tier is one
     /// round trip and is the client's to do.
+    /// True when this principal's external identities have all been disabled. A database error is
+    /// not evidence of that, for the same reason it is not evidence of revocation below.
+    async fn identity_ended(&self) -> bool {
+        match crate::auth::external::user_has_no_live_identity(&self.state.db, &self.user_id).await
+        {
+            Ok(ended) => ended,
+            Err(e) => {
+                tracing::warn!(error = ?e, "identity re-check failed; leaving the bridge open");
+                false
+            }
+        }
+    }
+
     async fn still_entitled(&self) -> bool {
         match crate::auth::extractor::load_member(&self.state, &self.project_id, &self.user_id)
             .await
         {
-            Ok((_, tier)) => tier >= self.tier,
+            // A disabled external identity ends the socket too. Membership is unchanged by it, so
+            // without this an operator's `DELETE /v1/auth/external-identities/{id}` refused the
+            // next HTTP request and left every open events stream running until its lifetime cap.
+            Ok((_, tier)) => tier >= self.tier && !self.identity_ended().await,
             // A database error is not evidence of revocation, and closing every socket in the
             // deployment because Postgres blinked would be an outage we caused. The lifetime cap
             // still bounds how long that can persist.
