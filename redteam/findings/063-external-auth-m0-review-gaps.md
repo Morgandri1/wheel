@@ -5,8 +5,11 @@
   mandatory `aud`, `(issuer, subject)` mapping, no-`wht_`-minting and proxy-peer controls all hold, and QA's nine
   mutants all die (see "What holds"). These are the places the design's own table (§6) is silent.
 - **Owner:** SDK/API (`crates/wheel-api/src/auth/{jwks,external}.rs`, `http/{hop,actor}.rs`).
-- **Status:** OPEN. Filed from the pre-merge review of #136 (head `d54b56c`); every PoC below is a throwaway test
-  against that commit, reproduced 2026-09-19.
+- **Status:** A–D FIXED at `213d1da` (SDK's additive commits on #136; my PoCs re-run against that head now fail to
+  reproduce — A `Err(unknown or unavailable signing key)`, B `Err(sent more than once)`, C both `Ok` with one principal, D
+  stripped on both outbound paths — and 9 of 9 mutants of the fixes are killed). **E OPEN**: `iss` pin, `azp` allowlist and the
+  JWKS `MAX_AGE_CEILING` clamp still survive every test; token-header exclusivity is now pinned. Filed from the pre-merge
+  review of #136 (head `d54b56c`); every PoC below is a throwaway test against that commit, reproduced 2026-09-19.
 - **Method:** source read of the whole diff, then PoC tests run against the real verifier, plus mutation testing of
   the controls. Where a mutant "survived" I re-ran it with a private `CARGO_TARGET_DIR` (see the note on the shared
   target dir at the end) before believing it.
