@@ -520,6 +520,124 @@ reads as an oversight to anyone auditing us later.
 
 ---
 
+## 7a-ii. AUTH-external — the deployer's own identity system (`AUTH_MODE=external`)
+
+Design, threat model and the reasoning behind every refusal: `docs/proposals/external-auth.md`.
+Operator contract: `docs/API.md`, "External auth".
+
+`external` replaces the credential path, so every `API-auth-*` and `API-auth-owner-404` criterion in
+§7 applies under it unchanged and is re-run per mode. This section covers only what the external
+provider adds — and it is weighted the way the threat model is: the things that would be a **total
+forgery** get the most rows.
+
+The organising rule: **`external` is only a control if each of its checks is independently
+load-bearing.** A suite in which one check masks another passes against a build where the other has
+been removed, so every criterion below is mutation-checked — the bug is restored, the named
+assertion is watched going red, the fix is restored. A row whose mutant survives is not evidence.
+
+Suites: `crates/wheel-api/tests/external_auth.rs` (verification, against a live fixture key set),
+`external_config.rs` (boot), `principal_mapping.rs` (the `(issuer, subject)` → Wheel id map),
+`external_identities.rs` (the routes and the proxy-header plane), `config_interlock.rs` (the dev
+interlock and the `CLERK_*` alias), plus unit tests in `auth::external`, `auth::jwks`, `http::hop`
+and `http::actor`. The verification suites sign with the same two committed fixture keys as
+`examples/stub-issuer`, so what the tests accept and what a runnable stub emits cannot drift.
+
+### Verification — the algorithm, and why it is not the token's to choose
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-alg-from-key` | **Positive control, runs first.** A token on each configured algorithm (RS256 and EdDSA) against its own `kid` is accepted. Every other row here is "this is refused", and all of them pass against a verifier that refuses everything. | **S1** |
+| `AUTH-ext-alg-header-disagrees` | A token whose header names an algorithm the resolved key does not carry → 401, even when the signature would verify under the header's algorithm. The key set decides; the header only has to agree. | **S1** |
+| `AUTH-ext-alg-not-allowlisted` | A key whose algorithm is valid and resolvable but absent from `WHEEL_EXTERNAL_ALGS` → 401. The allowlist is a second, independent gate: a key set that starts serving a new algorithm must not silently enable it. | **S1** |
+| `AUTH-ext-alg-hs256-confusion` | The classic: re-sign as HS256 using the RSA **public key** as the HMAC secret → 401. Defeated twice over — the loader never holds a symmetric key, and the algorithm comes from the key — and asserted here because it is the attack the structure exists for. | **S1** |
+| `AUTH-ext-alg-none` | `alg: none` → 401. `jsonwebtoken` has no variant for it so it fails at `decode_header`; that is a property of a **dependency**, which is exactly why it gets a test rather than a comment. | **S1** |
+| `AUTH-ext-no-kid` | A token with no `kid` → 401. Without it there is no key to take an algorithm from, and "try every key" is how a verifier gets chosen by the attacker again. | **S1** |
+| `AUTH-ext-jwks-refuses-oct` | An `oct` (symmetric) key in the key set is **never imported** — the other keys in the same document still are. Skipped, not fatal: a provider that publishes an encryption key alongside its signing keys must not take the deployment down. | **S1** |
+| `AUTH-ext-jwks-refuses-non-ed25519-okp` | An `OKP` key on any curve but Ed25519 (e.g. X25519, P-256) is never imported. A key-agreement key imported as a signature key is the shape of a downgrade. | **S1** |
+| `AUTH-ext-algs-symmetric-refused-at-boot` | `WHEEL_EXTERNAL_ALGS` naming `HS256`/`HS512`, alone or beside `RS256`, **refuses to boot**, and the message says why. Case-insensitive, so `hs512` is refused too. | **S1** |
+| `AUTH-ext-algs-unverifiable-refused-at-boot` | `WHEEL_EXTERNAL_ALGS=ES256` refuses to boot naming `ES256`, rather than booting and rejecting every token for a reason nobody can see. | S2 |
+
+### Verification — audience, issuer, time
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-aud-absent` | A token from the right issuer with **no `aud` claim at all** → 401. This is the one that needs its own row: with `validate_aud = true` and an audience configured, `jsonwebtoken` **passes** a token whose `aud` is absent, because validation is only applied to a claim that is present. `required_spec_claims` is what closes it, and this test is what keeps it closed. | **S1** |
+| `AUTH-ext-aud-wrong` | A token whose `aud` names another relying party → 401. Attack #3: without it, every surface the deployer's issuer serves becomes a Wheel credential. | **S1** |
+| `AUTH-ext-aud-not-a-prefix` | `wheel:evil` against a configured `wheel:` → 401. Exact string equality, never `starts_with` — a prefix match admits every `wheel:*` audience, which is the cross-tenant confusion the check exists to stop. | **S1** |
+| `AUTH-ext-aud-multi-must-name-us` | An `aud` **array** that does not contain our audience → 401; one that does → accepted (RFC 7519 §4.1.3). | **S1** |
+| `AUTH-ext-aud-sole` | With `WHEEL_EXTERNAL_SOLE_AUDIENCE=1`, an array naming us **and** someone else → 401, while a sole audience (array or string) is accepted. Off by default, and the residual it leaves — a co-named relying party can replay here — is named in API.md rather than hidden. | S2 |
+| `AUTH-ext-iss-wrong` | A **validly signed** token from another issuer → 401. Signed by a key we hold, so this asserts the issuer pin and not the signature check. | **S1** |
+| `AUTH-ext-exp` | A token with no `exp`, and an expired one, are both 401. `exp` is in `required_spec_claims` for the same reason `aud` is. | **S1** |
+| `AUTH-ext-ttl-cap` | With `WHEEL_EXTERNAL_MAX_TTL_SECS` set: `exp - iat` over the cap → 401, exactly at the cap → accepted, and **a token with no `iat` → 401**. A cap that cannot be computed must refuse, not pass — otherwise omitting `iat` is how you opt out of the cap. | **S1** |
+| `AUTH-ext-azp` | An `azp` allowlist is checked only when configured; when it is, a token with a non-matching `azp` **and a token with no `azp` at all** are both refused. | S2 |
+| `AUTH-ext-kid-flood-throttled` | An unknown `kid` does not refetch the key set every time — the existing 60 s throttle applies to the external cache unchanged. Otherwise the auth path is a traffic pump aimed at the deployer's IdP, and a way to stall our own handlers. | S2 |
+
+### The principal — a foreign subject is not a Wheel identity
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-subject-stable` | The same `(issuer, subject)` always resolves to the same Wheel `users.id`, across requests and provisioning. | **S1** |
+| `AUTH-ext-subject-scoped-by-issuer` | The **same subject under a different issuer is a different principal**, with no projects. Keying on the operator's `provider` label instead would mean re-pointing a label at another issuer silently merges two populations; keying on the verified `iss` makes that typo fail closed. | **S1** |
+| `AUTH-ext-no-email-link` | A token carrying the email of an **existing local account** provisions a new principal and never attaches to that account. An IdP that lets a user set an unverified address would otherwise be a one-step takeover of any local account whose address an attacker can guess. | **S1** |
+| `AUTH-ext-subject-not-a-principal` | A subject with a control character, an envelope-closing quote, or absurd length → 401 **at verification**, not sanitised at each use. Rejected at the boundary or it becomes a forged actor header downstream. | **S1** |
+| `AUTH-ext-subject-claim-configured` | `WHEEL_EXTERNAL_SUBJECT_CLAIM=oid` reads `oid` and not `sub`, and a non-string subject (`sub: 7`) is refused rather than coerced. | S2 |
+| `AUTH-ext-provision-linked` | Under `WHEEL_EXTERNAL_PROVISION=linked`, a fully valid token for an unknown subject → 401, and the same token succeeds after the operator links it. | **S1** |
+| `AUTH-ext-disabled-identity` | A disabled identity → 401 **even though verification succeeded** — the IdP still vouches for them. This is the only revocation lever Wheel has over a provider with no back-channel logout, and `disable` is soft so the link stays visible. | **S1** |
+| `AUTH-ext-link-once` | A subject can be linked only once; a second link → 409 at the database constraint, not at a read-then-write above it. | S2 |
+| `AUTH-ext-last-seen` | Resolving an identity stamps `last_seen_at`. It is what makes a dormant-then-active identity visible to an operator, which is one of the three partial mitigations for subject reuse. | S3 |
+| `AUTH-ext-no-wht-mint` | `POST /v1/auth/tokens` from an external credential → **403**. Without it the TTL story is decorative: five minutes of access buys an indefinite credential the deployer's IdP can no longer revoke. | **S1** |
+| `AUTH-ext-provisioned-is-not-operator` | An externally-provisioned account is **not** the token-only owner account, and so cannot reach the identity-administration routes. Auto-provisioning must not mint operators. | **S1** |
+
+### `proxy_header` — the mode where a header is the credential
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-proxy-trusted-peer` | An assertion from a peer **inside** `WHEEL_TRUSTED_PROXIES` authenticates and provisions; the byte-identical request from a peer outside it → 401. The TCP peer, never `X-Forwarded-For`. | **S1** |
+| `AUTH-ext-proxy-fails-closed` | With the trusted-peer marker **absent** — including when the middleware that computes it is not installed at all — every request is refused. A control whose failure is silent must fail closed by construction, not by remembering to install a layer. | **S1** |
+| `AUTH-ext-proxy-no-subject` | No subject header → 401, rather than a default or empty principal. | **S1** |
+| `AUTH-ext-proxy-cross-origin` | A request carrying an `Origin` outside `CORS_ALLOWED_ORIGINS` → **403** under `proxy_header`. The credential is ambient, and the engine proxy is `ANY` with arbitrary content types, so preflight is luck rather than a control. | **S1** |
+| `AUTH-ext-proxy-cross-origin-provisions-nobody` | A refused cross-origin request creates **no** `external_identities` row and no user. The refusal is before the identity is resolved, so a hostile page cannot even use the CSRF path as a provisioning oracle. Separate ID because it is a different observation from the 403. | **S1** |
+| `AUTH-ext-proxy-empty-allowlist-refuses` | An **empty** origin allowlist refuses every `Origin`, and an allowlist extension that is **missing entirely** is read as empty rather than as "no policy". The fail-open shape here would be invisible. A request with no `Origin` passes — that is every non-browser client, and not something a page can cause. | **S1** |
+| `AUTH-ext-proxy-origin-exact` | An allowed origin is matched exactly: `https://app.example.evil`, `http://app.example`, `https://app.example:8443`, `https://app.example/` and `https://sub.app.example` all fail against `https://app.example`. | **S1** |
+| `AUTH-ext-proxy-headers-never-relayed` | The configured subject and email headers are stripped before **any** outbound request to an engine, on the authenticated proxy path and on the public ingress path. They are the credential; relaying one puts "who the edge says is calling" in front of an agent that could replay it back at the API as its author. Asserted on both paths, because they are two call sites and the names cannot be a `const`. | **S1** |
+| `AUTH-ext-proxy-names-from-config-only` | The strip list is derived from configuration and from nowhere else: a deployment with no external auth, and one on the `jwks` verifier, both strip nothing extra; the email header being unset must not drop the subject header with it. A strip list that is empty when it should not be is a silent leak. | **S1** |
+| `AUTH-ext-proxy-api-token-still-works` | A `wht_` token still authenticates under `proxy_header`. It is this API's own credential, checked before the proxy branch — without that, `wheeld token` is useless on a proxy-authenticated deployment, which is the one credential an operator can use from a script. | S2 |
+| `AUTH-ext-verifier-no-crossover` | Each verifier refuses the other's credential rather than falling through to a weaker check: a bearer token under `proxy_header`, and a subject header under `jwks`. | **S1** |
+
+### Boot — a half-configured control must stop the process
+
+Every row is a refusal at boot. The shared principle: a deployment that starts, looks configured and
+is not, is worse than one that does not start.
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-cfg-baseline` | **Positive control.** A complete `jwks` configuration boots, and every field parses to what was set — the default subject claim, no cap, multi-audience on, both algorithms. Without it every refusal below passes against a `Config::from_env` that refuses everything. | **S1** |
+| `AUTH-ext-cfg-vars-outside-mode` | Any `WHEEL_EXTERNAL_*` set while `AUTH_MODE != external` refuses to boot, **naming the variable and the mode**. A knob that looks configured and is never read is how a deployer comes to believe they pinned an audience. | **S1** |
+| `AUTH-ext-cfg-required` | Each of `WHEEL_EXTERNAL_VERIFIER`, `_ISSUER`, `_AUDIENCE`, `_ALGS`, `_JWKS_URL`, `_PROVISION` is required, and the error **names the missing one**. Asserted per variable, in a loop, so a new required variable cannot be added without a row. | **S1** |
+| `AUTH-ext-cfg-blank-is-missing` | A whitespace-only `WHEEL_EXTERNAL_AUDIENCE` is a missing one, not an empty audience list. | **S1** |
+| `AUTH-ext-cfg-issuer-collisions` | `WHEEL_EXTERNAL_ISSUER` equal to `WHEEL_JWKS_ISSUER`, or to `PUBLIC_BASE_URL`, refuses to boot naming the other variable. Two verifiers on one issuer are two token populations that can stand in for each other; our own session issuer above all. | **S1** |
+| `AUTH-ext-cfg-prod-interlock` | Under `WHEEL_ENV=prod`, a loopback, `.local`/`.internal`, or plaintext `WHEEL_EXTERNAL_JWKS_URL`/`_ISSUER` refuses to boot — ADVERSARY 017's interlock, extended to this plane. In **dev** a local issuer boots, because that is what dev is for. | **S1** |
+| `AUTH-ext-cfg-proxy-needs-trusted` | `WHEEL_EXTERNAL_VERIFIER=proxy_header` with an empty `WHEEL_TRUSTED_PROXIES` refuses to boot, naming `WHEEL_TRUSTED_PROXIES`. Believing a header from everyone is not a configuration, it is an open door. | **S1** |
+| `AUTH-ext-cfg-provision-explicit` | `WHEEL_EXTERNAL_PROVISION` unset refuses to boot, and an unrecognised value refuses naming the variable. Never defaulted: on an open-signup IdP, `auto` lets anyone into Wheel. | **S1** |
+| `AUTH-ext-cfg-verifier-unknown` | An unrecognised `WHEEL_EXTERNAL_VERIFIER` (e.g. `introspection`) refuses, naming it. It must not fall back to either real verifier. | **S1** |
+| `AUTH-ext-cfg-ttl-cap-sane` | `WHEEL_EXTERNAL_MAX_TTL_SECS` of `0`, `-1` or `soon` refuses naming the variable; `300` parses. | S2 |
+| `AUTH-ext-cfg-header-folding` | Header names (`WHEEL_EXTERNAL_TOKEN_HEADER`, `_PROXY_SUBJECT_HEADER`, `_PROXY_EMAIL_HEADER`) are stored case-folded, because that is how they are matched. An unfolded name is a strip list that never matches. | **S1** |
+| `AUTH-ext-cfg-audience-shadows-issuer` | `ExternalAuth::audience_shadowing_the_issuer` identifies a configured audience equal to the pinned issuer or its origin. It **warns** rather than refuses — Wheel does not know what else the deployer's issuer serves — and it is a pure function precisely so this rule can be asserted: a control that lives only inside a `tracing::warn!` cannot be tested, and an untestable control silently stops firing. | S2 |
+| `AUTH-ext-cfg-clerk-alias` | `WHEEL_JWKS_*` and the deprecated `CLERK_*` spellings, five cases: new alone, old alone, an agreeing pair, a **disagreeing pair (refused, naming both)**, and blank-old-plus-set-new. Ambiguity is the one hazard an alias introduces, and this is where it is closed. `config_interlock.rs` also configures *itself* with the deprecated names deliberately, so the whole suite doubles as the regression test — if the alias ever stopped being read, that file goes red instead of a deployment going down. | **S1** |
+| `AUTH-ext-cfg-dev-interlock` | `API-dev-interlock-boot` still holds beside all of this: `AUTH_DEV_SECRET` set while `WHEEL_ENV != dev` exits non-zero, with unset counting as prod. A total authentication bypass and a pluggable verifier must not weaken each other. | **S1** |
+
+### The routes
+
+| ID | Criterion | Sev |
+|---|---|---|
+| `AUTH-ext-routes-absent-without-mode` | `GET`/`POST /v1/auth/external-identities` and `DELETE /v1/auth/external-identities/{id}` **404 unless `AUTH_MODE=external`**, so a deployment that does not use external auth has no such surface. | S2 |
+| `AUTH-ext-routes-operator-only` | Only the token-only owner account may list, link or disable. Any other authenticated caller → 403. Whoever can write this table chooses who everyone is. | **S1** |
+| `AUTH-ext-link-issuer-not-a-parameter` | The link route takes `{subject, user_id, email?}` and **not** an issuer — it comes from configuration, because it is what was or will be cryptographically asserted. A caller-named issuer creates a row that can never match and looks like it should. | **S1** |
+| `AUTH-ext-link-validates` | A hostile subject → 400; a `user_id` with no account → 404. Linking to an absent account would create a row that authenticates nobody, silently. | S2 |
+| `AUTH-ext-link-then-disable` | The full operator round trip: link, authenticate with it, disable, and the same token stops working while the row stays visible. | **S1** |
+
+---
+
 ### 7b. AUTH-cred — credential routing to the harness (§4)
 
 An `sk-ant-oat…` setup-token and an `sk-ant-api…` key are **not** interchangeable: each must

@@ -276,8 +276,8 @@ async fn main() {
     println!("stub JWKS issuer — NOT FOR PRODUCTION, the signing keys are public in this repo");
     println!();
     println!("  AUTH_MODE=jwks");
-    println!("  CLERK_JWKS_URL={jwks_url}");
-    println!("  CLERK_ISSUER={ISSUER}");
+    println!("  WHEEL_JWKS_URL={jwks_url}");
+    println!("  WHEEL_JWKS_ISSUER={ISSUER}");
     println!();
     println!("  x-auth-token: {}", mint(&sub, Algorithm::RS256, None));
     println!();

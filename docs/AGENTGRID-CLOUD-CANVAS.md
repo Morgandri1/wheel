@@ -2,8 +2,9 @@
 
 **Audience:** AgentGrid's client team, implementing against a hosted Wheel project as AgentGrid's cloud
 canvas — AgentGrid acts as a puppeteer UI in front of Wheel's engine. **Status:** draft, engine-side work
-in progress against this design. **Do not build a client against this yet — §2's auth section describes a
-prerequisite (M0, tracked in issue #132) that has not landed. Read §6 in full before writing any code.**
+in progress against this design. §2's auth prerequisite (M0, issue #132) is **built and under review, not
+yet merged** — the configuration below is the real one, and it is not live on any deployment until that PR
+lands on `dev`. **Read §8 in full before pointing a client at real infrastructure.**
 
 Wheel already has the pieces a cloud canvas needs: per-project sandboxed containers, a board/wire model
 for agents and their tools, a WebSocket event stream, and pluggable external auth. This doc is the API
@@ -21,43 +22,132 @@ directly: the API authenticates the caller, proves project ownership/membership,
 project's engine. Board state (nodes, wires), agent lifecycle (start/stop/send/interrupt), and live
 events all go through this one API surface.
 
-## 2. Authentication — blocked on M0, do not build against the current state
+## 2. Authentication
 
-**The auth path described here does not work today, and is unsafe to make work without the fix already
-in progress.** Two problems, both in `crates/wheel-api/src/auth/claims.rs`:
+**Status: the fix is built, reviewed and not yet merged.** Configure against what is below; do not point a
+client at a deployment until the M0 PR (issue #132) lands on `dev`. Nothing in this section is expected to
+change when it does.
 
-1. **Algorithm.** Wheel verifies **RS256 only** (`claims.rs:49`). AgentGrid's Better Auth issuer signs
-   **EdDSA (Ed25519)**. Every AgentGrid token is refused as-is — not exploitable today, just broken.
-2. **Audience.** `validate_aud` is `false`, with no mandatory `aud` check. If EdDSA support were added
-   without also fixing this, **any token from AgentGrid's shared issuer** — desktop, mobile, and relay
-   surfaces all mint from the same issuer — would be accepted as a valid Wheel credential. That is a real
-   cross-surface token confusion vulnerability, not a hypothetical one.
+What was wrong on `main`, and what `AUTH_MODE=external` replaces it with:
 
-**The fix (M0, issue #132) is mostly already built**, parked on branch `sdk/multiplayer-external-auth`
-from a closed PR, needing a rebase onto current `main` and an ADVERSARY review (it replaces the
-credential path). It adds: EdDSA/Ed25519 key support keyed off the JWKS key set rather than the token
-header, a **mandatory** `aud` claim via `required_spec_claims`, and `proxy_header` mode with network
-containment. Once it lands:
+1. **Algorithm.** `AUTH_MODE=jwks` verifies **RS256 only** and picks its verifier from the token's own `alg`
+   header. AgentGrid's Better Auth issuer signs **EdDSA (Ed25519)**, so every AgentGrid token was refused —
+   broken rather than exploitable. Under `external` the algorithm comes from the **key set**, never the
+   header: the `kid` resolves to a key whose JWK material declares its algorithm (`RSA` → RS256, `OKP` +
+   `crv: Ed25519` → EdDSA), the header must *agree* with it, the algorithm must be in the operator's
+   allowlist, and decoding is pinned to that one algorithm. `oct` keys and non-Ed25519 `OKP` keys are never
+   imported at all.
+2. **Audience.** `jwks` sets `validate_aud = false`. If EdDSA had been added without fixing that, **any
+   token from AgentGrid's shared issuer** — desktop, mobile and relay all mint from it — would have been a
+   valid Wheel credential. That is cross-surface token confusion, not a hypothetical. Under `external`,
+   `aud` is **mandatory** (named in `required_spec_claims`, because `jsonwebtoken` passes a token whose
+   `aud` is *absent* even with validation on) and compared by **exact string equality**, never a prefix.
 
-- `AUTH_MODE=jwks` is set once, at engine boot — not a per-project or per-request toggle. (A resource's
-  own owner being able to flip a security-relevant policy is treated as not a policy at all, elsewhere in
-  Wheel's design; the same rule applies here.)
-- The env vars will be renamed off the current `CLERK_JWKS_URL`/`CLERK_ISSUER` naming (a leftover from an
-  earlier Clerk-only build) — this doc will be updated once the new names land.
-- The audience configured for AgentGrid's deployment must be **Wheel-specific** (e.g. `wheel` or
-  `https://api.<wheel-domain>`), never the issuer origin AgentGrid's desktop tokens already use as `aud`.
-- **AgentGrid's own side:** the client must exchange the user's session for a **short-lived, Wheel-audience
-  token**, not hand Wheel an existing desktop/mobile token. That exchange endpoint is AgentGrid's to
-  build; the audience string is the shared contract between the two sides.
+### The configuration
 
-Every authenticated request (once M0 lands) carries the exchanged JWT as `x-auth-token`. The API verifies
-signature, issuer, audience, and expiry per request — no separate Wheel login step. The token's `sub`
-becomes the Wheel principal (`user_id` everywhere below); an optional `email` claim is carried through for
-display only (masked per-viewer-tier on the roster, never used for identity).
+`AUTH_MODE` is set once, at API boot — not a per-project or per-request toggle. A resource's own owner being
+able to flip a security-relevant policy is treated as not a policy at all elsewhere in Wheel's design, and
+the same rule applies here.
 
-**Do not point the JWKS URL/issuer config at anything reachable only from the Wheel API's own network**
-(e.g. `localhost`, a Docker-internal name) — refused at boot as a stub-issuer misconfiguration (a stub
-issuer in production authenticates everyone as anyone).
+```
+AUTH_MODE=external
+WHEEL_EXTERNAL_VERIFIER=jwks
+WHEEL_EXTERNAL_ISSUER=https://<agentgrid-issuer>          # exactly the `iss` Better Auth puts in the token
+WHEEL_EXTERNAL_JWKS_URL=https://<agentgrid-issuer>/api/auth/jwks
+WHEEL_EXTERNAL_ALGS=EdDSA                                 # RS256 stays available for other deployers
+WHEEL_EXTERNAL_AUDIENCE=https://api.<wheel-domain>        # Wheel-dedicated; see below
+WHEEL_EXTERNAL_PROVISION=auto                             # or `linked`; there is no default
+```
+
+| Variable | What it does here |
+|---|---|
+| `WHEEL_EXTERNAL_VERIFIER=jwks` | Verify a signed token against a published key set. The other value, `proxy_header`, trusts a reverse proxy's header instead and is not what AgentGrid uses. |
+| `WHEEL_EXTERNAL_ISSUER` | The exact `iss` to pin. Boot refuses it if it equals `WHEEL_JWKS_ISSUER` or `PUBLIC_BASE_URL` — two verifiers on one issuer are two token populations that can stand in for each other. |
+| `WHEEL_EXTERNAL_JWKS_URL` | Where the signing keys are fetched. Cached, with key rotation on an unknown `kid` and a 60 s refetch throttle so an unknown-`kid` flood cannot pump traffic at AgentGrid's issuer. |
+| `WHEEL_EXTERNAL_ALGS=EdDSA` | The operator's allowlist, checked **after** the algorithm is taken from the key. A symmetric algorithm here refuses to boot by name. |
+| `WHEEL_EXTERNAL_AUDIENCE` | Mandatory, exact-match. The shared contract between the two sides. |
+| `WHEEL_EXTERNAL_PROVISION` | `auto` mints a Wheel account for any subject the issuer vouches for; `linked` refuses until an operator links one. No default — if AgentGrid's issuer lets anyone sign up, `auto` lets anyone into that Wheel deployment, so it is a decision to make out loud. |
+
+The env vars are also no longer Clerk-named. `jwks` mode now reads `WHEEL_JWKS_URL`, `WHEEL_JWKS_ISSUER` and
+`WHEEL_JWKS_AZP`; the `CLERK_*` spellings are deprecated aliases that still work, and setting a name and its
+alias to different values refuses to boot.
+
+### The audience is Wheel-dedicated, and never the issuer origin
+
+**`WHEEL_EXTERNAL_AUDIENCE` must name this Wheel deployment and nothing else** — `wheel`, `wheel:prod`, or
+`https://api.<wheel-domain>`. It must **never** be the issuer origin. AgentGrid's desktop tokens already
+carry the issuer origin as their `aud`; configure that here and every desktop, mobile and relay token
+becomes a valid Wheel cloud credential, which is the audience-confusion attack with the control switched on
+and pointed the wrong way. Wheel **warns loudly at boot** when a configured audience equals the pinned
+issuer or its origin — it cannot refuse, because it does not know what else AgentGrid's issuer serves.
+
+On a multi-valued `aud`, Wheel accepts any-match by default (finding itself in the audience, per RFC 7519
+§4.1.3). What that admits is narrow and named: another relying party listed in the same token can replay it
+at Wheel. `WHEEL_EXTERNAL_SOLE_AUDIENCE=1` refuses a token that names anyone but us — worth setting if
+AgentGrid's exchange emits a single-audience token, which it should.
+
+### AgentGrid's side of the contract: token exchange, not a desktop token
+
+**The client must exchange the user's session for a short-lived, Wheel-audience token.** It must not hand
+Wheel a token it already had. That endpoint is AgentGrid's to build; the audience string is the contract
+between the two sides.
+
+That exchange exists on AgentGrid's branch `feat/wheel-token-exchange`:
+
+```
+POST /api/auth/wheel/token        (authenticated by the user's AgentGrid web session)
+→ a 5-minute EdDSA JWT, claims: iss, sub, aud, iat, exp, jti, email
+```
+
+Five minutes is the revocation story: Wheel has no back-channel logout, so with no lifetime cap revocation
+latency equals token lifetime. A Wheel deployment can pin that from its own side with
+`WHEEL_EXTERNAL_MAX_TTL_SECS=300`, which additionally **requires `iat`** and refuses `exp - iat` above the
+cap — a token with no `iat` under a configured cap is refused, so omitting it is not a way to opt out.
+
+`jti` is carried and is **not** yet a replay control: Wheel does not keep a seen-set, so a stolen token is
+replayable inside its lifetime, and TTL is the mitigation. A replica-shared `jti` set is named as the
+upgrade path, not built.
+
+`email` is carried through for display only — masked per-viewer-tier on the roster, and **never** used for
+identity. Wheel never auto-links an external subject to an existing account by email; the only automatic
+link is `(issuer, subject)`.
+
+**An external session cannot mint `wht_` tokens.** `POST /v1/auth/tokens` returns **403** for a caller
+authenticated by `external`. This is deliberate and it is what keeps the 5-minute lifetime from being
+decorative: a `wht_` token is long-lived and is not revoked by AgentGrid's issuer, so trading a
+five-minute credential for one would hand out indefinite access that AgentGrid can no longer take away.
+Anything AgentGrid needs a durable credential for has to come from a Wheel account that logged in some
+other way, deliberately — see §8.1 of `docs/proposals/external-auth.md` on project-scoped tokens, which is
+the slice that actually fits this use case and is not built yet.
+
+### Per request
+
+Every authenticated request carries the exchanged JWT as `x-auth-token` (or `Authorization: Bearer`). The
+API verifies signature, issuer, audience and expiry **per request** — there is no separate Wheel login step
+and no Wheel session cookie; cookies are never credentials on this API.
+
+The token's `sub` is **not** the Wheel principal. Wheel maps `(issuer, subject)` through an
+`external_identities` table to a Wheel `users.id` that Wheel itself minted, and *that* is what
+`projects.owner_id`, `project_members.user_id` and `on_behalf_of` hold. There is no account unification in
+either direction: an AgentGrid identity never becomes a Wheel identity, it is mapped to one.
+
+Two consequences worth designing for:
+
+- **AgentGrid's issuer must never reuse a `sub`.** OIDC Core §2 requires it. If a retired `sub` is
+  reassigned, the new human inherits the previous one's Wheel account, projects and memberships, and Wheel
+  cannot detect it. If Better Auth exposes a better immutable identifier, `WHEEL_EXTERNAL_SUBJECT_CLAIM`
+  can be pointed at it instead of `sub`.
+- **Changing the issuer hostname creates new, empty principals.** A new `(issuer, subject)` pair is a new
+  Wheel user with no projects. That is fail-closed on purpose — inheriting an account because a URL changed
+  would be account takeover triggered by a config edit — and the migration path is explicit re-linking
+  through `POST /v1/auth/external-identities`.
+
+**Do not point the JWKS URL or issuer at anything reachable only from the Wheel API's own network** (e.g.
+`localhost`, a Docker-internal name, a `.internal` hostname, or plain `http://`) — refused at boot in prod
+as a stub-issuer misconfiguration. A stub issuer in production authenticates everyone as anyone.
+
+Full operator contract: `docs/API.md`, "External auth". Design and threat model:
+`docs/proposals/external-auth.md`.
 
 ## 3. Where the model credential lives
 
@@ -178,8 +268,9 @@ future roadmap item.
   itself is not built.)
 - **Finding 048** — network isolation between the hosted engine and Wheel's own database/API is not
   actually deployed as designed; the segmentation the threat model assumes isn't there yet.
-- **M0 (§2)** — the auth fix above. Nothing in this doc is safe to build a client against until this
-  lands specifically, independent of 037/048.
+- **M0 (§2)** — the auth fix above. **Built and reviewed; not merged.** The configuration in §2 is the
+  real one and is not expected to change, but no deployment is running it until that PR lands on `dev`, so
+  a client configured against it today authenticates against nothing. Independent of 037/048.
 
 None of the request/response shapes described in this doc are expected to change once these land — this
 is a safety gate on when to point a real client at real infrastructure, not a warning that the API itself
