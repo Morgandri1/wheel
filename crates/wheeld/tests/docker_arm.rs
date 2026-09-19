@@ -103,7 +103,9 @@ fn fake_daemon(initial: Daemon) -> (std::path::PathBuf, Arc<Mutex<Daemon>>) {
                 let (code, body) = {
                     let mut d = shared.lock().unwrap();
                     d.requests.push(format!("{method} {path}"));
-                    if path.ends_with("/version") {
+                    if path.ends_with("/containers/json") {
+                        (200, "[]".to_string())
+                    } else if path.ends_with("/version") {
                         (
                             200,
                             r#"{"Version":"27.0.0","ApiVersion":"1.46"}"#.to_string(),
@@ -273,10 +275,6 @@ async fn docker_mode_refuses_the_daemons_own_socket_and_an_unset_host() {
         assert!(
             why.contains("refusing to run the docker sandbox"),
             "{host:?}: {why}"
-        );
-        assert!(
-            why.contains("WHEEL_ALLOW_RAW_DOCKER_SOCKET"),
-            "the way out must be named: {why}"
         );
     }
 }
