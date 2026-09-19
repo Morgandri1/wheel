@@ -50,8 +50,8 @@ POST   /v1/projects/{id}/start | /stop | /restart
 ```
 
 Every request needs `x-auth-token` (the Better Auth JWT) and, for anything project-scoped,
-`x-project-id`. A project not owned by (or shared with, §5) the caller returns **404**, never 403 — no
-enumeration of projects that exist but aren't yours.
+`x-project-id`. A project not owned by (or shared with, per Wheel's admin/prompter/guest tiers — see §7)
+the caller returns **404**, never 403 — no enumeration of projects that exist but aren't yours.
 
 ## 4. Driving the board
 
@@ -74,8 +74,8 @@ ANY  /v1/projects/{id}/engine/{*rest}    → proxied to that project's engine co
 
 `rest` is the engine's own route space (`docs/PROTOCOL.md` §4): `agents/{id}/start`, `agents/{id}/send`,
 `agents/{id}/interrupt`, `agents/{id}/log`, `vault/{id}/{key}`, `board`, etc. The API attaches the
-engine's own bearer secret; AgentGrid's client never sees it. Membership/tier is re-checked on every
-proxied call, not just at the WebSocket handshake.
+engine's own bearer secret; AgentGrid's client never sees it. For these REST proxy calls, membership/tier
+is re-checked with a fresh lookup on every request, not just once at connection time.
 
 ## 5. Live updates
 
@@ -86,8 +86,24 @@ ANY  /v1/projects/{id}/engine/v1/events?ticket=<ticket>   (WebSocket upgrade)
 
 Browsers can't set headers on a WebSocket handshake, so the ticket goes in the query string instead of
 `x-auth-token`. Mint a fresh ticket immediately before opening the socket (they expire fast and are
-single-use). Events on the stream: `node.state`, `message`, `log`, `board.changed` — see
-`docs/PROTOCOL.md` for the exact event shapes. **Not yet available:** a presence/cursor event for
+single-use). On the connection itself, membership/tier is re-checked every 30 seconds and immediately on
+any membership change — not just once at the handshake — and the socket is torn down on a lapse.
+
+Events on the stream, all six — **implement all of them**, including the two below, before shipping a
+client: a client that types the event union from a schema and then meets an undeclared frame in
+production will very plausibly take its default branch (tear down and reconnect), which is actively
+wrong for one of these two.
+
+- `node.state`, `message`, `log`, `board.changed` — the obvious four.
+- `wire.denied` — a capability check failed; cosmetic to omit (you just won't show denial info), but it
+  is a real frame type and an unhandled-variant client will choke on it.
+- `lagged` — this subscriber fell behind and events were dropped. **The socket is healthy, only behind.**
+  The correct client behavior is: stay connected, refetch `GET /v1/board`, keep going. Treating this
+  frame as fatal (reconnect/tear-down) is exactly the failure mode the engine's own source comments warn
+  against — build the reconnect-vs-refetch branch for this one deliberately, don't let it fall through to
+  a generic "unknown event" handler.
+
+See `docs/PROTOCOL.md` for the exact shape of each. **Not yet available:** a presence/cursor event for
 multi-user live collaboration is being designed now (internal tracking only, no client-facing shape
 yet) — don't build against it until a follow-up to this doc names the wire format.
 
@@ -112,7 +128,11 @@ deadline rather than background work — right now it's prioritized but not yet 
 
 - Multi-user canvases: does AgentGrid want role-based sharing (Wheel's admin/prompter/guest tiers, §
   `docs/ARCHITECTURE.md`) exposed in the canvas UI, or is a canvas single-user from AgentGrid's side
-  with Wheel's membership model unused?
+  with Wheel's membership model unused? **If yes** — same "tell you before you build on it" instinct as
+  §6: `redteam/findings/062` is open right now and says the guest tier's read boundary isn't fully closed
+  — a guest can currently read an agent's full transcript (system prompt, every injected context block,
+  everything it's been told), not just the identity-masking §2 already covers. Don't expose the guest
+  tier to real AgentGrid end users until that's confirmed closed.
 - Credential flow: AgentGrid canvases should run harness auth as **API-key-only** (`WHEEL_HARNESS_AUTH`),
   not the OAuth-token mode reserved for self-hosted/operator use — confirm this matches AgentGrid's
   expectation before the client ever offers an OAuth-login option to end users.
