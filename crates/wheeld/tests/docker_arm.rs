@@ -127,9 +127,20 @@ fn fake_daemon(initial: Daemon) -> (std::path::PathBuf, Arc<Mutex<Daemon>>) {
                                 .health
                                 .map(|h| format!(r#","Health":{{"Status":"{h}"}}"#))
                                 .unwrap_or_default();
+                            // What a real daemon remembers of the create: its labels.
+                            let labels = d
+                                .spec
+                                .as_ref()
+                                .map(|h| {
+                                    format!(r#","Config":{{"Labels":{{"wheel.spec":"{h}"}}}}"#)
+                                })
+                                .unwrap_or_default();
                             (
                                 200,
-                                format!(r#"{{"State":{{"Status":"{}"{health}}}}}"#, d.status),
+                                format!(
+                                    r#"{{"State":{{"Status":"{}"{health}}}{labels}}}"#,
+                                    d.status
+                                ),
                             )
                         } else {
                             (404, r#"{"message":"No such container"}"#.to_string())
