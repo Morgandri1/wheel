@@ -197,14 +197,18 @@ pub fn sign_rs256(key: &TestKey, kid: &str, c: &Claims) -> String {
 
 /// Sign with HS256 using an arbitrary secret, while still claiming a real `kid`.
 /// This is the shape of the algorithm-confusion attack.
-pub fn sign_hs256(kid: &str, secret: &[u8], c: &Claims) -> String {
+/// Generic over the claim shape on purpose: an algorithm test must be able to sign a claim set
+/// that is valid on EVERY other axis, or the refusal it observes may be about the claims rather
+/// than the algorithm (ADVERSARY 067).
+pub fn sign_hs256<T: serde::Serialize>(kid: &str, secret: &[u8], c: &T) -> String {
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(kid.to_string());
     jsonwebtoken::encode(&header, c, &EncodingKey::from_secret(secret)).unwrap()
 }
 
-/// Hand-roll an `alg: none` token — no library will mint one for us.
-pub fn forge_alg_none(c: &Claims) -> String {
+/// Hand-roll an `alg: none` token — no library will mint one for us. Generic for the same reason
+/// as [`sign_hs256`].
+pub fn forge_alg_none<T: serde::Serialize>(c: &T) -> String {
     let header = b64u(br#"{"alg":"none","typ":"JWT"}"#);
     let payload = b64u(serde_json::to_string(c).unwrap().as_bytes());
     format!("{header}.{payload}.")

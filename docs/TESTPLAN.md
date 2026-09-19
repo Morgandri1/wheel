@@ -552,6 +552,10 @@ this table is the record.
 | `cross-origin` | `refuse_cross_origin` returns `Ok(())` for every origin | `external_identities::a_cross_origin_page_may_not_spend_an_ambient_proxy_credential` |
 | `hop-strip-authenticated` | `sanitized_with_actor` passes `&[]` instead of `proxy_asserted_headers(cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_the_authenticated_proxy` |
 | `hop-strip-ingress` | `routes::ingress` passes `&[]` instead of `proxy_asserted_headers(&state.cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_public_ingress` |
+| `iss-required` | `iss` dropped from `required_spec_claims` | `external_auth::a_token_with_no_issuer_is_refused` |
+| `azp-allowlist` | the `azp` allowlist check deleted | `external_auth::the_azp_allowlist_admits_only_the_named_client_applications` |
+| `jwks-max-age-ceiling` | the `Cache-Control` clamp reduced to a floor | `jwks_expiry::an_issuer_may_not_lengthen_the_trust_window_past_the_ceiling` |
+| `hs256-confusion` | the `header.alg != entry.alg` guard deleted | `external_auth::the_hs256_confusion_attack_is_refused` |
 | `proxy-trusted-wildcard` | `TrustedProxies::covers_every_address` returns `false` | `external_config::external_auth_refuses_every_configuration_that_would_be_unsafe` |
 | `dev-hs256-interlock` | `(Env::Prod, Some(s)) => Some(s)` instead of `bail!` | `config_interlock::dev_secret_interlock_and_config_validation` |
 
@@ -577,6 +581,37 @@ real rather than cosmetic:
 Both findings share a shape worth naming: **a negative assertion is only as good as its reason.**
 `is_err()` and "no such header" are both satisfied by accidents — a different error, a request that
 never ran — and neither notices when the control it names stops existing.
+
+### Second pass (ADVERSARY 063-E and 067, 2026-09-19)
+
+The rule above was applied to one test and not swept across the file it was learned in, and an
+external review found the rest. Four more controls had no test that could fail for the right
+reason, and each now has one and a mutant:
+
+* **`iss` was not pinned.** It sits in `required_spec_claims` beside `aud` for exactly the same
+  reason — `jsonwebtoken` validates an issuer only when the claim is *present*, so an absent one
+  skips the pin — and dropping it from that list survived the entire suite.
+* **`azp` had no behavioural test**, only a unit test over a literal claim set, so the wiring from
+  configuration through to refusal was uncovered.
+* **The JWKS `max-age` ceiling was unreachable from a test**, because it was a bare constant rather
+  than a field on `Timing`. It is the bound on revocation latency against an issuer that advertises
+  a long window, and nothing could observe it without an hour-long test.
+* **`the_hs256_confusion_attack_is_refused` and `alg_none_is_refused` signed the wrong fixture** —
+  the `jwks`-plane claim set, which has the wrong `iss` and no `aud`. Either refuses the token
+  before any algorithm reasoning happens, so both passed with the header/key check, the allowlist
+  and the pinned `Validation` all deleted. The headline algorithm-confusion test could not fail.
+
+The last one is the same defect as the first pass's `alg-from-key`, one test to the left, and it is
+worth stating why it recurred: the fix there was applied to *the test that the mutant named*, not to
+its neighbours that share the fixture. A mutation harness measures **controls**, not whether each
+test earns its name, so a test nothing points a mutant at is unmeasured by construction. The four
+mutants above close that for this file.
+
+**The harness now sets its own `CARGO_TARGET_DIR`.** Worktrees here share one `cargo-target` and
+artifacts for `wheel-api` built from another tree get reused, which was measured to produce phantom
+`unresolved import` compile failures *and* **false SURVIVED verdicts** — a pinned control reported
+as unpinned because the binary that ran was built from somebody else's source. Verdicts that depend
+on what another worktree compiled last are not evidence in either direction.
 
 Suites: `crates/wheel-api/tests/external_auth.rs` (verification, against a live fixture key set),
 `external_config.rs` (boot), `principal_mapping.rs` (the `(issuer, subject)` → Wheel id map),

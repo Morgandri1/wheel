@@ -94,11 +94,15 @@ impl Parts for (StatusCode, String, Vec<(header::HeaderName, String)>) {
 
 const MAX_AGE: Duration = Duration::from_millis(300);
 const GRACE: Duration = Duration::from_millis(300);
+/// Deliberately longer than `MAX_AGE` and far shorter than what a hostile issuer would advertise,
+/// so the clamp is the only thing that can produce the observed window.
+const CEILING: Duration = Duration::from_millis(600);
 
 fn quick() -> Timing {
     Timing {
         min_refresh: Duration::ZERO,
         default_max_age: MAX_AGE,
+        max_age_ceiling: CEILING,
         stale_grace: GRACE,
     }
 }
@@ -219,4 +223,53 @@ async fn the_issuers_cache_control_shortens_the_trust_window() {
         "no-store was ignored: a removed key still verified from the cache"
     );
     assert!(iss.hits.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+}
+
+/// ADVERSARY 063-E. The `Cache-Control` window is clamped, and the ceiling is what bounds
+/// revocation latency against an issuer that advertises a long one.
+///
+/// The neighbouring test proves an issuer can *shorten* the window. Nothing proved it cannot
+/// *lengthen* it without bound — and an issuer that says `max-age=86400` is precisely the case the
+/// ceiling exists for, because a key it removed would otherwise keep verifying for a day. Removing
+/// the clamp leaves every other test in this file green: they all use windows shorter than the
+/// default, which no clamp affects.
+#[tokio::test]
+async fn an_issuer_may_not_lengthen_the_trust_window_past_the_ceiling() {
+    let key = make_key();
+    let iss = issuer(external_jwks(&key)).await;
+    // A day, which is what a real IdP's CDN commonly advertises.
+    *iss.cache_control.lock().unwrap() = Some("public, max-age=86400".into());
+
+    let cache = JwksCache::with_timing(iss.url.clone(), reqwest::Client::new(), quick());
+    let cfg = ext(&iss.url);
+    assert!(
+        external::verify_token(&token(&key), &cfg, &cache)
+            .await
+            .is_ok(),
+        "the key set must load before any of this means anything"
+    );
+
+    // The issuer withdraws the RSA key.
+    *iss.body.lock().unwrap() = ed_only();
+
+    // Inside the ceiling the retired key still verifies — that is the honest cost of caching, and
+    // it is the window the operator is told about.
+    tokio::time::sleep(CEILING / 2).await;
+    assert!(
+        external::verify_token(&token(&key), &cfg, &cache)
+            .await
+            .is_ok(),
+        "still inside the clamped window"
+    );
+
+    // Past the ceiling it must not, even though the issuer asked for a day. Without the clamp the
+    // held set would stay fresh for 86400s and this would pass.
+    tokio::time::sleep(CEILING).await;
+    let e = external::verify_token(&token(&key), &cfg, &cache)
+        .await
+        .expect_err("a key the issuer removed kept verifying past the ceiling it set for itself");
+    assert!(
+        matches!(e, wheel_api::error::ApiError::Unauthorized(w) if w.contains("unknown or unavailable")),
+        "refused, but not by the key set having been replaced: {e:?}"
+    );
 }

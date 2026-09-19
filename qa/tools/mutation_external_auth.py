@@ -18,10 +18,17 @@ Exit 0 only if every selected mutant DIED. SURVIVED is the finding; COMPILE-FAIL
 mean the mutant is stale and proves nothing -- a mutant that does not build is not evidence that
 the control holds, it is evidence that this file needs updating.
 
-**Run it against a clean tree.** Interrupting it mid-mutant leaves the edit applied; the verdict
-line names the file, and `git checkout -- <file>` puts it back.
+**Run it against a clean tree, and preferably in a detached worktree.** It restores files with
+`git checkout -- <file>`, so uncommitted work in the tree it runs in is at risk, and interrupting
+it mid-mutant leaves the edit applied — the verdict line names the file.
+
+It uses its OWN `CARGO_TARGET_DIR` (override with `WHEEL_MUTATION_TARGET_DIR`); see `MUT_ENV`.
 """
-import subprocess, sys, json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 MUTANTS = [
   dict(
@@ -110,6 +117,49 @@ MUTANTS = [
     test="proxy_header_hop the_proxy_assertion_never_reaches_an_engine_through_public_ingress",
   ),
   dict(
+    id="iss-required",
+    why="`iss` is mandatory, so an absent issuer cannot skip the pin (ADVERSARY 063-E)",
+    file="crates/wheel-api/src/auth/external.rs",
+    edits=[('v.set_required_spec_claims(&["exp", "iss", "aud"]);',
+            'v.set_required_spec_claims(&["exp", "aud"]);')],
+    test="external_auth a_token_with_no_issuer_is_refused",
+  ),
+  dict(
+    id="azp-allowlist",
+    why="the azp allowlist decides which client applications may authenticate (ADVERSARY 063-E)",
+    file="crates/wheel-api/src/auth/external.rs",
+    edits=[("""    if !ext.azp.is_empty() {
+        let azp = claims.get("azp").and_then(|v| v.as_str()).unwrap_or("");
+        if !ext.azp.iter().any(|a| a == azp) {
+            return Err("azp not in allowlist");
+        }
+    }
+""", "")],
+    test="external_auth the_azp_allowlist_admits_only_the_named_client_applications",
+  ),
+  dict(
+    id="jwks-max-age-ceiling",
+    why="an issuer may not lengthen the key-set trust window without bound (ADVERSARY 063-E)",
+    file="crates/wheel-api/src/auth/jwks.rs",
+    edits=[("""            .clamp(
+                self.timing.min_refresh,
+                self.timing.max_age_ceiling.max(self.timing.min_refresh),
+            );""", "            .max(self.timing.min_refresh);")],
+    test="jwks_expiry an_issuer_may_not_lengthen_the_trust_window_past_the_ceiling",
+  ),
+  dict(
+    id="hs256-confusion",
+    why="the HS256-with-public-key forgery is refused by OUR check, not by an invalid claim set (ADVERSARY 067)",
+    file="crates/wheel-api/src/auth/external.rs",
+    edits=[("""    if header.alg != entry.alg {
+        return Err(ApiError::Unauthorized(
+            "token algorithm does not match the signing key's",
+        ));
+    }
+""", "")],
+    test="external_auth the_hs256_confusion_attack_is_refused",
+  ),
+  dict(
     id="proxy-trusted-wildcard",
     why="an all-addresses WHEEL_TRUSTED_PROXIES is refused under proxy_header (ADVERSARY 065)",
     file="crates/wheel-api/src/http/client_ip.rs",
@@ -128,8 +178,22 @@ MUTANTS = [
   ),
 ]
 
+# A PRIVATE target directory, and this is not a performance tweak.
+#
+# Worktrees here share one `cargo-target`, and artifacts for `wheel-api v0.1.0` built from a
+# different tree get reused for this one. Measured by ADVERSARY on #145: that produces phantom
+# `unresolved import` errors this harness reports as COMPILE-FAIL, and — far worse — **false
+# SURVIVED verdicts**, where a control that is genuinely pinned looks unpinned because the test
+# binary that ran was built from somebody else's source. A mutation harness whose verdicts depend
+# on what another worktree compiled last is not evidence of anything, in either direction.
+MUT_ENV = {**os.environ, "CARGO_TARGET_DIR": os.environ.get(
+    "WHEEL_MUTATION_TARGET_DIR", str(Path(tempfile.gettempdir()) / "wheel-mutation-target"))}
+
+
 def run(cmd, **kw):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+    return subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, env=MUT_ENV, **kw
+    )
 
 def restore(paths):
     run("git checkout -- " + " ".join(sorted(set(paths))))

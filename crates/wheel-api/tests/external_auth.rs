@@ -171,22 +171,99 @@ async fn an_algorithm_outside_the_allowlist_is_refused() {
 /// The classic confusion attack: re-sign with HMAC, using the provider's published key material as
 /// the secret. It cannot work, because no symmetric key is ever imported and the header's
 /// algorithm never selects the verifier.
+///
+/// **Signed over `claims_for`, and that is the test.** It used to sign `support::claims`, which is
+/// the `jwks`-plane fixture: wrong `iss` for this verifier and **no `aud` at all**. Either refuses
+/// the token on its own, before any algorithm reasoning is reached — so the assertion held with
+/// the header/key agreement check, the allowlist and the pinned `Validation` **all deleted**
+/// (ADVERSARY 067). The token here is valid on every axis except the one under test.
 #[tokio::test]
 async fn the_hs256_confusion_attack_is_refused() {
     let (key, server, cache) = plane().await;
     let cfg = ext(&server.url);
-    let forged = sign_hs256(KID, key.public_der_b64.as_bytes(), &claims("alice"));
-    assert!(verify(&forged, &cfg, &cache).await.is_err());
+    let forged = sign_hs256(KID, key.public_der_b64.as_bytes(), &claims_for("alice"));
+    assert_refused_because(
+        verify(&forged, &cfg, &cache).await,
+        "does not match",
+        "an HS256 token signed with the RSA public key, naming the RSA kid",
+    );
 }
 
 /// `alg: none`. There is no `Algorithm` variant for it, so the header does not even parse —
 /// incidental to a dependency, which is exactly why it is pinned here rather than assumed.
+///
+/// Same fixture correction as above: with a claim set that was invalid anyway, this demonstrated
+/// only that *something* refused, not that `decode_header` did.
 #[tokio::test]
 async fn alg_none_is_refused() {
     let (_key, server, cache) = plane().await;
     let cfg = ext(&server.url);
-    let forged = forge_alg_none(&claims("alice"));
-    assert!(verify(&forged, &cfg, &cache).await.is_err());
+    let forged = forge_alg_none(&claims_for("alice"));
+    assert_refused_because(
+        verify(&forged, &cfg, &cache).await,
+        "malformed jwt header",
+        "an alg:none token",
+    );
+}
+
+/// ADVERSARY 063-E. `iss` is in `required_spec_claims` beside `aud`, and for the same reason:
+/// `jsonwebtoken` validates an issuer only when the claim is **present**, so an absent one would
+/// otherwise skip the pin entirely. The module comment claims this control; nothing pinned it, and
+/// dropping `iss` from that list survived the whole suite.
+#[tokio::test]
+async fn a_token_with_no_issuer_is_refused() {
+    let (key, server, cache) = plane().await;
+    let cfg = ext(&server.url);
+    let no_iss = json!({
+        "sub": "alice",
+        "aud": EXTERNAL_AUDIENCE,
+        "exp": now() + 300,
+        "nbf": now() - 60,
+    });
+    assert_refused_because(
+        verify(&sign_rs256_value(&key, KID, &no_iss), &cfg, &cache).await,
+        "a required claim is absent",
+        "a validly signed token carrying no iss at all",
+    );
+}
+
+/// ADVERSARY 063-E. `WHEEL_EXTERNAL_AZP` decides which of the issuer's client applications may
+/// authenticate here, and it had no behavioural test — only a unit test over a literal claim set.
+/// Driven through the real verifier, so the wiring from configuration to refusal is covered too.
+#[tokio::test]
+async fn the_azp_allowlist_admits_only_the_named_client_applications() {
+    let (key, server, cache) = plane().await;
+    let mut cfg = ext(&server.url);
+    cfg.azp = vec!["app-1".into()];
+
+    let with_azp = |app: Option<&str>| {
+        let mut c = claims_for("alice");
+        if let Some(a) = app {
+            c["azp"] = json!(a);
+        }
+        sign_rs256_value(&key, KID, &c)
+    };
+
+    assert_eq!(
+        verify(&with_azp(Some("app-1")), &cfg, &cache)
+            .await
+            .unwrap()
+            .subject,
+        "alice",
+        "the allowed client application must still authenticate"
+    );
+    assert_refused_because(
+        verify(&with_azp(Some("app-2")), &cfg, &cache).await,
+        "azp",
+        "a token from a client application the operator did not allow",
+    );
+    // A token with no `azp` at all cannot satisfy a non-empty allowlist — otherwise omitting the
+    // claim is how you opt out of the control.
+    assert_refused_because(
+        verify(&with_azp(None), &cfg, &cache).await,
+        "azp",
+        "a token carrying no azp against a configured allowlist",
+    );
 }
 
 /// A token with no `kid` cannot resolve a key, and therefore cannot resolve an algorithm.

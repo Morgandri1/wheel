@@ -56,13 +56,21 @@ struct Inner {
     fetched: Option<(Instant, Duration)>,
 }
 
-/// The three time bounds. Separate so a test can shrink them; production uses [`Timing::default`].
+/// The four time bounds. Separate so a test can shrink them; production uses [`Timing::default`].
 #[derive(Clone, Copy)]
 pub struct Timing {
     /// Minimum gap between refetch attempts.
     pub min_refresh: Duration,
     /// Trust window for a fetched set when the issuer names none.
     pub default_max_age: Duration,
+    /// The most an issuer's own `Cache-Control` may lengthen that to.
+    ///
+    /// A field rather than the bare constant because a control that cannot be reached from a test
+    /// is a control nothing pins: this clamp is the difference between "a removed key stops
+    /// verifying within the hour" and "within whatever the issuer felt like advertising", and
+    /// shrinking the ceiling is the only way to observe it without an hour-long test
+    /// (ADVERSARY 063-E).
+    pub max_age_ceiling: Duration,
     /// Extra time a held set may be served when a refresh fails.
     pub stale_grace: Duration,
 }
@@ -72,6 +80,7 @@ impl Default for Timing {
         Self {
             min_refresh: MIN_REFRESH_INTERVAL,
             default_max_age: DEFAULT_MAX_AGE,
+            max_age_ceiling: MAX_AGE_CEILING,
             stale_grace: STALE_GRACE,
         }
     }
@@ -183,7 +192,7 @@ impl JwksCache {
             .unwrap_or(self.timing.default_max_age)
             .clamp(
                 self.timing.min_refresh,
-                MAX_AGE_CEILING.max(self.timing.min_refresh),
+                self.timing.max_age_ceiling.max(self.timing.min_refresh),
             );
         let set: JwkSet = resp.json().await.context("parsing JWKS")?;
         let out = admissible_keys(&set);
