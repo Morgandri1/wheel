@@ -38,6 +38,10 @@ only (masked per-viewer-tier on the roster, never used for identity).
 network** (e.g. `localhost`, a Docker-internal name) — this is refused at boot as a stub-issuer
 misconfiguration (a stub issuer in production authenticates everyone as anyone).
 
+`AUTH_MODE=jwks` is set once, at engine boot — it is not a per-project or per-request setting a project
+owner can toggle. A resource's own owner being able to flip a security-relevant policy is treated as not
+a policy at all elsewhere in Wheel's design, and the same rule applies here.
+
 ## 3. Project lifecycle
 
 ```
