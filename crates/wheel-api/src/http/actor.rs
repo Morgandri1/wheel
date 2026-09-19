@@ -58,23 +58,36 @@ pub fn set_actor(headers: &mut HeaderMap, user: &AuthUser, tier: Tier) {
     }
 }
 
-/// The header names this deployment's authenticating proxy sets, if it has one.
+/// The header names that carry this deployment's external credential, and so must never be relayed.
 ///
-/// Under `AUTH_MODE=external` with the `proxy_header` verifier these headers ARE the credential,
-/// so they belong with `x-auth-token` on the never-relay list. They cannot live in
-/// `hop::CLIENT_ONLY`, which is a `const`, because the deployer chooses their names — so they are
-/// resolved from configuration here, at the one function every outbound engine request goes
-/// through, rather than at each of the call sites that would otherwise have to remember.
+/// Two kinds, both credentials:
+///   * under the `proxy_header` verifier, the subject and email headers the authenticating proxy
+///     sets — they ARE the identity;
+///   * under any external verifier, the header the deployer told Wheel to read the token from
+///     (`WHEEL_EXTERNAL_TOKEN_HEADER`, e.g. Cloudflare Access's `cf-access-jwt-assertion`) — a
+///     signed identity token, which is `x-auth-token` by another name. Without it here an agent
+///     could read, and replay against this API, the token of the person it is talking to, and
+///     public ingress would put it in a stored, guest-readable message body.
+///
+/// They cannot live in `hop::CLIENT_ONLY`, which is a `const`, because the deployer chooses their
+/// names — so they are resolved from configuration here, at the one function every outbound engine
+/// request goes through, rather than at each of the call sites that would otherwise have to
+/// remember.
 pub fn proxy_asserted_headers(cfg: &Config) -> Vec<&str> {
-    match cfg.external.as_ref().map(|e| &e.verifier) {
-        Some(ExternalVerifier::ProxyHeader {
-            subject_header,
-            email_header,
-        }) => std::iter::once(subject_header.as_str())
-            .chain(email_header.as_deref())
-            .collect(),
-        _ => Vec::new(),
+    let Some(ext) = cfg.external.as_ref() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let ExternalVerifier::ProxyHeader {
+        subject_header,
+        email_header,
+    } = &ext.verifier
+    {
+        names.push(subject_header.as_str());
+        names.extend(email_header.as_deref());
     }
+    names.extend(ext.token_header.as_deref());
+    names
 }
 
 /// The header set to send upstream: the client's, minus hop-by-hop, minus their credentials —
@@ -126,6 +139,33 @@ mod tests {
             vec!["x-forwarded-user", "x-forwarded-email"]
         );
 
+        // The deployer's token header is a credential under EITHER verifier, and is listed in
+        // addition to the proxy names rather than instead of them.
+        ext.token_header = Some("cf-access-jwt-assertion".into());
+        cfg.external = Some(ext.clone());
+        assert_eq!(
+            proxy_asserted_headers(&cfg),
+            vec![
+                "x-forwarded-user",
+                "x-forwarded-email",
+                "cf-access-jwt-assertion"
+            ]
+        );
+        ext.verifier = crate::config::ExternalVerifier::Jwks {
+            url: "https://idp.example/jwks".into(),
+            algs: vec![jsonwebtoken::Algorithm::EdDSA],
+        };
+        cfg.external = Some(ext.clone());
+        assert_eq!(
+            proxy_asserted_headers(&cfg),
+            vec!["cf-access-jwt-assertion"],
+            "the jwks verifier's token header must be stripped too"
+        );
+        ext.token_header = None;
+        ext.verifier = crate::config::ExternalVerifier::ProxyHeader {
+            subject_header: "x-forwarded-user".into(),
+            email_header: Some("x-forwarded-email".into()),
+        };
         // The email header is optional, and its absence must not drop the subject with it.
         ext.verifier = crate::config::ExternalVerifier::ProxyHeader {
             subject_header: "x-forwarded-user".into(),

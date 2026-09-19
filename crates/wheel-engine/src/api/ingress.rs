@@ -533,12 +533,19 @@ pub(crate) fn deliver(
 /// the log — an agent that can echo its own prompt would otherwise publish the
 /// endpoint's secret, and the transcript is stored.
 fn envelope_payload(method: &Method, path: &str, headers: &HeaderMap, raw: &[u8]) -> String {
-    const REDACTED: [&str; 5] = [
+    // The API strips a deployer-chosen credential header before it reaches here, and that is the
+    // control: the engine cannot know a name the deployer picked. The two below are the ones that
+    // are knowable statically — the API's own `x-auth-token`, and Cloudflare Access's signed
+    // assertion, the documented example — kept as a second line so a hole in the first does not
+    // put a signed identity token into a stored, guest-readable message.
+    const REDACTED: [&str; 7] = [
         "authorization",
         "x-telegram-bot-api-secret-token",
         "x-wheel-secret",
         "cookie",
         "proxy-authorization",
+        "x-auth-token",
+        "cf-access-jwt-assertion",
     ];
     let mut safe = serde_json::Map::new();
     for (name, value) in headers {
@@ -1286,6 +1293,15 @@ mod tests {
 
         assert!(!payload.contains("super-secret-value"), "{payload}");
         assert!(!payload.contains("telegram-secret"), "{payload}");
+        // A signed identity token must not become a stored, guest-readable message either.
+        headers.insert("x-auth-token", "an-api-session-token".parse().unwrap());
+        headers.insert(
+            "cf-access-jwt-assertion",
+            "eyJ.signed.identity".parse().unwrap(),
+        );
+        let payload = envelope_payload(&Method::POST, "/tg", &headers, br#"{"ok":true}"#);
+        assert!(!payload.contains("an-api-session-token"), "{payload}");
+        assert!(!payload.contains("eyJ.signed.identity"), "{payload}");
         // ...while the useful part of the request survives.
         assert!(payload.contains("application/json"), "{payload}");
         assert!(payload.contains("\\\"ok\\\":true"), "{payload}");

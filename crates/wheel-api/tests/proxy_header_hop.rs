@@ -79,7 +79,7 @@ fn proxy_external() -> ExternalAuth {
     }
 }
 
-fn cfg(db_url: &str) -> Config {
+fn cfg(db_url: &str, external: ExternalAuth) -> Config {
     Config {
         env: Env::Prod,
         bind_addr: "127.0.0.1:0".into(),
@@ -101,13 +101,17 @@ fn cfg(db_url: &str) -> Config {
         ingress_body_limit_bytes: 5 * 1024 * 1024,
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
-        external: Some(proxy_external()),
+        external: Some(external),
         ws_max_bridges_per_project: 16,
         ws_max_lifetime_secs: 3600,
     }
 }
 
 async fn app() -> Router {
+    app_with(proxy_external()).await
+}
+
+async fn app_with(external: ExternalAuth) -> Router {
     let path = std::env::temp_dir().join(format!("wheel-hop-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
     let db = Db::connect(&url).await.expect("connect and migrate");
@@ -116,7 +120,7 @@ async fn app() -> Router {
             "https://clerk.test/jwks".into(),
             reqwest::Client::new(),
         ),
-        cfg: cfg(&url),
+        cfg: cfg(&url, external),
         db,
         http: reqwest::Client::new(),
         orch: Arc::new(NoopOrchestrator) as Arc<dyn Orchestrator>,
@@ -138,11 +142,26 @@ async fn as_the_proxy(
     uri: &str,
     body: Option<serde_json::Value>,
 ) -> (StatusCode, serde_json::Value) {
-    let req = axum::http::Request::builder()
+    as_the_proxy_with(app, method, uri, body, &[]).await
+}
+
+/// As above, plus extra request headers — the deployer's own credential header among them.
+async fn as_the_proxy_with(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, serde_json::Value) {
+    let mut req = axum::http::Request::builder()
         .method(method)
         .uri(uri)
         .header(SUBJECT_HEADER, "alice")
         .header(EMAIL_HEADER, "alice@corp.test");
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let req = req;
     let mut req = match body {
         Some(b) => req
             .header("content-type", "application/json")
@@ -267,5 +286,81 @@ async fn the_proxy_assertion_never_reaches_an_engine_through_public_ingress() {
     assert!(
         seen.iter().any(|h| h == "x-wheel-ingress"),
         "ingress's own marker did not cross, so nothing here is evidence: {seen:?}"
+    );
+}
+
+/// The deployer's own credential header (`WHEEL_EXTERNAL_TOKEN_HEADER`, e.g. Cloudflare Access's
+/// `cf-access-jwt-assertion`) carries a signed identity token. It was on no never-relay list, so it
+/// reached the engine on both outbound paths — and through public ingress into a stored,
+/// guest-readable message body. Required change 4 on #136.
+const TOKEN_HEADER: &str = "cf-access-jwt-assertion";
+
+fn with_token_header() -> ExternalAuth {
+    ExternalAuth {
+        token_header: Some(TOKEN_HEADER.into()),
+        ..proxy_external()
+    }
+}
+
+#[tokio::test]
+async fn the_deployers_token_header_never_reaches_an_engine_through_the_authenticated_proxy() {
+    let app = app_with(with_token_header()).await;
+    let id = project(&app).await;
+
+    let (status, body) = as_the_proxy_with(
+        &app,
+        "GET",
+        &format!("/v1/projects/{id}/engine/v1/board"),
+        None,
+        &[(TOKEN_HEADER, "eyJ.signed.identity-token")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the engine proxy did not answer: {body}"
+    );
+
+    let seen = seen(&body);
+    assert!(
+        !seen.iter().any(|h| h == TOKEN_HEADER),
+        "the deployer's credential header reached the engine: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|h| h == "x-wheel-actor-id"),
+        "nothing crossed, so the assertion above is vacuous: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_deployers_token_header_never_reaches_an_engine_through_public_ingress() {
+    let app = app_with(with_token_header()).await;
+    let id = project(&app).await;
+
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/p/{id}/hook"))
+        .header(TOKEN_HEADER, "eyJ.signed.identity-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "ingress did not reach the engine"
+    );
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let seen = seen(&body);
+    assert!(
+        !seen.iter().any(|h| h == TOKEN_HEADER),
+        "the deployer's credential header reached the engine through ingress: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|h| h == "x-wheel-ingress"),
+        "nothing crossed, so the assertion above is vacuous: {seen:?}"
     );
 }
