@@ -59,6 +59,34 @@ the shapes differ only in fixed overhead and per-service minimums, which is wher
 4. Later: **037** for agents that must not trust each other *inside* one canvas (SDK's proposal); auto-update for a
    non-wheeld deployment.
 
+## Pre-scope: the docker-socket decision (build #3)
+
+Two different threats hide in "the socket is dangerous", and they need different answers:
+**(a) host compromised → root on the VPS and every tenant**, and **(b) a tenant escapes its container through
+the shared kernel.** In the docker backend a tenant's agents are in a *different container* from the host, so
+the host's bearer and socket are not reachable from an agent — (a) needs a bug in the host, not a sandbox
+escape. Still worth closing, because the payoff is total.
+
+What the host actually asks of the daemon (`docker.rs`, bollard): exactly **seven calls** — `inspect_container`,
+`create_volume`, `create_container`, `start_container`, `stop_container`, `remove_container`, `remove_volume`.
+Every name is derived from a uuid the API generated. That makes an allowlist unusually cheap to state.
+
+| Option | Stops (a)? | Stops (b)? | Cost / complexity | Verdict |
+|---|---|---|---|---|
+| **Endpoint-only socket proxy** (e.g. tecnativa/docker-socket-proxy) | **No.** `POST /containers/create` stays allowed, and a create with `Privileged` or a `/` bind *is* the escape. It only removes `exec`, image build, swarm, etc. | No | ~0: one small container, config only | Not a decision — false comfort on its own |
+| **Body-validating proxy** (~200 lines in this repo, over the unix-socket client `wheel-host` already depends on) allowing only those seven calls, on `wheel-p-<uuid>` names, and refusing any `create` whose body is not exactly today's: engine image, `cap_drop ALL`, `no-new-privileges`, tenant network, `wheel-p-<uuid>-data:/data` only, no `Privileged`/`CapAdd`/`Devices`/`PidMode`/`UsernsMode`/`Binds` outside that one, unknown `HostConfig` keys denied | **Yes** for the create-a-privileged-container route (the obvious one) | No | ~1–2 days incl. tests + adversary review; no runtime cost; the expected body already exists as the golden request in `tests/sandbox_docker_fake.rs` | **Recommended, required before real multi-tenant** |
+| **Rootless docker** | Yes (daemon is unprivileged) | Partly (container root ≠ host root) | High: uidmap/subuid, `Delegate=yes` for cgroup limits, and on Ubuntu 24.04 the AppArmor unprivileged-userns restriction needs a profile change. **Conflicts with build #1**: no `DOCKER-USER` chain, so per-tenant egress filtering must be redone inside the rootless netns; slirp4netns/pasta adds network overhead | Skip — it trades away the egress control we need more |
+| **gVisor (`runsc`) runtime** | No | **Yes, strongly** (user-space kernel; tenants stop touching the host kernel's syscall surface) | Install + register the runtime, set `runtime` in the create body (one line + config). **Real overhead:** syscall/filesystem-heavy work (cargo/pnpm builds — the Wheel-on-Wheel workload) is materially slower, and Claude Code/Codex under runsc is **unverified** | Do as an **opt-in per-project runtime after measuring**, not day one |
+| **Sysbox** | Partly | Partly | Distro/kernel-specific; upstream maintenance status unclear to me | Skip |
+
+**Recommendation:** ship (C) with the **body-validating proxy** as the socket boundary, and put the proxy's
+allowlist under the same mutation-tested discipline as `policy.rs` (a test that walks every bollard call the host
+makes and asserts the proxy admits it, and a set of forbidden creates it refuses). Treat gVisor as the answer to
+(b) *if* Morgan's escape-security priority is raised above operator cost after we measure a build inside it;
+until then (b) rests on `cap_drop ALL` + `no-new-privileges` + a dedicated tenant network, the same posture as
+today's process backend but with a per-project mount/pid/network namespace on top. None of this needs building
+until Morgan confirms the requirement.
+
 ## What I am NOT recommending, and why
 
 - **Adding a docker arm to wheeld.** The API would then sit in the same process as a docker socket — exactly what
