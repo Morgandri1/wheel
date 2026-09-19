@@ -85,14 +85,30 @@ edge address (nothing reads `X-Forwarded-For`). So the moment the host gets a pu
 who learns the domain can burn the failure budget for that shared peer and lock `wheel-api` out of the
 host: platform-wide outage from one `curl` loop, no secret needed.
 
-**This must be fixed before the migration, not after.** Proposed (separate PR, adversary review):
-1. Always let a *correct* bearer through, whatever the peer's failure count (the secret is ≥ 16
-   chars — see step 6 for making it 32+ random; guessing it is not what the limiter is really for at
-   that entropy, while locking the API out is a real cost).
-2. Key the failure counter on the client address the edge observed (the right-most `X-Forwarded-For`
-   hop Railway appends — the left-most is client-supplied and spoofable), falling back to the peer.
-3. Test: a flood of bad bearers from one address does not stop a valid request from another, and
-   does not stop a valid request from the same address.
+**This must be fixed before the migration, not after** — and it changes what the limiter is (adversary, #138):
+a limiter can only throttle guesses by refusing them *without evaluating them*; once a correct bearer must always
+pass, every guess is evaluated and a right one returns 200 whatever the budget. Availability and guess-bounding are
+incompatible at the limiter. So after the fix it is a logging/alerting device, and **the only real guess resistance
+is the secret's entropy.** Prerequisites, all in the limiter PR (#140) or beside it:
+1. Always admit a correct bearer. (Done in #140.)
+2. Charge failures to the edge-observed client address (`WHEEL_TRUSTED_PROXIES`). Defence in depth only. Whether
+   Railway's edge appends or passes a client `X-Forwarded-For` through is **unverified**; before relying on it, run
+   `curl -H 'X-Forwarded-For: 203.0.113.9' https://<domain>/host/v1/healthz` against a build that logs the header, and
+   record the answer here.
+3. **Bound the failure map**: sweep expired entries on insert and cap the map (overflow shares one bucket), with a
+   test that 10^5 distinct keys stay under the cap — otherwise an unauthenticated caller rotating a header value grows
+   it without limit and OOMs the supervisor of every tenant.
+4. **Enforce entropy under a public domain**: with `ALLOW_PUBLIC_DOMAIN=1`, refuse to boot on a `WHEEL_HOST_SECRET`
+   under 32 characters (today 16 is accepted).
+5. **Two accepted secrets (current + previous)** so rotation is not a synchronized redeploy of the host and every API
+   replica — otherwise rotation will simply never happen.
+6. **Tighten the guard, not just the flag**: under `ALLOW_PUBLIC_DOMAIN=1` also require `RAILWAY_PUBLIC_DOMAIN` to equal
+   a configured `WHEEL_HOST_EXPECTED_DOMAIN`, so a second accidental `railway domain` still stops the boot.
+7. Alert on the host's 401/429 rate (the log line exists).
+
+What bearer+TLS on a public domain does and does not buy: sandboxes lose the private route to Postgres and to
+`wheel-api.railway.internal:8080` (which also matters for #136's trusted-proxy header). It does NOT stop a sandboxed
+agent, which has internet egress, from reaching the host's public domain; one shared secret still guards every tenant.
 
 ## Migration checklist (operator; needs the Railway session — `railway login`, workspace "Morgan Metz's Projects")
 
@@ -118,7 +134,8 @@ Prerequisite: the limiter PR above is merged and deployed to the OLD host and th
    "Gotchas"), then `railway volume add -m /data`. Size ≥ the old volume's used space + headroom
    (old is 5 GB; measured 4.5 G used on 6 Sep — check step 1's `df`, don't trust the dashboard).
 5. [ ] Set variables on the NEW service (`railway variables --set 'K=V' -s wheel-host`, never paste the
-   secret into chat/git). Read the old values with `railway variables -s wheel-host --kv` while linked
+   secret into chat/git, and do not put it on a command line — it lands in shell history and argv; use the dashboard
+   variable editor or stdin). Read the old values with `railway variables -s wheel-host --kv` while linked
    to the OLD project. Copy verbatim: `SANDBOX_BACKEND=process`, `WHEEL_DATA_DIR=/data`,
    `WHEEL_HARNESS_AUTH_OAUTH_PROJECTS`, `PORT=7100`, plus any others `--kv` shows.
    **New/changed:** `ALLOW_PUBLIC_DOMAIN=1` (must be set BEFORE any domain exists or the host refuses to
@@ -136,18 +153,22 @@ Prerequisite: the limiter PR above is merged and deployed to the OLD host and th
    process (`ps aux`) — this quiesces every engine and `host.db`, giving a consistent copy. (This is
    why we do not simply stop the service: `railway ssh` needs a running container to read the volume.)
 8. [ ] Checksum on the old side: `railway ssh -s wheel-host 'tar --numeric-owner -czf - -C / data | sha256sum'`. Save it.
-9. [ ] Pull the data down: `railway ssh -s wheel-host 'tar --numeric-owner -czf - -C / data | base64 -w0' | tr -d '\r\n' | base64 -d > wheel-data.tgz`
-   then `sha256sum wheel-data.tgz` — **must equal step 8** (base64 because a tty in `railway ssh`
-   corrupts raw binary; the prune script's `tr -d '\r'` exists for the same reason). Mismatch = stop,
-   do not proceed.
-10. [ ] Push it up to the NEW volume: link the NEW project, then
-    `base64 -w0 wheel-data.tgz | railway ssh -s wheel-host 'base64 -d | tar --numeric-owner -xzpf - -C /'`.
-    **Unverified that `railway ssh` forwards stdin — test with a 1 MB file to `/data/.probe` first.** If
-    it does not, fallback: upload `wheel-data.tgz` to a private bucket, mint a short-lived presigned URL,
-    and `railway ssh -s wheel-host 'curl -fsSL "<url>" | tar --numeric-owner -xzpf - -C /'`; delete the object after.
-11. [ ] Verify on the new volume: `railway ssh -s wheel-host 'ls /data/projects | wc -l; du -sh /data/projects/*/* | sort -h | tail'`
-    matches step 1, and ownership survived: `ls -ln /data/projects | head` shows the per-project numeric
-    uids (20000+), not 0.
+9. [ ] **Encrypt before it leaves the container.** The tarball holds every tenant's decrypted secrets (`host.db` stores
+   `engine_secret` and `vault_key` as plaintext, beside the vault ciphertext). Generate a key locally and keep it out of
+   the archive's path; the transfer is then, e.g. (key passed via the remote environment, never argv):
+   `railway ssh -s wheel-host 'tar --numeric-owner -czf - -C / data | openssl enc -aes-256-cbc -pbkdf2 -pass env:K | base64 -w0' | tr -d '\r\n' | base64 -d > wheel-data.enc`
+   (base64 because a tty in `railway ssh` corrupts raw binary; the prune script's `tr -d '\r'` is the same fix). Compare
+   `sha256sum wheel-data.enc` with the same pipeline's hash computed remotely — must be equal; mismatch = stop.
+10. [ ] Push it up and decrypt on the new volume: `base64 -w0 wheel-data.enc | railway ssh -s wheel-host 'base64 -d | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:K | tar --numeric-owner -xzpf - -C /'`.
+    **Unverified that `railway ssh` forwards stdin — test with a 1 MB file to `/data/.probe` first.** If it does not, the
+    fallback is a private bucket + short-lived presigned URL carrying the ENCRYPTED file only; the object is deleted in step 15.
+11. [ ] Verify the RESTORE, not just the transfer, on BOTH sides (old volume before, new volume after) and compare:
+    `find /data -xdev -printf '%p %U:%G %m %y %s\n' | LC_ALL=C sort | sha256sum` — covers ownership, mode, type and size of
+    every path (the step 9 hash proves only the transfer). Then `PRAGMA integrity_check` on `host.db` and every project's
+    `wheel.db`: parking by redeploy may SIGKILL after the drain window, so treat every sqlite file as crash-recovered (WAL
+    recovery is safe because `-wal`/`-shm` travel with the tree). `find /data -type s` first: sockets are not archived
+    (`/run/wheel` is not on the volume; engines recreate theirs). **Go/no-go for step 14, decided before starting:** every
+    project reconciles to its step-1 state and `projects_running` equals step 1's value.
 12. [ ] Unpark the new host: clear the Custom Start Command, restore the healthcheck (`./infra/railway/apply-settings.sh`
     after filling `settings.json` — its `wheel-host` entry now needs the new `project`/`environment`/`serviceId`),
     redeploy. `railway logs -s wheel-host` should show reconcile restoring the projects; wait for
@@ -162,9 +183,12 @@ Prerequisite: the limiter PR above is merged and deployed to the OLD host and th
 14. [ ] `curl -s https://<new-domain>/healthz` → 200; `curl -s -o /dev/null -w '%{http_code}' https://<new-domain>/host/v1/healthz` → **401**
     (bearer enforced on the public route). Through the public API: sign in, open an existing project,
     confirm its board loads and an agent responds; create a throwaway project and delete it.
-    Then `railway link -p wheel-host -s wheel-host && ./infra/railway/verify-network-isolation.sh` → exit 0. **This is the acceptance test for 048.**
+    Then `railway link -p wheel-host -s wheel-host && ./infra/railway/verify-network-isolation.sh` → exit 0. **This is the acceptance test for 048.** It exits 0 (isolated, every probe ran), 1 (reachable — 048 open) or 2 (could not
+    measure — never reported as isolated); it probes as root AND as a sandbox uid, with a public-name positive control, and is
+    itself tested against a stub `railway` (`infra/tests/verify-network-isolation.test.sh`).
 15. [ ] Leave the OLD service parked (`sleep infinity`) and its volume alone for a soak period (your call, days not
-    hours; keep `wheel-data.tgz` too). Only then delete the old service + volume. Update
+    hours). **Then, as a step not a suggestion: delete `wheel-data.enc` from the laptop, any bucket object, and the key.**
+    Only then delete the old service + volume. Update
     `infra/prune-probe-projects.railway.sh` (its TODO) and README topology text in the same PR that fills in `settings.json`.
 
 **Rollback (any point before step 15's deletion):** link `wheel`, `railway variables --set 'WHEEL_HOST_URL=http://wheel-host.railway.internal:7100' --set 'WHEEL_HOST_SECRET=<old secret>' -s wheel-api`;
