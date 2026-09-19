@@ -53,9 +53,8 @@ the shapes differ only in fixed overhead and per-service minimums, which is wher
    an isolation check adapted from `infra/railway/verify-network-isolation.sh`. (Closes 048's intent.)
 2. **A production compose** for api + host (+ Caddy, and Postgres or SQLite). `infra/vps/compose.yml` is
    wheeld-only and `infra/docker-compose.yml` is a dev stack with dev secrets. Pre-built images, not on-box compiles.
-3. **A decision on the docker socket** — the host holding it is the escape hatch (`#86`): socket proxy limited to
-   container create/start/stop/rm, or rootless docker / gVisor / sysbox. This is the security P2 item and the
-   real cost of (C).
+3. **A decision on the docker socket** — the host holding it is the escape hatch (`#86`). Recommendation and
+   the alternatives ruled out are in the next section. This is the security P2 item and the real cost of (C).
 4. Later: **037** for agents that must not trust each other *inside* one canvas (SDK's proposal); auto-update for a
    non-wheeld deployment.
 
