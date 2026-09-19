@@ -121,7 +121,7 @@ async fn stopping_a_project_stops_its_agents_and_everything_they_started() {
     for pid in &survivors {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
-    host.sandbox.shutdown_all().await;
+    host.shutdown().await;
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&fake).ok();
     assert!(

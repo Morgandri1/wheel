@@ -26,10 +26,23 @@ use uuid::Uuid;
 /// raised (review round 2, finding 2).
 const ENGINE_STOP_GRACE_SECS: i32 = 30;
 
+/// Label carrying a hash of everything a container was created from.
+pub const SPEC_LABEL: &str = "wheel.spec";
+
+struct Inspected {
+    state: String,
+    spec: Option<String>,
+}
+
 pub struct DockerSandbox {
     docker: Docker,
     cfg: Config,
     http: reqwest::Client,
+    /// Why the last attempt to bring a project up failed, until one succeeds or the project is
+    /// stopped or destroyed. Kept here because a failed start leaves nothing in docker to inspect —
+    /// the container may not exist at all — and a project that could not be brought back must read
+    /// as an error, not as a quietly stopped one.
+    last_error: std::sync::Mutex<HashMap<Uuid, String>>,
 }
 
 impl DockerSandbox {
@@ -52,10 +65,16 @@ impl DockerSandbox {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("build http client"),
+            last_error: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     async fn inspect_state(&self, id: &Uuid) -> Result<Option<String>> {
+        Ok(self.inspect(id).await?.map(|i| i.state))
+    }
+
+    /// The container's state word and the spec it was created from, or `None` if there is none.
+    async fn inspect(&self, id: &Uuid) -> Result<Option<Inspected>> {
         match self
             .docker
             .inspect_container(
@@ -64,10 +83,28 @@ impl DockerSandbox {
             )
             .await
         {
-            Ok(c) => Ok(c
-                .state
-                .and_then(|s| s.status)
-                .map(|s| s.to_string().to_ascii_lowercase())),
+            Ok(c) => {
+                let spec = c
+                    .config
+                    .and_then(|c| c.labels)
+                    .and_then(|l| l.get(SPEC_LABEL).cloned());
+                let state = c.state.and_then(|s| {
+                    let status = s.status?.to_string().to_ascii_lowercase();
+                    // The engine image declares a HEALTHCHECK, so docker itself knows whether a
+                    // running engine is answering. Reported as its own word: `running` alone is a
+                    // process that exists, which is not the same as a project that works.
+                    let health = s
+                        .health
+                        .and_then(|h| h.status)
+                        .map(|h| h.to_string().to_ascii_lowercase());
+                    Some(match (status.as_str(), health.as_deref()) {
+                        ("running", Some("unhealthy")) => "unhealthy".to_string(),
+                        ("running", Some("starting")) => "created".to_string(),
+                        _ => status,
+                    })
+                });
+                Ok(state.map(|state| Inspected { state, spec }))
+            }
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(None),
@@ -101,6 +138,134 @@ impl DockerSandbox {
             tokio::time::sleep(delay).await;
             // Back off gently so a slow start does not mean hundreds of probes.
             delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    fn record_error(&self, id: &Uuid, error: Option<String>) {
+        let mut map = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        match error {
+            Some(e) => {
+                map.insert(*id, e);
+            }
+            None => {
+                map.remove(id);
+            }
+        }
+    }
+
+    fn recorded_error(&self, id: &Uuid) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+
+    async fn bring_up(&self, id: &Uuid, secrets: &Secrets) -> Result<()> {
+        // Provision on demand: the API may PUT and start in quick succession, and a start for a
+        // project whose container was reaped should heal rather than fail.
+        self.provision(id, secrets).await?;
+
+        match self
+            .docker
+            .start_container(
+                &self.cfg.container_name(id),
+                None::<qp::StartContainerOptions>,
+            )
+            .await
+        {
+            Ok(()) => {}
+            // 304 = already started. Idempotent: a user click and a reconcile can race.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {}
+            Err(e) => return Err(e).context("starting container"),
+        }
+        self.await_healthy(id).await
+    }
+
+    /// Every container this host made (labelled `wheel.project`), running or not, with its state.
+    ///
+    /// Reconcile walks the store, so a container with no row — left by a crash between the two
+    /// halves of a delete, or by a store restored from an older backup — would otherwise never be
+    /// looked at again.
+    pub async fn list_project_containers(&self) -> Result<Vec<(Uuid, String)>> {
+        let filters = HashMap::from([("label".to_string(), vec!["wheel.project".to_string()])]);
+        let listed = self
+            .docker
+            .list_containers(Some(qp::ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .context("listing project containers")?;
+        Ok(listed
+            .into_iter()
+            .filter_map(|c| {
+                let name = c.names?.into_iter().find_map(|n| n.strip_prefix('/').map(str::to_string))?;
+                let id = name.strip_prefix("wheel-p-")?.parse::<Uuid>().ok()?;
+                Some((id, c.state.map(|s| s.to_string().to_ascii_lowercase()).unwrap_or_default()))
+            })
+            .collect())
+    }
+
+    /// The environment a project's container is created with, in a fixed order.
+    fn env_for(&self, id: &Uuid, secrets: &Secrets) -> Vec<String> {
+        vec![
+            format!("WHEEL_PROJECT_ID={id}"),
+            format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret),
+            format!("WHEEL_VAULT_KEY={}", secrets.vault_key),
+            // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
+            // fail-secure per project, computed by wheel-host itself — never a value a project's
+            // own owner can influence.
+            format!("WHEEL_HARNESS_AUTH={}", self.cfg.harness_auth_for(id)),
+            format!("WHEEL_LISTEN=tcp://0.0.0.0:{}", self.cfg.engine_port),
+            "WHEEL_DATA_DIR=/data".to_string(),
+            "WHEEL_LOG=json".to_string(),
+            // Selects the engine entrypoint from the shared host image.
+            "WHEEL_ROLE=engine".to_string(),
+        ]
+    }
+
+    /// A hash of every input to the container: image, limits, network and environment (which holds
+    /// the engine secret, the vault key and the harness-auth policy).
+    ///
+    /// A container outlives the host that made it, and `provision` used to be a no-op once one
+    /// existed — so a rotated secret, a changed harness policy or a new image never reached a
+    /// surviving engine. A container whose label differs from this is recreated, on its volume.
+    fn spec_hash(&self, id: &Uuid, secrets: &Secrets) -> String {
+        let c = &self.cfg;
+        let mut spec = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            c.engine_image, c.docker_network, c.memory_bytes, c.nano_cpus, c.pids_limit
+        );
+        for e in self.env_for(id, secrets) {
+            spec.push_str(&e);
+            spec.push('\n');
+        }
+        wheel_core::sha256_hex(spec.as_bytes())
+    }
+
+    /// Remove the container but keep its volume: the project's data is not what changed.
+    async fn remove_container_only(&self, id: &Uuid) -> Result<()> {
+        match self
+            .docker
+            .remove_container(
+                &self.cfg.container_name(id),
+                Some(qp::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(e).context("removing a stale container"),
         }
     }
 
@@ -149,21 +314,11 @@ impl DockerSandbox {
 
         let config = bollard::models::ContainerCreateBody {
             image: Some(self.cfg.engine_image.clone()),
-            env: Some(vec![
-                format!("WHEEL_PROJECT_ID={id}"),
-                format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret),
-                format!("WHEEL_VAULT_KEY={}", secrets.vault_key),
-                // wow-agent-brief task 4 / docs/proposals/wheeld-first-class-cloud-api-key-policy.md:
-                // fail-secure per project, computed by wheel-host itself — never a value a project's
-                // own owner can influence.
-                format!("WHEEL_HARNESS_AUTH={}", self.cfg.harness_auth_for(id)),
-                format!("WHEEL_LISTEN=tcp://0.0.0.0:{}", self.cfg.engine_port),
-                "WHEEL_DATA_DIR=/data".to_string(),
-                "WHEEL_LOG=json".to_string(),
-                // Selects the engine entrypoint from the shared host image.
-                "WHEEL_ROLE=engine".to_string(),
-            ]),
-            labels: Some(HashMap::from([("wheel.project".into(), id.to_string())])),
+            env: Some(self.env_for(id, secrets)),
+            labels: Some(HashMap::from([
+                ("wheel.project".into(), id.to_string()),
+                (SPEC_LABEL.into(), self.spec_hash(id, secrets)),
+            ])),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -200,36 +355,36 @@ fn explain_create_failure(e: bollard::errors::Error, image: &str) -> anyhow::Err
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn provision(&self, id: &Uuid, secrets: &Secrets) -> Result<()> {
-        if self.inspect_state(id).await?.is_some() {
-            return Ok(());
+        match self.inspect(id).await? {
+            None => self.create(id, secrets).await,
+            Some(existing) if existing.spec.as_deref() == Some(self.spec_hash(id, secrets).as_str()) => Ok(()),
+            Some(_) => {
+                tracing::warn!(
+                    project = %id,
+                    "the project's container was made from a different configuration (a rotated \
+                     secret, a changed policy or a new image); recreating it on its volume"
+                );
+                self.remove_container_only(id).await?;
+                self.create(id, secrets).await
+            }
         }
-        self.create(id, secrets).await
     }
 
     async fn start(&self, id: &Uuid, secrets: &Secrets) -> Result<()> {
-        // Provision on demand: the API may PUT and start in quick succession, and a start for a
-        // project whose container was reaped should heal rather than fail.
-        self.provision(id, secrets).await?;
-
-        match self
-            .docker
-            .start_container(
-                &self.cfg.container_name(id),
-                None::<qp::StartContainerOptions>,
-            )
-            .await
-        {
-            Ok(()) => {}
-            // 304 = already started. Idempotent: a user click and a reconcile can race.
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 304, ..
-            }) => {}
-            Err(e) => return Err(e).context("starting container"),
+        match self.bring_up(id, secrets).await {
+            Ok(()) => {
+                self.record_error(id, None);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_error(id, Some(format!("{e:#}")));
+                Err(e)
+            }
         }
-        self.await_healthy(id).await
     }
 
     async fn stop(&self, id: &Uuid) -> Result<()> {
+        self.record_error(id, None);
         match self
             .docker
             .stop_container(
@@ -258,13 +413,14 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn destroy(&self, id: &Uuid) -> Result<()> {
+        self.record_error(id, None);
         if let Err(e) = self
             .docker
             .remove_container(
                 &self.cfg.container_name(id),
                 Some(qp::RemoveContainerOptions {
                     force: true,
-                    v: false,
+                    v: true,
                     ..Default::default()
                 }),
             )
@@ -296,7 +452,21 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn status(&self, id: &Uuid) -> Result<Status> {
-        Ok(match self.inspect_state(id).await?.as_deref() {
+        let state = self.inspect_state(id).await?;
+        // An error is reported through `Err`, which the host serves as `status: "error"` with the
+        // reason: a running container docker calls unhealthy, or a project that failed to come up
+        // and is not running. A project that is running and healthy has no error to show, even if
+        // an earlier attempt failed.
+        if state.as_deref() == Some("unhealthy") {
+            anyhow::bail!("the engine container is running but docker reports it unhealthy");
+        }
+        let running = state.as_deref() == Some("running");
+        if !running {
+            if let Some(e) = self.recorded_error(id) {
+                anyhow::bail!("the project failed to start: {e}");
+            }
+        }
+        Ok(match state.as_deref() {
             None => Status::Stopped,
             Some("running") => Status::Running,
             Some("created") | Some("restarting") => Status::Starting,

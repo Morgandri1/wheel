@@ -37,6 +37,10 @@ ENVIRONMENT:
                           accounts with POST /v1/auth/users and the operator token.
     CORS_ALLOWED_ORIGINS  Browser origins allowed to call the API directly. Default: none.
     WHEEL_AUTO_UPDATE     off (the default), prompt or auto. See docs/proposals/auto-update.md.
+    WHEEL_SANDBOX         embedded (the default) or docker. Docker gives every project its own
+                          container, through the filtering proxy DOCKER_HOST names (never the raw
+                          docker socket), and cannot be combined with WHEEL_AUTO_UPDATE.
+                          See docs/proposals/wheeld-docker-arm.md.
 ";
 
 /// Loopback: only this machine can reach it until the operator says otherwise.
@@ -46,6 +50,40 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
 pub struct Settings {
     pub data_dir: PathBuf,
     pub bind: String,
+    pub sandbox: SandboxMode,
+}
+
+/// Where a project's engine runs.
+///
+/// Chosen ONLY by an explicit `WHEEL_SANDBOX`, never inferred from what happens to be reachable:
+/// a daemon that quietly ran embedded because docker was down would keep serving with the
+/// isolation gone and nothing to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxMode {
+    /// A task inside this process. One user, one machine; the default.
+    #[default]
+    Embedded,
+    /// A container per project, created through the docker socket proxy.
+    Docker,
+}
+
+impl SandboxMode {
+    pub const ENV: &'static str = "WHEEL_SANDBOX";
+
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim) {
+            None | Some("") | Some("embedded") => Ok(Self::Embedded),
+            Some("docker") => Ok(Self::Docker),
+            Some(other) => bail!(
+                "{} must be \"embedded\" or \"docker\", got {other:?}",
+                Self::ENV
+            ),
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::parse(std::env::var(Self::ENV).ok().as_deref())
+    }
 }
 
 /// What `main` should do, decided from the arguments before anything is started.
@@ -115,7 +153,11 @@ impl Settings {
             .or_else(|| std::env::var("BIND_ADDR").ok())
             .unwrap_or_else(|| DEFAULT_BIND.to_string());
 
-        Ok(Action::Run(Settings { data_dir, bind }))
+        Ok(Action::Run(Settings {
+            data_dir,
+            bind,
+            sandbox: SandboxMode::from_env()?,
+        }))
     }
 }
 
@@ -378,5 +420,32 @@ mod ready_line_tests {
         assert_eq!(displayable("0.0.0.0:8080"), "localhost:8080");
         assert_eq!(displayable("[::]:8080"), "localhost:8080");
         assert_eq!(displayable("127.0.0.1:8099"), "127.0.0.1:8099");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_mode_tests {
+    use super::SandboxMode;
+
+    #[test]
+    fn embedded_is_the_default_and_docker_must_be_asked_for_by_name() {
+        assert_eq!(SandboxMode::parse(None).unwrap(), SandboxMode::Embedded);
+        assert_eq!(SandboxMode::parse(Some("")).unwrap(), SandboxMode::Embedded);
+        assert_eq!(
+            SandboxMode::parse(Some("embedded")).unwrap(),
+            SandboxMode::Embedded
+        );
+        assert_eq!(
+            SandboxMode::parse(Some("docker")).unwrap(),
+            SandboxMode::Docker
+        );
+    }
+
+    #[test]
+    fn anything_else_is_a_boot_failure_naming_the_variable_not_a_guess() {
+        for bad in ["Docker", "container", "true", "1", "process"] {
+            let e = SandboxMode::parse(Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("WHEEL_SANDBOX") && e.contains(bad), "{e}");
+        }
     }
 }
