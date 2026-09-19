@@ -1,4 +1,5 @@
 {
+  "_comment": "Default project/environment, used by any service below that does not name its own. See docs/proposals/network-isolation-048.md: wheel-host is moving to its own project to close finding 048, and will get its own \"project\"/\"environment\" override here once that project exists — until then it keeps using this default, unchanged.",
   "project": "c6049c66-9530-4900-a3c1-659529328c1e",
   "environment": "69d3c09b-8a50-4fde-9a7c-53b3307c6ad6",
   "services": {
