@@ -35,9 +35,9 @@ fn dev_config(db_url: &str) -> Config {
         env: Env::Dev,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "http://unused.invalid/jwks".into(),
-        clerk_issuer: ISSUER.into(),
-        clerk_azp: vec![],
+        jwks_url: "http://unused.invalid/jwks".into(),
+        jwks_issuer: ISSUER.into(),
+        jwks_azp: vec![],
         dev_secret: Some(DEV_SECRET.into()),
         auth_mode: wheel_api::config::AuthMode::Jwks,
         session_secret: wheel_api::crypto::Secret::new("test-session-secret-at-least-32-chars"),
@@ -151,10 +151,7 @@ async fn app() -> Option<(axum::Router, wheel_api::db::Db)> {
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {
-        jwks: wheel_api::auth::jwks::JwksCache::new(
-            cfg.clerk_jwks_url.clone(),
-            reqwest::Client::new(),
-        ),
+        jwks: wheel_api::auth::jwks::JwksCache::new(cfg.jwks_url.clone(), reqwest::Client::new()),
         cfg,
         db: db.clone(),
         http: reqwest::Client::new(),

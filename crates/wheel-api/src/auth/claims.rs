@@ -87,7 +87,7 @@ pub async fn verify(
     };
 
     if let Some(azp) = &claims.azp {
-        if !cfg.clerk_azp.is_empty() && !cfg.clerk_azp.iter().any(|a| a == azp) {
+        if !cfg.jwks_azp.is_empty() && !cfg.jwks_azp.iter().any(|a| a == azp) {
             return Err(ApiError::Unauthorized("azp not in allowlist"));
         }
     }
@@ -111,10 +111,14 @@ fn decode_with(
 ) -> Result<Claims, ApiError> {
     // Pin to exactly one algorithm — never a permissive list.
     let mut v = Validation::new(alg);
-    v.set_issuer(&[cfg.clerk_issuer.as_str()]);
+    v.set_issuer(&[cfg.jwks_issuer.as_str()]);
     v.validate_exp = true;
     v.validate_nbf = true;
-    // `aud` is validated via azp above; Clerk session tokens do not reliably carry `aud`.
+    // `aud` is validated via azp above, because the session tokens this mode was built for do not
+    // reliably carry one. That is the weakness `AUTH_MODE=external` exists to fix, and it is not
+    // fixed here: tightening it would break the deployed `jwks` contract. `external` is where the
+    // rigour lives (`auth::external`, where `aud` is mandatory), and `jwks` is the removal
+    // candidate — see `docs/proposals/external-auth.md` §2.
     v.validate_aud = false;
     v.leeway = 5;
 
