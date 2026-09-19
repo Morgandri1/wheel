@@ -535,6 +535,48 @@ load-bearing.** A suite in which one check masks another passes against a build 
 been removed, so every criterion below is mutation-checked — the bug is restored, the named
 assertion is watched going red, the fix is restored. A row whose mutant survives is not evidence.
 
+### Mutation results (run of 2026-09-19, against `sdk/external-auth`)
+
+Harness: `qa/tools/mutation_external_auth.py`, which applies each edit, runs the one named test,
+and restores the file. Not in `make check` — it edits tracked source, and a merge gate should not
+do that to somebody's working tree — so it is a tool for whoever changes `auth/external.rs`, and
+this table is the record.
+
+| Mutant | The regression restored | Dies on |
+|---|---|---|
+| `alg-from-key` | `Validation::new(header.alg)` and the allowlist read from the header, with the `header.alg != entry.alg` guard removed | `external_auth::a_header_algorithm_that_disagrees_with_the_key_is_refused` |
+| `allowlist` | the `algs.contains(&entry.alg)` check deleted | `external_auth::an_algorithm_outside_the_allowlist_is_refused` |
+| `aud-mandatory` | `aud` dropped from `required_spec_claims` | `external_auth::a_token_with_no_audience_is_refused` |
+| `issuer-pin` | `v.set_issuer(..)` deleted | `external_auth::another_issuer_is_refused_even_with_a_valid_signature` |
+| `proxy-peer` | the `!trusted_peer` refusal deleted | `external_identities::the_same_assertion_from_an_untrusted_peer_is_refused` |
+| `cross-origin` | `refuse_cross_origin` returns `Ok(())` for every origin | `external_identities::a_cross_origin_page_may_not_spend_an_ambient_proxy_credential` |
+| `hop-strip-authenticated` | `sanitized_with_actor` passes `&[]` instead of `proxy_asserted_headers(cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_the_authenticated_proxy` |
+| `hop-strip-ingress` | `routes::ingress` passes `&[]` instead of `proxy_asserted_headers(&state.cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_public_ingress` |
+| `dev-hs256-interlock` | `(Env::Prod, Some(s)) => Some(s)` instead of `bail!` | `config_interlock::dev_secret_interlock_and_config_validation` |
+
+All nine die on a named assertion. **Two of them did not, on the first run**, and both gaps were
+real rather than cosmetic:
+
+* **`hop-strip-authenticated` and `hop-strip-ingress` had no test at all.** `http::hop`'s unit test
+  passes the header names in as a literal argument, and `http::actor`'s tests
+  `proxy_asserted_headers` in isolation; neither reads the two call sites where they are joined, so
+  removing the argument from either one was invisible. `tests/proxy_header_hop.rs` is the fix: a
+  mock engine that answers with the header names it received, so the assertion is on what crossed
+  rather than on what the API believes it sent. Both outbound paths, each with a positive control
+  (`x-wheel-actor-id`, `x-wheel-ingress`) — without one, "the header is absent" is satisfied
+  perfectly by a request that never arrived.
+* **`alg-from-key` survived a test that looked correct.** It asserted only `is_err()`, and under the
+  mutant `jsonwebtoken` still refuses — an RSA `DecodingKey` cannot verify an Ed25519 signature. So
+  the suite was proving that the two fixture keys belong to different algorithm families, which is
+  a property of `jwks::algorithm_of`, in a different file from the decision it protects. That
+  cross-file dependency is verbatim what §3.1 restructured the verifier to eliminate, so the test
+  was passing on the strength of the design it replaced. It now asserts **which** refusal, through
+  `assert_refused_because`.
+
+Both findings share a shape worth naming: **a negative assertion is only as good as its reason.**
+`is_err()` and "no such header" are both satisfied by accidents — a different error, a request that
+never ran — and neither notices when the control it names stops existing.
+
 Suites: `crates/wheel-api/tests/external_auth.rs` (verification, against a live fixture key set),
 `external_config.rs` (boot), `principal_mapping.rs` (the `(issuer, subject)` → Wheel id map),
 `external_identities.rs` (the routes and the proxy-header plane), `config_interlock.rs` (the dev
