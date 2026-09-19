@@ -1014,12 +1014,27 @@ mod tests {
             .decide("POST", "/volumes/create", ok.to_string().as_bytes())
             .is_ok());
 
+        // Every row below carries valid labels, so it can only be refused for the defect it names —
+        // a row that also lacked them would keep passing after its own guard was removed.
+        let labels = json!({"wheel.project": id().to_string()});
         for (what, body) in [
             (
                 "a bind mount through the volume API",
-                json!({"Name": name, "DriverOpts": {"type":"none","o":"bind","device":"/"}}),
+                json!({"Name": name, "Labels": labels, "DriverOpts": {"type":"none","o":"bind","device":"/"}}),
             ),
-            ("another driver", json!({"Name": name, "Driver": "nfs"})),
+            (
+                "the same with the driver spelled out",
+                json!({"Name": name, "Labels": labels, "Driver": "local", "DriverOpts": {"type":"none","o":"bind","device":"/"}}),
+            ),
+            (
+                "a cluster volume",
+                json!({"Name": name, "Labels": labels, "ClusterVolumeSpec": {}}),
+            ),
+            (
+                "another driver",
+                json!({"Name": name, "Labels": labels, "Driver": "nfs"}),
+            ),
+            ("no labels at all", json!({"Name": name})),
             (
                 "another project's name",
                 json!({"Name": volume_name(&Uuid::nil()), "Labels": {"wheel.project": id().to_string()}}),
