@@ -153,6 +153,13 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             "/v1/projects/{id}/engine/{*rest}",
             axum::routing::any(routes::proxy::engine_proxy),
         )
+        // The CORS allowlist, reachable by the auth extractor. Under proxy-header auth the
+        // credential is ambient, so `auth::external::refuse_cross_origin` refuses a page that is
+        // not on this list — a control CORS itself cannot provide, because the engine proxy
+        // accepts every verb and content type and therefore is not always preflighted.
+        .layer(axum::Extension(auth::external::AllowedOrigins(
+            std::sync::Arc::new(allowed_origins.to_vec()),
+        )))
         .layer(cors_layer(allowed_origins))
         // Public ingress. No auth by design; gated on the project's `http` capability. Merged after
         // the layer above so it carries its own, permissive, CORS instead of the app allowlist.

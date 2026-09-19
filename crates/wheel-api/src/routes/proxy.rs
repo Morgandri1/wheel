@@ -272,7 +272,7 @@ async fn forward_http(
     // Strip the whole `x-wheel-` namespace, then set ours. A caller who forged
     // `x-wheel-actor-tier: admin` has it removed and *replaced* with their real tier — not merely
     // ignored, which would leave their value in the map beside ours.
-    let headers = actor::sanitized_with_actor(req.headers(), user, tier);
+    let headers = actor::sanitized_with_actor(req.headers(), &state.cfg, user, tier);
 
     // Buffer the body against the configured cap. Streaming would be nicer, but an unbounded
     // stream from an authenticated client is still a memory-exhaustion vector across N replicas.

@@ -19,6 +19,7 @@
 //! sites where two of them would eventually be a version behind.
 
 use crate::auth::{AuthUser, Tier};
+use crate::config::{Config, ExternalVerifier};
 use axum::http::{HeaderMap, HeaderValue};
 
 /// The namespace only the API may write. Everything under it is stripped from a client's request
@@ -57,14 +58,39 @@ pub fn set_actor(headers: &mut HeaderMap, user: &AuthUser, tier: Tier) {
     }
 }
 
-/// The header set to send upstream: the client's, minus hop-by-hop, minus their credentials, minus
-/// the entire `x-wheel-` namespace, plus ours.
+/// The header names this deployment's authenticating proxy sets, if it has one.
+///
+/// Under `AUTH_MODE=external` with the `proxy_header` verifier these headers ARE the credential,
+/// so they belong with `x-auth-token` on the never-relay list. They cannot live in
+/// `hop::CLIENT_ONLY`, which is a `const`, because the deployer chooses their names — so they are
+/// resolved from configuration here, at the one function every outbound engine request goes
+/// through, rather than at each of the call sites that would otherwise have to remember.
+pub fn proxy_asserted_headers(cfg: &Config) -> Vec<&str> {
+    match cfg.external.as_ref().map(|e| &e.verifier) {
+        Some(ExternalVerifier::ProxyHeader {
+            subject_header,
+            email_header,
+        }) => std::iter::once(subject_header.as_str())
+            .chain(email_header.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The header set to send upstream: the client's, minus hop-by-hop, minus their credentials —
+/// including a proxy-asserted identity — minus the entire `x-wheel-` namespace, plus ours.
 ///
 /// A caller that forges `x-wheel-actor-tier: admin` therefore has it removed and then *replaced*
 /// with their real tier — not merely ignored. The distinction matters: "ignored" would still leave
 /// their value in the map beside ours, and `HeaderMap` can hold two values for one name.
-pub fn sanitized_with_actor(inbound: &HeaderMap, user: &AuthUser, tier: Tier) -> HeaderMap {
-    let mut headers = super::hop::sanitize_for_upstream(inbound, &[WHEEL_PREFIX]);
+pub fn sanitized_with_actor(
+    inbound: &HeaderMap,
+    cfg: &Config,
+    user: &AuthUser,
+    tier: Tier,
+) -> HeaderMap {
+    let mut headers =
+        super::hop::sanitize_for_upstream(inbound, &[WHEEL_PREFIX], &proxy_asserted_headers(cfg));
     set_actor(&mut headers, user, tier);
     headers
 }
