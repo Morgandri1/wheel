@@ -159,7 +159,11 @@ impl Policy {
                 Ok(Admitted::StripEnv)
             }
             ("POST", ["containers", "create"]) => {
-                only_params(&q, &["name"], |_, _| true)?;
+                // bollard also sends an empty `platform=`; a non-empty one would pick an image
+                // variant, which the pinned image already decides.
+                only_params(&q, &["name", "platform"], |k, v| {
+                    k == "name" || v.is_empty()
+                })?;
                 let Some((_, name)) = q.iter().find(|(k, _)| *k == "name") else {
                     return deny("a container must be created with a name");
                 };
@@ -181,8 +185,9 @@ impl Policy {
             }
             ("DELETE", ["containers", name]) => {
                 container_id(name)?;
-                // `v=true` would also remove anonymous volumes; `link` reaches other containers.
-                only_params(&q, &["force", "v"], |k, v| match k {
+                // `v=true` would also remove anonymous volumes and `link=true` removes a link between
+                // containers, so both are admitted only as `false` (which is what bollard sends).
+                only_params(&q, &["force", "v", "link"], |k, v| match k {
                     "force" => bool_word(v),
                     _ => v == "false",
                 })?;
@@ -729,7 +734,10 @@ mod tests {
             ("GET", format!("/containers/{c}/json?size=false")),
             ("POST", format!("/containers/{c}/start")),
             ("POST", format!("/containers/{c}/stop?t=30")),
-            ("DELETE", format!("/containers/{c}?force=true&v=false")),
+            (
+                "DELETE",
+                format!("/containers/{c}?force=true&v=false&link=false"),
+            ),
             ("DELETE", format!("/volumes/{v}?force=true")),
         ] {
             assert!(p.decide(m, &t, b"").is_ok(), "{m} {t}");

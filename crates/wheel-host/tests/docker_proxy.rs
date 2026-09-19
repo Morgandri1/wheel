@@ -33,13 +33,20 @@ fn sock(tag: &str) -> std::path::PathBuf {
 /// A docker daemon that records every request line it is sent. Inspection reports the container's
 /// environment, as a real one does, so a test can see whether the proxy removes it.
 fn fake_daemon() -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+    fake_daemon_with(false)
+}
+
+/// `pre_existing` starts the daemon as if the container were already there.
+fn fake_daemon_with(pre_existing: bool) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
     let path = sock("daemon");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let recorder = seen.clone();
+    let created = Arc::new(std::sync::atomic::AtomicBool::new(pre_existing));
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let recorder = recorder.clone();
+            let created = created.clone();
             tokio::spawn(async move {
                 let mut raw = Vec::new();
                 let mut buf = vec![0u8; 16384];
@@ -73,7 +80,15 @@ fn fake_daemon() -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
                 recorder.lock().unwrap().push(format!("{method} {target}"));
                 let path = target.split('?').next().unwrap_or("");
 
-                let (code, body) = if path.ends_with("/json") {
+                if path.ends_with("/containers/create") {
+                    created.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let exists = created.load(std::sync::atomic::Ordering::SeqCst);
+                let (code, body) = if path.ends_with("/json") && !exists {
+                    // A real daemon 404s until the container exists; without this `provision`
+                    // always thinks it is already there and no test ever sees a create.
+                    (404, r#"{"message":"No such container"}"#.to_string())
+                } else if path.ends_with("/json") {
                     (
                         200,
                         format!(
@@ -208,9 +223,13 @@ async fn the_real_docker_backend_runs_its_whole_lifecycle_through_the_proxy() {
     let v = format!("wheel-p-{id}-data");
     let strip = |s: &String| {
         let (m, t) = s.split_once(' ').unwrap();
-        let t = t.strip_prefix("/v").map_or(t.to_string(), |r| {
-            r.find('/').map_or(t.to_string(), |i| r[i..].to_string())
-        });
+        // Only a real version prefix (/v1.49/...): stripping a bare "/v" also eats "/volumes".
+        let t = match t.strip_prefix("/v") {
+            Some(r) if r.starts_with(|c: char| c.is_ascii_digit()) => {
+                r.find('/').map_or(t.to_string(), |i| r[i..].to_string())
+            }
+            _ => t.to_string(),
+        };
         format!("{m} {t}")
     };
     let calls: Vec<String> = seen.lock().unwrap().iter().map(strip).collect();
@@ -233,7 +252,7 @@ async fn the_real_docker_backend_runs_its_whole_lifecycle_through_the_proxy() {
 
 #[tokio::test]
 async fn an_inspection_never_carries_the_engine_secret_back() {
-    let (daemon, _) = fake_daemon();
+    let (daemon, _) = fake_daemon_with(true);
     let front = proxy_in_front_of(&daemon).await;
     let id = Uuid::new_v4();
 
