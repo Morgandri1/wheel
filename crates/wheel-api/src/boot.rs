@@ -72,7 +72,7 @@ pub async fn connect_and_migrate(cfg: &Config) -> Result<Db> {
 }
 
 pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState {
-    let jwks = crate::auth::jwks::JwksCache::new(cfg.clerk_jwks_url.clone(), http.clone());
+    let jwks = crate::auth::jwks::JwksCache::new(cfg.jwks_url.clone(), http.clone());
     // Only when an external provider is actually in use. Under AUTH_MODE=local there is no JWKS
     // URL to fetch, and priming one anyway made every local boot print a warning about a failure
     // that cannot matter — the first thing a new user sees, and entirely misleading.
@@ -84,6 +84,19 @@ pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState
             tracing::warn!(error = ?e, "could not prime JWKS at startup; will fetch on first request");
         }
     }
+    // The deployer's own key source, under AUTH_MODE=external with the `jwks` verifier. A separate
+    // cache from the one above: one map holding both issuers' keys would let a `kid` from either
+    // satisfy a token naming the other.
+    let external_jwks = match cfg.external.as_ref().map(|e| &e.verifier) {
+        Some(crate::config::ExternalVerifier::Jwks { url, .. }) => {
+            let cache = crate::auth::jwks::JwksCache::new(url.clone(), http.clone());
+            if let Err(e) = cache.prime().await {
+                tracing::warn!(error = ?e, "could not prime the external JWKS at startup; will fetch on first request");
+            }
+            Some(cache)
+        }
+        _ => None,
+    };
     let orch = build_orchestrator(&cfg, http.clone());
     let ingress_limiter = crate::http::ratelimit::RateLimiter::new(cfg.ingress_rate_per_min);
 
@@ -97,6 +110,7 @@ pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState
         cfg,
         db,
         jwks,
+        external_jwks,
         http,
         orch,
         ingress_limiter,

@@ -35,9 +35,9 @@ fn cfg(db_url: &str) -> Config {
         env: Env::Prod,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "https://clerk.test/jwks".into(),
-        clerk_issuer: "https://clerk.test".into(),
-        clerk_azp: vec![],
+        jwks_url: "https://clerk.test/jwks".into(),
+        jwks_issuer: "https://clerk.test".into(),
+        jwks_azp: vec![],
         dev_secret: None,
         auth_mode: AuthMode::Local,
         session_secret: Secret::new(SESSION_SECRET),
@@ -52,6 +52,7 @@ fn cfg(db_url: &str) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
         ws_max_bridges_per_project: 16,
         ws_max_lifetime_secs: 3600,
     }
@@ -75,6 +76,7 @@ async fn app() -> (Router, Db) {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: None,
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     (wheel_api::build_router(state, &[]), db)
@@ -317,6 +319,7 @@ async fn the_per_user_project_cap_is_enforced_on_sqlite() {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: None,
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     let app = wheel_api::build_router(state, &[]);

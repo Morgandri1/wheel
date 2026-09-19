@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod board_apply;
 pub mod builder;
+pub mod external_identities;
 pub mod health;
 pub mod info;
 pub mod ingress;

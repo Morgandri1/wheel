@@ -43,6 +43,8 @@ pub struct MemberList {
 /// jwks member is the caller's own, carried on `AuthUser` from the token THIS request presented —
 /// `None` for every other jwks row is not a gap to close, it is the honest limit of what the server
 /// can know without inventing a second identity store.
+///
+/// Under `external` the limit is different but the answer is the same, and the arm below says why.
 async fn display_email(state: &AppState, scope: &ProjectScope, user_id: &str) -> Option<String> {
     match state.cfg.auth_mode {
         crate::config::AuthMode::Local => {
@@ -53,9 +55,23 @@ async fn display_email(state: &AppState, scope: &ProjectScope, user_id: &str) ->
                 .flatten()
                 .map(|u| u.email)
         }
-        crate::config::AuthMode::Jwks => (user_id == scope.user.id())
-            .then(|| scope.user.email().map(str::to_string))
-            .flatten(),
+        // `external` joins `jwks` rather than `local`, even though an external principal IS a
+        // `users.id` and the lookup above would succeed. It would succeed with a LIE: an
+        // auto-provisioned account's address is synthetic by construction
+        // (`external-<uuid>@external.invalid`, `auth::local::create_external_user`), because the
+        // provider's `email` claim must never become a Wheel account address. Displaying that row
+        // would put a fabricated address in the roster. The provider's real claim is carried on
+        // `AuthUser` from the token THIS request presented, so — as under `jwks` — the caller's own
+        // is the only one the server can honestly show. (`external_identities.email` holds the
+        // claim for the operator's identity listing; making the roster read it is a widening of who
+        // sees whose address, so it is a decision, not a fallthrough.)
+        crate::config::AuthMode::Jwks | crate::config::AuthMode::External => {
+            if user_id == scope.user.id() {
+                scope.user.email().map(str::to_string)
+            } else {
+                None
+            }
+        }
     }
 }
 

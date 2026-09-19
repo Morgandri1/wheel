@@ -62,6 +62,100 @@ people directly, keeping the password off the command line:
 printf '{"email":"%s","password":"%s"}' you@example.com "$PASSWORD" | wh /v1/auth/users -d @-
 ```
 
+## Bringing your own identity provider (`AUTH_MODE=external`)
+
+`wheeld`'s built-in accounts are the default and need nothing here. If you already run an identity
+system — Keycloak, Authentik, Dex, Zitadel, Okta, Auth0, Entra, Cloudflare Access, or an in-house
+signer that publishes a JWKS — Wheel can verify *its* tokens instead. The full contract, every
+variable and every boot refusal is in `docs/API.md`; this is the operator's version.
+
+Nothing about this unifies accounts. Wheel maps a verified foreign subject to a Wheel account it
+mints itself, and everything downstream — ownership, membership, attribution — keys off that.
+
+**A JWKS issuer.** The recommended shape, and the only one with no availability coupling and no new
+secret for Wheel to hold:
+
+```bash
+AUTH_MODE=external
+WHEEL_EXTERNAL_VERIFIER=jwks
+WHEEL_EXTERNAL_ISSUER=https://accounts.example.com          # exactly the `iss` your tokens carry
+WHEEL_EXTERNAL_JWKS_URL=https://accounts.example.com/jwks
+WHEEL_EXTERNAL_ALGS=RS256,EdDSA                             # what your issuer actually signs with
+WHEEL_EXTERNAL_AUDIENCE=https://wheel.example.com           # what WE are — see below
+WHEEL_EXTERNAL_PROVISION=linked                             # or `auto`; there is no default
+```
+
+Four of those deserve a sentence each, because getting one wrong is the difference between a
+credential and a doorway:
+
+- **`WHEEL_EXTERNAL_AUDIENCE` must name this Wheel deployment and nothing else.** Not your issuer's
+  origin. An issuer that serves several of its own surfaces usually mints for all of them under one
+  issuer, and several of those already carry the issuer origin as their `aud` — set that here and
+  every one of them becomes a valid Wheel login. Wheel warns at boot if you do; it cannot refuse,
+  because it does not know what else your issuer serves.
+- **`WHEEL_EXTERNAL_ALGS` is an allowlist, and it must not contain an `HS*` algorithm.** Wheel
+  refuses one by name at boot: a key that verifies an HMAC is also a key that mints one.
+- **`WHEEL_EXTERNAL_PROVISION` has no default and you must state it.** `auto` gives a Wheel account
+  to anyone your issuer vouches for — right when the IdP's population *is* the intended Wheel
+  population, and wrong when your IdP lets anyone sign up. `linked` refuses an unknown subject until
+  an operator links it, and the first-boot operator token is the credential that does the first
+  linking, so there is no chicken-and-egg:
+
+  ```bash
+  wh /v1/auth/users -d '{"email":"you@example.com","password":"…"}'   # or an existing account id
+  wh /v1/auth/external-identities -d '{"subject":"<the sub your IdP issues>","user_id":"<uuid>"}'
+  wh /v1/auth/external-identities                                     # list them
+  wh /v1/auth/external-identities/<id> -X DELETE                      # disable one
+  ```
+
+  Those three routes need the operator account (the one `wheeld` writes the first token for) and
+  `404` on a deployment that is not running `external`.
+- **Your IdP must never reuse a `sub`.** OIDC requires it, and not every implementation obeys. A
+  reassigned subject inherits the previous human's Wheel account, projects and memberships, and
+  Wheel cannot detect it. If your IdP publishes a better immutable id — `oid` on Entra, `user_id` on
+  several others — point `WHEEL_EXTERNAL_SUBJECT_CLAIM` at that instead of `sub`.
+
+**Cloudflare Access** is a JWKS deployment, not a header one. It signs its assertion and publishes a
+key set, so verify it rather than trusting it: keep `WHEEL_EXTERNAL_VERIFIER=jwks` and add
+`WHEEL_EXTERNAL_TOKEN_HEADER=cf-access-jwt-assertion`.
+
+**A reverse proxy that has already authenticated the user** (oauth2-proxy, Pomerium, `nginx
+auth_request`, Tailscale serve) is the other verifier, and it is the dangerous one:
+
+```bash
+AUTH_MODE=external
+WHEEL_EXTERNAL_VERIFIER=proxy_header
+WHEEL_EXTERNAL_ISSUER=proxy:oauth2-proxy                    # a stable label; no token exists to carry one
+WHEEL_EXTERNAL_AUDIENCE=wheel
+WHEEL_EXTERNAL_PROVISION=linked
+WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER=x-forwarded-user
+WHEEL_EXTERNAL_PROXY_EMAIL_HEADER=x-forwarded-email         # optional, display only
+WHEEL_TRUSTED_PROXIES=10.0.0.5/32                           # REQUIRED here; empty refuses to boot
+```
+
+Wheel verifies **nothing** about that header. The proxy is the verifier, so the entire control is
+that the request reached Wheel *from* the proxy — which means **Wheel must not be reachable any
+other way.** Not "should": anything that can open a TCP connection to Wheel directly can be anyone.
+`WHEEL_TRUSTED_PROXIES` is the last check, not the only one; put Wheel on a network the proxy is the
+only route into. Setting it to `127.0.0.1` trusts every process on the machine, agents included.
+
+Wheel adds two things on top, and both are on by default in this mode: a **cross-origin request is
+refused 403** (the credential is ambient, so a hostile page could otherwise spend it from a victim's
+browser — set `CORS_ALLOWED_ORIGINS` if a browser client genuinely needs to call the API directly),
+and the subject and email headers are **stripped before anything is forwarded to an engine**, so an
+agent can never read or replay who the edge said was calling.
+
+**Trying it without an identity provider.** `cargo run -p wheel-api --example stub-issuer` serves a
+key set with both an RSA and an Ed25519 key and prints a ready token for each mode. It needs
+`WHEEL_ENV=dev`, because the production interlock refuses a loopback issuer — a stub issuer
+authenticates everyone as anyone. `docs/API.md` has the full recipe.
+
+**One thing external auth does not get.** `POST /v1/auth/tokens` is refused for an
+externally-authenticated caller. Your IdP's token is short-lived and you can revoke it; a `wht_`
+token is neither, so trading one for the other would hand out an indefinite credential your identity
+system can no longer take away. A `wht_` token *minted some other way* still works normally in every
+mode, including behind a proxy — that is how `wheeld token` keeps working from a script.
+
 ## Network and CORS
 
 The browser-facing settings are closed by default: `CORS_ALLOWED_ORIGINS` is empty, and a request is refused

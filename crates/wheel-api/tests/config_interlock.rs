@@ -12,12 +12,24 @@
 //! threads mutating them would race. Sequencing the cases inside a single test makes the
 //! interference impossible rather than unlikely.
 
+use std::sync::Mutex;
 use wheel_api::config::{Config, Env};
+
+/// Environment variables are process-global and Rust runs these two test functions on separate
+/// threads of one process. Everything that touches them holds this.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn base_env() {
     std::env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
+    // Deliberately the DEPRECATED spellings. Every assertion in this file therefore doubles as
+    // the regression test for the `CLERK_*` alias: if the alias ever stopped being read, this
+    // whole suite would go red rather than a deployment going down. See `config::aliased`.
     std::env::set_var("CLERK_JWKS_URL", "https://clerk.example.test/jwks");
     std::env::set_var("CLERK_ISSUER", "https://clerk.example.test");
+    std::env::remove_var("WHEEL_JWKS_URL");
+    std::env::remove_var("WHEEL_JWKS_ISSUER");
+    std::env::remove_var("WHEEL_JWKS_AZP");
+    std::env::remove_var("CLERK_AZP");
     // 32 zero bytes, base64.
     std::env::set_var(
         "API_MASTER_KEY",
@@ -36,6 +48,8 @@ fn base_env() {
 
 #[test]
 fn dev_secret_interlock_and_config_validation() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // --- the interlock ------------------------------------------------------------------------
     base_env();
     std::env::set_var("WHEEL_ENV", "prod");
@@ -332,4 +346,77 @@ fn dev_secret_interlock_and_config_validation() {
     base_env();
     std::env::remove_var("WHEEL_ENV");
     std::env::remove_var("AUTH_MODE");
+}
+
+/// The `CLERK_*` → `WHEEL_JWKS_*` alias (issue #132, `docs/proposals/external-auth.md` §3.4).
+///
+/// Its own test function rather than lines in the one above, because it needs the deprecated names
+/// *absent* while that one needs them present, and environment variables are process-global. Rust
+/// runs test functions in one process on several threads, so these two would race — hence the
+/// shared mutex below, the same reason the suite above is a single function.
+#[test]
+fn the_deprecated_clerk_names_are_aliases_and_an_ambiguous_pair_refuses_to_boot() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // 1. The new names alone work, and nothing requires the old ones any more.
+    base_env();
+    std::env::remove_var("CLERK_JWKS_URL");
+    std::env::remove_var("CLERK_ISSUER");
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("WHEEL_JWKS_URL", "https://idp.example.test/jwks");
+    std::env::set_var("WHEEL_JWKS_ISSUER", "https://idp.example.test");
+    std::env::set_var("WHEEL_JWKS_AZP", "app-1, app-2");
+    let cfg = Config::from_env().expect("the current names must be enough on their own");
+    assert_eq!(cfg.jwks_url, "https://idp.example.test/jwks");
+    assert_eq!(cfg.jwks_issuer, "https://idp.example.test");
+    assert_eq!(cfg.jwks_azp, vec!["app-1".to_string(), "app-2".to_string()]);
+
+    // 2. The deprecated names alone still work — the whole point of aliasing rather than renaming,
+    //    since these are required under `jwks` and a rename would fail the next deploy.
+    base_env();
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("CLERK_AZP", "app-1");
+    let cfg = Config::from_env().expect("a deployment configured the old way must keep booting");
+    assert_eq!(cfg.jwks_url, "https://clerk.example.test/jwks");
+    assert_eq!(cfg.jwks_issuer, "https://clerk.example.test");
+    assert_eq!(cfg.jwks_azp, vec!["app-1".to_string()]);
+
+    // 3. Both set to the SAME value is a redundancy, not an error.
+    base_env();
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("WHEEL_JWKS_URL", "https://clerk.example.test/jwks");
+    std::env::set_var("WHEEL_JWKS_ISSUER", "https://clerk.example.test");
+    let cfg = Config::from_env().expect("agreeing duplicates are not a conflict");
+    assert_eq!(cfg.jwks_issuer, "https://clerk.example.test");
+
+    // 4. Both set to DIFFERENT values refuses to boot. There is no correct way to pick a winner
+    //    between two issuers an operator has named, and picking one silently is how a deployment
+    //    ends up pinned to a provider nobody meant.
+    for (current, deprecated) in [
+        ("WHEEL_JWKS_ISSUER", "CLERK_ISSUER"),
+        ("WHEEL_JWKS_URL", "CLERK_JWKS_URL"),
+    ] {
+        base_env();
+        std::env::set_var("AUTH_MODE", "jwks");
+        std::env::set_var(current, "https://attacker.example/jwks");
+        let err = match Config::from_env() {
+            Ok(_) => panic!("{current} and {deprecated} disagreed and it booted anyway"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(current), "{err}");
+        assert!(err.contains(deprecated), "{err}");
+    }
+
+    // 5. An empty value is an unset value, not an empty issuer: a deployment that leaves the old
+    //    name declared-but-blank must still be configured by the new one.
+    base_env();
+    std::env::set_var("AUTH_MODE", "jwks");
+    std::env::set_var("CLERK_JWKS_URL", "");
+    std::env::set_var("CLERK_ISSUER", "   ");
+    std::env::set_var("WHEEL_JWKS_URL", "https://idp.example.test/jwks");
+    std::env::set_var("WHEEL_JWKS_ISSUER", "https://idp.example.test");
+    let cfg = Config::from_env().expect("a blank deprecated name is not a conflict");
+    assert_eq!(cfg.jwks_issuer, "https://idp.example.test");
+
+    base_env();
 }

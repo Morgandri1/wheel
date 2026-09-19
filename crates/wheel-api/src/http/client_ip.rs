@@ -28,6 +28,19 @@ pub const ENV_TRUSTED_PROXIES: &str = "WHEEL_TRUSTED_PROXIES";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// Marker: this request's **TCP peer** is inside `WHEEL_TRUSTED_PROXIES`.
+///
+/// The peer, deliberately — not `X-Forwarded-For`, which a client writes itself. Proxy-header
+/// authentication believes a header, so the only thing standing between that header and anyone on
+/// the internet is that the connection came from the proxy.
+///
+/// It is a request *extension*, set by [`resolve`] on the server side, so no client can present
+/// one. And its absence — including when this middleware is not installed at all — reads as "not
+/// trusted", so a deployment that forgets the layer refuses every proxy-authenticated request
+/// instead of accepting every forged one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedPeer;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -104,7 +117,12 @@ impl TrustedProxies {
         self.0.is_empty()
     }
 
-    fn trusts(&self, ip: IpAddr) -> bool {
+    /// Is this address one of the operator's proxies?
+    ///
+    /// Named for the peer because that is the only address it may ever be asked about: an
+    /// `X-Forwarded-For` hop is a claim, and asking whether a claim is trusted is how a header
+    /// becomes an identity.
+    pub fn trusts_peer(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|c| c.contains(ip))
     }
 
@@ -113,7 +131,7 @@ impl TrustedProxies {
     /// not an address ends the walk at the last one that could be vouched for.
     pub fn client(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         let mut client = canonical(peer);
-        if !self.trusts(client) {
+        if !self.trusts_peer(client) {
             return client;
         }
         let mut hops = Vec::new();
@@ -128,7 +146,7 @@ impl TrustedProxies {
                 return client;
             };
             client = canonical(ip);
-            if !self.trusts(client) {
+            if !self.trusts_peer(client) {
                 return client;
             }
         }
@@ -145,6 +163,11 @@ pub async fn resolve(
     if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() {
         let client = trusted.client(peer.ip(), req.headers());
         req.extensions_mut().insert(ClientIp(client));
+        // The PEER, not `client`: `client` is the address the forwarding chain claims, and
+        // proxy-header auth must depend on who actually connected.
+        if trusted.trusts_peer(peer.ip()) {
+            req.extensions_mut().insert(TrustedPeer);
+        }
     }
     next.run(req).await
 }
