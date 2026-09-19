@@ -201,10 +201,22 @@ pub fn verify_proxy(
         ));
     }
 
-    let subject = headers
-        .get(subject_header.as_str())
-        .and_then(|v| v.to_str().ok())
-        .ok_or(ApiError::Unauthorized("no subject header from the proxy"))?;
+    // Exactly one value. `HeaderMap::get` returns the FIRST of several, so a request carrying
+    // `[mallory, alice]` would be believed as mallory while a proxy that appends its own value
+    // after a client-supplied one meant alice. Which value is the proxy's is not something this
+    // side can know, so more than one is refused rather than picked from.
+    let mut values = headers.get_all(subject_header.as_str()).iter();
+    let subject = match (values.next(), values.next()) {
+        (Some(v), None) => v
+            .to_str()
+            .map_err(|_| ApiError::Unauthorized("proxy subject header is not text"))?,
+        (Some(_), Some(_)) => {
+            return Err(ApiError::Unauthorized(
+                "the proxy subject header was sent more than once",
+            ))
+        }
+        (None, _) => return Err(ApiError::Unauthorized("no subject header from the proxy")),
+    };
     super::principal::validate(subject)
         .map_err(|_| ApiError::Unauthorized("proxy subject is not a usable principal"))?;
 
@@ -539,6 +551,30 @@ mod tests {
             &e
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_duplicated_proxy_subject_header_is_refused_not_first_wins() {
+        let e = ExternalAuth::for_test_proxy();
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-user", "mallory".parse().unwrap());
+        h.append("x-forwarded-user", "alice".parse().unwrap());
+        assert!(
+            verify_proxy(&h, true, &e).is_err(),
+            "two subject headers were resolved to one of them"
+        );
+        // Order must not matter either: neither value is preferred.
+        let mut r = HeaderMap::new();
+        r.append("x-forwarded-user", "alice".parse().unwrap());
+        r.append("x-forwarded-user", "mallory".parse().unwrap());
+        assert!(verify_proxy(&r, true, &e).is_err());
+        // A value that is not text is refused rather than treated as absent.
+        let mut b = HeaderMap::new();
+        b.insert(
+            "x-forwarded-user",
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert!(verify_proxy(&b, true, &e).is_err());
     }
 
     #[test]
