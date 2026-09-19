@@ -16,6 +16,7 @@
 //! JSON shape here you must regenerate `docs/schema/` in the same commit and
 //! tell PM, because Web regenerates its TypeScript types from it.
 
+pub mod client_ip;
 pub mod engine;
 pub mod event;
 pub mod host;

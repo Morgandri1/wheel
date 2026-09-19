@@ -8,22 +8,31 @@
 //! limit. The constant-time compare stops the secret leaking a byte at a time through response
 //! timing; this stops an attacker simply trying secrets until one works.
 //!
-//! Why per-peer rather than global: a global counter would let anyone who can reach the port lock
-//! the real API out by burning the budget deliberately. Keyed by peer address, a hostile sandbox
+//! Why per-client rather than global: a global counter would let anyone who can reach the port lock
+//! the real API out by burning the budget deliberately. Keyed by client address, a hostile caller
 //! can only exhaust its own.
+//!
+//! "Client" is the TCP peer unless the operator names a reverse proxy in `WHEEL_TRUSTED_PROXIES`
+//! (`wheel_core::client_ip`). It has to be nameable, because behind a public edge — the §5b
+//! topology, where the API reaches this host over its public domain — the peer of EVERY caller,
+//! `wheel-api` included, is the edge. Keyed on that peer this limiter would let anyone who learns
+//! the domain spend the API's budget and lock the whole platform out of the host.
 //!
 //! In-memory is correct here, unlike the API's ingress limiter. The host is deliberately a single
 //! instance — there is no second replica for a shared counter to coordinate with.
 
+use axum::http::HeaderMap;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use wheel_core::client_ip::TrustedProxies;
 
 const WINDOW: Duration = Duration::from_secs(60);
 
 pub struct AuthLimiter {
     max_failures_per_min: u32,
+    trusted: TrustedProxies,
     state: Mutex<HashMap<IpAddr, Window>>,
 }
 
@@ -36,8 +45,25 @@ impl AuthLimiter {
     pub fn new(max_failures_per_min: u32) -> Self {
         Self {
             max_failures_per_min,
+            trusted: TrustedProxies::default(),
             state: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Believe `X-Forwarded-For` from these proxies (and only these) when naming a caller.
+    pub fn behind(mut self, trusted: TrustedProxies) -> Self {
+        self.trusted = trusted;
+        self
+    }
+
+    /// The address to charge a failure to: the vouched-for client, else the peer.
+    pub fn client(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        let values: Option<Vec<&str>> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(|v| v.to_str().ok())
+            .collect();
+        self.trusted.client(peer, &values.unwrap_or_default())
     }
 
     /// True when this peer still has budget to attempt authentication.
