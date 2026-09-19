@@ -38,7 +38,48 @@ it is the one thing I am asserting from memory); `wheel-host` config for the doc
 | **M4** | `infra: production compose + docs` | `infra/vps/compose.docker.yml`: wheeld + proxy + Caddy (+ web); one image (see table); pull-not-compile; secrets; backup of `/data` **and** `wheel-p-*` volumes; upgrade procedure; explicit "no auto-update in docker mode". `docs/SETUP.md`/`infra/vps/README.md` updated. | `rehearse.sh`-style run brings up a fresh box config and passes M3's script. |
 | **M5** | `measure: gVisor opt-in` | Measurement only first: `runsc` runtime, a cargo build and a Claude Code turn inside it vs runc (wall time, RSS). Then, if acceptable, a per-project opt-in field in the create body (proxy allowlists `Runtime`). | A number and a recommendation; code only if the number is acceptable. |
 
-Order: **M2 → M1 → M3 → M4 → M5** (M2 and M1 can be developed in parallel; M1 must not be *deployed* before M2).
+Order: **M2 → M1 → M3 → M4 → M5** (M2 and M1 can be developed in parallel; M1 must not be *deployed* before M2 **and M3** — see the revisions).
+
+## Revisions after adversary's review of this plan (2026-09-19)
+
+Adversary's full review is on #141. Accepted, and where each lands:
+
+**Changed in the plan**
+- **Engine channel: unix socket, wheeld OFF the tenant network (M3 topology change).** Tenant containers get an
+  egress-only network with no wheeld and no peers; each engine listens on `unix://` in a per-project subpath of one
+  shared socket volume (`Mounts` + `VolumeOptions.Subpath`, Docker >= 26; wheeld creates `<uuid>/` first and mounts the
+  whole volume). That removes tenant->tenant, tenant->wheeld and the `WHEEL_TRUSTED_PROXIES`/`proxy_header` (#136)
+  exposure by construction instead of by firewall rule, and dissolves the `enable_icc=false` asymmetry. **M1 stays on
+  TCP-by-name and is therefore dev/test-only until M3 lands** — not deployable before M2 *and* M3. M3's firewall work
+  shrinks to: tenants may reach global unicast only (allow-list, v6 disabled or mirrored), an `INPUT` rule on the tenant
+  bridge for host services (DOCKER-USER sees only forwarded traffic), `bridge.name` pinned.
+- **M2 is stricter than first written** (below). **M1 gains the survive-restart correctness work** (below).
+- **Boot guards are behavioural, not string matches.** `DOCKER_HOST` is resolved as bollard resolves it (unset =>
+  `/var/run/docker.sock`); the socket must answer the proxy's identity endpoint AND refuse a call a real daemon answers
+  (`GET /version` => 403). Not a unix socket => refuse (it cannot be identity-checked). The raw-socket dev flag also
+  requires `WHEEL_ENV=dev`. `WHEEL_SANDBOX` and `SANDBOX_BACKEND` must not disagree.
+
+**M2 additions**
+- The proxy never forwards client bytes: it validates, then **builds a fresh body from the checked values** and rebuilds the
+  request target from parsed components. Unknown/case-variant keys are refused (exact-case allowlist), so Go's
+  case-insensitive decoding and serde cannot disagree about what was sent.
+- Values must EQUAL the configured ones (limits included; the proxy and host get the same `CONTAINER_*`), not merely be
+  present. Volume create: no `DriverOpts` (already enforced), local driver, exact name and label.
+- Inspect is **projected**, not stripped: only `State.Status`, `State.Health.Status` and the `wheel.spec` label leave.
+- An eighth call, `GET /containers/json` filtered to `label=wheel.project`, projected to name/labels/state, for orphan GC.
+- Refusal tests cover the fields adversary listed (`NetworkingConfig`, `PidMode`/`IpcMode`/`UTSMode`, `Mounts`,
+  `VolumesFrom`, `MaskedPaths`, `OomScoreAdj`, `LogConfig`, `Sysctls`, `Tmpfs`, ...) and case/duplicate/fold-variant keys.
+
+**M1 additions (correctness of "containers survive a restart")**
+- **`wheel.spec` label = hash of the full create config incl. env; `provision`/`start` recreate (stop, remove, keep volume)
+  on mismatch** — today a rotated secret, a changed `WHEEL_HARNESS_AUTH` or a new image never reach a surviving container.
+- Remove with `v=true` (no anonymous volumes holding tenant data after "delete").
+- **Sandbox kind is sticky**: `wheeld` records it beside `host.db` and refuses a mismatch (embedded projects present =>
+  never boot docker mode as if they did not exist).
+- Reconcile also stops containers whose record says stopped/absent, and garbage-collects `wheel.project`-labelled orphans.
+
+**Not adopted:** digest-pinning as the image control (exact string equality from the proxy's own env is the control; use
+`image@sha256:` in the production compose for reproducibility). `--internal` + egress gateway: a later, separate decision.
 
 ## Deliberately out of scope
 - Per-node uid (037): SDK's proposal; docker mode fixes cross-*project* isolation, not agent-vs-agent inside one canvas.
