@@ -219,7 +219,10 @@ impl Policy {
 
         match (method, segs.as_slice()) {
             ("GET", ["containers", "json"]) => {
-                only_params(&q, &["all"], |_, v| v == "true")?;
+                only_params(&q, &["all", "size"], |k, v| match k {
+                    "all" => v == "true",
+                    _ => v == "false",
+                })?;
                 let mut target = rebuild(version, &segs, &q);
                 target.push(if q.is_empty() { '?' } else { '&' });
                 target.push_str("filters=");
@@ -1268,11 +1271,15 @@ mod tests {
         let p = policy();
         let ok =
             "/v1.49/containers/json?all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+        // What bollard really sends for a list: `size=false` rides along with `all`.
+        let real = "/v1.49/containers/json?all=true&size=false&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+        assert_eq!(p.decide("GET", real, b"").unwrap().reply, Reply::List);
         let a = p.decide("GET", ok, b"").unwrap();
         assert_eq!(a.reply, Reply::List);
         for bad in [
             "/containers/json",
             "/containers/json?all=true",
+            "/containers/json?all=true&size=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D",
             "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22traefik.enable%22%5D%7D",
             "/containers/json?all=true&filters=%7B%7D",
             "/containers/json?size=true&all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D",
