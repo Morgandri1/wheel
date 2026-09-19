@@ -6,14 +6,16 @@
 //!
 //! A dedicated route rather than the generic engine proxy, for one measured reason: the shared
 //! client carries a whole-request timeout (`proxy_timeout_secs`, 30s by default) that would cut a
-//! builder turn mid-answer. Everything else is the proxy's discipline — `ProjectScope` proves
-//! ownership before a byte is forwarded, the host bearer is attached here and never travels back,
-//! and the upstream URL is built from a `Uuid` this API loaded from its own database.
+//! builder turn mid-answer. Everything else is the proxy's discipline — `AdminScope` proves
+//! membership at the admin tier before a byte is forwarded (a turn can name an agent's or a
+//! vault's credential as its source, and its output is only ever applied by an admin), the host
+//! bearer is attached here and never travels back, and the upstream URL is built from a `Uuid`
+//! this API loaded from its own database.
 //!
 //! The body is passed through as it arrives, so the SSE frames reach the caller as events rather
 //! than as one late response.
 
-use crate::auth::ProjectScope;
+use crate::auth::AdminScope;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::body::Body;
@@ -34,7 +36,7 @@ const STREAM_HEADERS: [(&str, &str); 2] = [
 
 pub async fn turns(
     State(state): State<AppState>,
-    scope: ProjectScope,
+    AdminScope(scope): AdminScope,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
     if body.len() > state.cfg.ingress_body_limit_bytes {

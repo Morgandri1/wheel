@@ -322,6 +322,9 @@ fn engine_paths() -> Vec<(&'static str, String, &'static str)> {
         ("POST", format!("v1/tools/{AGENT}/call"), "admin"),
         ("POST", "v1/tools/import".into(), "admin"),
         ("POST", format!("v1/tools/{AGENT}/import"), "admin"),
+        ("GET", "v1/builder/credential".into(), "admin"),
+        ("PUT", "v1/builder/credential".into(), "admin"),
+        ("DELETE", "v1/builder/credential".into(), "admin"),
     ]
 }
 
@@ -451,6 +454,11 @@ async fn a_lower_tier_is_refused_every_admin_api_route() {
             Some(json!({"role": "guest"})),
         ),
         ("DELETE", format!("/v1/projects/{p}"), None),
+        (
+            "POST",
+            format!("/v1/projects/{p}/builder/turns"),
+            Some(json!({"turns": []})),
+        ),
     ];
 
     for (method, uri, body) in admin_only {

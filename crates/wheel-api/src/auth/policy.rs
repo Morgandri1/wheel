@@ -153,6 +153,20 @@ const RULES: &[Rule] = &[
         path: "v1/tools/{}/import",
         tier: Tier::Admin,
     },
+    // The builder's own LLM account: whoever saves it is handing the project a credential to
+    // spend, so it sits with `agents/{}/auth` (admin), for reads too -- whether one is configured
+    // and of what kind is not a guest's business. Missing entirely until now, which made saving a
+    // setup-token fail for every tier, admin included.
+    Rule {
+        methods: GET,
+        path: "v1/builder/credential",
+        tier: Tier::Admin,
+    },
+    Rule {
+        methods: &["PUT", "DELETE"],
+        path: "v1/builder/credential",
+        tier: Tier::Admin,
+    },
     // ---- prompter: context and prompting ---------------------------------------------------------
     // The narrow content door. `PATCH /v1/nodes/{id}` stays admin below, because it also carries
     // agent config and a tier may not have conditional powers.
@@ -284,6 +298,152 @@ mod tests {
     }
 
     const AGENT: &str = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+    /// Engine `/v1` routes that are deliberately NOT reachable through the generic proxy, each
+    /// with the API route that serves it instead. The test below holds every one of them to
+    /// staying denied here, so this list cannot quietly become a way to skip a tier decision.
+    const NOT_PROXIED: &[(&str, &str)] = &[
+        // `routes::builder::turns`: a dedicated route (the shared client's timeout would cut a
+        // turn short), gated by `AdminScope` in its own signature.
+        ("POST", "v1/builder/turns"),
+    ];
+
+    /// One engine route, as registered: the method set and the path with every `{name}` reduced
+    /// to `{}`, matching the spelling this file's rules use.
+    struct EngineRoute {
+        path: String,
+        methods: Vec<&'static str>,
+    }
+
+    /// The engine's real `/v1` route table, read from the source that registers it.
+    ///
+    /// An axum `Router` cannot be enumerated, and the alternative -- a second, hand-kept list of
+    /// engine routes -- is exactly the drift this test exists to catch. Reading the registration
+    /// itself means a route added there is seen here with no one remembering to say so.
+    fn engine_v1_routes() -> Vec<EngineRoute> {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../wheel-engine/src/api/mod.rs"
+        ))
+        .expect("the engine's route table is readable from this workspace");
+        let start = src.find("let v1 = Router::new()").expect("the /v1 router");
+        let end = start + src[start..].find(".route_layer(").expect("the end of /v1");
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        body.split(".route(")
+            .skip(1)
+            .map(|chunk| {
+                let open = chunk.find('"').expect("a route path literal") + 1;
+                let close = open + chunk[open..].find('"').unwrap();
+                let raw = &chunk[open..close];
+                let path = std::iter::once("v1".to_string())
+                    .chain(raw.split('/').filter(|s| !s.is_empty()).map(|s| {
+                        if s.starts_with('{') {
+                            "{}".to_string()
+                        } else {
+                            s.to_string()
+                        }
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let handlers = &chunk[close..];
+                let methods = [
+                    ("get", "GET"),
+                    ("post", "POST"),
+                    ("put", "PUT"),
+                    ("patch", "PATCH"),
+                    ("delete", "DELETE"),
+                ]
+                .into_iter()
+                .filter(|(name, _)| {
+                    handlers.match_indices(&format!("{name}(")).any(|(i, _)| {
+                        !handlers[..i]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+                })
+                .map(|(_, m)| m)
+                .collect();
+                EngineRoute { path, methods }
+            })
+            .collect()
+    }
+
+    fn concrete(path: &str) -> String {
+        path.split('/')
+            .map(|s| if s == "{}" { AGENT } else { s })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The gate this table exists for, and the second time its absence bit: a route shipped in
+    /// the engine with no row here is refused for every tier, admin included, and the first
+    /// anyone learns of it is a user staring at "not permitted" (`interrupt`, `scripts/run`, then
+    /// `builder/credential`). Default-deny made each failure safe; it did not make it visible.
+    #[test]
+    fn every_engine_route_has_a_tier_decision() {
+        let routes = engine_v1_routes();
+        assert!(
+            routes.len() >= 30 && routes.iter().any(|r| r.path == "v1/builder/credential"),
+            "the route scan looks wrong ({} routes) -- did the engine's router move?",
+            routes.len()
+        );
+
+        let mut missing = Vec::new();
+        for route in &routes {
+            for method in &route.methods {
+                let decided = tier(method, &concrete(&route.path));
+                let exempt = NOT_PROXIED.contains(&(*method, route.path.as_str()));
+                match (decided, exempt) {
+                    (None, false) => missing.push(format!("{method} /{}", route.path)),
+                    (Some(_), true) => panic!(
+                        "{method} /{} is listed as not proxied but has a proxy row",
+                        route.path
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "engine routes with no tier row in auth/policy.rs (unreachable for EVERY tier): {missing:#?}"
+        );
+    }
+
+    /// The other direction: a row for a route the engine no longer has is a tier decision about
+    /// nothing, and it quietly stops meaning what its comment says.
+    #[test]
+    fn every_policy_row_names_a_real_engine_route() {
+        let routes = engine_v1_routes();
+        let stale: Vec<_> = RULES
+            .iter()
+            .filter(|rule| {
+                !routes.iter().any(|route| {
+                    route.path == rule.path
+                        && route.methods.iter().any(|m| rule.methods.contains(m))
+                })
+            })
+            .map(|rule| format!("{:?} /{}", rule.methods, rule.path))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "policy rows with no engine route: {stale:#?}"
+        );
+    }
+
+    #[test]
+    fn the_builders_credential_is_admin_only_for_every_method() {
+        let path = "v1/builder/credential";
+        for method in ["GET", "PUT", "DELETE"] {
+            assert_eq!(tier(method, path), Some(Tier::Admin), "{method}");
+        }
+        assert_eq!(tier("POST", path), None);
+    }
 
     #[test]
     fn a_guest_may_read_the_board_and_the_transcripts() {

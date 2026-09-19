@@ -602,8 +602,11 @@ rather than a gap awaiting a fix.
 
 ### `POST /v1/projects/{id}/builder/turns` — the Workflow Builder, streamed
 
-Owner-scoped, like every project route. Forwards the conversation to the project's engine
-(`docs/PROTOCOL.md` §"Workflow Builder") and streams its Server-Sent Events back verbatim.
+**Admin tier.** A turn can name an agent's or a vault's credential as its source and its output is
+only ever applied by an admin, so a guest or prompter gets `403`. Forwards the conversation to the
+project's engine (`docs/PROTOCOL.md` §"Workflow Builder") and streams its Server-Sent Events back
+verbatim. The builder's own LLM account, `GET|PUT|DELETE .../engine/v1/builder/credential`, is admin
+for every method, through the proxy's tier table (`auth/policy.rs`).
 
 ```jsonc
 POST /v1/projects/{id}/builder/turns
