@@ -65,7 +65,15 @@ pub async fn ingress(
     )?;
 
     let method = req.method().clone();
-    let mut headers = hop::sanitize_for_upstream(req.headers(), &[WHEEL_PREFIX]);
+    // The proxy-asserted identity is dropped here too. Public ingress never authenticates anyone,
+    // so it is not a credential on THIS path — but a deployment behind an authenticating proxy has
+    // one attached to every request the proxy forwards, including these, and relaying it would put
+    // "who the edge says is calling" in front of an agent.
+    let mut headers = hop::sanitize_for_upstream(
+        req.headers(),
+        &[WHEEL_PREFIX],
+        &crate::http::actor::proxy_asserted_headers(&state.cfg),
+    );
     headers.insert(hop::header_name("x-wheel-ingress"), "1".parse().unwrap());
     // The engine keys its per-caller ingress limit and `ip_allow` on this, and may trust it: the
     // caller's own x-wheel-* headers were dropped just above, so only we can have set it.

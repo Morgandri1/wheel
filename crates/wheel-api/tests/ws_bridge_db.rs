@@ -69,6 +69,7 @@ async fn serve_api(engine: String) -> Option<(String, wheel_api::db::Db)> {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: Some(engine),
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
 

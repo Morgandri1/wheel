@@ -104,6 +104,7 @@ fn cfg(db_url: &str, host_url: &str) -> Config {
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
         signup: SignupPolicy::Open,
+        external: None,
         master_key: [9u8; 32],
         host_url: host_url.into(),
         host_secret: Secret::new("host-secret"),
@@ -229,6 +230,7 @@ async fn harness() -> Harness {
         // The real host URL layout, not a direct engine: that layout is what the bug escaped.
         engine_base_override: None,
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     let app = wheel_api::build_router(state, &[]);

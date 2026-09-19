@@ -82,6 +82,7 @@ fn cfg(db_url: &str, engine: &str, max_bridges: usize, lifetime: u64) -> Config 
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
         signup: SignupPolicy::Open,
+        external: None,
         master_key: [8u8; 32],
         host_url: "http://host.invalid".into(),
         host_secret: Secret::new("host-secret"),
@@ -124,6 +125,7 @@ async fn serve(max_bridges: usize, lifetime: u64) -> Api {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(10_000, 10_000),
         engine_base_override: Some(engine_base),
         membership: membership.clone(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
 

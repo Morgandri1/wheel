@@ -113,6 +113,7 @@ fn cfg(db_url: &str) -> Config {
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
         signup: SignupPolicy::Open,
+        external: None,
         master_key: [3u8; 32],
         host_url: "http://host.invalid".into(),
         host_secret: Secret::new("host-secret"),
@@ -229,6 +230,7 @@ async fn harness_with_engine(engine_base: String, engine: EngineLog) -> Harness 
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(10_000, 10_000),
         engine_base_override: Some(engine_base),
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     let app = wheel_api::build_router(state, &[]);

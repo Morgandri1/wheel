@@ -1,5 +1,6 @@
 pub mod api_token;
 pub mod claims;
+pub mod external;
 pub mod extractor;
 pub mod jwks;
 pub mod local;
