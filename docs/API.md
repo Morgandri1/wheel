@@ -165,7 +165,11 @@ the order inverts:
 
 The JWKS loader additionally refuses to hold an `oct` (symmetric) key at all, and refuses an `OKP`
 key on any curve but Ed25519 — X25519 is a key-*agreement* key, and importing one as a signature key
-is the shape of a downgrade, not a mistake. `alg: none` has no algorithm variant, so it fails at
+is the shape of a downgrade, not a mistake. **It also honours the key set's own `use` and `key_ops`
+declarations** (RFC 7517 §4.2/§4.3): a key published as `use: "enc"`, or with a `key_ops` that does
+not include `verify`, is never held. Absent means unconstrained, because most issuers omit both and
+refusing silence would break nearly every real key set — only an explicit contradiction is a
+refusal. `alg: none` has no algorithm variant, so it fails at
 `decode_header`; that is a property of a dependency, so it has its own test rather than a comment.
 
 `WHEEL_EXTERNAL_ALGS` refuses a symmetric algorithm **at boot**, by name. A verification key that is
@@ -311,7 +315,12 @@ What is enforced mechanically:
 4. **Cross-origin requests are refused 403.** The credential is *ambient* — the proxy attaches it —
    so a hostile page can make a browser issue an authenticated request. JSON routes are covered by
    preflight, but the engine proxy is `ANY` with arbitrary content types, so preflight is luck
-   rather than a control. An `Origin` header not in `CORS_ALLOWED_ORIGINS` is refused, **before** the
+   rather than a control. **`Sec-Fetch-Site: cross-site` or `same-site` is refused on its own**,
+   because a cross-site `GET` carries no `Origin` at all — per Fetch, `Origin` is appended only for
+   non-`GET`/`HEAD` methods or `cors`/`websocket` modes, so `<img src>`, `<script src>`,
+   `<iframe src>` and a link click would otherwise pass. A non-browser client sends neither header
+   and is unaffected, which is why this is a second check rather than a replacement. An `Origin`
+   header not in `CORS_ALLOWED_ORIGINS` is refused, **before** the
    identity is resolved, so a refused request provisions nobody and touches no row. A request with
    no `Origin` is not something a page can cause and passes. With the default empty allowlist, no
    browser page may call the API cross-origin at all — which is the correct answer for an ambient

@@ -262,9 +262,44 @@ fn algorithm_of(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
 ///
 /// Separated from [`JwksCache::fetch`] so the admission rules can be tested against a literal key
 /// set without a server: this function is the security boundary, and the HTTP around it is not.
+/// Does the key set itself say this key may verify a signature?
+///
+/// RFC 7517 §4.2/§4.3 let an issuer declare what a key is for, and until now we ignored both
+/// declarations and inferred purpose from key type alone (ADVERSARY 068). That is the same class of
+/// mistake as taking the algorithm from the token: the authority on what a key is for is the
+/// document we fetched from the issuer over TLS, and here it was telling us and we were not
+/// listening. An issuer that publishes its encryption and signing keys in one set — which is what
+/// `use` exists to disambiguate — would have had its RSA *encryption* key admitted as a signing
+/// key.
+///
+/// Absent means unconstrained: both parameters are optional, most issuers omit them, and refusing a
+/// key that declares nothing would break nearly every real key set. Only an explicit contradiction
+/// is a refusal. `use: "enc"` and any other unrecognised value are both refused — `Other` is not a
+/// declaration we can read, and a key whose purpose we cannot read is not one to guess at.
+fn declared_for_verification(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+    use jsonwebtoken::jwk::{KeyOperations, PublicKeyUse};
+    match &jwk.common.public_key_use {
+        Some(PublicKeyUse::Signature) | None => {}
+        Some(_) => return false,
+    }
+    match &jwk.common.key_operations {
+        None => true,
+        // Present and non-empty: `verify` has to be in it. An empty list declares no operation at
+        // all, which is a refusal rather than a blank cheque.
+        Some(ops) => ops.iter().any(|o| matches!(o, KeyOperations::Verify)),
+    }
+}
+
 pub(crate) fn admissible_keys(set: &JwkSet) -> HashMap<String, KeyEntry> {
     let mut out = HashMap::new();
     for jwk in &set.keys {
+        if !declared_for_verification(jwk) {
+            tracing::warn!(
+                kid = ?jwk.common.key_id,
+                "skipping JWKS key the issuer did not publish for signature verification"
+            );
+            continue;
+        }
         let Some(alg) = algorithm_of(jwk) else {
             tracing::warn!("skipping JWKS key of an unusable type");
             continue;
@@ -344,6 +379,54 @@ Y2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU\
             }]
         })));
         assert!(keys.is_empty(), "only Ed25519 is a signing curve here");
+    }
+
+    /// ADVERSARY 068. The key set says what each key is for, and we were not reading it. An issuer
+    /// that publishes encryption and signing keys together — which is what `use` disambiguates —
+    /// would have had its encryption key admitted as a signing key.
+    #[test]
+    fn a_key_the_issuer_did_not_publish_for_verification_is_never_held() {
+        let rsa = |extra: serde_json::Value| {
+            let mut k = serde_json::json!({
+                "kty": "RSA", "kid": "r1",
+                "n": RSA_N, "e": "AQAB",
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                k[key] = value.clone();
+            }
+            serde_json::from_value::<JwkSet>(serde_json::json!({ "keys": [k] })).unwrap()
+        };
+
+        // Explicitly for signatures, or saying nothing at all: held. Most real key sets say
+        // nothing, so refusing silence would break almost every deployment.
+        for ok in [
+            serde_json::json!({ "use": "sig" }),
+            serde_json::json!({}),
+            serde_json::json!({ "key_ops": ["verify"] }),
+            serde_json::json!({ "key_ops": ["verify", "wrapKey"] }),
+            serde_json::json!({ "use": "sig", "key_ops": ["verify"] }),
+        ] {
+            assert_eq!(
+                admissible_keys(&rsa(ok.clone())).len(),
+                1,
+                "a key declared usable for verification must be held: {ok}"
+            );
+        }
+
+        // An explicit contradiction: refused.
+        for refused in [
+            serde_json::json!({ "use": "enc" }),
+            serde_json::json!({ "use": "something-else" }),
+            serde_json::json!({ "key_ops": ["encrypt"] }),
+            serde_json::json!({ "key_ops": ["sign"] }),
+            serde_json::json!({ "key_ops": [] }),
+            serde_json::json!({ "use": "enc", "key_ops": ["verify"] }),
+        ] {
+            assert!(
+                admissible_keys(&rsa(refused.clone())).is_empty(),
+                "the issuer did not publish this key for verification: {refused}"
+            );
+        }
     }
 
     #[test]

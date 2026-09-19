@@ -256,6 +256,34 @@ pub struct AllowedOrigins(pub std::sync::Arc<Vec<String>>);
 /// Fail-closed by construction: `allowed` arrives from the router, and an empty list refuses every
 /// `Origin` rather than allowing every one.
 pub fn refuse_cross_origin(headers: &HeaderMap, allowed: &[String]) -> Result<(), ApiError> {
+    // `Sec-Fetch-Site` first, because the absence of `Origin` is not the absence of a page
+    // (ADVERSARY 070). Per Fetch, `Origin` is appended only when the method is not GET/HEAD or the
+    // mode is cors/websocket — so `<img src>`, `<script src>`, `<iframe src>` and a plain
+    // link-click navigation are all cross-site GETs that a page causes and that carry **no**
+    // `Origin`. Under an ambient credential every one of them is an authenticated GET as the
+    // victim, and the engine proxy is registered `any`, so GET reaches it.
+    //
+    // `Sec-Fetch-Site` is the header that does distinguish them, it is set by the browser and
+    // forbidden to scripts, and it is sent on GETs that carry no `Origin`. A non-browser client
+    // sends neither header and is unaffected — which is why this is a second check rather than a
+    // replacement for the one below: requiring `Sec-Fetch-Site` would break every curl and SDK
+    // caller, and requiring `Origin` would do the same.
+    //
+    // Browsers that do not send `Sec-Fetch-Site` at all are not made worse off: they fall through
+    // to exactly the `Origin` handling that was here before.
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        let site = site.trim();
+        // `same-origin` and `none` (a user typing the URL, a bookmark) are not page-caused
+        // cross-site requests. `same-site` is a sibling subdomain, which is cross-origin and is
+        // exactly the neighbour an exact-match origin allowlist refuses below.
+        if site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("same-site") {
+            return Err(ApiError::Forbidden(
+                "cross-site request refused: this deployment authenticates by proxy header, so \
+                 the credential is ambient and a page may not spend it",
+            ));
+        }
+    }
+
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         return Ok(());
     };
@@ -704,6 +732,53 @@ mod tests {
         );
         assert!(refuse_cross_origin(&h, &["https://app.example".to_string()]).is_err());
         assert!(refuse_cross_origin(&h, &["https://evil.example".to_string()]).is_ok());
+    }
+
+    /// ADVERSARY 070. A cross-site **GET** carries no `Origin` at all — per Fetch, `Origin` is
+    /// appended only for non-GET/HEAD methods or cors/websocket modes — so `<img src>`,
+    /// `<script src>`, `<iframe src>` and a link click were all passing a check whose whole job is
+    /// to stop a page spending an ambient credential.
+    #[test]
+    fn a_cross_site_get_with_no_origin_is_refused() {
+        fn req(pairs: &[(&'static str, &str)]) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, v.parse().unwrap());
+            }
+            h
+        }
+
+        // The shape the finding names: a page-caused GET, no Origin anywhere.
+        assert!(
+            refuse_cross_origin(&req(&[("sec-fetch-site", "cross-site")]), &[]).is_err(),
+            "a cross-site GET is page-caused whether or not it carries an Origin"
+        );
+        // A sibling subdomain is still not us, and is the neighbour the exact-match allowlist
+        // below refuses.
+        assert!(refuse_cross_origin(&req(&[("sec-fetch-site", "same-site")]), &[]).is_err());
+        // Case is not a bypass.
+        assert!(refuse_cross_origin(&req(&[("sec-fetch-site", "Cross-Site")]), &[]).is_err());
+
+        // A user typing the URL, or a bookmark: `none`. The deployment's own page: `same-origin`.
+        // Neither is something a hostile page can cause.
+        assert!(refuse_cross_origin(&req(&[("sec-fetch-site", "none")]), &[]).is_ok());
+        assert!(refuse_cross_origin(&req(&[("sec-fetch-site", "same-origin")]), &[]).is_ok());
+
+        // A non-browser client sends neither header, and must keep working — this is the reason
+        // the check cannot simply require one of them to be present.
+        assert!(refuse_cross_origin(&req(&[]), &[]).is_ok());
+        assert!(refuse_cross_origin(&req(&[("user-agent", "curl/8")]), &[]).is_ok());
+
+        // An allowed origin does not buy a pass on the site check: a cross-site request that also
+        // names an allowed origin is still a page spending an ambient credential.
+        assert!(refuse_cross_origin(
+            &req(&[
+                ("sec-fetch-site", "cross-site"),
+                ("origin", "https://app.example")
+            ]),
+            &["https://app.example".to_string()]
+        )
+        .is_err());
     }
 
     /// Exact match, because an origin is a scheme+host+port triple and every looser comparison

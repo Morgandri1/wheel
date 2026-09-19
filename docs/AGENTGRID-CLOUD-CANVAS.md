@@ -57,7 +57,16 @@ WHEEL_EXTERNAL_JWKS_URL=https://<agentgrid-issuer>/api/auth/jwks
 WHEEL_EXTERNAL_ALGS=EdDSA                                 # RS256 stays available for other deployers
 WHEEL_EXTERNAL_AUDIENCE=https://api.<wheel-domain>        # Wheel-dedicated; see below
 WHEEL_EXTERNAL_PROVISION=auto                             # or `linked`; there is no default
+WHEEL_EXTERNAL_MAX_TTL_SECS=300                           # ENFORCES the 5-minute story; see below
+WHEEL_EXTERNAL_SOLE_AUDIENCE=1                            # the exchange mints a single audience
 ```
+
+**The last two lines are the ones that make the rest of this section true**, and they were missing
+from an earlier version of this block (ADVERSARY 069). Without `WHEEL_EXTERNAL_MAX_TTL_SECS`, Wheel
+accepts whatever `exp` the token carries: the 5-minute lifetime below would be AgentGrid's promise
+to itself, enforced nowhere, and an issuer bug or a compromised signer could mint a 24-hour token
+that Wheel would honour in full. With it, `exp - iat` above the cap is refused and `iat` becomes
+mandatory, so omitting `iat` is not a way around it.
 
 | Variable | What it does here |
 |---|---|
@@ -100,10 +109,27 @@ POST /api/auth/wheel/token        (authenticated by the user's AgentGrid web ses
 → a 5-minute EdDSA JWT, claims: iss, sub, aud, iat, exp, jti, email
 ```
 
-Five minutes is the revocation story: Wheel has no back-channel logout, so with no lifetime cap revocation
-latency equals token lifetime. A Wheel deployment can pin that from its own side with
-`WHEEL_EXTERNAL_MAX_TTL_SECS=300`, which additionally **requires `iat`** and refuses `exp - iat` above the
-cap — a token with no `iat` under a configured cap is refused, so omitting it is not a way to opt out.
+Five minutes is the revocation story, and it is worth being exact about who enforces which half,
+because "short-lived" is the kind of claim that gets believed on both sides and implemented on
+neither.
+
+| | Enforced by | If the other side is wrong |
+|---|---|---|
+| the token lives 5 minutes | **AgentGrid's exchange**, when it mints `exp` | Wheel refuses anything longer *only if* `WHEEL_EXTERNAL_MAX_TTL_SECS` is set |
+| Wheel will not accept a longer one | **Wheel**, `WHEEL_EXTERNAL_MAX_TTL_SECS=300` | unset means Wheel honours whatever `exp` says, up to the IdP's discretion |
+| a revoked AgentGrid session stops working | **nobody, within the token's lifetime** | there is no back-channel logout and no introspection; TTL *is* the revocation mechanism |
+| a stolen token cannot be replayed | **nobody** | `jti` is carried and is not checked; see below |
+| a withdrawn signing key stops verifying | **Wheel**, within the JWKS cache max-age | default 10 min, hard ceiling 1 h, and the issuer's `Cache-Control` may only shorten it |
+
+Read the third row directly: **revoking an AgentGrid session does not revoke Wheel access until the
+token expires.** Five minutes is short enough that this is a reasonable trade, and it is a trade
+rather than a guarantee. The operator lever that *is* immediate is
+`DELETE /v1/auth/external-identities/{id}`, which fails closed on the next request.
+
+The last row is a second, independent clock and it is the one people forget: if AgentGrid removes a
+compromised signing key from its JWKS, tokens signed with it keep verifying at Wheel until the
+cached key set ages out. Bounded and stated rather than unbounded and implied — the ceiling is
+enforced regardless of what the issuer's `Cache-Control` advertises.
 
 `jti` is carried and is **not** yet a replay control: Wheel does not keep a seen-set, so a stolen token is
 replayable inside its lifetime, and TTL is the mitigation. A replica-shared `jti` set is named as the
