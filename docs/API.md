@@ -7,24 +7,28 @@ operation is an authenticated call to the single `wheel-host` machine over priva
 
 ## Authentication
 
-Two providers, selected by `AUTH_MODE`. Both end at the same verified user id, and nothing
-downstream — the ownership check above all — can tell which one ran. Swapping providers is
+Three providers, selected by `AUTH_MODE`. All three end at the same verified user id, and nothing
+downstream — the membership check above all — can tell which one ran. Swapping providers is
 configuration, not code.
 
-| `AUTH_MODE` | Token | Verified against |
+| `AUTH_MODE` | Credential | Verified against |
 |---|---|---|
 | `local` (built in) | HS256, issued by this API | `SESSION_SECRET`, plus a live row in `sessions` |
 | `jwks` | RS256, issued by an external provider | the provider's JWKS |
-| either | `wht_…` API token, issued by this API | its SHA-256 in `api_tokens`, not revoked (see [API tokens](#api-tokens-every-auth_mode)) |
+| `external` | a JWT from the deployer's issuer, or an assertion from a proxy they run | the deployer's JWKS with a **mandatory audience** and a key-pinned algorithm, or the TCP peer. See [External auth](#external-auth-auth_modeexternal). |
+| any | `wht_…` API token, issued by this API | its SHA-256 in `api_tokens`, not revoked (see [API tokens](#api-tokens-every-auth_mode)) |
 
 `AUTH_MODE` must be set explicitly in production — an unset value refuses to boot rather than
 defaulting, because guessing wrong either rejects every real user or accepts tokens from the wrong
-issuer. Under `jwks`, empty `CLERK_JWKS_URL`/`CLERK_ISSUER` also refuse to boot: a placeholder that
-looks like configuration is worse than a missing one, since it starts and then rejects every token
-for a reason nobody can see.
+issuer. Under `jwks`, empty `WHEEL_JWKS_URL`/`WHEEL_JWKS_ISSUER` also refuse to boot: a placeholder
+that looks like configuration is worse than a missing one, since it starts and then rejects every
+token for a reason nobody can see.
 
-A token minted under one mode is rejected under the other. They are different algorithms verified
-with different keys, so this needs no special case — it falls out of the design.
+A token minted under one mode is rejected under the others. `local` and `jwks` are different
+algorithms verified with different keys, so that needs no special case. `external` is pinned to an
+issuer that boot refuses to let equal `WHEEL_JWKS_ISSUER` or `PUBLIC_BASE_URL`, so the two
+JWKS-backed planes cannot stand in for each other either — see
+[Configuration interlocks](#configuration-interlocks).
 
 ## Local auth routes (`AUTH_MODE=local`)
 
@@ -120,6 +124,225 @@ compromised, leaving existing sessions alive would defeat the point. Clients mus
 
 Email-based password *reset* is M3 — it needs a mail provider, and there is none yet.
 
+## External auth (`AUTH_MODE=external`)
+
+The deployer brings an identity system and Wheel verifies and maps it. Full design, threat model and
+the reasoning behind every refusal below: `docs/proposals/external-auth.md`.
+
+`external` is a stricter superset of `jwks`. It adds a **mandatory audience**, an explicit algorithm
+allowlist, **key-pinned algorithm selection**, and local principal mapping. `jwks` keeps its missing
+audience validation because that is the deployed contract; `external` is where the rigour lives.
+
+**There is no account unification.** A foreign subject is never a Wheel principal. Every verified
+subject is mapped to a Wheel `users.id` that Wheel minted, and that is what `projects.owner_id`,
+`project_members.user_id` and `on_behalf_of` hold.
+
+### Two verifiers
+
+`WHEEL_EXTERNAL_VERIFIER` picks one, and there is no default.
+
+| Verifier | What is verified | Where the credential is read from |
+|---|---|---|
+| `jwks` | the signature, `iss`, `aud`, `exp`, `nbf`, and optionally `azp` and a lifetime cap | `x-auth-token` / `Authorization: Bearer`, or `WHEEL_EXTERNAL_TOKEN_HEADER` (e.g. `cf-access-jwt-assertion`) |
+| `proxy_header` | **nothing about the assertion.** The proxy is the verifier; the control is that the request arrived *from* the proxy | `WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER` |
+
+A deployment configured for one refuses the other's credential rather than falling through to a
+weaker check: a bearer token under `proxy_header` is a 401, and a subject header under `jwks` is
+never read.
+
+### The algorithm comes from the key, not from the token
+
+This is the structural change, not an addition to a list. `jwks` mode branches on `header.alg` to
+pick a verifier, which hands the choice of verifier to whoever wrote the header. Under `external`
+the order inverts:
+
+1. `decode_header` → `kid`. **A token with no `kid` is refused.**
+2. The `kid` resolves in the key set to a key *and the algorithm the JWK's own key material
+   declares* — `RSA` → `RS256`, `OKP` with `crv: Ed25519` → `EdDSA`. Never the token's `alg`.
+3. Refused unless `header.alg` **equals** the key's algorithm.
+4. Refused unless the key's algorithm is in `WHEEL_EXTERNAL_ALGS`.
+5. Decoded with a `Validation` pinned to that **one** algorithm, never a list.
+
+The JWKS loader additionally refuses to hold an `oct` (symmetric) key at all, and refuses an `OKP`
+key on any curve but Ed25519 — X25519 is a key-*agreement* key, and importing one as a signature key
+is the shape of a downgrade, not a mistake. `alg: none` has no algorithm variant, so it fails at
+`decode_header`; that is a property of a dependency, so it has its own test rather than a comment.
+
+`WHEEL_EXTERNAL_ALGS` refuses a symmetric algorithm **at boot**, by name. A verification key that is
+also a minting key means anyone who can verify can forge.
+
+### Audience is mandatory, exact, and Wheel-dedicated
+
+`aud` is **required**: a token that does not carry one is refused. That needs saying because it is
+not what the library does on its own — with `validate_aud = true` and an audience configured,
+`jsonwebtoken` passes a token whose `aud` is *absent*, since validation is only applied to a claim
+that is present. Wheel names `aud` in `required_spec_claims` explicitly, and a test pins it.
+
+Comparison is **exact string equality** against the configured set. Never a prefix: `wheel:` as a
+prefix would accept `wheel:some-other-deployment`, which is the cross-tenant confusion the check
+exists to stop. `iss` and `exp` are required for the same reason — an absent issuer would otherwise
+skip the pin.
+
+**Choose an audience that means *this Wheel deployment* and nothing else.** The obvious value — the
+issuer's own origin — is the one that must not be used. An issuer that serves several of its own
+surfaces typically mints for all of them under one issuer, and several of those already carry the
+issuer origin as their `aud`. Configure that here and every one of them becomes a valid Wheel
+credential.
+
+```
+WHEEL_EXTERNAL_ISSUER=https://accounts.example.com      # what the IdP puts in `iss`
+WHEEL_EXTERNAL_AUDIENCE=https://api.wheel.example       # what WE are, and nothing else
+```
+
+`wheel`, `wheel:prod`, or the deployment's own API origin are all fine; the issuer origin is not.
+Wheel cannot decide this for a deployer — it does not know what else their issuer serves — so it
+**warns loudly at boot** when a configured audience equals the pinned issuer or its origin.
+
+On a multi-valued `aud`, any-match is the default: a token carrying
+`["https://wheel.example/api", "https://wheel.example/userinfo"]` is what several IdPs emit as a
+matter of course, and a control nobody can enable is not a control. What that admits is narrow and
+named: **another relying party listed in the same token can replay that token here.** The IdP named
+that party deliberately. `WHEEL_EXTERNAL_SOLE_AUDIENCE=1` is the lever for deployers who do not
+extend that trust.
+
+### Time, and the lifetime cap
+
+`exp` is required, `nbf` is validated when present, and leeway is 5 s. `WHEEL_EXTERNAL_MAX_TTL_SECS`,
+when set, *additionally* requires `iat` and refuses `exp - iat` above the cap — a token with no `iat`
+under a configured cap is refused, because a cap that cannot be computed is not a cap. It is
+optional because an 8-hour access token is a legitimate thing for an IdP to issue, and a cap that
+breaks every real deployment gets set to infinity by the first person who hits it. **No cap means
+revocation latency equals token lifetime.**
+
+### Principal mapping
+
+New table `external_identities` (migration `0007`, both dialects), keyed `UNIQUE (issuer, subject)`:
+
+| column | |
+|---|---|
+| `provider` | the operator's label, for display and logs |
+| `issuer` | the `iss` that was actually verified |
+| `subject` | the claim named by `WHEEL_EXTERNAL_SUBJECT_CLAIM` (default `sub`) |
+| `user_id` | the Wheel `users.id` this maps to |
+| `email` | **display only, never a link key** |
+| `created_at`, `last_seen_at`, `disabled_at` | |
+
+The key is `(issuer, subject)` and **not** `(provider, subject)`. `provider` is a label an operator
+may retitle; `issuer` is what was cryptographically asserted. Keying on the label would mean that
+pointing `provider=acme` at a different issuer silently merges two populations into one set of
+accounts. Keying on the issuer makes the same typo fail closed, into new empty accounts.
+
+**Never auto-link by email.** If a token carries `email` it is stored for display and never used to
+find an existing account. An IdP that lets a user set an unverified address would otherwise be a
+one-step takeover of any local Wheel account whose address an attacker can guess. The only automatic
+link is `(issuer, subject)`.
+
+`WHEEL_EXTERNAL_PROVISION` has no default and must be stated:
+
+- **`auto`** — a verified token for an unknown `(issuer, subject)` creates a Wheel user and links it.
+  Correct when the IdP's population *is* the intended Wheel population. **If your issuer lets anyone
+  sign up, `auto` lets anyone into Wheel.**
+- **`linked`** — a verified token for an unknown `(issuer, subject)` is rejected until an operator
+  links it. There is no bootstrap problem: the `wht_` operator token from first boot is the
+  pre-existing principal that performs the first link.
+
+Three cases an operator should know about before choosing an IdP:
+
+- **A subject disappears** (deleted upstream). **Wheel does not find out.** There is no back-channel
+  logout and no SCIM in v1; access ends only because the IdP stops issuing tokens. The operator's
+  lever is `DELETE /v1/auth/external-identities/{id}`.
+- **A subject is reused** — the IdP re-assigns a retired `sub` to a different human. The new human
+  **inherits the old one's Wheel account, projects and memberships, and Wheel cannot detect it.**
+  OIDC Core §2 requires `sub` never to be reassigned, so this is a provider defect — but it is a
+  requirement *of the deployer's IdP*, stated here because Wheel cannot enforce it. Where the IdP
+  has a better immutable identifier (`oid` on Entra, `user_id` on several others), point
+  `WHEEL_EXTERNAL_SUBJECT_CLAIM` at it. `last_seen_at` makes a dormant-then-active identity visible
+  to an operator who looks. Residual, not closed.
+- **The issuer changes** (an IdP migration, or a hostname move). A new `(issuer, subject)` is a
+  **new principal with no projects.** That is deliberate and fail-closed: inheriting an account
+  because a URL changed is account takeover triggered by a config edit. The migration path is
+  explicit re-linking through the admin route below.
+
+### An external credential may not mint a `wht_` token
+
+`POST /v1/auth/tokens` returns **403** for a caller authenticated by `external`. This is the control
+that keeps the whole external lifetime story from being decorative: a deployer's token is
+short-lived and revocable by their IdP, and a `wht_` token is neither, so allowing the trade would
+let anyone with five minutes of access buy an indefinite credential the deployer's identity system
+can no longer take away.
+
+### `proxy_header` — the dangerous mode, and what contains it
+
+If Wheel believes a header, then **anything that can reach Wheel directly can be anyone.** Wheel must
+be reachable *only* through the authenticating proxy. A trusted-peer list is the last check, not the
+only one. What is enforced mechanically:
+
+1. **Boot refuses** `proxy_header` when `WHEEL_TRUSTED_PROXIES` is empty, naming the missing
+   variable. Believing a header from everyone is not a configuration, it is an open door.
+2. **Per request, the TCP peer** must be inside `WHEEL_TRUSTED_PROXIES` or the request is 401
+   whatever its headers say. Not `X-Forwarded-For` — the peer. The marker is a server-side request
+   extension a client cannot forge, and if the middleware that computes it is absent the marker is
+   absent and every request fails closed.
+3. **The subject and email headers never cross the proxy hop.** They are the credential, so they
+   join `x-auth-token` on the never-relay list — on the authenticated engine proxy *and* on public
+   ingress, where the proxy attaches them to every forwarded request even though ingress
+   authenticates nobody. Relaying one would put "who the edge says is calling" in front of an agent,
+   which could replay it back at the API as its author. They cannot be a `const` list, because the
+   deployer names them, so they are resolved from configuration at the one function every outbound
+   request goes through.
+4. **Cross-origin requests are refused 403.** The credential is *ambient* — the proxy attaches it —
+   so a hostile page can make a browser issue an authenticated request. JSON routes are covered by
+   preflight, but the engine proxy is `ANY` with arbitrary content types, so preflight is luck
+   rather than a control. An `Origin` header not in `CORS_ALLOWED_ORIGINS` is refused, **before** the
+   identity is resolved, so a refused request provisions nobody and touches no row. A request with
+   no `Origin` is not something a page can cause and passes. With the default empty allowlist, no
+   browser page may call the API cross-origin at all — which is the correct answer for an ambient
+   credential. The allowlist reaches the extractor as a request extension whose **absence** is read
+   as an empty list, so a router assembled without the layer refuses every cross-origin request
+   rather than admitting every one.
+5. **Boot warns, loudly and once**, naming the mode, so the reduced posture is in the first screen
+   of logs rather than discoverable only by reading configuration.
+
+`wht_` API tokens keep working under `proxy_header`: they are *this API's own* credential, and the
+extractor checks for one before the proxy-header branch. Without that, `wheeld token` — the one
+credential an operator can use from a script — would be useless on a proxy-authenticated deployment.
+
+### External identity administration
+
+Three operator-only routes. They **404 unless `AUTH_MODE=external`**, so a deployment that does not
+use external auth has no such surface at all. Authorisation is the token-only owner account — the one
+`wheeld` creates on first boot, which no signup can produce — the same guard as `POST /v1/auth/users`.
+
+#### `GET /v1/auth/external-identities`
+`200` → every link, oldest first. None of it is a credential.
+```json
+[ { "id": "<uuid>", "provider": "acme", "issuer": "https://accounts.example.com",
+    "subject": "auth0|abc", "user_id": "<uuid>", "email": "a@example.com",
+    "created_at": "…", "last_seen_at": "…" | null, "disabled_at": null } ]
+```
+
+#### `POST /v1/auth/external-identities`
+```json
+{ "subject": "auth0|abc", "user_id": "<uuid>", "email": "a@example.com" }
+```
+`201` → the created link.
+
+- **The issuer is not a parameter.** It is taken from configuration, because it is the thing that was
+  or will be cryptographically asserted. Letting a caller name one would let an operator link a
+  subject under an issuer this deployment never verifies — a row that can never match and looks like
+  it should.
+- `subject` is validated as a principal (bounded length, no control characters) → `400`.
+- The account must exist → `404`. Linking to an absent one would create a row that authenticates
+  nobody, silently.
+- A subject already linked → `409`.
+
+#### `DELETE /v1/auth/external-identities/{id}`
+`204`, `404` for an unknown id. **Soft**: it sets `disabled_at` rather than deleting, so the link is
+still visible to an operator afterwards and re-enabling is a decision rather than a fresh provision
+under a new Wheel account, which would silently orphan the old account's projects. Verification then
+still succeeds — the IdP still vouches for them — and access does not, which is the only revocation
+lever Wheel has over a provider with no back-channel logout.
+
 ## API tokens (every `AUTH_MODE`)
 
 API tokens are how a client without a browser signs in: a script, CI, or a desktop app such as AgentGrid. They work the
@@ -128,7 +351,12 @@ same way against a local `wheeld` and the cloud API. Design and threat model: `d
 - **Format.** `wht_` followed by 43 base64url characters, which encode 32 random bytes.
 - **Sending one.** Use it wherever a session goes: `x-auth-token: wht_…` or `Authorization: Bearer wht_…`.
 - **Subject.** A token speaks for the account that minted it. Under `local` that is the user's id; under `jwks` it is the
-  identity provider's `sub`. Projects and ownership checks cannot tell a token from a session.
+  identity provider's `sub`; under `external` it is the Wheel `users.id` the subject maps to. Projects and membership
+  checks cannot tell a token from a session.
+- **Not mintable by an external credential.** `POST /v1/auth/tokens` is **403** under `AUTH_MODE=external`. See
+  [An external credential may not mint a `wht_` token](#an-external-credential-may-not-mint-a-wht_-token). A `wht_`
+  token presented *to* a proxy-header deployment still authenticates normally — it is this API's own credential, and it
+  is checked before the proxy-header branch.
 - **Storage.** The server keeps only the token's SHA-256, which is also the lookup key. The value is returned once, when
   it is minted, and never again: not by any route, and not in any log.
 - **Failure.** An unknown or revoked token gets the same `401`, with the same body, as every other authentication failure.
@@ -142,7 +370,9 @@ same way against a local `wheeld` and the cloud API. Design and threat model: `d
   (`wheeld token create`, the first-boot operator token) are not a session's, and survive it.
 
 ### `POST /v1/auth/tokens`
-Authenticated by a session or by an existing token.
+Authenticated by a session or by an existing token. **`403` for an externally-authenticated caller**
+(`AUTH_MODE=external`), so a short-lived credential the deployer's IdP can revoke cannot be traded
+for an indefinite one it cannot.
 ```json
 { "name": "laptop" }
 ```
@@ -198,10 +428,15 @@ rather than silently substituted; say the word if you want the counter instead.
 
 Order of operations on every project-scoped request, without exception:
 
-1. Verify the JWT signature against the cached Clerk JWKS (RS256 only).
+1. Verify the credential. Under `jwks`, the signature against the cached JWKS (RS256 only). Under
+   `external`, the signature against a key whose algorithm the *key set* declares, then the
+   mandatory `aud`, then everything in [External auth](#external-auth-auth_modeexternal). Under
+   `proxy_header` there is no signature, and the check is that the TCP peer is a trusted proxy.
 2. Validate `iss`, `exp`, `nbf`, and `azp` when an allowlist is configured.
-3. Load the project **with `owner_id = sub` as part of the query**.
-4. Only then run the handler.
+3. Resolve the principal. Under `external` that is a lookup of `(issuer, subject)` in
+   `external_identities`, which yields a Wheel `users.id` — never the foreign subject.
+4. Load the project **with membership as part of the query**.
+5. Only then run the handler.
 
 Step 3 is a `WHERE` predicate rather than a comparison after the fetch, so "no such project" and
 "someone else's project" are literally the same code path. Both return `404`. There is no way to
@@ -213,6 +448,14 @@ learn whether an id exists.
 |---|---|---|
 | No token, malformed token, bad signature, expired, wrong issuer, unknown `kid` | `401` | `unauthorized` |
 | Valid token, project not owned by `sub`, or no such project | `404` | `not_found` |
+| Token with no `kid`, `alg: none`, a header `alg` disagreeing with the key's, or an algorithm outside `WHEEL_EXTERNAL_ALGS` | `401` | `unauthorized` |
+| Missing, wrong, or non-exactly-matching `aud` under `external` | `401` | `unauthorized` |
+| Proxy-header assertion from a peer outside `WHEEL_TRUSTED_PROXIES`, or with the trusted-peer layer absent | `401` | `unauthorized` |
+| Unknown `(issuer, subject)` under `WHEEL_EXTERNAL_PROVISION=linked`, or a disabled external identity | `401` | `unauthorized` |
+| Cross-origin request under `proxy_header` | `403` | `forbidden` |
+| `POST /v1/auth/tokens` from an external credential | `403` | `forbidden` |
+| An external-identity route without the operator account | `403` | `forbidden` |
+| An external-identity route with `AUTH_MODE != external` | `404` | `not_found` |
 | `x-project-id` not a UUID, or disagrees with the path | `400` | `bad_request` |
 | Ingress on a project with `capabilities.http = false` | `403` | `forbidden` |
 | Per-user project cap reached | `409` | `conflict` |
@@ -432,7 +675,7 @@ rather than by whichever PR happens to touch it first.
 ## Routes
 
 ### `GET /healthz`
-Unauthenticated. `200 {"status":"ok","auth_mode":"local"|"jwks"}`.
+Unauthenticated. `200 {"status":"ok","auth_mode":"local"|"jwks"|"external"}`.
 
 `auth_mode` is the mode this API is actually running, and it is published so a client can assert it
 agrees. If the web build ships `clerk` while the API runs `local`, the user gets a login widget whose
@@ -744,8 +987,9 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `WHEEL_ENV` | no | `prod` | `dev` or `prod`. Anything else refuses to boot. Unset means prod. |
 | `STORE` | yes* | — | `postgres://…` or `sqlite://path/to/wheel.db`. The scheme picks the backend, so there is no mode flag that can disagree with the connection string. |
 | `DATABASE_URL` | yes* | — | Accepted as an alias for `STORE`; production, the compose stack and every deploy already set it. (*one of the two is required.) |
-| `CLERK_JWKS_URL`, `CLERK_ISSUER` | yes | — | |
-| `CLERK_AZP` | no | — | Comma-separated `azp` allowlist. |
+| `WHEEL_JWKS_URL`, `WHEEL_JWKS_ISSUER` | under `jwks` | — | Where `AUTH_MODE=jwks` fetches the provider's signing keys, and the `iss` it pins. |
+| `WHEEL_JWKS_AZP` | no | — | Comma-separated `azp` allowlist. |
+| `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AZP` | no | — | **Deprecated aliases** for the three above. Still read, with a one-line boot warning naming both spellings. Setting a name and its alias to *different* values refuses to boot. See [The `CLERK_*` aliases](#the-clerk_-aliases). |
 | `API_MASTER_KEY` | yes | — | 32 bytes, base64. `openssl rand -base64 32`. |
 | `WHEEL_HOST_URL` | yes | — | e.g. `http://wheel-host.railway.internal:7100`. |
 | `WHEEL_HOST_SECRET` | yes | — | Bearer for the host. Must never appear in a sandbox's environment. |
@@ -762,28 +1006,96 @@ route, not to smooth traffic. A sliding window in Redis is the upgrade path.
 | `WS_MAX_BRIDGES_PER_PROJECT` | no | `16` | Live WebSocket bridges one project may hold **on this replica**. Per replica, not global: with N replicas the effective ceiling is N times this. It is a blast-radius bound, not a quota (ADVERSARY 011). |
 | `WS_MAX_LIFETIME_SECS` | no | `3600` | Absolute lifetime of a bridge; the client then takes a new ws-ticket. |
 
-### Running `AUTH_MODE=jwks` without a provider account
+### `AUTH_MODE=external` — the external verifier's variables
 
-`cargo run -p wheel-api --example stub-issuer` serves a JWKS on `127.0.0.1:9911` and prints a ready
-token, so `jwks` mode can be exercised with no Clerk account:
+Everything the verifier does is named by a variable. Nothing is inferred and nothing has a
+permissive default. **Setting any `WHEEL_EXTERNAL_*` variable while `AUTH_MODE` is not `external`
+refuses to boot, naming the variable** — a knob that looks configured and is never read is how a
+deployer comes to believe they have pinned an audience.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `WHEEL_EXTERNAL_VERIFIER` | yes | — | `jwks` or `proxy_header`. Any other value refuses to boot rather than falling back to either real one. |
+| `WHEEL_EXTERNAL_ISSUER` | yes | — | Exact `iss` to pin. Under `proxy_header` it is a synthetic stable label (e.g. `proxy:oauth2-proxy`), because the principal key needs an issuer even when no token exists. |
+| `WHEEL_EXTERNAL_AUDIENCE` | yes | — | Comma-separated. **Exact string equality**, never a prefix. Empty or blank refuses to boot. Must name *this Wheel deployment*, never the issuer origin. |
+| `WHEEL_EXTERNAL_ALGS` | yes (`jwks`) | — | Comma-separated allowlist, e.g. `RS256,EdDSA`. Case-insensitive. A symmetric algorithm (`HS*`) is refused **by name** at boot. An algorithm no key can ever carry (`ES256`) is refused too, rather than booting and then rejecting every token for a reason nobody can see. |
+| `WHEEL_EXTERNAL_JWKS_URL` | yes (`jwks`) | — | Subject to the production identity-provider interlock: `https://` and non-local in prod. |
+| `WHEEL_EXTERNAL_PROVISION` | yes | — | `auto` or `linked`. No default: if your issuer lets anyone sign up, `auto` lets anyone into Wheel, so this is a decision to make out loud. |
+| `WHEEL_EXTERNAL_PROVIDER` | no | `external` | The operator's display label on `external_identities` rows. Never a link key. |
+| `WHEEL_EXTERNAL_TOKEN_HEADER` | no | `x-auth-token` / `Authorization: Bearer` | Read the credential from a different header, e.g. `cf-access-jwt-assertion` for Cloudflare Access. Stored case-folded. |
+| `WHEEL_EXTERNAL_SUBJECT_CLAIM` | no | `sub` | Point at a better immutable identifier where the IdP has one (`oid` on Entra). Empty refuses to boot. |
+| `WHEEL_EXTERNAL_AZP` | no | — | `azp` allowlist. When set, a token with **no** `azp` cannot satisfy it. |
+| `WHEEL_EXTERNAL_MAX_TTL_SECS` | no | none | Requires `iat` and refuses `exp - iat` above it. Must be a positive whole number. Unset means no cap — and no cap means revocation latency equals token lifetime. |
+| `WHEEL_EXTERNAL_SOLE_AUDIENCE` | no | off | `1`/`true`/`yes` requires our audience be the **only** one the token names. |
+| `WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER` | yes (`proxy_header`) | — | e.g. `x-forwarded-user`. Stored case-folded. Stripped at the proxy hop on every outbound path. |
+| `WHEEL_EXTERNAL_PROXY_EMAIL_HEADER` | no (`proxy_header`) | — | Display only, never a link key. Stripped at the hop alongside the subject header. |
+
+Under `proxy_header`, `WHEEL_TRUSTED_PROXIES` becomes **required**: an empty list refuses to boot.
+
+### Cloudflare Access is a `jwks` deployment, not a `proxy_header` one
+
+It passes a *signed* JWT in `Cf-Access-Jwt-Assertion` and publishes a JWKS. "Where the credential is
+read from" and "how it is verified" are two axes, not one, and they are configured independently:
+
+```
+WHEEL_EXTERNAL_VERIFIER=jwks
+WHEEL_EXTERNAL_TOKEN_HEADER=cf-access-jwt-assertion
+```
+
+Treating Access as a trusted-header provider would throw away a signature we could check.
+
+### Running `jwks` or `external` without a provider account — the stub issuer
+
+```
+cargo run -p wheel-api --example stub-issuer          # port 9911
+PORT=9000 SUB=user_abc cargo run -p wheel-api --example stub-issuer
+```
+
+It serves **two** JWKS documents, because there are two modes and they are deliberately not the same
+issuer — `Config::cross_check` refuses to boot with two verifiers pinned to one issuer.
+
+| Path | Keys | For |
+|---|---|---|
+| `/jwks` | RSA only | `AUTH_MODE=jwks` |
+| `/external/jwks` | RSA **and** Ed25519 | `AUTH_MODE=external` |
+
+Both algorithms on the external plane, because the whole point of the external verifier is that the
+algorithm comes from the key rather than from the token, and a key set with one algorithm in it
+cannot demonstrate that.
 
 ```
 AUTH_MODE=jwks
-CLERK_JWKS_URL=http://127.0.0.1:9911/jwks
-CLERK_ISSUER=https://clerk.example.test
+WHEEL_JWKS_URL=http://127.0.0.1:9911/jwks
+WHEEL_JWKS_ISSUER=https://clerk.example.test
 ```
 
-`GET /token?sub=<id>` mints more. `PORT` and `SUB` override the defaults.
+```
+AUTH_MODE=external
+WHEEL_EXTERNAL_VERIFIER=jwks
+WHEEL_EXTERNAL_JWKS_URL=http://127.0.0.1:9911/external/jwks
+WHEEL_EXTERNAL_ISSUER=https://idp.example.test
+WHEEL_EXTERNAL_AUDIENCE=wheel-stub
+WHEEL_EXTERNAL_ALGS=RS256,EdDSA
+WHEEL_EXTERNAL_PROVISION=auto
+```
 
-It signs with the fixture key in `crates/wheel-api/tests/fixtures/`, so a token it mints and a token
-the test suite mints are signed by the same key. On startup it puts a token through
-`auth::claims::verify` — the real verifier, not a copy — and refuses to serve if that fails, so a
-drift between the JWKS document and what the API accepts is caught here rather than somewhere less
-obvious.
+`WHEEL_ENV=dev` is required for either of those URLs: the production identity-provider interlock
+refuses a loopback issuer, which is exactly what this is.
+
+`GET /token?sub=<id>&alg=<RS256|EdDSA>&aud=<audience>` mints more. Passing `aud` mints on the
+external plane (external issuer, audience set); omitting it mints on the `jwks` plane. `PORT` and
+`SUB` override the defaults, and the process prints a ready token for each plane at startup.
+
+**It verifies itself before it serves.** On startup it mints tokens on both planes and both
+algorithms and puts them through `auth::claims::verify` *and* `auth::external::verify_token` — the
+real production verifiers, not copies — and **exits non-zero** if any of them fails. So a drift
+between a JWKS shape, a claim set and what the API accepts is caught here rather than somewhere less
+obvious. That is also what keeps the test fixture and the runnable stub from diverging: both sign
+with the same two committed keys, in `crates/wheel-api/tests/fixtures/`.
 
 **Never in production.** It is an `examples/` target, so it is in no shipped binary and unreachable
-from the library, and its signing key is committed to this repository in plain text — anyone can mint
-any `sub`.
+from the library, and its signing keys are committed to this repository in plain text — anyone can
+mint any `sub`, on either plane.
 
 ### The dev-bypass interlock
 
@@ -841,9 +1153,11 @@ production answers 409, and "works locally" would stop meaning anything.
 
 ### The production identity-provider interlock
 
-Under `AUTH_MODE=jwks` with `WHEEL_ENV=prod`, `CLERK_JWKS_URL` and `CLERK_ISSUER` must both be
-`https://` and must not point at loopback, RFC1918, link-local, unique-local IPv6, or a `.local` /
-`.internal` name. Otherwise the process refuses to start.
+Under `WHEEL_ENV=prod`, the issuer and key-set URLs of **both** JWKS-backed modes must be `https://`
+and must not point at loopback, RFC1918, link-local, unique-local IPv6, or a `.local` / `.internal`
+name. Otherwise the process refuses to start. That is `WHEEL_JWKS_URL` and `WHEEL_JWKS_ISSUER` under
+`AUTH_MODE=jwks`, and `WHEEL_EXTERNAL_JWKS_URL` and `WHEEL_EXTERNAL_ISSUER` under
+`AUTH_MODE=external`.
 
 This is not tidiness. A stub identity provider does not fail closed — it authenticates everyone, as
 whoever the caller claims to be, and the ownership checks then work perfectly against an identity
@@ -851,6 +1165,65 @@ the attacker chose (ADVERSARY 017, where a mock-auth build resolved every token 
 `owner_id`). Boot is the only place to catch it. Dev is unaffected: pointing at a local issuer is
 exactly what dev is for. The host is checked as a literal, without DNS — boot is not the place to
 trust a resolver, and a name that resolves publicly today may not tomorrow.
+
+## Configuration interlocks
+
+Every one of these is a refusal at boot, not a warning, and every one is pinned by
+`tests/config_interlock.rs` or `tests/external_config.rs`. The shared principle: a security control
+that is half-configured must stop the process, because the alternative is a deployment that starts,
+looks configured, and is not.
+
+| Interlock | Why |
+|---|---|
+| `AUTH_MODE` unset in prod | Guessing wrong either rejects every real user or accepts tokens from the wrong issuer. |
+| `AUTH_DEV_SECRET` set while `WHEEL_ENV != dev` | A total authentication bypass. See [the dev-bypass interlock](#the-dev-bypass-interlock). |
+| `AUTH_MODE=jwks` with an empty `WHEEL_JWKS_URL`/`WHEEL_JWKS_ISSUER` | A placeholder that looks like configuration starts and then rejects every token for a reason nobody can see. |
+| A `WHEEL_JWKS_*` name and its `CLERK_*` alias set to **different** values | There is no correct way to pick a winner between two issuers an operator has named, and picking one silently is how a deployment ends up pinned to a provider nobody meant. |
+| Any `WHEEL_EXTERNAL_*` set while `AUTH_MODE != external` | A knob that looks configured and is never read is how a deployer comes to believe they have pinned an audience. The message names the variable. |
+| `WHEEL_EXTERNAL_AUDIENCE` empty or blank | An unvalidated audience means a token minted for a different relying party is accepted here as its subject. |
+| `WHEEL_EXTERNAL_ALGS` naming a symmetric algorithm | The key that verifies is then also a key that mints: anyone who can verify can forge. Refused **by name**, so an operator cannot believe they enabled something. |
+| `WHEEL_EXTERNAL_ALGS` naming an algorithm no key can carry (e.g. `ES256`) | It would boot and then reject every token for a reason nobody can see. |
+| `WHEEL_EXTERNAL_VERIFIER` unrecognised | It must not fall back to either real verifier. |
+| `WHEEL_EXTERNAL_PROVISION` unset | `auto` on an open-signup IdP lets anyone into Wheel. Never a default. |
+| `WHEEL_EXTERNAL_MAX_TTL_SECS` not a positive whole number | |
+| `WHEEL_EXTERNAL_SUBJECT_CLAIM` empty | |
+| `WHEEL_EXTERNAL_ISSUER == WHEEL_JWKS_ISSUER` | Two verifiers pinned to one issuer are two token populations that can stand in for each other. |
+| `WHEEL_EXTERNAL_ISSUER == PUBLIC_BASE_URL` | That is the issuer of this API's own sessions. A local session JWT must never route to the external verifier, nor the reverse. |
+| `WHEEL_EXTERNAL_VERIFIER=proxy_header` with an empty `WHEEL_TRUSTED_PROXIES` | Believing a header from everyone is not a configuration, it is an open door. |
+| Prod, either JWKS mode, a loopback or plaintext issuer | [The production identity-provider interlock](#the-production-identity-provider-interlock). |
+
+Two things **warn** rather than refuse, because Wheel cannot decide them for a deployer:
+
+- `WHEEL_EXTERNAL_AUDIENCE` equal to the pinned issuer or its origin. Wheel does not know what else
+  the deployer's issuer serves. The warning names both values and says what to use instead.
+  (`ExternalAuth::audience_shadowing_the_issuer` is a pure function so a test can assert the rule —
+  a rule that exists only inside a `tracing::warn!` cannot be asserted, and a control nobody can
+  test is a control that silently stops firing.)
+- `proxy_header` mode at all, naming the mode, because the reduced posture belongs in the first
+  screen of logs.
+
+### The `CLERK_*` aliases
+
+`AUTH_MODE=jwks` predates this project having more than one identity provider, and its variables
+were named after one vendor. Nothing in the mode is Clerk-specific — it is an OIDC issuer and a
+JWKS. The documented names are now:
+
+```
+WHEEL_JWKS_URL     <- CLERK_JWKS_URL
+WHEEL_JWKS_ISSUER  <- CLERK_ISSUER
+WHEEL_JWKS_AZP     <- CLERK_AZP
+```
+
+**Aliased, not renamed.** `CLERK_JWKS_URL` and `CLERK_ISSUER` are *required* under `jwks` and an
+empty value already refuses to boot, so a hard rename would turn a documentation fix into a failed
+deploy at the next restart of every deployment configured the old way — including
+`infra/docker-compose.yml`. The deprecated spelling keeps working and logs a one-line deprecation at
+boot naming both variables.
+
+The one hazard an alias introduces is ambiguity, and that is closed: **both names set to different
+values refuses to boot**, naming both. Both set to the same value is a redundancy, not an error, and
+an empty or whitespace value is an unset one. Dropping the alias is its own change, taken
+deliberately once no deployment reads them.
 
 ## Behind a reverse proxy
 
@@ -875,6 +1248,13 @@ over loopback and claim any client address for a hit on another project's `/p/�
 endpoint's `ip_allow` and per-caller limit. A dedicated loopback alias does not change that, since any
 local process may bind the alias as its source. Prefer the Docker layout, where the trusted address
 is the proxy's own container, on a network the agents are not on.
+
+Under `AUTH_MODE=external` with `WHEEL_EXTERNAL_VERIFIER=proxy_header`, `WHEEL_TRUSTED_PROXIES` stops
+being an `X-Forwarded-For` policy and becomes **the authentication boundary**: the peer check is the
+entire control, so the warning above is no longer about a rate-limit key, it is about who may be
+anyone. An empty list refuses to boot in that mode, and trusting loopback there means every local
+process — agents included — can authenticate as any subject. See
+[`proxy_header`](#proxy_header--the-dangerous-mode-and-what-contains-it).
 
 ## Cookies are never credentials
 
@@ -933,7 +1313,7 @@ WHEEL_DATA_DIR=/tmp/wheel-host-data ./target/debug/wheel-host &
 # 4. API on :8080
 WHEEL_ENV=dev BIND_ADDR=127.0.0.1:8080 \
 DATABASE_URL=postgres://wheel:wheel@127.0.0.1:55432/wheel_dev \
-CLERK_ISSUER=https://dev.wheel.local AUTH_DEV_SECRET=dev-only-hs256-secret \
+WHEEL_JWKS_ISSUER=https://dev.wheel.local AUTH_DEV_SECRET=dev-only-hs256-secret \
 API_MASTER_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
 WHEEL_HOST_URL=http://127.0.0.1:7100 WHEEL_HOST_SECRET=dev-host-secret-at-least-16-chars \
 WHEEL_SIGNUP=open CORS_ALLOWED_ORIGINS=http://localhost:3000 ./target/debug/wheel-api
@@ -942,11 +1322,11 @@ WHEEL_SIGNUP=open CORS_ALLOWED_ORIGINS=http://localhost:3000 ./target/debug/whee
 `SANDBOX_BACKEND=external` points the host at an engine someone else started, instead of creating
 containers. It refuses to load unless `WHEEL_ENV=dev`, because it performs no isolation at all.
 
-### Minting a token without Clerk
+### Minting a token without an identity provider
 
 With `AUTH_DEV_SECRET` set and `WHEEL_ENV=dev`, the API accepts HS256 tokens. `sub` is the user id,
 so two different `sub` values are two different tenants — which is how to exercise the ownership
-boundary locally. Claims: `{sub, iss, exp, nbf}`, where `iss` must equal `CLERK_ISSUER` exactly.
+boundary locally. Claims: `{sub, iss, exp, nbf}`, where `iss` must equal `WHEEL_JWKS_ISSUER` (or the deprecated `CLERK_ISSUER`) exactly.
 A ten-line reference implementation lives in `infra/dev/e2e.py` (`mint()`); copy it rather than
 rewriting it.
 
@@ -1001,7 +1381,7 @@ lives on, so whether it lands as one PR with that path or two is a question for 
 
 ```bash
 export API_MASTER_KEY=$(openssl rand -base64 32)
-export CLERK_JWKS_URL=... CLERK_ISSUER=...
+export WHEEL_JWKS_URL=... WHEEL_JWKS_ISSUER=...
 docker compose -f infra/docker-compose.yml up --build
 ```
 
@@ -1009,7 +1389,7 @@ The docker socket is mounted into the **host** service only. Anything that can r
 trivially escape to the machine, so the internet-facing API must never see it.
 
 With `WHEEL_ENV=dev` and `AUTH_DEV_SECRET` set, HS256 tokens are accepted and the JWKS endpoint is
-never contacted. `iss` is still validated, so a minted token must carry exactly `CLERK_ISSUER`.
+never contacted. `iss` is still validated, so a minted token must carry exactly `WHEEL_JWKS_ISSUER`.
 
 ### End-to-end check
 
