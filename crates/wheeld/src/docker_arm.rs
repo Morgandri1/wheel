@@ -10,47 +10,85 @@
 //! it a question the proxy refuses and a real daemon would answer.
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
 use bollard::Docker;
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 use wheel_host::config::{Backend, Config};
 use wheel_host::sandbox::{docker::DockerSandbox, Sandbox};
 
-/// Dev only: run against a daemon socket that is not filtered. Warned about on every boot.
+/// Dev only: run against a daemon socket that is not filtered. Also requires `WHEEL_ENV=dev`,
+/// because a flag that only warns is one `.env` copied from a laptop to a server away from on.
 pub const ENV_ALLOW_RAW_SOCKET: &str = "WHEEL_ALLOW_RAW_DOCKER_SOCKET";
 
-const DAEMON_SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
+/// Where bollard connects when `DOCKER_HOST` is unset.
+const DEFAULT_SOCKET: &str = "/var/run/docker.sock";
 
-/// Whether `DOCKER_HOST` could name a filtering proxy at all. Only a unix socket that is not one of
-/// the daemon's own can: a `tcp://` address may be anything, and it is not this function's job to
-/// guess. Err carries the reason, worded for the operator.
-pub fn could_be_the_proxy(docker_host: Option<&str>) -> Result<(), String> {
-    let Some(host) = docker_host.map(str::trim).filter(|h| !h.is_empty()) else {
-        return Err("DOCKER_HOST is not set, so the daemon's own socket would be used".into());
-    };
-    let Some(path) = host.strip_prefix("unix://") else {
-        return Err(format!(
-            "DOCKER_HOST={host} is not a unix socket, so it cannot be the filtering proxy"
-        ));
-    };
-    if DAEMON_SOCKETS.contains(&path) {
-        return Err(format!(
-            "DOCKER_HOST={host} is the docker daemon's own socket"
-        ));
+/// The unix socket `DOCKER_HOST` names, resolved as bollard resolves it (unset means the daemon's
+/// default). Anything that is not a unix socket cannot be identity-checked, so it is refused.
+pub fn docker_socket(docker_host: Option<&str>) -> Result<std::path::PathBuf, String> {
+    match docker_host.filter(|h| !h.is_empty()) {
+        None => Ok(DEFAULT_SOCKET.into()),
+        Some(host) => host
+            .strip_prefix("unix://")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                format!(
+                    "DOCKER_HOST={host} is not a unix socket, so it cannot be the filtering proxy"
+                )
+            }),
     }
-    Ok(())
 }
 
-/// Ask for something the proxy refuses (`GET /version`). A filtered socket answers 403; a raw
-/// daemon answers, and a socket that cannot be reached at all is no better a place to run tenants.
-pub async fn prove_filtered(docker: &Docker) -> Result<(), String> {
+/// One `GET` over a unix socket; returns (status, body).
+async fn get_over_socket(path: &std::path::Path, target: &str) -> std::io::Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nhost: docker\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut raw = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut raw),
+    )
+    .await
+    .map_err(|_| std::io::Error::other("the docker socket did not answer"))??;
+    let text = String::from_utf8_lossy(&raw);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok((status, body))
+}
+
+/// Prove, by behaviour, that this socket is the filtering proxy: it says so, AND it refuses a call
+/// a real daemon answers. Naming the socket proves nothing — an unset `DOCKER_HOST`, a symlink, or a
+/// bind-mount at another path all reach a real daemon under a name that looks innocent.
+pub async fn prove_filtered(socket: &std::path::Path, docker: &Docker) -> Result<(), String> {
+    match get_over_socket(socket, wheel_host::docker_proxy::IDENTITY_PATH).await {
+        Ok((200, body)) if body == wheel_host::docker_proxy::IDENTITY_BODY => {}
+        Ok((status, _)) => {
+            return Err(format!(
+                "{} did not identify itself as the filtering proxy (answered {status})",
+                socket.display()
+            ))
+        }
+        Err(e) => return Err(format!("{} could not be reached: {e}", socket.display())),
+    }
     match docker.version().await {
-        Ok(_) => Err("the socket answered GET /version, so it is not the filtering proxy".into()),
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 403, ..
         }) => Ok(()),
-        Err(e) => Err(format!("the docker socket could not be reached: {e}")),
+        Ok(_) => {
+            Err("the socket answered GET /version, so a real daemon is behind it unfiltered".into())
+        }
+        Err(e) => Err(format!("the docker socket misbehaved: {e}")),
     }
 }
 
@@ -59,6 +97,12 @@ pub async fn connect(mut cfg: Config) -> Result<Arc<DockerSandbox>> {
     cfg.backend = Backend::Docker;
 
     if std::env::var(ENV_ALLOW_RAW_SOCKET).as_deref() == Ok("1") {
+        if std::env::var("WHEEL_ENV").as_deref() != Ok("dev") {
+            bail!(
+                "{ENV_ALLOW_RAW_SOCKET}=1 is only honoured with WHEEL_ENV=dev; refusing to run the \
+                 docker sandbox against a socket that is not proved to be filtered"
+            );
+        }
         tracing::warn!(
             "{ENV_ALLOW_RAW_SOCKET}=1: the docker socket this process uses is NOT proved to be the \
              filtering proxy. A bug in wheeld or the API is then root on this machine. Development \
@@ -66,18 +110,18 @@ pub async fn connect(mut cfg: Config) -> Result<Arc<DockerSandbox>> {
         );
     } else {
         let host = std::env::var("DOCKER_HOST").ok();
-        if let Err(why) = could_be_the_proxy(host.as_deref()) {
-            bail!(
+        let socket = match docker_socket(host.as_deref()) {
+            Ok(p) => p,
+            Err(why) => bail!(
                 "refusing to run the docker sandbox: {why}. Point DOCKER_HOST at wheel-docker-proxy's \
-                 socket (unix:///path). For development against an unfiltered daemon, set \
-                 {ENV_ALLOW_RAW_SOCKET}=1"
-            );
-        }
+                 socket (unix:///path)"
+            ),
+        };
         let docker = Docker::connect_with_local_defaults().context("connecting to DOCKER_HOST")?;
-        if let Err(why) = prove_filtered(&docker).await {
+        if let Err(why) = prove_filtered(&socket, &docker).await {
             bail!(
                 "refusing to run the docker sandbox: {why}. DOCKER_HOST must be wheel-docker-proxy \
-                 (or set {ENV_ALLOW_RAW_SOCKET}=1 for development)"
+                 (for development against an unfiltered daemon: {ENV_ALLOW_RAW_SOCKET}=1 and WHEEL_ENV=dev)"
             );
         }
     }
@@ -92,28 +136,54 @@ pub async fn connect(mut cfg: Config) -> Result<Arc<DockerSandbox>> {
     Ok(sandbox)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_unix_socket_that_is_not_the_daemons_own_could_be_the_proxy() {
-        assert!(could_be_the_proxy(Some("unix:///run/wheel-docker/docker.sock")).is_ok());
-        for bad in [
-            None,
-            Some(""),
-            Some("  "),
-            Some("unix:///var/run/docker.sock"),
-            Some("unix:///run/docker.sock"),
-            Some("tcp://docker:2375"),
-            Some("http://127.0.0.1:2375"),
-            Some("/run/wheel-docker/docker.sock"),
-        ] {
-            assert!(could_be_the_proxy(bad).is_err(), "{bad:?} was accepted");
+/// The sandbox kind a data directory belongs to, recorded beside `host.db` and never silently
+/// changed. Flipping the mode on a box with projects would provision EMPTY volumes for records whose
+/// data sits untouched on disk, which looks exactly like data loss.
+pub fn check_sandbox_kind(
+    data_dir: &std::path::Path,
+    mode: crate::config::SandboxMode,
+) -> Result<()> {
+    use crate::config::SandboxMode;
+    let want = match mode {
+        SandboxMode::Embedded => "embedded",
+        SandboxMode::Docker => "docker",
+    };
+    let marker = data_dir.join("sandbox-kind");
+    let existing = match std::fs::read_to_string(&marker) {
+        Ok(k) => Some(k.trim().to_string()),
+        // Written before the marker existed: embedded projects live under `projects/`.
+        Err(_)
+            if std::fs::read_dir(data_dir.join("projects"))
+                .is_ok_and(|mut d| d.next().is_some()) =>
+        {
+            Some("embedded".to_string())
         }
+        Err(_) => None,
+    };
+    match existing {
+        Some(kind) if kind != want => bail!(
+            "this data directory belongs to the {kind} sandbox, and WHEEL_SANDBOX selects {want}. \
+             Switching would start every project from an empty volume while its real data sits \
+             untouched. Keep WHEEL_SANDBOX as it was, or use a new data directory"
+        ),
+        Some(_) => Ok(()),
+        None => std::fs::write(&marker, want).context("recording the sandbox kind"),
     }
 }
 
+/// `WHEEL_SANDBOX` and `SANDBOX_BACKEND` are two spellings of one decision and must not disagree.
+pub fn check_backend_spelling(mode: crate::config::SandboxMode) -> Result<()> {
+    use crate::config::SandboxMode;
+    match (mode, std::env::var("SANDBOX_BACKEND").ok().as_deref()) {
+        (SandboxMode::Docker, Some(b)) if b != "docker" => bail!(
+            "WHEEL_SANDBOX=docker but SANDBOX_BACKEND={b}: two settings for one decision must agree"
+        ),
+        (SandboxMode::Embedded, Some("docker")) => bail!(
+            "SANDBOX_BACKEND=docker but WHEEL_SANDBOX is not docker: set WHEEL_SANDBOX=docker, or unset SANDBOX_BACKEND"
+        ),
+        _ => Ok(()),
+    }
+}
 
 /// After the normal reconcile: containers the store does not account for.
 ///
@@ -150,4 +220,48 @@ pub async fn reconcile_extras(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_host_is_resolved_as_bollard_resolves_it_and_only_a_unix_socket_qualifies() {
+        let default = std::path::PathBuf::from("/var/run/docker.sock");
+        assert_eq!(docker_socket(None).unwrap(), default);
+        assert_eq!(docker_socket(Some("")).unwrap(), default);
+        assert_eq!(
+            docker_socket(Some("unix:///run/wheel-docker/docker.sock")).unwrap(),
+            std::path::PathBuf::from("/run/wheel-docker/docker.sock")
+        );
+        for bad in [
+            "tcp://docker:2375",
+            "http://127.0.0.1:2375",
+            "ssh://root@box",
+            "/run/x.sock",
+        ] {
+            assert!(docker_socket(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_data_directory_keeps_its_sandbox_kind() {
+        use crate::config::SandboxMode::{Docker, Embedded};
+        let dir = std::path::PathBuf::from(format!("/tmp/wd-kind-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        check_sandbox_kind(&dir, Docker).unwrap();
+        check_sandbox_kind(&dir, Docker).unwrap();
+        let why = check_sandbox_kind(&dir, Embedded).unwrap_err().to_string();
+        assert!(
+            why.contains("docker") && why.contains("empty volume"),
+            "{why}"
+        );
+
+        // A directory that has embedded projects but predates the marker is embedded, not blank.
+        let legacy = std::path::PathBuf::from(format!("/tmp/wd-kind-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(legacy.join("projects").join(Uuid::new_v4().to_string())).unwrap();
+        assert!(check_sandbox_kind(&legacy, Docker).is_err());
+        check_sandbox_kind(&legacy, Embedded).unwrap();
+    }
 }

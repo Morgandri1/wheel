@@ -203,9 +203,17 @@ impl DockerSandbox {
         Ok(listed
             .into_iter()
             .filter_map(|c| {
-                let name = c.names?.into_iter().find_map(|n| n.strip_prefix('/').map(str::to_string))?;
+                let name = c
+                    .names?
+                    .into_iter()
+                    .find_map(|n| n.strip_prefix('/').map(str::to_string))?;
                 let id = name.strip_prefix("wheel-p-")?.parse::<Uuid>().ok()?;
-                Some((id, c.state.map(|s| s.to_string().to_ascii_lowercase()).unwrap_or_default()))
+                Some((
+                    id,
+                    c.state
+                        .map(|s| s.to_string().to_ascii_lowercase())
+                        .unwrap_or_default(),
+                ))
             })
             .collect())
     }
@@ -357,7 +365,11 @@ impl Sandbox for DockerSandbox {
     async fn provision(&self, id: &Uuid, secrets: &Secrets) -> Result<()> {
         match self.inspect(id).await? {
             None => self.create(id, secrets).await,
-            Some(existing) if existing.spec.as_deref() == Some(self.spec_hash(id, secrets).as_str()) => Ok(()),
+            Some(existing)
+                if existing.spec.as_deref() == Some(self.spec_hash(id, secrets).as_str()) =>
+            {
+                Ok(())
+            }
             Some(_) => {
                 tracing::warn!(
                     project = %id,

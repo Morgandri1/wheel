@@ -243,6 +243,12 @@ pub async fn start_host_with(
     update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
     mode: config::SandboxMode,
 ) -> Result<Host> {
+    docker_arm::check_backend_spelling(mode)?;
+    docker_arm::check_sandbox_kind(data_dir, mode)?;
+    if mode == config::SandboxMode::Docker {
+        // The default `composed_env` would otherwise set the other spelling to `process`.
+        supervise::apply_defaults(&[("SANDBOX_BACKEND", "docker".into())]);
+    }
     if mode == config::SandboxMode::Docker && update.is_some() {
         anyhow::bail!(
             "WHEEL_SANDBOX=docker cannot be combined with WHEEL_AUTO_UPDATE: tenant engines run \
