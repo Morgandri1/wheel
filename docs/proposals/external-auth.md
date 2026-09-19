@@ -292,6 +292,16 @@ fencing hard.
 **The network requirement.** Wheel must be reachable *only* through the authenticating proxy. A
 trusted-peer list is not a firewall; it is the last check, not the only one.
 
+**Known limit: this is only as strong as the network in front of it (finding 048, still open).** The
+peer check trusts whoever holds a trusted address. `redteam/findings/048-s5b-network-isolation-not-deployed.md`
+is unresolved: on the current Railway deployment the host that runs agent sandboxes shares a private
+network with the API, and the API's internal port accepted TCP connections from that host (measured from
+the host container; reachability from an agent's own uid was not separately measured). So a peer inside
+`WHEEL_TRUSTED_PROXIES` may not be the proxy. Until 048 is closed: do not use `proxy_header` where agents
+can reach the API's network, keep `WHEEL_TRUSTED_PROXIES` to the proxy's exact addresses and never a
+private-network range that agents are also on, or use the `jwks` verifier, which does not depend on the
+network at all.
+
 **What is enforced, mechanically:**
 
 1. **Boot refuses** `proxy_header` when `WHEEL_TRUSTED_PROXIES` is empty. Believing a header from
