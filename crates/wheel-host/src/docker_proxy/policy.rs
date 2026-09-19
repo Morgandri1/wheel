@@ -6,46 +6,72 @@
 //!
 //! Access to the docker socket is root on the machine: a `create` with `Privileged`, or with a bind
 //! of `/`, is a container escape in one request. The host is the only thing that holds it, and the
-//! host proxies tenant traffic, so "the host has a bug" is the risk this closes. The host makes
-//! exactly seven calls (`DockerSandbox`), all on names derived from a uuid the API generated, so
-//! the allowlist is short enough to state in full and to refuse everything else.
+//! host proxies tenant traffic, so "the host has a bug" is the risk this closes. The host makes a
+//! handful of calls (`DockerSandbox`), all on names derived from a uuid the API generated, so the
+//! allowlist is short enough to state in full and to refuse everything else.
 //!
-//! Two rules make it hold:
+//! Three rules make it hold:
 //!
-//! * Bodies are checked against an ALLOWLIST OF KEYS, not a denylist of dangerous ones. Docker's
-//!   create body grows with every release; "not on the list" is the only fail-closed shape.
-//! * Every name, and every id that appears in a body, must agree with the id in the URL, so a
-//!   request cannot be admitted for one project and act on another.
+//! * **The daemon never receives the caller's bytes.** A request is validated and then a FRESH body
+//!   and target are built from the checked values. Go's JSON decoding is case-insensitive (with
+//!   special folds) and ignores unknown keys; serde is neither. Forwarding what was checked would
+//!   let a key serde calls "unknown" be one the daemon applies. Here an exact-case allowlist refuses
+//!   every variant, and what is forwarded is rebuilt, so the two decoders cannot disagree.
+//! * **Values must EQUAL what the operator configured**, not merely be present: `Memory: 0` is
+//!   "unlimited", and "present" is not a check.
+//! * Every name, and every id in a body, must agree with the id in the URL, so a request cannot be
+//!   admitted for one project and act on another.
 //!
 //! Pure: no I/O, no clock. The proxy in `super` owns the socket.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
-const PROJECT_LABEL: &str = "wheel.project";
+pub const PROJECT_LABEL: &str = "wheel.project";
+/// Hash of the full create configuration; the host recreates a container whose label is stale.
+pub const SPEC_LABEL: &str = "wheel.spec";
+
+/// The list query the host uses to find its own containers, exactly as a client percent-encodes it.
+const LIST_FILTERS_ENCODED: &str = "%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
 
 /// What the operator configured; the proxy admits exactly this and nothing else.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// The one image a tenant container may run.
+    /// The one image a tenant container may run, compared as a string.
     pub image: String,
     /// The one network a tenant container may join.
     pub network: String,
-    /// Ceilings, not exact values: the host's own settings must fit under them.
-    pub max_memory: i64,
-    pub max_nano_cpus: i64,
-    pub max_pids: i64,
+    /// Exact values. The host and the proxy are given the same `CONTAINER_*` settings.
+    pub memory: i64,
+    pub nano_cpus: i64,
+    pub pids_limit: i64,
     pub engine_port: u16,
 }
 
-/// What to do to a response before it leaves the proxy.
+/// What the proxy does with the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admitted {
-    /// Forward as is.
-    Plain,
-    /// Container inspection: the environment holds the engine secret and vault key, and the host
-    /// only ever reads `State` from it, so the environment is removed.
-    StripEnv,
+pub enum Reply {
+    /// The daemon's status with an empty body on success; a fixed body on failure (error messages
+    /// can echo input).
+    Fixed,
+    /// A container create: reduced to its id.
+    Create,
+    /// A volume create: reduced to its name and driver.
+    Volume,
+    /// A container inspection, reduced to the few non-secret fields the host reads.
+    Inspect,
+    /// A container list, reduced to name, project label, spec label and state.
+    List,
+}
+
+/// An admitted request, ready to send: nothing in it came from the caller unchecked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    pub method: &'static str,
+    /// Path and query, rebuilt from parsed components.
+    pub target: String,
+    pub body: Option<Vec<u8>>,
+    pub reply: Reply,
 }
 
 /// Why a request was refused. Safe to log and to return: it never quotes a body.
@@ -56,7 +82,7 @@ fn deny<T>(why: impl Into<String>) -> Result<T, Denied> {
     Err(Denied(why.into()))
 }
 
-type Verdict = Result<Admitted, Denied>;
+type Verdict = Result<Admission, Denied>;
 
 pub fn container_name(id: &Uuid) -> String {
     format!("wheel-p-{id}")
@@ -82,9 +108,9 @@ fn volume_id(name: &str) -> Result<Uuid, Denied> {
     id_of(name, "-data").ok_or_else(|| Denied("not a project volume name".into()))
 }
 
-/// Path segments after an optional `/v1.NN` API-version prefix. Refuses anything that could be read
-/// two ways: percent-encoding, backslashes, empty or dot segments, non-ASCII.
-fn segments(path: &str) -> Result<Vec<&str>, Denied> {
+/// The API-version prefix (if any) and the path segments after it. Refuses anything that could be
+/// read two ways: percent-encoding, backslashes, empty or dot segments, non-ASCII.
+fn segments(path: &str) -> Result<(Option<&str>, Vec<&str>), Denied> {
     if !path.starts_with('/')
         || !path.is_ascii()
         || path.contains('%')
@@ -94,19 +120,21 @@ fn segments(path: &str) -> Result<Vec<&str>, Denied> {
         return deny("path is not in canonical form");
     }
     let mut segs: Vec<&str> = path[1..].split('/').collect();
+    let mut version = None;
     if segs.first().is_some_and(|s| {
         s.strip_prefix('v')
             .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'))
     }) {
-        segs.remove(0);
+        version = Some(segs.remove(0));
     }
     if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
         return deny("path is not in canonical form");
     }
-    Ok(segs)
+    Ok((version, segs))
 }
 
-/// `k=v&k=v`, refusing encoding, repeats and valueless keys.
+/// `k=v&k=v`, refusing repeats and valueless keys. Percent-encoding is refused here; the one query
+/// that legitimately carries it (`filters`) is matched whole before this runs.
 fn query(q: Option<&str>) -> Result<Vec<(&str, &str)>, Denied> {
     let Some(q) = q.filter(|q| !q.is_empty()) else {
         return Ok(Vec::new());
@@ -141,26 +169,79 @@ fn only_params(
     Ok(())
 }
 
+fn rebuild(version: Option<&str>, segs: &[&str], q: &[(&str, &str)]) -> String {
+    let mut target = String::new();
+    if let Some(v) = version {
+        target.push('/');
+        target.push_str(v);
+    }
+    for s in segs {
+        target.push('/');
+        target.push_str(s);
+    }
+    for (i, (k, v)) in q.iter().enumerate() {
+        target.push(if i == 0 { '?' } else { '&' });
+        target.push_str(k);
+        target.push('=');
+        target.push_str(v);
+    }
+    target
+}
+
 impl Policy {
     /// Decide one request. `target` is the request target as received (path and optional query).
     pub fn decide(&self, method: &str, target: &str, body: &[u8]) -> Verdict {
-        let (path, q) = match target.split_once('?') {
+        let (path, raw_query) = match target.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (target, None),
         };
-        let segs = segments(path)?;
-        let q = query(q)?;
+        let (version, segs) = segments(path)?;
+
+        // The one query that needs percent-encoding: matched whole, then never decoded.
+        let is_list = method == "GET" && segs == ["containers", "json"];
+        let q = if is_list {
+            match raw_query.and_then(|q| q.split_once("&filters=")) {
+                Some((head, LIST_FILTERS_ENCODED)) => query(Some(head))?,
+                _ => return deny("the container list may only be filtered to project containers"),
+            }
+        } else {
+            query(raw_query)?
+        };
         let bool_word = |v: &str| matches!(v, "true" | "false");
 
+        let needs_body = matches!(
+            (method, segs.as_slice()),
+            ("POST", ["containers", "create"]) | ("POST", ["volumes", "create"])
+        );
+        if !needs_body && !body.is_empty() {
+            return deny("this call takes no body");
+        }
+
         match (method, segs.as_slice()) {
+            ("GET", ["containers", "json"]) => {
+                only_params(&q, &["all"], |_, v| v == "true")?;
+                let mut target = rebuild(version, &segs, &q);
+                target.push(if q.is_empty() { '?' } else { '&' });
+                target.push_str("filters=");
+                target.push_str(LIST_FILTERS_ENCODED);
+                Ok(Admission {
+                    method: "GET",
+                    target,
+                    body: None,
+                    reply: Reply::List,
+                })
+            }
             ("GET", ["containers", name, "json"]) => {
                 container_id(name)?;
                 only_params(&q, &["size"], |_, v| matches!(v, "false" | "0"))?;
-                Ok(Admitted::StripEnv)
+                Ok(Admission {
+                    method: "GET",
+                    target: rebuild(version, &segs, &q),
+                    body: None,
+                    reply: Reply::Inspect,
+                })
             }
             ("POST", ["containers", "create"]) => {
-                // bollard also sends an empty `platform=`; a non-empty one would pick an image
-                // variant, which the pinned image already decides.
                 only_params(&q, &["name", "platform"], |k, v| {
                     k == "name" || v.is_empty()
                 })?;
@@ -168,61 +249,76 @@ impl Policy {
                     return deny("a container must be created with a name");
                 };
                 let id = container_id(name)?;
-                self.container_body(&id, body)?;
-                Ok(Admitted::Plain)
+                let body = self.container_body(&id, body)?;
+                // Rebuilt: only the name, in its canonical form.
+                let target = rebuild(version, &segs, &[("name", name)]);
+                Ok(Admission {
+                    method: "POST",
+                    target,
+                    body: Some(body),
+                    reply: Reply::Create,
+                })
             }
             ("POST", ["containers", name, "start"]) => {
                 container_id(name)?;
                 only_params(&q, &[], |_, _| false)?;
-                Ok(Admitted::Plain)
+                Ok(plain("POST", rebuild(version, &segs, &q)))
             }
             ("POST", ["containers", name, "stop"]) => {
                 container_id(name)?;
                 only_params(&q, &["t"], |_, v| {
                     !v.is_empty() && v.len() <= 4 && v.chars().all(|c| c.is_ascii_digit())
                 })?;
-                Ok(Admitted::Plain)
+                Ok(plain("POST", rebuild(version, &segs, &q)))
             }
             ("DELETE", ["containers", name]) => {
                 container_id(name)?;
-                // `v=true` would also remove anonymous volumes and `link=true` removes a link between
-                // containers, so both are admitted only as `false` (which is what bollard sends).
+                // `link=true` removes a link between containers, so only `false` is admitted; `v`
+                // removes anonymous volumes with the container, which is what a delete must do.
                 only_params(&q, &["force", "v", "link"], |k, v| match k {
-                    "force" => bool_word(v),
-                    _ => v == "false",
+                    "link" => v == "false",
+                    _ => bool_word(v),
                 })?;
-                Ok(Admitted::Plain)
+                Ok(plain("DELETE", rebuild(version, &segs, &q)))
             }
             ("POST", ["volumes", "create"]) => {
                 only_params(&q, &[], |_, _| false)?;
-                self.volume_body(body)?;
-                Ok(Admitted::Plain)
+                let body = self.volume_body(body)?;
+                Ok(Admission {
+                    method: "POST",
+                    target: rebuild(version, &segs, &q),
+                    body: Some(body),
+                    reply: Reply::Volume,
+                })
             }
             ("DELETE", ["volumes", name]) => {
                 volume_id(name)?;
                 only_params(&q, &["force"], |_, v| bool_word(v))?;
-                Ok(Admitted::Plain)
+                Ok(plain("DELETE", rebuild(version, &segs, &q)))
             }
             _ => deny("this docker API call is not one the sandbox host makes"),
         }
     }
 
-    fn volume_body(&self, body: &[u8]) -> Result<(), Denied> {
+    fn volume_body(&self, body: &[u8]) -> Result<Vec<u8>, Denied> {
         let v = json_object(body)?;
         let obj = v.as_object().expect("json_object returns an object");
+        // `DriverOpts` is not on the list, so a `local` volume with `type=none,o=bind,device=/` — a
+        // bind mount of any host path through the volume API — cannot be spelled at all.
         only_keys(obj, &["Name", "Labels", "Driver"], "volume")?;
         let id = volume_id(str_field(obj, "Name")?)?;
-        // Not on the list, so a `local` driver with `type=none,o=bind,device=/` — a bind mount of
-        // any host path through the volume API — cannot be spelled at all.
         if let Some(driver) = obj.get("Driver").filter(|d| !d.is_null()) {
             if driver.as_str() != Some("local") {
                 return deny("volume driver must be local");
             }
         }
-        labels_are_only_the_project(obj.get("Labels"), &id)
+        let labels = labels(obj.get("Labels"), &id, false)?;
+        Ok(json!({ "Name": volume_name(&id), "Labels": labels })
+            .to_string()
+            .into_bytes())
     }
 
-    fn container_body(&self, id: &Uuid, body: &[u8]) -> Result<(), Denied> {
+    fn container_body(&self, id: &Uuid, body: &[u8]) -> Result<Vec<u8>, Denied> {
         let v = json_object(body)?;
         let obj = v.as_object().expect("json_object returns an object");
         only_keys(obj, &["Image", "Env", "Labels", "HostConfig"], "container")?;
@@ -230,22 +326,31 @@ impl Policy {
         if str_field(obj, "Image")? != self.image {
             return deny("image is not the configured engine image");
         }
-        labels_are_only_the_project(obj.get("Labels"), id)?;
-        self.env(id, obj.get("Env"))?;
-        self.host_config(id, obj.get("HostConfig"))
+        let labels = labels(obj.get("Labels"), id, true)?;
+        let env = self.env(id, obj.get("Env"))?;
+        let host_config = self.host_config(id, obj.get("HostConfig"))?;
+        Ok(json!({
+            "Image": self.image,
+            "Env": env,
+            "Labels": labels,
+            "HostConfig": host_config,
+        })
+        .to_string()
+        .into_bytes())
     }
 
-    fn env(&self, id: &Uuid, env: Option<&Value>) -> Result<(), Denied> {
+    /// The validated environment, in a fixed order.
+    fn env(&self, id: &Uuid, env: Option<&Value>) -> Result<Vec<String>, Denied> {
         let Some(list) = env.and_then(Value::as_array) else {
             return deny("Env is required");
         };
         let listen = format!("tcp://0.0.0.0:{}", self.engine_port);
-        let mut seen: Vec<&str> = Vec::new();
+        let mut found: Vec<(&str, &str)> = Vec::new();
         for entry in list {
             let Some((k, val)) = entry.as_str().and_then(|e| e.split_once('=')) else {
                 return deny("Env entries must be KEY=VALUE strings");
             };
-            if seen.contains(&k) {
+            if found.iter().any(|(seen, _)| *seen == k) {
                 return deny("Env repeats a key");
             }
             let fits = match k {
@@ -263,9 +368,9 @@ impl Policy {
             if !fits {
                 return deny(format!("Env value for {k:?} is not permitted"));
             }
-            seen.push(k);
+            found.push((k, val));
         }
-        for required in [
+        const ORDER: [&str; 8] = [
             "WHEEL_PROJECT_ID",
             "WHEEL_ENGINE_SECRET",
             "WHEEL_VAULT_KEY",
@@ -274,15 +379,20 @@ impl Policy {
             "WHEEL_DATA_DIR",
             "WHEEL_LOG",
             "WHEEL_ROLE",
-        ] {
-            if !seen.contains(&required) {
-                return deny(format!("Env is missing {required}"));
-            }
-        }
-        Ok(())
+        ];
+        ORDER
+            .iter()
+            .map(|key| {
+                found
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .ok_or_else(|| Denied(format!("Env is missing {key}")))
+            })
+            .collect()
     }
 
-    fn host_config(&self, id: &Uuid, hc: Option<&Value>) -> Result<(), Denied> {
+    fn host_config(&self, id: &Uuid, hc: Option<&Value>) -> Result<Value, Denied> {
         let Some(hc) = hc.and_then(Value::as_object) else {
             return deny("HostConfig is required");
         };
@@ -312,41 +422,54 @@ impl Policy {
         if strings("SecurityOpt")? != ["no-new-privileges"] {
             return deny("HostConfig.SecurityOpt must be exactly [\"no-new-privileges\"]");
         }
-        let expected_bind = format!("{}:/data", volume_name(id));
-        if strings("Binds")? != [expected_bind.as_str()] {
+        let bind = format!("{}:/data", volume_name(id));
+        if strings("Binds")? != [bind.as_str()] {
             return deny("HostConfig.Binds must be exactly this project's data volume");
         }
         if str_field(hc, "NetworkMode")? != self.network {
             return deny("HostConfig.NetworkMode is not the tenant network");
         }
-        for (key, ceiling) in [
-            ("Memory", self.max_memory),
-            ("NanoCpus", self.max_nano_cpus),
-            ("PidsLimit", self.max_pids),
+        for (key, exact) in [
+            ("Memory", self.memory),
+            ("NanoCpus", self.nano_cpus),
+            ("PidsLimit", self.pids_limit),
         ] {
-            match hc.get(key).and_then(Value::as_i64) {
-                Some(n) if n > 0 && n <= ceiling => {}
-                _ => {
-                    return deny(format!(
-                        "HostConfig.{key} must be set, positive and within the ceiling"
-                    ))
-                }
+            if hc.get(key).and_then(Value::as_i64) != Some(exact) {
+                return deny(format!("HostConfig.{key} must equal the configured limit"));
             }
         }
         let restart = hc.get("RestartPolicy").and_then(Value::as_object);
-        match restart {
-            Some(r) => {
-                only_keys(r, &["Name"], "RestartPolicy")?;
-                if r.get("Name").and_then(Value::as_str) != Some("unless-stopped") {
-                    return deny("RestartPolicy must be unless-stopped");
-                }
-            }
-            None => return deny("RestartPolicy is required"),
+        let Some(r) = restart else {
+            return deny("RestartPolicy is required");
+        };
+        only_keys(r, &["Name"], "RestartPolicy")?;
+        if r.get("Name").and_then(Value::as_str) != Some("unless-stopped") {
+            return deny("RestartPolicy must be unless-stopped");
         }
-        Ok(())
+        Ok(json!({
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges"],
+            "Memory": self.memory,
+            "NanoCpus": self.nano_cpus,
+            "PidsLimit": self.pids_limit,
+            "NetworkMode": self.network,
+            "Binds": [bind],
+            "RestartPolicy": { "Name": "unless-stopped" },
+        }))
     }
 }
 
+fn plain(method: &'static str, target: String) -> Admission {
+    Admission {
+        method,
+        target,
+        body: None,
+        reply: Reply::Fixed,
+    }
+}
+
+/// A body must be one JSON object and nothing after it: the daemon reads the first value and would
+/// ignore trailing bytes that serde refuses, so refusing them keeps the two in step.
 fn json_object(body: &[u8]) -> Result<Value, Denied> {
     match serde_json::from_slice::<Value>(body) {
         Ok(v) if v.is_object() => Ok(v),
@@ -372,18 +495,122 @@ fn str_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Result<&
         .ok_or_else(|| Denied(format!("{key} is required")))
 }
 
-fn labels_are_only_the_project(labels: Option<&Value>, id: &Uuid) -> Result<(), Denied> {
-    let Some(labels) = labels.filter(|l| !l.is_null()) else {
-        return Ok(());
+/// The project label (required) and optionally the spec hash; nothing else. Rebuilt for the daemon.
+fn labels(labels: Option<&Value>, id: &Uuid, allow_spec: bool) -> Result<Value, Denied> {
+    let Some(map) = labels.and_then(Value::as_object) else {
+        return deny("Labels must carry the project label");
     };
-    let Some(map) = labels.as_object() else {
-        return deny("Labels must be an object");
-    };
-    only_keys(map, &[PROJECT_LABEL], "Labels")?;
-    match map.get(PROJECT_LABEL).map(|v| v.as_str()) {
-        None => Ok(()),
-        Some(Some(v)) if v == id.to_string() => Ok(()),
-        _ => deny("the project label does not match the name"),
+    only_keys(
+        map,
+        if allow_spec {
+            &[PROJECT_LABEL, SPEC_LABEL]
+        } else {
+            &[PROJECT_LABEL]
+        },
+        "Labels",
+    )?;
+    match map.get(PROJECT_LABEL).and_then(Value::as_str) {
+        Some(v) if v == id.to_string() => {}
+        _ => return deny("the project label does not match the name"),
+    }
+    let mut out = serde_json::Map::new();
+    out.insert(PROJECT_LABEL.into(), json!(id.to_string()));
+    if let Some(spec) = map.get(SPEC_LABEL) {
+        match spec.as_str() {
+            Some(h)
+                if h.len() == 64
+                    && h.chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) =>
+            {
+                out.insert(SPEC_LABEL.into(), spec.clone());
+            }
+            _ => return deny("the spec label must be a lowercase sha256"),
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Reduce a container inspection to what the host reads and nothing a future docker adds.
+pub fn project_inspect(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let status = v.pointer("/State/Status")?.as_str()?;
+    let mut state = serde_json::Map::new();
+    state.insert("Status".into(), json!(status));
+    if let Some(h) = v.pointer("/State/Health/Status").and_then(Value::as_str) {
+        state.insert("Health".into(), json!({ "Status": h }));
+    }
+    let mut labels = serde_json::Map::new();
+    for key in [PROJECT_LABEL, SPEC_LABEL] {
+        if let Some(l) = v
+            .pointer("/Config/Labels")
+            .and_then(|l| l.get(key))
+            .and_then(Value::as_str)
+        {
+            labels.insert(key.into(), json!(l));
+        }
+    }
+    serde_json::to_vec(&json!({ "State": state, "Config": { "Labels": labels } })).ok()
+}
+
+/// Reduce a container list to project containers, by name.
+pub fn project_list(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let mut out = Vec::new();
+    for c in v.as_array()? {
+        let name = c
+            .get("Names")
+            .and_then(Value::as_array)
+            .and_then(|n| {
+                n.iter()
+                    .filter_map(Value::as_str)
+                    .find_map(|n| n.strip_prefix('/'))
+            })
+            .filter(|n| container_id(n).is_ok());
+        let Some(name) = name else { continue };
+        let mut labels = serde_json::Map::new();
+        for key in [PROJECT_LABEL, SPEC_LABEL] {
+            if let Some(l) = c
+                .pointer("/Labels")
+                .and_then(|l| l.get(key))
+                .and_then(Value::as_str)
+            {
+                labels.insert(key.into(), json!(l));
+            }
+        }
+        out.push(json!({
+            "Names": [format!("/{name}")],
+            "Labels": labels,
+            "State": c.get("State").and_then(Value::as_str).unwrap_or(""),
+        }));
+    }
+    serde_json::to_vec(&out).ok()
+}
+
+/// A container create's answer, reduced to its id.
+pub fn project_create(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let id = v.get("Id")?.as_str()?;
+    serde_json::to_vec(&json!({ "Id": id, "Warnings": [] })).ok()
+}
+
+/// A volume create's answer, reduced to what a client needs to believe it worked. The mountpoint is
+/// a path on the host and nothing the sandbox host has any use for.
+pub fn project_volume(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let name = v.get("Name")?.as_str()?;
+    serde_json::to_vec(&json!({
+        "Name": name, "Driver": "local", "Mountpoint": "", "Labels": {}, "Scope": "local", "Options": {}
+    }))
+    .ok()
+}
+
+/// The fixed answer to a refused-or-failed daemon reply: error messages can echo the request.
+pub fn fixed_error(status: u16) -> &'static str {
+    match status {
+        404 => "not found",
+        409 => "conflict",
+        304 => "not modified",
+        _ => "the docker daemon could not do that",
     }
 }
 
@@ -396,9 +623,9 @@ mod tests {
         Policy {
             image: "wheel-engine:test".into(),
             network: "wheel-tenants".into(),
-            max_memory: 1 << 30,
-            max_nano_cpus: 2_000_000_000,
-            max_pids: 512,
+            memory: 1 << 30,
+            nano_cpus: 1_000_000_000,
+            pids_limit: 512,
             engine_port: 7000,
         }
     }
@@ -447,7 +674,9 @@ mod tests {
 
     #[test]
     fn the_hardened_container_the_host_asks_for_is_admitted() {
-        assert_eq!(create(&policy(), &golden()), Ok(Admitted::Plain));
+        let admitted = create(&policy(), &golden()).expect("the golden create is admitted");
+        assert_eq!(admitted.reply, Reply::Create);
+        assert_eq!(admitted.method, "POST");
     }
 
     /// Each row is a create that is a container escape, a tenant crossing, or an unpinned resource,
@@ -595,6 +824,89 @@ mod tests {
                 |b| b["HostConfig"]["RestartPolicy"] = json!({"Name":"always"}),
                 "RestartPolicy",
             ),
+            (
+                "a network attachment with aliases",
+                |b| {
+                    b["NetworkingConfig"] =
+                        json!({"EndpointsConfig":{"wheel-tenants":{"Aliases":["wheeld"]}}})
+                },
+                "\"NetworkingConfig\"",
+            ),
+            (
+                "another container's ipc namespace",
+                |b| b["HostConfig"]["IpcMode"] = json!("container:victim"),
+                "\"IpcMode\"",
+            ),
+            (
+                "another container's uts namespace",
+                |b| b["HostConfig"]["UTSMode"] = json!("host"),
+                "\"UTSMode\"",
+            ),
+            (
+                "unmasked proc paths",
+                |b| b["HostConfig"]["MaskedPaths"] = json!([]),
+                "\"MaskedPaths\"",
+            ),
+            (
+                "a negative oom score",
+                |b| b["HostConfig"]["OomScoreAdj"] = json!(-1000),
+                "\"OomScoreAdj\"",
+            ),
+            (
+                "a log driver that dials out",
+                |b| {
+                    b["HostConfig"]["LogConfig"] =
+                        json!({"Type":"syslog","Config":{"syslog-address":"tcp://10.0.0.1:514"}})
+                },
+                "\"LogConfig\"",
+            ),
+            (
+                "sysctls",
+                |b| b["HostConfig"]["Sysctls"] = json!({"net.ipv4.ip_forward":"1"}),
+                "\"Sysctls\"",
+            ),
+            (
+                "a tmpfs",
+                |b| b["HostConfig"]["Tmpfs"] = json!({"/x":""}),
+                "\"Tmpfs\"",
+            ),
+            (
+                "extra hosts",
+                |b| b["HostConfig"]["ExtraHosts"] = json!(["wheeld:10.0.0.1"]),
+                "\"ExtraHosts\"",
+            ),
+            (
+                "dns",
+                |b| b["HostConfig"]["Dns"] = json!(["10.0.0.1"]),
+                "\"Dns\"",
+            ),
+            (
+                "a healthcheck",
+                |b| b["Healthcheck"] = json!({"Test":["NONE"]}),
+                "\"Healthcheck\"",
+            ),
+            (
+                "exposed ports",
+                |b| b["ExposedPorts"] = json!({"7000/tcp":{}}),
+                "\"ExposedPorts\"",
+            ),
+            (
+                "volumes in the config",
+                |b| b["Volumes"] = json!({"/host":{}}),
+                "\"Volumes\"",
+            ),
+            (
+                "no project label",
+                |b| {
+                    b["Labels"].as_object_mut().unwrap().remove("wheel.project");
+                },
+                "label",
+            ),
+            (
+                "a spec label that is not a hash",
+                |b| b["Labels"]["wheel.spec"] = json!("latest"),
+                "spec",
+            ),
             ("another image", |b| b["Image"] = json!("alpine"), "image"),
             ("a command", |b| b["Cmd"] = json!(["sh"]), "\"Cmd\""),
             (
@@ -698,10 +1010,9 @@ mod tests {
         let p = policy();
         let name = volume_name(&id());
         let ok = json!({"Name": name, "Labels": {"wheel.project": id().to_string()}});
-        assert_eq!(
-            p.decide("POST", "/volumes/create", ok.to_string().as_bytes()),
-            Ok(Admitted::Plain)
-        );
+        assert!(p
+            .decide("POST", "/volumes/create", ok.to_string().as_bytes())
+            .is_ok());
 
         for (what, body) in [
             (
@@ -743,9 +1054,11 @@ mod tests {
             assert!(p.decide(m, &t, b"").is_ok(), "{m} {t}");
         }
         assert_eq!(
-            p.decide("GET", &format!("/containers/{c}/json"), b""),
-            Ok(Admitted::StripEnv),
-            "inspection must have its environment removed"
+            p.decide("GET", &format!("/containers/{c}/json"), b"")
+                .unwrap()
+                .reply,
+            Reply::Inspect,
+            "inspection must be reduced to the fields the host reads"
         );
     }
 
@@ -769,7 +1082,6 @@ mod tests {
             ("POST", format!("/containers/{c}/kill")),
             ("POST", format!("/containers/{c}/update")),
             ("POST", format!("/containers/{c}/rename?name=x")),
-            ("DELETE", format!("/containers/{c}?v=true")),
             ("DELETE", format!("/containers/{c}?link=true")),
             ("POST", format!("/containers/{c}/stop?signal=SIGKILL")),
             ("GET", format!("/containers/{c}/json?size=true")),
@@ -808,6 +1120,197 @@ mod tests {
             !why.contains("hunter2") && !why.contains("engine-secret"),
             "{why}"
         );
+    }
+
+    /// Go's JSON decoder matches keys case-insensitively (with special folds) and ignores unknown
+    /// ones; serde does neither. A proxy that checked with one and forwarded to the other could be
+    /// shown a key it calls unknown that the daemon applies. Every variant is therefore REFUSED, not
+    /// ignored.
+    #[test]
+    fn case_variant_and_unicode_folded_keys_are_refused_not_ignored() {
+        type Edit = fn(&mut Value);
+        let cases: [(&str, Edit); 6] = [
+            ("lower-case privileged", |b| {
+                b["HostConfig"]["privileged"] = json!(true)
+            }),
+            ("lower-case hostconfig", |b| {
+                b["hostconfig"] = json!({"Privileged": true})
+            }),
+            ("upper-case image", |b| b["IMAGE"] = json!("alpine")),
+            ("a long-s fold of SecurityOpt", |b| {
+                b["HostConfig"]["\u{17f}ecurityOpt"] = json!([])
+            }),
+            ("a kelvin-sign fold", |b| {
+                b["HostConfig"]["Binds\u{212a}"] = json!(["/:/x"])
+            }),
+            ("an escaped spelling of a denied key", |b| {
+                // serde decodes the escape before comparing, so this is `Privileged` and is refused.
+                *b = serde_json::from_str(&golden().to_string().replace(
+                    "\"HostConfig\":{",
+                    "\"HostConfig\":{\"Priv\\u0069leged\":true,",
+                ))
+                .unwrap();
+            }),
+        ];
+        for (what, edit) in cases {
+            let mut body = golden();
+            edit(&mut body);
+            refused(create(&policy(), &body));
+            let _ = what;
+        }
+    }
+
+    /// The daemon must never receive the caller's bytes: what is sent is built from the checked
+    /// values, so odd whitespace, key order and duplicate keys cannot reach it.
+    #[test]
+    fn what_is_forwarded_is_rebuilt_from_checked_values_not_the_callers_bytes() {
+        let p = policy();
+        let g = golden().to_string();
+        // A duplicate key, extra whitespace, and a reordered document.
+        let messy = g
+            .replacen("{\"", "{  \"Image\":\"evil\",\n\"", 1)
+            .replace(",\"HostConfig\"", " ,  \"HostConfig\"");
+        let target = format!("/containers/create?name=wheel-p-{}", id());
+        let sent = p
+            .decide("POST", &target, messy.as_bytes())
+            .unwrap()
+            .body
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&sent).unwrap();
+        assert_eq!(
+            sent["Image"], "wheel-engine:test",
+            "the duplicate key was not collapsed"
+        );
+        assert_eq!(sent, {
+            let mut expected = golden();
+            expected["Env"] = sent["Env"].clone();
+            expected
+        });
+        // Canonical key order for the environment, whatever order arrived.
+        let env: Vec<&str> = sent["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        assert!(env[0].starts_with("WHEEL_PROJECT_ID=") && env[7].starts_with("WHEEL_ROLE="));
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_object_are_refused() {
+        let p = policy();
+        let target = format!("/containers/create?name=wheel-p-{}", id());
+        let body = format!("{}{}", golden(), r#"{"HostConfig":{"Privileged":true}}"#);
+        assert!(p.decide("POST", &target, body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn calls_that_take_no_body_refuse_one() {
+        let p = policy();
+        let c = container_name(&id());
+        assert!(p
+            .decide("POST", &format!("/containers/{c}/start"), b"{}")
+            .is_err());
+        assert!(p
+            .decide("GET", &format!("/containers/{c}/json"), b"x")
+            .is_err());
+    }
+
+    #[test]
+    fn the_target_sent_on_is_rebuilt_from_parsed_components() {
+        let p = policy();
+        let c = container_name(&id());
+        let a = p
+            .decide("POST", &format!("/v1.49/containers/{c}/stop?t=30"), b"")
+            .unwrap();
+        assert_eq!(a.target, format!("/v1.49/containers/{c}/stop?t=30"));
+        let a = p
+            .decide(
+                "DELETE",
+                &format!("/containers/{c}?force=true&v=true&link=false"),
+                b"",
+            )
+            .unwrap();
+        assert_eq!(
+            a.target,
+            format!("/containers/{c}?force=true&v=true&link=false")
+        );
+    }
+
+    #[test]
+    fn only_the_project_container_list_is_admitted() {
+        let p = policy();
+        let ok =
+            "/v1.49/containers/json?all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+        let a = p.decide("GET", ok, b"").unwrap();
+        assert_eq!(a.reply, Reply::List);
+        for bad in [
+            "/containers/json",
+            "/containers/json?all=true",
+            "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22traefik.enable%22%5D%7D",
+            "/containers/json?all=true&filters=%7B%7D",
+            "/containers/json?size=true&all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D",
+        ] {
+            assert!(p.decide("GET", bad, b"").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_inspection_is_reduced_to_state_and_the_two_wheel_labels() {
+        let raw = br#"{"Id":"x","State":{"Status":"running","Health":{"Status":"unhealthy","Log":[{"Output":"secret"}]}},
+            "Config":{"Env":["WHEEL_ENGINE_SECRET=s3cret"],"Cmd":["x"],"Labels":{"wheel.spec":"abc","traefik.x":"y","wheel.project":"p"}},
+            "HostConfig":{"Binds":["/:/h"]},"NetworkSettings":{"IPAddress":"10.0.0.2"},"Mounts":[{"Source":"/var/lib/docker"}]}"#;
+        let out = String::from_utf8(project_inspect(raw).unwrap()).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["State"]["Status"], "running");
+        assert_eq!(v["State"]["Health"]["Status"], "unhealthy");
+        assert_eq!(v["Config"]["Labels"]["wheel.spec"], "abc");
+        for leak in [
+            "s3cret",
+            "traefik",
+            "10.0.0.2",
+            "/var/lib/docker",
+            "Cmd",
+            "Output",
+        ] {
+            assert!(!out.contains(leak), "{leak} leaked: {out}");
+        }
+        assert!(project_inspect(b"not json").is_none());
+    }
+
+    #[test]
+    fn a_list_keeps_only_project_containers_and_only_their_wheel_labels() {
+        let raw = br#"[
+          {"Names":["/wheel-p-3f2504e0-4f89-11d3-9a0c-0305e82c3301"],"State":"running","Labels":{"wheel.project":"3f2504e0-4f89-11d3-9a0c-0305e82c3301","evil":"1"},"HostConfig":{"NetworkMode":"x"}},
+          {"Names":["/caddy"],"State":"running","Labels":{}},
+          {"Names":["/wheel-host"],"State":"running","Labels":{}}
+        ]"#;
+        let v: Value = serde_json::from_slice(&project_list(raw).unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+        assert!(
+            v[0]["Labels"].get("evil").is_none() && v[0].get("HostConfig").is_none(),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn daemon_answers_are_reduced_and_errors_are_fixed_strings() {
+        let c: Value = serde_json::from_slice(
+            &project_create(br#"{"Id":"deadbeef","Warnings":["your env FOO=bar"]}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(c, json!({"Id":"deadbeef","Warnings":[]}));
+        let v = String::from_utf8(
+            project_volume(
+                br#"{"Name":"n","Driver":"local","Mountpoint":"/var/lib/docker/volumes/n/_data"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!v.contains("/var/lib/docker"), "{v}");
+        for status in [400u16, 403, 409, 500] {
+            assert!(!fixed_error(status).contains("wheel-p-"), "{status}");
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
-use policy::{Admitted, Policy};
+use policy::{Admission, Policy, Reply};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -59,6 +59,11 @@ fn docker_error(status: StatusCode, message: &str) -> Response {
         .expect("static response")
 }
 
+/// The path a caller can ask for to learn it is talking to this proxy and not to a daemon. A real
+/// daemon answers 404 here, which is how the sandbox host tells the two apart.
+pub const IDENTITY_PATH: &str = "/_wheel_proxy";
+pub const IDENTITY_BODY: &str = r#"{"wheel-docker-proxy":1}"#;
+
 async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_string();
@@ -67,6 +72,23 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_default();
+
+    if method == "GET" && target == IDENTITY_PATH {
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(IDENTITY_BODY))
+            .expect("static response");
+    }
+    // Nothing that turns this connection into something else, or asks for a reply the proxy did not
+    // plan for.
+    for h in [header::UPGRADE, header::EXPECT, header::TRANSFER_ENCODING] {
+        if parts.headers.contains_key(&h) {
+            return docker_error(
+                StatusCode::FORBIDDEN,
+                "docker proxy: refused (unsupported header)",
+            );
+        }
+    }
 
     let body = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -78,7 +100,7 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
         }
     };
 
-    let admitted = match proxy.policy.decide(&method, &target, &body) {
+    let admission = match proxy.policy.decide(&method, &target, &body) {
         Ok(a) => a,
         Err(policy::Denied(why)) => {
             // Method and target only: a create body carries the engine secret.
@@ -90,7 +112,7 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
         }
     };
 
-    match forward(&proxy.upstream, &method, &target, body, admitted).await {
+    match forward(&proxy.upstream, admission).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(%method, %target, error = ?e, "docker proxy could not reach the daemon");
@@ -99,14 +121,9 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
     }
 }
 
-async fn forward(
-    upstream: &PathBuf,
-    method: &str,
-    target: &str,
-    body: bytes::Bytes,
-    admitted: Admitted,
-) -> Result<Response> {
-    let stream = tokio::net::UnixStream::connect(upstream.as_path())
+/// Send what was admitted — rebuilt, never the caller's own bytes — and reduce the answer.
+async fn forward(upstream: &std::path::Path, admission: Admission) -> Result<Response> {
+    let stream = tokio::net::UnixStream::connect(upstream)
         .await
         .context("connecting to the docker socket")?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -116,17 +133,18 @@ async fn forward(
         let _ = conn.await;
     });
 
-    // Only what docker needs. Nothing the caller sent is passed through unread: no `Upgrade`, no
-    // `Connection`, no hijacking a stream.
+    let has_body = admission.body.is_some();
     let mut builder = hyper::Request::builder()
-        .method(method)
-        .uri(target)
+        .method(admission.method)
+        .uri(admission.target.as_str())
         .header(header::HOST, "docker");
-    if !body.is_empty() {
+    if has_body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
     }
     let request = builder
-        .body(http_body_util::Full::new(body))
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            admission.body.unwrap_or_default(),
+        )))
         .context("building the docker request")?;
 
     let upstream = sender
@@ -134,36 +152,45 @@ async fn forward(
         .await
         .context("docker request")?;
     let (parts, incoming) = upstream.into_parts();
-    let bytes = incoming
+    let raw = incoming
         .collect()
         .await
         .context("docker response")?
         .to_bytes();
 
-    let bytes = match admitted {
-        Admitted::Plain => bytes,
-        Admitted::StripEnv if parts.status.is_success() => strip_env(&bytes)?,
-        Admitted::StripEnv => bytes,
+    let status = parts.status;
+    let body: Vec<u8> = if !status.is_success() {
+        // A daemon's error text can echo what it was sent. A missing thing keeps its "No such …"
+        // wording, because the host tells a missing image from a daemon fault by it.
+        let text = std::str::from_utf8(&raw)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str().map(str::to_string))
+            })
+            .filter(|m| {
+                status == StatusCode::NOT_FOUND && m.starts_with("No such ") && m.len() <= 200
+            });
+        let message = text.unwrap_or_else(|| policy::fixed_error(status.as_u16()).to_string());
+        serde_json::json!({ "message": message })
+            .to_string()
+            .into_bytes()
+    } else {
+        match admission.reply {
+            Reply::Fixed => Vec::new(),
+            Reply::Inspect => policy::project_inspect(&raw).context("inspection had no State")?,
+            Reply::List => policy::project_list(&raw).context("container list was not a list")?,
+            Reply::Create => policy::project_create(&raw).context("create had no Id")?,
+            Reply::Volume => policy::project_volume(&raw).context("volume create had no Name")?,
+        }
     };
 
-    let mut out = Response::builder().status(parts.status);
-    if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
-        out = out.header(header::CONTENT_TYPE, ct);
+    let mut out = Response::builder().status(status);
+    if !body.is_empty() {
+        out = out.header(header::CONTENT_TYPE, "application/json");
     }
-    Ok(out
-        .body(Body::from(bytes))
-        .context("building the response")?)
-}
-
-/// Remove `Config.Env` from a container inspection. Parsing failure is an error, not a pass
-/// through: an inspection that cannot be read cannot be shown to be free of the secret.
-fn strip_env(bytes: &[u8]) -> Result<bytes::Bytes> {
-    let mut v: serde_json::Value =
-        serde_json::from_slice(bytes).context("container inspection was not JSON")?;
-    if let Some(config) = v.get_mut("Config").and_then(|c| c.as_object_mut()) {
-        config.remove("Env");
-    }
-    Ok(bytes::Bytes::from(serde_json::to_vec(&v)?))
+    out.body(Body::from(body)).context("building the response")
 }
 
 /// Bind `path` and serve until the process ends. The socket's mode is set explicitly after bind
@@ -193,27 +220,4 @@ pub async fn serve(
     axum::serve(listener, proxy.router())
         .await
         .context("serving the docker proxy")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inspection_loses_its_environment_and_keeps_its_state() {
-        let out = strip_env(
-            br#"{"State":{"Status":"running"},"Config":{"Env":["WHEEL_ENGINE_SECRET=s"],"Image":"i"}}"#,
-        )
-        .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["State"]["Status"], "running");
-        assert_eq!(v["Config"]["Image"], "i");
-        assert!(v["Config"].get("Env").is_none(), "{v}");
-        assert!(!String::from_utf8_lossy(&out).contains("WHEEL_ENGINE_SECRET"));
-    }
-
-    #[test]
-    fn an_inspection_that_is_not_json_is_an_error_not_a_pass_through() {
-        assert!(strip_env(b"WHEEL_ENGINE_SECRET=leak").is_err());
-    }
 }

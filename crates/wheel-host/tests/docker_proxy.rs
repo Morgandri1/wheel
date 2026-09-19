@@ -84,7 +84,9 @@ fn fake_daemon_with(pre_existing: bool) -> (std::path::PathBuf, Arc<Mutex<Vec<St
                     created.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 let exists = created.load(std::sync::atomic::Ordering::SeqCst);
-                let (code, body) = if path.ends_with("/json") && !exists {
+                let (code, body) = if path.ends_with("/containers/json") {
+                    (200, "[]".to_string())
+                } else if path.ends_with("/json") && !exists {
                     // A real daemon 404s until the container exists; without this `provision`
                     // always thinks it is already there and no test ever sees a create.
                     (404, r#"{"message":"No such container"}"#.to_string())
@@ -118,9 +120,9 @@ fn policy() -> Policy {
     Policy {
         image: IMAGE.into(),
         network: NETWORK.into(),
-        max_memory: 512 * 1024 * 1024,
-        max_nano_cpus: 1_500_000_000,
-        max_pids: 256,
+        memory: 512 * 1024 * 1024,
+        nano_cpus: 1_500_000_000,
+        pids_limit: 256,
         engine_port: 7000,
     }
 }
@@ -331,4 +333,33 @@ async fn an_unreachable_daemon_is_a_gateway_error_not_a_hang() {
     )
     .await;
     assert_eq!(status, 502, "{body}");
+}
+
+#[tokio::test]
+async fn the_proxy_says_what_it_is_and_never_forwards_that_question() {
+    let (daemon, seen) = fake_daemon();
+    let front = proxy_in_front_of(&daemon).await;
+    let (status, body) = raw(&front, "GET", "/_wheel_proxy", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, wheel_host::docker_proxy::IDENTITY_BODY);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the identity check reached the daemon"
+    );
+}
+
+#[tokio::test]
+async fn the_project_container_list_is_admitted_and_reduced() {
+    let (daemon, seen) = fake_daemon();
+    let front = proxy_in_front_of(&daemon).await;
+    let target =
+        "/v1.49/containers/json?all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+    let (status, _) = raw(&front, "GET", target, "").await;
+    assert_eq!(status, 200);
+    let heard = seen.lock().unwrap().clone();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].contains("filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D"),
+        "{heard:?}"
+    );
 }

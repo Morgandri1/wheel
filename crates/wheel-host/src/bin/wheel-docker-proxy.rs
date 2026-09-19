@@ -12,8 +12,8 @@
 //!   DOCKER_PROXY_SOCKET_MODE    octal mode of the listen socket (default 0660)
 //!   DOCKER_PROXY_SOCKET_OWNER   `uid:gid` to chown it to (default: leave as created)
 //!   ENGINE_IMAGE, DOCKER_NETWORK, ENGINE_PORT (default 7000),
-//!   CONTAINER_MEMORY_MB, CONTAINER_CPUS, CONTAINER_PIDS_LIMIT — the ceilings; the host's own
-//!   settings of the same names must fit under them, so give both processes the same values.
+//!   CONTAINER_MEMORY_MB, CONTAINER_CPUS, CONTAINER_PIDS_LIMIT — the EXACT limits a tenant
+//!   container may carry; give the sandbox host the same values.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -48,9 +48,9 @@ async fn main() -> Result<()> {
     let policy = Policy {
         image: required("ENGINE_IMAGE")?,
         network: required("DOCKER_NETWORK")?,
-        max_memory: or("CONTAINER_MEMORY_MB", 1024i64)? * 1024 * 1024,
-        max_nano_cpus: (or("CONTAINER_CPUS", 1.0f64)? * 1e9) as i64,
-        max_pids: or("CONTAINER_PIDS_LIMIT", 512i64)?,
+        memory: or("CONTAINER_MEMORY_MB", 1024i64)? * 1024 * 1024,
+        nano_cpus: (or("CONTAINER_CPUS", 1.0f64)? * 1e9) as i64,
+        pids_limit: or("CONTAINER_PIDS_LIMIT", 512i64)?,
         engine_port: or("ENGINE_PORT", 7000u16)?,
     };
     let listen = PathBuf::from(required("DOCKER_PROXY_LISTEN")?);
