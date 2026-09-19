@@ -105,6 +105,36 @@ pub fn from_headers(headers: &HeaderMap) -> Option<String> {
     Some(raw.to_string())
 }
 
+/// Mask a message's `on_behalf_of` for a guest caller, the same rule `wheel-api`'s roster already
+/// applies to `Member.email`/`Project.owner_id`'s display email: masked for everyone but the caller
+/// themselves, server-side (client-side masking alone would not protect a caller hitting this route
+/// directly). Unlike `user_id`/`owner_id`, `on_behalf_of` has no separate raw-opaque-id twin field —
+/// under `jwks` it IS the operator's principal, which for an email-shaped `sub` is a real email
+/// (`auth::principal`'s own allowlist accepts `alice@example.com` as one of "the subjects we
+/// actually need to carry") — so it is the thing being masked, not a value beside the masked one.
+///
+/// Deliberately does not touch `LogStream::Transcript`: that stream's whole reason to exist is
+/// "the exact bytes the engine wrote to the child's stdin" (`event.rs`), and `on_behalf_of` only
+/// reaches it already baked into the `<AgentPrompt on_behalf_of="...">` attribute of rendered free
+/// text — masking there would mean regexing an attribute out of opaque text and would break the
+/// exact-bytes guarantee the transcript view exists to keep. Left as a deliberate exception, not an
+/// oversight; whether a guest should see the transcript stream AT ALL is a separate question about
+/// `policy.rs`'s tier table, not decided here.
+pub fn mask_message_for_tier(
+    mut message: wheel_core::Message,
+    tier: ActorTier,
+    caller: Option<&str>,
+) -> wheel_core::Message {
+    if tier == ActorTier::Guest {
+        if let Some(who) = &message.on_behalf_of {
+            if caller != Some(who.as_str()) {
+                message.on_behalf_of = Some(wheel_core::mask_identifier(who));
+            }
+        }
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +194,69 @@ mod tests {
         ] {
             assert!(is_valid_principal(ok), "{ok} is legal on the API side");
         }
+    }
+
+    fn msg(on_behalf_of: Option<&str>) -> wheel_core::Message {
+        wheel_core::Message {
+            id: uuid::Uuid::nil(),
+            from: wheel_core::MessageSender::User,
+            to: uuid::Uuid::nil(),
+            body: "hello".into(),
+            sha256: String::new(),
+            bytes: 0,
+            state: wheel_core::MessageState::default(),
+            reply_to: None,
+            on_behalf_of: on_behalf_of.map(str::to_string),
+            created_at: wheel_core::Timestamp::now(),
+            delivered_at: None,
+            consumed_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn a_guest_sees_another_principals_on_behalf_of_masked() {
+        let out = mask_message_for_tier(
+            msg(Some("alice@example.com")),
+            ActorTier::Guest,
+            Some("bob@example.com"),
+        );
+        assert_eq!(out.on_behalf_of.as_deref(), Some("al•••ce@example.com"));
+    }
+
+    #[test]
+    fn a_guest_sees_their_own_on_behalf_of_unmasked() {
+        let out = mask_message_for_tier(
+            msg(Some("alice@example.com")),
+            ActorTier::Guest,
+            Some("alice@example.com"),
+        );
+        assert_eq!(out.on_behalf_of.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn prompter_and_admin_see_on_behalf_of_unmasked() {
+        for tier in [ActorTier::Prompter, ActorTier::Admin] {
+            let out = mask_message_for_tier(msg(Some("alice@example.com")), tier, None);
+            assert_eq!(out.on_behalf_of.as_deref(), Some("alice@example.com"));
+        }
+    }
+
+    #[test]
+    fn no_on_behalf_of_is_nothing_to_mask() {
+        let out = mask_message_for_tier(msg(None), ActorTier::Guest, None);
+        assert_eq!(out.on_behalf_of, None);
+    }
+
+    /// A non-email principal (a local UUID, or a non-email `jwks` `sub`) still gets masked — the
+    /// same string wearing a different shape is not a reason to skip it.
+    #[test]
+    fn a_non_email_on_behalf_of_is_masked_the_same_way() {
+        let out = mask_message_for_tier(
+            msg(Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301")),
+            ActorTier::Guest,
+            Some("someone-else"),
+        );
+        assert_eq!(out.on_behalf_of.as_deref(), Some("3f•••01"));
     }
 }

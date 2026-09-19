@@ -328,11 +328,19 @@ pub async fn log(
 }
 
 /// `GET /v1/agents/:id/inbox` — re-read exactly what was delivered (§3c#2).
+///
+/// `on_behalf_of` is masked for a guest caller on every message but their own — the same rule the
+/// roster applies to a member's display email, and for the same reason: under `jwks` this field IS
+/// the asking principal, which for an email-shaped `sub` is a real email (`super::actor::
+/// mask_message_for_tier`'s doc comment has the full reasoning).
 pub async fn inbox(
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(q): Query<InboxQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let tier = super::actor::tier_from_headers(&headers);
+    let caller = super::actor::from_headers(&headers);
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let since = q
         .since
@@ -340,19 +348,28 @@ pub async fn inbox(
         .and_then(|t| Timestamp::parse_rfc3339(t).ok());
     let msgs = messages::inbox(&conn, id, since, q.limit.unwrap_or(100).min(1000))
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    let msgs: Vec<_> = msgs
+        .into_iter()
+        .map(|m| super::actor::mask_message_for_tier(m, tier, caller.as_deref()))
+        .collect();
     Ok(Json(serde_json::json!({ "messages": msgs })))
 }
 
-/// `GET /v1/agents/:id/inbox/:message_id` — the exact original body.
+/// `GET /v1/agents/:id/inbox/:message_id` — the exact original body, `on_behalf_of` masked the
+/// same way `inbox` above masks it.
 pub async fn inbox_one(
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((id, message_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<wheel_core::Message>> {
+    let tier = super::actor::tier_from_headers(&headers);
+    let caller = super::actor::from_headers(&headers);
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let msg = messages::get(&conn, message_id)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .filter(|m| m.to == id)
         .ok_or_else(|| ApiError::not_found(message_id.to_string()))?;
+    let msg = super::actor::mask_message_for_tier(msg, tier, caller.as_deref());
     Ok(Json(msg))
 }
 
@@ -1270,6 +1287,153 @@ mod tests {
         assert!(v.get("outcome").is_none(), "{v}");
         assert!(v["sha256"].is_string() && v["id"].is_string(), "{v}");
         s.supervisor.stop(b).await.ok();
+    }
+
+    fn actor_headers(tier: &str, actor_id: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-wheel-actor-tier",
+            axum::http::HeaderValue::from_str(tier).unwrap(),
+        );
+        h.insert(
+            "x-wheel-actor-id",
+            axum::http::HeaderValue::from_str(actor_id).unwrap(),
+        );
+        h
+    }
+
+    /// A message's `on_behalf_of` is a Wheel principal (§`super::actor::mask_message_for_tier`),
+    /// and for a `jwks` email-shaped `sub` that principal IS an email — masked for a guest viewing
+    /// someone else's message, exactly like the roster masks a member's display email.
+    #[tokio::test]
+    async fn inbox_masks_on_behalf_of_for_a_guest_reading_someone_elses_message() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("inbox-mask");
+        let (target, _) = agent(&s, "target");
+
+        let (status, _) = send(
+            State(s.clone()),
+            Path(target),
+            actor_headers("admin", "alice@example.com"),
+            Json(SendBody {
+                body: "hi".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let Json(v) = inbox(
+            State(s.clone()),
+            actor_headers("guest", "bob@example.com"),
+            Path(target),
+            Query(InboxQuery {
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v["messages"][0]["on_behalf_of"], "al•••ce@example.com",
+            "{v}"
+        );
+
+        // The same guest, asking as themselves, sees their own attribution unmasked.
+        let (status, _) = send(
+            State(s.clone()),
+            Path(target),
+            actor_headers("guest", "bob@example.com"),
+            Json(SendBody {
+                body: "hi again".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let Json(v) = inbox(
+            State(s.clone()),
+            actor_headers("guest", "bob@example.com"),
+            Path(target),
+            Query(InboxQuery {
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let mine = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["body"] == "hi again")
+            .unwrap();
+        assert_eq!(mine["on_behalf_of"], "bob@example.com", "{v}");
+
+        // A prompter or admin sees every message's attribution unmasked.
+        let Json(v) = inbox(
+            State(s.clone()),
+            actor_headers("prompter", "carol@example.com"),
+            Path(target),
+            Query(InboxQuery {
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let first = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["body"] == "hi")
+            .unwrap();
+        assert_eq!(first["on_behalf_of"], "alice@example.com", "{v}");
+    }
+
+    /// `inbox_one` masks the same way `inbox` does — it is the same field on the same struct,
+    /// reached by a different route.
+    #[tokio::test]
+    async fn inbox_one_masks_on_behalf_of_for_a_guest_reading_someone_elses_message() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("inbox-one-mask");
+        let (target, _) = agent(&s, "target");
+
+        let (_, Json(receipt)) = send(
+            State(s.clone()),
+            Path(target),
+            actor_headers("admin", "alice@example.com"),
+            Json(SendBody {
+                body: "hi".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let message_id: Uuid = receipt["id"].as_str().unwrap().parse().unwrap();
+
+        let Json(msg) = inbox_one(
+            State(s.clone()),
+            actor_headers("guest", "bob@example.com"),
+            Path((target, message_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.on_behalf_of.as_deref(), Some("al•••ce@example.com"));
+
+        let Json(msg) = inbox_one(
+            State(s.clone()),
+            actor_headers("admin", "bob@example.com"),
+            Path((target, message_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(msg.on_behalf_of.as_deref(), Some("alice@example.com"));
     }
 
     #[test]

@@ -164,6 +164,17 @@ pub struct Message {
     /// forged attribution and it closes with per-node uids, not here. An agent that merely steals a
     /// *sibling's node token* reaches the CLI plane, where the header is ignored — so that failure
     /// is missing attribution rather than forged, which is the better of the two.
+    ///
+    /// **Masked for a guest, on two of its three surfaces.** Under `jwks` this field IS the asking
+    /// principal, which for an email-shaped `sub` is a real email — the same risk shape the roster
+    /// masks a member's display email for (`wheel_core::mask_identifier`). `GET /v1/agents/:id/
+    /// inbox[/:id]` and `Event::Message` over `GET /v1/events` both mask it for a guest viewing
+    /// anyone's message but their own (`wheel-engine`'s `api::actor::mask_message_for_tier`). The
+    /// third surface, `LogStream::Transcript` (`event.rs`), does NOT mask it: `on_behalf_of` only
+    /// reaches that stream already baked into an `<AgentPrompt on_behalf_of="...">` attribute of
+    /// rendered free text, and that stream's whole reason to exist is being the exact bytes the
+    /// engine wrote — regexing an attribute out of it would break the guarantee the transcript view
+    /// exists to keep. A deliberate exception, not an oversight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
     pub created_at: Timestamp,

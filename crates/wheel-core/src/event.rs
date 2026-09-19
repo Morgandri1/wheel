@@ -27,6 +27,11 @@ pub enum LogStream {
     /// Carried on the same stream as everything else deliberately: a separate
     /// subscription would double the reconnect and cursor logic for no gain.
     /// `stdout` is what the agent SAID; `transcript` is what it was HANDED.
+    ///
+    /// **Never masks `Message.on_behalf_of`**, unlike the inbox/events surfaces that field's own
+    /// doc comment describes — an `<AgentPrompt on_behalf_of="...">` attribute in this stream's
+    /// rendered text stays exact bytes, deliberately, because "exact bytes" is this stream's whole
+    /// reason to exist.
     Transcript,
 }
 

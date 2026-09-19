@@ -10,17 +10,31 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::HeaderMap,
     response::Response,
 };
 use tokio::sync::broadcast::error::RecvError;
 
 use super::AppState;
 
-pub async fn events_ws(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| pump(socket, s))
+pub async fn events_ws(
+    ws: WebSocketUpgrade,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    // Read once, at the upgrade: a WebSocket carries no further headers per frame, so this is the
+    // only chance to know who is on the other end for the life of the connection.
+    let tier = super::actor::tier_from_headers(&headers);
+    let caller = super::actor::from_headers(&headers);
+    ws.on_upgrade(move |socket| pump(socket, s, tier, caller))
 }
 
-async fn pump(mut socket: WebSocket, s: AppState) {
+async fn pump(
+    mut socket: WebSocket,
+    s: AppState,
+    tier: super::actor::ActorTier,
+    caller: Option<String>,
+) {
     let mut rx = s.events.subscribe();
 
     loop {
@@ -36,6 +50,19 @@ async fn pump(mut socket: WebSocket, s: AppState) {
 
             event = rx.recv() => match event {
                 Ok(ev) => {
+                    // `on_behalf_of` is masked per subscriber here, not at `Bus::publish` — the bus
+                    // fans one event out to every tier at once, and only this connection's own
+                    // upgrade headers say which tier is on the other end of THIS socket.
+                    let ev = match ev {
+                        wheel_core::Event::Message { message } => wheel_core::Event::Message {
+                            message: super::actor::mask_message_for_tier(
+                                message,
+                                tier,
+                                caller.as_deref(),
+                            ),
+                        },
+                        other => other,
+                    };
                     let Ok(json) = serde_json::to_string(&ev) else { continue };
                     if socket.send(Message::Text(json.into())).await.is_err() {
                         break;
