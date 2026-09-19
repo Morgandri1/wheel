@@ -51,11 +51,18 @@ pub async fn verify(
                 .kid
                 .as_deref()
                 .ok_or(ApiError::Unauthorized("jwt header has no kid"))?;
-            let key = jwks
+            let entry = jwks
                 .key_for(kid)
                 .await
                 .ok_or(ApiError::Unauthorized("unknown or unavailable signing key"))?;
-            decode_with(token, &key, cfg, Algorithm::RS256)?
+            // The key set says what this key is for. A `kid` that resolves to anything other than
+            // an RSA key is refused here rather than verified with whatever the header asked for —
+            // the same rule `auth::external` is built on, applied to this path too so the two
+            // cannot drift.
+            if entry.alg != Algorithm::RS256 {
+                return Err(ApiError::Unauthorized("key is not an RS256 signing key"));
+            }
+            decode_with(token, &entry.key, cfg, Algorithm::RS256)?
         }
 
         // The dev bypass. Reachable only when the process booted with WHEEL_ENV=dev *and* a secret
