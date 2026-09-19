@@ -151,9 +151,9 @@ WHEEL_EXTERNAL_AUDIENCE=https://api.wheel.example             # what WE are, and
 ```
 
 `wheel`, `wheel:prod`, or the deployment's own API origin are all fine; the issuer origin is not.
-Wheel cannot check this for the deployer — it does not know what else their issuer serves — so it
-warns at boot when a configured audience equals the pinned issuer or its origin, and this paragraph
-is the rest of the answer. The other half of the contract is the issuer's: AgentGrid's website
+Wheel cannot fully check this for the deployer — it does not know what else their issuer serves — so it
+refuses to boot when a configured audience equals the pinned issuer or its origin (override:
+`WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1`), and this paragraph is the rest of the answer. The other half of the contract is the issuer's: AgentGrid's website
 mints a **short-lived token with the Wheel audience**, via a token exchange from the user's session,
 rather than handing Wheel a desktop or mobile token it already had.
 

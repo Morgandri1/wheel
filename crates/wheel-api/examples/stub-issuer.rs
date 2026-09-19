@@ -155,6 +155,7 @@ fn external_config(url: &str) -> ExternalAuth {
         issuer: EXTERNAL_ISSUER.into(),
         audiences: vec![EXTERNAL_AUDIENCE.into()],
         sole_audience: false,
+        allow_issuer_audience: false,
         subject_claim: "sub".into(),
         azp: vec![],
         max_ttl_secs: None,

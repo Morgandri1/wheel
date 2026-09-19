@@ -78,8 +78,9 @@ alias to different values refuses to boot.
 `https://api.<wheel-domain>`. It must **never** be the issuer origin. AgentGrid's desktop tokens already
 carry the issuer origin as their `aud`; configure that here and every desktop, mobile and relay token
 becomes a valid Wheel cloud credential, which is the audience-confusion attack with the control switched on
-and pointed the wrong way. Wheel **warns loudly at boot** when a configured audience equals the pinned
-issuer or its origin — it cannot refuse, because it does not know what else AgentGrid's issuer serves.
+and pointed the wrong way. Wheel **refuses to boot** when a configured audience equals the pinned
+issuer or its origin. The one escape is `WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1`, for an issuer that mints tokens for Wheel and
+nothing else; AgentGrid's issuer is not that issuer, so do not set it there.
 
 On a multi-valued `aud`, Wheel accepts any-match by default (finding itself in the audience, per RFC 7519
 §4.1.3). What that admits is narrow and named: another relying party listed in the same token can replay it

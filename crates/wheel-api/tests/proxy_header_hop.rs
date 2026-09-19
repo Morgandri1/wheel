@@ -66,6 +66,7 @@ fn proxy_external() -> ExternalAuth {
         issuer: "proxy:oauth2-proxy".into(),
         audiences: vec!["wheel-test".into()],
         sole_audience: false,
+        allow_issuer_audience: false,
         subject_claim: "sub".into(),
         azp: vec![],
         max_ttl_secs: None,

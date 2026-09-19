@@ -177,6 +177,9 @@ pub struct ExternalAuth {
     /// Require our audience to be the *only* one. Off by default — multi-audience access tokens
     /// are ordinary — and on when the deployer does not trust the parties named alongside them.
     pub sole_audience: bool,
+    /// `WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1`: permit an audience that is the issuer's own origin.
+    /// Off, and refused at boot, by default — see `cross_check`.
+    pub allow_issuer_audience: bool,
     /// Which claim is the subject. `sub` unless the IdP has a better immutable id (`oid` on Entra).
     pub subject_claim: String,
     pub azp: Vec<String>,
@@ -201,6 +204,7 @@ const EXTERNAL_VARS: &[&str] = &[
     "WHEEL_EXTERNAL_AZP",
     "WHEEL_EXTERNAL_MAX_TTL_SECS",
     "WHEEL_EXTERNAL_SOLE_AUDIENCE",
+    "WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE",
     "WHEEL_EXTERNAL_PROVISION",
     "WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER",
     "WHEEL_EXTERNAL_PROXY_EMAIL_HEADER",
@@ -312,6 +316,10 @@ impl ExternalAuth {
                 var_or("WHEEL_EXTERNAL_SOLE_AUDIENCE", "").trim(),
                 "1" | "true" | "yes"
             ),
+            allow_issuer_audience: matches!(
+                var_or("WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE", "").trim(),
+                "1" | "true" | "yes"
+            ),
             subject_claim: {
                 let c = var_or("WHEEL_EXTERNAL_SUBJECT_CLAIM", "sub")
                     .trim()
@@ -365,18 +373,28 @@ impl ExternalAuth {
                  asserts. Wheel MUST NOT be reachable except through that proxy."
             );
         }
-        // Warned, not refused. Wheel cannot know what else the deployer's issuer serves, so it
-        // cannot decide this for them — but the one audience that is almost certainly wrong is the
-        // issuer's own origin, which an issuer's other surfaces routinely carry as their `aud`.
-        // Configure that here and every one of those tokens becomes a Wheel credential.
+        // Refused, with an explicit override. The audience that is almost certainly wrong is the
+        // issuer's own origin: an issuer's other surfaces (an AgentGrid desktop, mobile or relay
+        // token) carry it as their `aud`, so configuring it here turns every one of those tokens
+        // into a Wheel credential — and a warning in a boot log is not a control a deployer has
+        // to read. Wheel cannot know what ELSE the issuer serves, which is why the override exists
+        // rather than an unconditional refusal: an issuer that mints only for Wheel may say so.
         if let Some(shadow) = self.audience_shadowing_the_issuer() {
+            if !self.allow_issuer_audience {
+                bail!(
+                    "WHEEL_EXTERNAL_AUDIENCE names the issuer's own origin ({shadow}). Any token \
+                     your issuer mints for any of its OWN surfaces carries that audience and would \
+                     be a valid Wheel credential. Use an audience that names this deployment, e.g. \
+                     https://api.<your-wheel-domain>. If this issuer mints tokens for Wheel and \
+                     nothing else, set WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1 to accept it."
+                );
+            }
             tracing::warn!(
                 audience = %shadow,
                 issuer = %self.issuer,
-                "WHEEL_EXTERNAL_AUDIENCE names the issuer's own origin. Any token your issuer \
-                 mints for any of its OWN surfaces carries that audience, and is now a valid \
-                 Wheel credential. Use an audience that names this deployment, e.g. \
-                 https://api.<your-wheel-domain>."
+                "WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE is set: the issuer's own origin is accepted \
+                 as this deployment's audience, so every token the issuer mints for that audience \
+                 is a Wheel credential."
             );
         }
         Ok(())
@@ -406,6 +424,7 @@ impl ExternalAuth {
             issuer: "https://issuer.example".into(),
             audiences: vec!["wheel-test".into()],
             sole_audience: false,
+            allow_issuer_audience: false,
             subject_claim: "sub".into(),
             azp: Vec::new(),
             max_ttl_secs: None,
@@ -948,5 +967,34 @@ mod tests {
             ext.audience_shadowing_the_issuer(),
             Some("https://idp.example")
         );
+    }
+
+    /// Required change 6 on #136: an audience equal to the issuer's origin must stop the boot,
+    /// because AgentGrid's own desktop tokens carry exactly that `aud`.
+    #[test]
+    fn an_audience_that_is_the_issuers_origin_refuses_to_boot_unless_overridden() {
+        let cfg = super::Config::for_test();
+        let mut ext = super::ExternalAuth::for_test();
+        ext.issuer = "https://accounts.agentgrid.example".into();
+        ext.audiences = vec!["https://accounts.agentgrid.example".into()];
+
+        let err = ext
+            .cross_check(&cfg)
+            .expect_err("the shadowing audience booted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE"),
+            "{msg}"
+        );
+
+        ext.allow_issuer_audience = true;
+        ext.cross_check(&cfg)
+            .expect("the explicit override was refused");
+
+        // And a correct audience needs no override.
+        ext.allow_issuer_audience = false;
+        ext.audiences = vec!["https://api.wheel.example".into()];
+        ext.cross_check(&cfg)
+            .expect("a proper audience was refused");
     }
 }

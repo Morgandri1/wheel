@@ -195,8 +195,9 @@ WHEEL_EXTERNAL_AUDIENCE=https://api.wheel.example       # what WE are, and nothi
 ```
 
 `wheel`, `wheel:prod`, or the deployment's own API origin are all fine; the issuer origin is not.
-Wheel cannot decide this for a deployer — it does not know what else their issuer serves — so it
-**warns loudly at boot** when a configured audience equals the pinned issuer or its origin.
+Wheel **refuses to boot** when a configured audience equals the pinned issuer or its origin.
+It cannot know what else an issuer serves, so there is one explicit override,
+`WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1`, for an issuer that mints tokens for Wheel and nothing else.
 
 On a multi-valued `aud`, any-match is the default: a token carrying
 `["https://wheel.example/api", "https://wheel.example/userinfo"]` is what several IdPs emit as a
@@ -1027,6 +1028,7 @@ deployer comes to believe they have pinned an audience.
 | `WHEEL_EXTERNAL_AZP` | no | — | `azp` allowlist. When set, a token with **no** `azp` cannot satisfy it. |
 | `WHEEL_EXTERNAL_MAX_TTL_SECS` | no | none | Requires `iat` and refuses `exp - iat` above it. Must be a positive whole number. Unset means no cap — and no cap means revocation latency equals token lifetime. |
 | `WHEEL_EXTERNAL_SOLE_AUDIENCE` | no | off | `1`/`true`/`yes` requires our audience be the **only** one the token names. |
+| `WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE` | no | off | `1`/`true`/`yes` permits an audience equal to the issuer's own origin, which otherwise **refuses to boot**. Only for an issuer that mints tokens for Wheel and nothing else. |
 | `WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER` | yes (`proxy_header`) | — | e.g. `x-forwarded-user`. Stored case-folded. Stripped at the proxy hop on every outbound path. |
 | `WHEEL_EXTERNAL_PROXY_EMAIL_HEADER` | no (`proxy_header`) | — | Display only, never a link key. Stripped at the hop alongside the subject header. |
 

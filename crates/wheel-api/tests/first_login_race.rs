@@ -24,6 +24,7 @@ async fn concurrent_first_requests_for_one_new_subject_resolve_to_one_principal(
         issuer: "https://idp.example".into(),
         audiences: vec!["wheel-test".into()],
         sole_audience: false,
+        allow_issuer_audience: false,
         subject_claim: "sub".into(),
         azp: vec![],
         max_ttl_secs: None,
