@@ -325,6 +325,49 @@ mod tests {
         })
     }
 
+    /// `text` with `//` and `/* */` comments removed, leaving string literals alone. A line-based
+    /// filter misses `/* .route(..) */` on one line and a `.route(` after code on the same line.
+    fn without_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    out.push(c);
+                    while let Some(d) = chars.next() {
+                        out.push(d);
+                        if d == '\\' {
+                            out.extend(chars.next());
+                        } else if d == '"' {
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'/') => {
+                    for d in chars.by_ref() {
+                        if d == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut prev = ' ';
+                    for d in chars.by_ref() {
+                        if prev == '*' && d == '/' {
+                            break;
+                        }
+                        prev = d;
+                    }
+                    out.push(' ');
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     /// The engine's `router()` function body, comments removed.
     fn engine_router_source() -> String {
         let src = std::fs::read_to_string(concat!(
@@ -334,11 +377,15 @@ mod tests {
         .expect("the engine's route table is readable from this workspace");
         let start = src.find("pub fn router(").expect("the engine router");
         let end = start + src[start..].find("\n}\n").expect("the end of router()");
-        src[start..end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let body = without_comments(&src[start..end]);
+        // The build may differ from the text: a gated registration is scanned here whether or not it
+        // is compiled in, and an attribute on a route call is not something this scan reads.
+        assert!(
+            !body.contains("#[cfg") && !body.contains("cfg!("),
+            "router() uses cfg: this scan reads text, not what the build compiles -- register the \
+             route unconditionally, or teach the scan"
+        );
+        body
     }
 
     /// The text of one `let <name> = Router::new()` builder chain, up to its `.route_layer(`.
@@ -394,6 +441,10 @@ mod tests {
                 let close = open + chunk[open..].find('"').expect("an unterminated path literal");
                 let raw = &chunk[open..close];
                 let handlers = &chunk[close + 1..];
+                assert!(
+                    !handlers.contains('|') && !handlers.contains('{'),
+                    "a closure or block inside the handlers of {raw:?}: the scan would misread it"
+                );
                 assert!(
                     !handlers.contains('"'),
                     "a string literal inside the handlers of {raw:?}: the scan would misread it"
