@@ -1176,6 +1176,17 @@ mod tests {
             .unwrap()
             .body
             .unwrap();
+        // Bytes, not parsed values: a parser hides the very things a forwarded copy would carry.
+        let text = String::from_utf8(sent.clone()).unwrap();
+        assert_eq!(
+            text.matches("\"Image\"").count(),
+            1,
+            "a duplicate key reached the daemon: {text}"
+        );
+        assert!(
+            !text.contains("evil") && !text.contains("  ") && !text.contains('\n'),
+            "{text}"
+        );
         let sent: Value = serde_json::from_slice(&sent).unwrap();
         assert_eq!(
             sent["Image"], "wheel-engine:test",
