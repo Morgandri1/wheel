@@ -46,7 +46,7 @@ run the real CLI for this proposal. Candidate behaviours:
 **Gate 0 (before any code): a spike against the real CLI**, recorded in this file. It must answer: which of the
 three; whether a `result` appears per message or per turn; whether `--replay-user-messages` echoes the mid-turn
 message and with what identifier; what happens if the message arrives during a tool call vs while the model is
-streaming; whether stdin reads stall while a turn runs (§5.3); and the same for a large body. Codex is out of
+streaming; whether stdin reads stall while a turn runs (§4.3); and the same for a large body. Codex is out of
 scope (no driver, `has_driver` refuses it).
 
 The design below is parameterised on this so the spike selects a constant rather than forcing a redesign.
