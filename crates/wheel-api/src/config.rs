@@ -673,6 +673,38 @@ impl Config {
         Ok(cfg)
     }
 
+    /// A minimal `local`-auth configuration, for unit tests inside this crate that need a `Config`
+    /// to ask one question of. Integration suites build their own literal, because what they are
+    /// testing is usually which field is set.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Config {
+            env: Env::Prod,
+            bind_addr: "127.0.0.1:0".into(),
+            database_url: "sqlite://:memory:".into(),
+            clerk_jwks_url: String::new(),
+            clerk_issuer: String::new(),
+            clerk_azp: Vec::new(),
+            dev_secret: None,
+            auth_mode: AuthMode::Local,
+            session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
+            signup: SignupPolicy::Closed,
+            external: None,
+            master_key: [0u8; 32],
+            host_url: "http://host.invalid".into(),
+            host_secret: Secret::new("host-secret"),
+            engine_port: 7000,
+            public_base_url: "https://api.wheel.test".into(),
+            max_projects_per_user: 20,
+            ingress_rate_per_min: 60,
+            ingress_body_limit_bytes: 5 * 1024 * 1024,
+            proxy_timeout_secs: 30,
+            host_connect_timeout_secs: 3,
+            ws_max_bridges_per_project: 16,
+            ws_max_lifetime_secs: 3600,
+        }
+    }
+
     /// Base URL for this project's engine control plane, as reached through the host.
     pub fn host_engine_url(&self, project_id: &uuid::Uuid) -> String {
         format!("{}/host/v1/projects/{}/engine", self.host_url, project_id)

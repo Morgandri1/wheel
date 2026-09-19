@@ -99,6 +99,42 @@ pub fn sanitized_with_actor(
 mod tests {
     use super::*;
 
+    /// The never-relay list has to come from configuration, and a deployment with no proxy
+    /// verifier must not acquire one out of nowhere.
+    #[test]
+    fn the_proxy_assertion_names_come_from_configuration_or_nowhere() {
+        let mut cfg = crate::config::Config::for_test();
+        assert!(
+            proxy_asserted_headers(&cfg).is_empty(),
+            "no external auth means nothing extra to strip"
+        );
+
+        let mut ext = crate::config::ExternalAuth::for_test();
+        cfg.external = Some(ext.clone());
+        assert!(
+            proxy_asserted_headers(&cfg).is_empty(),
+            "the jwks verifier asserts nothing through a header"
+        );
+
+        ext.verifier = crate::config::ExternalVerifier::ProxyHeader {
+            subject_header: "x-forwarded-user".into(),
+            email_header: Some("x-forwarded-email".into()),
+        };
+        cfg.external = Some(ext.clone());
+        assert_eq!(
+            proxy_asserted_headers(&cfg),
+            vec!["x-forwarded-user", "x-forwarded-email"]
+        );
+
+        // The email header is optional, and its absence must not drop the subject with it.
+        ext.verifier = crate::config::ExternalVerifier::ProxyHeader {
+            subject_header: "x-forwarded-user".into(),
+            email_header: None,
+        };
+        cfg.external = Some(ext);
+        assert_eq!(proxy_asserted_headers(&cfg), vec!["x-forwarded-user"]);
+    }
+
     #[test]
     fn the_names_live_under_the_stripped_namespace() {
         // If one of these ever stopped starting with the prefix, the strip would no longer remove
