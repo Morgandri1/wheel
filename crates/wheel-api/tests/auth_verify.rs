@@ -32,9 +32,9 @@ fn config(env: Env, jwks_url: &str, dev_secret: Option<&str>) -> Config {
         env,
         bind_addr: "127.0.0.1:0".into(),
         database_url: "postgres://unused".into(),
-        clerk_jwks_url: jwks_url.into(),
-        clerk_issuer: ISSUER.into(),
-        clerk_azp: vec![],
+        jwks_url: jwks_url.into(),
+        jwks_issuer: ISSUER.into(),
+        jwks_azp: vec![],
         dev_secret: dev_secret.map(str::to_string),
         auth_mode: wheel_api::config::AuthMode::Local,
         session_secret: wheel_api::crypto::Secret::new("test-session-secret-at-least-32-chars"),
@@ -58,7 +58,7 @@ fn config(env: Env, jwks_url: &str, dev_secret: Option<&str>) -> Config {
 async fn fixture(env: Env, dev_secret: Option<&str>) -> (Config, JwksCache, JwksServer) {
     let server = serve_jwks(key().jwks.clone()).await;
     let cfg = config(env, &server.url, dev_secret);
-    let cache = JwksCache::new(cfg.clerk_jwks_url.clone(), reqwest::Client::new());
+    let cache = JwksCache::new(cfg.jwks_url.clone(), reqwest::Client::new());
     (cfg, cache, server)
 }
 
@@ -202,7 +202,7 @@ async fn empty_sub_is_rejected() {
 #[tokio::test]
 async fn azp_outside_the_allowlist_is_rejected() {
     let (mut cfg, jwks, _s) = fixture(Env::Prod, None).await;
-    cfg.clerk_azp = vec!["https://wheel.dev".into()];
+    cfg.jwks_azp = vec!["https://wheel.dev".into()];
     let mut c = claims("user_alice");
     c.azp = Some("https://evil.example".into());
     assert!(verify(&sign_rs256(key(), KID, &c), &cfg, &jwks)

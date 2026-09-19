@@ -66,6 +66,11 @@ services:
       # Dev defaults: with AUTH_DEV_SECRET set, HS256 tokens are verified locally and the
       # JWKS endpoint is never contacted. `iss` is still validated, so minted tokens must carry
       # exactly CLERK_ISSUER.
+      # CLERK_* are the DEPRECATED spellings of WHEEL_JWKS_URL / WHEEL_JWKS_ISSUER, still read
+      # (with a boot warning) so an existing .env keeps working — see docs/API.md. They are left
+      # here rather than renamed because these are the values a running deployment already has;
+      # setting both names to different values refuses to boot, so migrate by replacing, not by
+      # adding.
       CLERK_JWKS_URL: ${CLERK_JWKS_URL:-http://localhost/unused-jwks}
       CLERK_ISSUER: ${CLERK_ISSUER:-https://dev.wheel.local}
       API_MASTER_KEY: ${API_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}

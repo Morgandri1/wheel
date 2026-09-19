@@ -72,7 +72,7 @@ pub async fn connect_and_migrate(cfg: &Config) -> Result<Db> {
 }
 
 pub async fn build_state(cfg: Config, db: Db, http: reqwest::Client) -> AppState {
-    let jwks = crate::auth::jwks::JwksCache::new(cfg.clerk_jwks_url.clone(), http.clone());
+    let jwks = crate::auth::jwks::JwksCache::new(cfg.jwks_url.clone(), http.clone());
     // Only when an external provider is actually in use. Under AUTH_MODE=local there is no JWKS
     // URL to fetch, and priming one anyway made every local boot print a warning about a failure
     // that cannot matter — the first thing a new user sees, and entirely misleading.

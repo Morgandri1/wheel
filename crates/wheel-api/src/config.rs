@@ -85,10 +85,14 @@ pub struct Config {
     pub database_url: String,
 
     // Auth
-    pub clerk_jwks_url: String,
-    pub clerk_issuer: String,
+    /// Where `AUTH_MODE=jwks` fetches the provider's signing keys. `WHEEL_JWKS_URL`, or the
+    /// deprecated `CLERK_JWKS_URL` (see [`aliased`]).
+    pub jwks_url: String,
+    /// The `iss` that `AUTH_MODE=jwks` pins. `WHEEL_JWKS_ISSUER`, or the deprecated `CLERK_ISSUER`.
+    pub jwks_issuer: String,
     /// Optional authorized-party allowlist. When non-empty, `azp` must be one of these.
-    pub clerk_azp: Vec<String>,
+    /// `WHEEL_JWKS_AZP`, or the deprecated `CLERK_AZP`.
+    pub jwks_azp: Vec<String>,
     /// HS256 shared secret for local testing. Only ever populated when `env == Dev`.
     pub dev_secret: Option<String>,
     pub auth_mode: AuthMode,
@@ -345,8 +349,8 @@ impl ExternalAuth {
         // Two issuers that compare equal are two token populations that can stand in for each
         // other. Our own session issuer above all: a local session JWT must never route to the
         // external verifier, nor the reverse.
-        if !cfg.clerk_issuer.trim().is_empty() && self.issuer == cfg.clerk_issuer.trim() {
-            bail!("WHEEL_EXTERNAL_ISSUER must not equal CLERK_ISSUER: two verifiers pinned to one issuer can stand in for each other");
+        if !cfg.jwks_issuer.trim().is_empty() && self.issuer == cfg.jwks_issuer.trim() {
+            bail!("WHEEL_EXTERNAL_ISSUER must not equal WHEEL_JWKS_ISSUER (CLERK_ISSUER): two verifiers pinned to one issuer can stand in for each other");
         }
         if self.issuer == cfg.public_base_url.trim_end_matches('/') {
             bail!("WHEEL_EXTERNAL_ISSUER must not equal PUBLIC_BASE_URL: that is the issuer of this API's own sessions");
@@ -507,6 +511,56 @@ fn var_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Read a variable by its current name, accepting its deprecated spelling.
+///
+/// The `jwks` mode reads an OIDC issuer and a JWKS. Nothing about it is Clerk-specific, and a
+/// variable named after one vendor describes a configuration this project no longer has. The names
+/// are therefore `WHEEL_JWKS_*`, with `CLERK_*` **aliased and deprecated** rather than retired
+/// (issue #132; the argument is in `docs/proposals/external-auth.md` §3.4).
+///
+/// Aliased, not renamed, because `CLERK_JWKS_URL` and `CLERK_ISSUER` are *required* under `jwks`
+/// and an empty value refuses to boot — so a hard rename turns a documentation fix into a failed
+/// deploy on the next restart of every deployment configured the old way.
+///
+/// The one hazard an alias introduces is ambiguity, so it is closed here: both names set to
+/// **different** values refuses to boot. There is no correct way to pick a winner between two
+/// issuers an operator has named, and picking one silently is how a deployment ends up pinned to a
+/// provider nobody meant.
+fn aliased(current: &str, deprecated: &str) -> Result<String> {
+    let new = std::env::var(current)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let old = std::env::var(deprecated)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    match (new.as_str(), old.as_str()) {
+        (_, "") => Ok(new),
+        ("", _) => {
+            tracing::warn!(
+                deprecated,
+                replacement = current,
+                "{deprecated} is deprecated and will be removed; rename it to {current}. \
+                 Nothing about AUTH_MODE=jwks is Clerk-specific."
+            );
+            Ok(old)
+        }
+        (n, o) if n == o => {
+            tracing::warn!(
+                deprecated,
+                replacement = current,
+                "{deprecated} is set alongside {current} with the same value; drop {deprecated}."
+            );
+            Ok(new)
+        }
+        _ => bail!(
+            "{current} and {deprecated} are both set, to different values. {deprecated} is the \
+             deprecated alias of {current}, so there is no way to honour both — unset one."
+        ),
+    }
+}
+
 fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
     match std::env::var(key) {
         Ok(v) => v.parse::<T>().map_err(|_| {
@@ -545,8 +599,8 @@ impl Config {
             ),
             (Env::Dev, Some(s)) => {
                 tracing::warn!(
-                    "AUTH_DEV_SECRET is enabled: unsigned-by-Clerk HS256 tokens will be accepted. \
-                     This must never be reachable from the internet."
+                    "AUTH_DEV_SECRET is enabled: any HS256 token signed with this secret will be \
+                     accepted as any user. This must never be reachable from the internet."
                 );
                 Some(s)
             }
@@ -604,7 +658,7 @@ impl Config {
             AuthMode::Jwks | AuthMode::External => Secret::new(String::new()),
         };
 
-        let clerk_azp = var_or("CLERK_AZP", "")
+        let jwks_azp = aliased("WHEEL_JWKS_AZP", "CLERK_AZP")?
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -623,9 +677,9 @@ impl Config {
                     .context("set STORE (postgres://… or sqlite://…), or DATABASE_URL")?,
             },
             // Only meaningful under AUTH_MODE=jwks; blank is fine and expected under local.
-            clerk_jwks_url: var_or("CLERK_JWKS_URL", ""),
-            clerk_issuer: var_or("CLERK_ISSUER", ""),
-            clerk_azp,
+            jwks_url: aliased("WHEEL_JWKS_URL", "CLERK_JWKS_URL")?,
+            jwks_issuer: aliased("WHEEL_JWKS_ISSUER", "CLERK_ISSUER")?,
+            jwks_azp,
             dev_secret,
             auth_mode,
             session_secret,
@@ -649,23 +703,21 @@ impl Config {
             bail!("WHEEL_HOST_SECRET must not be empty: it is the only thing authenticating the API to the host");
         }
         if cfg.auth_mode == AuthMode::Jwks
-            && (cfg.clerk_jwks_url.trim().is_empty() || cfg.clerk_issuer.trim().is_empty())
+            && (cfg.jwks_url.trim().is_empty() || cfg.jwks_issuer.trim().is_empty())
         {
             bail!(
-                "AUTH_MODE=jwks requires CLERK_JWKS_URL and CLERK_ISSUER to be set to real values. \
-                 A placeholder that looks like configuration is worse than a missing one: it boots, \
-                 and then rejects every token for a reason nobody can see."
+                "AUTH_MODE=jwks requires WHEEL_JWKS_URL and WHEEL_JWKS_ISSUER (formerly \
+                 CLERK_JWKS_URL and CLERK_ISSUER) to be set to real values. A placeholder that \
+                 looks like configuration is worse than a missing one: it boots, and then rejects \
+                 every token for a reason nobody can see."
             );
-        }
-        if cfg.auth_mode == AuthMode::Jwks && cfg.clerk_issuer.is_empty() {
-            bail!("CLERK_ISSUER must not be empty: it is what pins tokens to our tenant");
         }
         if cfg.env == Env::Prod && cfg.auth_mode == AuthMode::Jwks {
             // ADVERSARY 017: an identity provider we do not control is a provider that can mint any
             // `sub`. A mock issuer on loopback is the dev shortcut that must never survive a deploy:
             // it does not fail — it authenticates everyone, as anyone.
-            reject_local_identity_provider("CLERK_JWKS_URL", &cfg.clerk_jwks_url)?;
-            reject_local_identity_provider("CLERK_ISSUER", &cfg.clerk_issuer)?;
+            reject_local_identity_provider("WHEEL_JWKS_URL", &cfg.jwks_url)?;
+            reject_local_identity_provider("WHEEL_JWKS_ISSUER", &cfg.jwks_issuer)?;
         }
         if let Some(ext) = &cfg.external {
             ext.cross_check(&cfg)?;
@@ -682,9 +734,9 @@ impl Config {
             env: Env::Prod,
             bind_addr: "127.0.0.1:0".into(),
             database_url: "sqlite://:memory:".into(),
-            clerk_jwks_url: String::new(),
-            clerk_issuer: String::new(),
-            clerk_azp: Vec::new(),
+            jwks_url: String::new(),
+            jwks_issuer: String::new(),
+            jwks_azp: Vec::new(),
             dev_secret: None,
             auth_mode: AuthMode::Local,
             session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
@@ -802,9 +854,9 @@ impl std::fmt::Debug for Config {
             .field("env", &self.env)
             .field("signup", &self.signup)
             .field("bind_addr", &self.bind_addr)
-            .field("clerk_issuer", &self.clerk_issuer)
-            .field("clerk_jwks_url", &self.clerk_jwks_url)
-            .field("clerk_azp", &self.clerk_azp)
+            .field("jwks_issuer", &self.jwks_issuer)
+            .field("jwks_url", &self.jwks_url)
+            .field("jwks_azp", &self.jwks_azp)
             .field("host_url", &self.host_url)
             .field("host_secret", &"<redacted>")
             .field("master_key", &"<redacted>")

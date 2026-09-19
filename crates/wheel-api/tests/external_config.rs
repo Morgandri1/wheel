@@ -19,8 +19,8 @@ use wheel_api::config::{Config, ExternalVerifier, Provision};
 /// A valid non-external baseline. Every case below starts from this and breaks one thing.
 fn base_env() {
     std::env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
-    std::env::set_var("CLERK_JWKS_URL", "https://clerk.example.test/jwks");
-    std::env::set_var("CLERK_ISSUER", "https://clerk.example.test");
+    std::env::set_var("WHEEL_JWKS_URL", "https://idp.legacy.test/jwks");
+    std::env::set_var("WHEEL_JWKS_ISSUER", "https://idp.legacy.test");
     std::env::set_var(
         "API_MASTER_KEY",
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -35,6 +35,10 @@ fn base_env() {
         "STORE",
         "SESSION_SECRET",
         "WHEEL_TRUSTED_PROXIES",
+        "CLERK_JWKS_URL",
+        "CLERK_ISSUER",
+        "CLERK_AZP",
+        "WHEEL_JWKS_AZP",
         "WHEEL_EXTERNAL_VERIFIER",
         "WHEEL_EXTERNAL_PROVIDER",
         "WHEEL_EXTERNAL_ISSUER",
@@ -183,10 +187,10 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
     // Two verifiers pinned to one issuer are two token populations that can stand in for each
     // other, which is the confusion the pin exists to prevent.
     external_jwks_env();
-    std::env::set_var("WHEEL_EXTERNAL_ISSUER", "https://clerk.example.test");
-    std::env::set_var("WHEEL_EXTERNAL_JWKS_URL", "https://clerk.example.test/jwks");
-    let e = refuses("an issuer equal to CLERK_ISSUER");
-    assert!(e.contains("CLERK_ISSUER"), "{e}");
+    std::env::set_var("WHEEL_EXTERNAL_ISSUER", "https://idp.legacy.test");
+    std::env::set_var("WHEEL_EXTERNAL_JWKS_URL", "https://idp.legacy.test/jwks");
+    let e = refuses("an issuer equal to the jwks-mode issuer");
+    assert!(e.contains("WHEEL_JWKS_ISSUER"), "{e}");
 
     // Our own session issuer above all: a local session JWT must never route to the external
     // verifier, nor the reverse.
