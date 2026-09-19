@@ -110,6 +110,13 @@ MUTANTS = [
     test="proxy_header_hop the_proxy_assertion_never_reaches_an_engine_through_public_ingress",
   ),
   dict(
+    id="proxy-trusted-wildcard",
+    why="an all-addresses WHEEL_TRUSTED_PROXIES is refused under proxy_header (ADVERSARY 065)",
+    file="crates/wheel-api/src/http/client_ip.rs",
+    edits=[("        self.0.iter().any(|c| c.bits == 0)", "        false")],
+    test="external_config external_auth_refuses_every_configuration_that_would_be_unsafe",
+  ),
+  dict(
     id="dev-hs256-interlock",
     why="the dev HS256 interlock",
     file="crates/wheel-api/src/config.rs",

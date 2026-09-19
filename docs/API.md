@@ -291,7 +291,12 @@ network at all.
 What is enforced mechanically:
 
 1. **Boot refuses** `proxy_header` when `WHEEL_TRUSTED_PROXIES` is empty, naming the missing
-   variable. Believing a header from everyone is not a configuration, it is an open door.
+   variable. Believing a header from everyone is not a configuration, it is an open door. **It also
+   refuses an all-addresses range** — `0.0.0.0/0`, `::/0`, or a mapped spelling — because that is
+   the same open door with a value in it. A wide but real range such as `10.0.0.0/8` is a
+   legitimate answer and boots. If your platform gives you no stable proxy address, this is not the
+   verifier for that deployment: use `jwks`, which authenticates a signature rather than a network
+   position.
 2. **Per request, the TCP peer** must be inside `WHEEL_TRUSTED_PROXIES` or the request is 401
    whatever its headers say. Not `X-Forwarded-For` — the peer. The marker is a server-side request
    extension a client cannot forge, and if the middleware that computes it is absent the marker is
@@ -1212,6 +1217,7 @@ looks configured, and is not.
 | `WHEEL_EXTERNAL_ISSUER == WHEEL_JWKS_ISSUER` | Two verifiers pinned to one issuer are two token populations that can stand in for each other. |
 | `WHEEL_EXTERNAL_ISSUER == PUBLIC_BASE_URL` | That is the issuer of this API's own sessions. A local session JWT must never route to the external verifier, nor the reverse. |
 | `WHEEL_EXTERNAL_VERIFIER=proxy_header` with an empty `WHEEL_TRUSTED_PROXIES` | Believing a header from everyone is not a configuration, it is an open door. |
+| `WHEEL_EXTERNAL_VERIFIER=proxy_header` with an all-addresses `WHEEL_TRUSTED_PROXIES` (`0.0.0.0/0`, `::/0`) | The same open door, with a value in it. It is not empty, it parses, and it trusts the whole internet — so the emptiness check alone did not catch it. Scoped to this verifier: under `local` or `jwks` the same value only affects `X-Forwarded-For` attribution and rate-limit keying. |
 | Prod, either JWKS mode, a loopback or plaintext issuer | [The production identity-provider interlock](#the-production-identity-provider-interlock). |
 
 Two things **warn** rather than refuse, because Wheel cannot decide them for a deployer:

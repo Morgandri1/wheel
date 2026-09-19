@@ -265,6 +265,29 @@ impl ExternalAuth {
                          can be anyone; with no trusted peer list that is everyone."
                     );
                 }
+                // The refusal above says "that is everyone", and an all-addresses range means
+                // exactly that while satisfying it — it is not empty, it parses, and
+                // `trusts_peer` then returns true for the entire internet (ADVERSARY 065). Two
+                // different questions were being asked as one.
+                //
+                // This is the value an operator reaches for, not a contrived one: a platform
+                // whose load-balancer egress is not pinnable leaves them a choice between
+                // abandoning the mode and widening the range until it boots, and this interlock
+                // exists to stop the second. So the message has to name the alternative, or it
+                // just moves the same operator one step further along the same path.
+                if trusted.covers_every_address() {
+                    bail!(
+                        "WHEEL_EXTERNAL_VERIFIER=proxy_header with an all-addresses \
+                         WHEEL_TRUSTED_PROXIES (0.0.0.0/0 or ::/0) trusts every peer that can \
+                         open a connection, which is the same open door an empty list is: any \
+                         caller may then set the subject header and be anyone. This mode needs \
+                         the proxy's actual address or network — a container address, or the \
+                         private range it sits in, e.g. 10.0.0.0/8. If your platform gives you no \
+                         stable proxy address, proxy_header is not the verifier for that \
+                         deployment: use WHEEL_EXTERNAL_VERIFIER=jwks, which authenticates a \
+                         signature instead of a network position."
+                    );
+                }
                 ExternalVerifier::ProxyHeader {
                     subject_header: required("WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER")?
                         .to_ascii_lowercase(),

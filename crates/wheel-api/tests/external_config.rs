@@ -261,6 +261,49 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
         "the error must name what is missing: {e}"
     );
 
+    // ADVERSARY 065. The empty-list refusal above says "with no trusted peer list that is
+    // everyone" — and the value that literally means everyone sails past it, because it is not
+    // empty. It is also the value an operator reaches for on a platform with no pinnable
+    // load-balancer address, which is Wheel's documented deployment target.
+    for wildcard in ["0.0.0.0/0", "::/0", "0.0.0.0/0,::/0", "10.0.0.0/8, ::/0"] {
+        std::env::set_var("WHEEL_TRUSTED_PROXIES", wildcard);
+        let e = refuses(&format!(
+            "proxy_header with WHEEL_TRUSTED_PROXIES={wildcard}"
+        ));
+        assert!(
+            e.contains("WHEEL_TRUSTED_PROXIES"),
+            "the error must name the variable: {e}"
+        );
+        assert!(
+            e.contains("jwks"),
+            "an operator who cannot name a stable proxy address needs to be told what to use \
+             instead, or they will widen the range until it boots: {e}"
+        );
+    }
+
+    // A wide but real range still boots. Refusing `10.0.0.0/8` would be a uselessly strict
+    // default, and this arm is what stops the fix above from growing into one.
+    std::env::set_var("WHEEL_TRUSTED_PROXIES", "10.0.0.0/8");
+    assert!(boots("proxy_header with a private range")
+        .external
+        .is_some());
+
+    // The same wildcard is fine under a mode that does not authenticate with it: there it only
+    // affects X-Forwarded-For attribution and rate-limit keying.
+    base_env();
+    std::env::set_var("WHEEL_TRUSTED_PROXIES", "0.0.0.0/0");
+    assert!(
+        boots("a wildcard under local auth").external.is_none(),
+        "the refusal is scoped to the verifier that authenticates with the peer"
+    );
+
+    base_env();
+    std::env::set_var("AUTH_MODE", "external");
+    std::env::set_var("WHEEL_EXTERNAL_VERIFIER", "proxy_header");
+    std::env::set_var("WHEEL_EXTERNAL_ISSUER", "proxy:oauth2-proxy");
+    std::env::set_var("WHEEL_EXTERNAL_AUDIENCE", "wheel-prod");
+    std::env::set_var("WHEEL_EXTERNAL_PROVISION", "auto");
+    std::env::set_var("WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER", "X-Forwarded-User");
     std::env::set_var("WHEEL_TRUSTED_PROXIES", "127.0.0.1/32");
     let cfg = boots("proxy_header with a trusted proxy");
     match &cfg.external.as_ref().unwrap().verifier {

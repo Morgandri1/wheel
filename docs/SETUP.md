@@ -130,8 +130,14 @@ WHEEL_EXTERNAL_AUDIENCE=wheel
 WHEEL_EXTERNAL_PROVISION=linked
 WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER=x-forwarded-user
 WHEEL_EXTERNAL_PROXY_EMAIL_HEADER=x-forwarded-email         # optional, display only
-WHEEL_TRUSTED_PROXIES=10.0.0.5/32                           # REQUIRED here; empty refuses to boot
+WHEEL_TRUSTED_PROXIES=10.0.0.5/32                           # REQUIRED here; empty OR 0.0.0.0/0 refuses to boot
 ```
+
+Boot refuses this mode with an empty `WHEEL_TRUSTED_PROXIES`, and also with an all-addresses one
+(`0.0.0.0/0`, `::/0`). That second refusal exists because the first one is easy to satisfy the wrong
+way: an operator on a platform with no pinnable load-balancer address hits "empty refuses to boot"
+and widens the range until it starts. If that is your platform, **this is not the verifier for that
+deployment** — use `jwks`, which authenticates a signature instead of a network position.
 
 Wheel verifies **nothing** about that header. The proxy is the verifier, so the entire control is
 that the request reached Wheel *from* the proxy — which means **Wheel must not be reachable any

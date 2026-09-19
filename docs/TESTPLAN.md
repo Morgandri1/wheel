@@ -552,6 +552,7 @@ this table is the record.
 | `cross-origin` | `refuse_cross_origin` returns `Ok(())` for every origin | `external_identities::a_cross_origin_page_may_not_spend_an_ambient_proxy_credential` |
 | `hop-strip-authenticated` | `sanitized_with_actor` passes `&[]` instead of `proxy_asserted_headers(cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_the_authenticated_proxy` |
 | `hop-strip-ingress` | `routes::ingress` passes `&[]` instead of `proxy_asserted_headers(&state.cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_public_ingress` |
+| `proxy-trusted-wildcard` | `TrustedProxies::covers_every_address` returns `false` | `external_config::external_auth_refuses_every_configuration_that_would_be_unsafe` |
 | `dev-hs256-interlock` | `(Env::Prod, Some(s)) => Some(s)` instead of `bail!` | `config_interlock::dev_secret_interlock_and_config_validation` |
 
 All nine die on a named assertion. **Two of them did not, on the first run**, and both gaps were
@@ -660,6 +661,7 @@ is not, is worse than one that does not start.
 | `AUTH-ext-cfg-issuer-collisions` | `WHEEL_EXTERNAL_ISSUER` equal to `WHEEL_JWKS_ISSUER`, or to `PUBLIC_BASE_URL`, refuses to boot naming the other variable. Two verifiers on one issuer are two token populations that can stand in for each other; our own session issuer above all. | **S1** |
 | `AUTH-ext-cfg-prod-interlock` | Under `WHEEL_ENV=prod`, a loopback, `.local`/`.internal`, or plaintext `WHEEL_EXTERNAL_JWKS_URL`/`_ISSUER` refuses to boot — ADVERSARY 017's interlock, extended to this plane. In **dev** a local issuer boots, because that is what dev is for. | **S1** |
 | `AUTH-ext-cfg-proxy-needs-trusted` | `WHEEL_EXTERNAL_VERIFIER=proxy_header` with an empty `WHEEL_TRUSTED_PROXIES` refuses to boot, naming `WHEEL_TRUSTED_PROXIES`. Believing a header from everyone is not a configuration, it is an open door. | **S1** |
+| `AUTH-ext-cfg-proxy-refuses-wildcard` | The same interlock refuses an **all-addresses** range — `0.0.0.0/0`, `::/0`, either mapped, and either sitting in a list beside real entries — and the message names both the variable and `jwks` as the alternative. A wide but real range (`10.0.0.0/8`) still boots, and the same wildcard under `local`/`jwks` still boots, so the fix cannot grow into a uselessly strict default. ADVERSARY 065: the empty-list refusal says "with no trusted peer list that is everyone", and the value that literally means everyone satisfied it — not empty, parses, trusts the internet. | **S1** |
 | `AUTH-ext-cfg-provision-explicit` | `WHEEL_EXTERNAL_PROVISION` unset refuses to boot, and an unrecognised value refuses naming the variable. Never defaulted: on an open-signup IdP, `auto` lets anyone into Wheel. | **S1** |
 | `AUTH-ext-cfg-verifier-unknown` | An unrecognised `WHEEL_EXTERNAL_VERIFIER` (e.g. `introspection`) refuses, naming it. It must not fall back to either real verifier. | **S1** |
 | `AUTH-ext-cfg-ttl-cap-sane` | `WHEEL_EXTERNAL_MAX_TTL_SECS` of `0`, `-1` or `soon` refuses naming the variable; `300` parses. | S2 |
