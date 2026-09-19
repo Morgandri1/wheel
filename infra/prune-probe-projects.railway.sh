@@ -17,6 +17,13 @@
 # secrets stay in those containers: the commands below name $DATABASE_URL and $WHEEL_HOST_SECRET,
 # they never carry their values.
 #
+# TODO(048): once docs/proposals/network-isolation-048.md's migration lands, wheel-host moves to its
+# own Railway project — the comment above stops being true (postgres and wheel-host are no longer on
+# the SAME private network, they are each private within a DIFFERENT one) and `rw()` below needs a
+# `railway link -p wheel-host -s wheel-host` before its calls, separate from whatever links to
+# `postgres`. Left as unchanged-until-then rather than guessed at now, since the new project id
+# doesn't exist yet.
+#
 #   ./infra/prune-probe-projects.railway.sh            # list candidates
 #   ./infra/prune-probe-projects.railway.sh --apply    # delete them
 set -euo pipefail

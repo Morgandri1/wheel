@@ -101,14 +101,17 @@ impl Config {
         let secret = var("WHEEL_HOST_SECRET")?;
         // This secret is the *only* thing standing between anything that can reach this port and
         // full control of every tenant's sandbox. A short or absent one is not a warning.
-        // The host must never be reachable from the internet (§5b). Railway sets
-        // RAILWAY_PUBLIC_DOMAIN only when a public domain exists, so its presence means someone
-        // has exposed the sandbox supervisor — every tenant's engine, behind one bearer.
+        // §5b's actual requirement is that this host be reachable ONLY behind that bearer — today
+        // (finding 048: `wheel-host` still shares a Railway project with Postgres/the API,
+        // unfixed) that means private-networking-only, so RAILWAY_PUBLIC_DOMAIN's presence means
+        // someone has exposed the sandbox supervisor by accident. Once `wheel-host` moves to its
+        // own project (docs/proposals/network-isolation-048.md), §5b's target topology has the
+        // API reach it over a public domain BY DESIGN — bearer+TLS is the protection then, not
+        // private networking — which is exactly the deliberate case ALLOW_PUBLIC_DOMAIN exists for.
         //
         // This is not hypothetical: a bare `railway domain` with this service linked created one
         // by accident, and nothing in the system would have noticed. Refusing to boot turns a
         // silent exposure into an obvious outage, which is the trade you want for this process.
-        // ALLOW_PUBLIC_DOMAIN exists only so a deliberate future topology is not blocked by me.
         if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
             let domain = domain.trim();
             if !domain.is_empty() && var_or("ALLOW_PUBLIC_DOMAIN", "0") != "1" {
