@@ -1733,16 +1733,30 @@ impl Supervisor {
                 match event {
                     HarnessEvent::Init { session_id } => {
                         initialised = true;
-                        {
+                        // `pump_queue` can already have written the first turn to this
+                        // child's stdin before its `Init` line reaches us here — stdin
+                        // and stdout are unsynchronized, and a message queued during
+                        // startup is delivered as soon as the slot exists, not once
+                        // `Init` is seen. Overwriting to `Idle` unconditionally would
+                        // clobber that correct `Running` status while the turn is still
+                        // in flight, so a message delivered during startup would read
+                        // idle for the whole turn it is actually running.
+                        let mid_turn = {
                             let mut g = slot.lock().await;
                             if let Some(r) = g.as_mut() {
                                 r.session_id = Some(session_id.clone());
                             }
-                        }
+                            g.as_ref().is_some_and(|r| r.in_flight.is_some())
+                        };
                         {
                             let conn = db.lock().unwrap();
                             set_session(&conn, agent, &session_id);
-                            set_status_db(&conn, agent, AgentStatus::Idle, None);
+                            let settled = if mid_turn {
+                                AgentStatus::Running
+                            } else {
+                                AgentStatus::Idle
+                            };
+                            set_status_db(&conn, agent, settled, None);
                         }
                         // The child can be written to now. Anything enqueued
                         // while it was coming up has no other trigger: the
@@ -5390,6 +5404,55 @@ done
         enqueue(&sup, id, "say something");
         sup.deliver(id).await.unwrap();
         until("the agent to settle once it has been spoken to", || {
+            matches!(status_of(&sup, id), AgentStatus::Idle)
+        })
+        .await;
+
+        sup.stop(id).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Like `LATE_INIT_HARNESS` (reads a line before saying anything, so
+    /// delivery can land before `init` does) but holds `turn_secs` between
+    /// `init` and its `result` — long enough to observe the status mid-turn,
+    /// not just the settled end state the plain late-init test waits for.
+    const LATE_INIT_SLOW_RESULT_HARNESS: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo run >> "$dir/runs"
+session=$(cat "$dir/session" 2>/dev/null || echo s1)
+while IFS= read -r line; do
+  echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$session\"}"
+  sleep "$(cat "$dir/turn_secs" 2>/dev/null || echo 1)"
+  echo "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"$session\",\"is_error\":false,\"result\":\"ok\"}"
+done
+"#;
+
+    /// A message delivered while the agent is still `starting` writes to
+    /// stdin before `init` is read — `pump_queue` needs only a live process,
+    /// not a status — so a turn is already `in_flight` by the time `init`
+    /// arrives. The engine used to set `Idle` on every `init` unconditionally,
+    /// clobbering the `Running` `pump_queue` had already set correctly: the
+    /// board would read idle for the whole turn that was actually running.
+    #[tokio::test]
+    async fn a_message_delivered_during_startup_reads_running_not_idle_once_init_arrives() {
+        let (sup, id, dir) = shim_supervisor("mid-turn-init", LATE_INIT_SLOW_RESULT_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "2").unwrap();
+
+        sup.start(id).await.unwrap();
+        enqueue(&sup, id, "arrived before init");
+        sup.deliver(id).await.unwrap();
+
+        // Comfortably longer than a child reading one line and the engine
+        // processing `init` takes, comfortably shorter than the 2s `result`
+        // delay above — the window this test exists to look inside.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(
+            status_of(&sup, id),
+            AgentStatus::Running,
+            "a turn already in flight when init arrives must not read idle"
+        );
+
+        until("the turn to complete", || {
             matches!(status_of(&sup, id), AgentStatus::Idle)
         })
         .await;
