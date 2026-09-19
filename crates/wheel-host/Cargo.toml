@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "wheel-host"
 path = "src/main.rs"
 
+[[bin]]
+name = "wheel-docker-proxy"
+path = "src/bin/wheel-docker-proxy.rs"
+
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
