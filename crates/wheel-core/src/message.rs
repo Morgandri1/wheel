@@ -167,8 +167,8 @@ pub struct Message {
     ///
     /// **Masked for a guest, on two of its three surfaces.** Under `jwks` this field IS the asking
     /// principal, which for an email-shaped `sub` is a real email — the same risk shape the roster
-    /// masks a member's display email for (`wheel_core::mask_identifier`). `GET /v1/agents/:id/
-    /// inbox[/:id]` and `Event::Message` over `GET /v1/events` both mask it for a guest viewing
+    /// masks a member's display email for (`wheel_core::mask_identifier`).
+    /// `GET /v1/agents/:id/inbox[/:id]` and `Event::Message` over `GET /v1/events` both mask it for a guest viewing
     /// anyone's message but their own (`wheel-engine`'s `api::actor::mask_message_for_tier`). The
     /// third surface, `LogStream::Transcript` (`event.rs`), does NOT mask it: `on_behalf_of` only
     /// reaches that stream already baked into an `<AgentPrompt on_behalf_of="...">` attribute of
