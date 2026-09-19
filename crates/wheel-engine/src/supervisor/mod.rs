@@ -1741,13 +1741,16 @@ impl Supervisor {
                         // clobber that correct `Running` status while the turn is still
                         // in flight, so a message delivered during startup would read
                         // idle for the whole turn it is actually running.
-                        let mid_turn = {
-                            let mut g = slot.lock().await;
-                            if let Some(r) = g.as_mut() {
-                                r.session_id = Some(session_id.clone());
-                            }
-                            g.as_ref().is_some_and(|r| r.in_flight.is_some())
-                        };
+                        // The slot guard is held across the `in_flight` check AND the status
+                        // write (ADVERSARY, #134): releasing it between them lets an unrelated
+                        // `pump_queue` deliver and write `Running` in the gap, and this handler's
+                        // already-decided `Idle` then clobbers it. `pump_queue` holds its own
+                        // guard across its trailing `set_status(Running)` for the same reason.
+                        let mut g = slot.lock().await;
+                        if let Some(r) = g.as_mut() {
+                            r.session_id = Some(session_id.clone());
+                        }
+                        let mid_turn = g.as_ref().is_some_and(|r| r.in_flight.is_some());
                         {
                             let conn = db.lock().unwrap();
                             set_session(&conn, agent, &session_id);
@@ -1758,6 +1761,7 @@ impl Supervisor {
                             };
                             set_status_db(&conn, agent, settled, None);
                         }
+                        drop(g);
                         // The child can be written to now. Anything enqueued
                         // while it was coming up has no other trigger: the
                         // queue is pumped when something enqueues and when a
