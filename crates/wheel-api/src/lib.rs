@@ -81,6 +81,16 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/tokens", post(routes::tokens::create))
         .route("/v1/auth/tokens", get(routes::tokens::list))
         .route("/v1/auth/tokens/{id}", delete(routes::tokens::revoke))
+        // External identity administration. These 404 unless AUTH_MODE=external, so a deployment
+        // that does not use external auth has no such surface at all.
+        .route(
+            "/v1/auth/external-identities",
+            get(routes::external_identities::list).post(routes::external_identities::link),
+        )
+        .route(
+            "/v1/auth/external-identities/{id}",
+            delete(routes::external_identities::disable),
+        )
         // Redeeming an invite takes AuthUser, not ProjectScope: the caller is not a member yet.
         // Outside `/v1/projects/{id}` for the same reason — the invite names the project.
         .route("/v1/invites/accept", post(routes::members::accept))
