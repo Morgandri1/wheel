@@ -173,6 +173,14 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// [`Supervisor::shutdown`].
 pub const INTERRUPTED_BY_SHUTDOWN: &str = "interrupted by engine shutdown";
 
+/// What a turn is consumed with when [`Supervisor::stop`] kills the child mid-turn. Never requeued,
+/// for the same reason as [`INTERRUPTED_BY_SHUTDOWN`].
+pub const STOPPED_BY_USER: &str = "stopped at the caller's request";
+
+/// What a turn is consumed with when the `api-key-only` re-check kills the child that was running it.
+pub const STOPPED_BY_POLICY: &str =
+    "stopped: an OAuth-shaped credential appeared under api-key-only";
+
 /// What a turn is consumed with when [`Supervisor::interrupt`] cancels it. Never requeued, for the
 /// same reason as [`INTERRUPTED_BY_SHUTDOWN`].
 pub const INTERRUPTED_BY_USER: &str = "interrupted at the caller's request";
@@ -3476,6 +3484,63 @@ mod tests {
         assert!(
             err.contains("mid-turn"),
             "say why this is different from a spawn-time refusal: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `stop` took the slot and killed the child without settling the message that turn was for. The
+    /// dying child's reaper then found the slot empty and settled nothing, so the message stayed
+    /// `delivered` for ever: `/healthz` reported the agent as wedged and nothing cleared it. Consumed
+    /// with a reason, never requeued, for the reason `interrupt` and `shutdown` give: a turn killed
+    /// mid-flight may already have committed or pushed, and running it again would do that twice.
+    #[tokio::test]
+    async fn stopping_an_agent_mid_turn_does_not_strand_the_message_in_delivered() {
+        let (sup, id, dir) = shim_supervisor("stop-mid-turn", SLOW_TURN_HARNESS);
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        let mid = deliver_one(&sup, id, "a turn that will be stopped").await;
+
+        sup.stop(id).await.unwrap();
+
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (MessageState::Consumed, Some(STOPPED_BY_USER.to_string())),
+            "a message whose turn was killed by stop must be settled, not left delivered"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same defect on the other path that kills a busy child and never looks at its message: the
+    /// `api-key-only` re-check exists precisely for an agent that never idles, so the turn it kills is
+    /// by construction one that is in flight.
+    #[tokio::test]
+    async fn the_api_key_only_recheck_does_not_strand_the_turn_it_kills() {
+        let (sup, id, dir) = shim_supervisor_inner(
+            "policy-strand",
+            SLOW_TURN_HARNESS,
+            |cfg| cfg.idle_timeout_secs = Some(1),
+            crate::config::DEFAULT_STARTUP_DEADLINE_SECS,
+            None,
+            crate::config::HarnessAuthPolicy::ApiKeyOnly,
+        );
+        std::fs::write(dir.join("turn_secs"), "3600").unwrap();
+        let mid = deliver_one(&sup, id, "a turn the policy will kill").await;
+        std::fs::write(
+            dir.join("creds")
+                .join(id.to_string())
+                .join(".credentials.json"),
+            r#"{"accessToken":"sk-ant-oat01-selfprovisioned"}"#,
+        )
+        .unwrap();
+
+        until("the re-check to stop the agent", || {
+            matches!(status_of(&sup, id), AgentStatus::Error)
+        })
+        .await;
+
+        assert_eq!(
+            state_and_error(&sup, mid),
+            (MessageState::Consumed, Some(STOPPED_BY_POLICY.to_string())),
+            "a message whose turn the policy killed must be settled, not left delivered"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
