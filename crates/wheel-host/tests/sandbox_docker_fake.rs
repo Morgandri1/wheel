@@ -109,6 +109,9 @@ fn fake_daemon_with(
                 let path = strip_version(full.split('?').next().unwrap_or(""));
                 let full = strip_version(&full);
 
+                // What a real daemon remembers of the create: its labels, echoed back on inspection
+                // (the backend reads its `wheel.spec` label to tell a current container from a stale one).
+                let mut labels_json = String::new();
                 let exists = {
                     let mut r = recorder.lock().unwrap();
                     r.requests.push(format!("{method} {full}"));
@@ -120,12 +123,24 @@ fn fake_daemon_with(
                     if path == "/containers/create" {
                         r.created = true;
                     }
+                    if let Some(l) = r
+                        .bodies
+                        .get("/containers/create")
+                        .map(|b| b["Labels"].clone())
+                    {
+                        if !l.is_null() {
+                            labels_json = format!(r#","Config":{{"Labels":{l}}}"#);
+                        }
+                    }
                     r.created
                 };
 
                 let (code, body) = if path.ends_with("/json") {
                     if exists {
-                        (200, format!(r#"{{"State":{{"Status":"{state}"}}}}"#))
+                        (
+                            200,
+                            format!(r#"{{"State":{{"Status":"{state}"}}{labels_json}}}"#),
+                        )
                     } else {
                         (404, r#"{"message":"No such container"}"#.to_string())
                     }

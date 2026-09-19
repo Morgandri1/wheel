@@ -3209,6 +3209,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bollard",
  "libc",
  "rand 0.9.5",
  "reqwest",

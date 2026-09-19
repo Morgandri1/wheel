@@ -48,6 +48,7 @@ impl Daemon {
             status: "running",
             health: None,
             start_code: 204,
+            spec: None,
             requests: vec![],
         }
     }
