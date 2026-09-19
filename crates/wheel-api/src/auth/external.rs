@@ -289,8 +289,27 @@ pub async fn principal_for(db: &Db, ext: &ExternalAuth, v: &Verified) -> ApiResu
     }
 
     let user = super::local::create_external_user(db).await?;
-    link(db, ext, v, user.id).await?;
-    Ok(user.id.to_string())
+    match link(db, ext, v, user.id).await {
+        Ok(_) => Ok(user.id.to_string()),
+        // A concurrent first request for the same subject linked it between our lookup and our
+        // insert (a client's first page load is several requests at once). The winner's account is
+        // the principal; ours was never referenced by anything, so it goes, and this request
+        // resolves exactly as a later one would. Any other failure is not a race and propagates.
+        Err(ApiError::Conflict(_)) => {
+            super::local::delete_unlinked_user(db, &user.id).await?;
+            let winner = lookup(db, &ext.issuer, &v.subject).await?.ok_or_else(|| {
+                ApiError::Internal(anyhow::anyhow!("a conflicting link vanished"))
+            })?;
+            match winner.disabled_at {
+                Some(_) => Err(ApiError::Unauthorized("external identity is disabled")),
+                None => Ok(winner.user_id.to_string()),
+            }
+        }
+        Err(e) => {
+            let _ = super::local::delete_unlinked_user(db, &user.id).await;
+            Err(e)
+        }
+    }
 }
 
 /// A row of `external_identities`.

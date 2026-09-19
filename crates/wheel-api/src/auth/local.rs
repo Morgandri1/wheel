@@ -188,6 +188,14 @@ pub async fn create_external_user(db: &Db) -> ApiResult<User> {
     insert_user(db, &email, EXTERNAL_ONLY).await
 }
 
+/// Remove a user row. Only for an external user created a moment ago that lost a first-login race
+/// (`auth::external::principal_for`): it has no projects, tokens or memberships yet, so nothing
+/// else can reference it.
+pub(crate) async fn delete_unlinked_user(db: &Db, id: &Uuid) -> ApiResult<()> {
+    crate::db_execute!(db, "DELETE FROM users WHERE id = $1", id)?;
+    Ok(())
+}
+
 pub async fn find_token_only_user(db: &Db, email: &str) -> ApiResult<Option<User>> {
     let Ok(email) = validate_email(email) else {
         return Ok(None);
