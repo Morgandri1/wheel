@@ -89,6 +89,16 @@ async fn both_configured_algorithms_verify() {
 /// The key set decides what a key is for. A token whose header claims one algorithm while its `kid`
 /// resolves to a key of the other is refused before any signature is checked — so an attacker
 /// cannot pick the verifier by writing a header.
+///
+/// **It asserts WHICH refusal, and that is the whole test.** An earlier version asserted only
+/// `is_err()`, and a mutation that took the algorithm from `header.alg` instead of from the key
+/// SURVIVED it: `jsonwebtoken` still refused, because an RSA `DecodingKey` cannot verify an Ed25519
+/// signature. The suite was green, and what it was actually proving was that the two fixture keys
+/// happen to be of different families — a property of `jwks::algorithm_of` refusing to import
+/// anything but RSA and Ed25519, in a different file from the decision it protects. That
+/// cross-file dependency is the exact thing §3.1 restructured the verifier to eliminate, so a test
+/// that rests on it is testing the old design. Reading the reason is what makes this an assertion
+/// about OUR check.
 #[tokio::test]
 async fn a_header_algorithm_that_disagrees_with_the_key_is_refused() {
     let (key, server, cache) = plane().await;
@@ -96,17 +106,43 @@ async fn a_header_algorithm_that_disagrees_with_the_key_is_refused() {
 
     // RS256 header, Ed25519 kid.
     let confused = sign_rs256_value(&key, ED_KID, &claims_for("alice"));
-    assert!(
-        verify(&confused, &cfg, &cache).await.is_err(),
-        "an RS256 token naming the Ed25519 key was accepted"
+    assert_refused_because(
+        verify(&confused, &cfg, &cache).await,
+        "does not match",
+        "an RS256 token naming the Ed25519 key",
     );
 
     // EdDSA header, RSA kid.
     let confused = sign_eddsa(KID, &claims_for("alice"));
-    assert!(
-        verify(&confused, &cfg, &cache).await.is_err(),
-        "an EdDSA token naming the RSA key was accepted"
+    assert_refused_because(
+        verify(&confused, &cfg, &cache).await,
+        "does not match",
+        "an EdDSA token naming the RSA key",
     );
+}
+
+/// The refusal came from the named check and not from somewhere further down.
+///
+/// `ApiError::Unauthorized` carries a `&'static str` the client never sees — its `Display` is the
+/// flat "unauthorized" precisely so a response cannot be used as an oracle for which part of a
+/// forged token was wrong. A test is on the other side of that boundary and may read it, and for
+/// the algorithm check it MUST: "refused" and "refused for the reason this control exists" are
+/// different facts, and only one of them survives the control being removed.
+#[track_caller]
+fn assert_refused_because(
+    got: Result<Verified, wheel_api::error::ApiError>,
+    needle: &str,
+    what: &str,
+) {
+    match got {
+        Ok(v) => panic!("{what} was accepted, as {}", v.subject),
+        Err(wheel_api::error::ApiError::Unauthorized(why)) => assert!(
+            why.contains(needle),
+            "{what} was refused, but by {why:?} rather than by a check containing {needle:?} — \
+             the control under test did not fire, something downstream did"
+        ),
+        Err(other) => panic!("{what} produced {other:?}, which is not an authentication refusal"),
+    }
 }
 
 /// The operator's allowlist is enforced even when the key set would otherwise support the key.
