@@ -72,7 +72,7 @@ pub async fn ingress(
     let mut headers = hop::sanitize_for_upstream(
         req.headers(),
         &[WHEEL_PREFIX],
-        &crate::http::actor::proxy_asserted_headers(&state.cfg),
+        &crate::http::actor::credential_headers(&state.cfg),
     );
     headers.insert(hop::header_name("x-wheel-ingress"), "1".parse().unwrap());
     // The engine keys its per-caller ingress limit and `ip_allow` on this, and may trust it: the

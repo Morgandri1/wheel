@@ -6,7 +6,7 @@
 //! credential must not cross the hop into an engine.
 //!
 //! `http::hop`'s unit test proves that `sanitize_for_upstream` drops the names it is *given*, and
-//! `http::actor`'s proves that `proxy_asserted_headers` derives the right names from configuration.
+//! `http::actor`'s proves that `credential_headers` derives the right names from configuration.
 //! Neither proves the two are wired together at the call sites, and the mutation that removes the
 //! argument from either call site survives both of them. This file is that missing assertion, taken
 //! from the only place it is observable: what an engine actually receives.

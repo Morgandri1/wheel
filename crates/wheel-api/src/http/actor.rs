@@ -60,6 +60,11 @@ pub fn set_actor(headers: &mut HeaderMap, user: &AuthUser, tier: Tier) {
 
 /// The header names that carry this deployment's external credential, and so must never be relayed.
 ///
+/// Named for what the list *is* rather than for who set it. It was `proxy_asserted_headers` and
+/// returned an empty list under the `jwks` verifier, which read as correct — a token header is not
+/// "proxy-asserted" — and the deployer's `WHEEL_EXTERNAL_TOKEN_HEADER` was relayed into the engine
+/// as a result (ADVERSARY 064). The question here is only ever "is it a credential".
+///
 /// Two kinds, both credentials:
 ///   * under the `proxy_header` verifier, the subject and email headers the authenticating proxy
 ///     sets — they ARE the identity;
@@ -73,7 +78,7 @@ pub fn set_actor(headers: &mut HeaderMap, user: &AuthUser, tier: Tier) {
 /// names — so they are resolved from configuration here, at the one function every outbound engine
 /// request goes through, rather than at each of the call sites that would otherwise have to
 /// remember.
-pub fn proxy_asserted_headers(cfg: &Config) -> Vec<&str> {
+pub fn credential_headers(cfg: &Config) -> Vec<&str> {
     let Some(ext) = cfg.external.as_ref() else {
         return Vec::new();
     };
@@ -103,7 +108,7 @@ pub fn sanitized_with_actor(
     tier: Tier,
 ) -> HeaderMap {
     let mut headers =
-        super::hop::sanitize_for_upstream(inbound, &[WHEEL_PREFIX], &proxy_asserted_headers(cfg));
+        super::hop::sanitize_for_upstream(inbound, &[WHEEL_PREFIX], &credential_headers(cfg));
     set_actor(&mut headers, user, tier);
     headers
 }
@@ -118,14 +123,14 @@ mod tests {
     fn the_proxy_assertion_names_come_from_configuration_or_nowhere() {
         let mut cfg = crate::config::Config::for_test();
         assert!(
-            proxy_asserted_headers(&cfg).is_empty(),
+            credential_headers(&cfg).is_empty(),
             "no external auth means nothing extra to strip"
         );
 
         let mut ext = crate::config::ExternalAuth::for_test();
         cfg.external = Some(ext.clone());
         assert!(
-            proxy_asserted_headers(&cfg).is_empty(),
+            credential_headers(&cfg).is_empty(),
             "the jwks verifier asserts nothing through a header"
         );
 
@@ -135,7 +140,7 @@ mod tests {
         };
         cfg.external = Some(ext.clone());
         assert_eq!(
-            proxy_asserted_headers(&cfg),
+            credential_headers(&cfg),
             vec!["x-forwarded-user", "x-forwarded-email"]
         );
 
@@ -144,7 +149,7 @@ mod tests {
         ext.token_header = Some("cf-access-jwt-assertion".into());
         cfg.external = Some(ext.clone());
         assert_eq!(
-            proxy_asserted_headers(&cfg),
+            credential_headers(&cfg),
             vec![
                 "x-forwarded-user",
                 "x-forwarded-email",
@@ -157,7 +162,7 @@ mod tests {
         };
         cfg.external = Some(ext.clone());
         assert_eq!(
-            proxy_asserted_headers(&cfg),
+            credential_headers(&cfg),
             vec!["cf-access-jwt-assertion"],
             "the jwks verifier's token header must be stripped too"
         );
@@ -172,7 +177,7 @@ mod tests {
             email_header: None,
         };
         cfg.external = Some(ext);
-        assert_eq!(proxy_asserted_headers(&cfg), vec!["x-forwarded-user"]);
+        assert_eq!(credential_headers(&cfg), vec!["x-forwarded-user"]);
     }
 
     #[test]

@@ -550,8 +550,8 @@ this table is the record.
 | `issuer-pin` | `v.set_issuer(..)` deleted | `external_auth::another_issuer_is_refused_even_with_a_valid_signature` |
 | `proxy-peer` | the `!trusted_peer` refusal deleted | `external_identities::the_same_assertion_from_an_untrusted_peer_is_refused` |
 | `cross-origin` | `refuse_cross_origin` returns `Ok(())` for every origin | `external_identities::a_cross_origin_page_may_not_spend_an_ambient_proxy_credential` |
-| `hop-strip-authenticated` | `sanitized_with_actor` passes `&[]` instead of `proxy_asserted_headers(cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_the_authenticated_proxy` |
-| `hop-strip-ingress` | `routes::ingress` passes `&[]` instead of `proxy_asserted_headers(&state.cfg)` | `proxy_header_hop::the_proxy_assertion_never_reaches_an_engine_through_public_ingress` |
+| `hop-strip-authenticated` | `sanitized_with_actor` passes `&[]` instead of `proxy_asserted_headers(cfg)` | `credential_hop::the_proxy_assertion_never_reaches_an_engine_through_the_authenticated_proxy` |
+| `hop-strip-ingress` | `routes::ingress` passes `&[]` instead of `proxy_asserted_headers(&state.cfg)` | `credential_hop::the_proxy_assertion_never_reaches_an_engine_through_public_ingress` |
 | `iss-required` | `iss` dropped from `required_spec_claims` | `external_auth::a_token_with_no_issuer_is_refused` |
 | `azp-allowlist` | the `azp` allowlist check deleted | `external_auth::the_azp_allowlist_admits_only_the_named_client_applications` |
 | `jwks-max-age-ceiling` | the `Cache-Control` clamp reduced to a floor | `jwks_expiry::an_issuer_may_not_lengthen_the_trust_window_past_the_ceiling` |
@@ -565,7 +565,7 @@ real rather than cosmetic:
 * **`hop-strip-authenticated` and `hop-strip-ingress` had no test at all.** `http::hop`'s unit test
   passes the header names in as a literal argument, and `http::actor`'s tests
   `proxy_asserted_headers` in isolation; neither reads the two call sites where they are joined, so
-  removing the argument from either one was invisible. `tests/proxy_header_hop.rs` is the fix: a
+  removing the argument from either one was invisible. `tests/credential_hop.rs` is the fix: a
   mock engine that answers with the header names it received, so the assertion is on what crossed
   rather than on what the API believes it sent. Both outbound paths, each with a positive control
   (`x-wheel-actor-id`, `x-wheel-ingress`) — without one, "the header is absent" is satisfied
