@@ -149,6 +149,45 @@ ruleset — e.g. the tenant bridge's own gateway answering ARP/ICMP, Docker's em
 resolver, `host.docker.internal`? (3) Is dropping IPv6 wholesale on the bridge right, or should the network be v6-capable with the
 same denied set mirrored?
 
+### M3 amendments after adversary's delta review (PM rulings; these are the M3a spec)
+
+1. **`Mounts` is new surface and gets the same equality discipline as everything else.** The golden create carries exactly one
+   `Mounts` entry, and the proxy pins every field of it: `Type == "volume"` (never `bind`, `tmpfs`, `image`, `npipe`),
+   `Source ==` the proxy's configured socket-volume name, `Target == /run/wheel`, `ReadOnly` absent/false, and
+   `VolumeOptions == {Subpath: <uuid>}` with **`Subpath` equal to the uuid in the container name, the volume name, the
+   `wheel.project` label and `WHEEL_PROJECT_ID`** — otherwise a compromised wheeld hands one project's engine another's socket
+   directory. `VolumeOptions` carries nothing else (no `DriverConfig`, no `Labels`, no `NoCopy`). Refusal table rows:
+   `Type: bind` with `Source: /`, `Type: tmpfs`, another `Source`, another `Target`, a `Subpath` of another uuid / `..` /
+   absolute / empty / with a slash, two mounts, `ReadOnly`, `BindOptions`, `TmpfsOptions`, `DriverConfig` — each refused for its
+   own reason. `Mounts` was refused wholesale until now, so this is the identical class of hole to the original
+   `DriverOpts`-bind-of-`/` finding, and gets the same mutation-check treatment.
+2. **`Subpath` vs one volume per project — decided: do NOT rely on `Subpath` until measured; the fallback is stated.**
+   Kubernetes' `subPath` had a multi-year symlink/TOCTOU record (CVE-2017-1002101, CVE-2021-25741). I have **no evidence**, from
+   Docker's source or docs or a test, that Docker's `Subpath` resolves race-free, and I will not assert it. Plan:
+   (a) M3b's first task is a measurement on a real Docker >= 26: from inside a tenant, plant symlinks in its socket directory
+   (`engine.sock -> ../<other-uuid>/engine.sock`, `.. -> /`) and race container (re)creation of a *different* project against
+   the swap; record what the daemon resolves. Result goes in this document either way.
+   (b) **Fallback if (a) is not clean: one volume per project for the socket directory** (`wheel-p-<uuid>-run`, created through the
+   same validated `POST /volumes/create`, mounted at `/run/wheel` as a plain `Binds` entry — no `Mounts`, no `Subpath`). wheeld
+   itself cannot mount a new volume into its own running container, so it reaches the socket through the **host path of that
+   volume** (`/var/lib/docker/volumes/wheel-p-<uuid>-run/_data`, bind-mounted read-only into wheeld as
+   `/var/lib/docker/volumes` — which exposes every volume's data to wheeld, i.e. every tenant's data, which wheeld already
+   holds the keys to). That costs wheeld one read-only mount; it does not cost the proxy anything new to check. Adversary: is there
+   a better fallback that keeps wheeld unprivileged?
+   **Trade-off, stated plainly:** either way the tenant boundary moves from the network namespace (kernel-enforced, mature) to a
+   volume path (newer, less proven), and wheeld gains a new filesystem path into a tree tenants also have a view into.
+   wheeld must only ever `connect()` to `<root>/<its own uuid>/engine.sock`, checking with `lstat` that neither the directory nor
+   the socket is a symlink and that the socket is owned by the engine uid, and must fail closed on anything else.
+3. **Verify script adds** (M3d): an **ICMP probe to the bridge gateway** (none of the listed probes exercised it; the
+   unconditional per-interface input drop covers it, and the script proves it), and it **asserts the probe container has zero
+   IPv6 addresses** (`ip -6 addr` empty — not just that v6 destinations are unreachable). Confirm `daemon.json` sets no global
+   `host-gateway-ip` / `host.docker.internal` mapping (`ExtraHosts` is already off the M2 allowlist; the daemon-wide default is
+   checked in M4's preflight).
+4. **IPv6: no capability, not merely firewalled.** Linux assigns link-local IPv6 by SLAAC whatever Docker's network object says,
+   so besides the wholesale drop the tenant bridge gets `net.ipv6.conf.<bridge>.disable_ipv6=1` (set by the M3d unit that installs
+   the ruleset, before any tenant starts) and the tenant containers get none. IPv6's special-range list is long enough that
+   "no v6 at all" beats "v6 everywhere filtered".
+
 ## Deliberately out of scope
 - Per-node uid (037): SDK's proposal; docker mode fixes cross-*project* isolation, not agent-vs-agent inside one canvas.
 - The Railway 048 migration and the limiter PR #140: both only matter if `wheel-host` is ever internet-reachable. Parked / lower priority.
