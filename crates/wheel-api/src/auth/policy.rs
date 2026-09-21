@@ -315,32 +315,160 @@ mod tests {
         methods: Vec<&'static str>,
     }
 
-    /// The engine's real `/v1` route table, read from the source that registers it.
-    ///
-    /// An axum `Router` cannot be enumerated, and the alternative -- a second, hand-kept list of
-    /// engine routes -- is exactly the drift this test exists to catch. Reading the registration
-    /// itself means a route added there is seen here with no one remembering to say so.
-    fn engine_v1_routes() -> Vec<EngineRoute> {
+    /// True when `text` calls `name(` as its own identifier -- `get(` but not `budget(`.
+    fn calls(text: &str, name: &str) -> bool {
+        text.match_indices(&format!("{name}(")).any(|(i, _)| {
+            !text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// `text` with `//` and `/* */` comments removed, leaving string literals alone. A line-based
+    /// filter misses `/* .route(..) */` on one line and a `.route(` after code on the same line.
+    fn without_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    out.push(c);
+                    while let Some(d) = chars.next() {
+                        out.push(d);
+                        if d == '\\' {
+                            out.extend(chars.next());
+                        } else if d == '"' {
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'/') => {
+                    for d in chars.by_ref() {
+                        if d == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut prev = ' ';
+                    for d in chars.by_ref() {
+                        if prev == '*' && d == '/' {
+                            break;
+                        }
+                        prev = d;
+                    }
+                    out.push(' ');
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Refuse any way of registering a route this scan cannot read. By IDENTIFIER, not a fixed list
+    /// of spellings: anything called `*_service`, anything called `fallback*`, and the method-router
+    /// constructors that take a filter or a service. A list of known-bad names is what missed
+    /// `fallback_service`, `put_service` and a top-level `route_service`. `nest` is only allowed
+    /// where the caller says so (the outermost router nests `/v1`, `/v1/cli` and `/ingress`).
+    fn refuse_unreadable_shapes(text: &str, allow_nest: bool, what: &str) {
+        for (i, _) in text.match_indices('(') {
+            let ident: String = text[..i]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let banned = ident.ends_with("_service")
+                || ident.starts_with("fallback")
+                || matches!(
+                    ident.as_str(),
+                    "merge"
+                        | "on"
+                        | "any"
+                        | "head"
+                        | "options"
+                        | "trace"
+                        | "connect"
+                        | "nest_service"
+                        | "route_service"
+                )
+                || (ident == "nest" && !allow_nest);
+            assert!(
+                !banned,
+                "the {what} router uses `{ident}(`, which this scan does not understand -- teach it, \
+                 or register the route in a shape it reads"
+            );
+        }
+    }
+
+    /// The engine's `router()` function body, comments removed.
+    fn engine_router_source() -> String {
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../wheel-engine/src/api/mod.rs"
         ))
         .expect("the engine's route table is readable from this workspace");
-        let start = src.find("let v1 = Router::new()").expect("the /v1 router");
-        let end = start + src[start..].find(".route_layer(").expect("the end of /v1");
-        let body: String = src[start..end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let start = src.find("pub fn router(").expect("the engine router");
+        let end = start + src[start..].find("\n}\n").expect("the end of router()");
+        let body = without_comments(&src[start..end]);
+        refuse_unreadable_shapes(&body, true, "engine");
+        // The build may differ from the text: a gated registration is scanned here whether or not it
+        // is compiled in, and an attribute on a route call is not something this scan reads.
+        assert!(
+            !body.contains("#[cfg") && !body.contains("cfg!("),
+            "router() uses cfg: this scan reads text, not what the build compiles -- register the \
+             route unconditionally, or teach the scan"
+        );
+        body
+    }
 
-        body.split(".route(")
+    /// The text of one `let <name> = Router::new()` builder chain, up to its `.route_layer(`.
+    fn chain<'a>(router: &'a str, name: &str) -> &'a str {
+        let start = router
+            .find(&format!("let {name} = Router::new()"))
+            .unwrap_or_else(|| panic!("the {name} router"));
+        let end = start
+            + router[start..]
+                .find(".route_layer(")
+                .unwrap_or_else(|| panic!("the end of the {name} router"));
+        &router[start..end]
+    }
+
+    /// Every `.route(path, handlers)` in one builder chain, under `prefix`.
+    ///
+    /// Reads source because an axum `Router` cannot be enumerated, and the alternative -- a second,
+    /// hand-kept list of engine routes -- is exactly the drift this test exists to catch. Because
+    /// it reads source, it must REFUSE what it cannot read rather than skip it: a registration
+    /// shape it does not understand fails the test loudly instead of contributing no rows.
+    fn scan(window: &str, prefix: &str) -> Vec<EngineRoute> {
+        refuse_unreadable_shapes(window, false, prefix);
+        window
+            .split(".route(")
             .skip(1)
             .map(|chunk| {
-                let open = chunk.find('"').expect("a route path literal") + 1;
-                let close = open + chunk[open..].find('"').unwrap();
+                assert!(
+                    chunk.trim_start().starts_with('"'),
+                    "a route path that is not a plain string literal: {}",
+                    &chunk[..chunk.len().min(60)]
+                );
+                let open = chunk.find('"').unwrap() + 1;
+                let close = open + chunk[open..].find('"').expect("an unterminated path literal");
                 let raw = &chunk[open..close];
-                let path = std::iter::once("v1".to_string())
+                let handlers = &chunk[close + 1..];
+                assert!(
+                    !handlers.contains('|') && !handlers.contains('{'),
+                    "a closure or block inside the handlers of {raw:?}: the scan would misread it"
+                );
+                assert!(
+                    !handlers.contains('"'),
+                    "a string literal inside the handlers of {raw:?}: the scan would misread it"
+                );
+                let path = std::iter::once(prefix.to_string())
                     .chain(raw.split('/').filter(|s| !s.is_empty()).map(|s| {
                         if s.starts_with('{') {
                             "{}".to_string()
@@ -350,8 +478,7 @@ mod tests {
                     }))
                     .collect::<Vec<_>>()
                     .join("/");
-                let handlers = &chunk[close..];
-                let methods = [
+                let methods: Vec<&'static str> = [
                     ("get", "GET"),
                     ("post", "POST"),
                     ("put", "PUT"),
@@ -359,19 +486,58 @@ mod tests {
                     ("delete", "DELETE"),
                 ]
                 .into_iter()
-                .filter(|(name, _)| {
-                    handlers.match_indices(&format!("{name}(")).any(|(i, _)| {
-                        !handlers[..i]
-                            .chars()
-                            .next_back()
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                    })
-                })
+                .filter(|(name, _)| calls(handlers, name))
                 .map(|(_, m)| m)
                 .collect();
+                assert!(
+                    !methods.is_empty(),
+                    "{raw:?} was registered with no method this scan recognises -- it would need no \
+                     policy row, which is the failure this test exists to prevent"
+                );
                 EngineRoute { path, methods }
             })
             .collect()
+    }
+
+    fn engine_v1_routes() -> Vec<EngineRoute> {
+        scan(chain(&engine_router_source(), "v1"), "v1")
+    }
+
+    /// The scan reads only the `/v1` builder. Everything else in `router()` has to be accounted for
+    /// independently, so a route added anywhere it does not read cannot slip past by being unseen.
+    #[test]
+    fn nothing_in_the_engine_router_is_registered_where_the_scan_cannot_see_it() {
+        let router = engine_router_source();
+        let v1 = scan(chain(&router, "v1"), "v1").len();
+        let cli = scan(chain(&router, "cli"), "v1/cli").len();
+        let all = router.matches(".route(").count();
+        // The one top-level route is `/healthz`.
+        assert_eq!(
+            all,
+            v1 + cli + 1,
+            "router() registers {all} routes; the scan accounts for {v1} in /v1, {cli} in /v1/cli \
+             and /healthz -- one is somewhere it does not read"
+        );
+        assert!(
+            !calls(&router, "merge"),
+            "router() merges a router the scan cannot read"
+        );
+        let nests: Vec<&str> = router
+            .match_indices(".nest(")
+            .map(|(i, _)| {
+                let rest = &router[i + ".nest(".len()..];
+                let rest = rest
+                    .trim_start()
+                    .strip_prefix('"')
+                    .expect("a literal nest path");
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        assert_eq!(
+            nests,
+            ["/v1", "/v1/cli", "/ingress"],
+            "router() nests a tree the scan does not read (ingress is public and never proxied)"
+        );
     }
 
     fn concrete(path: &str) -> String {
