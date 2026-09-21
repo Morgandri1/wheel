@@ -392,6 +392,24 @@ are the same code, so they cannot drift apart.
 the engine wrote to the child's stdin (§3c#10), exposed on this same route and as ordinary `log` events so the
 UI needs no second subscription (agreed with Web, M2). `seq` is monotonic per agent and is the resume cursor.
 
+**Who may read message bodies (finding 062).** The transcript, the inbox and the `message` event carry every
+operator instruction, agent-to-agent message and webhook payload an agent was ever given. A **Guest** (the
+`x-wheel-actor-tier` header; absent or unrecognised is Guest) may read only the bodies of messages they sent
+(`on_behalf_of` equal to their `x-wheel-actor-id`); Prompter and Admin read all of them, byte-identical to
+before. One predicate decides it, `may_read_bodies(tier)` in `api/actor.rs`.
+
+| Surface | Guest |
+|---|---|
+| `GET .../log?stream=transcript` | `403 tier_required` — never an empty page |
+| `GET .../log` (no stream, or another) | transcript rows omitted; `next` advances over the rows returned only |
+| `log` events with `stream:"transcript"` on `/v1/events` | not sent (dropped, not edited; other tiers on the same broadcast still get them) |
+| `GET .../inbox`, `.../inbox/:id`, `message` events | `body` is `[hidden: prompter tier or above]` for a message they did not send; `id`, `from`, `to`, `state`, `bytes`, `sha256` and timestamps are unchanged |
+
+Residuals, stated rather than fixed: `stdout` is what the agent *said* and may quote an instruction back, and a
+guest reads it by design; `bytes`, `sha256` and timing of a hidden body stay visible (metadata, no content); and
+`state.last_error` on the board can carry harness text. The board itself — every `system_prompt` and ctx node —
+is readable by a guest by design. A client must treat `stream=transcript` as tier-dependent.
+
 ### Auth (per agent node)
 
 | Route | Body → Response | M |

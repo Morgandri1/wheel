@@ -105,32 +105,47 @@ pub fn from_headers(headers: &HeaderMap) -> Option<String> {
     Some(raw.to_string())
 }
 
-/// Mask a message's `on_behalf_of` for a guest caller, the same rule `wheel-api`'s roster already
-/// applies to `Member.email`/`Project.owner_id`'s display email: masked for everyone but the caller
-/// themselves, server-side (client-side masking alone would not protect a caller hitting this route
-/// directly). Unlike `user_id`/`owner_id`, `on_behalf_of` has no separate raw-opaque-id twin field —
-/// under `jwks` it IS the operator's principal, which for an email-shaped `sub` is a real email
-/// (`auth::principal`'s own allowlist accepts `alice@example.com` as one of "the subjects we
-/// actually need to carry") — so it is the thing being masked, not a value beside the masked one.
+/// What a guest sees where a message body would be.
+pub const HIDDEN_BODY: &str = "[hidden: prompter tier or above]";
+
+/// May this caller read the bodies of messages they did not send?
 ///
-/// Deliberately does not touch `LogStream::Transcript`: that stream's whole reason to exist is
-/// "the exact bytes the engine wrote to the child's stdin" (`event.rs`), and `on_behalf_of` only
-/// reaches it already baked into the `<AgentPrompt on_behalf_of="...">` attribute of rendered free
-/// text — masking there would mean regexing an attribute out of opaque text and would break the
-/// exact-bytes guarantee the transcript view exists to keep. Left as a deliberate exception, not an
-/// oversight; whether a guest should see the transcript stream AT ALL is a separate question about
-/// `policy.rs`'s tier table, not decided here.
+/// A body is every operator instruction, agent-to-agent message and webhook payload the agent was
+/// ever given. The board itself is readable by a guest by design (finding 062), including every
+/// `system_prompt` and ctx node; what only these surfaces hand over is the *conversation*.
+pub fn may_read_bodies(tier: ActorTier) -> bool {
+    tier >= ActorTier::Prompter
+}
+
+/// Mask a message for a caller who may not see all of it. Two fields, both server-side (client-side
+/// masking alone would not protect a caller hitting this route directly), both for everyone but the
+/// caller themselves:
+///
+/// - `body`, replaced by [`HIDDEN_BODY`] unless [`may_read_bodies`];
+/// - `on_behalf_of`, for a guest — the same rule `wheel-api`'s roster applies to
+///   `Member.email`/`Project.owner_id`'s display email. Unlike `user_id`/`owner_id`, it has no
+///   separate raw-opaque-id twin field: under `jwks` it IS the operator's principal, which for an
+///   email-shaped `sub` is a real email, so it is the thing being masked, not a value beside it.
+///
+/// `LogStream::Transcript` is not a message and is not masked here: it is the exact bytes written
+/// to the child's stdin, so a guest is refused it outright (`agent_routes::log`,
+/// `events_route::pump`) rather than shown an edited copy.
 pub fn mask_message_for_tier(
     mut message: wheel_core::Message,
     tier: ActorTier,
     caller: Option<&str>,
 ) -> wheel_core::Message {
+    let sent_by_caller = caller.is_some() && message.on_behalf_of.as_deref() == caller;
+    if sent_by_caller {
+        return message;
+    }
     if tier == ActorTier::Guest {
         if let Some(who) = &message.on_behalf_of {
-            if caller != Some(who.as_str()) {
-                message.on_behalf_of = Some(wheel_core::mask_identifier(who));
-            }
+            message.on_behalf_of = Some(wheel_core::mask_identifier(who));
         }
+    }
+    if !may_read_bodies(tier) {
+        message.body = HIDDEN_BODY.into();
     }
     message
 }
@@ -240,6 +255,46 @@ mod tests {
             let out = mask_message_for_tier(msg(Some("alice@example.com")), tier, None);
             assert_eq!(out.on_behalf_of.as_deref(), Some("alice@example.com"));
         }
+    }
+
+    #[test]
+    fn a_guest_gets_a_placeholder_for_a_body_they_did_not_send() {
+        for caller in [Some("bob@example.com"), None] {
+            let out =
+                mask_message_for_tier(msg(Some("alice@example.com")), ActorTier::Guest, caller);
+            assert_eq!(out.body, HIDDEN_BODY);
+        }
+        let out = mask_message_for_tier(msg(None), ActorTier::Guest, Some("bob@example.com"));
+        assert_eq!(
+            out.body, HIDDEN_BODY,
+            "an agent's or endpoint's message has no sender to match"
+        );
+    }
+
+    #[test]
+    fn a_guest_keeps_the_body_of_their_own_message_and_the_metadata_of_all() {
+        let own = mask_message_for_tier(
+            msg(Some("alice@example.com")),
+            ActorTier::Guest,
+            Some("alice@example.com"),
+        );
+        assert_eq!(own.body, "hello");
+
+        let mut theirs = msg(Some("alice@example.com"));
+        theirs.bytes = 5;
+        theirs.sha256 = "abc".into();
+        let out = mask_message_for_tier(theirs, ActorTier::Guest, None);
+        assert_eq!((out.bytes, out.sha256.as_str()), (5, "abc"));
+    }
+
+    #[test]
+    fn prompter_and_admin_see_every_body() {
+        for tier in [ActorTier::Prompter, ActorTier::Admin] {
+            assert!(may_read_bodies(tier));
+            let out = mask_message_for_tier(msg(Some("alice@example.com")), tier, None);
+            assert_eq!(out.body, "hello");
+        }
+        assert!(!may_read_bodies(ActorTier::Guest));
     }
 
     #[test]

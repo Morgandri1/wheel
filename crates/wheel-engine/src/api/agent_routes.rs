@@ -259,15 +259,25 @@ fn await_refused(r: crate::supervisor::awaits::AwaitRefused) -> ApiError {
     }
 }
 
+/// The `logs.stream` value the engine stores transcript lines under.
+const TRANSCRIPT_STREAM: &str = "transcript";
+
 /// `GET /v1/agents/:id/log?since=&stream=&limit=`
 ///
 /// `stream=transcript` returns the exact bytes written to the child's stdin,
 /// on this same route so the UI needs no second subscription.
+///
+/// The transcript is every message body the agent was given, so it is for callers `actor::may_read_bodies` allows
+/// only (finding 062): a guest asking for it by name gets `403 tier_required` — never an
+/// empty page, for the reason below — and an unfiltered read simply omits those rows. `next`
+/// advances over returned rows only, so a poller does not stall on rows it was never shown.
 pub async fn log(
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Query(q): Query<LogQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let bodies = super::actor::may_read_bodies(super::actor::tier_from_headers(&headers));
     // An unknown stream is refused rather than ignored. Passing it through to
     // SQL would match no rows and return an EMPTY page, which is the worst
     // outcome: the operator sees a heading with nothing under it and concludes
@@ -289,21 +299,35 @@ pub async fn log(
         }
     }
 
+    if !bodies && stream.as_deref() == Some(TRANSCRIPT_STREAM) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "tier_required",
+            "the transcript holds message bodies; it needs prompter tier or above",
+        ));
+    }
+
     let conn = s.db.lock().map_err(|_| ApiError::internal("db poisoned"))?;
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).min(10_000) as i64;
+    let hidden_stream = if bodies {
+        None
+    } else {
+        Some(TRANSCRIPT_STREAM)
+    };
 
     let mut stmt = conn
         .prepare(
             "SELECT seq, stream, at, text FROM logs
              WHERE node_id = ?1 AND seq > ?2 AND (?3 IS NULL OR stream = ?3)
+               AND (?5 IS NULL OR stream != ?5)
              ORDER BY seq LIMIT ?4",
         )
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let rows = stmt
         .query_map(
-            rusqlite::params![id.to_string(), since, stream, limit],
+            rusqlite::params![id.to_string(), since, stream, limit, hidden_stream],
             |r| {
                 Ok(serde_json::json!({
                     "node_id": id,
@@ -1434,6 +1458,230 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(msg.on_behalf_of.as_deref(), Some("alice@example.com"));
+    }
+
+    const SECRET_BODY: &str = "the launch code is 0000";
+
+    fn seed_log(s: &AppState, agent: Uuid) {
+        let conn = s.db.lock().unwrap();
+        for (seq, stream, text) in [
+            (1, "stdout", "said one"),
+            (2, "transcript", SECRET_BODY),
+            (3, "engine", "engine note"),
+            (4, "transcript", SECRET_BODY),
+        ] {
+            conn.execute(
+                "INSERT INTO logs (node_id,seq,stream,at,text) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    agent.to_string(),
+                    seq,
+                    stream,
+                    wheel_core::Timestamp::now().to_rfc3339(),
+                    text
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    async fn read_log(
+        s: &AppState,
+        agent: Uuid,
+        headers: axum::http::HeaderMap,
+        stream: Option<&str>,
+        since: Option<i64>,
+    ) -> ApiResult<Json<serde_json::Value>> {
+        log(
+            State(s.clone()),
+            headers,
+            Path(agent),
+            Query(LogQuery {
+                since,
+                stream: stream.map(str::to_string),
+                limit: None,
+            }),
+        )
+        .await
+    }
+
+    fn streams(v: &serde_json::Value) -> Vec<String> {
+        v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["stream"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unfiltered_log_read_omits_the_transcript_for_a_guest() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("log-guest-unfiltered");
+        let (target, _) = agent(&s, "target");
+        seed_log(&s, target);
+
+        for headers in [
+            actor_headers("guest", "bob@example.com"),
+            axum::http::HeaderMap::new(),
+        ] {
+            let Json(v) = read_log(&s, target, headers, None, None).await.unwrap();
+            assert_eq!(streams(&v), ["stdout", "engine"], "{v}");
+            assert!(!v.to_string().contains(SECRET_BODY), "{v}");
+            // The cursor stops at the last row shown, not at the hidden one after it.
+            assert_eq!(v["next"], 3, "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guest_asking_for_the_transcript_by_name_is_refused_not_given_an_empty_page() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("log-guest-named");
+        let (target, _) = agent(&s, "target");
+        seed_log(&s, target);
+
+        for headers in [
+            actor_headers("guest", "bob@example.com"),
+            axum::http::HeaderMap::new(),
+        ] {
+            let err = read_log(&s, target, headers, Some("transcript"), None)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "tier_required");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompter_and_an_admin_read_the_transcript_exactly_as_before() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("log-bodies-tier");
+        let (target, _) = agent(&s, "target");
+        seed_log(&s, target);
+
+        for tier in ["prompter", "admin"] {
+            let Json(all) = read_log(&s, target, actor_headers(tier, "carol"), None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                streams(&all),
+                ["stdout", "transcript", "engine", "transcript"]
+            );
+            assert_eq!(all["next"], 4);
+
+            let Json(only) = read_log(
+                &s,
+                target,
+                actor_headers(tier, "carol"),
+                Some("transcript"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(streams(&only), ["transcript", "transcript"]);
+            assert_eq!(only["lines"][0]["text"], SECRET_BODY);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guests_cursor_advances_over_rows_it_was_shown() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("log-guest-cursor");
+        let (target, _) = agent(&s, "target");
+        seed_log(&s, target);
+
+        let Json(v) = read_log(
+            &s,
+            target,
+            actor_headers("guest", "bob@example.com"),
+            None,
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert!(v["lines"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(
+            v["next"], 3,
+            "the cursor must not jump past unseen rows: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_hides_the_body_of_a_message_a_guest_did_not_send() {
+        use crate::api::cli_routes::await_tests::{agent, fake_state};
+        let (s, _dir) = fake_state("inbox-body-mask");
+        let (target, _) = agent(&s, "target");
+
+        let (_, Json(admins)) = send(
+            State(s.clone()),
+            Path(target),
+            actor_headers("admin", "alice@example.com"),
+            Json(SendBody {
+                body: "operator instruction".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let admins_id: Uuid = admins["id"].as_str().unwrap().parse().unwrap();
+        let (_, Json(bobs)) = send(
+            State(s.clone()),
+            Path(target),
+            actor_headers("guest", "bob@example.com"),
+            Json(SendBody {
+                body: "bob's own words".into(),
+                reply_to: None,
+                await_secs: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let bobs_id: Uuid = bobs["id"].as_str().unwrap().parse().unwrap();
+
+        let bob = || actor_headers("guest", "bob@example.com");
+        let Json(list) = inbox(
+            State(s.clone()),
+            bob(),
+            Path(target),
+            Query(InboxQuery {
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let bodies: Vec<_> = list["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            bodies.contains(&super::super::actor::HIDDEN_BODY.to_string()),
+            "{list}"
+        );
+        assert!(bodies.contains(&"bob's own words".to_string()), "{list}");
+        assert!(!list.to_string().contains("operator instruction"), "{list}");
+
+        let Json(one) = inbox_one(State(s.clone()), bob(), Path((target, admins_id)))
+            .await
+            .unwrap();
+        assert_eq!(one.body, super::super::actor::HIDDEN_BODY);
+        // Everything but the content is still there: sha256/bytes are metadata, by design.
+        assert!(one.bytes > 0 && !one.sha256.is_empty());
+        let Json(one) = inbox_one(State(s.clone()), bob(), Path((target, bobs_id)))
+            .await
+            .unwrap();
+        assert_eq!(one.body, "bob's own words");
+
+        let Json(one) = inbox_one(
+            State(s.clone()),
+            actor_headers("prompter", "carol@example.com"),
+            Path((target, admins_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.body, "operator instruction");
     }
 
     #[test]
