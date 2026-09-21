@@ -107,6 +107,14 @@ fn config_validation() {
         "wheel-host-production.up.railway.app",
     );
     std::env::set_var("ALLOW_PUBLIC_DOMAIN", "1");
+    assert!(
+        Config::from_env().is_err(),
+        "a public host with a short secret has nothing left between it and the internet"
+    );
+    std::env::set_var(
+        "WHEEL_HOST_SECRET",
+        "0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
     assert!(Config::from_env().is_ok());
 
     // An empty value is Railway saying "no domain", not a domain named "".

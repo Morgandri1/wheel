@@ -96,6 +96,9 @@ fn parse_oauth_allowlist() -> Result<Vec<uuid::Uuid>> {
         .collect()
 }
 
+/// Shortest secret accepted for a host that has a public domain.
+const PUBLIC_SECRET_MIN_LEN: usize = 32;
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let secret = var("WHEEL_HOST_SECRET")?;
@@ -123,6 +126,18 @@ impl Config {
 
         if secret.len() < 16 {
             bail!("WHEEL_HOST_SECRET must be at least 16 characters");
+        }
+        // Reachable from the internet, the bearer is the only thing between anyone and every
+        // tenant's sandbox, and the failed-attempt throttle cannot bound guessing once a correct
+        // bearer must always pass (it would otherwise be a way to lock the API out). Entropy is
+        // therefore the whole defence: `openssl rand -hex 32`.
+        if std::env::var("RAILWAY_PUBLIC_DOMAIN").is_ok_and(|d| !d.trim().is_empty())
+            && secret.len() < PUBLIC_SECRET_MIN_LEN
+        {
+            bail!(
+                "WHEEL_HOST_SECRET must be at least {PUBLIC_SECRET_MIN_LEN} characters when the \
+                 host has a public domain (try `openssl rand -hex 32`)"
+            );
         }
 
         let backend = match var_or("SANDBOX_BACKEND", "docker").as_str() {

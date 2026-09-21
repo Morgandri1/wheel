@@ -30,6 +30,16 @@ use wheel_core::client_ip::TrustedProxies;
 
 const WINDOW: Duration = Duration::from_secs(60);
 
+/// The most distinct callers tracked at once. Past it, new callers share one bucket.
+///
+/// Keyed on an address the edge vouches for, the key space is whatever a caller can make it: a
+/// rotating IPv6 /64, or a header the edge does not sanitise. Unbounded, an unauthenticated caller
+/// could grow this map until the process that supervises every tenant runs out of memory.
+const MAX_TRACKED: usize = 10_000;
+
+/// Where callers past [`MAX_TRACKED`] are counted together.
+const OVERFLOW: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
 pub struct AuthLimiter {
     max_failures_per_min: u32,
     trusted: TrustedProxies,
@@ -66,12 +76,27 @@ impl AuthLimiter {
         self.trusted.client(peer, &values.unwrap_or_default())
     }
 
+    /// The entry a caller is counted under: its own, or the shared one once the map is full.
+    fn key_for(map: &HashMap<IpAddr, Window>, peer: IpAddr) -> IpAddr {
+        if map.contains_key(&peer) || map.len() < MAX_TRACKED {
+            peer
+        } else {
+            OVERFLOW
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
+
     /// True when this peer still has budget to attempt authentication.
     pub fn may_attempt(&self, peer: IpAddr) -> bool {
         if self.max_failures_per_min == 0 {
             return true;
         }
         let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let peer = Self::key_for(&map, peer);
         match map.get(&peer) {
             Some(w) if w.started.elapsed() < WINDOW => w.failures < self.max_failures_per_min,
             // Window has closed; drop the stale entry so the map cannot grow without bound as
@@ -91,6 +116,11 @@ impl AuthLimiter {
             return;
         }
         let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_TRACKED && !map.contains_key(&peer) {
+            // Full: drop what has expired before deciding anyone shares a bucket.
+            map.retain(|_, w| w.started.elapsed() < WINDOW);
+        }
+        let peer = Self::key_for(&map, peer);
         let entry = map.entry(peer).or_insert_with(|| Window {
             started: Instant::now(),
             failures: 0,
@@ -146,6 +176,63 @@ mod tests {
         for _ in 0..100 {
             assert!(l.may_attempt(ip(3)));
         }
+    }
+
+    #[test]
+    fn the_map_stays_bounded_however_many_distinct_callers_fail() {
+        let l = AuthLimiter::new(3);
+        for n in 0..(MAX_TRACKED as u128 * 10) {
+            l.record_failure(IpAddr::from(n.to_be_bytes()));
+        }
+        assert!(
+            l.tracked() <= MAX_TRACKED + 1,
+            "{} entries tracked; a rotating key can OOM the host",
+            l.tracked()
+        );
+    }
+
+    #[test]
+    fn past_the_cap_new_callers_share_one_bucket_and_known_ones_keep_their_own() {
+        let l = AuthLimiter::new(2);
+        let known = IpAddr::from([10, 9, 9, 9]);
+        l.record_failure(known);
+        for n in 0..(MAX_TRACKED as u32 + 50) {
+            l.record_failure(IpAddr::from(n.to_be_bytes()));
+        }
+        // A caller first seen after the map filled is throttled with the others, not tracked alone.
+        let late = IpAddr::from([203, 0, 113, 1]);
+        for _ in 0..3 {
+            l.record_failure(late);
+        }
+        assert!(!l.may_attempt(late), "the shared bucket should be spent");
+        assert!(
+            l.may_attempt(known),
+            "a caller tracked before the cap kept its own budget"
+        );
+    }
+
+    #[test]
+    fn expired_entries_are_swept_when_the_map_is_full() {
+        let l = AuthLimiter::new(3);
+        {
+            let mut map = l.state.lock().unwrap();
+            for n in 0..MAX_TRACKED as u32 {
+                map.insert(
+                    IpAddr::from(n.to_be_bytes()),
+                    Window {
+                        started: Instant::now() - WINDOW * 2,
+                        failures: 1,
+                    },
+                );
+            }
+        }
+        let fresh = IpAddr::from([198, 51, 100, 7]);
+        l.record_failure(fresh);
+        assert_eq!(
+            l.tracked(),
+            1,
+            "the stale entries should have been swept, leaving only the new one"
+        );
     }
 
     #[test]
