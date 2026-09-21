@@ -125,13 +125,13 @@ table inet wheel_tenants {
       192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } }
   chain input   { type filter hook input   priority -10; iifname "wheel-tenants" drop }   # any host service: gateway IP, public IP, sshd, Caddy admin, published 80/443
   chain forward { type filter hook forward priority -10;
-      iifname "wheel-tenants" oifname "wheel-tenants" drop                                  # tenant -> tenant (needs no br_netfilter: this is the bridge's own traffic only when it is routed; enable_icc=false covers the L2 case)
+      iifname "wheel-tenants" oifname "wheel-tenants" drop                                  # tenant -> tenant: seen by `forward` ONLY with br_netfilter loaded (see below)
       iifname "wheel-tenants" meta nfproto ipv6 drop                                        # tenants have no IPv6; nothing to send
       iifname "wheel-tenants" ip daddr @denied4 drop }                                      # 100.64/10 (tailnet/CGNAT), RFC1918, link-local/metadata, the provider's private net
 }
 ```
 The deny list is the complement of "global unicast" for IPv4; adversary preferred an allow-list and this is the same set stated
-the way nft can express it. The ruleset ships as `infra/vps/tenant-firewall.nft` with a unit that re-applies it after Docker.
+the way nft can express it. **Tenant->tenant on one bridge is L2-switched** and reaches `forward` only when `br_netfilter` is loaded; where it is not, the rule above is a silent no-op. M3d therefore also installs a `table bridge` filter (hook `forward`, drop between two tenant ports) so the property does not depend on a kernel module being loaded, and the verify script's second-probe-container case is what proves it either way. The ruleset ships as `infra/vps/tenant-firewall.nft` with a unit that re-applies it after Docker.
 
 **Verification (M3d) — measured, from inside the tenant network, fail-closed.** `infra/vps/verify-tenant-isolation.sh` runs a
 probe container on `wheel-tenants` (and a second one for tenant->tenant). Exit 0 isolated and every probe ran / 1 reachable /
