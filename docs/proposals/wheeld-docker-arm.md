@@ -92,6 +92,63 @@ Adversary's full review is on #141. Accepted, and where each lands:
 **Not adopted:** digest-pinning as the image control (exact string equality from the proxy's own env is the control; use
 `image@sha256:` in the production compose for reproducibility). `--internal` + egress gateway: a later, separate decision.
 
+## M3 design delta — for adversary review BEFORE code
+
+Adversary's topology change is accepted (PM ruling). This is what it means concretely; nothing below is built.
+
+**Topology.** Two networks and no path between wheeld and a tenant:
+- `wheel-front` — Caddy and wheeld. Never attached to a tenant.
+- `wheel-tenants` — tenant containers only. A user-defined bridge named `wheel-tenants`
+  (`com.docker.network.bridge.name`), `enable_icc=false`, masquerade on (they need the internet), **no IPv6** (not enabled on the
+  network or daemon).
+- Engines listen on a **unix socket**: `WHEEL_LISTEN=unix:///run/wheel/engine.sock`. One named volume `wheel-sockets` is mounted
+  in wheeld at `/run/wheel-engines` and into each engine at `/run/wheel` as a `Mounts` entry with
+  `VolumeOptions.Subpath = <project uuid>` — an engine sees only its own directory. wheeld makes `<uuid>/` (0700) before the create.
+  `engine_base` becomes `unix:///run/wheel-engines/<uuid>/engine.sock`, which the host's proxy already speaks (the process
+  backend's transport, `proxy.rs`). `await_healthy` probes the socket; the image `HEALTHCHECK` (today `curl 127.0.0.1:7000`)
+  becomes `curl --unix-socket /run/wheel/engine.sock http://localhost/healthz`.
+- Requires Docker >= 26 (`Subpath`). wheeld cannot check the daemon version through the proxy (`/version` is refused by design),
+  so M4's preflight checks it and a create failure names the requirement.
+
+**Proxy changes (M3a).** HostConfig may carry `Mounts` with exactly one entry, `{Type: volume, Source: <socket volume, from the
+proxy's env>, Target: /run/wheel, VolumeOptions: {Subpath: <the uuid in the name>}}`, and nothing else; `WHEEL_LISTEN` must equal
+the socket path; NetworkMode is the tenant network. A **ceiling**: the proxy counts `wheel.project`-labelled containers and
+volumes (its own list call) and refuses a create past `DOCKER_PROXY_MAX_PROJECTS` (default 200).
+
+**Host firewall (M3d) — nftables, not iptables.** `DOCKER-USER` sees forwarded traffic only; tenant->host itself is `INPUT`. A
+separate table `inet wheel_tenants` hooked at `input` and `forward` (priority before Docker's chains) is independent of
+Docker's iptables mode, survives Docker restarts (Docker does not flush tables it did not create), and covers both families:
+```
+table inet wheel_tenants {
+  set denied4 { type ipv4_addr; flags interval; elements = {
+      0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24,
+      192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } }
+  chain input   { type filter hook input   priority -10; iifname "wheel-tenants" drop }   # any host service: gateway IP, public IP, sshd, Caddy admin, published 80/443
+  chain forward { type filter hook forward priority -10;
+      iifname "wheel-tenants" oifname "wheel-tenants" drop                                  # tenant -> tenant (needs no br_netfilter: this is the bridge's own traffic only when it is routed; enable_icc=false covers the L2 case)
+      iifname "wheel-tenants" meta nfproto ipv6 drop                                        # tenants have no IPv6; nothing to send
+      iifname "wheel-tenants" ip daddr @denied4 drop }                                      # 100.64/10 (tailnet/CGNAT), RFC1918, link-local/metadata, the provider's private net
+}
+```
+The deny list is the complement of "global unicast" for IPv4; adversary preferred an allow-list and this is the same set stated
+the way nft can express it. The ruleset ships as `infra/vps/tenant-firewall.nft` with a unit that re-applies it after Docker.
+
+**Verification (M3d) — measured, from inside the tenant network, fail-closed.** `infra/vps/verify-tenant-isolation.sh` runs a
+probe container on `wheel-tenants` (and a second one for tenant->tenant). Exit 0 isolated and every probe ran / 1 reachable /
+2 could not measure — never "isolated" from a probe that did not run (the lesson of #138's script). **Positive controls first**
+(a public IPv4 address on 443 must connect; DNS must resolve), then: the bridge gateway on 22/80/443/8080/2019, the host's public
+address, the second tenant's IP, wheeld's IP on `wheel-front`, `169.254.169.254`, `10.0.0.1`, `172.17.0.1`, `100.64.0.1`, and an
+IPv6 literal. Stub-tested with the same eight-case shape as `verify-network-isolation.test.sh`.
+
+**Order.** M3a proxy allowlist + ceiling -> M3b `DockerSandbox` unix channel + healthz + image healthcheck -> M3c wheeld off the
+network (compose) -> M3d nft ruleset + verify script + stub tests. Each its own small PR after #149.
+
+**Questions for adversary.** (1) Is `Subpath` on a shared volume an acceptable isolation between tenants' socket directories, or
+must each project get its own volume that wheeld attaches some other way? (2) Any tenant-reachable path to the host left with this
+ruleset — e.g. the tenant bridge's own gateway answering ARP/ICMP, Docker's embedded DNS resolver forwarding to a host-local
+resolver, `host.docker.internal`? (3) Is dropping IPv6 wholesale on the bridge right, or should the network be v6-capable with the
+same denied set mirrored?
+
 ## Deliberately out of scope
 - Per-node uid (037): SDK's proposal; docker mode fixes cross-*project* isolation, not agent-vs-agent inside one canvas.
 - The Railway 048 migration and the limiter PR #140: both only matter if `wheel-host` is ever internet-reachable. Parked / lower priority.
