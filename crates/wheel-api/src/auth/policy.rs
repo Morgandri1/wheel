@@ -368,6 +368,44 @@ mod tests {
         out
     }
 
+    /// Refuse any way of registering a route this scan cannot read. By IDENTIFIER, not a fixed list
+    /// of spellings: anything called `*_service`, anything called `fallback*`, and the method-router
+    /// constructors that take a filter or a service. A list of known-bad names is what missed
+    /// `fallback_service`, `put_service` and a top-level `route_service`. `nest` is only allowed
+    /// where the caller says so (the outermost router nests `/v1`, `/v1/cli` and `/ingress`).
+    fn refuse_unreadable_shapes(text: &str, allow_nest: bool, what: &str) {
+        for (i, _) in text.match_indices('(') {
+            let ident: String = text[..i]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let banned = ident.ends_with("_service")
+                || ident.starts_with("fallback")
+                || matches!(
+                    ident.as_str(),
+                    "merge"
+                        | "on"
+                        | "any"
+                        | "head"
+                        | "options"
+                        | "trace"
+                        | "connect"
+                        | "nest_service"
+                        | "route_service"
+                )
+                || (ident == "nest" && !allow_nest);
+            assert!(
+                !banned,
+                "the {what} router uses `{ident}(`, which this scan does not understand -- teach it, \
+                 or register the route in a shape it reads"
+            );
+        }
+    }
+
     /// The engine's `router()` function body, comments removed.
     fn engine_router_source() -> String {
         let src = std::fs::read_to_string(concat!(
@@ -378,6 +416,7 @@ mod tests {
         let start = src.find("pub fn router(").expect("the engine router");
         let end = start + src[start..].find("\n}\n").expect("the end of router()");
         let body = without_comments(&src[start..end]);
+        refuse_unreadable_shapes(&body, true, "engine");
         // The build may differ from the text: a gated registration is scanned here whether or not it
         // is compiled in, and an attribute on a route call is not something this scan reads.
         assert!(
@@ -407,27 +446,7 @@ mod tests {
     /// it reads source, it must REFUSE what it cannot read rather than skip it: a registration
     /// shape it does not understand fails the test loudly instead of contributing no rows.
     fn scan(window: &str, prefix: &str) -> Vec<EngineRoute> {
-        for shape in [
-            "merge",
-            "nest",
-            "route_service",
-            "nest_service",
-            "fallback",
-            "on",
-            "any",
-            "head",
-            "options",
-            "trace",
-            "connect",
-            "get_service",
-            "post_service",
-        ] {
-            assert!(
-                !calls(window, shape),
-                "the {prefix} router uses `{shape}(`, which this scan does not understand -- teach it, \
-                 or register the route in a shape it reads"
-            );
-        }
+        refuse_unreadable_shapes(window, false, prefix);
         window
             .split(".route(")
             .skip(1)
