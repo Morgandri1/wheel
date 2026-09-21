@@ -26,9 +26,24 @@ probe "/app"               /app               307 "$ORIGIN/sign-in" "${P[@]}"
 probe "/app/<id>"          /app/9b1d-44       307 "$ORIGIN/sign-in?next=%2Fapp%2F9b1d-44" "${P[@]}"
 probe "/app/invite/<tok>"  /app/invite/wi_abc 307 "$ORIGIN/sign-in?next=%2Fapp%2Finvite%2Fwi_abc" "${P[@]}"
 probe "hostile fwd host"   /app               307 "$ORIGIN/sign-in" -H Host:evil.example -H X-Forwarded-Host:evil.example -H X-Forwarded-Proto:http
+# Awkward paths must stay inside ?next= (encodeURIComponent escapes both / and \, so the target can
+# never be absolute or protocol-relative). Next itself answers the last two before middleware runs.
+NEXT="$ORIGIN/sign-in?next=%2Fapp%2F"
+probe "encoded backslash"  '/app/%5cevil.com'      307 "${NEXT}%255cevil.com" "${P[@]}"
+probe "encoded dot-dot"    '/app/..%2f..%2f'       307 "${NEXT}..%252f..%252f" "${P[@]}"
+probe "encoded //"         '/app/%2f%2fevil.com'   307 "${NEXT}%252f%252fevil.com" "${P[@]}"
+probe "encoded tab+newline" '/app/%09%0aevil.com'  307 "${NEXT}%2509%250aevil.com" "${P[@]}"
+probe "duplicate slash (Next)" '/app//evil.com'    308 "/app/evil.com" "${P[@]}"
+probe "raw backslash (Next)"   '/app/\evil.com'    308 "/app/evil.com" "${P[@]}" --path-as-is
 echo "== WHEEL_TRUST_PROXY only"
 start WHEEL_TRUST_PROXY=1
 probe "/app"               /app               307 "$ORIGIN/sign-in" "${P[@]}"
+# Pinned as CURRENT behaviour, not a wish: with no WHEEL_PUBLIC_ORIGIN, "trust the proxy" means the
+# forwarded host wins, so a client-supplied one steers the Location. wheel.avo.so sets
+# WHEEL_PUBLIC_ORIGIN, which is why the prod-config block above cannot be steered. This assertion
+# exists so a change to that branch fails loudly rather than silently altering who can steer it (for
+# instance a deployment that sets WHEEL_TRUST_PROXY=1 believing Caddy alone protects it).
+probe "hostile fwd host (trust-proxy only, steers)" /app 307 "https://evil.example/sign-in" -H Host:evil.example -H X-Forwarded-Host:evil.example -H X-Forwarded-Proto:https
 echo "== neither (localhost-only mode)"
 start
 probe "/app on localhost"  /app               307 "http://localhost:$PORT/sign-in" -H "Host: localhost:$PORT"
