@@ -363,3 +363,36 @@ async fn the_project_container_list_is_admitted_and_reduced() {
         "{heard:?}"
     );
 }
+
+/// Headers that change what a request IS — a connection upgrade, a deferred body, a chunked body —
+/// are refused before the policy runs, and the daemon never hears of the request. Pinned because the
+/// refusal is defence in depth: nothing else would fail if it were removed.
+#[tokio::test]
+async fn headers_that_change_what_a_request_is_are_refused_before_the_daemon_hears_it() {
+    let (daemon, seen) = fake_daemon_with(true);
+    let front = proxy_in_front_of(&daemon).await;
+    let id = Uuid::new_v4();
+    for (header, body) in [
+        ("upgrade: websocket", ""),
+        ("expect: 100-continue", ""),
+        ("transfer-encoding: chunked", "0\r\n\r\n"),
+    ] {
+        let mut s = tokio::net::UnixStream::connect(&front).await.unwrap();
+        let req = format!(
+            "GET /containers/wheel-p-{id}/json HTTP/1.1\r\nhost: docker\r\n{header}\r\nconnection: close\r\n\r\n{body}"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "{header} was not refused: {text}"
+        );
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the daemon heard a refused request: {:?}",
+        seen.lock().unwrap()
+    );
+}
