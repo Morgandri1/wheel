@@ -5,6 +5,7 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse, type NextFetchEvent, type NextMiddleware, type NextRequest } from "next/server";
 import { serverAuthMode } from "@/lib/runtime-config";
+import { publicOrigin } from "@/lib/same-origin";
 import { buildCsp } from "@/lib/csp";
 import { liveSessionToken, signInRedirect } from "@/lib/session-cookie";
 
@@ -49,7 +50,16 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
   if (mode === "local") {
     const target = signInRedirect(req.nextUrl.pathname, liveSessionToken(req) !== null);
     if (target) {
-      const redirect = NextResponse.redirect(new URL(target, req.url));
+      // The base is the origin browsers use, not `req.url`: behind a proxy Next's standalone builds
+      // `req.url` from its own bind address (HOSTNAME/PORT), which sent browsers to
+      // https://localhost:3000. `publicOrigin` is the derivation every /api route already uses: a
+      // configured WHEEL_PUBLIC_ORIGIN wins outright, and forwarded headers count only under
+      // WHEEL_TRUST_PROXY, so a client cannot steer it. `"null"` means it cannot be told, which is
+      // only reachable with neither setting — the localhost-only mode, where `req.url` is right.
+      // (A relative Location does not work here: Next's middleware adapter parses it as absolute
+      // and answers 500.) `target` is always an app-built `/sign-in[?next=<encoded /app path>]`.
+      const origin = publicOrigin(req);
+      const redirect = NextResponse.redirect(new URL(target, origin === "null" ? req.url : origin));
       redirect.headers.set("content-security-policy", csp);
       return redirect;
     }
