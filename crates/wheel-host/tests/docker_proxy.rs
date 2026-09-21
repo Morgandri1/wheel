@@ -460,7 +460,7 @@ async fn raw_with_headers(sock: &std::path::Path, extra: &str, body: &str) -> u1
     );
     s.write_all(req.as_bytes()).await.unwrap();
     let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut out)).await;
     String::from_utf8_lossy(&out).split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
 }
 
