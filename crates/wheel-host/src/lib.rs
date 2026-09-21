@@ -15,6 +15,7 @@
 pub mod auth_limit;
 pub mod config;
 pub mod disk;
+pub mod docker_proxy;
 pub mod proxy;
 pub mod sandbox;
 pub mod store;
