@@ -1662,3 +1662,106 @@ async fn a_dead_invite_link_is_a_404_and_leaves_the_visitors_session_alone() {
         "a stale link ended the visitor's session"
     );
 }
+
+// --------------------------------------------------------------------------- the events socket
+
+/// The handshake headers the engine received for `GET /v1/events`, waiting for them: the bridge
+/// connects upstream after the caller's upgrade, so the recorder can lag the client's own answer.
+async fn events_handshake(engine: &EngineLog) -> HeaderMap {
+    for _ in 0..100 {
+        let seen = engine.take();
+        if let Some((_, headers)) = seen.into_iter().find(|(t, _)| t.starts_with("/v1/events")) {
+            return headers;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the engine never received an events handshake");
+}
+
+/// Open the events socket against the real router. Whether the mock engine then completes the
+/// upgrade does not matter here — it answers plain JSON — only what it was TOLD does.
+async fn open_events(
+    addr: std::net::SocketAddr,
+    project: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = format!("ws://{addr}/v1/projects/{project}/engine/v1/events{query}");
+    let mut req = url.into_client_request().unwrap();
+    for (k, v) in extra {
+        req.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    let _ = tokio_tungstenite::connect_async(req).await;
+}
+
+/// The engine decides what a socket may see (the transcript, message bodies) from the tier this API
+/// forwards on the WebSocket handshake. Nothing pinned that the tier reaching it is the caller's REAL
+/// one — the redeemed ticket's, or the session's — rather than one the caller wrote themselves on
+/// the upgrade request, which a browser cannot do but a script can.
+#[tokio::test]
+async fn the_events_socket_tells_the_engine_the_callers_real_tier() {
+    let h = harness().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = h.app.clone();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let forged = [
+        ("x-wheel-actor-id", "creator@example.com"),
+        ("x-wheel-actor-tier", "admin"),
+    ];
+    for (tier, token, id) in [
+        ("guest", &h.guest, &h.guest_id),
+        ("prompter", &h.prompter, &h.prompter_id),
+        ("admin", &h.creator, &h.creator_id),
+    ] {
+        // The ticket door: a browser's, with the tier forged on the handshake as well.
+        let (status, minted) = call(
+            &h.app,
+            "POST",
+            &format!("/v1/projects/{}/ws-ticket", h.project),
+            Some(token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        let ticket = minted["ticket"].as_str().unwrap().to_string();
+        open_events(addr, &h.project, &format!("?ticket={ticket}"), &forged).await;
+        let headers = events_handshake(&h.engine).await;
+        assert_eq!(
+            headers.get("x-wheel-actor-tier").unwrap(),
+            tier,
+            "ticket door"
+        );
+        assert_eq!(
+            headers.get("x-wheel-actor-id").unwrap(),
+            id.as_str(),
+            "ticket door"
+        );
+        assert_eq!(headers.get_all("x-wheel-actor-tier").iter().count(), 1);
+
+        // The header door: a script's, again with a forged tier riding along.
+        let mut with_auth = vec![
+            ("x-auth-token", token.as_str()),
+            ("x-project-id", h.project.as_str()),
+        ];
+        with_auth.extend_from_slice(&forged);
+        open_events(addr, &h.project, "", &with_auth).await;
+        let headers = events_handshake(&h.engine).await;
+        assert_eq!(
+            headers.get("x-wheel-actor-tier").unwrap(),
+            tier,
+            "header door"
+        );
+        assert_eq!(
+            headers.get("x-wheel-actor-id").unwrap(),
+            id.as_str(),
+            "header door"
+        );
+        assert_eq!(headers.get_all("x-wheel-actor-tier").iter().count(), 1);
+    }
+}
