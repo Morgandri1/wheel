@@ -60,3 +60,66 @@ describe("the document CSP", () => {
     expect(routeHeaders.get("content-security-policy")).toBe("sandbox");
   });
 });
+
+/**
+ * P0 (wheel.avo.so): a signed-out visit to /app answered `Location: https://localhost:3000/sign-in`.
+ * Behind Caddy, Next's standalone server builds `req.url` from its own bind address
+ * (HOSTNAME=127.0.0.1, PORT=3000), and only the headers carry the public host — so any absolute
+ * URL built from `req.url` points the browser at the server's own loopback. The redirect is
+ * therefore relative: the browser resolves it against the URL IT used, with no host derivation and
+ * no forwarded header able to steer it (nothing to open-redirect through).
+ */
+function behindProxy(path: string, headers: Record<string, string> = {}) {
+  return new NextRequest(
+    new Request(`http://localhost:3000${path}`, {
+      headers: {
+        host: "wheel.avo.so",
+        "x-forwarded-host": "wheel.avo.so",
+        "x-forwarded-proto": "https",
+        ...headers,
+      },
+    }),
+  );
+}
+
+describe("the signed-out redirect, behind a proxy", () => {
+  beforeEach(() => {
+    vi.stubEnv("WHEEL_AUTH_MODE", "local");
+    vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "https://wheel.avo.so");
+    vi.stubEnv("WHEEL_TRUST_PROXY", "1");
+  });
+
+  it.each([
+    ["/app", "/sign-in"],
+    ["/app/9b1d-44", "/sign-in?next=%2Fapp%2F9b1d-44"],
+    ["/app/invite/wi_abc", "/sign-in?next=%2Fapp%2Finvite%2Fwi_abc"],
+  ])("sends %s to %s without ever naming the server's own address", async (path, expected) => {
+    const res = await middleware(behindProxy(path), ev);
+    expect(res.status).toBe(307);
+    const location = res.headers.get("location") ?? "";
+    expect(location).toBe(expected);
+    expect(location).not.toMatch(/localhost|127\.0\.0\.1|:3000/);
+  });
+
+  it("stays relative whatever the forwarded headers claim — they cannot steer it", async () => {
+    const res = await middleware(
+      behindProxy("/app", { "x-forwarded-host": "evil.example", host: "evil.example", "x-forwarded-proto": "http" }),
+      ev,
+    );
+    const location = res.headers.get("location") ?? "";
+    expect(location).toBe("/sign-in");
+    expect(location.startsWith("//")).toBe(false);
+  });
+
+  it("carries the document CSP on the redirect, as it did before", async () => {
+    const res = await middleware(behindProxy("/app"), ev);
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
+  it("does not redirect a visitor whose session cookie is live", async () => {
+    const b = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const jwt = `${b({ alg: "HS256" })}.${b({ sub: "u1", exp: Math.floor(Date.now() / 1000) + 600 })}.x`;
+    const res = await middleware(behindProxy("/app", { cookie: `__Host-wheel_session=${jwt}` }), ev);
+    expect(res.headers.get("location")).toBeNull();
+  });
+});

@@ -49,7 +49,12 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
   if (mode === "local") {
     const target = signInRedirect(req.nextUrl.pathname, liveSessionToken(req) !== null);
     if (target) {
-      const redirect = NextResponse.redirect(new URL(target, req.url));
+      // Relative on purpose. Behind a proxy `req.url` is this server's own bind address (Next's
+      // standalone builds it from HOSTNAME/PORT), so `new URL(target, req.url)` sent browsers to
+      // https://localhost:3000. A relative Location is resolved by the browser against the URL it
+      // actually used: no host is derived here, so no forwarded header can steer it either.
+      // `target` is always a path this app built (`/sign-in[?next=<encoded /app path>]`).
+      const redirect = new NextResponse(null, { status: 307, headers: { location: target } });
       redirect.headers.set("content-security-policy", csp);
       return redirect;
     }
