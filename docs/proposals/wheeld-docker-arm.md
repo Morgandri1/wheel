@@ -78,6 +78,17 @@ Adversary's full review is on #141. Accepted, and where each lands:
   never boot docker mode as if they did not exist).
 - Reconcile also stops containers whose record says stopped/absent, and garbage-collects `wheel.project`-labelled orphans.
 
+**Hardening carried forward from adversary's approval of M2 (non-blocking for M2; land in M1/M3/M4)**
+- `MemorySwap` must equal `Memory` in the golden create (otherwise a container gets twice its memory in swap) — proxy and
+  `DockerSandbox` together (M1).
+- A ceiling on project containers and volumes per host (a compromised wheeld could otherwise create N at the per-container cap and
+  OOM the box or fill the disk) — enforced by the proxy counting `wheel.project`-labelled objects (M3).
+- `daemon.json`: `log-driver: local` with `max-size`/`max-file`; `/var/lib/docker` on its own filesystem (the proxy can't set a
+  volume quota); `userns-remap` (M4 host preparation checklist).
+- `umask` set before the proxy binds its socket (M1, with the mode set explicitly after).
+- **M4 rehearsal asserts** `docker inspect wheeld` shows **no** `docker.sock` mount, no `Privileged`, no host network, and that
+  the proxy container is on no network wheeld or tenants share (unix socket only).
+
 **Not adopted:** digest-pinning as the image control (exact string equality from the proxy's own env is the control; use
 `image@sha256:` in the production compose for reproducibility). `--internal` + egress gateway: a later, separate decision.
 
