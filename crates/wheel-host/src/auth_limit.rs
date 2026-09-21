@@ -38,12 +38,18 @@ const WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED: usize = 10_000;
 
 /// Where callers past [`MAX_TRACKED`] are counted together.
+/// The least time between two sweeps of a full map. Windows last a minute, so this loses nothing.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
 const OVERFLOW: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 pub struct AuthLimiter {
     max_failures_per_min: u32,
     trusted: TrustedProxies,
     state: Mutex<HashMap<IpAddr, Window>>,
+    /// When the map was last swept of expired entries while full. A sweep is a pass over every
+    /// entry, so doing one per insert made a full map quadratic to fill (100k inserts took ~2 minutes).
+    last_sweep: Mutex<Instant>,
 }
 
 struct Window {
@@ -57,6 +63,11 @@ impl AuthLimiter {
             max_failures_per_min,
             trusted: TrustedProxies::default(),
             state: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(
+                Instant::now()
+                    .checked_sub(SWEEP_EVERY)
+                    .unwrap_or_else(Instant::now),
+            ),
         }
     }
 
@@ -117,8 +128,13 @@ impl AuthLimiter {
         }
         let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_TRACKED && !map.contains_key(&peer) {
-            // Full: drop what has expired before deciding anyone shares a bucket.
-            map.retain(|_, w| w.started.elapsed() < WINDOW);
+            // Full: drop what has expired before deciding anyone shares a bucket — but at most
+            // once per SWEEP_EVERY, not per insert.
+            let mut last = self.last_sweep.lock().unwrap_or_else(|e| e.into_inner());
+            if last.elapsed() >= SWEEP_EVERY {
+                map.retain(|_, w| w.started.elapsed() < WINDOW);
+                *last = Instant::now();
+            }
         }
         let peer = Self::key_for(&map, peer);
         let entry = map.entry(peer).or_insert_with(|| Window {
