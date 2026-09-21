@@ -442,15 +442,30 @@ for (const scheme of ["http", "https"] as const) {
       expect(seen.filter((u) => new URL(u).origin !== proxy.origin), "the browser left the public origin").toEqual([]);
     });
 
-    test("E2E-proxy-rsc-redirect-followed: a client-side RSC/prefetch of /app follows the redirect on the public origin", async ({ page }) => {
-      await page.goto(proxy.origin + "/sign-in", { waitUntil: "domcontentloaded" });
-      const r = await page.evaluate(async () => {
-        const res = await fetch("/app", { headers: { RSC: "1", "Next-Router-Prefetch": "1" } });
-        return { url: res.url, redirected: res.redirected, status: res.status };
+    test("E2E-proxy-rsc-redirect-followed: a client-side RSC/prefetch of /app is redirected to the public origin", async ({ page }) => {
+      const hops: { url: string; status: number; location?: string }[] = [];
+      page.on("response", (res) => {
+        if (new URL(res.url()).pathname === "/app") hops.push({ url: res.url(), status: res.status(), location: res.headers()["location"] });
       });
-      expect(r.redirected, "the prefetch of a protected route should have been redirected").toBe(true);
-      expect(new URL(r.url).origin, "the followed redirect left the public origin").toBe(proxy.origin);
-      expect(r.status, "the followed redirect must not end in an error").toBeLessThan(400);
+      await page.goto(proxy.origin + "/sign-in", { waitUntil: "domcontentloaded" });
+      const followed = await page.evaluate(async () => {
+        try {
+          const res = await fetch("/app", { headers: { RSC: "1", "Next-Router-Prefetch": "1" } });
+          return { url: res.url, redirected: res.redirected, status: res.status };
+        } catch (e) {
+          return { error: String(e) };
+        }
+      });
+      expect(hops, "the prefetch reached the server once").toHaveLength(1);
+      expect(hops[0].status).toBe(307);
+      expect(hops[0].location, "the redirect the browser was handed").toBe(`${proxy.origin}/sign-in`);
+      // The CSP's upgrade-insecure-requests rewrites the followed hop of an http page to https, so
+      // only the https page can complete the follow; over http the assertion above is the whole point.
+      if (scheme === "https") {
+        expect(followed, "the followed redirect").toMatchObject({ redirected: true });
+        expect(new URL((followed as { url: string }).url).origin).toBe(proxy.origin);
+        expect((followed as { status: number }).status).toBeLessThan(400);
+      }
     });
 
     test("E2E-proxy-browser-no-invalid-url: the server never logged ERR_INVALID_URL", async () => {
