@@ -646,11 +646,12 @@ mod unix_transport {
 
     #[tokio::test]
     async fn proxies_over_a_unix_socket_and_still_swaps_the_bearer() {
-        let sock = std::env::temp_dir()
-            .join(format!("wheel-eng-{}.sock", Uuid::new_v4()))
-            .to_str()
-            .unwrap()
-            .to_string();
+        // A fixed short directory, not `temp_dir()`: a unix socket path must fit in `sun_path`
+        // (~104 bytes), and a sandbox's TMPDIR alone can exceed that.
+        let sock = format!(
+            "/tmp/wh-eng-{}.sock",
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
         let seen = socket_engine(sock.clone()).await;
         let (app, id) = harness_socket(sock).await;
 
