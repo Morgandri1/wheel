@@ -37,6 +37,8 @@ struct Daemon {
     start_code: u16,
     /// The `wheel.spec` label of the last create, as a real daemon would remember it.
     spec: Option<String>,
+    /// What a list of project containers returns: (project, docker state).
+    listed: Vec<(Uuid, &'static str)>,
     /// A raw daemon answers `GET /version`; the proxy never lets it get that far.
     requests: Vec<String>,
 }
@@ -49,6 +51,7 @@ impl Daemon {
             health: None,
             start_code: 204,
             spec: None,
+            listed: vec![],
             requests: vec![],
         }
     }
@@ -104,7 +107,16 @@ fn fake_daemon(initial: Daemon) -> (std::path::PathBuf, Arc<Mutex<Daemon>>) {
                     let mut d = shared.lock().unwrap();
                     d.requests.push(format!("{method} {path}"));
                     if path.ends_with("/containers/json") {
-                        (200, "[]".to_string())
+                        let items: Vec<String> = d
+                            .listed
+                            .iter()
+                            .map(|(id, state)| {
+                                format!(
+                                    r#"{{"Names":["/wheel-p-{id}"],"State":"{state}","Labels":{{"wheel.project":"{id}"}}}}"#
+                                )
+                            })
+                            .collect();
+                        (200, format!("[{}]", items.join(",")))
                     } else if path.ends_with("/version") {
                         (
                             200,
@@ -542,4 +554,77 @@ async fn the_raw_socket_flag_is_ignored_outside_a_dev_environment() {
 
     std::env::remove_var(wheeld::docker_arm::ENV_ALLOW_RAW_SOCKET);
     std::env::set_var("WHEEL_ENV", "prod");
+}
+
+fn stops(d: &Arc<Mutex<Daemon>>, project: Uuid) -> usize {
+    d.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| **r == format!("POST /containers/wheel-p-{project}/stop"))
+        .count()
+}
+
+/// A container with no project row may be someone's only copy (a store restored from an older
+/// backup looks exactly like this): it is stopped and reported, and NEVER removed.
+#[tokio::test]
+async fn a_container_with_no_project_record_is_stopped_and_never_deleted() {
+    let _guard = env_lock().lock().await;
+    let orphan = Uuid::new_v4();
+    let (daemon_sock, daemon) = fake_daemon(Daemon {
+        listed: vec![(orphan, "running")],
+        ..Daemon::absent()
+    });
+    let front = proxy_in_front_of(&daemon_sock).await;
+    use_docker_host(&front);
+    let dir = wheeld::supervise::prepare_data_dir(&short("data")).unwrap();
+
+    boot(&dir).await.unwrap();
+
+    assert_eq!(
+        stops(&daemon, orphan),
+        1,
+        "{:?}",
+        daemon.lock().unwrap().requests
+    );
+    let d = daemon.lock().unwrap().requests.clone();
+    assert!(
+        !d.iter().any(|r| r.starts_with("DELETE")),
+        "an orphan's container or volume was removed: {d:?}"
+    );
+}
+
+/// docker's own `unless-stopped` brings a container back before wheeld ever looks, so a project
+/// the store says should not run has to be stopped explicitly; one it wants running must not be.
+#[tokio::test]
+async fn a_container_the_store_says_should_not_run_is_stopped_and_a_wanted_one_is_not() {
+    let _guard = env_lock().lock().await;
+    let unwanted = Uuid::new_v4();
+    let wanted = Uuid::new_v4();
+    let (daemon_sock, daemon) = fake_daemon(Daemon {
+        listed: vec![(unwanted, "running"), (wanted, "running")],
+        ..Daemon::absent()
+    });
+    let front = proxy_in_front_of(&daemon_sock).await;
+    use_docker_host(&front);
+    let dir = data_dir_with_running_project(wanted).await;
+    let store = wheel_host::store::Store::open(&dir.join("host.db").display().to_string()).unwrap();
+    store
+        .upsert(&unwanted, "engine-secret-of-that-project", VAULT_KEY)
+        .await
+        .unwrap();
+
+    boot(&dir).await.unwrap();
+
+    assert_eq!(
+        stops(&daemon, unwanted),
+        1,
+        "{:?}",
+        daemon.lock().unwrap().requests
+    );
+    assert_eq!(
+        stops(&daemon, wanted),
+        0,
+        "a wanted project was stopped by the sweep"
+    );
 }
