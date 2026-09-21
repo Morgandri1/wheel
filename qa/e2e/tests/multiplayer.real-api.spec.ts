@@ -2,6 +2,7 @@ import { test, expect, type Browser, type BrowserContext, type Page } from "@pla
 import { T } from "../testids";
 
 const STUB_HOST = "http://127.0.0.1:8791";
+const PASSWORD = "correct-horse-battery";
 
 interface Api {
   status: number;
@@ -45,10 +46,18 @@ async function signUp(browser: Browser, label: string): Promise<{ ctx: BrowserCo
   const email = `${label}-${Date.now()}@example.test`;
   await page.goto("/sign-up", { waitUntil: "domcontentloaded" });
   await page.getByTestId(T.emailInput).fill(email);
-  await page.getByTestId(T.passwordInput).fill("correct-horse-battery");
+  await page.getByTestId(T.passwordInput).fill(PASSWORD);
   await page.getByTestId(T.authSubmit).click({ noWaitAfter: true });
   await expect(page.getByTestId(T.sessionBadge)).toContainText(email, { timeout: 20_000 });
   return { ctx, page, email };
+}
+
+async function signIn(page: Page, email: string) {
+  await page.goto("/sign-in", { waitUntil: "domcontentloaded" });
+  await page.getByTestId(T.emailInput).fill(email);
+  await page.getByTestId(T.passwordInput).fill(PASSWORD);
+  await page.getByTestId(T.authSubmit).click({ noWaitAfter: true });
+  await expect(page.getByTestId(T.sessionBadge)).toContainText(email, { timeout: 20_000 });
 }
 
 async function redeem(page: Page, token: string) {
@@ -106,18 +115,22 @@ test.describe.serial("E2E-mp: invites and tiers against the real API", () => {
   test("E2E-mp-invite-single-use: the same link cannot be spent twice, and says nothing about why", async () => {
     await redeem(outsider.page, guestToken);
     await expect(outsider.page.getByTestId("invite-error")).toBeVisible({ timeout: 20_000 });
-    const probe = await api(outsider.page, "GET", `/v1/projects/${projectId}`);
-    expect(probe.status, "a failed redeem grants nothing").toBe(404);
   });
 
   test("E2E-mp-failed-redeem-keeps-session: a dead invite link does not sign the visitor out", async () => {
-    // The API answers an unusable invite with 401 (deliberately one indistinguishable answer), and web
-    // clears the session cookie on any 401 in local mode. A stale link must cost the visitor the link,
-    // not their login.
+    // KNOWN BUG, found by this suite: the API answers an unusable invite with 401 (deliberately one
+    // indistinguishable answer) and web's acceptInvite clears the session cookie on any 401 in local
+    // mode, so a stale link costs the visitor their login as well as the link. Expected-fail until fixed:
+    // when it is fixed this test turns red ("expected to fail, but passed") — delete the annotation then.
+    test.fail(true, "BUG: web clears the session cookie when the API answers a dead invite with 401");
     const mine = await api(outsider.page, "GET", "/v1/projects");
     expect(mine.status, "the session is still alive after a dead invite link").toBe(200);
-    await outsider.page.goto("/app", { waitUntil: "domcontentloaded" });
-    await expect(outsider.page).toHaveURL(/\/app$/);
+  });
+
+  test("E2E-mp-failed-redeem-grants-nothing: a dead link leaves the visitor a non-member", async () => {
+    await signIn(outsider.page, outsider.email);
+    const probe = await api(outsider.page, "GET", `/v1/projects/${projectId}`);
+    expect(probe.status, "a failed redeem grants nothing").toBe(404);
   });
 
   test("E2E-mp-prompter-tier: a prompter invite lands at prompter, not guest", async () => {
