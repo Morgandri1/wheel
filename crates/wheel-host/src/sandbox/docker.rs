@@ -307,6 +307,7 @@ impl DockerSandbox {
             // if anything, is granted.
             security_opt: Some(vec!["no-new-privileges".into()]),
             memory: Some(self.cfg.memory_bytes),
+            memory_swap: Some(self.cfg.memory_bytes),
             nano_cpus: Some(self.cfg.nano_cpus),
             pids_limit: Some(self.cfg.pids_limit),
             network_mode: Some(self.cfg.docker_network.clone()),

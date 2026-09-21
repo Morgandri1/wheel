@@ -206,8 +206,12 @@ pub async fn serve(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)
-        .with_context(|| format!("binding {}", path.display()))?;
+    // Created private from the first instant; the mode is then set explicitly below.
+    // SAFETY: `umask` only swaps this process's file-creation mask.
+    let previous = unsafe { libc::umask(0o177) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { libc::umask(previous) };
+    let listener = bound.with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .context("setting the socket mode")?;
     if let Some((uid, gid)) = owner {

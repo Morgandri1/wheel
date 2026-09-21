@@ -286,6 +286,13 @@ pub async fn start_host_with(
     })
 }
 
+/// The sandbox behind the host, and whichever concrete handle the daemon itself must keep.
+type ChosenSandbox = (
+    Arc<dyn wheel_host::sandbox::Sandbox>,
+    Option<Arc<embedded::EmbeddedSandbox>>,
+    Option<Arc<wheel_host::sandbox::docker::DockerSandbox>>,
+);
+
 /// The host over the chosen sandbox: engines embedded in this process, or a container each.
 async fn build_host_state(
     data_dir: &std::path::Path,
@@ -300,11 +307,7 @@ async fn build_host_state(
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
     )?);
-    let (sandbox, embedded, docker): (
-        Arc<dyn wheel_host::sandbox::Sandbox>,
-        Option<Arc<embedded::EmbeddedSandbox>>,
-        Option<Arc<wheel_host::sandbox::docker::DockerSandbox>>,
-    ) = match mode {
+    let (sandbox, embedded, docker): ChosenSandbox = match mode {
         config::SandboxMode::Embedded => {
             let embedded = Arc::new(
                 embedded::EmbeddedSandbox::for_data_dir(
