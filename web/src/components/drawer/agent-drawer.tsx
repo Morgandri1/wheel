@@ -13,6 +13,7 @@ import { AGENT_STATUS_META } from "@/lib/node-meta";
 import { clearDraft, readDraft, writeDraft } from "@/lib/drafts";
 import { displayState, senderKind, senderLabel } from "@/lib/message-state";
 import { LIMITS, byteLength, checkLimit, formatBytes } from "@/lib/limits";
+import { HIDDEN_LABEL, isRedactedMessage, redactedStreamsOf, transcriptHidden } from "@/lib/redaction";
 import type { EngineApi } from "@/lib/api";
 import type { AgentStatus, Message, WheelNode } from "@/lib/schema";
 
@@ -20,10 +21,13 @@ export function AgentDrawer({
   nodes,
   api,
   projectId,
+  tier,
 }: {
   nodes: WheelNode[];
   api: EngineApi;
   projectId: string;
+  /** The caller's tier on this project; decides what is offered, never what is allowed. */
+  tier?: string;
 }) {
   const tabs = useBoardStore((s) => s.drawerTabs);
   const activeTab = useBoardStore((s) => s.activeTab);
@@ -39,6 +43,8 @@ export function AgentDrawer({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const seeded = useRef(new Set<string>());
+  /** Streams the engine said it left out of each agent's first log page (finding 062). */
+  const [withheld, setWithheld] = useState<Record<string, string[]>>({});
 
   const byId = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
   const node = activeTab ? byId.get(activeTab) : null;
@@ -55,7 +61,11 @@ export function AgentDrawer({
     void api
       .agent(activeTab)
       .log()
-      .then((r) => seedLog(activeTab, r.lines))
+      .then((r) => {
+        seedLog(activeTab, r.lines);
+        const streams = redactedStreamsOf(r);
+        if (streams.length) setWithheld((prev) => ({ ...prev, [activeTab]: streams }));
+      })
       .catch(() => seeded.current.delete(activeTab));
   }, [activeTab, api, seedLog]);
 
@@ -69,6 +79,7 @@ export function AgentDrawer({
    * in stdout when the two are interleaved.
    */
   const lines = view === "transcript" ? all.filter((l) => l.stream === "transcript") : all;
+  const hidden = transcriptHidden(tier, (activeTab && withheld[activeTab]) || []);
   const thread = activeTab
     ? messages.filter((m) => m.to === activeTab || (m.from.kind === "node" && m.from.id === activeTab))
     : [];
@@ -169,7 +180,11 @@ export function AgentDrawer({
       {open ? (
         <>
           <div className="min-h-0 flex-1">
-            {view === "log" || view === "transcript" ? (
+            {view === "transcript" && hidden ? (
+              <p className="p-3 text-micro text-ink-faint" data-testid="transcript-hidden">
+                {HIDDEN_LABEL}. The transcript holds message bodies.
+              </p>
+            ) : view === "log" || view === "transcript" ? (
               <LogStream lines={lines} empty={view === "transcript" ? TRANSCRIPT_EMPTY : undefined} />
             ) : (
               <ul className="h-full overflow-y-auto p-3" data-testid="message-list">
@@ -198,7 +213,13 @@ export function AgentDrawer({
                           {m.sha256.slice(0, 8)}
                         </span>
                       </p>
-                      <p className="whitespace-pre-wrap text-meta">{m.body}</p>
+                      {isRedactedMessage(m) ? (
+                        <p className="text-meta italic text-ink-faint" data-testid={`msg-${m.id}-hidden`}>
+                          {HIDDEN_LABEL}
+                        </p>
+                      ) : (
+                        <p className="whitespace-pre-wrap text-meta">{m.body}</p>
+                      )}
                     </li>
                   ))
                 ) : (

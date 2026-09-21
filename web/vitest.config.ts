@@ -73,6 +73,7 @@ export default defineConfig({
         // branch here offers a guest a button that 403s, or hides one an admin needs, and both
         // read as the product being broken.
         "src/lib/tiers.ts",
+        "src/lib/redaction.ts",
         "src/components/members/members-panel.tsx",
       ],
       thresholds: { lines: 90, functions: 90, branches: 85, statements: 90 },

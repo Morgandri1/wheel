@@ -297,7 +297,7 @@ export default function BoardPage({ params }: { params: Promise<{ projectId: str
             />
           </div>
           <StatusBar nodes={nodes} />
-          <AgentDrawer nodes={nodes} api={api} projectId={projectId} />
+          <AgentDrawer nodes={nodes} api={api} projectId={projectId} tier={project.data?.tier} />
         </>
       )}
       <MembersPanel

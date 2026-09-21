@@ -318,7 +318,10 @@ export function engineApi(projectId: string) {
         const q = new URLSearchParams();
         if (opts.since !== undefined) q.set("since", String(opts.since));
         if (opts.stream) q.set("stream", opts.stream);
-        return request<{ lines: LogLine[] }>(withQuery(engine("agents", nodeId, "log"), q), p);
+        return request<{ lines: LogLine[]; next?: number; redacted_streams?: string[] }>(
+          withQuery(engine("agents", nodeId, "log"), q),
+          p,
+        );
       },
       authStatus: () => request<AuthStatus>(engine("agents", nodeId, "auth"), p),
       authBegin: (body?: { mode?: "paste_code" | "device_code" | "api_key" }) =>
