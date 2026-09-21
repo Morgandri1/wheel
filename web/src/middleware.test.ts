@@ -60,3 +60,93 @@ describe("the document CSP", () => {
     expect(routeHeaders.get("content-security-policy")).toBe("sandbox");
   });
 });
+
+/**
+ * P0 (wheel.avo.so): a signed-out visit to /app answered `Location: https://localhost:3000/sign-in`.
+ * Behind Caddy, Next's standalone server builds `req.url` from its own bind address
+ * (HOSTNAME=127.0.0.1, PORT=3000) and only the headers carry the public host, so an absolute URL
+ * built from `req.url` points browsers at the server's own loopback. The base is `publicOrigin()`,
+ * the derivation every /api route already uses.
+ *
+ * NOT covered here, and it matters: these call `middleware()` directly, so they never reach Next's
+ * middleware adapter. A relative `Location` passed every one of them and still answered 500 on a
+ * real server (the adapter parses it as absolute). `scripts/probe-redirect.sh` builds and probes
+ * a real standalone server; run it for anything that changes what middleware returns.
+ */
+function behindProxy(path: string, headers: Record<string, string> = {}) {
+  return new NextRequest(
+    new Request(`http://localhost:3000${path}`, {
+      headers: {
+        host: "wheel.avo.so",
+        "x-forwarded-host": "wheel.avo.so",
+        "x-forwarded-proto": "https",
+        ...headers,
+      },
+    }),
+  );
+}
+
+const locationOf = (res: Response) => res.headers.get("location") ?? "";
+
+describe("the signed-out redirect, behind a proxy", () => {
+  describe("with WHEEL_PUBLIC_ORIGIN set", () => {
+    beforeEach(() => {
+      vi.stubEnv("WHEEL_AUTH_MODE", "local");
+      vi.stubEnv("WHEEL_PUBLIC_ORIGIN", "https://wheel.avo.so");
+      vi.stubEnv("WHEEL_TRUST_PROXY", "1");
+    });
+
+    it.each([
+      ["/app", "https://wheel.avo.so/sign-in"],
+      ["/app/9b1d-44", "https://wheel.avo.so/sign-in?next=%2Fapp%2F9b1d-44"],
+      ["/app/invite/wi_abc", "https://wheel.avo.so/sign-in?next=%2Fapp%2Finvite%2Fwi_abc"],
+    ])("sends %s to %s, never the server's own address", async (path, expected) => {
+      const res = await middleware(behindProxy(path), ev);
+      expect(res.status).toBe(307);
+      expect(locationOf(res)).toBe(expected);
+    });
+
+    it("cannot be steered by forwarded headers: a configured origin wins outright", async () => {
+      const res = await middleware(
+        behindProxy("/app", { "x-forwarded-host": "evil.example", host: "evil.example", "x-forwarded-proto": "http" }),
+        ev,
+      );
+      expect(locationOf(res)).toBe("https://wheel.avo.so/sign-in");
+    });
+
+    it("keeps an awkward path inside ?next= rather than letting it leave the origin", async () => {
+      for (const path of ["/app/%5Cevil.com", "/app/..%2Fx", "/app/%2F%2Fevil.com"]) {
+        const url = new URL(locationOf(await middleware(behindProxy(path), ev)));
+        expect(url.origin).toBe("https://wheel.avo.so");
+        expect(url.pathname).toBe("/sign-in");
+      }
+    });
+
+    it("carries the document CSP on the redirect, as before", async () => {
+      const res = await middleware(behindProxy("/app"), ev);
+      expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+    });
+
+    it("does not redirect a visitor whose session cookie is live", async () => {
+      const b = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+      const jwt = `${b({ alg: "HS256" })}.${b({ sub: "u1", exp: Math.floor(Date.now() / 1000) + 600 })}.x`;
+      const res = await middleware(behindProxy("/app", { cookie: `__Host-wheel_session=${jwt}` }), ev);
+      expect(res.headers.get("location")).toBeNull();
+    });
+  });
+
+  it("with only WHEEL_TRUST_PROXY, follows the proxy's forwarded host and scheme", async () => {
+    vi.stubEnv("WHEEL_AUTH_MODE", "local");
+    vi.stubEnv("WHEEL_TRUST_PROXY", "1");
+    expect(locationOf(await middleware(behindProxy("/app"), ev))).toBe("https://wheel.avo.so/sign-in");
+  });
+
+  it("with neither set (localhost-only mode), stays on the request's own origin", async () => {
+    vi.stubEnv("WHEEL_AUTH_MODE", "local");
+    const res = await middleware(
+      new NextRequest(new Request("http://localhost:3000/app", { headers: { host: "localhost:3000" } })),
+      ev,
+    );
+    expect(locationOf(res)).toBe("http://localhost:3000/sign-in");
+  });
+});
