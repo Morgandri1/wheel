@@ -1354,4 +1354,89 @@ mod tests {
             assert!(p.decide("POST", &t, b).is_err());
         }
     }
+    fn with_env(mut body: Value, key: &str, value: &str) -> Value {
+        let env = body["Env"].as_array_mut().unwrap();
+        let entry = env
+            .iter_mut()
+            .find(|e| e.as_str().unwrap().starts_with(&format!("{key}=")))
+            .unwrap();
+        *entry = json!(format!("{key}={value}"));
+        body
+    }
+
+    #[test]
+    fn a_project_has_exactly_one_spelling_of_its_names() {
+        let p = policy();
+        let canonical = id().hyphenated().to_string();
+        for spelling in [
+            canonical.to_uppercase(),
+            canonical.replace('-', ""),
+            format!("{{{canonical}}}"),
+            format!("urn:uuid:{canonical}"),
+        ] {
+            let c = format!("wheel-p-{spelling}");
+            assert!(p.decide("POST", &format!("/containers/{c}/start"), b"").is_err(), "{c}");
+            assert!(p.decide("DELETE", &format!("/volumes/{c}-data"), b"").is_err(), "{c}-data");
+            let create = format!("/containers/create?name={c}");
+            assert!(p.decide("POST", &create, golden().to_string().as_bytes()).is_err(), "{c}");
+        }
+    }
+
+    #[test]
+    fn every_environment_value_must_equal_what_the_operator_configured() {
+        let p = policy();
+        for (key, value) in [
+            ("WHEEL_LISTEN", "tcp://0.0.0.0:7001"),
+            ("WHEEL_DATA_DIR", "/"),
+            ("WHEEL_HARNESS_AUTH", "none"),
+            ("WHEEL_LOG", "text"),
+            ("WHEEL_ENGINE_SECRET", "has a space"),
+            ("WHEEL_VAULT_KEY", ""),
+        ] {
+            let why = refused(create(&p, &with_env(golden(), key, value)));
+            assert!(why.contains(key), "{key}: {why}");
+        }
+        let too_long = "a".repeat(513);
+        assert!(create(&p, &with_env(golden(), "WHEEL_ENGINE_SECRET", &too_long)).is_err());
+    }
+
+    #[test]
+    fn the_spec_label_is_a_lowercase_sha256_or_nothing() {
+        let p = policy();
+        let good = "a".repeat(64);
+        let mut ok = golden();
+        ok["Labels"]["wheel.spec"] = json!(good);
+        assert!(create(&p, &ok).is_ok());
+        for bad in ["a".repeat(63), "A".repeat(64), "g".repeat(64), String::new()] {
+            let mut b = golden();
+            b["Labels"]["wheel.spec"] = json!(bad);
+            assert!(create(&p, &b).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_restart_policy_carries_a_name_and_nothing_else() {
+        let mut b = golden();
+        b["HostConfig"]["RestartPolicy"]["MaximumRetryCount"] = json!(5);
+        assert!(refused(create(&policy(), &b)).contains("RestartPolicy"));
+    }
+
+    #[test]
+    fn query_values_must_be_the_values_the_host_sends() {
+        let p = policy();
+        let c = container_name(&id());
+        let v = volume_name(&id());
+        let filters = LIST_FILTERS_ENCODED;
+        for (m, t) in [
+            ("GET", format!("/containers/json?all=yes&filters={filters}")),
+            ("GET", format!("/containers/json?all=false&filters={filters}")),
+            ("POST", format!("/containers/{c}/stop?t=-1")),
+            ("POST", format!("/containers/{c}/stop?t=12345")),
+            ("POST", format!("/containers/{c}/stop?t=1a")),
+            ("DELETE", format!("/containers/{c}?force=yes")),
+            ("DELETE", format!("/volumes/{v}?force=yes")),
+        ] {
+            assert!(p.decide(m, &t, b"").is_err(), "{m} {t}");
+        }
+    }
 }

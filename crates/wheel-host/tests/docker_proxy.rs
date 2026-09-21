@@ -363,3 +363,132 @@ async fn the_project_container_list_is_admitted_and_reduced() {
         "{heard:?}"
     );
 }
+
+/// A daemon that answers every request with `status` and `body`.
+fn scripted_daemon(status: u16, body: &'static str) -> std::path::PathBuf {
+    let path = sock("scripted");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    path
+}
+
+fn project_container() -> String {
+    format!("wheel-p-{}", Uuid::new_v4())
+}
+
+#[tokio::test]
+async fn a_daemon_error_never_reaches_the_caller_in_its_own_words() {
+    for (status, body, must_not_contain, expected) in [
+        (500u16, r#"{"message":"boom WHEEL_ENGINE_SECRET=hunter2"}"#, "hunter2", "the docker daemon could not do that"),
+        (500, r#"{"message":"No such container: hunter2"}"#, "hunter2", "the docker daemon could not do that"),
+        (409, r#"{"message":"conflict with hunter2"}"#, "hunter2", "conflict"),
+    ] {
+        let front = proxy_in_front_of(&scripted_daemon(status, body)).await;
+        let (got, text) = raw(&front, "POST", &format!("/containers/{}/start", project_container()), "").await;
+        assert_eq!(got, status);
+        assert!(!text.contains(must_not_contain), "{text}");
+        assert!(text.contains(expected), "{text}");
+    }
+    let long = Box::leak(format!(r#"{{"message":"No such container: {}"}}"#, "x".repeat(300)).into_boxed_str());
+    let front = proxy_in_front_of(&scripted_daemon(404, long)).await;
+    let (_, text) = raw(&front, "POST", &format!("/containers/{}/start", project_container()), "").await;
+    assert!(text.contains("not found") && !text.contains("xxxx"), "{text}");
+    let front = proxy_in_front_of(&scripted_daemon(404, r#"{"message":"No such container: wheel-p-x"}"#)).await;
+    let (_, text) = raw(&front, "POST", &format!("/containers/{}/start", project_container()), "").await;
+    assert!(text.contains("No such container"), "a missing thing keeps its wording: {text}");
+}
+
+#[tokio::test]
+async fn what_the_daemon_answers_is_reduced_before_the_caller_sees_it() {
+    let id = Uuid::new_v4();
+    let create_body = serde_json::json!({
+        "Image": IMAGE,
+        "Env": [
+            format!("WHEEL_PROJECT_ID={id}"), format!("WHEEL_ENGINE_SECRET={SECRET}"), "WHEEL_VAULT_KEY=k".to_string(),
+            "WHEEL_HARNESS_AUTH=api-key-only".to_string(), "WHEEL_LISTEN=tcp://0.0.0.0:7000".to_string(),
+            "WHEEL_DATA_DIR=/data".to_string(), "WHEEL_LOG=json".to_string(), "WHEEL_ROLE=engine".to_string(),
+        ],
+        "Labels": { "wheel.project": id.to_string() },
+        "HostConfig": {
+            "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"], "Memory": 512 * 1024 * 1024,
+            "NanoCpus": 1_500_000_000i64, "PidsLimit": 256, "NetworkMode": NETWORK,
+            "Binds": [format!("wheel-p-{id}-data:/data")], "RestartPolicy": {"Name": "unless-stopped"},
+        },
+    })
+    .to_string();
+    let front = proxy_in_front_of(&scripted_daemon(201, r#"{"Id":"abc","Warnings":["leak-1"],"Extra":"leak-2"}"#)).await;
+    let (status, body) = raw(&front, "POST", &format!("/containers/create?name=wheel-p-{id}"), &create_body).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body, r#"{"Id":"abc","Warnings":[]}"#);
+
+    let front = proxy_in_front_of(&scripted_daemon(201, r#"{"Name":"n","Mountpoint":"/var/lib/docker/leak","UsageData":{"x":1}}"#)).await;
+    let vol = serde_json::json!({"Name": format!("wheel-p-{id}-data"), "Labels": {"wheel.project": id.to_string()}}).to_string();
+    let (status, body) = raw(&front, "POST", "/volumes/create", &vol).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(!body.contains("leak") && !body.contains("UsageData"), "{body}");
+
+    let list = format!(
+        r#"[{{"Names":["/wheel-p-{id}"],"Labels":{{"wheel.project":"{id}","other":"leak-3"}},"State":"running","Ports":[1]}},{{"Names":["/somebody-elses"],"Labels":{{}},"State":"running"}}]"#
+    );
+    let list: &'static str = Box::leak(list.into_boxed_str());
+    let front = proxy_in_front_of(&scripted_daemon(200, list)).await;
+    let target = "/containers/json?all=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+    let (status, body) = raw(&front, "GET", target, "").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(&format!("wheel-p-{id}")), "{body}");
+    assert!(!body.contains("somebody-elses") && !body.contains("leak-3") && !body.contains("Ports"), "{body}");
+}
+
+async fn raw_with_headers(sock: &std::path::Path, extra: &str, body: &str) -> u16 {
+    let mut s = tokio::net::UnixStream::connect(sock).await.unwrap();
+    let req = format!(
+        "POST /containers/{}/start HTTP/1.1\r\nhost: docker\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        project_container(),
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    String::from_utf8_lossy(&out).split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn a_request_that_could_change_the_connection_is_refused_and_never_forwarded() {
+    for header in ["upgrade: websocket\r\nconnection: upgrade\r\n", "expect: 100-continue\r\n", "transfer-encoding: chunked\r\n"] {
+        let (daemon, seen) = fake_daemon();
+        let front = proxy_in_front_of(&daemon).await;
+        let status = raw_with_headers(&front, header, "").await;
+        assert_eq!(status, 403, "{header}");
+        assert!(seen.lock().unwrap().is_empty(), "{header} reached the daemon");
+    }
+}
+
+#[tokio::test]
+async fn a_body_over_the_bound_is_refused_not_buffered() {
+    let (daemon, seen) = fake_daemon();
+    let front = proxy_in_front_of(&daemon).await;
+    let (status, _) = raw(&front, "POST", &format!("/containers/create?name={}", project_container()), &"x".repeat(70 * 1024)).await;
+    assert_eq!(status, 413);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_socket_is_created_with_exactly_the_requested_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let (daemon, _) = fake_daemon();
+    let front = proxy_in_front_of(&daemon).await;
+    let mode = std::fs::metadata(&front).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
