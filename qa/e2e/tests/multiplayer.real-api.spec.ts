@@ -160,7 +160,7 @@ test.describe.serial("E2E-mp: invites and tiers against the real API", () => {
       ["PATCH", p, { name: "renamed" }],
       ["DELETE", p],
       ["POST", `${p}/stop`],
-      ["POST", `${p}/builder/turns`, { message: "hi" }],
+      ["POST", `/projects/${projectId}/builder`, { message: "hi" }],
       ["POST", `${p}/engine/v1/nodes`, { name: "x", type: "ctx", config: { markdown: "" } }],
       ["POST", `${p}/engine/v1/agents/00000000-0000-0000-0000-000000000000/send`, { body: "hi" }],
     ];
@@ -180,7 +180,7 @@ test.describe.serial("E2E-mp: invites and tiers against the real API", () => {
     const p = `/v1/projects/${projectId}`;
     for (const [method, path, body] of [
       ["POST", `${p}/invites`, { role: "guest" }],
-      ["POST", `${p}/builder/turns`, { message: "hi" }],
+      ["POST", `/projects/${projectId}/builder`, { message: "hi" }],
       ["POST", `${p}/engine/v1/nodes`, { name: "x", type: "ctx", config: { markdown: "" } }],
       ["DELETE", p, undefined],
     ] as [string, string, unknown][]) {
