@@ -26,6 +26,8 @@ const LOCAL_AUTH = /local-auth\.spec\.ts/;
 // It is ignored here so a normal run does not try to load the packaged board off a dev
 // server that was never built for it.
 const PACKAGED = /packaged\.spec\.ts/;
+// real-api.spec.ts needs the real wheel-api and a stubbed host: multiplayer.config.ts.
+const REAL_API = /real-api\.spec\.ts/;
 
 const WEB_URL = process.env.WHEEL_WEB_URL ?? "http://localhost:3000";
 const LOCAL_URL = process.env.WHEEL_LOCAL_WEB_URL ?? "http://localhost:3200";
@@ -50,7 +52,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: [LOCAL_AUTH, PACKAGED],
+      testIgnore: [LOCAL_AUTH, PACKAGED, REAL_API],
       use: { ...devices["Desktop Chrome"] },
     },
     {

@@ -8,7 +8,7 @@ SHELL := /bin/bash
 export PATH := $(HOME)/.cargo/bin:/opt/homebrew/bin:$(PATH)
 
 .PHONY: help check check-strict fmt clippy test-rust coverage web-lint web-typecheck web-test \
-        qa-selftest test-int test-e2e test-pkg test-live test-live-ws bootstrap clean
+        qa-selftest test-int test-e2e test-pkg test-multiplayer test-live test-live-ws bootstrap clean
 
 help: ## show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -66,6 +66,16 @@ test-pkg: ## E2E against the PACKAGED board (npx wheel-web) — builds it first,
 	@lsof -ti :3300 | xargs -r kill -9 2>/dev/null || true
 	@lsof -ti :8789 | xargs -r kill -9 2>/dev/null || true
 	@bash qa/e2e/run.sh --config packaged.config.ts
+
+test-multiplayer: ## E2E for invites/tiers: the REAL wheel-api (sqlite) + the packaged board, only the sandbox host stubbed
+	@cargo build -p wheel-api --bin wheel-api
+	@pnpm -C web install --frozen-lockfile
+	@pnpm -C web build:pkg
+	@pnpm -C web pack:pkg
+	@lsof -ti :3301 | xargs -r kill -9 2>/dev/null || true
+	@lsof -ti :8790 | xargs -r kill -9 2>/dev/null || true
+	@lsof -ti :8791 | xargs -r kill -9 2>/dev/null || true
+	@bash qa/e2e/run.sh --config multiplayer.config.ts
 
 test-live-ws: ## WS-vs-DB log stream parity against a running stack (needs infra/docker-compose.yml up)
 	@node qa/live/ws_streams_parity.mjs
