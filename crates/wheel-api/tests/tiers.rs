@@ -919,7 +919,7 @@ async fn an_invite_is_single_use_by_default() {
         Some(json!({"token": token})),
     )
     .await;
-    assert_eq!(second, StatusCode::UNAUTHORIZED, "an invite was used twice");
+    assert_eq!(second, StatusCode::NOT_FOUND, "an invite was used twice");
 }
 
 /// A revoked invite is refused, and refused the same way an unknown one is — an invite link is a
@@ -964,7 +964,7 @@ async fn a_revoked_invite_is_indistinguishable_from_an_unknown_one() {
         Some(json!({"token": "wi_nosuchtokenatallreallynone"})),
     )
     .await;
-    assert_eq!(revoked, StatusCode::UNAUTHORIZED);
+    assert_eq!(revoked, StatusCode::NOT_FOUND);
     assert_eq!(revoked, unknown);
     assert_eq!(revoked_body, unknown_body, "the two answers differ");
 }
@@ -993,7 +993,7 @@ async fn an_email_locked_invite_only_opens_for_that_account() {
         Some(json!({"token": token.clone(), "email": "outsider@example.com"})),
     )
     .await;
-    assert_eq!(wrong, StatusCode::UNAUTHORIZED, "the lock was bypassed");
+    assert_eq!(wrong, StatusCode::NOT_FOUND, "the lock was bypassed");
 
     let (right, _) = call(
         &h.app,
@@ -1042,7 +1042,7 @@ async fn a_wrong_email_attempt_on_a_locked_invite_does_not_spend_a_use() {
     .await;
     assert_eq!(
         wrong,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::NOT_FOUND,
         "a mismatched email must be refused"
     );
 
@@ -1130,7 +1130,7 @@ async fn a_revoked_member_cannot_walk_back_in_with_the_invite_they_joined_on() {
     .await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::NOT_FOUND,
         "a revoked member must not be able to re-admit themselves with their old invite: {body}"
     );
     let (status, _) = call(&h.app, "GET", &uri, Some(&member), None).await;
@@ -1604,5 +1604,61 @@ async fn the_tier_is_checked_before_the_body_is_parsed() {
     assert!(
         status.is_client_error(),
         "a malformed body should still be a client error for an admin, got {status}"
+    );
+}
+
+/// A dead invite link costs the visitor the LINK, not their login. It used to answer 401, which
+/// clients read as "your session is gone" — the web app then cleared the cookie of a signed-in user
+/// who had merely opened a stale link. Every way an invite can fail answers the same 404 with the
+/// same body, so nothing about which links exist leaks, and the caller's session is untouched.
+#[tokio::test]
+async fn a_dead_invite_link_is_a_404_and_leaves_the_visitors_session_alone() {
+    let h = harness().await;
+    let (_, created) = call(
+        &h.app,
+        "POST",
+        &format!("/v1/projects/{}/invites", h.project),
+        Some(&h.creator),
+        Some(json!({"role": "guest"})),
+    )
+    .await;
+    let token = created["token"].as_str().unwrap().to_string();
+    let accept = |who: &String, token: String| {
+        let app = h.app.clone();
+        let who = who.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/invites/accept",
+                Some(&who),
+                Some(json!({"token": token})),
+            )
+            .await
+        }
+    };
+    let (first, _) = accept(&h.outsider, token.clone()).await;
+    assert_eq!(first, StatusCode::OK);
+
+    // Spent, unknown and malformed all answer alike, for a visitor whose session is perfectly good.
+    let (spent, spent_body) = accept(&h.prompter, token).await;
+    let (unknown, unknown_body) = accept(&h.prompter, "wi_nosuchtokenatallreallynone".into()).await;
+    assert_eq!(spent, StatusCode::NOT_FOUND);
+    assert_eq!(unknown, StatusCode::NOT_FOUND);
+    assert_eq!(
+        spent_body, unknown_body,
+        "the answers differ, so links can be probed"
+    );
+    assert_eq!(
+        spent_body["error"]["code"], "invite_unusable",
+        "{spent_body}"
+    );
+
+    // The point: the visitor is still signed in.
+    let (status, _) = call(&h.app, "GET", "/v1/projects", Some(&h.prompter), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a stale link ended the visitor's session"
     );
 }

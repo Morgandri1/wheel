@@ -516,18 +516,19 @@ pub async fn accept(
 
     // Unknown, expired, revoked and exhausted are deliberately one answer: an invite link is a
     // credential, and distinguishing them would say which links exist.
-    let unusable = || ApiError::Unauthorized("invite is unknown, expired, revoked, or fully used");
+    let unusable =
+        || ApiError::InviteUnusable("invite is unknown, expired, revoked, or fully used");
     let Some((project_id, role, locked_email)) = row else {
         return Err(unusable());
     };
-    let tier = Tier::parse(&role).ok_or(ApiError::Unauthorized("invite has an unknown role"))?;
+    let tier = Tier::parse(&role).ok_or(ApiError::InviteUnusable("invite has an unknown role"))?;
 
     // The lock is checked against the *verified* account's address, never against anything in the
     // request. An email the caller supplies is a claim, not an identity.
     if let Some(want) = &locked_email {
         let matches = user_email.is_some_and(|have| have.eq_ignore_ascii_case(want));
         if !matches {
-            return Err(ApiError::Unauthorized(
+            return Err(ApiError::InviteUnusable(
                 "invite is locked to another address",
             ));
         }
@@ -557,7 +558,7 @@ pub async fn accept(
     // user id the revocation named. An admin who changed their mind says so, rather than a link
     // they no longer remember saying it for them.
     if was_revoked(db, &project_id, user_id).await? {
-        return Err(ApiError::Unauthorized(
+        return Err(ApiError::InviteUnusable(
             "membership of this project was revoked; an admin must grant it again",
         ));
     }
