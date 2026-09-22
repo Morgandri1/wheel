@@ -122,6 +122,11 @@ describe("the signed-out redirect, behind a proxy", () => {
       }
     });
 
+    it("is never cacheable: the answer depends on the Cookie header but is served on a URL alone", async () => {
+      const res = await middleware(behindProxy("/app"), ev);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+
     it("carries the document CSP on the redirect, as before", async () => {
       const res = await middleware(behindProxy("/app"), ev);
       expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
