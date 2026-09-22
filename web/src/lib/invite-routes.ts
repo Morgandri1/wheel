@@ -3,6 +3,7 @@
 // See the LICENSE file or https://polyformproject.org/licenses/noncommercial/1.0.0
 
 import "server-only";
+import type { AuthMode } from "@/lib/auth";
 import { errorEnvelope, isJsonMediaType, readCapped } from "@/lib/proxy-rules";
 import { serverAuthMode } from "@/lib/runtime-config";
 import { refuseCrossOrigin } from "@/lib/same-origin";
@@ -59,5 +60,32 @@ export async function acceptInvite(req: Request): Promise<Response> {
     timeoutMs: API_CALL_TIMEOUT_MS,
   });
   if (!answered(res)) return apiFailed(res);
-  return passThrough(res, clearCookieOn401(res.status, req, mode));
+  if (res.status !== 401) return passThrough(res);
+
+  // A 401 here is ambiguous: the API answers an unusable invite (unknown, expired, revoked, used,
+  // locked to another address) with the same generic 401 it uses for a dead session, on purpose —
+  // saying which would tell a caller which invite links exist. Treating it as a dead session cleared
+  // the cookie and signed out a visitor whose only mistake was a stale link. Only the caller's own
+  // session can tell the two apart, and that is not a secret from them, so ask it.
+  if (!(await sessionIsAlive(token, mode))) return passThrough(res, clearCookieOn401(401, req, mode));
+  await res.body?.cancel();
+  return errorEnvelope(
+    403,
+    "invite_unusable",
+    "This invite link can't be used: it may be expired, already used, or meant for a different account.",
+  );
+}
+
+/**
+ * Whether the API still accepts this session. Only local mode has a cookie this app can lose, and
+ * only local mode serves `/v1/auth/me` (the routes 404 elsewhere), so every other mode answers
+ * "alive" without a call: a 401 there is the invite's verdict. Uncertainty also answers "alive": a
+ * probe that times out must not destroy a session that may be perfectly good.
+ */
+async function sessionIsAlive(token: string, mode: AuthMode): Promise<boolean> {
+  if (mode !== "local") return true;
+  const probe = await callApi(apiUrl("/v1/auth/me"), { method: "GET", token, timeoutMs: API_CALL_TIMEOUT_MS });
+  if (!answered(probe)) return true;
+  await probe.body?.cancel();
+  return probe.status !== 401;
 }

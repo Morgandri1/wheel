@@ -83,19 +83,77 @@ describe("redeeming an invite", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("passes an unusable invite's answer through unchanged — the API's wording, not ours", async () => {
-    fetchMock.mockResolvedValue(
-      Response.json({ error: { code: "unauthorized", message: "Missing or invalid authentication token." } }, { status: 401 }),
-    );
-    const res = await acceptInvite(post({ token: "wi_dead" }, { cookie: `wheel_session=${TOKEN}` }));
-    expect(res.status).toBe(401);
-    expect((await res.json()).error.message).toBe("Missing or invalid authentication token.");
+  /**
+   * The API answers an unusable invite with the SAME generic 401 it uses for a dead session. This
+   * route used to treat every 401 as a dead session, clear the cookie, and sign out a visitor whose
+   * only mistake was a stale link (found by QA's multiplayer e2e, S2). Only the session itself can
+   * say which it was, so the route asks `GET /v1/auth/me`.
+   */
+  describe("when the API answers the invite with a 401", () => {
+    const generic = () =>
+      Response.json({ error: { code: "unauthorized", message: "Missing or invalid authentication token." } }, { status: 401 });
+    const bySession = (meStatus: number) =>
+      fetchMock.mockImplementation(async (url) => (String(url).endsWith("/v1/auth/me") ? new Response("{}", { status: meStatus }) : generic()));
+    const dead = () => acceptInvite(post({ token: "wi_dead" }, { cookie: `wheel_session=${TOKEN}` }));
+
+    it("keeps a LIVE session: the visitor loses the link, not their login", async () => {
+      bySession(200);
+      const res = await dead();
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error.code).toBe("invite_unusable");
+      expect(body.error.message).toMatch(/invite link can't be used/);
+      expect(body.error.message).not.toMatch(/authentication token/);
+    });
+
+    it("still clears the cookie when the session ITSELF is dead (revoked server-side)", async () => {
+      bySession(401);
+      const res = await dead();
+      expect(res.status).toBe(401);
+      expect(res.headers.get("set-cookie")).toMatch(/Max-Age=0/);
+    });
+
+    it("asks with the caller's own session, and only after the invite call", async () => {
+      bySession(200);
+      await dead();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sent(0).url).toBe(`${API}/v1/invites/accept`);
+      expect(sent(1).url).toBe(`${API}/v1/auth/me`);
+      expect(sent(1).headers.get("x-auth-token")).toBe(TOKEN);
+    });
+
+    it("does not sign anyone out on uncertainty: a probe that cannot be answered leaves the cookie", async () => {
+      fetchMock.mockImplementation(async (url) => {
+        if (String(url).endsWith("/v1/auth/me")) throw new TypeError("fetch failed");
+        return generic();
+      });
+      const res = await dead();
+      expect(res.status).toBe(403);
+      expect(res.headers.get("set-cookie")).toBeNull();
+    });
+
+    it("makes no probe outside local mode: there is no cookie to lose and no /v1/auth/me to ask", async () => {
+      vi.stubEnv("WHEEL_AUTH_MODE", "dev");
+      vi.stubEnv("WHEEL_DEV_TOKEN", "dev-token");
+      fetchMock.mockImplementation(async () => generic());
+      const res = await acceptInvite(post({ token: "wi_dead" }));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(res.status).toBe(403);
+      expect((await res.json()).error.code).toBe("invite_unusable");
+    });
   });
 
-  it("clears this browser's own session cookie when the API says it, specifically, is dead", async () => {
-    fetchMock.mockResolvedValue(new Response("{}", { status: 401 }));
-    const res = await acceptInvite(post({ token: "wi_dead" }, { cookie: `wheel_session=${TOKEN}` }));
-    expect(res.headers.get("set-cookie")).toMatch(/Max-Age=0/);
+  it.each([
+    [400, "bad_request"],
+    [409, "conflict"],
+    [500, "internal"],
+  ])("passes a %s through unchanged and never probes the session", async (status, code) => {
+    fetchMock.mockResolvedValue(Response.json({ error: { code, message: "engine words" } }, { status }));
+    const res = await acceptInvite(post({ token: "wi_abc" }, { cookie: `wheel_session=${TOKEN}` }));
+    expect(res.status).toBe(status);
+    expect((await res.json()).error.message).toBe("engine words");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("reports an unreachable API", async () => {

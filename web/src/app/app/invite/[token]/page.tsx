@@ -38,8 +38,9 @@ export default function AcceptInvitePage({ params }: { params: Promise<{ token: 
         router.replace(`/app/${project_id}`);
       })
       .catch((e: unknown) => {
-        // The API gives one indistinguishable answer for unknown, expired, revoked and exhausted
-        // invites — a link is a credential, and the response must not say which links exist.
+        // `/api/invites/accept` answers every unusable invite with one message (403 invite_unusable):
+        // a link is a credential, and the response must not say which links exist. A stale link
+        // leaves the visitor signed in.
         const message =
           e instanceof ApiError ? e.message : "Couldn't reach this app's server. Check your connection.";
         setState({ kind: "error", message });
@@ -59,9 +60,10 @@ export default function AcceptInvitePage({ params }: { params: Promise<{ token: 
           </p>
         ) : state.kind === "error" ? (
           <>
-            <p className="text-meta text-ink" data-testid="invite-error">
-              Couldn&rsquo;t join: {state.message}
-            </p>
+            <div className="flex flex-col gap-1" data-testid="invite-error">
+              <p className="text-meta font-medium text-ink">Couldn&rsquo;t join the project</p>
+              <p className="text-meta text-ink-dim">{state.message}</p>
+            </div>
             <Button onClick={() => router.push("/app")} data-testid="btn-invite-back">
               Go to your projects
             </Button>
