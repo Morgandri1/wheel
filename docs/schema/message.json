@@ -67,6 +67,10 @@
         "null"
       ]
     },
+    "redacted": {
+      "description": "`true` when the caller's tier may not read this message's `body` and it has been replaced (finding 062). Everything else — `id`, `from`, `to`, `state`, `bytes`, `sha256`, the timestamps — is the real value. Absent when `false`, so an unredacted message is byte-identical to what it was before this field existed.",
+      "type": "boolean"
+    },
     "reply_to": {
       "description": "Threading (§3c#9): the message this one replies to.",
       "type": [
