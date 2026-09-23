@@ -58,6 +58,7 @@ pub fn enqueue(
         delivered_at: None,
         consumed_at: None,
         last_error: None,
+        redacted: false,
     };
     let (kind, from_id) = sender_columns(&msg.from);
 

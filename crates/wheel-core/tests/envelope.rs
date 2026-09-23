@@ -26,6 +26,7 @@ fn msg(body: &str, from: MessageSender) -> Message {
         delivered_at: None,
         consumed_at: None,
         last_error: None,
+        redacted: false,
     }
 }
 

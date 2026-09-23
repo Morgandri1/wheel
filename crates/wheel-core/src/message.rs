@@ -186,6 +186,12 @@ pub struct Message {
     /// (§3c#11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// `true` when the caller's tier may not read this message's `body` and it has been replaced
+    /// (finding 062). Everything else — `id`, `from`, `to`, `state`, `bytes`, `sha256`, the
+    /// timestamps — is the real value. Absent when `false`, so an unredacted message is
+    /// byte-identical to what it was before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 /// What `wheel msg` returns to the sender (§3c#3).

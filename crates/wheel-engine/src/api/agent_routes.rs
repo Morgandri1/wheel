@@ -270,7 +270,8 @@ const TRANSCRIPT_STREAM: &str = "transcript";
 /// The transcript is every message body the agent was given, so it is for callers `actor::may_read_bodies` allows
 /// only (finding 062): a guest asking for it by name gets `403 tier_required` — never an
 /// empty page, for the reason below — and an unfiltered read simply omits those rows. `next`
-/// advances over returned rows only, so a poller does not stall on rows it was never shown.
+/// advances over returned rows only, so a poller does not stall on rows it was never shown. Such a
+/// page carries `"redacted_streams": ["transcript"]`, so a client can tell "hidden" from "empty".
 pub async fn log(
     State(s): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -348,7 +349,12 @@ pub async fn log(
         .and_then(|l| l["seq"].as_i64())
         .unwrap_or(since);
 
-    Ok(Json(serde_json::json!({ "lines": lines, "next": next })))
+    let mut page = serde_json::json!({ "lines": lines, "next": next });
+    if !bodies {
+        // Absence must not read as "the agent wrote nothing": say what was left out.
+        page["redacted_streams"] = serde_json::json!([TRANSCRIPT_STREAM]);
+    }
+    Ok(Json(page))
 }
 
 /// `GET /v1/agents/:id/inbox` — re-read exactly what was delivered (§3c#2).
@@ -1529,6 +1535,11 @@ mod tests {
             assert!(!v.to_string().contains(SECRET_BODY), "{v}");
             // The cursor stops at the last row shown, not at the hidden one after it.
             assert_eq!(v["next"], 3, "{v}");
+            assert_eq!(
+                v["redacted_streams"],
+                serde_json::json!(["transcript"]),
+                "{v}"
+            );
         }
     }
 
@@ -1567,6 +1578,7 @@ mod tests {
                 ["stdout", "transcript", "engine", "transcript"]
             );
             assert_eq!(all["next"], 4);
+            assert!(all.get("redacted_streams").is_none(), "{all}");
 
             let Json(only) = read_log(
                 &s,
@@ -1669,10 +1681,12 @@ mod tests {
         assert_eq!(one.body, super::super::actor::HIDDEN_BODY);
         // Everything but the content is still there: sha256/bytes are metadata, by design.
         assert!(one.bytes > 0 && !one.sha256.is_empty());
+        assert!(one.redacted);
         let Json(one) = inbox_one(State(s.clone()), bob(), Path((target, bobs_id)))
             .await
             .unwrap();
         assert_eq!(one.body, "bob's own words");
+        assert!(!one.redacted);
 
         let Json(one) = inbox_one(
             State(s.clone()),

@@ -146,6 +146,7 @@ pub fn mask_message_for_tier(
     }
     if !may_read_bodies(tier) {
         message.body = HIDDEN_BODY.into();
+        message.redacted = true;
     }
     message
 }
@@ -226,6 +227,7 @@ mod tests {
             delivered_at: None,
             consumed_at: None,
             last_error: None,
+            redacted: false,
         }
     }
 
@@ -263,6 +265,7 @@ mod tests {
             let out =
                 mask_message_for_tier(msg(Some("alice@example.com")), ActorTier::Guest, caller);
             assert_eq!(out.body, HIDDEN_BODY);
+            assert!(out.redacted);
         }
         let out = mask_message_for_tier(msg(None), ActorTier::Guest, Some("bob@example.com"));
         assert_eq!(
@@ -279,6 +282,7 @@ mod tests {
             Some("alice@example.com"),
         );
         assert_eq!(own.body, "hello");
+        assert!(!own.redacted);
 
         let mut theirs = msg(Some("alice@example.com"));
         theirs.bytes = 5;
@@ -293,6 +297,7 @@ mod tests {
             assert!(may_read_bodies(tier));
             let out = mask_message_for_tier(msg(Some("alice@example.com")), tier, None);
             assert_eq!(out.body, "hello");
+            assert!(!out.redacted);
         }
         assert!(!may_read_bodies(ActorTier::Guest));
     }

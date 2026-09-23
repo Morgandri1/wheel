@@ -135,6 +135,7 @@ mod tests {
                 delivered_at: None,
                 consumed_at: None,
                 last_error: None,
+                redacted: false,
             },
         }
     }
@@ -166,6 +167,7 @@ mod tests {
         )
         .unwrap();
         assert!(theirs.contains(HIDDEN_BODY), "{theirs}");
+        assert!(theirs.contains("\"redacted\":true"), "{theirs}");
         assert!(!theirs.contains("secret instruction"), "{theirs}");
 
         let own = frame_for(
@@ -175,6 +177,7 @@ mod tests {
         )
         .unwrap();
         assert!(own.contains("my own words"), "{own}");
+        assert!(!own.contains("redacted"), "{own}");
     }
 
     #[test]
