@@ -447,6 +447,12 @@ fn fake_daemon_listing(count: usize) -> std::path::PathBuf {
                         })
                         .collect();
                     (200, format!("[{}]", items.join(",")))
+                } else if path.ends_with("/volumes") {
+                    // No volumes of their own in this fixture: the `count` existing projects are
+                    // represented by containers alone, which is enough to prove the ceiling reacts
+                    // to the count — a SEPARATE fixture (`fake_daemon_listing_volumes_only`, if a
+                    // future test needs it) would represent the volume-only-orphan case instead.
+                    (200, r#"{"Volumes":[],"Warnings":[]}"#.to_string())
                 } else if path.ends_with("/volumes/create") {
                     (201, r#"{"Name":"v","Driver":"local","Mountpoint":"/m","Labels":{},"Scope":"local","Options":{}}"#.to_string())
                 } else if path.ends_with("/containers/create") {
@@ -579,4 +585,196 @@ fn golden(id: &Uuid) -> String {
         },
     })
     .to_string()
+}
+
+/// A daemon that reports `count` VOLUMES but no containers at all — adversary's Gap A shape
+/// (`POST /volumes/create` in a loop, never paired with a container).
+fn fake_daemon_volumes_only(count: usize) -> std::path::PathBuf {
+    let path = sock("daemon-vol-only");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let want: usize = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + want {
+                        break;
+                    }
+                }
+                let raw = String::from_utf8_lossy(&raw).to_string();
+                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                let path = target.split('?').next().unwrap_or("");
+                let (code, body) = if path.ends_with("/containers/json") {
+                    (200, "[]".to_string())
+                } else if path.ends_with("/volumes") {
+                    let items: Vec<String> = (0..count)
+                        .map(|_| {
+                            let id = Uuid::new_v4();
+                            format!(
+                                r#"{{"Name":"wheel-p-{id}-data","Driver":"local","Mountpoint":"","Labels":{{"wheel.project":"{id}"}}}}"#
+                            )
+                        })
+                        .collect();
+                    (
+                        200,
+                        format!(r#"{{"Volumes":[{}],"Warnings":[]}}"#, items.join(",")),
+                    )
+                } else if path.ends_with("/volumes/create") {
+                    (201, r#"{"Name":"v","Driver":"local","Mountpoint":"/m","Labels":{},"Scope":"local","Options":{}}"#.to_string())
+                } else {
+                    (204, String::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {code} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    path
+}
+
+/// Adversary's Gap A, reproduced against the fix: without volumes counted, this admitted 50/50
+/// volume creates against a ceiling of 2. With them counted, the ceiling refuses once the volume
+/// count alone reaches it — `POST /volumes/create` is capped even though no container ever exists.
+#[tokio::test]
+async fn a_flood_of_volume_only_creates_is_capped_by_the_ceiling() {
+    let daemon = fake_daemon_volumes_only(2);
+    let front = proxy_with_ceiling(&daemon, 2).await;
+    let id = Uuid::new_v4();
+    let (status, body) = raw(
+        &front,
+        "POST",
+        "/volumes/create",
+        &serde_json::json!({"Name": format!("wheel-p-{id}-data"), "Labels": {"wheel.project": id.to_string()}}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.to_lowercase().contains("ceiling"), "{body}");
+}
+
+/// The race adversary demonstrated: without the create-serialising lock, a slow-listing daemon let
+/// more than one of ten concurrent creates through a ceiling of one. With it, at most one admitted.
+#[tokio::test]
+async fn concurrent_creates_against_a_slow_daemon_do_not_defeat_the_ceiling() {
+    let daemon = fake_daemon_slow_listing(150);
+    let front = std::sync::Arc::new(proxy_with_ceiling(&daemon, 1).await);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        let front = front.clone();
+        tasks.spawn(async move {
+            let id = Uuid::new_v4();
+            let (status, _) = raw(
+                &front,
+                "POST",
+                &format!("/containers/create?name=wheel-p-{id}"),
+                &golden(&id),
+            )
+            .await;
+            status
+        });
+    }
+    let mut admitted = 0;
+    while let Some(r) = tasks.join_next().await {
+        if r.unwrap() == 201 {
+            admitted += 1;
+        }
+    }
+    assert_eq!(
+        admitted, 1,
+        "the ceiling let more than one concurrent create through"
+    );
+}
+
+/// A daemon whose `/containers/json` (the ceiling's count) is slow — long enough to open the race
+/// window a serialising lock has to close — and otherwise empty, so anything admitted is a bug.
+fn fake_daemon_slow_listing(delay_ms: u64) -> std::path::PathBuf {
+    let path = sock("daemon-slow");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    // STATEFUL: a create must actually grow what the next list call reports, or the race this
+    // daemon exists to open is invisible — every concurrent count would see the same "0 so far"
+    // and admitting all of them would look identical to admitting only the first.
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let count = count.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let want: usize = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + want {
+                        break;
+                    }
+                }
+                let raw = String::from_utf8_lossy(&raw).to_string();
+                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                let path = target.split('?').next().unwrap_or("");
+                if path.ends_with("/containers/json") {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                let (code, body) = if path.ends_with("/containers/json") {
+                    let items: Vec<String> = (0..count.load(std::sync::atomic::Ordering::SeqCst))
+                        .map(|_| {
+                            let id = Uuid::new_v4();
+                            format!(
+                                r#"{{"Names":["/wheel-p-{id}"],"State":"running","Labels":{{"wheel.project":"{id}"}}}}"#
+                            )
+                        })
+                        .collect();
+                    (200, format!("[{}]", items.join(",")))
+                } else if path.ends_with("/volumes") {
+                    (200, r#"{"Volumes":[],"Warnings":[]}"#.to_string())
+                } else if path.ends_with("/containers/create") {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (201, r#"{"Id":"deadbeef","Warnings":[]}"#.to_string())
+                } else {
+                    (204, String::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {code} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    path
 }

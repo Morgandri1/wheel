@@ -107,6 +107,8 @@ pub enum Reply {
     Inspect,
     /// A container list, reduced to name, project label, spec label and state.
     List,
+    /// A volume list, reduced to name and the project label.
+    VolumeList,
 }
 
 /// An admitted request, ready to send: nothing in it came from the caller unchecked.
@@ -137,6 +139,19 @@ pub fn list_admission() -> Admission {
         target: format!("/containers/json?all=true&filters={LIST_FILTERS_ENCODED}"),
         body: None,
         reply: Reply::List,
+    }
+}
+
+/// As [`list_admission`], for volumes — the ceiling has to count these too: `POST
+/// /volumes/create` is one of the two admission kinds it gates, and a volume can exist with no
+/// matching container (the host creates the volume first), so counting containers alone leaves
+/// volume creation completely uncapped.
+pub fn volume_list_admission() -> Admission {
+    Admission {
+        method: "GET",
+        target: format!("/volumes?filters={LIST_FILTERS_ENCODED}"),
+        body: None,
+        reply: Reply::VolumeList,
     }
 }
 
@@ -253,12 +268,20 @@ impl Policy {
         };
         let (version, segs) = segments(path)?;
 
-        // The one query that needs percent-encoding: matched whole, then never decoded.
-        let is_list = method == "GET" && segs == ["containers", "json"];
+        // The one query that needs percent-encoding: matched whole, then never decoded. Anchored
+        // on the start of the string or on a preceding `&` — never a bare substring match — so a
+        // parameter whose VALUE happens to contain the text `filters=` cannot be mistaken for the
+        // real one.
+        let is_list = method == "GET" && (segs == ["containers", "json"] || segs == ["volumes"]);
         let q = if is_list {
-            match raw_query.and_then(|q| q.split_once("&filters=")) {
+            let raw_query = raw_query.unwrap_or("");
+            let head_and_rest = raw_query
+                .strip_prefix("filters=")
+                .map(|rest| ("", rest))
+                .or_else(|| raw_query.split_once("&filters="));
+            match head_and_rest {
                 Some((head, LIST_FILTERS_ENCODED)) => query(Some(head))?,
-                _ => return deny("the container list may only be filtered to project containers"),
+                _ => return deny("a list may only be filtered to project objects"),
             }
         } else {
             query(raw_query)?
@@ -288,6 +311,19 @@ impl Policy {
                     target,
                     body: None,
                     reply: Reply::List,
+                })
+            }
+            ("GET", ["volumes"]) => {
+                only_params(&q, &[], |_, _| false)?;
+                let mut target = rebuild(version, &segs, &q);
+                target.push(if q.is_empty() { '?' } else { '&' });
+                target.push_str("filters=");
+                target.push_str(LIST_FILTERS_ENCODED);
+                Ok(Admission {
+                    method: "GET",
+                    target,
+                    body: None,
+                    reply: Reply::VolumeList,
                 })
             }
             ("GET", ["containers", name, "json"]) => {
@@ -657,6 +693,40 @@ pub fn project_list(raw: &[u8]) -> Option<Vec<u8>> {
         }));
     }
     serde_json::to_vec(&out).ok()
+}
+
+/// A volume list, reduced the same way [`project_list`] reduces a container list — but kept
+/// inside `{"Volumes": [...]}`, NOT a bare array like the container list: `GET /volumes` and `GET
+/// /containers/json` disagree on their own envelope shape (Docker's real API does too — this is
+/// not a simplification), and a real bollard client (`DockerSandbox`, reading this same reduced
+/// response back through the proxy) fails to deserialise a bare array as a `VolumeListResponse`.
+pub fn project_volume_list(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let mut out = Vec::new();
+    for vol in v.get("Volumes")?.as_array()? {
+        let name = vol
+            .get("Name")
+            .and_then(Value::as_str)
+            .filter(|n| volume_id(n).is_ok());
+        let Some(name) = name else { continue };
+        let project = vol
+            .pointer("/Labels")
+            .and_then(|l| l.get(PROJECT_LABEL))
+            .and_then(Value::as_str);
+        // `Driver`/`Mountpoint` are required by the real `Volume` model a bollard client
+        // deserialises this into (`DockerSandbox` reads this reduced response back through the
+        // proxy) — present so parsing succeeds, `Mountpoint` deliberately empty rather than a real
+        // host path, which this reduction exists to keep out of a response at all.
+        out.push(json!({
+            "Name": name,
+            "Driver": "local",
+            "Mountpoint": "",
+            "Scope": "local",
+            "Options": {},
+            "Labels": { PROJECT_LABEL: project },
+        }));
+    }
+    serde_json::to_vec(&json!({ "Volumes": out })).ok()
 }
 
 /// A container create's answer, reduced to its id.
@@ -1359,6 +1429,60 @@ mod tests {
         ] {
             assert!(p.decide("GET", bad, b"").is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_the_project_volume_list_is_admitted() {
+        let p = policy();
+        let ok = "/v1.49/volumes?filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+        assert_eq!(p.decide("GET", ok, b"").unwrap().reply, Reply::VolumeList);
+        for bad in [
+            "/volumes",
+            "/volumes?filters=%7B%22label%22%3A%5B%22traefik.enable%22%5D%7D",
+            "/volumes?filters=%7B%7D",
+            "/volumes?dangling=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D",
+        ] {
+            assert!(p.decide("GET", bad, b"").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_value_that_merely_contains_the_text_filters_equals_is_not_the_filters_param() {
+        // The anchoring (start-of-string or after `&`) matters: a value ending in the literal
+        // text "filters=..." must not be mistaken for the real, well-formed parameter.
+        let p = policy();
+        let sneaky = format!("/containers/json?all=true&evil=x%26filters={LIST_FILTERS_ENCODED}");
+        assert!(p.decide("GET", &sneaky, b"").is_err(), "{sneaky}");
+    }
+
+    #[test]
+    fn a_volume_list_is_reduced_to_name_and_the_project_label() {
+        let raw = br#"{"Volumes":[
+            {"Name":"wheel-p-3f2504e0-4f89-11d3-9a0c-0305e82c3301-data","Labels":{"wheel.project":"3f2504e0-4f89-11d3-9a0c-0305e82c3301","evil":"1"},"Mountpoint":"/var/lib/docker/volumes/x/_data"},
+            {"Name":"some-other-volume","Labels":{}}
+        ],"Warnings":[]}"#;
+        let v: Value = serde_json::from_slice(&project_volume_list(raw).unwrap()).unwrap();
+        // {"Volumes": [...]}, not a bare array — matches Docker's own real `GET /volumes` shape,
+        // which the real bollard client reading this back through the proxy depends on.
+        let out = v["Volumes"].as_array().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0]["Name"],
+            "wheel-p-3f2504e0-4f89-11d3-9a0c-0305e82c3301-data"
+        );
+        assert_eq!(
+            out[0]["Labels"]["wheel.project"],
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        );
+        assert!(out[0]["Labels"].get("evil").is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn the_volume_list_admission_is_fixed_and_internal() {
+        let a = volume_list_admission();
+        assert_eq!(a.method, "GET");
+        assert!(a.target.starts_with("/volumes?filters="));
+        assert_eq!(a.reply, Reply::VolumeList);
     }
 
     #[test]
