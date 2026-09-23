@@ -63,7 +63,7 @@ pub fn set_actor(headers: &mut HeaderMap, user: &AuthUser, tier: Tier) {
 /// Named for what the list *is* rather than for who set it. It was `proxy_asserted_headers` and
 /// returned an empty list under the `jwks` verifier, which read as correct — a token header is not
 /// "proxy-asserted" — and the deployer's `WHEEL_EXTERNAL_TOKEN_HEADER` was relayed into the engine
-/// as a result (ADVERSARY 064). The question here is only ever "is it a credential".
+/// as a result. The question here is only ever "is it a credential".
 ///
 /// Two kinds, both credentials:
 ///   * under the `proxy_header` verifier, the subject and email headers the authenticating proxy

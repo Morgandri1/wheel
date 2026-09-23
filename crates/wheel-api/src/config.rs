@@ -267,7 +267,7 @@ impl ExternalAuth {
                 }
                 // The refusal above says "that is everyone", and an all-addresses range means
                 // exactly that while satisfying it — it is not empty, it parses, and
-                // `trusts_peer` then returns true for the entire internet (ADVERSARY 065). Two
+                // `trusts_peer` then returns true for the entire internet. Two
                 // different questions were being asked as one.
                 //
                 // This is the value an operator reaches for, not a contrived one: a platform

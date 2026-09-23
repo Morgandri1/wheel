@@ -175,8 +175,8 @@ async fn an_algorithm_outside_the_allowlist_is_refused() {
 /// **Signed over `claims_for`, and that is the test.** It used to sign `support::claims`, which is
 /// the `jwks`-plane fixture: wrong `iss` for this verifier and **no `aud` at all**. Either refuses
 /// the token on its own, before any algorithm reasoning is reached — so the assertion held with
-/// the header/key agreement check, the allowlist and the pinned `Validation` **all deleted**
-/// (ADVERSARY 067). The token here is valid on every axis except the one under test.
+/// the header/key agreement check, the allowlist and the pinned `Validation` **all deleted**.
+/// The token here is valid on every axis except the one under test.
 #[tokio::test]
 async fn the_hs256_confusion_attack_is_refused() {
     let (key, server, cache) = plane().await;

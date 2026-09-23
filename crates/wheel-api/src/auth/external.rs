@@ -256,8 +256,8 @@ pub struct AllowedOrigins(pub std::sync::Arc<Vec<String>>);
 /// Fail-closed by construction: `allowed` arrives from the router, and an empty list refuses every
 /// `Origin` rather than allowing every one.
 pub fn refuse_cross_origin(headers: &HeaderMap, allowed: &[String]) -> Result<(), ApiError> {
-    // `Sec-Fetch-Site` first, because the absence of `Origin` is not the absence of a page
-    // (ADVERSARY 070). Per Fetch, `Origin` is appended only when the method is not GET/HEAD or the
+    // `Sec-Fetch-Site` first, because the absence of `Origin` is not the absence of a page.
+    // Per Fetch, `Origin` is appended only when the method is not GET/HEAD or the
     // mode is cors/websocket — so `<img src>`, `<script src>`, `<iframe src>` and a plain
     // link-click navigation are all cross-site GETs that a page causes and that carry **no**
     // `Origin`. Under an ambient credential every one of them is an authenticated GET as the
@@ -734,7 +734,7 @@ mod tests {
         assert!(refuse_cross_origin(&h, &["https://evil.example".to_string()]).is_ok());
     }
 
-    /// ADVERSARY 070. A cross-site **GET** carries no `Origin` at all — per Fetch, `Origin` is
+    /// A cross-site **GET** carries no `Origin` at all — per Fetch, `Origin` is
     /// appended only for non-GET/HEAD methods or cors/websocket modes — so `<img src>`,
     /// `<script src>`, `<iframe src>` and a link click were all passing a check whose whole job is
     /// to stop a page spending an ambient credential.

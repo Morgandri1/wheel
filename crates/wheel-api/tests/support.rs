@@ -199,7 +199,7 @@ pub fn sign_rs256(key: &TestKey, kid: &str, c: &Claims) -> String {
 /// This is the shape of the algorithm-confusion attack.
 /// Generic over the claim shape on purpose: an algorithm test must be able to sign a claim set
 /// that is valid on EVERY other axis, or the refusal it observes may be about the claims rather
-/// than the algorithm (ADVERSARY 067).
+/// than the algorithm.
 pub fn sign_hs256<T: serde::Serialize>(kid: &str, secret: &[u8], c: &T) -> String {
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(kid.to_string());

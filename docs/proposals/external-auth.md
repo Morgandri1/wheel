@@ -306,8 +306,8 @@ network at all.
 
 1. **Boot refuses** `proxy_header` when `WHEEL_TRUSTED_PROXIES` is empty **or covers every
    address**. Believing a header from everyone is not a configuration, it is an open door — and
-   `0.0.0.0/0` is that door with a value in it, which the emptiness check alone admitted
-   (ADVERSARY 065). `bits == 0` is the whole predicate, because it is the only prefix length that
+   `0.0.0.0/0` is that door with a value in it, which the emptiness check alone admitted.
+   `bits == 0` is the whole predicate, because it is the only prefix length that
    is never a correct answer here; `10.0.0.0/8` is one, so this is not a private-range check.
 2. **Per request**, the **TCP peer** must be inside `WHEEL_TRUSTED_PROXIES`, or the request is 401
    whatever its headers say. Not `X-Forwarded-For` — the peer. `http::client_ip::resolve` already

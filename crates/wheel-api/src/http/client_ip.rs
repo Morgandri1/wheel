@@ -149,7 +149,11 @@ mod tests {
             .route(
                 "/",
                 get(|m: Option<axum::Extension<TrustedPeer>>| async move {
-                    if m.is_some() { "trusted" } else { "untrusted" }
+                    if m.is_some() {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    }
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(

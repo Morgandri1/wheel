@@ -261,7 +261,7 @@ fn external_auth_refuses_every_configuration_that_would_be_unsafe() {
         "the error must name what is missing: {e}"
     );
 
-    // ADVERSARY 065. The empty-list refusal above says "with no trusted peer list that is
+    // The empty-list refusal above says "with no trusted peer list that is
     // everyone" — and the value that literally means everyone sails past it, because it is not
     // empty. It is also the value an operator reaches for on a platform with no pinnable
     // load-balancer address, which is Wheel's documented deployment target.

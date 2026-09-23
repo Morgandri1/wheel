@@ -238,7 +238,9 @@ mod tests {
     fn covers_every_address_is_true_only_for_a_true_wildcard() {
         for wildcard in ["0.0.0.0/0", "::/0", "0.0.0.0/0,::/0", "10.0.0.0/8, ::/0"] {
             assert!(
-                TrustedProxies::parse(wildcard).unwrap().covers_every_address(),
+                TrustedProxies::parse(wildcard)
+                    .unwrap()
+                    .covers_every_address(),
                 "{wildcard}"
             );
         }

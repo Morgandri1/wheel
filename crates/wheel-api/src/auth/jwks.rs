@@ -265,7 +265,7 @@ fn algorithm_of(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
 /// Does the key set itself say this key may verify a signature?
 ///
 /// RFC 7517 §4.2/§4.3 let an issuer declare what a key is for, and until now we ignored both
-/// declarations and inferred purpose from key type alone (ADVERSARY 068). That is the same class of
+/// declarations and inferred purpose from key type alone. That is the same class of
 /// mistake as taking the algorithm from the token: the authority on what a key is for is the
 /// document we fetched from the issuer over TLS, and here it was telling us and we were not
 /// listening. An issuer that publishes its encryption and signing keys in one set — which is what
@@ -381,7 +381,7 @@ Y2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU\
         assert!(keys.is_empty(), "only Ed25519 is a signing curve here");
     }
 
-    /// ADVERSARY 068. The key set says what each key is for, and we were not reading it. An issuer
+    /// The key set says what each key is for, and we were not reading it. An issuer
     /// that publishes encryption and signing keys together — which is what `use` disambiguates —
     /// would have had its encryption key admitted as a signing key.
     #[test]
