@@ -227,6 +227,56 @@ impl DockerSandbox {
             .collect())
     }
 
+    /// Remove one volume by project id, with no matching container involved. For an orphan: a
+    /// volume whose project has no container AND no store row at all, so nothing else this host
+    /// does will ever touch it again.
+    pub async fn remove_orphan_volume(&self, id: &Uuid) -> Result<()> {
+        match self
+            .docker
+            .remove_volume(
+                &self.cfg.volume_name(id),
+                Some(qp::RemoveVolumeOptions { force: true }),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(e).context("removing an orphaned volume"),
+        }
+    }
+
+    /// Every volume this host made (labelled `wheel.project`), whether or not a container of the
+    /// same project still exists.
+    ///
+    /// A volume created without a matching container — the create sequence makes the volume
+    /// first, so a crash or a race between the two leaves exactly this — is invisible to
+    /// [`Self::list_project_containers`], which is why reconcile needs this as its own walk
+    /// rather than deriving it from the container list.
+    pub async fn list_project_volumes(&self) -> Result<Vec<Uuid>> {
+        let filters = HashMap::from([("label".to_string(), vec!["wheel.project".to_string()])]);
+        let listed = self
+            .docker
+            .list_volumes(Some(qp::ListVolumesOptions {
+                filters: Some(filters),
+            }))
+            .await
+            .context("listing project volumes")?;
+        Ok(listed
+            .volumes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| {
+                v.name
+                    .strip_prefix("wheel-p-")?
+                    .strip_suffix("-data")?
+                    .parse::<Uuid>()
+                    .ok()
+            })
+            .collect())
+    }
+
     /// The environment a project's container is created with, in a fixed order.
     fn env_for(&self, id: &Uuid, secrets: &Secrets) -> Vec<String> {
         vec![

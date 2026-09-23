@@ -39,6 +39,8 @@ struct Daemon {
     spec: Option<String>,
     /// What a list of project containers returns: (project, docker state).
     listed: Vec<(Uuid, &'static str)>,
+    /// What a list of project volumes returns.
+    listed_volumes: Vec<Uuid>,
     /// A raw daemon answers `GET /version`; the proxy never lets it get that far.
     requests: Vec<String>,
 }
@@ -52,6 +54,7 @@ impl Daemon {
             start_code: 204,
             spec: None,
             listed: vec![],
+            listed_volumes: vec![],
             requests: vec![],
         }
     }
@@ -106,7 +109,21 @@ fn fake_daemon(initial: Daemon) -> (std::path::PathBuf, Arc<Mutex<Daemon>>) {
                 let (code, body) = {
                     let mut d = shared.lock().unwrap();
                     d.requests.push(format!("{method} {path}"));
-                    if path.ends_with("/containers/json") {
+                    if path.ends_with("/volumes") {
+                        let items: Vec<String> = d
+                            .listed_volumes
+                            .iter()
+                            .map(|id| {
+                                format!(
+                                    r#"{{"Name":"wheel-p-{id}-data","Labels":{{"wheel.project":"{id}"}}}}"#
+                                )
+                            })
+                            .collect();
+                        (
+                            200,
+                            format!(r#"{{"Volumes":[{}],"Warnings":[]}}"#, items.join(",")),
+                        )
+                    } else if path.ends_with("/containers/json") {
                         let items: Vec<String> = d
                             .listed
                             .iter()
@@ -628,5 +645,96 @@ async fn a_container_the_store_says_should_not_run_is_stopped_and_a_wanted_one_i
         stops(&daemon, wanted),
         0,
         "a wanted project was stopped by the sweep"
+    );
+}
+
+fn removed_volume(d: &Arc<Mutex<Daemon>>, project: Uuid) -> bool {
+    d.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .any(|r| r.starts_with(&format!("DELETE /volumes/wheel-p-{project}-data")))
+}
+
+/// A volume with NO container at all and no project record was never handed an engine to write
+/// into (the create sequence makes the volume before the container), so it is the ceiling's real
+/// backstop: reaped, not merely stopped like an orphan container.
+#[tokio::test]
+async fn an_orphaned_volume_with_no_container_at_all_is_removed() {
+    let _guard = env_lock().lock().await;
+    let orphan = Uuid::new_v4();
+    let (daemon_sock, daemon) = fake_daemon(Daemon {
+        listed_volumes: vec![orphan],
+        ..Daemon::absent()
+    });
+    let front = proxy_in_front_of(&daemon_sock).await;
+    use_docker_host(&front);
+    let dir = wheeld::supervise::prepare_data_dir(&short("data")).unwrap();
+
+    boot(&dir).await.unwrap();
+
+    assert!(
+        removed_volume(&daemon, orphan),
+        "{:?}",
+        daemon.lock().unwrap().requests
+    );
+}
+
+/// A volume whose project DOES have a store row is left alone by the volume sweep even with no
+/// container yet (it is mid-creation, or the container step simply hasn't run) — reaping it would
+/// be reaping a project reconcile is about to (re)create for, not an orphan.
+#[tokio::test]
+async fn a_volume_whose_project_has_a_store_row_is_never_reaped() {
+    let _guard = env_lock().lock().await;
+    let project = Uuid::new_v4();
+    let (daemon_sock, daemon) = fake_daemon(Daemon {
+        listed_volumes: vec![project],
+        ..Daemon::absent()
+    });
+    let front = proxy_in_front_of(&daemon_sock).await;
+    use_docker_host(&front);
+    let dir = wheeld::supervise::prepare_data_dir(&short("data")).unwrap();
+    let store = wheel_host::store::Store::open(&dir.join("host.db").display().to_string()).unwrap();
+    store
+        .upsert(&project, "engine-secret", VAULT_KEY)
+        .await
+        .unwrap();
+
+    boot(&dir).await.unwrap();
+
+    assert!(
+        !removed_volume(&daemon, project),
+        "{:?}",
+        daemon.lock().unwrap().requests
+    );
+}
+
+/// A volume that DOES have a matching container is left to the container's own branch, whatever
+/// the container's state and store row — the volume sweep must not double-handle it.
+#[tokio::test]
+async fn a_volume_with_a_matching_container_is_left_to_the_container_branch() {
+    let _guard = env_lock().lock().await;
+    let orphan = Uuid::new_v4();
+    let (daemon_sock, daemon) = fake_daemon(Daemon {
+        listed: vec![(orphan, "running")],
+        listed_volumes: vec![orphan],
+        ..Daemon::absent()
+    });
+    let front = proxy_in_front_of(&daemon_sock).await;
+    use_docker_host(&front);
+    let dir = wheeld::supervise::prepare_data_dir(&short("data")).unwrap();
+
+    boot(&dir).await.unwrap();
+
+    assert!(
+        !removed_volume(&daemon, orphan),
+        "the container branch's data-preserving stop was bypassed: {:?}",
+        daemon.lock().unwrap().requests
+    );
+    assert_eq!(
+        stops(&daemon, orphan),
+        1,
+        "{:?}",
+        daemon.lock().unwrap().requests
     );
 }

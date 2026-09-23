@@ -185,13 +185,15 @@ pub fn check_backend_spelling(mode: crate::config::SandboxMode) -> Result<()> {
     }
 }
 
-/// After the normal reconcile: containers the store does not account for.
+/// After the normal reconcile: containers and volumes the store does not account for.
 ///
 /// A container with no project row is STOPPED and reported at error level, never deleted: its
 /// volume may be the only copy of someone's data (a store restored from an older backup looks
 /// exactly like this), so removing it is an operator's decision. A container whose row says the
 /// project should not be running is stopped, because docker's own `unless-stopped` restart would
-/// otherwise bring it back before this process ever looked.
+/// otherwise bring it back before this process ever looked. A VOLUME with no project row AND no
+/// container at all is a different case, treated differently (removed, not stopped) — see the
+/// comment on that half below.
 pub async fn reconcile_extras(
     sandbox: &DockerSandbox,
     store: &wheel_host::store::Store,
@@ -202,7 +204,9 @@ pub async fn reconcile_extras(
         .into_iter()
         .map(|r| r.id)
         .collect();
+    let mut has_container: HashSet<Uuid> = HashSet::new();
     for (id, state) in sandbox.list_project_containers().await? {
+        has_container.insert(id);
         let running = state == "running" || state == "restarting";
         if store.get(&id).await?.is_none() {
             tracing::error!(
@@ -217,6 +221,30 @@ pub async fn reconcile_extras(
         } else if running && !wanted.contains(&id) {
             tracing::info!(project = %id, "stopping a container the store says should not be running");
             sandbox.stop(&id).await?;
+        }
+    }
+
+    // A VOLUME with no container at all and no project record is a different case from the one
+    // above, not the same rule applied to a different object: the container branch stops rather
+    // than deletes because a container with real work in it might be the only copy of that work.
+    // A volume with NO container was, by construction, never handed to an engine to write
+    // anything into — the create sequence makes the volume before the container, so this is
+    // exactly what an interrupted create (a crash, or the M3a project ceiling losing a race
+    // between its count and the daemon's actual state) leaves behind. Reaped as the ceiling's
+    // real backstop (adversary, #163: without this, 50 volume creates in a row are invisible to
+    // both the ceiling and this reconcile forever). A volume whose project DOES have a container
+    // is left to that container's own branch above, whatever the container's state.
+    for id in sandbox.list_project_volumes().await? {
+        if has_container.contains(&id) {
+            continue;
+        }
+        if store.get(&id).await?.is_none() {
+            tracing::error!(
+                project = %id,
+                "an orphaned project volume has no container and no project record; removing it \
+                 (nothing was ever handed an engine to write into it)"
+            );
+            sandbox.remove_orphan_volume(&id).await?;
         }
     }
     Ok(())
