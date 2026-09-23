@@ -134,6 +134,9 @@ fn row_to_message(conn: &Connection, row: &rusqlite::Row<'_>) -> rusqlite::Resul
         delivered_at: delivered.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),
         consumed_at: consumed.and_then(|t| Timestamp::parse_rfc3339(&t).ok()),
         last_error: row.get("last_error")?,
+        // Not a stored column: redaction is applied per caller at the API boundary
+        // (`api::actor::mask_message_for_tier`), never persisted.
+        redacted: false,
     })
 }
 
