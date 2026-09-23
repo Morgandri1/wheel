@@ -20,7 +20,7 @@ export const HIDDEN_LABEL = "Hidden — prompter tier or above";
  * clients that do not know the flag; this one keys off the flag and never matches that string.
  */
 export function isRedactedMessage(message: Message): boolean {
-  return (message as { redacted?: unknown }).redacted === true;
+  return message.redacted === true;
 }
 
 /** The unfiltered `GET …/log` names what it left out, and only for a caller it left something out for. */
