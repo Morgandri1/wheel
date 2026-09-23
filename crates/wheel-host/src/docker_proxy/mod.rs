@@ -112,6 +112,29 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
         }
     };
 
+    // The ceiling only ever applies to a CREATE: nothing else grows the count, and refusing a
+    // create when the daemon cannot even be asked how many projects exist would turn "the daemon
+    // is briefly slow" into "no new project can ever start" — a stronger failure than the ceiling
+    // is meant to cause. So an uncountable daemon is treated as "under the ceiling," and a real,
+    // enforced-elsewhere resource limit (this proxy's own container/volume checks, the disk floor)
+    // is what actually bounds a daemon this proxy cannot even query.
+    let is_create = matches!(admission.reply, Reply::Create | Reply::Volume);
+    if is_create && proxy.policy.max_projects > 0 {
+        if let Ok(count) = count_projects(&proxy.upstream).await {
+            if count >= proxy.policy.max_projects {
+                tracing::warn!(
+                    count,
+                    max = proxy.policy.max_projects,
+                    "docker proxy refused a create: at the project ceiling"
+                );
+                return docker_error(
+                    StatusCode::FORBIDDEN,
+                    "docker proxy: refused (at the configured project ceiling)",
+                );
+            }
+        }
+    }
+
     match forward(&proxy.upstream, admission).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -119,6 +142,22 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
             docker_error(StatusCode::BAD_GATEWAY, "docker proxy: daemon unreachable")
         }
     }
+}
+
+/// How many project containers the daemon already holds. Used only to enforce the ceiling; a
+/// daemon that cannot answer this is not itself refused (see the caller).
+async fn count_projects(upstream: &std::path::Path) -> Result<usize> {
+    let list = policy::list_admission();
+    let resp = forward(upstream, list).await?;
+    if resp.status() != StatusCode::OK {
+        anyhow::bail!("listing project containers answered {}", resp.status());
+    }
+    let body = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .context("reading the container list")?;
+    let items: Vec<serde_json::Value> =
+        serde_json::from_slice(&body).context("container list was not a JSON array")?;
+    Ok(items.len())
 }
 
 /// Send what was admitted — rebuilt, never the caller's own bytes — and reduce the answer.
@@ -202,6 +241,15 @@ pub async fn serve(
     owner: Option<(u32, u32)>,
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // A unix socket path has to fit in `sockaddr_un.sun_path` (~104 bytes). Past that, `bind`
+    // fails with an error that says nothing about the real cause — check it here, by name, the
+    // same guard `sandbox/process.rs::provision` already has for the engine's own socket.
+    let len = path.as_os_str().len();
+    anyhow::ensure!(
+        len < 100,
+        "docker proxy socket path is {len} bytes and must stay under 100 (sockaddr_un limit): {}",
+        path.display()
+    );
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }

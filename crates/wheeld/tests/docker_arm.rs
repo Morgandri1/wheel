@@ -192,6 +192,8 @@ async fn proxy_in_front_of(daemon: &std::path::Path) -> std::path::PathBuf {
             nano_cpus: 1_000_000_000,
             pids_limit: 512,
             engine_port: 7000,
+            run_root: None,
+            max_projects: 0,
         },
         daemon.to_path_buf(),
     );

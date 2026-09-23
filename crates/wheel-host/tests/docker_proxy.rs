@@ -124,6 +124,8 @@ fn policy() -> Policy {
         nano_cpus: 1_500_000_000,
         pids_limit: 256,
         engine_port: 7000,
+        run_root: None,
+        max_projects: 0,
     }
 }
 
@@ -395,4 +397,186 @@ async fn headers_that_change_what_a_request_is_are_refused_before_the_daemon_hea
         "the daemon heard a refused request: {:?}",
         seen.lock().unwrap()
     );
+}
+
+// --------------------------------------------------------------------- project ceiling (M3a)
+
+/// A daemon that answers a fixed number of project containers on `/containers/json` and admits
+/// creates otherwise, so the ceiling is the only thing under test.
+fn fake_daemon_listing(count: usize) -> std::path::PathBuf {
+    let path = sock("daemon-list");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    let Some(head_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let want: usize = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + want {
+                        break;
+                    }
+                }
+                let raw = String::from_utf8_lossy(&raw).to_string();
+                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                let path = target.split('?').next().unwrap_or("");
+                let (code, body) = if path.ends_with("/containers/json") {
+                    let items: Vec<String> = (0..count)
+                        .map(|_| {
+                            format!(
+                                r#"{{"Names":["/wheel-p-{}"],"State":"running","Labels":{{"wheel.project":"{}"}}}}"#,
+                                Uuid::new_v4(),
+                                Uuid::new_v4()
+                            )
+                        })
+                        .collect();
+                    (200, format!("[{}]", items.join(",")))
+                } else if path.ends_with("/volumes/create") {
+                    (201, r#"{"Name":"v","Driver":"local","Mountpoint":"/m","Labels":{},"Scope":"local","Options":{}}"#.to_string())
+                } else if path.ends_with("/containers/create") {
+                    (201, r#"{"Id":"deadbeef","Warnings":[]}"#.to_string())
+                } else {
+                    (204, String::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {code} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    path
+}
+
+async fn proxy_with_ceiling(daemon: &std::path::Path, max: usize) -> std::path::PathBuf {
+    let listen = sock("proxy-ceil");
+    let mut p = policy();
+    p.max_projects = max;
+    let proxy = Proxy::new(p, daemon.to_path_buf());
+    let l = listen.clone();
+    tokio::spawn(async move { serve(proxy, &l, 0o600, None).await.unwrap() });
+    for _ in 0..200 {
+        if listen.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    listen
+}
+
+#[tokio::test]
+async fn a_create_past_the_ceiling_is_refused_and_never_reaches_the_daemon() {
+    let daemon = fake_daemon_listing(3);
+    let front = proxy_with_ceiling(&daemon, 3).await;
+    let id = Uuid::new_v4();
+    let (status, body) = raw(
+        &front,
+        "POST",
+        &format!("/containers/create?name=wheel-p-{id}"),
+        &golden(&id),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.to_lowercase().contains("ceiling"), "{body}");
+}
+
+#[tokio::test]
+async fn a_create_under_the_ceiling_is_admitted() {
+    let daemon = fake_daemon_listing(2);
+    let front = proxy_with_ceiling(&daemon, 3).await;
+    let id = Uuid::new_v4();
+    let (status, body) = raw(
+        &front,
+        "POST",
+        &format!("/containers/create?name=wheel-p-{id}"),
+        &golden(&id),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn a_zero_ceiling_means_no_ceiling() {
+    let daemon = fake_daemon_listing(1_000_000);
+    let front = proxy_with_ceiling(&daemon, 0).await;
+    let id = Uuid::new_v4();
+    let (status, body) = raw(
+        &front,
+        "POST",
+        &format!("/containers/create?name=wheel-p-{id}"),
+        &golden(&id),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+/// The daemon this counts against is the SAME upstream the create would use; a daemon that cannot
+/// even answer the list must not become a way to block every future create.
+#[tokio::test]
+async fn a_daemon_that_cannot_be_asked_does_not_block_creates() {
+    let front = proxy_with_ceiling(
+        std::path::Path::new("/tmp/wh-no-daemon-for-ceiling.sock"),
+        3,
+    )
+    .await;
+    let id = Uuid::new_v4();
+    let (status, _) = raw(
+        &front,
+        "POST",
+        &format!("/containers/create?name=wheel-p-{id}"),
+        &golden(&id),
+    )
+    .await;
+    // Refused for lack of a daemon (502), not for the ceiling (403) -- the create was still
+    // ATTEMPTED, which is the property under test.
+    assert_eq!(status, 502);
+}
+
+/// `golden()`'s helper takes the FIXED test `id()`; the ceiling tests each use a fresh project id,
+/// so this builds the same shape for an arbitrary one.
+fn golden(id: &Uuid) -> String {
+    serde_json::json!({
+        "Image": IMAGE,
+        "Env": [
+            format!("WHEEL_PROJECT_ID={id}"),
+            "WHEEL_ENGINE_SECRET=engine-secret",
+            "WHEEL_VAULT_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "WHEEL_HARNESS_AUTH=api-key-only",
+            "WHEEL_LISTEN=tcp://0.0.0.0:7000",
+            "WHEEL_DATA_DIR=/data",
+            "WHEEL_LOG=json",
+            "WHEEL_ROLE=engine",
+        ],
+        "Labels": { "wheel.project": id.to_string() },
+        "HostConfig": {
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges"],
+            "Memory": 512 * 1024 * 1024i64,
+            "MemorySwap": 512 * 1024 * 1024i64,
+            "NanoCpus": 1_500_000_000i64,
+            "PidsLimit": 256,
+            "NetworkMode": NETWORK,
+            "Binds": [format!("wheel-p-{id}-data:/data")],
+            "RestartPolicy": { "Name": "unless-stopped" },
+        },
+    })
+    .to_string()
 }
