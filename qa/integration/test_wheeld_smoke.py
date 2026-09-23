@@ -69,9 +69,18 @@ def clean_env(data_dir):
     Every WHEEL_* and DATABASE_URL is removed. If wheeld needs one, the point of this suite
     is to find that out -- and a variable sitting in my shell would supply it silently and
     turn the one honest test of the promise into a test of my laptop.
+
+    SANDBOX_BACKEND belongs to the same "settings that must not leak in" class even though it
+    isn't WHEEL_*-spelled: it's wheel-host's own env var (this CI job's docker-matrix leg sets
+    it ambiently, for the OTHER suites in this same run that talk to wheel-host directly), and
+    since wheeld/docker_arm.rs started cross-checking it against WHEEL_SANDBOX (M1's "two
+    spellings of one decision must agree" guard), a leaked SANDBOX_BACKEND=docker alongside a
+    correctly-stripped WHEEL_SANDBOX (-> embedded) reads as a genuine contradiction and wheeld
+    correctly refuses to boot. This suite tests the embedded default, which never sees a
+    wheel-host-scoped variable in a real user's shell, so the leak -- not the guard -- is the bug.
     """
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("WHEEL_") and k not in ("DATABASE_URL", "BIND_ADDR")}
+           if not k.startswith("WHEEL_") and k not in ("DATABASE_URL", "BIND_ADDR", "SANDBOX_BACKEND")}
     env["WHEEL_DATA_DIR"] = data_dir          # the one flag a user would pass
     # Signup is closed unless the operator opens it (headless-first review, round 1), and this
     # smoke signs up; saying so is the one decision a user makes out loud.
