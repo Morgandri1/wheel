@@ -239,4 +239,17 @@ Web (loop node UI: interval + prompt/op config, start/stop). Short proposal firs
 touching the wire matrix and the schema (§3) — lighter-weight than portals/helper-agent since it doesn't cross
 any auth boundary, but the interval floor and budget/rate-limit interaction need to be nailed down before code.
 
+## 9. Board-manager "sentinel" mascot (cosmetic, low priority)
+
+**Operator's ask (2026-09-23), verbatim:** "I think it would be a really fun gimmick if the board manager agent
+walks around like a Matrix spider; one of the big computers on legs that walks around managing the matrix cells."
+Follow-up clarifications: "This is just in UI; it would walk to the agents it's managing at any given moment" —
+i.e. tied to real board activity (current message/turn target), not an idle/fixed animation.
+
+**Goal:** purely cosmetic canvas decoration — a spider-legged "sentinel" mascot representing the board-manager
+agent, animating between node cells to whichever agent(s) it's currently active with. No functional requirement,
+no wire/schema/engine change; UI-only.
+
+**Owner:** Web. No fuller spec requested yet — pick up when there's slack in the queue.
+
 <!-- Further tasks appended as the operator provides them. -->
