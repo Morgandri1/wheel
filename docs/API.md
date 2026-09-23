@@ -340,6 +340,12 @@ is not a copy of anyone's invitations. It expires (7 days by default), has a use
 default), and may be locked to an email — checked against the account's *verified* address, never
 against a claim in the request.
 
+**Accepting an unusable invite is `404 invite_unusable`, never `401`.** Unknown, expired, revoked,
+fully used, locked to another address, and "your membership of this project was revoked" all answer
+the same status and body, so a link cannot be probed to learn which links exist. It is deliberately
+not a 401: the caller's session is fine, and clients treat a 401 as "your login is dead" (the web app
+clears the cookie), which would sign out a visitor for opening a stale link.
+
 ### Member and creator email — resolved for display, masked for a guest
 
 `Member.email` and `MemberList.creator_email` are `Option<String>`, omitted from the response

@@ -62,6 +62,14 @@ pub enum ApiError {
     #[error("ingress is not implemented by this engine")]
     IngressUnavailable,
 
+    /// An invite link that cannot be redeemed, whatever the reason: unknown, expired, revoked, used
+    /// up, meant for another account, or the redeemer's membership having been revoked. ONE answer
+    /// for all of them, so a link cannot be probed to learn which links exist — and NOT a 401, because
+    /// the caller's own session is fine. A 401 here is read by clients as "your login is dead", and
+    /// the web app then clears the session of a visitor whose only mistake was a stale link.
+    #[error("invite cannot be used")]
+    InviteUnusable(&'static str),
+
     /// Anything unexpected. The inner error is logged and dropped from the response.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -89,6 +97,13 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "The requested resource does not exist.".into(),
+            ),
+            ApiError::InviteUnusable(_) => (
+                StatusCode::NOT_FOUND,
+                "invite_unusable",
+                "This invite link cannot be used. It may be unknown, expired, revoked, fully \
+                 used, or meant for a different account."
+                    .into(),
             ),
             ApiError::Forbidden(_) => (
                 StatusCode::FORBIDDEN,
@@ -154,6 +169,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Unauthorized(why) => tracing::debug!(reason = why, "auth rejected"),
             ApiError::Forbidden(why) => tracing::debug!(reason = why, "forbidden"),
+            ApiError::InviteUnusable(why) => tracing::debug!(reason = why, "invite refused"),
             ApiError::BadGateway(why) => tracing::warn!(reason = why, "upstream unavailable"),
             ApiError::ServiceUnavailable(why) => {
                 tracing::warn!(reason = why, "refused: at capacity")
