@@ -35,14 +35,17 @@ struct Recorded {
 /// `state` decides what container inspection reports, so a test can put the daemon in a state and
 /// assert how the backend maps it.
 fn fake_daemon(state: &'static str) -> (std::path::PathBuf, Arc<Mutex<Recorded>>) {
-    fake_daemon_with(state, false)
+    fake_daemon_with(state, false, None)
 }
 
 /// `pre_existing` starts the daemon as if the container were already there, for tests about
-/// inspection rather than creation.
+/// inspection rather than creation. `health`, when set, is docker's own HEALTHCHECK status word
+/// (`starting`/`healthy`/`unhealthy`) reported alongside `state` — `None` matches a container
+/// with no HEALTHCHECK result yet reported (what every existing caller of this fixture predates).
 fn fake_daemon_with(
     state: &'static str,
     pre_existing: bool,
+    health: Option<&'static str>,
 ) -> (std::path::PathBuf, Arc<Mutex<Recorded>>) {
     let path = std::path::PathBuf::from(format!(
         "/tmp/wh-dk-{}.sock",
@@ -109,6 +112,9 @@ fn fake_daemon_with(
                 let path = strip_version(full.split('?').next().unwrap_or(""));
                 let full = strip_version(&full);
 
+                // What a real daemon remembers of the create: its labels, echoed back on inspection
+                // (the backend reads its `wheel.spec` label to tell a current container from a stale one).
+                let mut labels_json = String::new();
                 let exists = {
                     let mut r = recorder.lock().unwrap();
                     r.requests.push(format!("{method} {full}"));
@@ -120,12 +126,30 @@ fn fake_daemon_with(
                     if path == "/containers/create" {
                         r.created = true;
                     }
+                    if let Some(l) = r
+                        .bodies
+                        .get("/containers/create")
+                        .map(|b| b["Labels"].clone())
+                    {
+                        if !l.is_null() {
+                            labels_json = format!(r#","Config":{{"Labels":{l}}}"#);
+                        }
+                    }
                     r.created
                 };
 
                 let (code, body) = if path.ends_with("/json") {
                     if exists {
-                        (200, format!(r#"{{"State":{{"Status":"{state}"}}}}"#))
+                        let health_json = match health {
+                            Some(h) => format!(r#","Health":{{"Status":"{h}"}}"#),
+                            None => String::new(),
+                        };
+                        (
+                            200,
+                            format!(
+                                r#"{{"State":{{"Status":"{state}"{health_json}}}{labels_json}}}"#
+                            ),
+                        )
                     } else {
                         (404, r#"{"message":"No such container"}"#.to_string())
                     }
@@ -391,7 +415,7 @@ async fn docker_states_map_to_our_statuses() {
         // anything docker does not define, so our `Status::Error` arm is unreachable through it.
         ("removing", Status::Stopped),
     ] {
-        let (sock, _) = fake_daemon_with(docker_state, true);
+        let (sock, _) = fake_daemon_with(docker_state, true, None);
         let sb = sandbox(&sock);
         assert_eq!(
             sb.status(&Uuid::new_v4()).await.unwrap(),
@@ -399,6 +423,36 @@ async fn docker_states_map_to_our_statuses() {
             "docker state {docker_state:?}"
         );
     }
+}
+
+/// A container docker reports as `running` whose own HEALTHCHECK hasn't completed its first cycle
+/// yet (`health: "starting"`, always true for the whole `--start-period`, 10s on this image) must
+/// still read as `Running`, not `Starting` — that health word is not a negative signal, and
+/// `start()` has already confirmed the engine live via a direct, more current `/healthz` probe of
+/// its own before this status is ever asked for. Getting this wrong meant a project read back
+/// `starting` for up to ten seconds after a start that had already succeeded.
+///
+/// `unhealthy`, in contrast, IS a negative signal (docker ran the check and it failed) and must
+/// still demote — pinned alongside so the fix doesn't overcorrect into ignoring health entirely.
+#[tokio::test]
+async fn a_running_container_still_awaiting_its_first_healthcheck_reads_as_running() {
+    for health in [Some("starting"), Some("healthy"), None] {
+        let (sock, _) = fake_daemon_with("running", true, health);
+        let sb = sandbox(&sock);
+        assert_eq!(
+            sb.status(&Uuid::new_v4()).await.unwrap(),
+            Status::Running,
+            "health={health:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_running_container_that_actually_failed_its_healthcheck_reads_as_error() {
+    let (sock, _) = fake_daemon_with("running", true, Some("unhealthy"));
+    let sb = sandbox(&sock);
+    let err = sb.status(&Uuid::new_v4()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("unhealthy"), "{err:#}");
 }
 
 #[tokio::test]

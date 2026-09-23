@@ -8,6 +8,7 @@
 //! are the ones that ship; what changes is only how they are wired together.
 
 pub mod config;
+pub mod docker_arm;
 pub mod embedded;
 pub mod guard;
 pub mod supervise;
@@ -37,7 +38,13 @@ pub async fn run_with_updates(settings: Settings, lane: Option<Arc<update::Lane>
     let data_dir = supervise::prepare_data_dir(&settings.data_dir)?;
     let keys = supervise::Keys::load_or_create(&data_dir)?;
 
-    let host = start_host(&data_dir, &keys, lane.as_ref().map(|l| l.hook())).await?;
+    let host = start_host_with(
+        &data_dir,
+        &keys,
+        lane.as_ref().map(|l| l.hook()),
+        settings.sandbox,
+    )
+    .await?;
 
     // An update that has passed every gate and waited for the board to go quiet arrives here. The
     // API stops serving, and then the SAME shutdown a SIGTERM runs stops every agent.
@@ -70,7 +77,7 @@ pub async fn run_with_updates(settings: Settings, lane: Option<Arc<update::Lane>
     };
     // After the API stops taking requests, before the process exits: every engine stops its
     // agents, whatever ended serving. Nothing this daemon started may outlive it.
-    host.sandbox.shutdown_all().await;
+    host.shutdown().await;
 
     let ready = installing.lock().unwrap().take();
     if let (Some(lane), Some(ready)) = (lane, ready) {
@@ -112,7 +119,20 @@ fn confirm_health_when_serving(bind: &str, lane: Arc<update::Lane>) {
 pub struct Host {
     /// The loopback URL the API reaches the host on.
     pub url: String,
-    pub sandbox: Arc<embedded::EmbeddedSandbox>,
+    pub sandbox: Arc<dyn wheel_host::sandbox::Sandbox>,
+    /// Present only in embedded mode: those engines are tasks in this process and must be stopped
+    /// by it. Docker containers are deliberately not stopped when this process exits — they keep
+    /// running, and the next boot's reconcile re-adopts them.
+    embedded: Option<Arc<embedded::EmbeddedSandbox>>,
+}
+
+impl Host {
+    /// Stop what this process itself is running. Nothing else: see `embedded`.
+    pub async fn shutdown(&self) {
+        if let Some(embedded) = &self.embedded {
+            embedded.shutdown_all().await;
+        }
+    }
 }
 
 /// Everything the binary does, so that `main` is a call and nothing else.
@@ -213,6 +233,30 @@ pub async fn start_host(
     keys: &supervise::Keys,
     update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
 ) -> Result<Host> {
+    start_host_with(data_dir, keys, update, config::SandboxMode::Embedded).await
+}
+
+/// [`start_host`] with the sandbox chosen.
+pub async fn start_host_with(
+    data_dir: &std::path::Path,
+    keys: &supervise::Keys,
+    update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
+    mode: config::SandboxMode,
+) -> Result<Host> {
+    docker_arm::check_backend_spelling(mode)?;
+    docker_arm::check_sandbox_kind(data_dir, mode)?;
+    if mode == config::SandboxMode::Docker {
+        // The default `composed_env` would otherwise set the other spelling to `process`.
+        supervise::apply_defaults(&[("SANDBOX_BACKEND", "docker".into())]);
+    }
+    if mode == config::SandboxMode::Docker && update.is_some() {
+        anyhow::bail!(
+            "WHEEL_SANDBOX=docker cannot be combined with WHEEL_AUTO_UPDATE: tenant engines run \
+             from a separate image, so updating wheeld alone would leave them behind. Upgrade with \
+             `docker compose pull && docker compose up -d`, or unset WHEEL_SANDBOX to keep \
+             auto-update (embedded mode)"
+        );
+    }
     // Loopback only, on a port the OS picks. Nothing outside this machine may reach the host: it
     // is the half of the process that can start and stop any project's engine.
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -223,8 +267,12 @@ pub async fn start_host(
 
     supervise::apply_defaults(&supervise::composed_env(data_dir, keys, &host_url));
 
-    let (host_state, sandbox) = build_host_state(data_dir, update)?;
+    let (host_state, embedded, docker) = build_host_state(data_dir, update, mode).await?;
+    let sandbox = host_state.sandbox.clone();
     wheel_host::reconcile_on_boot(&host_state).await;
+    if let Some(docker) = &docker {
+        docker_arm::reconcile_extras(docker, &host_state.store).await?;
+    }
     tokio::spawn(async move {
         if let Err(e) = wheel_host::serve_on(host_listener, host_state).await {
             tracing::error!(error = %format_args!("{e:#}"), "the sandbox host stopped");
@@ -234,28 +282,50 @@ pub async fn start_host(
     Ok(Host {
         url: host_url,
         sandbox,
+        embedded,
     })
 }
 
-/// The host, with engines embedded rather than spawned.
-fn build_host_state(
+/// The sandbox behind the host, and whichever concrete handle the daemon itself must keep.
+type ChosenSandbox = (
+    Arc<dyn wheel_host::sandbox::Sandbox>,
+    Option<Arc<embedded::EmbeddedSandbox>>,
+    Option<Arc<wheel_host::sandbox::docker::DockerSandbox>>,
+);
+
+/// The host over the chosen sandbox: engines embedded in this process, or a container each.
+async fn build_host_state(
     data_dir: &std::path::Path,
     update: Option<Arc<dyn wheel_engine::update::UpdateHook>>,
-) -> Result<(wheel_host::HostState, Arc<embedded::EmbeddedSandbox>)> {
+    mode: config::SandboxMode,
+) -> Result<(
+    wheel_host::HostState,
+    Option<Arc<embedded::EmbeddedSandbox>>,
+    Option<Arc<wheel_host::sandbox::docker::DockerSandbox>>,
+)> {
     let cfg = wheel_host::config::Config::from_env().context("host configuration")?;
     let store = Arc::new(wheel_host::store::Store::open(
         &data_dir.join("host.db").display().to_string(),
     )?);
-    let sandbox = Arc::new(
-        embedded::EmbeddedSandbox::for_data_dir(
-            data_dir.to_path_buf(),
-            std::time::Duration::from_secs(cfg.start_timeout_secs),
-        )?
-        .with_update(update),
-    );
+    let (sandbox, embedded, docker): ChosenSandbox = match mode {
+        config::SandboxMode::Embedded => {
+            let embedded = Arc::new(
+                embedded::EmbeddedSandbox::for_data_dir(
+                    data_dir.to_path_buf(),
+                    std::time::Duration::from_secs(cfg.start_timeout_secs),
+                )?
+                .with_update(update),
+            );
+            (embedded.clone(), Some(embedded), None)
+        }
+        config::SandboxMode::Docker => {
+            let docker = docker_arm::connect(cfg.clone()).await?;
+            (docker.clone(), None, Some(docker))
+        }
+    };
     let state = wheel_host::HostState {
         cfg,
-        sandbox: sandbox.clone(),
+        sandbox,
         store,
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -264,7 +334,7 @@ fn build_host_state(
         auth_limiter: Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
         ready: wheel_host::Readiness::serving_from_start(),
     };
-    Ok((state, sandbox))
+    Ok((state, embedded, docker))
 }
 
 /// `0.0.0.0:8080` is not an address a browser can open; say `localhost` instead.

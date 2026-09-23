@@ -51,6 +51,7 @@ async fn wheeld_boots_the_whole_product_in_one_process() {
     let settings = wheeld::config::Settings {
         data_dir: dir.clone(),
         bind: bind.clone(),
+        sandbox: Default::default(),
     };
     let server = tokio::spawn(async move { wheeld::run(settings).await });
 

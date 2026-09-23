@@ -405,6 +405,7 @@ impl Policy {
                 "CapDrop",
                 "SecurityOpt",
                 "Memory",
+                "MemorySwap",
                 "NanoCpus",
                 "PidsLimit",
                 "NetworkMode",
@@ -434,6 +435,9 @@ impl Policy {
         }
         for (key, exact) in [
             ("Memory", self.memory),
+            // Swap equal to memory means no swap at all; left unset a container gets twice its
+            // memory limit in swap.
+            ("MemorySwap", self.memory),
             ("NanoCpus", self.nano_cpus),
             ("PidsLimit", self.pids_limit),
         ] {
@@ -453,6 +457,7 @@ impl Policy {
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges"],
             "Memory": self.memory,
+            "MemorySwap": self.memory,
             "NanoCpus": self.nano_cpus,
             "PidsLimit": self.pids_limit,
             "NetworkMode": self.network,
@@ -657,6 +662,7 @@ mod tests {
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges"],
                 "Memory": 1 << 30,
+                "MemorySwap": 1 << 30,
                 "NanoCpus": 1_000_000_000i64,
                 "PidsLimit": 512,
                 "NetworkMode": "wheel-tenants",
