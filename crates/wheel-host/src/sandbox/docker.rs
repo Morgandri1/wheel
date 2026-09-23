@@ -93,13 +93,22 @@ impl DockerSandbox {
                     // The engine image declares a HEALTHCHECK, so docker itself knows whether a
                     // running engine is answering. Reported as its own word: `running` alone is a
                     // process that exists, which is not the same as a project that works.
+                    //
+                    // Only `unhealthy` (docker has actually run its healthcheck and it failed)
+                    // demotes. `starting` is NOT a negative signal -- it just means docker hasn't
+                    // completed its own check cycle yet (HEALTHCHECK's `--start-period`, 10s on
+                    // this image), and by the time `start()` returns at all it has already
+                    // confirmed the engine healthy directly, via `await_healthy`'s own probe of
+                    // the exact same `/healthz` -- a strictly more current signal than docker's own
+                    // lagging one. Treating "docker hasn't checked yet" as "not ready" here used to
+                    // make every project read back `starting` for up to ten seconds after a start
+                    // that had already succeeded, real health probe and all.
                     let health = s
                         .health
                         .and_then(|h| h.status)
                         .map(|h| h.to_string().to_ascii_lowercase());
                     Some(match (status.as_str(), health.as_deref()) {
                         ("running", Some("unhealthy")) => "unhealthy".to_string(),
-                        ("running", Some("starting")) => "created".to_string(),
                         _ => status,
                     })
                 });
