@@ -33,9 +33,9 @@ fn cfg(db_url: &str, mode: AuthMode) -> Config {
         env: Env::Prod,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "https://clerk.test/jwks".into(),
-        clerk_issuer: "https://clerk.test".into(),
-        clerk_azp: vec![],
+        jwks_url: "https://clerk.test/jwks".into(),
+        jwks_issuer: "https://clerk.test".into(),
+        jwks_azp: vec![],
         dev_secret: None,
         auth_mode: mode,
         session_secret: Secret::new(SESSION_SECRET),
@@ -50,6 +50,7 @@ fn cfg(db_url: &str, mode: AuthMode) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
         ws_max_bridges_per_project: 16,
         ws_max_lifetime_secs: 3600,
     }
@@ -83,6 +84,7 @@ async fn app_with(mode: AuthMode) -> Option<(Router, wheel_api::db::Db)> {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: None,
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     Some((wheel_api::build_router(state, &[]), db))

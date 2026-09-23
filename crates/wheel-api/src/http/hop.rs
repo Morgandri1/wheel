@@ -38,9 +38,19 @@ const CLIENT_ONLY: &[&str] = &[
 
 /// Build the header set to send upstream.
 ///
-/// `extra_forbidden_prefixes` lets the ingress path additionally drop every `x-wheel-*` header, so
-/// a public caller cannot forge the trust markers we ourselves add.
-pub fn sanitize_for_upstream(inbound: &HeaderMap, extra_forbidden_prefixes: &[&str]) -> HeaderMap {
+/// `extra_forbidden_prefixes` lets both proxy paths additionally drop every `x-wheel-*` header, so
+/// a caller cannot forge the trust markers we ourselves add.
+///
+/// `extra_forbidden_names` is the same idea for names that cannot be a `const`, because the
+/// deployment chooses them: under `AUTH_MODE=external` with the `proxy_header` verifier, the
+/// authenticating proxy's subject and email headers ARE the caller's credential, and relaying a
+/// credential downstream is exactly what `CLIENT_ONLY` exists to prevent. They are lower-cased by
+/// the caller, and compared against the already-folded name here.
+pub fn sanitize_for_upstream(
+    inbound: &HeaderMap,
+    extra_forbidden_prefixes: &[&str],
+    extra_forbidden_names: &[&str],
+) -> HeaderMap {
     // Headers the client nominated via `Connection: foo, bar` are hop-by-hop for this exchange.
     let mut nominated: Vec<String> = Vec::new();
     for v in inbound.get_all("connection").iter() {
@@ -60,6 +70,7 @@ pub fn sanitize_for_upstream(inbound: &HeaderMap, extra_forbidden_prefixes: &[&s
             || CLIENT_ONLY.contains(&n.as_str())
             || nominated.iter().any(|x| x == &n)
             || extra_forbidden_prefixes.iter().any(|p| n.starts_with(p))
+            || extra_forbidden_names.iter().any(|f| *f == n)
         {
             continue;
         }
@@ -110,6 +121,7 @@ mod tests {
                 ("content-type", "application/json"),
             ]),
             &[],
+            &[],
         );
         assert!(out.get("x-auth-token").is_none());
         assert!(
@@ -131,6 +143,7 @@ mod tests {
                 ("x-keep", "yes"),
             ]),
             &[],
+            &[],
         );
         assert!(
             out.get("x-secret-thing").is_none(),
@@ -150,6 +163,7 @@ mod tests {
                 ("accept", "*/*"),
             ]),
             &["x-wheel-"],
+            &[],
         );
         assert!(
             out.get("x-wheel-ingress").is_none(),
@@ -159,9 +173,31 @@ mod tests {
         assert_eq!(out.get("accept").unwrap(), "*/*");
     }
 
+    /// The proxy-asserted identity is a credential. It must not reach an engine, where an agent
+    /// could read it and learn — or replay — who the edge said was calling.
+    #[test]
+    fn a_configured_proxy_assertion_never_crosses_the_hop() {
+        let out = sanitize_for_upstream(
+            &hm(&[
+                ("X-Forwarded-User", "alice"),
+                ("X-Forwarded-Email", "alice@example.com"),
+                ("x-keep", "yes"),
+            ]),
+            &[],
+            &["x-forwarded-user", "x-forwarded-email"],
+        );
+        assert!(out.get("x-forwarded-user").is_none());
+        assert!(out.get("x-forwarded-email").is_none());
+        assert_eq!(out.get("x-keep").unwrap(), "yes");
+    }
+
     #[test]
     fn case_insensitive() {
-        let out = sanitize_for_upstream(&hm(&[("X-Auth-Token", "t"), ("AUTHORIZATION", "b")]), &[]);
+        let out = sanitize_for_upstream(
+            &hm(&[("X-Auth-Token", "t"), ("AUTHORIZATION", "b")]),
+            &[],
+            &[],
+        );
         assert!(out.is_empty(), "header matching must be case-insensitive");
     }
 }

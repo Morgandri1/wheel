@@ -105,9 +105,9 @@ fn cfg(db_url: &str) -> Config {
         env: Env::Prod,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "https://clerk.test/jwks".into(),
-        clerk_issuer: "https://clerk.test".into(),
-        clerk_azp: vec![],
+        jwks_url: "https://clerk.test/jwks".into(),
+        jwks_issuer: "https://clerk.test".into(),
+        jwks_azp: vec![],
         dev_secret: None,
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
@@ -122,6 +122,7 @@ fn cfg(db_url: &str) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
         ws_max_bridges_per_project: 16,
         ws_max_lifetime_secs: 3600,
     }
@@ -144,6 +145,7 @@ async fn app_with(orch: Arc<dyn Orchestrator>, engine_base: String) -> Router {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: Some(engine_base),
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     wheel_api::build_router(state, &[])

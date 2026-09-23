@@ -35,6 +35,8 @@ pub enum Credential {
     Session(Option<Uuid>),
     /// A long-lived `wht_` API token, by id.
     ApiToken(Uuid),
+    /// The deployer's own identity system (`AUTH_MODE=external`).
+    External,
     /// A redeemed single-use WebSocket ticket. Only ever produced on the events route.
     WsTicket,
 }
@@ -45,6 +47,7 @@ impl Credential {
         match self {
             Credential::Session(_) => "session",
             Credential::ApiToken(_) => "api_token",
+            Credential::External => "external",
             Credential::WsTicket => "ws_ticket",
         }
     }
@@ -162,6 +165,40 @@ impl FromRequestParts<AppState> for AuthUser {
             }
         }
 
+        // Proxy-header auth carries no token: the proxy authenticated the user and names them in a
+        // header. Nothing about that assertion is verified, so the trusted-peer check is the whole
+        // control — and its absence, including when the middleware is not installed, fails closed.
+        // Checked before the bail below, because in this mode there is no bearer token to miss.
+        if let Some(ext) = &state.cfg.external {
+            if matches!(
+                ext.verifier,
+                crate::config::ExternalVerifier::ProxyHeader { .. }
+            ) {
+                // The credential is ambient — the proxy attaches it — so a hostile page could
+                // otherwise spend it from a victim's browser. Refused before the identity is
+                // resolved, so a cross-origin request never reaches the database either.
+                let allowed = parts
+                    .extensions
+                    .get::<crate::auth::external::AllowedOrigins>()
+                    .map(|o| o.0.clone())
+                    .unwrap_or_default();
+                crate::auth::external::refuse_cross_origin(&parts.headers, &allowed)?;
+
+                let trusted = parts
+                    .extensions
+                    .get::<crate::http::client_ip::TrustedPeer>()
+                    .is_some();
+                let v = crate::auth::external::verify_proxy(&parts.headers, trusted, ext)?;
+                let email = v.email.clone();
+                let user_id = crate::auth::external::principal_for(&state.db, ext, &v).await?;
+                return Ok(AuthUser {
+                    user_id,
+                    credential: Credential::External,
+                    email,
+                });
+            }
+        }
+
         let token = presented.ok_or(ApiError::Unauthorized("no bearer token presented"))?;
 
         // The two providers end here, at the same user id. Everything downstream — ProjectScope
@@ -192,6 +229,24 @@ impl FromRequestParts<AppState> for AuthUser {
                 let verified = crate::auth::claims::verify(&token, &state.cfg, &state.jwks).await?;
                 (verified.user_id, Credential::Session(None), verified.email)
             }
+            crate::config::AuthMode::External => {
+                let ext = state.cfg.external.as_ref().ok_or_else(|| {
+                    // Unreachable by construction: `Config::from_env` refuses to boot with
+                    // AUTH_MODE=external and no block. Stated as an error rather than a panic
+                    // because an auth path is the wrong place to be certain.
+                    ApiError::Internal(anyhow::anyhow!("external auth mode with no configuration"))
+                })?;
+                let jwks = state.external_jwks.as_ref().ok_or_else(|| {
+                    ApiError::Internal(anyhow::anyhow!("external auth mode with no key source"))
+                })?;
+                let v = crate::auth::external::verify_token(&token, ext, jwks).await?;
+                let email = v.email.clone();
+                (
+                    crate::auth::external::principal_for(&state.db, ext, &v).await?,
+                    Credential::External,
+                    email,
+                )
+            }
         };
 
         Ok(AuthUser {
@@ -202,8 +257,27 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// The credential this request carries.
-fn token_from_parts(parts: &Parts, _state: &AppState) -> Option<String> {
+/// The credential this request carries, from wherever this deployment carries it.
+///
+/// Under external auth a deployer may name a different header — `cf-access-jwt-assertion` for
+/// Cloudflare Access, which *signs* its assertion rather than merely asserting it. When they have,
+/// that header is the *only* one read: falling back to `Authorization` would mean a caller could
+/// choose which of two doors to knock on.
+fn token_from_parts(parts: &Parts, state: &AppState) -> Option<String> {
+    if let Some(name) = state
+        .cfg
+        .external
+        .as_ref()
+        .and_then(|e| e.token_header.as_deref())
+    {
+        return parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v.trim()))
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+    }
     crate::auth::claims::token_from_headers(&parts.headers).map(str::to_string)
 }
 
@@ -477,6 +551,7 @@ mod tests {
     fn credential_names_are_stable() {
         assert_eq!(Credential::Session(None).as_str(), "session");
         assert_eq!(Credential::ApiToken(Uuid::nil()).as_str(), "api_token");
+        assert_eq!(Credential::External.as_str(), "external");
         assert_eq!(Credential::WsTicket.as_str(), "ws_ticket");
     }
 }

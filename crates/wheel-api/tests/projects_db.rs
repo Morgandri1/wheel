@@ -35,9 +35,9 @@ fn dev_config(db_url: &str) -> Config {
         env: Env::Dev,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "http://unused.invalid/jwks".into(),
-        clerk_issuer: ISSUER.into(),
-        clerk_azp: vec![],
+        jwks_url: "http://unused.invalid/jwks".into(),
+        jwks_issuer: ISSUER.into(),
+        jwks_azp: vec![],
         dev_secret: Some(DEV_SECRET.into()),
         auth_mode: wheel_api::config::AuthMode::Jwks,
         session_secret: wheel_api::crypto::Secret::new("test-session-secret-at-least-32-chars"),
@@ -52,6 +52,7 @@ fn dev_config(db_url: &str) -> Config {
         proxy_timeout_secs: 30,
         host_connect_timeout_secs: 3,
         signup: wheel_api::config::SignupPolicy::Open,
+        external: None,
         ws_max_bridges_per_project: 16,
         ws_max_lifetime_secs: 3600,
     }
@@ -150,10 +151,7 @@ async fn app() -> Option<(axum::Router, wheel_api::db::Db)> {
 
     let cfg = dev_config(&url);
     let state = AppState::new(Inner {
-        jwks: wheel_api::auth::jwks::JwksCache::new(
-            cfg.clerk_jwks_url.clone(),
-            reqwest::Client::new(),
-        ),
+        jwks: wheel_api::auth::jwks::JwksCache::new(cfg.jwks_url.clone(), reqwest::Client::new()),
         cfg,
         db: db.clone(),
         http: reqwest::Client::new(),
@@ -162,6 +160,7 @@ async fn app() -> Option<(axum::Router, wheel_api::db::Db)> {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(1000, 1000),
         engine_base_override: None,
         membership: wheel_api::membership::MembershipEvents::new(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
     Some((wheel_api::build_router(state, &[]), db))

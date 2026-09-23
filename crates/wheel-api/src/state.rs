@@ -19,6 +19,10 @@ pub struct Inner {
     pub cfg: Config,
     pub db: Db,
     pub jwks: JwksCache,
+    /// Keys for the deployer's issuer under `AUTH_MODE=external`. A *separate* cache from `jwks`
+    /// on purpose: two key sets sharing one map would let a `kid` published by one issuer satisfy
+    /// a token claiming the other, which is issuer confusion delivered by a cache.
+    pub external_jwks: Option<JwksCache>,
     pub http: reqwest::Client,
     pub orch: Arc<dyn Orchestrator>,
     pub ingress_limiter: RateLimiter,

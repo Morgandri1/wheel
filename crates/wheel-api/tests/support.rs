@@ -4,6 +4,13 @@
 
 //! Test scaffolding: a throwaway RSA keypair, a JWKS server that counts fetches, and token minting
 //! helpers that can produce *deliberately malformed* tokens.
+//!
+//! `allow(dead_code)` for the same reason `ws_support.rs` carries it: this module is compiled into
+//! every test binary that says `mod support`, and no single one of them uses all of it. Without the
+//! allow, adding a helper for one suite turns every *other* suite's build into a wall of dead-code
+//! warnings — and under `clippy -D warnings` that is a failing gate about nothing.
+
+#![allow(dead_code)]
 
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -16,6 +23,63 @@ use std::sync::Arc;
 
 pub const KID: &str = "test-key-1";
 pub const ISSUER: &str = "https://clerk.example.test";
+
+/// The external plane's fixtures. A *different* issuer from `ISSUER` on purpose: `Config` refuses
+/// to boot with two verifiers pinned to one issuer, because two token populations that can stand in
+/// for each other is the confusion the pin exists to prevent.
+pub const ED_KID: &str = "test-ed25519-1";
+pub const EXTERNAL_ISSUER: &str = "https://idp.example.test";
+pub const EXTERNAL_AUDIENCE: &str = "wheel-test";
+
+const TEST_ED25519_KEY_PEM: &str = include_str!("fixtures/test_ed25519_key.pem");
+/// base64url of the raw 32-byte public key belonging to the PEM above. Hardcoded because nothing
+/// here parses an Ed25519 PEM; a wrong value fails every signature check loudly, so it cannot rot
+/// silently.
+pub const ED_PUBLIC_X: &str = "AmUKDFwwuIqAcFP-b5FYLoZLhrxLKWJTY4rBGsL4HJs";
+
+/// The Ed25519 JWK, as a provider publishes it.
+pub fn ed25519_jwk() -> serde_json::Value {
+    json!({
+        "kty": "OKP",
+        "use": "sig",
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": ED_KID,
+        "x": ED_PUBLIC_X,
+    })
+}
+
+/// A key set holding both algorithms — which is the point: the external verifier resolves an
+/// algorithm from the key, so a set with only one in it cannot demonstrate that it does.
+pub fn external_jwks(key: &TestKey) -> serde_json::Value {
+    let rsa = key.jwks["keys"][0].clone();
+    json!({ "keys": [rsa, ed25519_jwk()] })
+}
+
+/// Sign with Ed25519. `kid` is a parameter so a test can present a token whose `kid` names a key of
+/// the *other* type, which is the algorithm-confusion shape this design is built to refuse.
+pub fn sign_eddsa<T: serde::Serialize>(kid: &str, c: &T) -> String {
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(kid.to_string());
+    jsonwebtoken::encode(
+        &header,
+        c,
+        &EncodingKey::from_ed_pem(TEST_ED25519_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Sign with RS256, over any claim shape rather than only [`Claims`].
+pub fn sign_rs256_value<T: serde::Serialize>(key: &TestKey, kid: &str, c: &T) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_string());
+    jsonwebtoken::encode(
+        &header,
+        c,
+        &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
 
 fn b64u(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -133,14 +197,18 @@ pub fn sign_rs256(key: &TestKey, kid: &str, c: &Claims) -> String {
 
 /// Sign with HS256 using an arbitrary secret, while still claiming a real `kid`.
 /// This is the shape of the algorithm-confusion attack.
-pub fn sign_hs256(kid: &str, secret: &[u8], c: &Claims) -> String {
+/// Generic over the claim shape on purpose: an algorithm test must be able to sign a claim set
+/// that is valid on EVERY other axis, or the refusal it observes may be about the claims rather
+/// than the algorithm.
+pub fn sign_hs256<T: serde::Serialize>(kid: &str, secret: &[u8], c: &T) -> String {
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(kid.to_string());
     jsonwebtoken::encode(&header, c, &EncodingKey::from_secret(secret)).unwrap()
 }
 
-/// Hand-roll an `alg: none` token — no library will mint one for us.
-pub fn forge_alg_none(c: &Claims) -> String {
+/// Hand-roll an `alg: none` token — no library will mint one for us. Generic for the same reason
+/// as [`sign_hs256`].
+pub fn forge_alg_none<T: serde::Serialize>(c: &T) -> String {
     let header = b64u(br#"{"alg":"none","typ":"JWT"}"#);
     let payload = b64u(serde_json::to_string(c).unwrap().as_bytes());
     format!("{header}.{payload}.")

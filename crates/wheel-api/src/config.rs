@@ -14,14 +14,17 @@ use base64::Engine as _;
 
 /// Which identity provider verifies session tokens.
 ///
-/// The two modes end at the same `VerifiedUser`, so everything downstream — the ownership
-/// extractor above all — is unaware of which one ran. Swapping providers is configuration.
+/// Every mode ends at the same verified user id, so everything downstream — the access extractor
+/// above all — is unaware of which one ran. Swapping providers is configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     /// Built-in: users and passwords in our own database, HS256 sessions we issue.
     Local,
-    /// External: RS256 tokens verified against a provider's JWKS.
+    /// RS256 tokens verified against a provider's JWKS. The deployed contract.
     Jwks,
+    /// The deployer's own identity system: a JWT from their issuer, or an assertion from a proxy
+    /// they run. See `docs/proposals/external-auth.md` and [`ExternalAuth`].
+    External,
 }
 
 impl AuthMode {
@@ -30,6 +33,7 @@ impl AuthMode {
         match self {
             AuthMode::Local => "local",
             AuthMode::Jwks => "jwks",
+            AuthMode::External => "external",
         }
     }
 }
@@ -81,10 +85,14 @@ pub struct Config {
     pub database_url: String,
 
     // Auth
-    pub clerk_jwks_url: String,
-    pub clerk_issuer: String,
+    /// Where `AUTH_MODE=jwks` fetches the provider's signing keys. `WHEEL_JWKS_URL`, or the
+    /// deprecated `CLERK_JWKS_URL` (see [`aliased`]).
+    pub jwks_url: String,
+    /// The `iss` that `AUTH_MODE=jwks` pins. `WHEEL_JWKS_ISSUER`, or the deprecated `CLERK_ISSUER`.
+    pub jwks_issuer: String,
     /// Optional authorized-party allowlist. When non-empty, `azp` must be one of these.
-    pub clerk_azp: Vec<String>,
+    /// `WHEEL_JWKS_AZP`, or the deprecated `CLERK_AZP`.
+    pub jwks_azp: Vec<String>,
     /// HS256 shared secret for local testing. Only ever populated when `env == Dev`.
     pub dev_secret: Option<String>,
     pub auth_mode: AuthMode,
@@ -92,6 +100,9 @@ pub struct Config {
     pub session_secret: Secret,
     /// Whether `POST /v1/auth/signup` creates accounts. Only meaningful when `auth_mode == Local`.
     pub signup: SignupPolicy,
+    /// The deployer's identity system. `Some` exactly when `auth_mode == External`; the mode and
+    /// the block cannot disagree, because `from_env` refuses to boot if they do.
+    pub external: Option<ExternalAuth>,
 
     // Crypto
     pub master_key: [u8; 32],
@@ -120,6 +131,406 @@ pub struct Config {
     pub ws_max_lifetime_secs: u64,
 }
 
+/// How a deployer's identity system proves who a caller is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalVerifier {
+    /// A JWT from the deployer's issuer, verified against keys they publish.
+    Jwks {
+        url: String,
+        /// The algorithms this deployment will accept, as an explicit operator choice. Never
+        /// inferred from a token, and never a permissive default.
+        algs: Vec<jsonwebtoken::Algorithm>,
+    },
+    /// A reverse proxy has already authenticated the user and names them in a header. Wheel
+    /// verifies nothing about the assertion, so the trusted-peer check is the whole control.
+    ProxyHeader {
+        subject_header: String,
+        email_header: Option<String>,
+    },
+}
+
+/// What happens the first time a verified external subject appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provision {
+    /// Create a Wheel account and link it. Right when the IdP's population is the Wheel population.
+    Auto,
+    /// Refuse until somebody links the subject to an account. Right when the IdP lets anyone sign
+    /// up, where `Auto` would mean anyone on the internet gets a Wheel account.
+    Linked,
+}
+
+/// The deployer's identity system, as configuration.
+///
+/// Everything the verifier does is named here, and nothing has a permissive default: an unset
+/// audience, algorithm list or provisioning policy refuses to boot rather than guessing. Accepting
+/// an unintended algorithm or audience is a cross-tenant compromise, so "it booted" must not be
+/// achievable by leaving a field out.
+#[derive(Debug, Clone)]
+pub struct ExternalAuth {
+    /// The operator's label for this provider. Display and logs only — the identity key is the
+    /// issuer, because a label can be retitled and an `iss` is what was actually asserted.
+    pub provider: String,
+    pub issuer: String,
+    /// Exact strings. Compared by equality, never by prefix: `wheel:` as a prefix would accept
+    /// `wheel:some-other-deployment`, which is the confusion this exists to stop.
+    pub audiences: Vec<String>,
+    /// Require our audience to be the *only* one. Off by default — multi-audience access tokens
+    /// are ordinary — and on when the deployer does not trust the parties named alongside them.
+    pub sole_audience: bool,
+    /// `WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1`: permit an audience that is the issuer's own origin.
+    /// Off, and refused at boot, by default — see `cross_check`.
+    pub allow_issuer_audience: bool,
+    /// Which claim is the subject. `sub` unless the IdP has a better immutable id (`oid` on Entra).
+    pub subject_claim: String,
+    pub azp: Vec<String>,
+    /// When set, the token must carry `iat` and live no longer than this.
+    pub max_ttl_secs: Option<i64>,
+    /// A non-standard header to read the credential from, e.g. `cf-access-jwt-assertion`.
+    pub token_header: Option<String>,
+    pub provision: Provision,
+    pub verifier: ExternalVerifier,
+}
+
+/// Every variable this block reads. Listed once so "set but not read" can be detected.
+const EXTERNAL_VARS: &[&str] = &[
+    "WHEEL_EXTERNAL_VERIFIER",
+    "WHEEL_EXTERNAL_PROVIDER",
+    "WHEEL_EXTERNAL_ISSUER",
+    "WHEEL_EXTERNAL_AUDIENCE",
+    "WHEEL_EXTERNAL_ALGS",
+    "WHEEL_EXTERNAL_JWKS_URL",
+    "WHEEL_EXTERNAL_TOKEN_HEADER",
+    "WHEEL_EXTERNAL_SUBJECT_CLAIM",
+    "WHEEL_EXTERNAL_AZP",
+    "WHEEL_EXTERNAL_MAX_TTL_SECS",
+    "WHEEL_EXTERNAL_SOLE_AUDIENCE",
+    "WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE",
+    "WHEEL_EXTERNAL_PROVISION",
+    "WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER",
+    "WHEEL_EXTERNAL_PROXY_EMAIL_HEADER",
+];
+
+impl ExternalAuth {
+    /// `Some` exactly under `AUTH_MODE=external`.
+    ///
+    /// A `WHEEL_EXTERNAL_*` variable set under any other mode refuses to boot. A knob that looks
+    /// configured and is never read is how a deployer comes to believe they have pinned an
+    /// audience; there is no safe way to ignore one.
+    pub fn from_env(mode: AuthMode, env: Env) -> Result<Option<Self>> {
+        let present: Vec<&str> = EXTERNAL_VARS
+            .iter()
+            .copied()
+            .filter(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+            .collect();
+
+        if mode != AuthMode::External {
+            if !present.is_empty() {
+                bail!(
+                    "{} is set but AUTH_MODE is not \"external\", so it would never be read. \
+                     Either set AUTH_MODE=external or unset it.",
+                    present.join(", ")
+                );
+            }
+            return Ok(None);
+        }
+
+        let provider = var_or("WHEEL_EXTERNAL_PROVIDER", "external");
+        let issuer = required("WHEEL_EXTERNAL_ISSUER")?;
+
+        let audiences: Vec<String> = var_or("WHEEL_EXTERNAL_AUDIENCE", "")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if audiences.is_empty() {
+            bail!(
+                "WHEEL_EXTERNAL_AUDIENCE must name at least one audience. An unvalidated audience \
+                 means a token minted for a different relying party — another Wheel deployment, a \
+                 relay, anything else your issuer serves — is accepted here as its subject."
+            );
+        }
+
+        let verifier = match var_or("WHEEL_EXTERNAL_VERIFIER", "").trim() {
+            "jwks" => ExternalVerifier::Jwks {
+                url: required("WHEEL_EXTERNAL_JWKS_URL")?,
+                algs: parse_algs(&required("WHEEL_EXTERNAL_ALGS")?)?,
+            },
+            "proxy_header" => {
+                let trusted = crate::http::client_ip::TrustedProxies::from_env()
+                    .map_err(|e| anyhow!("{e}"))?;
+                if trusted.is_empty() {
+                    bail!(
+                        "WHEEL_EXTERNAL_VERIFIER=proxy_header requires WHEEL_TRUSTED_PROXIES. \
+                         This mode believes a header, so anything that can reach Wheel directly \
+                         can be anyone; with no trusted peer list that is everyone."
+                    );
+                }
+                // The refusal above says "that is everyone", and an all-addresses range means
+                // exactly that while satisfying it — it is not empty, it parses, and
+                // `trusts_peer` then returns true for the entire internet. Two
+                // different questions were being asked as one.
+                //
+                // This is the value an operator reaches for, not a contrived one: a platform
+                // whose load-balancer egress is not pinnable leaves them a choice between
+                // abandoning the mode and widening the range until it boots, and this interlock
+                // exists to stop the second. So the message has to name the alternative, or it
+                // just moves the same operator one step further along the same path.
+                if trusted.covers_every_address() {
+                    bail!(
+                        "WHEEL_EXTERNAL_VERIFIER=proxy_header with an all-addresses \
+                         WHEEL_TRUSTED_PROXIES (0.0.0.0/0 or ::/0) trusts every peer that can \
+                         open a connection, which is the same open door an empty list is: any \
+                         caller may then set the subject header and be anyone. This mode needs \
+                         the proxy's actual address or network — a container address, or the \
+                         private range it sits in, e.g. 10.0.0.0/8. If your platform gives you no \
+                         stable proxy address, proxy_header is not the verifier for that \
+                         deployment: use WHEEL_EXTERNAL_VERIFIER=jwks, which authenticates a \
+                         signature instead of a network position."
+                    );
+                }
+                ExternalVerifier::ProxyHeader {
+                    subject_header: required("WHEEL_EXTERNAL_PROXY_SUBJECT_HEADER")?
+                        .to_ascii_lowercase(),
+                    email_header: std::env::var("WHEEL_EXTERNAL_PROXY_EMAIL_HEADER")
+                        .ok()
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty()),
+                }
+            }
+            "" => bail!("WHEEL_EXTERNAL_VERIFIER must be set (\"jwks\" or \"proxy_header\")"),
+            other => {
+                bail!("WHEEL_EXTERNAL_VERIFIER must be \"jwks\" or \"proxy_header\", got {other:?}")
+            }
+        };
+
+        let provision = match var_or("WHEEL_EXTERNAL_PROVISION", "").trim() {
+            "auto" => Provision::Auto,
+            "linked" => Provision::Linked,
+            "" => bail!(
+                "WHEEL_EXTERNAL_PROVISION must be set: \"auto\" creates a Wheel account for any \
+                 subject your issuer vouches for, \"linked\" refuses until an operator links one. \
+                 If your issuer lets anyone sign up, \"auto\" lets anyone into Wheel — so this is \
+                 a decision to make out loud, never one to default."
+            ),
+            other => {
+                bail!("WHEEL_EXTERNAL_PROVISION must be \"auto\" or \"linked\", got {other:?}")
+            }
+        };
+
+        let max_ttl_secs = match std::env::var("WHEEL_EXTERNAL_MAX_TTL_SECS") {
+            Ok(v) if !v.trim().is_empty() => {
+                let n: i64 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow!("WHEEL_EXTERNAL_MAX_TTL_SECS must be a whole number"))?;
+                if n <= 0 {
+                    bail!("WHEEL_EXTERNAL_MAX_TTL_SECS must be positive");
+                }
+                Some(n)
+            }
+            _ => None,
+        };
+
+        let ext = ExternalAuth {
+            provider,
+            issuer,
+            audiences,
+            sole_audience: matches!(
+                var_or("WHEEL_EXTERNAL_SOLE_AUDIENCE", "").trim(),
+                "1" | "true" | "yes"
+            ),
+            allow_issuer_audience: matches!(
+                var_or("WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE", "").trim(),
+                "1" | "true" | "yes"
+            ),
+            subject_claim: {
+                let c = var_or("WHEEL_EXTERNAL_SUBJECT_CLAIM", "sub")
+                    .trim()
+                    .to_string();
+                if c.is_empty() {
+                    bail!("WHEEL_EXTERNAL_SUBJECT_CLAIM must not be empty");
+                }
+                c
+            },
+            azp: var_or("WHEEL_EXTERNAL_AZP", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            max_ttl_secs,
+            token_header: std::env::var("WHEEL_EXTERNAL_TOKEN_HEADER")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty()),
+            provision,
+            verifier,
+        };
+
+        if env == Env::Prod {
+            if let ExternalVerifier::Jwks { url, .. } = &ext.verifier {
+                reject_local_identity_provider("WHEEL_EXTERNAL_JWKS_URL", url)?;
+                reject_local_identity_provider("WHEEL_EXTERNAL_ISSUER", &ext.issuer)?;
+            }
+        }
+        Ok(Some(ext))
+    }
+
+    /// Checks that need the rest of the configuration to be built first.
+    pub(crate) fn cross_check(&self, cfg: &Config) -> Result<()> {
+        // Two issuers that compare equal are two token populations that can stand in for each
+        // other. Our own session issuer above all: a local session JWT must never route to the
+        // external verifier, nor the reverse.
+        if !cfg.jwks_issuer.trim().is_empty() && self.issuer == cfg.jwks_issuer.trim() {
+            bail!("WHEEL_EXTERNAL_ISSUER must not equal WHEEL_JWKS_ISSUER (CLERK_ISSUER): two verifiers pinned to one issuer can stand in for each other");
+        }
+        if self.issuer == cfg.public_base_url.trim_end_matches('/') {
+            bail!("WHEEL_EXTERNAL_ISSUER must not equal PUBLIC_BASE_URL: that is the issuer of this API's own sessions");
+        }
+        // Ambient credentials plus a browser is CSRF. `auth::external` refuses a cross-origin
+        // request in this mode, and an origin allowlist here would be a second, contradictory
+        // answer.
+        if matches!(self.verifier, ExternalVerifier::ProxyHeader { .. }) {
+            tracing::warn!(
+                provider = %self.provider,
+                "AUTH_MODE=external with proxy-header auth: identity is whatever a trusted proxy \
+                 asserts. Wheel MUST NOT be reachable except through that proxy."
+            );
+        }
+        // Refused, with an explicit override. The audience that is almost certainly wrong is the
+        // issuer's own origin: an issuer's other surfaces (an AgentGrid desktop, mobile or relay
+        // token) carry it as their `aud`, so configuring it here turns every one of those tokens
+        // into a Wheel credential — and a warning in a boot log is not a control a deployer has
+        // to read. Wheel cannot know what ELSE the issuer serves, which is why the override exists
+        // rather than an unconditional refusal: an issuer that mints only for Wheel may say so.
+        if let Some(shadow) = self.audience_shadowing_the_issuer() {
+            if !self.allow_issuer_audience {
+                bail!(
+                    "WHEEL_EXTERNAL_AUDIENCE names the issuer's own origin ({shadow}). Any token \
+                     your issuer mints for any of its OWN surfaces carries that audience and would \
+                     be a valid Wheel credential. Use an audience that names this deployment, e.g. \
+                     https://api.<your-wheel-domain>. If this issuer mints tokens for Wheel and \
+                     nothing else, set WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE=1 to accept it."
+                );
+            }
+            tracing::warn!(
+                audience = %shadow,
+                issuer = %self.issuer,
+                "WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE is set: the issuer's own origin is accepted \
+                 as this deployment's audience, so every token the issuer mints for that audience \
+                 is a Wheel credential."
+            );
+        }
+        Ok(())
+    }
+
+    /// The configured audience that is the pinned issuer, or its origin — or `None`.
+    ///
+    /// Pure, and separate from the warning, because an audience-vs-issuer rule that only exists
+    /// inside a `tracing::warn!` cannot be asserted by a test, and a control nobody can test is a
+    /// control that silently stops firing.
+    pub fn audience_shadowing_the_issuer(&self) -> Option<&str> {
+        let issuer = self.issuer.trim_end_matches('/');
+        let issuer_origin = origin_of(issuer).unwrap_or(issuer);
+        self.audiences
+            .iter()
+            .find(|a| {
+                let a = a.trim_end_matches('/');
+                a == issuer || a == issuer_origin
+            })
+            .map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        ExternalAuth {
+            provider: "test".into(),
+            issuer: "https://issuer.example".into(),
+            audiences: vec!["wheel-test".into()],
+            sole_audience: false,
+            allow_issuer_audience: false,
+            subject_claim: "sub".into(),
+            azp: Vec::new(),
+            max_ttl_secs: None,
+            token_header: None,
+            provision: Provision::Auto,
+            verifier: ExternalVerifier::Jwks {
+                url: "https://issuer.example/jwks".into(),
+                algs: vec![
+                    jsonwebtoken::Algorithm::RS256,
+                    jsonwebtoken::Algorithm::EdDSA,
+                ],
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test_proxy() -> Self {
+        ExternalAuth {
+            verifier: ExternalVerifier::ProxyHeader {
+                subject_header: "x-forwarded-user".into(),
+                email_header: Some("x-forwarded-email".into()),
+            },
+            ..Self::for_test()
+        }
+    }
+}
+
+/// `scheme://host[:port]` of a URL-shaped string, or `None` when it is not one.
+///
+/// Deliberately naive: it exists to answer "is this audience the issuer's origin", and an audience
+/// that is not a URL at all — `wheel`, `wheel:prod` — has no origin to collide with.
+fn origin_of(s: &str) -> Option<&str> {
+    let (scheme, rest) = s.split_once("://")?;
+    let authority_start = scheme.len() + 3;
+    let end = rest
+        .find('/')
+        .map(|i| authority_start + i)
+        .unwrap_or(s.len());
+    (end > authority_start).then(|| &s[..end])
+}
+
+/// Parse the operator's algorithm allowlist.
+///
+/// Only the two asymmetric algorithms the key loader can produce are accepted. A symmetric one is
+/// refused by name rather than ignored: `HS256` in a list beside a public key set is the classic
+/// confusion attack spelled out in configuration, and silently dropping it would leave an operator
+/// believing they had enabled something. Anything else — `RS512`, `ES256` — is refused because
+/// `auth::jwks` holds no key that could match it, so accepting the word would produce a deployment
+/// that boots and then rejects every token for a reason nobody can see.
+fn parse_algs(raw: &str) -> Result<Vec<jsonwebtoken::Algorithm>> {
+    use jsonwebtoken::Algorithm;
+    let mut out = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let alg = match name.to_ascii_uppercase().as_str() {
+            "RS256" => Algorithm::RS256,
+            "EDDSA" | "ED25519" => Algorithm::EdDSA,
+            "HS256" | "HS384" | "HS512" => bail!(
+                "WHEEL_EXTERNAL_ALGS names {name}, a symmetric algorithm. The key that verifies is \
+                 then also the key that signs, so anyone who can verify can forge. Refused."
+            ),
+            other => bail!(
+                "WHEEL_EXTERNAL_ALGS names {other}, which this build cannot verify. Supported: \
+                 RS256, EdDSA."
+            ),
+        };
+        if !out.contains(&alg) {
+            out.push(alg);
+        }
+    }
+    if out.is_empty() {
+        bail!("WHEEL_EXTERNAL_ALGS must name at least one algorithm (RS256, EdDSA)");
+    }
+    Ok(out)
+}
+
+fn required(key: &str) -> Result<String> {
+    let v = std::env::var(key).unwrap_or_default().trim().to_string();
+    if v.is_empty() {
+        bail!("{key} must be set and non-empty under AUTH_MODE=external");
+    }
+    Ok(v)
+}
+
 /// Derive the session signing key from the master key, with domain separation.
 ///
 /// The label keeps this key distinct from every other use of the master key, so a weakness in one
@@ -140,6 +551,56 @@ fn var(key: &str) -> Result<String> {
 
 fn var_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Read a variable by its current name, accepting its deprecated spelling.
+///
+/// The `jwks` mode reads an OIDC issuer and a JWKS. Nothing about it is Clerk-specific, and a
+/// variable named after one vendor describes a configuration this project no longer has. The names
+/// are therefore `WHEEL_JWKS_*`, with `CLERK_*` **aliased and deprecated** rather than retired
+/// (issue #132; the argument is in `docs/proposals/external-auth.md` §3.4).
+///
+/// Aliased, not renamed, because `CLERK_JWKS_URL` and `CLERK_ISSUER` are *required* under `jwks`
+/// and an empty value refuses to boot — so a hard rename turns a documentation fix into a failed
+/// deploy on the next restart of every deployment configured the old way.
+///
+/// The one hazard an alias introduces is ambiguity, so it is closed here: both names set to
+/// **different** values refuses to boot. There is no correct way to pick a winner between two
+/// issuers an operator has named, and picking one silently is how a deployment ends up pinned to a
+/// provider nobody meant.
+fn aliased(current: &str, deprecated: &str) -> Result<String> {
+    let new = std::env::var(current)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let old = std::env::var(deprecated)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    match (new.as_str(), old.as_str()) {
+        (_, "") => Ok(new),
+        ("", _) => {
+            tracing::warn!(
+                deprecated,
+                replacement = current,
+                "{deprecated} is deprecated and will be removed; rename it to {current}. \
+                 Nothing about AUTH_MODE=jwks is Clerk-specific."
+            );
+            Ok(old)
+        }
+        (n, o) if n == o => {
+            tracing::warn!(
+                deprecated,
+                replacement = current,
+                "{deprecated} is set alongside {current} with the same value; drop {deprecated}."
+            );
+            Ok(new)
+        }
+        _ => bail!(
+            "{current} and {deprecated} are both set, to different values. {deprecated} is the \
+             deprecated alias of {current}, so there is no way to honour both — unset one."
+        ),
+    }
 }
 
 fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
@@ -180,8 +641,8 @@ impl Config {
             ),
             (Env::Dev, Some(s)) => {
                 tracing::warn!(
-                    "AUTH_DEV_SECRET is enabled: unsigned-by-Clerk HS256 tokens will be accepted. \
-                     This must never be reachable from the internet."
+                    "AUTH_DEV_SECRET is enabled: any HS256 token signed with this secret will be \
+                     accepted as any user. This must never be reachable from the internet."
                 );
                 Some(s)
             }
@@ -194,9 +655,14 @@ impl Config {
         let auth_mode = match std::env::var("AUTH_MODE").ok().as_deref() {
             Some("local") => AuthMode::Local,
             Some("jwks") => AuthMode::Jwks,
-            Some(other) => bail!("AUTH_MODE must be \"local\" or \"jwks\", got {other:?}"),
+            Some("external") => AuthMode::External,
+            Some(other) => {
+                bail!("AUTH_MODE must be \"local\", \"jwks\" or \"external\", got {other:?}")
+            }
             None if env == Env::Dev => AuthMode::Local,
-            None => bail!("AUTH_MODE must be set in production (\"local\" or \"jwks\")"),
+            None => {
+                bail!("AUTH_MODE must be set in production (\"local\", \"jwks\" or \"external\")")
+            }
         };
 
         let master_key = {
@@ -231,14 +697,16 @@ impl Config {
                 }
                 None => Secret::new(derive_session_key(&master_key)),
             },
-            AuthMode::Jwks => Secret::new(String::new()),
+            AuthMode::Jwks | AuthMode::External => Secret::new(String::new()),
         };
 
-        let clerk_azp = var_or("CLERK_AZP", "")
+        let jwks_azp = aliased("WHEEL_JWKS_AZP", "CLERK_AZP")?
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+
+        let external = ExternalAuth::from_env(auth_mode, env)?;
 
         let cfg = Config {
             env,
@@ -251,13 +719,14 @@ impl Config {
                     .context("set STORE (postgres://… or sqlite://…), or DATABASE_URL")?,
             },
             // Only meaningful under AUTH_MODE=jwks; blank is fine and expected under local.
-            clerk_jwks_url: var_or("CLERK_JWKS_URL", ""),
-            clerk_issuer: var_or("CLERK_ISSUER", ""),
-            clerk_azp,
+            jwks_url: aliased("WHEEL_JWKS_URL", "CLERK_JWKS_URL")?,
+            jwks_issuer: aliased("WHEEL_JWKS_ISSUER", "CLERK_ISSUER")?,
+            jwks_azp,
             dev_secret,
             auth_mode,
             session_secret,
             signup: SignupPolicy::parse(std::env::var("WHEEL_SIGNUP").ok().as_deref())?,
+            external,
             master_key,
             host_url: var("WHEEL_HOST_URL")?.trim_end_matches('/').to_string(),
             host_secret: Secret::new(var("WHEEL_HOST_SECRET")?),
@@ -276,25 +745,58 @@ impl Config {
             bail!("WHEEL_HOST_SECRET must not be empty: it is the only thing authenticating the API to the host");
         }
         if cfg.auth_mode == AuthMode::Jwks
-            && (cfg.clerk_jwks_url.trim().is_empty() || cfg.clerk_issuer.trim().is_empty())
+            && (cfg.jwks_url.trim().is_empty() || cfg.jwks_issuer.trim().is_empty())
         {
             bail!(
-                "AUTH_MODE=jwks requires CLERK_JWKS_URL and CLERK_ISSUER to be set to real values. \
-                 A placeholder that looks like configuration is worse than a missing one: it boots, \
-                 and then rejects every token for a reason nobody can see."
+                "AUTH_MODE=jwks requires WHEEL_JWKS_URL and WHEEL_JWKS_ISSUER (formerly \
+                 CLERK_JWKS_URL and CLERK_ISSUER) to be set to real values. A placeholder that \
+                 looks like configuration is worse than a missing one: it boots, and then rejects \
+                 every token for a reason nobody can see."
             );
-        }
-        if cfg.auth_mode == AuthMode::Jwks && cfg.clerk_issuer.is_empty() {
-            bail!("CLERK_ISSUER must not be empty: it is what pins tokens to our tenant");
         }
         if cfg.env == Env::Prod && cfg.auth_mode == AuthMode::Jwks {
             // ADVERSARY 017: an identity provider we do not control is a provider that can mint any
             // `sub`. A mock issuer on loopback is the dev shortcut that must never survive a deploy:
             // it does not fail — it authenticates everyone, as anyone.
-            reject_local_identity_provider("CLERK_JWKS_URL", &cfg.clerk_jwks_url)?;
-            reject_local_identity_provider("CLERK_ISSUER", &cfg.clerk_issuer)?;
+            reject_local_identity_provider("WHEEL_JWKS_URL", &cfg.jwks_url)?;
+            reject_local_identity_provider("WHEEL_JWKS_ISSUER", &cfg.jwks_issuer)?;
+        }
+        if let Some(ext) = &cfg.external {
+            ext.cross_check(&cfg)?;
         }
         Ok(cfg)
+    }
+
+    /// A minimal `local`-auth configuration, for unit tests inside this crate that need a `Config`
+    /// to ask one question of. Integration suites build their own literal, because what they are
+    /// testing is usually which field is set.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Config {
+            env: Env::Prod,
+            bind_addr: "127.0.0.1:0".into(),
+            database_url: "sqlite://:memory:".into(),
+            jwks_url: String::new(),
+            jwks_issuer: String::new(),
+            jwks_azp: Vec::new(),
+            dev_secret: None,
+            auth_mode: AuthMode::Local,
+            session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
+            signup: SignupPolicy::Closed,
+            external: None,
+            master_key: [0u8; 32],
+            host_url: "http://host.invalid".into(),
+            host_secret: Secret::new("host-secret"),
+            engine_port: 7000,
+            public_base_url: "https://api.wheel.test".into(),
+            max_projects_per_user: 20,
+            ingress_rate_per_min: 60,
+            ingress_body_limit_bytes: 5 * 1024 * 1024,
+            proxy_timeout_secs: 30,
+            host_connect_timeout_secs: 3,
+            ws_max_bridges_per_project: 16,
+            ws_max_lifetime_secs: 3600,
+        }
     }
 
     /// Base URL for this project's engine control plane, as reached through the host.
@@ -394,9 +896,9 @@ impl std::fmt::Debug for Config {
             .field("env", &self.env)
             .field("signup", &self.signup)
             .field("bind_addr", &self.bind_addr)
-            .field("clerk_issuer", &self.clerk_issuer)
-            .field("clerk_jwks_url", &self.clerk_jwks_url)
-            .field("clerk_azp", &self.clerk_azp)
+            .field("jwks_issuer", &self.jwks_issuer)
+            .field("jwks_url", &self.jwks_url)
+            .field("jwks_azp", &self.jwks_azp)
             .field("host_url", &self.host_url)
             .field("host_secret", &"<redacted>")
             .field("master_key", &"<redacted>")
@@ -433,5 +935,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(other.contains("WHEEL_SIGNUP"), "{other}");
+    }
+
+    /// Issue #132: the audience must name *this deployment*, never the issuer's own origin — an
+    /// issuer's other surfaces routinely carry that origin as their `aud`, so configuring it here
+    /// turns every one of them into a Wheel credential.
+    #[test]
+    fn an_audience_that_is_the_issuers_own_origin_is_detected() {
+        let mut ext = super::ExternalAuth::for_test();
+        ext.issuer = "https://accounts.agentgrid.example".into();
+
+        for shadow in [
+            "https://accounts.agentgrid.example",
+            "https://accounts.agentgrid.example/",
+        ] {
+            ext.audiences = vec![shadow.into()];
+            assert!(
+                ext.audience_shadowing_the_issuer().is_some(),
+                "{shadow} is the issuer's origin"
+            );
+        }
+
+        // An issuer with a path: both the whole `iss` and its bare origin are the wrong audience.
+        ext.issuer = "https://idp.example/realms/wheel".into();
+        for shadow in ["https://idp.example/realms/wheel", "https://idp.example"] {
+            ext.audiences = vec![shadow.into()];
+            assert!(
+                ext.audience_shadowing_the_issuer().is_some(),
+                "{shadow} shadows the issuer"
+            );
+        }
+
+        // And the audiences a deployer should actually configure are not flagged.
+        for good in [
+            "https://api.wheel.example",
+            "wheel",
+            "wheel:prod",
+            "https://idp.example.evil",
+            "https://idp.example/realms/other",
+        ] {
+            ext.audiences = vec![good.into()];
+            assert!(
+                ext.audience_shadowing_the_issuer().is_none(),
+                "{good} is a legitimate Wheel audience"
+            );
+        }
+
+        // It finds the offender among several, rather than only checking the first.
+        ext.audiences = vec![
+            "https://api.wheel.example".into(),
+            "https://idp.example".into(),
+        ];
+        assert_eq!(
+            ext.audience_shadowing_the_issuer(),
+            Some("https://idp.example")
+        );
+    }
+
+    /// Required change 6 on #136: an audience equal to the issuer's origin must stop the boot,
+    /// because AgentGrid's own desktop tokens carry exactly that `aud`.
+    #[test]
+    fn an_audience_that_is_the_issuers_origin_refuses_to_boot_unless_overridden() {
+        let cfg = super::Config::for_test();
+        let mut ext = super::ExternalAuth::for_test();
+        ext.issuer = "https://accounts.agentgrid.example".into();
+        ext.audiences = vec!["https://accounts.agentgrid.example".into()];
+
+        let err = ext
+            .cross_check(&cfg)
+            .expect_err("the shadowing audience booted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WHEEL_EXTERNAL_ALLOW_ISSUER_AUDIENCE"),
+            "{msg}"
+        );
+
+        ext.allow_issuer_audience = true;
+        ext.cross_check(&cfg)
+            .expect("the explicit override was refused");
+
+        // And a correct audience needs no override.
+        ext.allow_issuer_audience = false;
+        ext.audiences = vec!["https://api.wheel.example".into()];
+        ext.cross_check(&cfg)
+            .expect("a proper audience was refused");
     }
 }

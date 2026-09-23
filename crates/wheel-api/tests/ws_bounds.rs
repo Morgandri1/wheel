@@ -75,13 +75,14 @@ fn cfg(db_url: &str, engine: &str, max_bridges: usize, lifetime: u64) -> Config 
         env: Env::Prod,
         bind_addr: "127.0.0.1:0".into(),
         database_url: db_url.into(),
-        clerk_jwks_url: "https://clerk.test/jwks".into(),
-        clerk_issuer: "https://clerk.test".into(),
-        clerk_azp: vec![],
+        jwks_url: "https://clerk.test/jwks".into(),
+        jwks_issuer: "https://clerk.test".into(),
+        jwks_azp: vec![],
         dev_secret: None,
         auth_mode: AuthMode::Local,
         session_secret: Secret::new("session-secret-that-is-at-least-32-chars"),
         signup: SignupPolicy::Open,
+        external: None,
         master_key: [8u8; 32],
         host_url: "http://host.invalid".into(),
         host_secret: Secret::new("host-secret"),
@@ -124,6 +125,7 @@ async fn serve(max_bridges: usize, lifetime: u64) -> Api {
         auth_limiter: wheel_api::http::authlimit::AuthLimiter::new(10_000, 10_000),
         engine_base_override: Some(engine_base),
         membership: membership.clone(),
+        external_jwks: None,
         bridges: wheel_api::http::bridges::BridgeCounter::new(),
     });
 
@@ -376,5 +378,179 @@ async fn a_bridge_does_not_outlive_its_lifetime_cap() {
     assert!(
         open(&api.base, &token, &pid).await.is_ok(),
         "the capped bridge did not release its slot"
+    );
+}
+
+// ---------------------------------------------------------------- disabled external identities
+
+fn identity_cfg() -> wheel_api::config::ExternalAuth {
+    wheel_api::config::ExternalAuth {
+        provider: "test".into(),
+        issuer: "https://idp.example".into(),
+        audiences: vec!["wheel-test".into()],
+        sole_audience: false,
+        allow_issuer_audience: false,
+        subject_claim: "sub".into(),
+        azp: vec![],
+        max_ttl_secs: None,
+        token_header: None,
+        provision: wheel_api::config::Provision::Auto,
+        verifier: wheel_api::config::ExternalVerifier::ProxyHeader {
+            subject_header: "x-forwarded-user".into(),
+            email_header: None,
+        },
+    }
+}
+
+/// Link an external subject to an existing Wheel account, returning the identity's id.
+async fn link(api: &Api, user_id: &str, subject: &str) -> uuid::Uuid {
+    let verified = wheel_api::auth::external::Verified {
+        subject: subject.into(),
+        email: None,
+    };
+    wheel_api::auth::external::link(
+        &api.db,
+        &identity_cfg(),
+        &verified,
+        uuid::Uuid::parse_str(user_id).unwrap(),
+    )
+    .await
+    .expect("link")
+    .id
+}
+
+async fn closes(socket: &mut Socket, secs: u64) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(secs), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) => return true,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return true,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await,
+        Ok(true)
+    )
+}
+
+/// The mock engine echoes, so a frame coming back proves the bridge is still open end to end.
+async fn still_relays(socket: &mut Socket) -> bool {
+    use futures_util::SinkExt;
+    if socket
+        .send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) if t == "ping" => {
+                        return true
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => return false,
+                }
+            }
+        })
+        .await,
+        Ok(true)
+    )
+}
+
+/// Required change 5 on #136. Disabling an identity used to refuse the next HTTP request and leave
+/// every open events stream running until its lifetime cap, because membership is unchanged by it
+/// and the bridge only re-checked membership.
+#[tokio::test]
+async fn disabling_an_external_identity_closes_its_live_bridge_at_once() {
+    let api = serve(4, 3600).await;
+    let (token, user_id) = signup(&api.base, "ext@example.com").await;
+    let pid = project(&api.base, &token).await;
+    let identity = link(&api, &user_id, "alice").await;
+
+    let mut socket = open(&api.base, &token, &pid).await.expect("a bridge");
+    assert!(
+        still_relays(&mut socket).await,
+        "positive control: the bridge did not relay before the identity was disabled"
+    );
+
+    let disabled =
+        wheel_api::auth::external::disable_and_announce(&api.db, &api.membership, &identity)
+            .await
+            .unwrap();
+    assert!(disabled);
+    assert!(
+        closes(&mut socket, 10).await,
+        "the live bridge of a disabled external identity stayed open"
+    );
+}
+
+/// The announcement is the fast path; the re-check is what makes it certain. Disable WITHOUT
+/// announcing (a lost NOTIFY, a row changed by hand), then send only the unrelated event that makes
+/// the watcher look again — the bridge must still end, because the re-check reads the identity.
+#[tokio::test]
+async fn a_disabled_identity_is_caught_by_the_recheck_even_if_the_announcement_is_lost() {
+    let api = serve(4, 3600).await;
+    let (token, user_id) = signup(&api.base, "lost@example.com").await;
+    let pid = project(&api.base, &token).await;
+    let identity = link(&api, &user_id, "bob").await;
+
+    let mut socket = open(&api.base, &token, &pid).await.expect("a bridge");
+    assert!(still_relays(&mut socket).await);
+
+    assert!(wheel_api::auth::external::disable(&api.db, &identity)
+        .await
+        .unwrap());
+    // Nothing has told the bridge yet.
+    assert!(
+        still_relays(&mut socket).await,
+        "the bridge closed before anything asked it to re-check, so this proves nothing"
+    );
+    api.membership
+        .publish(wheel_api::membership::AccessChanged {
+            project_id: uuid::Uuid::parse_str(&pid).unwrap(),
+            user_id: user_id.clone(),
+        });
+    assert!(
+        closes(&mut socket, 10).await,
+        "a re-check did not notice the disabled identity"
+    );
+}
+
+/// An account linked to two subjects is not cut off by disabling one: the socket does not say which
+/// identity opened it, so closing on the first disabled one would end a person the operator has
+/// not ended. The control for the rule "all identities disabled", not "any".
+#[tokio::test]
+async fn disabling_one_of_two_identities_leaves_the_bridge_open() {
+    let api = serve(4, 3600).await;
+    let (token, user_id) = signup(&api.base, "two-ids@example.com").await;
+    let pid = project(&api.base, &token).await;
+    let first = link(&api, &user_id, "carol-work").await;
+    let second = link(&api, &user_id, "carol-home").await;
+
+    let mut socket = open(&api.base, &token, &pid).await.expect("a bridge");
+    assert!(
+        wheel_api::auth::external::disable_and_announce(&api.db, &api.membership, &first)
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        still_relays(&mut socket).await,
+        "disabling one of two identities closed a bridge whose owner still has a live one"
+    );
+
+    assert!(
+        wheel_api::auth::external::disable_and_announce(&api.db, &api.membership, &second)
+            .await
+            .unwrap()
+    );
+    assert!(
+        closes(&mut socket, 10).await,
+        "with every identity disabled the bridge stayed open"
     );
 }

@@ -94,7 +94,28 @@ impl TrustedProxies {
         self.0.is_empty()
     }
 
-    fn trusts(&self, ip: IpAddr) -> bool {
+    /// Does any entry match **every** address of its family — `0.0.0.0/0`, `::/0`, or a mapped
+    /// spelling of either?
+    ///
+    /// A list that contains one is, for trust purposes, the same list as an empty one wearing a
+    /// configuration's clothes: [`trusts_peer`](Self::trusts_peer) returns true for the whole
+    /// internet. A caller deciding whether "no trusted proxies configured" should refuse to boot
+    /// (an empty-list check alone) must ask this too, or a value that is not empty, still parses,
+    /// and still trusts everyone slips past it.
+    ///
+    /// `bits == 0` is the whole predicate. It is the only prefix length that is never a correct
+    /// answer for an authenticating proxy; `10.0.0.0/8` is a legitimate one, so this is not a
+    /// private-range check and must not become one.
+    pub fn covers_every_address(&self) -> bool {
+        self.0.iter().any(|c| c.bits == 0)
+    }
+
+    /// Is this address one of the operator's proxies?
+    ///
+    /// Named for the peer because that is the only address it may ever be asked about directly: an
+    /// `X-Forwarded-For` hop is a claim, and asking whether a claim is trusted is how a header
+    /// becomes an identity — that walk stays inside [`client`](Self::client).
+    pub fn trusts_peer(&self, ip: IpAddr) -> bool {
         self.0.iter().any(|c| c.contains(ip))
     }
 
@@ -104,7 +125,7 @@ impl TrustedProxies {
     /// is not an address ends the walk at the last one that could be vouched for.
     pub fn client(&self, peer: IpAddr, forwarded_for: &[&str]) -> IpAddr {
         let mut client = canonical(peer);
-        if !self.trusts(client) {
+        if !self.trusts_peer(client) {
             return client;
         }
         let hops: Vec<&str> = forwarded_for
@@ -116,7 +137,7 @@ impl TrustedProxies {
                 return client;
             };
             client = canonical(ip);
-            if !self.trusts(client) {
+            if !self.trusts_peer(client) {
                 return client;
             }
         }
@@ -209,5 +230,33 @@ mod tests {
             let e = TrustedProxies::parse(bad).unwrap_err();
             assert!(e.contains(ENV_TRUSTED_PROXIES) && e.contains(bad), "{e}");
         }
+    }
+
+    /// `0.0.0.0/0` is not empty, parses, and trusts the internet — a different question from
+    /// `is_empty`, and a caller checking only the latter would let it through.
+    #[test]
+    fn covers_every_address_is_true_only_for_a_true_wildcard() {
+        for wildcard in ["0.0.0.0/0", "::/0", "0.0.0.0/0,::/0", "10.0.0.0/8, ::/0"] {
+            assert!(
+                TrustedProxies::parse(wildcard)
+                    .unwrap()
+                    .covers_every_address(),
+                "{wildcard}"
+            );
+        }
+        for real in ["", "10.0.0.0/8", "127.0.0.1", "127.0.0.1/32, 10.0.0.0/8"] {
+            assert!(
+                !TrustedProxies::parse(real).unwrap().covers_every_address(),
+                "{real}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusts_peer_answers_for_the_single_address_asked_about() {
+        let t = TrustedProxies::parse("127.0.0.1/32, 10.0.0.0/8").unwrap();
+        assert!(t.trusts_peer(ip("127.0.0.1")));
+        assert!(t.trusts_peer(ip("10.5.5.5")));
+        assert!(!t.trusts_peer(ip("8.8.8.8")));
     }
 }

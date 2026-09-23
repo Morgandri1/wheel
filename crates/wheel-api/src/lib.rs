@@ -81,6 +81,16 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/v1/auth/tokens", post(routes::tokens::create))
         .route("/v1/auth/tokens", get(routes::tokens::list))
         .route("/v1/auth/tokens/{id}", delete(routes::tokens::revoke))
+        // External identity administration. These 404 unless AUTH_MODE=external, so a deployment
+        // that does not use external auth has no such surface at all.
+        .route(
+            "/v1/auth/external-identities",
+            get(routes::external_identities::list).post(routes::external_identities::link),
+        )
+        .route(
+            "/v1/auth/external-identities/{id}",
+            delete(routes::external_identities::disable),
+        )
         // Redeeming an invite takes AuthUser, not ProjectScope: the caller is not a member yet.
         // Outside `/v1/projects/{id}` for the same reason — the invite names the project.
         .route("/v1/invites/accept", post(routes::members::accept))
@@ -153,6 +163,13 @@ pub fn build_router(state: AppState, allowed_origins: &[String]) -> Router {
             "/v1/projects/{id}/engine/{*rest}",
             axum::routing::any(routes::proxy::engine_proxy),
         )
+        // The CORS allowlist, reachable by the auth extractor. Under proxy-header auth the
+        // credential is ambient, so `auth::external::refuse_cross_origin` refuses a page that is
+        // not on this list — a control CORS itself cannot provide, because the engine proxy
+        // accepts every verb and content type and therefore is not always preflighted.
+        .layer(axum::Extension(auth::external::AllowedOrigins(
+            std::sync::Arc::new(allowed_origins.to_vec()),
+        )))
         .layer(cors_layer(allowed_origins))
         // Public ingress. No auth by design; gated on the project's `http` capability. Merged after
         // the layer above so it carries its own, permissive, CORS instead of the app allowlist.
