@@ -190,8 +190,13 @@ impl ProcessSandbox {
 ///
 /// The host does this *before* dropping privileges, and the engine never chowns anything: a child
 /// that can change ownership can hand its files to another uid.
+///
+/// `pub(crate)`: the docker backend's run-root channel needs the identical operation for the
+/// identical reason (a host directory a containerized engine must be able to write its socket
+/// into), just with a fixed uid/gid (`AGENT_UID`/`AGENT_GID`, docker/entrypoint.sh) instead of a
+/// per-project allocated one.
 #[cfg(unix)]
-fn make_owned_dir(path: &std::path::Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+pub(crate) fn make_owned_dir(path: &std::path::Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))

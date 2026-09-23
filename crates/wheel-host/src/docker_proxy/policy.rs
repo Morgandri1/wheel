@@ -88,6 +88,17 @@ impl RunRoot {
     fn bind_for(&self, id: &Uuid) -> String {
         format!("{}/{id}:/run/wheel", self.0)
     }
+
+    /// The host directory this run root reserves for one project: `<run_root>/<id>`. The
+    /// sandbox backend creates and owns this directory before the container that binds it
+    /// exists; the proxy itself never creates directories, only validates the bind string above.
+    pub fn dir_for(&self, id: &Uuid) -> String {
+        format!("{}/{id}", self.0)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Where the engine listens when it has a unix socket channel.

@@ -10,6 +10,7 @@
 
 use super::{Sandbox, Secrets, Status};
 use crate::config::Config;
+use crate::docker_proxy::policy::RunRoot;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::query_parameters as qp;
@@ -28,6 +29,15 @@ const ENGINE_STOP_GRACE_SECS: i32 = 30;
 
 /// Label carrying a hash of everything a container was created from.
 pub const SPEC_LABEL: &str = "wheel.spec";
+
+/// The fixed uid/gid every process inside the host image runs as, including the engine itself
+/// (`docker/entrypoint.sh`'s `exec_as_agent`, which wraps the `engine)` role dispatch case, not
+/// just the agents it later spawns). Docker mode has no userns-remap yet, so this uid inside a
+/// tenant container is the same uid on the host filesystem — the run-root directory this backend
+/// creates for a project's socket must be owned by it, or the containerized engine gets EACCES
+/// trying to create its own socket file there.
+const AGENT_UID: u32 = 10001;
+const AGENT_GID: u32 = 10001;
 
 struct Inspected {
     state: String,
@@ -127,16 +137,28 @@ impl DockerSandbox {
     /// gets 200 can immediately proxy to it. Reporting "running" the moment the container process
     /// exists would just move the race into the next request.
     async fn await_healthy(&self, id: &Uuid) -> Result<()> {
+        let socket = self
+            .cfg
+            .docker_run_root
+            .as_ref()
+            .map(|run_root| std::path::PathBuf::from(run_root.dir_for(id)).join("engine.sock"));
         let url = format!("{}/healthz", self.cfg.engine_url(id));
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.start_timeout_secs);
         let mut delay = Duration::from_millis(100);
 
         loop {
-            if let Ok(r) = self.http.get(&url).send().await {
-                if r.status().is_success() {
-                    return Ok(());
-                }
+            let healthy = match &socket {
+                Some(socket) => crate::sandbox::process::healthz_over_socket(socket).await,
+                None => self
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success()),
+            };
+            if healthy {
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
@@ -279,6 +301,14 @@ impl DockerSandbox {
 
     /// The environment a project's container is created with, in a fixed order.
     fn env_for(&self, id: &Uuid, secrets: &Secrets) -> Vec<String> {
+        // Must match exactly what `docker_proxy::policy` will admit in this container's `Binds`
+        // and what it checks `WHEEL_LISTEN` against for a run-root project (`ENGINE_SOCKET`):
+        // the proxy is the one thing standing between this and an arbitrary container spec.
+        let listen = if self.cfg.docker_run_root.is_some() {
+            crate::docker_proxy::policy::ENGINE_SOCKET.to_string()
+        } else {
+            format!("tcp://0.0.0.0:{}", self.cfg.engine_port)
+        };
         vec![
             format!("WHEEL_PROJECT_ID={id}"),
             format!("WHEEL_ENGINE_SECRET={}", secrets.engine_secret),
@@ -287,7 +317,7 @@ impl DockerSandbox {
             // fail-secure per project, computed by wheel-host itself — never a value a project's
             // own owner can influence.
             format!("WHEEL_HARNESS_AUTH={}", self.cfg.harness_auth_for(id)),
-            format!("WHEEL_LISTEN=tcp://0.0.0.0:{}", self.cfg.engine_port),
+            format!("WHEEL_LISTEN={listen}"),
             "WHEEL_DATA_DIR=/data".to_string(),
             "WHEEL_LOG=json".to_string(),
             // Selects the engine entrypoint from the shared host image.
@@ -304,8 +334,20 @@ impl DockerSandbox {
     fn spec_hash(&self, id: &Uuid, secrets: &Secrets) -> String {
         let c = &self.cfg;
         let mut spec = format!(
-            "{}\n{}\n{}\n{}\n{}\n",
-            c.engine_image, c.docker_network, c.memory_bytes, c.nano_cpus, c.pids_limit
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            c.engine_image,
+            c.docker_network,
+            c.memory_bytes,
+            c.nano_cpus,
+            c.pids_limit,
+            // `WHEEL_LISTEN` above is the same fixed unix path regardless of where the run root
+            // actually lives on the host, so a moved run root would not otherwise change this
+            // hash and a stale container would keep the OLD bind source forever. The path itself
+            // is a real container input even though it never appears in the env.
+            c.docker_run_root
+                .as_ref()
+                .map(RunRoot::as_str)
+                .unwrap_or(""),
         );
         for e in self.env_for(id, secrets) {
             spec.push_str(&e);
@@ -347,6 +389,32 @@ impl DockerSandbox {
             .await
             .context("creating project volume")?;
 
+        let mut binds = vec![format!("{volume}:/data")];
+        if let Some(run_root) = &self.cfg.docker_run_root {
+            let dir = run_root.dir_for(id);
+            // This host, not the container, is the one that later dials `<dir>/engine.sock`
+            // directly (`await_healthy`, `proxy.rs`), so it is this path's length against
+            // `sockaddr_un.sun_path` (~104 bytes) that matters — the container-side path is a
+            // fixed, always-short `/run/wheel/engine.sock` and never at risk.
+            let socket_len = dir.len() + "/engine.sock".len();
+            anyhow::ensure!(
+                socket_len < 100,
+                "engine socket path is {socket_len} bytes and must stay under 100 \
+                 (sockaddr_un limit): {dir}/engine.sock — shorten DOCKER_PROXY_RUN_ROOT"
+            );
+            // Owned by the fixed AGENT_UID/AGENT_GID the containerized engine itself runs as
+            // (see the constants above), not by wheel-host's own uid: this directory is where
+            // that engine, inside the container, creates its listening socket.
+            #[cfg(unix)]
+            crate::sandbox::process::make_owned_dir(
+                std::path::Path::new(&dir),
+                AGENT_UID,
+                AGENT_GID,
+                0o700,
+            )?;
+            binds.push(format!("{dir}:/run/wheel"));
+        }
+
         let host_config = bollard::models::HostConfig {
             // Least privilege. A tenant's agents run arbitrary code by design, so the container is
             // treated as hostile: hard resource caps so one project cannot starve the machine every
@@ -370,7 +438,7 @@ impl DockerSandbox {
             nano_cpus: Some(self.cfg.nano_cpus),
             pids_limit: Some(self.cfg.pids_limit),
             network_mode: Some(self.cfg.docker_network.clone()),
-            binds: Some(vec![format!("{volume}:/data")]),
+            binds: Some(binds),
             restart_policy: Some(bollard::models::RestartPolicy {
                 name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
                 ..Default::default()
@@ -520,6 +588,13 @@ impl Sandbox for DockerSandbox {
                 other => return Err(other).context("removing volume"),
             }
         }
+        // The container is gone, so nothing will ever bind this again. Left behind, it is just a
+        // uid-10001-owned directory accumulating on the host forever — harmless to another
+        // tenant (no bind names it) but still this backend's own litter to clean up, the same as
+        // the process backend's `run_dir` on its own destroy.
+        if let Some(run_root) = &self.cfg.docker_run_root {
+            let _ = std::fs::remove_dir_all(run_root.dir_for(id));
+        }
         Ok(())
     }
 
@@ -548,7 +623,14 @@ impl Sandbox for DockerSandbox {
     }
 
     fn engine_base(&self, id: &Uuid) -> String {
-        self.cfg.engine_url(id)
+        match &self.cfg.docker_run_root {
+            // Host-visible path to the socket the container writes at `/run/wheel/engine.sock`
+            // (the bind source in `create()`): `proxy.rs`'s `Target::resolve` already strips a
+            // `unix://` prefix and dials the remainder directly, built for the process backend
+            // and reused here unchanged.
+            Some(run_root) => format!("unix://{}/engine.sock", run_root.dir_for(id)),
+            None => self.cfg.engine_url(id),
+        }
     }
 }
 
