@@ -658,6 +658,29 @@ async fn provision_with_a_run_root_binds_the_socket_dir_and_switches_listen_to_u
     }
 }
 
+/// ADVERSARY review of #165: the sockaddr_un length guard in `create()` had no regression pin at
+/// any privilege level — every other test that reaches `create()` is `require_root!()`-gated, so
+/// a reverted `ensure!` would have shipped silently. This one needs no root: the guard fires and
+/// returns before `make_owned_dir` (the only privileged step) is ever called, so it is provable
+/// without root, unlike every other run-root assertion above.
+#[tokio::test]
+async fn a_run_root_path_too_long_for_sockaddr_un_is_refused_before_any_chown() {
+    let (sock, _rec) = fake_daemon("running");
+    let long_dir = format!("/tmp/wh-rr-{}", "x".repeat(90));
+    let run_root = RunRoot::new(&long_dir).unwrap();
+    let sb = sandbox_with_run_root(&sock, run_root);
+    let id = Uuid::new_v4();
+    let err = sb.provision(&id, &secrets()).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("sockaddr_un") || format!("{err:#}").contains("100"),
+        "{err:#}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{long_dir}/{id}")).exists(),
+        "the guard must fire before any directory is created"
+    );
+}
+
 /// A container made without a run root, then reprovisioned once one is configured, must be
 /// recreated rather than left alone: its `Binds` and `WHEEL_LISTEN` are stale relative to what the
 /// proxy will now admit for this project.
