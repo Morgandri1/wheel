@@ -151,7 +151,11 @@ pub fn build_state(cfg: config::Config) -> anyhow::Result<HostState> {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the engine http client")?,
-        auth_limiter: std::sync::Arc::new(auth_limit::AuthLimiter::new(cfg_auth_failure_budget())),
+        auth_limiter: std::sync::Arc::new(
+            auth_limit::AuthLimiter::new(cfg_auth_failure_budget()).behind(
+                wheel_core::client_ip::TrustedProxies::from_env().map_err(anyhow::Error::msg)?,
+            ),
+        ),
         ready: Readiness::serving_after_reconcile(),
     })
 }
@@ -241,10 +245,25 @@ pub async fn require_bearer(State(state): State<HostState>, req: Request, next: 
         .map(|ci| ci.0.ip())
         .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
 
-    // Refuse before comparing. Past its budget, a peer learns nothing further — not even the
-    // timing of a comparison.
-    if !state.auth_limiter.may_attempt(peer) {
-        tracing::warn!(%peer, "refusing bearer attempt: peer is over its failure budget");
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    // A correct bearer always passes, whatever the caller's failure count. The throttle exists to
+    // slow guessing; it must never be a lever for locking the real caller out, which is what it
+    // becomes if a hostile caller and `wheel-api` can share a client address (a NAT, an edge that
+    // is not named in WHEEL_TRUSTED_PROXIES). The price is that past its budget a caller can tell
+    // a right guess from a wrong one — acceptable only because the secret is long and random.
+    if constant_time_eq(presented.as_bytes(), state.cfg.secret.as_bytes()) {
+        return next.run(req).await;
+    }
+
+    let client = state.auth_limiter.client(peer, req.headers());
+    if !state.auth_limiter.may_attempt(client) {
+        tracing::warn!(%client, %peer, "refusing bearer attempt: client is over its failure budget");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(
@@ -253,24 +272,13 @@ pub async fn require_bearer(State(state): State<HostState>, req: Request, next: 
         )
             .into_response();
     }
-
-    let presented = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    if !constant_time_eq(presented.as_bytes(), state.cfg.secret.as_bytes()) {
-        state.auth_limiter.record_failure(peer);
-        tracing::warn!(%peer, "rejected host request with bad or missing bearer");
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": {"code": "unauthorized", "message": "Unauthorized."}})),
-        )
-            .into_response();
-    }
-    next.run(req).await
+    state.auth_limiter.record_failure(client);
+    tracing::warn!(%client, %peer, "rejected host request with bad or missing bearer");
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": {"code": "unauthorized", "message": "Unauthorized."}})),
+    )
+        .into_response()
 }
 
 /// Failed bearer attempts allowed per peer per minute before the host stops answering them.

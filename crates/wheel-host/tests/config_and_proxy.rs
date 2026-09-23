@@ -107,6 +107,14 @@ fn config_validation() {
         "wheel-host-production.up.railway.app",
     );
     std::env::set_var("ALLOW_PUBLIC_DOMAIN", "1");
+    assert!(
+        Config::from_env().is_err(),
+        "a public host with a short secret has nothing left between it and the internet"
+    );
+    std::env::set_var(
+        "WHEEL_HOST_SECRET",
+        "0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
     assert!(Config::from_env().is_ok());
 
     // An empty value is Railway saying "no domain", not a domain named "".
@@ -213,6 +221,13 @@ fn cfg() -> Config {
 }
 
 async fn harness(engine_base: String) -> (Router, Uuid) {
+    harness_limited(engine_base, wheel_host::auth_limit::AuthLimiter::new(30)).await
+}
+
+async fn harness_limited(
+    engine_base: String,
+    limiter: wheel_host::auth_limit::AuthLimiter,
+) -> (Router, Uuid) {
     let path = std::env::temp_dir().join(format!("wheel-host-proxy-{}.db", Uuid::new_v4()));
     let store = Arc::new(Store::open(path.to_str().unwrap()).unwrap());
     let id = Uuid::new_v4();
@@ -223,7 +238,7 @@ async fn harness(engine_base: String) -> (Router, Uuid) {
         sandbox: Arc::new(PointedSandbox(engine_base)),
         store,
         http: reqwest::Client::new(),
-        auth_limiter: std::sync::Arc::new(wheel_host::auth_limit::AuthLimiter::new(30)),
+        auth_limiter: std::sync::Arc::new(limiter),
         ready: wheel_host::Readiness::serving_from_start(),
     };
     (build_router(state), id)
@@ -419,6 +434,104 @@ async fn repeated_bad_bearers_are_eventually_refused_outright() {
     assert!(saw_429, "guessing the host bearer was never rate limited");
 }
 
+/// One request as a given TCP peer, optionally naming a client in `X-Forwarded-For`.
+async fn as_peer(
+    app: &Router,
+    id: Uuid,
+    bearer: &str,
+    peer: &str,
+    forwarded_for: Option<&str>,
+) -> StatusCode {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("/host/v1/projects/{id}"))
+        .header("authorization", format!("Bearer {bearer}"));
+    if let Some(v) = forwarded_for {
+        req = req.header("x-forwarded-for", v);
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            peer.parse().unwrap(),
+            4000,
+        )));
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// The lock-out lever: behind a shared edge, a hostile caller and the API are the same peer, and a
+/// throttle that also refuses a CORRECT bearer past the budget hands the hostile caller the API's
+/// access to the host. The correct bearer must pass however many failures the peer has racked up.
+#[tokio::test]
+async fn a_correct_bearer_passes_even_from_an_address_that_is_over_its_budget() {
+    let (engine, _) = mock_engine().await;
+    let (app, id) = harness_limited(engine, wheel_host::auth_limit::AuthLimiter::new(3)).await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            as_peer(&app, id, "wrong", "203.0.113.9", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        as_peer(&app, id, "wrong", "203.0.113.9", None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the budget was never spent, so this test proves nothing"
+    );
+    assert_eq!(
+        as_peer(&app, id, HOST_SECRET, "203.0.113.9", None).await,
+        StatusCode::OK,
+        "a correct bearer was refused because its address had failed too often"
+    );
+}
+
+/// Behind a named edge every caller shares the TCP peer; failures must be charged to the client the
+/// edge saw, so one hostile client exhausts only its own budget.
+#[tokio::test]
+async fn behind_a_trusted_edge_failures_are_charged_to_the_client_not_the_edge() {
+    let (engine, _) = mock_engine().await;
+    let limiter = wheel_host::auth_limit::AuthLimiter::new(3)
+        .behind(wheel_core::client_ip::TrustedProxies::parse("10.0.0.0/8").unwrap());
+    let (app, id) = harness_limited(engine, limiter).await;
+    let edge = "10.1.1.1";
+
+    for _ in 0..3 {
+        as_peer(&app, id, "wrong", edge, Some("203.0.113.9")).await;
+    }
+    assert_eq!(
+        as_peer(&app, id, "wrong", edge, Some("203.0.113.9")).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the hostile client should have spent its own budget"
+    );
+    assert_eq!(
+        as_peer(&app, id, "wrong", edge, Some("198.51.100.7")).await,
+        StatusCode::UNAUTHORIZED,
+        "a different client behind the same edge was throttled for the first one's failures"
+    );
+}
+
+/// Without a named proxy the header is a claim anyone can make; believing it would let a guesser
+/// pick a fresh key per attempt and never spend a budget.
+#[tokio::test]
+async fn an_unnamed_peer_cannot_dodge_the_throttle_by_forging_forwarded_for() {
+    let (engine, _) = mock_engine().await;
+    let (app, id) = harness_limited(engine, wheel_host::auth_limit::AuthLimiter::new(3)).await;
+
+    let mut refused = false;
+    for i in 0..10 {
+        let forged = format!("198.51.100.{i}");
+        if as_peer(&app, id, "wrong", "203.0.113.9", Some(&forged)).await
+            == StatusCode::TOO_MANY_REQUESTS
+        {
+            refused = true;
+            break;
+        }
+    }
+    assert!(
+        refused,
+        "a forged X-Forwarded-For bought the guesser a fresh budget each time"
+    );
+}
+
 /// The budget must be spent by failures only — a correct caller is never throttled.
 #[tokio::test]
 async fn a_correct_bearer_is_never_throttled() {
@@ -533,11 +646,12 @@ mod unix_transport {
 
     #[tokio::test]
     async fn proxies_over_a_unix_socket_and_still_swaps_the_bearer() {
-        let sock = std::env::temp_dir()
-            .join(format!("wheel-eng-{}.sock", Uuid::new_v4()))
-            .to_str()
-            .unwrap()
-            .to_string();
+        // A fixed short directory, not `temp_dir()`: a unix socket path must fit in `sun_path`
+        // (~104 bytes), and a sandbox's TMPDIR alone can exceed that.
+        let sock = format!(
+            "/tmp/wh-eng-{}.sock",
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
         let seen = socket_engine(sock.clone()).await;
         let (app, id) = harness_socket(sock).await;
 
