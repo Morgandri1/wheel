@@ -12,12 +12,18 @@
 //!   DOCKER_PROXY_SOCKET_MODE    octal mode of the listen socket (default 0660)
 //!   DOCKER_PROXY_SOCKET_OWNER   `uid:gid` to chown it to (default: leave as created)
 //!   ENGINE_IMAGE, DOCKER_NETWORK, ENGINE_PORT (default 7000),
+//!   DOCKER_PROXY_RUN_ROOT       host directory holding ONLY per-project socket directories; set, engines
+//!                               listen on a unix socket there instead of TCP (unset: the TCP form)
+//!   DOCKER_PROXY_MAX_PROJECTS   most project containers/volumes that may exist (default 200; 0 = no ceiling)
 //!   CONTAINER_MEMORY_MB, CONTAINER_CPUS, CONTAINER_PIDS_LIMIT — the EXACT limits a tenant
 //!   container may carry; give the sandbox host the same values.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use wheel_host::docker_proxy::{policy::Policy, serve, Proxy};
+use wheel_host::docker_proxy::{
+    policy::{Policy, RunRoot},
+    serve, Proxy,
+};
 
 fn required(key: &str) -> Result<String> {
     match std::env::var(key) {
@@ -52,6 +58,14 @@ async fn main() -> Result<()> {
         nano_cpus: (or("CONTAINER_CPUS", 1.0f64)? * 1e9) as i64,
         pids_limit: or("CONTAINER_PIDS_LIMIT", 512i64)?,
         engine_port: or("ENGINE_PORT", 7000u16)?,
+        run_root: match std::env::var("DOCKER_PROXY_RUN_ROOT") {
+            Ok(v) if !v.trim().is_empty() => Some(
+                RunRoot::new(v.trim())
+                    .map_err(|e| anyhow::anyhow!("DOCKER_PROXY_RUN_ROOT: {e}"))?,
+            ),
+            _ => None,
+        },
+        max_projects: or("DOCKER_PROXY_MAX_PROJECTS", 200usize)?,
     };
     let listen = PathBuf::from(required("DOCKER_PROXY_LISTEN")?);
     let upstream = PathBuf::from(

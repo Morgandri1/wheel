@@ -46,7 +46,52 @@ pub struct Policy {
     pub nano_cpus: i64,
     pub pids_limit: i64,
     pub engine_port: u16,
+    /// The engine's channel. `None`: it listens on TCP inside the shared network (`M1`). `Some(root)`:
+    /// it listens on a unix socket in `<root>/<project uuid>/`, bind-mounted at `/run/wheel`, and the
+    /// container needs no reachable address at all. Exactly one form is admitted, never both.
+    pub run_root: Option<RunRoot>,
+    /// The most project containers (and volumes) this proxy will let exist; 0 means no ceiling. A
+    /// compromised host could otherwise create containers up to the per-container limits until the
+    /// machine runs out of memory or disk.
+    pub max_projects: usize,
 }
+
+/// A host directory that holds nothing but per-project socket directories.
+///
+/// Its own type because it is the one HOST path the proxy ever lets into a container, so it is
+/// checked once, here, rather than trusted wherever it is used: absolute, canonical, and free of
+/// anything that changes what a bind string means (`:` separates fields, `..` and `//` re-route it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRoot(String);
+
+impl RunRoot {
+    pub fn new(path: &str) -> Result<Self, String> {
+        let ok = path.starts_with('/')
+            && path.len() > 1
+            && !path.ends_with('/')
+            && path.is_ascii()
+            && !path.contains("//")
+            && !path.contains(':')
+            && !path
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+            && path.split('/').all(|seg| seg != "." && seg != "..");
+        if ok && path != "/" {
+            Ok(Self(path.to_string()))
+        } else {
+            Err(format!(
+                "{path:?} is not a canonical absolute directory path"
+            ))
+        }
+    }
+
+    fn bind_for(&self, id: &Uuid) -> String {
+        format!("{}/{id}:/run/wheel", self.0)
+    }
+}
+
+/// Where the engine listens when it has a unix socket channel.
+pub const ENGINE_SOCKET: &str = "unix:///run/wheel/engine.sock";
 
 /// What the proxy does with the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +107,8 @@ pub enum Reply {
     Inspect,
     /// A container list, reduced to name, project label, spec label and state.
     List,
+    /// A volume list, reduced to name and the project label.
+    VolumeList,
 }
 
 /// An admitted request, ready to send: nothing in it came from the caller unchecked.
@@ -83,6 +130,30 @@ fn deny<T>(why: impl Into<String>) -> Result<T, Denied> {
 }
 
 type Verdict = Result<Admission, Denied>;
+
+/// The request the proxy sends itself, internally, to enforce the project ceiling. Not reachable
+/// by a caller through `decide` — nothing about it comes from outside this process.
+pub fn list_admission() -> Admission {
+    Admission {
+        method: "GET",
+        target: format!("/containers/json?all=true&filters={LIST_FILTERS_ENCODED}"),
+        body: None,
+        reply: Reply::List,
+    }
+}
+
+/// As [`list_admission`], for volumes — the ceiling has to count these too: `POST
+/// /volumes/create` is one of the two admission kinds it gates, and a volume can exist with no
+/// matching container (the host creates the volume first), so counting containers alone leaves
+/// volume creation completely uncapped.
+pub fn volume_list_admission() -> Admission {
+    Admission {
+        method: "GET",
+        target: format!("/volumes?filters={LIST_FILTERS_ENCODED}"),
+        body: None,
+        reply: Reply::VolumeList,
+    }
+}
 
 pub fn container_name(id: &Uuid) -> String {
     format!("wheel-p-{id}")
@@ -197,12 +268,20 @@ impl Policy {
         };
         let (version, segs) = segments(path)?;
 
-        // The one query that needs percent-encoding: matched whole, then never decoded.
-        let is_list = method == "GET" && segs == ["containers", "json"];
+        // The one query that needs percent-encoding: matched whole, then never decoded. Anchored
+        // on the start of the string or on a preceding `&` — never a bare substring match — so a
+        // parameter whose VALUE happens to contain the text `filters=` cannot be mistaken for the
+        // real one.
+        let is_list = method == "GET" && (segs == ["containers", "json"] || segs == ["volumes"]);
         let q = if is_list {
-            match raw_query.and_then(|q| q.split_once("&filters=")) {
+            let raw_query = raw_query.unwrap_or("");
+            let head_and_rest = raw_query
+                .strip_prefix("filters=")
+                .map(|rest| ("", rest))
+                .or_else(|| raw_query.split_once("&filters="));
+            match head_and_rest {
                 Some((head, LIST_FILTERS_ENCODED)) => query(Some(head))?,
-                _ => return deny("the container list may only be filtered to project containers"),
+                _ => return deny("a list may only be filtered to project objects"),
             }
         } else {
             query(raw_query)?
@@ -232,6 +311,19 @@ impl Policy {
                     target,
                     body: None,
                     reply: Reply::List,
+                })
+            }
+            ("GET", ["volumes"]) => {
+                only_params(&q, &[], |_, _| false)?;
+                let mut target = rebuild(version, &segs, &q);
+                target.push(if q.is_empty() { '?' } else { '&' });
+                target.push_str("filters=");
+                target.push_str(LIST_FILTERS_ENCODED);
+                Ok(Admission {
+                    method: "GET",
+                    target,
+                    body: None,
+                    reply: Reply::VolumeList,
                 })
             }
             ("GET", ["containers", name, "json"]) => {
@@ -347,7 +439,10 @@ impl Policy {
         let Some(list) = env.and_then(Value::as_array) else {
             return deny("Env is required");
         };
-        let listen = format!("tcp://0.0.0.0:{}", self.engine_port);
+        let listen = match self.run_root {
+            Some(_) => ENGINE_SOCKET.to_string(),
+            None => format!("tcp://0.0.0.0:{}", self.engine_port),
+        };
         let mut found: Vec<(&str, &str)> = Vec::new();
         for entry in list {
             let Some((k, val)) = entry.as_str().and_then(|e| e.split_once('=')) else {
@@ -426,9 +521,15 @@ impl Policy {
         if strings("SecurityOpt")? != ["no-new-privileges"] {
             return deny("HostConfig.SecurityOpt must be exactly [\"no-new-privileges\"]");
         }
-        let bind = format!("{}:/data", volume_name(id));
-        if strings("Binds")? != [bind.as_str()] {
-            return deny("HostConfig.Binds must be exactly this project's data volume");
+        let mut binds = vec![format!("{}:/data", volume_name(id))];
+        if let Some(root) = &self.run_root {
+            binds.push(root.bind_for(id));
+        }
+        if strings("Binds")? != binds.iter().map(String::as_str).collect::<Vec<_>>() {
+            return deny(
+                "HostConfig.Binds must be exactly this project's data volume (and, with a run \
+                 root, its own socket directory)",
+            );
         }
         if str_field(hc, "NetworkMode")? != self.network {
             return deny("HostConfig.NetworkMode is not the tenant network");
@@ -461,7 +562,7 @@ impl Policy {
             "NanoCpus": self.nano_cpus,
             "PidsLimit": self.pids_limit,
             "NetworkMode": self.network,
-            "Binds": [bind],
+            "Binds": binds,
             "RestartPolicy": { "Name": "unless-stopped" },
         }))
     }
@@ -594,6 +695,40 @@ pub fn project_list(raw: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&out).ok()
 }
 
+/// A volume list, reduced the same way [`project_list`] reduces a container list — but kept
+/// inside `{"Volumes": [...]}`, NOT a bare array like the container list: `GET /volumes` and `GET
+/// /containers/json` disagree on their own envelope shape (Docker's real API does too — this is
+/// not a simplification), and a real bollard client (`DockerSandbox`, reading this same reduced
+/// response back through the proxy) fails to deserialise a bare array as a `VolumeListResponse`.
+pub fn project_volume_list(raw: &[u8]) -> Option<Vec<u8>> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let mut out = Vec::new();
+    for vol in v.get("Volumes")?.as_array()? {
+        let name = vol
+            .get("Name")
+            .and_then(Value::as_str)
+            .filter(|n| volume_id(n).is_ok());
+        let Some(name) = name else { continue };
+        let project = vol
+            .pointer("/Labels")
+            .and_then(|l| l.get(PROJECT_LABEL))
+            .and_then(Value::as_str);
+        // `Driver`/`Mountpoint` are required by the real `Volume` model a bollard client
+        // deserialises this into (`DockerSandbox` reads this reduced response back through the
+        // proxy) — present so parsing succeeds, `Mountpoint` deliberately empty rather than a real
+        // host path, which this reduction exists to keep out of a response at all.
+        out.push(json!({
+            "Name": name,
+            "Driver": "local",
+            "Mountpoint": "",
+            "Scope": "local",
+            "Options": {},
+            "Labels": { PROJECT_LABEL: project },
+        }));
+    }
+    serde_json::to_vec(&json!({ "Volumes": out })).ok()
+}
+
 /// A container create's answer, reduced to its id.
 pub fn project_create(raw: &[u8]) -> Option<Vec<u8>> {
     let v: Value = serde_json::from_slice(raw).ok()?;
@@ -635,6 +770,8 @@ mod tests {
             nano_cpus: 1_000_000_000,
             pids_limit: 512,
             engine_port: 7000,
+            run_root: None,
+            max_projects: 0,
         }
     }
 
@@ -1295,6 +1432,60 @@ mod tests {
     }
 
     #[test]
+    fn only_the_project_volume_list_is_admitted() {
+        let p = policy();
+        let ok = "/v1.49/volumes?filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D";
+        assert_eq!(p.decide("GET", ok, b"").unwrap().reply, Reply::VolumeList);
+        for bad in [
+            "/volumes",
+            "/volumes?filters=%7B%22label%22%3A%5B%22traefik.enable%22%5D%7D",
+            "/volumes?filters=%7B%7D",
+            "/volumes?dangling=true&filters=%7B%22label%22%3A%5B%22wheel.project%22%5D%7D",
+        ] {
+            assert!(p.decide("GET", bad, b"").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_value_that_merely_contains_the_text_filters_equals_is_not_the_filters_param() {
+        // The anchoring (start-of-string or after `&`) matters: a value ending in the literal
+        // text "filters=..." must not be mistaken for the real, well-formed parameter.
+        let p = policy();
+        let sneaky = format!("/containers/json?all=true&evil=x%26filters={LIST_FILTERS_ENCODED}");
+        assert!(p.decide("GET", &sneaky, b"").is_err(), "{sneaky}");
+    }
+
+    #[test]
+    fn a_volume_list_is_reduced_to_name_and_the_project_label() {
+        let raw = br#"{"Volumes":[
+            {"Name":"wheel-p-3f2504e0-4f89-11d3-9a0c-0305e82c3301-data","Labels":{"wheel.project":"3f2504e0-4f89-11d3-9a0c-0305e82c3301","evil":"1"},"Mountpoint":"/var/lib/docker/volumes/x/_data"},
+            {"Name":"some-other-volume","Labels":{}}
+        ],"Warnings":[]}"#;
+        let v: Value = serde_json::from_slice(&project_volume_list(raw).unwrap()).unwrap();
+        // {"Volumes": [...]}, not a bare array — matches Docker's own real `GET /volumes` shape,
+        // which the real bollard client reading this back through the proxy depends on.
+        let out = v["Volumes"].as_array().unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0]["Name"],
+            "wheel-p-3f2504e0-4f89-11d3-9a0c-0305e82c3301-data"
+        );
+        assert_eq!(
+            out[0]["Labels"]["wheel.project"],
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        );
+        assert!(out[0]["Labels"].get("evil").is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn the_volume_list_admission_is_fixed_and_internal() {
+        let a = volume_list_admission();
+        assert_eq!(a.method, "GET");
+        assert!(a.target.starts_with("/volumes?filters="));
+        assert_eq!(a.reply, Reply::VolumeList);
+    }
+
+    #[test]
     fn an_inspection_is_reduced_to_state_and_the_two_wheel_labels() {
         let raw = br#"{"Id":"x","State":{"Status":"running","Health":{"Status":"unhealthy","Log":[{"Output":"secret"}]}},
             "Config":{"Env":["WHEEL_ENGINE_SECRET=s3cret"],"Cmd":["x"],"Labels":{"wheel.spec":"abc","traefik.x":"y","wheel.project":"p"}},
@@ -1359,5 +1550,141 @@ mod tests {
         for b in [&b"[]"[..], b"null", b"\"x\"", b"", b"{"] {
             assert!(p.decide("POST", &t, b).is_err());
         }
+    }
+
+    // --------------------------------------------------------------------- run root (M3a)
+
+    fn run_root_policy() -> Policy {
+        Policy {
+            run_root: Some(RunRoot::new("/run/wheel-docker").unwrap()),
+            ..policy()
+        }
+    }
+
+    fn golden_with_run_root() -> Value {
+        let mut b = golden();
+        b["Env"] = json!(b["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let e = e.as_str().unwrap();
+                if e.starts_with("WHEEL_LISTEN=") {
+                    format!("WHEEL_LISTEN={ENGINE_SOCKET}")
+                } else {
+                    e.to_string()
+                }
+            })
+            .collect::<Vec<_>>());
+        b["HostConfig"]["Binds"] = json!([
+            format!("wheel-p-{}-data:/data", id()),
+            format!("/run/wheel-docker/{}:/run/wheel", id()),
+        ]);
+        b
+    }
+
+    #[test]
+    fn a_run_root_path_must_be_canonical_and_absolute() {
+        assert!(RunRoot::new("/run/wheel-docker").is_ok());
+        assert!(RunRoot::new("/a").is_ok());
+        for bad in [
+            "",
+            "/",
+            "relative/path",
+            "/has/trailing/",
+            "/has//double",
+            "/has/../dotdot",
+            "/has/./dot",
+            "/has:colon",
+            "/has,comma",
+            "/has space",
+            "/has	tab",
+            "/has
+newline",
+        ] {
+            assert!(RunRoot::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn with_a_run_root_the_golden_create_needs_the_socket_bind_and_a_unix_listen() {
+        let p = run_root_policy();
+        let admitted = create(&p, &golden_with_run_root());
+        assert!(admitted.is_ok(), "{admitted:?}");
+    }
+
+    #[test]
+    fn without_a_run_root_the_socket_bind_is_refused() {
+        // The right WHEEL_LISTEN, but the Binds list is missing the socket mount (the plain,
+        // TCP-channel Binds) -- refused for Binds specifically, not silently admitted without it.
+        let mut b = golden_with_run_root();
+        b["HostConfig"]["Binds"] = json!([format!("wheel-p-{}-data:/data", id())]);
+        let why = refused(create(&run_root_policy(), &b));
+        assert!(why.contains("Binds"), "{why}");
+    }
+
+    #[test]
+    fn a_run_root_policy_refuses_the_plain_tcp_golden_create_too() {
+        // Belt and braces: the unmodified TCP-channel golden create (wrong WHEEL_LISTEN AND
+        // missing the socket bind) must not be admitted just because some other check fires first.
+        assert!(create(&run_root_policy(), &golden()).is_err());
+    }
+
+    #[test]
+    fn a_run_root_bind_is_refused_every_way_but_the_one_exact_form() {
+        let p = run_root_policy();
+        let other_project = Uuid::new_v4();
+        let cases: [(&str, &str); 6] = [
+            (
+                "another project's socket dir",
+                "/run/wheel-docker/00000000-0000-0000-0000-000000000000:/run/wheel",
+            ),
+            (
+                "a different run root",
+                "/somewhere/else/3f2504e0-4f89-11d3-9a0c-0305e82c3301:/run/wheel",
+            ),
+            (
+                "the wrong target",
+                "/run/wheel-docker/3f2504e0-4f89-11d3-9a0c-0305e82c3301:/somewhere",
+            ),
+            (
+                "read-only",
+                "/run/wheel-docker/3f2504e0-4f89-11d3-9a0c-0305e82c3301:/run/wheel:ro",
+            ),
+            (
+                "the run root itself, no per-project subdir",
+                "/run/wheel-docker:/run/wheel",
+            ),
+            ("the host root", "/:/run/wheel"),
+        ];
+        let _ = other_project;
+        for (what, extra) in cases {
+            let mut b = golden_with_run_root();
+            b["HostConfig"]["Binds"] = json!([format!("wheel-p-{}-data:/data", id()), extra]);
+            let why = refused(create(&p, &b));
+            assert!(why.contains("Binds"), "{what}: {why}");
+        }
+        // A third bind, or the socket bind alone without the data volume, is refused too.
+        let mut extra_bind = golden_with_run_root();
+        let mut binds = extra_bind["HostConfig"]["Binds"]
+            .as_array()
+            .unwrap()
+            .clone();
+        binds.push(json!("/etc:/etc"));
+        extra_bind["HostConfig"]["Binds"] = json!(binds);
+        assert!(refused(create(&p, &extra_bind)).contains("Binds"));
+
+        let mut socket_only = golden_with_run_root();
+        socket_only["HostConfig"]["Binds"] =
+            json!([format!("/run/wheel-docker/{}:/run/wheel", id())]);
+        assert!(refused(create(&p, &socket_only)).contains("Binds"));
+    }
+
+    #[test]
+    fn the_ceiling_admission_is_fixed_and_internal() {
+        let a = list_admission();
+        assert_eq!(a.method, "GET");
+        assert!(a.target.contains("wheel.project"));
+        assert_eq!(a.reply, Reply::List);
     }
 }

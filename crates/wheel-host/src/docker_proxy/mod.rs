@@ -35,6 +35,9 @@ const MAX_BODY: usize = 64 * 1024;
 pub struct Proxy {
     policy: Arc<Policy>,
     upstream: Arc<PathBuf>,
+    /// Held across "count the daemon's projects, then admit or refuse a create" so concurrent
+    /// creates cannot each see the same pre-creation count and all pass the ceiling together.
+    create_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Proxy {
@@ -42,6 +45,7 @@ impl Proxy {
         Self {
             policy: Arc::new(policy),
             upstream: Arc::new(upstream),
+            create_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -112,6 +116,39 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
         }
     };
 
+    // The ceiling only ever applies to a CREATE: nothing else grows the count. Every create is
+    // serialised through `create_gate` — count-then-admit is two round trips to the daemon, and
+    // without a lock held across both, concurrent creates each see the pre-creation count and the
+    // ceiling stops bounding anything (adversary, #163: 10 concurrent creates against a ceiling of
+    // 1 admitted more than one). The lock only ever blocks another create, never inspect/start/
+    // stop/list/etc., so it costs nothing outside the path it exists to serialise.
+    let is_create = matches!(admission.reply, Reply::Create | Reply::Volume);
+    let _create_permit = if is_create {
+        Some(proxy.create_gate.lock().await)
+    } else {
+        None
+    };
+    if is_create && proxy.policy.max_projects > 0 {
+        // Refusing a create when the daemon cannot even be asked how many projects exist would
+        // turn "the daemon is briefly slow" into "no new project can ever start" — a stronger
+        // failure than the ceiling is meant to cause. So an uncountable daemon is treated as
+        // "under the ceiling": a real, enforced-elsewhere limit (the per-container caps, the disk
+        // floor) is what actually bounds a daemon this proxy cannot even query.
+        if let Ok(count) = count_projects(&proxy.upstream).await {
+            if count >= proxy.policy.max_projects {
+                tracing::warn!(
+                    count,
+                    max = proxy.policy.max_projects,
+                    "docker proxy refused a create: at the project ceiling"
+                );
+                return docker_error(
+                    StatusCode::FORBIDDEN,
+                    "docker proxy: refused (at the configured project ceiling)",
+                );
+            }
+        }
+    }
+
     match forward(&proxy.upstream, admission).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -119,6 +156,60 @@ async fn handle(State(proxy): State<Proxy>, req: Request<Body>) -> Response {
             docker_error(StatusCode::BAD_GATEWAY, "docker proxy: daemon unreachable")
         }
     }
+}
+
+/// How many project containers the daemon already holds. Used only to enforce the ceiling; a
+/// daemon that cannot answer this is not itself refused (see the caller).
+async fn count_projects(upstream: &std::path::Path) -> Result<usize> {
+    // The UNION of container and volume project labels, not their sum: the steady state is one
+    // container plus its one matching volume, which must count as one project, not two. What the
+    // ceiling exists to catch is a project id present on ONE side without the other (an orphan) or
+    // present on neither yet (a brand new one) — counting labels, not objects, gets both right.
+    // Both lists have to be asked for: the host creates a project's volume before its container,
+    // so counting containers alone leaves `POST /volumes/create` completely uncapped (adversary,
+    // #163: 50 volume creates admitted in a row against a ceiling of 2).
+    let containers = labelled_project_ids(upstream, policy::list_admission(), "Names").await?;
+    let volumes = labelled_project_ids(upstream, policy::volume_list_admission(), "Name").await?;
+    Ok(containers.union(&volumes).count())
+}
+
+/// The `wheel.project` label of every entry in a reduced list response. `name_field` is `"Names"`
+/// for the container list (an array of one name) or `"Name"` for the volume list (a bare string);
+/// only used to confirm the entry has a project name at all, since the label is what is counted.
+async fn labelled_project_ids(
+    upstream: &std::path::Path,
+    admission: Admission,
+    name_field: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let resp = forward(upstream, admission).await?;
+    if resp.status() != StatusCode::OK {
+        anyhow::bail!("listing project objects answered {}", resp.status());
+    }
+    let body = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .context("reading the project list")?;
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).context("project list was not JSON")?;
+    // The container list's reduced shape is a bare array; the volume list's is `{"Volumes": [...]}`
+    // (matching Docker's own real API, which a real bollard client elsewhere depends on) —
+    // whichever this is, `items` ends up the array either way.
+    let items: Vec<serde_json::Value> = match parsed {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut obj) => match obj.remove("Volumes") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => anyhow::bail!("project list had neither a bare array nor a Volumes array"),
+        },
+        _ => anyhow::bail!("project list was not a JSON array or object"),
+    };
+    Ok(items
+        .into_iter()
+        .filter(|item| item.get(name_field).is_some())
+        .filter_map(|item| {
+            item.pointer("/Labels/wheel.project")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect())
 }
 
 /// Send what was admitted — rebuilt, never the caller's own bytes — and reduce the answer.
@@ -181,6 +272,9 @@ async fn forward(upstream: &std::path::Path, admission: Admission) -> Result<Res
             Reply::Fixed => Vec::new(),
             Reply::Inspect => policy::project_inspect(&raw).context("inspection had no State")?,
             Reply::List => policy::project_list(&raw).context("container list was not a list")?,
+            Reply::VolumeList => {
+                policy::project_volume_list(&raw).context("volume list was not a list")?
+            }
             Reply::Create => policy::project_create(&raw).context("create had no Id")?,
             Reply::Volume => policy::project_volume(&raw).context("volume create had no Name")?,
         }
@@ -202,6 +296,15 @@ pub async fn serve(
     owner: Option<(u32, u32)>,
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    // A unix socket path has to fit in `sockaddr_un.sun_path` (~104 bytes). Past that, `bind`
+    // fails with an error that says nothing about the real cause — check it here, by name, the
+    // same guard `sandbox/process.rs::provision` already has for the engine's own socket.
+    let len = path.as_os_str().len();
+    anyhow::ensure!(
+        len < 100,
+        "docker proxy socket path is {len} bytes and must stay under 100 (sockaddr_un limit): {}",
+        path.display()
+    );
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
