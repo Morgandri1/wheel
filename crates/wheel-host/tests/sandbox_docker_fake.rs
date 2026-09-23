@@ -16,7 +16,30 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 use wheel_host::config::{Backend, Config};
+use wheel_host::docker_proxy::policy::RunRoot;
 use wheel_host::sandbox::{docker::DockerSandbox, Sandbox, Secrets, Status};
+
+/// The run-root channel's directory ownership is the whole mechanism (§3, entrypoint.sh's fixed
+/// `AGENT_UID`/`AGENT_GID`), and only root can chown a directory to another uid. Skipped off-root
+/// so a laptop run stays useful; hard-failed where root was promised — the same pattern
+/// `sandbox_process.rs` already uses for the identical reason on the process backend.
+macro_rules! require_root {
+    () => {
+        #[cfg(unix)]
+        {
+            let is_root = unsafe { libc::geteuid() } == 0;
+            if !is_root {
+                if std::env::var("WHEEL_CI_HAS_ROOT").as_deref() == Ok("1") {
+                    panic!("WHEEL_CI_HAS_ROOT=1 but this process is not root");
+                }
+                eprintln!(
+                    "skipping: the docker run-root channel needs root to chown the socket dir"
+                );
+                return;
+            }
+        }
+    };
+}
 
 #[derive(Default, Clone)]
 struct Recorded {
@@ -203,6 +226,7 @@ fn cfg(data_dir: &str) -> Config {
         disk_floor_mb: 1,
         reconcile_concurrency: 8,
         engine_base_url: "http://127.0.0.1:7000".into(),
+        docker_run_root: None,
         oauth_allowed_projects: Vec::new(),
     }
 }
@@ -515,5 +539,152 @@ async fn restart_also_waits_for_readiness() {
         r.requests.iter().any(|q| q.ends_with("/start")),
         "restart never started the container: {:?}",
         r.requests
+    );
+}
+
+// --- M3b: the run-root unix-socket channel -----------------------------------------------------
+//
+// Without `docker_run_root`, none of this changes at all (every test above still runs with it
+// unset). With it set, three things have to move together or the proxy's own `policy.rs` refuses
+// the create outright: `WHEEL_LISTEN` in the env, the extra `Binds` entry, and `engine_base()` —
+// this is what proves they actually agree, not just that each one individually looks right.
+
+fn run_root_scratch() -> (RunRoot, String) {
+    // Short on purpose: `<this>/<project-uuid>/engine.sock` has to clear the sockaddr_un length
+    // guard `create()` itself enforces (~100 bytes), the same constraint `sandbox_process.rs`'s
+    // `run_dir` fixtures respect for the identical reason.
+    let dir = std::env::temp_dir().join(format!(
+        "wh-rr-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let path = dir.to_str().unwrap().to_string();
+    (RunRoot::new(&path).unwrap(), path)
+}
+
+fn sandbox_with_run_root(sock: &std::path::Path, run_root: RunRoot) -> DockerSandbox {
+    let docker = Docker::connect_with_unix(sock.to_str().unwrap(), 5, bollard::API_DEFAULT_VERSION)
+        .expect("connect to the fake daemon");
+    let mut config = cfg("/tmp/wheel-docker-fake-run-root");
+    config.docker_run_root = Some(run_root);
+    DockerSandbox::with_client(docker, config)
+}
+
+/// No run root configured: the engine base is the plain per-project TCP URL this backend has
+/// always used, unchanged by M3b for every project that has not opted in.
+#[tokio::test]
+async fn without_a_run_root_the_engine_base_stays_tcp() {
+    let (sock, _) = fake_daemon("running");
+    let sb = sandbox(&sock);
+    let id = Uuid::new_v4();
+    let base = sb.engine_base(&id);
+    assert!(base.starts_with("http://"), "got {base}");
+}
+
+/// With a run root, `engine_base()` is a host-visible unix socket path under it — never TCP, and
+/// never the container-internal `/run/wheel` path (which this host, outside the container, could
+/// not dial at all).
+#[tokio::test]
+async fn with_a_run_root_the_engine_base_is_a_host_visible_unix_socket() {
+    let (sock, _) = fake_daemon("running");
+    let (run_root, path) = run_root_scratch();
+    let sb = sandbox_with_run_root(&sock, run_root);
+    let id = Uuid::new_v4();
+
+    let base = sb.engine_base(&id);
+    assert!(base.starts_with("unix://"), "got {base}");
+    assert!(base.ends_with("engine.sock"), "got {base}");
+    assert!(
+        base.contains(&path) && base.contains(&id.to_string()),
+        "must be under the configured run root, per project: got {base}"
+    );
+    assert!(
+        !base.contains("/run/wheel"),
+        "must be the HOST path, not the container-internal mount point: got {base}"
+    );
+}
+
+/// The create the daemon actually receives: `WHEEL_LISTEN` switches to the fixed unix path the
+/// proxy's `policy::ENGINE_SOCKET` expects, and `Binds` grows the run-root entry alongside (never
+/// instead of) the data volume bind — dropping the data bind would silently lose every engine's
+/// sqlite file on the next recreate.
+#[tokio::test]
+async fn provision_with_a_run_root_binds_the_socket_dir_and_switches_listen_to_unix() {
+    require_root!();
+    let (sock, rec) = fake_daemon("running");
+    let (run_root, path) = run_root_scratch();
+    let sb = sandbox_with_run_root(&sock, run_root);
+    let id = Uuid::new_v4();
+
+    sb.provision(&id, &secrets()).await.unwrap();
+
+    let body = rec.lock().unwrap().bodies["/containers/create"].clone();
+    let env: Vec<String> = body["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        env.contains(&"WHEEL_LISTEN=unix:///run/wheel/engine.sock".to_string()),
+        "got {env:?}"
+    );
+
+    let binds: Vec<String> = body["HostConfig"]["Binds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        binds.iter().any(|b| b.ends_with(":/data")),
+        "the data volume bind must survive: {binds:?}"
+    );
+    assert!(
+        binds
+            .iter()
+            .any(|b| b == &format!("{path}/{id}:/run/wheel")),
+        "must bind exactly the same path the proxy's RunRoot::bind_for would produce: {binds:?}"
+    );
+
+    // The host-side directory this bind names has to actually exist before the container starts,
+    // or docker creates it as root:root and the containerized engine (uid 10001) gets EACCES.
+    let meta = std::fs::metadata(format!("{path}/{id}")).expect("run-root dir was created");
+    assert!(meta.is_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(meta.uid(), 10001, "must be owned by AGENT_UID");
+        assert_eq!(meta.gid(), 10001, "must be owned by AGENT_GID");
+    }
+}
+
+/// A container made without a run root, then reprovisioned once one is configured, must be
+/// recreated rather than left alone: its `Binds` and `WHEEL_LISTEN` are stale relative to what the
+/// proxy will now admit for this project.
+#[tokio::test]
+async fn enabling_a_run_root_on_an_existing_container_recreates_it() {
+    require_root!();
+    let (sock, rec) = fake_daemon("running");
+    let id = Uuid::new_v4();
+
+    {
+        let sb = sandbox(&sock);
+        sb.provision(&id, &secrets()).await.unwrap();
+    }
+    let (run_root, _path) = run_root_scratch();
+    {
+        let sb = sandbox_with_run_root(&sock, run_root);
+        sb.provision(&id, &secrets()).await.unwrap();
+    }
+
+    let r = rec.lock().unwrap();
+    let creates = r
+        .requests
+        .iter()
+        .filter(|r| r.contains("/containers/create"))
+        .count();
+    assert_eq!(
+        creates, 2,
+        "turning on the run root must recreate the container, not silently keep the old bind"
     );
 }

@@ -53,6 +53,19 @@ pub struct Config {
     pub reconcile_concurrency: usize,
     /// Only meaningful for the external backend.
     pub engine_base_url: String,
+    /// Only meaningful for the docker backend: a host directory holding nothing but per-project
+    /// socket subdirectories, `<run_root>/<uuid>`, bind-mounted into that project's container at
+    /// `/run/wheel`. `None` (the default): engines listen on TCP inside the shared docker network
+    /// (`Config::engine_url`), the M1 shape. `Some`: engines listen on a unix socket there instead,
+    /// and this host reaches them over a HOST-visible path, never the container network at all.
+    ///
+    /// Read from `DOCKER_PROXY_RUN_ROOT` — the same variable `wheel-docker-proxy` reads, not a
+    /// wheel-host-flavoured rename of it: this value and the proxy's have to be the literal same
+    /// path (the proxy validates every create's `Binds` against its own copy), and one name for
+    /// one fact is worth the slightly-off scoping of "PROXY" from wheel-host's side. Parsed with
+    /// the same `RunRoot` validator the proxy uses, so a malformed value fails this host's boot
+    /// too rather than surfacing only as every container create being refused downstream.
+    pub docker_run_root: Option<crate::docker_proxy::policy::RunRoot>,
     /// Project ids whose engines get `WHEEL_HARNESS_AUTH=oauth-token` instead of the fail-secure
     /// `api-key-only` every other project gets (`docs/proposals/wheeld-first-class-cloud-api-key-
     /// policy.md`, wow-agent-brief task 4). Deliberately host config, never a project-reachable
@@ -183,6 +196,13 @@ impl Config {
             disk_floor_mb: parse_or("DISK_FLOOR_MB", 256u64)?,
             reconcile_concurrency: parse_or("RECONCILE_CONCURRENCY", 8usize)?,
             engine_base_url: var_or("ENGINE_BASE_URL", "http://127.0.0.1:7000"),
+            docker_run_root: match std::env::var("DOCKER_PROXY_RUN_ROOT") {
+                Ok(v) if !v.trim().is_empty() => Some(
+                    crate::docker_proxy::policy::RunRoot::new(v.trim())
+                        .map_err(|e| anyhow::anyhow!("DOCKER_PROXY_RUN_ROOT: {e}"))?,
+                ),
+                _ => None,
+            },
             oauth_allowed_projects: parse_oauth_allowlist()?,
         })
     }
@@ -215,6 +235,7 @@ impl Config {
             disk_floor_mb: 1,
             reconcile_concurrency: 8,
             engine_base_url: "http://127.0.0.1:7000".into(),
+            docker_run_root: None,
             oauth_allowed_projects: Vec::new(),
         }
     }

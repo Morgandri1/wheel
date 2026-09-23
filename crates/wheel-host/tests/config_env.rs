@@ -18,6 +18,7 @@ fn base() {
     std::env::remove_var("BIND_ADDR");
     std::env::remove_var("PORT");
     std::env::remove_var("WHEEL_HARNESS_AUTH_OAUTH_PROJECTS");
+    std::env::remove_var("DOCKER_PROXY_RUN_ROOT");
 }
 
 #[test]
@@ -162,6 +163,37 @@ fn host_config_validation() {
         Err(e) => assert!(
             e.to_string().contains("not-a-uuid"),
             "error should name the bad token: {e}"
+        ),
+    }
+
+    // --- DOCKER_PROXY_RUN_ROOT (M3b) — the docker backend reads the SAME variable name the
+    // proxy reads (`wheel-docker-proxy.rs`), parsed with the same `RunRoot` validator, so a
+    // malformed value fails this host's boot too rather than surfacing only as every project
+    // create being refused downstream once it reaches the proxy.
+    base();
+    assert!(
+        Config::from_env().unwrap().docker_run_root.is_none(),
+        "unset must mean the TCP shape, not a guessed path"
+    );
+
+    base();
+    std::env::set_var("DOCKER_PROXY_RUN_ROOT", "/run/wheel-projects");
+    assert_eq!(
+        Config::from_env()
+            .unwrap()
+            .docker_run_root
+            .unwrap()
+            .as_str(),
+        "/run/wheel-projects"
+    );
+
+    base();
+    std::env::set_var("DOCKER_PROXY_RUN_ROOT", "relative/not/absolute");
+    match Config::from_env() {
+        Ok(_) => panic!("a non-absolute run root must fail boot, not be silently accepted"),
+        Err(e) => assert!(
+            e.to_string().contains("DOCKER_PROXY_RUN_ROOT"),
+            "error should name the offending variable: {e}"
         ),
     }
 
