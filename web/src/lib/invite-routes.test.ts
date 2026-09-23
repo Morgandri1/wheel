@@ -83,13 +83,17 @@ describe("redeeming an invite", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("passes an unusable invite's answer through unchanged — the API's wording, not ours", async () => {
+  it("passes an unusable invite's 404 through unchanged and leaves the session cookie alone", async () => {
     fetchMock.mockResolvedValue(
-      Response.json({ error: { code: "unauthorized", message: "Missing or invalid authentication token." } }, { status: 401 }),
+      Response.json(
+        { error: { code: "invite_unusable", message: "This invite link cannot be used." } },
+        { status: 404 },
+      ),
     );
     const res = await acceptInvite(post({ token: "wi_dead" }, { cookie: `wheel_session=${TOKEN}` }));
-    expect(res.status).toBe(401);
-    expect((await res.json()).error.message).toBe("Missing or invalid authentication token.");
+    expect(res.status).toBe(404);
+    expect((await res.json()).error.code).toBe("invite_unusable");
+    expect(res.headers.get("set-cookie")).toBeNull();
   });
 
   it("clears this browser's own session cookie when the API says it, specifically, is dead", async () => {
