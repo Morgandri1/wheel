@@ -749,6 +749,30 @@ wheel-on-wheel build leg has one. Web identified this gap and asked for the cove
 | `E2E-pkg-csp-agrees` | The CSP the packaged server sends names the same API it was pointed at. A policy computed for a different origin blocks every call in the browser and surfaces as a CSP violation rather than a failed fetch — so it reads as a network fault and gets debugged in the wrong place. | S2 |
 | `E2E-pkg-assets` | No 404s and no console errors: the package ships the assets it references. `next dev` serves from source and will happily find a file the packer never copied, so this is invisible to every other test, and it degrades quietly — the board renders and one panel is simply dead. | S2 |
 | `E2E-pkg-hydrates` | The packaged board is **interactive**, not merely rendered. A bundle that ships but never hydrates serves perfect HTML and responds to nothing; proving it needs a control whose enabled state only exists once React is live. | S2 |
+| `E2E-proxy-A` | Packaged server with `WHEEL_PUBLIC_ORIGIN` + `WHEEL_TRUST_PROXY` (the production shape), driven with raw HTTP so the test controls `Host`. Group of the rows below. | S1 |
+| `E2E-proxy-A-exact` | A signed-out `/app`, `/app/<id>` and `/app/invite/<token>` answer **307** with an ABSOLUTE `Location` equal to the configured origin (+`/sign-in[?next=…]`), never the bind address. Regression for the P0 where the redirect was built from `req.url` and sent browsers to `https://localhost:3000`. Also pins a CSP prefix, no `Set-Cookie`, and `Cache-Control` absent or `no-store` on the redirect. | **S1** |
+| `E2E-proxy-A-query-not-carried` | The original query string is NOT carried into `next=` (current behaviour, pinned so a change is deliberate). | S3 |
+| `E2E-proxy-A-unsteerable` | With `WHEEL_PUBLIC_ORIGIN` set, no `Host` / `X-Forwarded-Host` / `X-Forwarded-Proto` / `Forwarded` value moves the redirect off the configured origin (hostile-host list). | **S1** |
+| `E2E-proxy-A-rsc` | An RSC/prefetch request is redirected exactly like a document request and is not answered 500. | S2 |
+| `E2E-proxy-A-cookie-liveness` | A live-shaped session cookie is not redirected, and the cookie name is `__Host-` iff the public origin is https. | S2 |
+| `E2E-proxy-A-no-invalid-url` | The server log never contains `ERR_INVALID_URL` (a relative `Location` answers HTTP 500 on a real server and no unit test on `middleware()` can see it). | **S1** |
+| `E2E-proxy-B` | Packaged server with `WHEEL_TRUST_PROXY` only. Group of the rows below. | S2 |
+| `E2E-proxy-B-forwarded` | The redirect is built from the forwarded proto and host. | S2 |
+| `E2E-proxy-B-last-value` | With a comma list in the forwarding headers the LAST hop wins (the one the trusted proxy appended). | S2 |
+| `E2E-proxy-B-host-fallback` | With no `X-Forwarded-Host` the `Host` header is used. | S3 |
+| `E2E-proxy-B-no-invalid-url` | No `ERR_INVALID_URL` in the server log in this configuration. | S2 |
+| `E2E-proxy-C` | Packaged server with neither setting (localhost mode). Group of the rows below. | S2 |
+| `E2E-proxy-C-host` | The redirect points back at the `Host` the client used. | S2 |
+| `E2E-proxy-C-forwarded-ignored` | Forwarding headers are ignored when the proxy is not trusted. | S1 |
+| `E2E-proxy-C-nonloopback-host-reflected` | A non-loopback `Host` is reflected (CURRENT behaviour, pinned — not a guarantee). | S3 |
+| `E2E-proxy-C-cookie-name` | Over http the plain cookie is the session and `__Host-` is not used. | S2 |
+| `E2E-proxy-C-no-invalid-url` | No `ERR_INVALID_URL` in the server log in this configuration. | S2 |
+| `E2E-proxy-browser` | A real browser behind a Caddy-shaped reverse proxy (http, then https with a self-signed cert). Group of the rows below. | S1 |
+| `E2E-proxy-signed-out-stays-on-origin` | A protected URL lands on `/sign-in` on the address the browser used, and no navigation leaves that origin. | **S1** |
+| `E2E-proxy-signup-live-session` | A fresh sign-up sets a live session cookie and the next navigation sends it. | **S1** |
+| `E2E-proxy-signin-next` | Signing in through the real form returns to the `next=` deep link on the public origin. | S2 |
+| `E2E-proxy-rsc-redirect-followed` | A client-side RSC prefetch of `/app` is handed a 307 to the public origin (the followed hop is only asserted over https: the CSP's `upgrade-insecure-requests` rewrites it on an http page). | S2 |
+| `E2E-proxy-browser-no-invalid-url` | No `ERR_INVALID_URL` in the server log after the browser flows. | S2 |
 | `E2E-signin` | Sign-in through whatever `NEXT_PUBLIC_AUTH_MODE` is built with; unauthenticated `/app` redirects. |
 | `E2E-local-signup` | (`AUTH_MODE=local`) Sign-up page creates an account and lands on `/app` already authenticated — no second login step. |
 | `E2E-local-login` | Sign-in page authenticates an existing account; the session survives a full page reload. |
