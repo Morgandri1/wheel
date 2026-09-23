@@ -58,8 +58,9 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
       // only reachable with neither setting — the localhost-only mode, where `req.url` is right.
       // (A relative Location does not work here: Next's middleware adapter parses it as absolute
       // and answers 500.) `target` is always an app-built `/sign-in[?next=<encoded /app path>]`.
-      const origin = publicOrigin(req);
-      const redirect = NextResponse.redirect(new URL(target, origin === "null" ? req.url : origin));
+      // MUTATION (qa/mutate-150-fix): reintroduce the relative-Location variant that Next's
+      // middleware adapter answers 500 to, to prove the regression net (#154) actually catches it.
+      const redirect = NextResponse.redirect(target as unknown as URL);
       redirect.headers.set("content-security-policy", csp);
       return redirect;
     }
