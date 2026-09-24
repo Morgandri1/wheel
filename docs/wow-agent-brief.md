@@ -239,4 +239,43 @@ Web (loop node UI: interval + prompt/op config, start/stop). Short proposal firs
 touching the wire matrix and the schema (§3) — lighter-weight than portals/helper-agent since it doesn't cross
 any auth boundary, but the interval floor and budget/rate-limit interaction need to be nailed down before code.
 
+## 9. Board-manager "sentinel" mascot (cosmetic, low priority)
+
+**Operator's ask (2026-09-23), verbatim:** "I think it would be a really fun gimmick if the board manager agent
+walks around like a Matrix spider; one of the big computers on legs that walks around managing the matrix cells."
+Follow-up clarifications: "This is just in UI; it would walk to the agents it's managing at any given moment" —
+i.e. tied to real board activity (current message/turn target), not an idle/fixed animation.
+
+**Goal:** purely cosmetic canvas decoration — a spider-legged "sentinel" mascot representing the board-manager
+agent, animating between node cells to whichever agent(s) it's currently active with. No functional requirement,
+no wire/schema/engine change; UI-only.
+
+**Owner:** Web. No fuller spec requested yet — pick up when there's slack in the queue.
+
+## 10. Agent-facing slash commands (harness passthrough)
+
+**Operator's ask (2026-09-21), verbatim:** "also we need some way to push slash commands through to the
+underlying agent; presumably operator only but i'm open to playing with giving that power to certain manager
+agents."
+
+**Goal:** let a caller push a harness slash command (`/compact`, `/clear`, `/model`, `/context`, and the
+Codex-side equivalents) to a running agent, rather than only ordinary message bodies.
+
+**PM ruling on shape, given to SDK 2026-09-21 (status: proposal assigned, not yet written):**
+1. Audit which commands are meaningful/safe headless on the pinned CLI versions (some are interactive-only) —
+   piggyback on the #144 steer spike where possible to avoid spending extra model calls.
+2. Transport: a dedicated route (like the planned `/v1/agents/:id/steer`, not a mode on `/send` — `policy.rs`'s
+   own rule is that a tier may not have conditional powers), delivered through the engine's single stdin writer;
+   define how `/clear`/`/compact` interact with `session_id`, ephemeral-context re-injection, and parking/resume.
+3. Authority: Admin route by default, plus an opt-in **per-agent allowlist**
+   (`config.allowed_slash_commands`, default empty) so a manager agent can be granted e.g. `/compact` without
+   blanket power — never the broad `agent→agent write` (manage) wire for this. Every use logged as an event
+   with actor.
+4. Adversary's brief once the proposal exists: command injection via message bodies starting with `/`, a
+   manager agent escalating via an allowed command (`/permissions`, `/add-dir`, `/mcp`), cost-relevant commands.
+
+**Likely owner:** SDK (engine: route, transport, session-state interaction), folded into the `#144` steer
+proposal/spike cycle since both touch the same single-writer path. Adversary reviews the written proposal before
+any code — nothing has been implemented yet as of this entry.
+
 <!-- Further tasks appended as the operator provides them. -->
