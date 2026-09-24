@@ -278,4 +278,19 @@ Codex-side equivalents) to a running agent, rather than only ordinary message bo
 proposal/spike cycle since both touch the same single-writer path. Adversary reviews the written proposal before
 any code — nothing has been implemented yet as of this entry.
 
+## 11. "Copy invite link" in the Members panel (small UX fix)
+
+**Origin (PM-observed 2026-09-24, while triaging the operator's report that the invite page redirected
+coworkers to localhost):** the Members panel's issued-invite box shows only the raw `wi_…` token
+(`CopyField value={issued.token}`), so whoever invites someone has to hand-build
+`https://<host>/app/invite/<token>`. The localhost redirect itself was the signed-out-deep-link bug fixed in
+#150 (pending a web redeploy); this item removes the hand-built-link step that surrounds it.
+
+**Goal:** make a full invite link the primary copy affordance, built client-side from `window.location.origin`
+(never a server-derived base, so it cannot inherit a localhost origin), with the raw token kept as a secondary
+copy. Test that the link uses the page's origin.
+
+**Owner:** Web. Status: assigned to web 2026-09-24, low-medium priority; not started as of this entry.
+
 <!-- Further tasks appended as the operator provides them. -->
+
