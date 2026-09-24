@@ -431,8 +431,14 @@ export interface Message {
    * Set only on the engine control plane, from the `x-wheel-actor-id` header the API adds after stripping anything the client sent under that namespace. It is `None` on the node-token plane and on public ingress, deliberately: an agent cannot assert an actor, and an anonymous webhook has none.
    *
    * **Known limit (ADVERSARY 037).** An agent that lifts `WHEEL_ENGINE_SECRET` from the engine's environ can call the control plane as the host and set this to anything. That is forged attribution and it closes with per-node uids, not here. An agent that merely steals a *sibling's node token* reaches the CLI plane, where the header is ignored — so that failure is missing attribution rather than forged, which is the better of the two.
+   *
+   * **Masked for a guest, on two of its three surfaces.** Under `jwks` this field IS the asking principal, which for an email-shaped `sub` is a real email — the same risk shape the roster masks a member's display email for (`wheel_core::mask_identifier`). `GET /v1/agents/:id/inbox[/:id]` and `Event::Message` over `GET /v1/events` both mask it for a guest viewing anyone's message but their own (`wheel-engine`'s `api::actor::mask_message_for_tier`). The third surface, `LogStream::Transcript` (`event.rs`), does NOT mask it: `on_behalf_of` only reaches that stream already baked into an `<AgentPrompt on_behalf_of="...">` attribute of rendered free text, and that stream's whole reason to exist is being the exact bytes the engine wrote — regexing an attribute out of it would break the guarantee the transcript view exists to keep. A deliberate exception, not an oversight.
    */
   on_behalf_of?: string | null;
+  /**
+   * `true` when the caller's tier may not read this message's `body` and it has been replaced (finding 062). Everything else — `id`, `from`, `to`, `state`, `bytes`, `sha256`, the timestamps — is the real value. Absent when `false`, so an unredacted message is byte-identical to what it was before this field existed.
+   */
+  redacted?: boolean;
   /**
    * Threading (§3c#9): the message this one replies to.
    */
