@@ -47,7 +47,7 @@ agent could flip would not be a policy.
 |---|---|---|
 | `WHEEL_AUTO_UPDATE` | `off` \| `prompt` \| `auto` — **default `off`** | `off`: no notice, and every request surface refuses. `prompt`: notice plus agent/operator request. `auto`: `prompt`, plus apply at quiescence without a request. Anything else fails boot and names the variable. |
 | `WHEEL_UPDATE_REPO` | path, **required unless `off`** | The source checkout to fetch and build from. Remote is always `origin`, branch always `main`; neither is configurable, to keep the attack surface small. |
-| `WHEEL_UPDATE_GITHUB_TOKEN` | token, optional | Reads GitHub check-runs for the CI gate. Without it the gate is **unverifiable**: nothing applies, and boot, every notice and `wheeld update` say so. |
+| `WHEEL_UPDATE_GITHUB_TOKEN` | token, optional | `wheel` is public, so the CI gate reads GitHub check-runs **anonymously by default** — the token only raises the 60/hour anonymous ceiling (or reaches a private fork). A rate-limited or unreachable answer is still **unverifiable**: nothing applies, and boot, every notice and `wheeld update` say so; never applied on a guess. |
 | `WHEEL_UPDATE_GITHUB_REPO` | `owner/name`, optional | Defaults to what `origin` points at on github.com. |
 | `WHEEL_UPDATE_REQUIRED_CHECKS` | comma list, default `make check` | Check-run names that must be present and green, in addition to "every GitHub Actions run on the commit is green". |
 | `WHEEL_UPDATE_BIN_DIR` | default: directory of the running `wheeld` | Where `wheeld` and `wheel` live. Both must be present; a missing one fails boot. |
