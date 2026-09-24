@@ -22,7 +22,10 @@ vi.mock("@/lib/api", async (orig) => ({
   invites: { list: inviteList, create: inviteCreate, revoke: inviteRevoke },
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const roster = (): MemberList => ({
   creator: "u-creator",
@@ -129,6 +132,22 @@ describe("invites", () => {
       expect(inviteCreate).toHaveBeenCalledWith("p1", { role: "prompter", email: "souren@example.com" }),
     );
     await waitFor(() => expect(screen.getByTestId("invite-token").textContent).toBe("wi_abcDEF123"));
+  });
+
+  it("offers a ready-to-send link built from the page's own origin, with the raw token secondary", async () => {
+    vi.stubGlobal("location", { ...window.location, origin: "https://wheel.example" });
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    inviteCreate.mockResolvedValue({ ...invite(), token: "wi_abcDEF123" });
+    renderPanel("admin");
+    await waitFor(() => expect(screen.queryByTestId("btn-create-invite")).not.toBeNull());
+    fireEvent.click(screen.getByTestId("btn-create-invite"));
+    const link = await screen.findByTestId("invite-link");
+    expect(link.textContent).toBe("https://wheel.example/app/invite/wi_abcDEF123");
+    expect(screen.getByTestId("invite-token").textContent).toBe("wi_abcDEF123");
+    expect(link.compareDocumentPosition(screen.getByTestId("invite-token")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(link.parentElement!.querySelector("button")!);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("https://wheel.example/app/invite/wi_abcDEF123"));
   });
 
   it("omits the email field entirely when none was typed, rather than sending an empty string", async () => {

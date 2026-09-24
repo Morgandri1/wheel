@@ -211,6 +211,13 @@ export function MembersPanel({
                   <p className="mb-1.5 text-micro text-ink-dim">
                     {tierLabel(issued.role)} invite — shown once, copy it now:
                   </p>
+                  {/* The browser's own origin, read at click time: a server-derived base can be wrong
+                      behind a proxy, and this box only exists after a click, so never on the server. */}
+                  <CopyField
+                    value={`${window.location.origin}/app/invite/${encodeURIComponent(issued.token)}`}
+                    testId="invite-link"
+                  />
+                  <p className="mb-1 mt-2 text-micro text-ink-dim">Or just the token:</p>
                   <CopyField value={issued.token} testId="invite-token" />
                 </div>
               ) : null}
