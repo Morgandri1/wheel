@@ -208,6 +208,25 @@ In local mode, middleware sends a visitor with no session cookie from `/app…` 
 `/api/session` whether the session is alive and redirects if it is not. Both are routing
 courtesies; the API is the boundary. In clerk mode Clerk's middleware guard applies instead.
 
+The redirect's details, each one measured against a real `next start` (`scripts/probe-redirect.sh`
+builds a standalone server and checks them; a unit test on `middleware()` cannot, because Next's
+middleware adapter sits between the two):
+
+- **It is built on the public origin**, the same derivation the `/api` routes use (`WHEEL_PUBLIC_ORIGIN`,
+  else a trusted proxy's forwarded headers, else the request's own). Never on `req.url`: Next's
+  standalone server builds that from its own bind address, which once sent browsers to
+  `https://localhost:3000`. It cannot be a relative `Location` either: the adapter parses it as
+  absolute and answers 500.
+- **`Cache-Control: no-store`.** The answer depends on the `Cookie` header but is served on a URL alone.
+- **The query string is not carried** into `next=`; only the path. Nothing under `/app` reads one today,
+  and Next's own `?_rsc=` navigation parameter would need filtering out first.
+- **Known limit, plain http.** Reaching an http deployment by any name but `localhost` (with neither
+  `WHEEL_PUBLIC_ORIGIN` nor a trusted proxy set) reflects that `Host` into the redirect, and the CSP's
+  `upgrade-insecure-requests` (every non-dev build, `src/lib/csp.ts`) rewrites an http page's followed
+  redirect to https, so it can dead-end. Tunnel mode is `http://localhost:3000`; anything else should set
+  `WHEEL_PUBLIC_ORIGIN` behind TLS. (Observed by QA's behind-proxy e2e; not something this app can fix
+  from inside middleware.)
+
 ## Realtime
 
 The board opens an `EventSource` at `/api/wheel/projects/:id/events`. The relay opens the engine's

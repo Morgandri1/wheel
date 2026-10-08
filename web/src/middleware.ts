@@ -61,6 +61,10 @@ export default async function middleware(req: NextRequest, ev: NextFetchEvent) {
       const origin = publicOrigin(req);
       const redirect = NextResponse.redirect(new URL(target, origin === "null" ? req.url : origin));
       redirect.headers.set("content-security-policy", csp);
+      // The answer depends on the Cookie header (no live session, so sign in) yet is served on a URL
+      // alone. Without this a shared cache keyed on the URL could hand a signed-in visitor someone
+      // else's "go sign in". No `Cache-Control` was set at all before.
+      redirect.headers.set("cache-control", "no-store");
       return redirect;
     }
   }
