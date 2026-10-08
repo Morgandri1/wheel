@@ -289,6 +289,40 @@ jobs:
           name: packaged-web-report
           path: qa/e2e/playwright-report/
 
+  multiplayer:
+    name: multiplayer (real API + packaged board)
+    runs-on: ubuntu-latest
+    # Invites and tiers are enforced by wheel-api, and web/mock has no tiers, members or invites, so
+    # the mock-backed jobs cannot see a regression here. This one builds the real API and drives it
+    # from two or three browsers, with only the sandbox host stubbed.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-multiplayer-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-multiplayer-${{ runner.os }}-
+      - run: make test-multiplayer
+      - name: Upload the report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multiplayer-report
+          path: qa/e2e/playwright-report/
+
   wheel-on-wheel:
     name: wheel-on-wheel (agent clones and builds Wheel)
     runs-on: ubuntu-latest
