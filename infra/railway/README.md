@@ -1,12 +1,19 @@
 # Railway deployment
 
-Two services in the Railway project `wheel` (workspace "Morgan Metz's Projects"), plus Postgres.
-Both are connected to `github.com/Morgandri1/wheel`, branch `main`, and **deploy on push**.
+**Current state does not match the target described here** — both services below are, TODAY, in the
+one Railway project `wheel` (workspace "Morgan Metz's Projects"), plus Postgres. That is
+`redteam/findings/048-s5b-network-isolation-not-deployed.md`: §5b specifies `wheel-host` in its own
+project, network-segmented from Postgres/the API, and it isn't. The migration to fix it is planned in
+`docs/proposals/network-isolation-048.md` — read that before touching Railway project structure. The
+table below describes the TARGET topology; `settings.json`'s comment marks the one field that changes
+once the new project exists.
 
-| Service      | Dockerfile               | Replicas | Healthcheck          | Domain |
-|--------------|--------------------------|----------|----------------------|--------|
-| `wheel-api`  | `docker/Dockerfile.api`  | 2        | `/healthz`           | `wheel-api-production.up.railway.app` |
-| `wheel-host` | `docker/Dockerfile.host` | **1**    | `/healthz`           | none — private only |
+Both services are connected to `github.com/Morgandri1/wheel`, branch `main`, and **deploy on push**.
+
+| Service      | Project      | Dockerfile               | Replicas | Healthcheck          | Domain |
+|--------------|--------------|---------------------------|----------|----------------------|--------|
+| `wheel-api`  | `wheel`      | `docker/Dockerfile.api`  | 2        | `/healthz`           | `wheel-api-production.up.railway.app` |
+| `wheel-host` | `wheel-host` (own project, once migrated) | `docker/Dockerfile.host` | **1**    | `/healthz`           | public, bearer-gated (§5b) — private-only was the pre-048-fix posture |
 
 `wheel-host` must stay at one replica. It owns per-project sandboxes and a sqlite state file on a
 Railway volume; a second replica would fight it for both, and two supervisors reconciling the same
@@ -59,7 +66,11 @@ today.
   `--service` and act on whatever is linked. This has already put a volume on the wrong service and
   created a public domain on `wheel-host`, which must never have one.
 * `wheel-host` refuses to boot if `RAILWAY_PUBLIC_DOMAIN` is set (override: `ALLOW_PUBLIC_DOMAIN=1`),
-  so that mistake fails loudly instead of silently exposing every tenant's sandbox supervisor.
+  so that mistake fails loudly instead of silently exposing every tenant's sandbox supervisor. That
+  guard is for TODAY's topology, where `wheel-host` shares a project with the API and has no reason
+  to be public. Once `network-isolation-048.md`'s migration lands, a public domain (bearer+TLS-gated)
+  is how the API reaches it AT ALL, so that deployment sets `ALLOW_PUBLIC_DOMAIN=1` deliberately —
+  not a workaround, the intended state for a host in its own project.
 * Postgres has no public proxy. To query production, `railway ssh -s postgres` and use `psql` there.
 * **A health check must point at a port the platform actually probes.** `wheel-host` used to bind
   `0.0.0.0:7100` and ignore `$PORT`, so every probe reached nothing and answered "service
@@ -106,6 +117,14 @@ it explicitly on this deployment rather than relying on a default. A malformed e
 This is host config, not a database column or anything a project's own owner can reach through the
 project API — changing it means redeploying `wheel-host` itself, which only whoever controls this
 Railway service can do.
+
+## Verifying network isolation
+
+`./verify-network-isolation.sh` asserts `wheel-host` cannot resolve or reach
+`postgres.railway.internal` / `wheel-api.railway.internal` — the check `048`'s fix recommends running
+after the migration and periodically after, since a future dashboard change (someone re-adding
+`wheel-host` to the `wheel` project, say) would re-open the finding silently otherwise. Needs
+`railway link -p wheel-host -s wheel-host` first. See `docs/proposals/network-isolation-048.md`.
 
 ## Pruning probe projects
 

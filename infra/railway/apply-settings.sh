@@ -42,10 +42,17 @@ def call(body):
 failed = False
 for name, svc in cfg["services"].items():
     sid = svc.pop("serviceId")
+    # A service in a DIFFERENT Railway project (docs/proposals/network-isolation-048.md: wheel-host
+    # once it moves) names its own environment id here; every other service falls back to the
+    # top-level default. "project" is metadata for a human running `railway link` before this
+    # script — the mutation below addresses a service by serviceId+environmentId, and Railway
+    # derives the project from those, so it is popped rather than sent.
+    svc.pop("project", None)
+    svc_env = svc.pop("environment", env)
     # One field per call: the API rejects a whole input object if any single field is unsupported,
     # which would silently drop the rest and leave a half-applied service.
     for field, value in svc.items():
-        r = call({"query": MUTATION, "variables": {"id": sid, "env": env, "input": {field: value}}})
+        r = call({"query": MUTATION, "variables": {"id": sid, "env": svc_env, "input": {field: value}}})
         if "errors" in r:
             failed = True
             print(f"  {name}.{field}: REJECTED — {r['errors'][0]['message']}", file=sys.stderr)
